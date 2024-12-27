@@ -108,3 +108,4 @@ namespace_packages = true
 
 # TODO: Remove once solidifying file structure
 ignore_missing_imports = true
+disable_error_code = ["attr-defined"]
