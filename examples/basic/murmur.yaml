@@ -1,0 +1,14 @@
+name: examples-basic
+version: 1.0.0
+agents:
+  - name: friendly-assistant
+    version: 1.0.0
+tools:
+  - name: add
+    version: 1.0.0
+  - name: multiply
+    version: 1.0.0
+  - name: divide
+    version: 1.0.0
+  - name: is_prime
+    version: 1.0.0

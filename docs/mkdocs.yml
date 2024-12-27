@@ -1,0 +1,55 @@
+site_name: ""
+site_description: "Package, publish and manage agents and tools."
+site_url: https://murmur-nexus.github.io/murmur
+repo_url: https://github.com/murmur-nexus/murmur
+site_dir: ../site
+copyright: © E.W. de Graaff 2024 to present
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: grey
+      accent: white
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: white
+      primary: white
+      accent: grey
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - content.code.copy
+    - content.code.annotate 
+nav:
+  - index.md
+  - "Tutorial":
+    - Getting Started with the Examples: tutorial/getting-started-with-examples.md
+  - "How-to Guides":
+    - Installation:
+      - Setup PyPI server: how-to/setup-pypi-server.md
+markdown_extensions:
+  - attr_list
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - admonition
+  - pymdownx.details
+  - sane_lists
+  - toc:
+      permalink: true
+  - md_in_html
+  - pymdownx.blocks.caption
+  - pymdownx.critic
+  - pymdownx.caret
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.tilde
