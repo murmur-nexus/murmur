@@ -28,10 +28,6 @@ classifiers = [
 ]
 readme = "README.md"
 
-dependencies = [
-    "murmur-slim==0.0.1",
-]
-
 [project.optional-dependencies]
 langgraph = ["murmur-langgraph==0.0.1"]
 swarm = ["murmur-swarm==0.0.1"]
