@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "murmur-slim"
+version = "0.0.1"
+description = "Murmur's monorepo to package, publish and manage AI agents and tools."
+requires-python = ">=3.9"
+authors = [{ name = "E.W. de Graaff", email = "hi@murmur.nexus" }]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Environment :: MacOS X",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+readme = "README.md"
+
+[project.urls]
+Repository = "https://github.com/murmur-nexus/murmur"
+
+[tool.hatch.build]
+packages = ["murmur"]
+exclude = [
+    "murmur/clients/**",
+]
+only-packages = true

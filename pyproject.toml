@@ -1,0 +1,111 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "murmur-nexus"
+version = "0.0.1"
+description = "Murmur's monorepo to package, publish and manage AI agents and tools."
+requires-python = ">=3.9"
+authors = [{ name = "E.W. de Graaff", email = "hi@murmur.nexus" }]
+license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Environment :: MacOS X",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+readme = "README.md"
+
+[project.optional-dependencies]
+langgraph = ["murmur-langgraph==0.0.1"]
+swarm = ["murmur-swarm==0.0.1"]
+
+[project.urls]
+Repository = "https://github.com/murmur-nexus/murmur"
+
+[tool.hatch.envs.default]
+dependencies = [
+    "ruamel.yaml==0.18.6",
+    "langchain-core>=0.3.28",
+    "swarm @ git+https://github.com/openai/swarm.git",
+]
+
+[tool.hatch.envs.dev]
+extra-dependencies = [
+    "ruff>=0.8.4",
+    "mypy>=1.14.0",
+    "isort==5.13.2",
+    "mccabe==0.7.0",
+    "pydocstyle==6.3.0",
+    "mkdocs==1.6.1",
+    "mkdocs-material==9.1.11",
+]
+
+[tool.hatch.envs.dev.scripts]
+lint = [
+    "ruff check .",
+    "ruff format --check .",
+]
+format = "ruff format ."
+typecheck = "mypy ."
+
+[tool.hatch.build.targets.wheel]
+only-include = ["/README.md"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+exclude = [
+    "murmur/examples/*",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    "Q",
+    "RUF100",
+    "C90",
+    "UP",
+    "I",
+    "D",
+]
+ignore = [
+    "D100",  # ignore missing docstring in module
+    "D103",  # ignore missing docstring in public module
+    "D104",  # ignore missing docstring in public package
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["murmur"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.mypy]
+mypy_path = ["lib"]
+namespace_packages = true
+
+# TODO: Remove once solidifying file structure
+ignore_missing_imports = true
+disable_error_code = ["attr-defined"]

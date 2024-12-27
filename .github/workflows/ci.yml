@@ -1,0 +1,34 @@
+# .github/workflows/ci.yml
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - docs
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  # Linting and Type Checking Job
+  run-lint:
+    uses: ./.github/workflows/run_lint.yml
+    with:
+      python-version: '3.12'
+      working-directory: '.'
+
+  # Publish Documentation Job
+  publish-docs:
+    needs: run-lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/docs'
+    uses: ./.github/workflows/publish_docs.yml
+    with:
+      python-version: '3.12'
+      docs-directory: './docs'

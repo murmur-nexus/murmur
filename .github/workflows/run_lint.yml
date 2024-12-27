@@ -1,0 +1,55 @@
+name: Lint and Type Check
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: true
+        type: string
+      working-directory:
+        description: 'Directory containing pyproject.toml and source code'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Cache Hatch environment
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/hatch
+          key: ${{ runner.os }}-hatch-${{ hashFiles('${{ inputs.working-directory }}/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-hatch-
+
+      - name: Install Hatch
+        run: pip install --upgrade hatch
+
+      - name: Create Hatch Environment
+        run: hatch env create
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Run Ruff Linting
+        run: hatch -e dev run lint
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Run MyPy Type Checking
+        run: hatch -e dev run typecheck
+        working-directory: ${{ inputs.working-directory }}

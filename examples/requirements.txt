@@ -1,0 +1,4 @@
+langchain_core==0.3.28
+langchain_openai==0.2.14
+langgraph==0.2.60
+git+https://github.com/openai/swarm.git
