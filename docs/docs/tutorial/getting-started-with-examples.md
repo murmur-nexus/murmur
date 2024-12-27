@@ -17,16 +17,16 @@ python -m venv venv
 source venv/bin/activate
 ```
 
-2. Install `murmur-nexus` and `mur-cli`, both are essential for running the examples. 
+2. Install `murmur-nexus` and `mur`, both are essential for running the examples. 
 
 ```bash
-pip install murmur-nexus[langgraph,swarm] mur-cli
+pip install murmur-nexus[langgraph,swarm] mur
 ```
 
 !!! note ""
 
     - **`murmur-nexus`**: Murmur enables the use of published agents and tools within your orchestration code.
-    - **`mur-cli`**: Mur is a command-line interface for creating and managing agents and tools.
+    - **`mur`**: Mur is a command-line interface (CLI)for creating and managing agents and tools.
 
 Verify the installation by running `mur --help`.
 

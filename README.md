@@ -39,7 +39,7 @@ As the world transitions towards agentic workflows, developers face the challeng
   Easily integrate with open-source or cloud-based LLM systems, and enterprise packaging servers. Ensuring maximum compatibility with orchestration frameworks like LangGraph, AG2 and CrewAI.
 
 - **Easy Interface**  
-  Just as `pip` transformed Python package management, `mur` CLI aims to standardize the way developers build, manage and publish specialized AI agents and tools.
+  Just as `pip` transformed Python package management, [`mur`](https://github.com/murmur-nexus/mur) CLI aims to standardize the way developers build, manage and publish specialized AI agents and tools.
 
 ## Code Sample
 Bare-bone example using OpenAI's Swarm:
