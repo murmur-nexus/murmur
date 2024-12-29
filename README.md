@@ -47,7 +47,7 @@ Bare-bone example using OpenAI's Swarm:
 ```python
 from swarm import Swarm
 
-from murmur_swarm import SwarmAgent
+from murmur.clients.swarm import SwarmAgent
 from murmur.agents import friendly_assistant
 from murmur.tools import is_prime
 
