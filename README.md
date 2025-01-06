@@ -1,3 +1,5 @@
+> `ATTENTION!` Please be aware that we are NOT launching any crypto tokens or meme coins. Safeguard yourself and  avoid being deceived by any of these crypto scams! 
+
 ![Swarm Logo](docs/docs/assets/repo-header.png)
 
 <div align="center">
@@ -73,4 +75,4 @@ Murmur is in its early stages, and we're building it with the developer communit
 ---
 
 **Feedback**  
-Try Murmur, and let us know what you think. Star this repo 🌟 and join our [Discord community 💬](https://discord.gg/U9x96DCJ) to share your feedback and help us make agentic workflows accessible for everyone.
+Try Murmur, and let us know what you think. Star this repo 🌟 and join our [Discord community 💬](https://discord.gg/RGKCfD8HhC) to share your feedback and help us make agentic workflows accessible for everyone.
