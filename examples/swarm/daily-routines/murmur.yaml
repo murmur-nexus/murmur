@@ -1,0 +1,16 @@
+name: daily-routines
+version: 1.0.0
+agents:
+  - name: friendly-assistant
+    version: 1.0.0
+  - name: daily-routine
+    version: 1.0.0
+  - name: science-paper-explainer
+    version: 1.0.0
+tools:
+  - name: get-open-meteo-weather
+    version: 1.0.0
+  - name: get-bitcoin-exchange-rate
+    version: 1.0.0
+  - name: get-arxiv-paper
+    version: 1.0.0
