@@ -40,9 +40,6 @@ swarm = ["murmur-swarm==0.0.1"]
 [project.urls]
 Repository = "https://github.com/murmur-nexus/murmur"
 
-[tool.hatch.envs.default]
-features = ["project-dependencies"]
-
 [tool.hatch.envs.dev]
 extra-dependencies = [
     "ruff>=0.8.4",
