@@ -1,9 +1,11 @@
 import inspect
 import logging
 import os
+from typing import List
 
 from ruamel.yaml import YAML
 
+from .enums import InstructionsMode
 from .logging_config import configure_logging
 
 configure_logging()
@@ -27,23 +29,43 @@ class InstructionsHandler:
     MANIFEST_FILE: str = 'murmur.yaml'
     BUILD_MANIFEST_FILE: str = 'murmur-build.yaml'
 
-    def get_instructions(self, module, provided_instructions: list[str] | None) -> str:
-        """Try different methods to get instructions in order of priority."""
-        instructions = (
-            self._try_provided_instructions(provided_instructions)
-            or self._try_root_manifest()
+    def get_instructions(
+        self, 
+        module: type, 
+        provided_instructions: list[str] | None,
+        instructions_mode: InstructionsMode = InstructionsMode.APPEND
+    ) -> str:
+        """Get instructions based on the specified mode and available sources.
+
+        Args:
+            module: The module to get instructions for
+            provided_instructions: List of instructions provided directly
+            instructions_mode: How to handle provided instructions relative to found ones
+
+        Returns:
+            str: The final combined instructions string
+        """
+        if instructions_mode == InstructionsMode.REPLACE and provided_instructions:
+            logger.debug('Using provided instructions only (replace mode)')
+            return ' '.join(provided_instructions)
+
+        # Get base instructions from sources
+        base_instructions = (
+            self._try_root_manifest()
             or self._try_module_manifest(module)
             or self._try_module_attributes(module)
             or ''
         )
-        return instructions
 
-    def _try_provided_instructions(self, instructions: list[str] | None) -> str | None:
-        """Check if provided instructions are available and return them."""
-        logger.debug('Step 1: checking provided instructions')
-        if instructions:
-            return ' '.join(instructions)
-        return None
+        # If we have provided instructions and in append mode (or no base instructions),
+        # combine them
+        if provided_instructions:
+            if base_instructions:
+                logger.debug('Appending provided instructions to base instructions')
+                return f"{base_instructions} {' '.join(provided_instructions)}"
+            return ' '.join(provided_instructions)
+
+        return base_instructions
 
     def _try_root_manifest(self) -> str | None:
         """Attempt to retrieve instructions from the root manifest file."""

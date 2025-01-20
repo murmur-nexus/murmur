@@ -1,5 +1,9 @@
 import logging
+from typing import Literal
 
+from pydantic import BaseModel, Field
+
+from murmur.utils.enums import InstructionsMode
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
 from swarm import Agent
@@ -7,6 +11,20 @@ from swarm import Agent
 # Configure logging
 configure_logging()
 logger = logging.getLogger(__name__)
+
+
+class SwarmOptions(BaseModel):
+    """Configuration options for SwarmAgent.
+    
+    Attributes:
+        instructions: How to handle provided instructions relative to found instructions.
+            'append' (default) - Add provided instructions to found instructions
+            'replace' - Only use provided instructions, ignore found ones
+    """
+    instructions: InstructionsMode = Field(
+        default=InstructionsMode.APPEND,
+        description="How to handle provided instructions"
+    )
 
 
 class SwarmAgent(Agent):
@@ -20,15 +38,23 @@ class SwarmAgent(Agent):
         module: The module from which the agent is created.
         instructions (list[str] | None): A list of instructions or None.
         tools (list): A list of tools to be used by the agent.
+        options (SwarmOptions): Configuration options for the agent.
     """
 
-    def __init__(self, module: type, instructions: list[str] | None = None, tools: list = []) -> None:
+    def __init__(
+        self, 
+        module: type, 
+        instructions: list[str] | None = None, 
+        tools: list = [],
+        options: SwarmOptions | None = None
+    ) -> None:
         """Initialize the SwarmAgent.
 
         Args:
             module: The module from which the agent is created
             instructions: Optional list of instruction strings
             tools: List of tool functions for the agent
+            options: Configuration options for the agent
 
         Raises:
             TypeError: If module is not a valid type or module
@@ -36,8 +62,15 @@ class SwarmAgent(Agent):
         agent_name = module.__name__
         logger.debug(f'Initializing SwarmAgent with name: {agent_name}')
 
+        # Initialize options with defaults if not provided
+        options = options or SwarmOptions()
+
         instructions_handler = InstructionsHandler()
-        final_instructions = instructions_handler.get_instructions(module, instructions)
+        final_instructions = instructions_handler.get_instructions(
+            module=module, 
+            provided_instructions=instructions,
+            instructions_mode=options.instructions
+        )
         logger.debug(f'Generated instructions: {final_instructions[:100]}...')  # Log truncated preview
 
         super().__init__(name=agent_name, instructions=final_instructions, functions=tools)
