@@ -41,11 +41,7 @@ swarm = ["murmur-swarm==0.0.1"]
 Repository = "https://github.com/murmur-nexus/murmur"
 
 [tool.hatch.envs.default]
-dependencies = [
-    "ruamel.yaml==0.18.6",
-    "langchain-core>=0.3.28",
-    "swarm @ git+https://github.com/openai/swarm.git",
-]
+features = ["project-dependencies"]
 
 [tool.hatch.envs.dev]
 extra-dependencies = [
