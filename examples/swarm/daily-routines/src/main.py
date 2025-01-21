@@ -98,7 +98,7 @@ def transfer_to_friendly_assistant_agent():
     """Transfer science paper explainer requests."""
     return friendly_assistant_agent
 
-friendly_assistant_agent.functions = [transfer_to_daily_routine_agent, science_paper_explainer_agent]
+friendly_assistant_agent.functions = [transfer_to_daily_routine_agent, transfer_to_science_paper_explainer_agent]
 
 daily_routine_agent.functions.append(transfer_to_science_paper_explainer_agent)
 
