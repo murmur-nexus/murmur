@@ -1,7 +1,6 @@
 import inspect
 import logging
 import os
-from typing import List
 
 from ruamel.yaml import YAML
 
@@ -30,10 +29,10 @@ class InstructionsHandler:
     BUILD_MANIFEST_FILE: str = 'murmur-build.yaml'
 
     def get_instructions(
-        self, 
-        module: type, 
+        self,
+        module: type,
         provided_instructions: list[str] | None,
-        instructions_mode: InstructionsMode = InstructionsMode.APPEND
+        instructions_mode: InstructionsMode = InstructionsMode.APPEND,
     ) -> str:
         """Get instructions based on the specified mode and available sources.
 
@@ -51,10 +50,7 @@ class InstructionsHandler:
 
         # Get base instructions from sources
         base_instructions = (
-            self._try_root_manifest()
-            or self._try_module_manifest(module)
-            or self._try_module_attributes(module)
-            or ''
+            self._try_root_manifest() or self._try_module_manifest(module) or self._try_module_attributes(module) or ''
         )
 
         # If we have provided instructions and in append mode (or no base instructions),

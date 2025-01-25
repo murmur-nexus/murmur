@@ -1,9 +1,6 @@
 import logging
-from typing import Literal
 
-from pydantic import BaseModel, Field
-
-from murmur.utils.enums import InstructionsMode, ClientOptions
+from murmur.utils.enums import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
 from swarm import Agent
@@ -15,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 class SwarmOptions(ClientOptions):
     """Configuration options specific to SwarmAgent.
-    
+
     Inherits common options from ClientOptions and adds Swarm-specific options.
     Currently uses only common options, but can be extended with Swarm-specific ones.
     """
+
     pass
 
 
@@ -37,11 +35,7 @@ class SwarmAgent(Agent):
     """
 
     def __init__(
-        self, 
-        module: type, 
-        instructions: list[str] | None = None, 
-        tools: list = [],
-        options: SwarmOptions | None = None
+        self, module: type, instructions: list[str] | None = None, tools: list = [], options: SwarmOptions | None = None
     ) -> None:
         """Initialize the SwarmAgent.
 
@@ -62,9 +56,7 @@ class SwarmAgent(Agent):
 
         instructions_handler = InstructionsHandler()
         final_instructions = instructions_handler.get_instructions(
-            module=module, 
-            provided_instructions=instructions,
-            instructions_mode=options.instructions
+            module=module, provided_instructions=instructions, instructions_mode=options.instructions
         )
         logger.debug(f'Generated instructions: {final_instructions[:100]}...')  # Log truncated preview
 
