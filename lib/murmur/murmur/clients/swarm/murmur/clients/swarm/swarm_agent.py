@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from murmur.utils.enums import InstructionsMode
+from murmur.utils.enums import InstructionsMode, ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
 from swarm import Agent
@@ -13,18 +13,13 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 
-class SwarmOptions(BaseModel):
-    """Configuration options for SwarmAgent.
+class SwarmOptions(ClientOptions):
+    """Configuration options specific to SwarmAgent.
     
-    Attributes:
-        instructions: How to handle provided instructions relative to found instructions.
-            'append' (default) - Add provided instructions to found instructions
-            'replace' - Only use provided instructions, ignore found ones
+    Inherits common options from ClientOptions and adds Swarm-specific options.
+    Currently uses only common options, but can be extended with Swarm-specific ones.
     """
-    instructions: InstructionsMode = Field(
-        default=InstructionsMode.APPEND,
-        description="How to handle provided instructions"
-    )
+    pass
 
 
 class SwarmAgent(Agent):
