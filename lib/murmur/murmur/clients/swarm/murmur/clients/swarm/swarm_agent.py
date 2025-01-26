@@ -1,6 +1,6 @@
 import logging
 
-from murmur.utils.enums import ClientOptions
+from murmur.utils.client_options import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
 from swarm import Agent
@@ -60,4 +60,9 @@ class SwarmAgent(Agent):
         )
         logger.debug(f'Generated instructions: {final_instructions[:100]}...')  # Log truncated preview
 
-        super().__init__(name=agent_name, instructions=final_instructions, functions=tools)
+        super().__init__(
+            name=agent_name,
+            instructions=final_instructions,
+            functions=tools,
+            parallel_tool_calls=options.parallel_tool_execution,
+        )
