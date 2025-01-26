@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 
-from .enums import InstructionsMode
+from .enums import InstructionsMode, ToolChoiceMode
 
 
 class ClientOptions(BaseModel):
@@ -16,6 +16,11 @@ class ClientOptions(BaseModel):
         parallel_tool_execution: Whether to allow multiple tool calls to execute in parallel.
             True (default) - Allow parallel tool execution
             False - Execute tools sequentially
+        tool_choice: Controls tool calling behavior of the model.
+            'none' - Model will not call any tools, only generates messages
+            'auto' (default) - Model can choose between generating messages or calling tools
+            'required' - Model must call one or more tools
+            dict - Force model to call a specific tool by name
     """
 
     instructions: InstructionsMode = Field(
@@ -23,4 +28,8 @@ class ClientOptions(BaseModel):
     )
     parallel_tool_execution: bool = Field(
         default=True, description='Whether to allow multiple tool calls to execute in parallel'
+    )
+    tool_choice: ToolChoiceMode | dict = Field(
+        default=ToolChoiceMode.AUTO,
+        description='Controls whether and how the model uses tools'
     )
