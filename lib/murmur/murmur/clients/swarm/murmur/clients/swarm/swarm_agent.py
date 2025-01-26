@@ -56,9 +56,7 @@ class SwarmAgent(Agent):
 
         instructions_handler = InstructionsHandler()
         final_instructions = instructions_handler.get_instructions(
-            module=module, 
-            provided_instructions=instructions, 
-            instructions_mode=options.instructions
+            module=module, provided_instructions=instructions, instructions_mode=options.instructions
         )
         logger.debug(f'Generated instructions: {final_instructions[:100]}...')  # Log truncated preview
 
@@ -67,5 +65,5 @@ class SwarmAgent(Agent):
             instructions=final_instructions,
             functions=tools,
             parallel_tool_calls=options.parallel_tool_execution,
-            tool_choice=options.tool_choice
+            tool_choice=options.tool_choice,
         )

@@ -70,9 +70,7 @@ class LangGraphAgent:
             raise ValueError('Messages list cannot be empty')
 
         bound_model = self.model.bind_tools(
-            self.tools, 
-            parallel_tool_calls=self.options.parallel_tool_execution,
-            tool_choice=self.options.tool_choice
+            self.tools, parallel_tool_calls=self.options.parallel_tool_execution, tool_choice=self.options.tool_choice
         )
 
         logger.debug(f'Invoking model with {len(messages)} messages')

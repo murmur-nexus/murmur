@@ -17,7 +17,7 @@ class InstructionsMode(str, Enum):
 
 class ToolChoiceMode(str, Enum):
     """Enum for tool choice modes that control model tool calling behavior.
-    
+
     Attributes:
         NONE: Model will not call any tools, only generates messages
         AUTO: Model can choose between generating messages or calling tools
@@ -25,5 +25,5 @@ class ToolChoiceMode(str, Enum):
     """
 
     NONE = 'none'
-    AUTO = 'auto' 
+    AUTO = 'auto'
     REQUIRED = 'required'

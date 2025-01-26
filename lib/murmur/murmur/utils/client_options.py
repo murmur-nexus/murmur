@@ -30,6 +30,5 @@ class ClientOptions(BaseModel):
         default=True, description='Whether to allow multiple tool calls to execute in parallel'
     )
     tool_choice: ToolChoiceMode | dict = Field(
-        default=ToolChoiceMode.AUTO,
-        description='Controls whether and how the model uses tools'
+        default=ToolChoiceMode.AUTO, description='Controls whether and how the model uses tools'
     )
