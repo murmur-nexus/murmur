@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class LangGraphAgent:
     """Agent for managing language graph operations with LangChain.
-    
+
     This class provides an interface for running language models with custom instructions
     and tools in a LangGraph workflow. It handles proper message formatting, tool binding,
     and model invocation.
@@ -31,11 +31,11 @@ class LangGraphAgent:
     """
 
     def __init__(
-        self, 
-        agent: ModuleType, 
-        instructions: list[str] | None = None, 
-        tools: list = [], 
-        model: BaseChatModel | None = None
+        self,
+        agent: ModuleType,
+        instructions: list[str] | None = None,
+        tools: list = [],
+        model: BaseChatModel | None = None,
     ) -> None:
         """Initialize a new LangGraphAgent instance.
 
