@@ -65,4 +65,5 @@ class SwarmAgent(Agent):
             instructions=final_instructions,
             functions=tools,
             parallel_tool_calls=options.parallel_tool_execution,
+            tool_choice=options.tool_choice,
         )
