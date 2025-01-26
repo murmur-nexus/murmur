@@ -1,4 +1,5 @@
 import logging
+from types import ModuleType
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
@@ -23,41 +24,50 @@ class LangGraphOptions(ClientOptions):
 
 
 class LangGraphAgent:
-    """Agent for managing language graph operations.
+    """Agent for managing language graph operations with LangChain.
 
-    Handles model invocation with instructions and tools, ensuring proper message handling
-    and tool binding.
+    This class provides an interface for running language models with custom instructions
+    and tools in a LangGraph workflow. It handles proper message formatting, tool binding,
+    and model invocation.
+
+    Attributes:
+        name (str): Name of the agent derived from the agent module
+        instructions (str): Processed instructions for guiding model behavior
+        model (BaseChatModel): LangChain chat model for generating responses
+        tools (list): List of tool functions available to the model
+
+    Raises:
+        TypeError: If provided model is not a BaseChatModel instance
+        ValueError: If messages list is empty during invocation
     """
 
     def __init__(
         self,
-        module: type,
+        agent: ModuleType,
         instructions: list[str] | None = None,
         tools: list = [],
         model: BaseChatModel | None = None,
         options: LangGraphOptions | None = None,
-    ):
-        """Initialize the LangGraphAgent.
+    ) -> None:
+        """Initialize a new LangGraphAgent instance.
 
         Args:
-            module: The module containing instructions.
-            instructions: Optional list of instruction strings.
-            tools: List of tools to bind to the model.
-            model: The language model to use.
-            options: Configuration options for the agent.
+            agent: Agent module containing base configuration
+            instructions: Optional list of custom instructions to override defaults
+            tools: List of tool functions to make available to the model
+            model: LangChain chat model instance for generating responses
 
         Raises:
-            TypeError: If model is not an instance of BaseChatModel.
+            TypeError: If model is not an instance of BaseChatModel
         """
         if not isinstance(model, BaseChatModel):
             raise TypeError('model must be an instance of BaseChatModel')
 
-        self.name = module.__name__
+        self.name = agent.__name__
         self.options = options or LangGraphOptions()
-
         instructions_handler = InstructionsHandler()
         self.instructions = instructions_handler.get_instructions(
-            module=module, provided_instructions=instructions, instructions_mode=self.options.instructions
+            module=agent, provided_instructions=instructions, instructions_mode=self.options.instructions
         )
         logger.debug(f'Generated instructions: {self.instructions[:100]}...')  # Log truncated preview
 
@@ -65,7 +75,20 @@ class LangGraphAgent:
         self.tools = tools
 
     def invoke(self, messages: list[BaseMessage]) -> BaseMessage:
-        """Invoke the model with the provided messages."""
+        """Process messages through the model with tools and instructions.
+
+        Takes a list of messages, prepends system instructions, binds available tools
+        to the model, and returns the model's response.
+
+        Args:
+            messages: List of messages to process through the model
+
+        Returns:
+            BaseMessage: Model's response message
+
+        Raises:
+            ValueError: If messages list is empty
+        """
         if not messages:
             raise ValueError('Messages list cannot be empty')
 

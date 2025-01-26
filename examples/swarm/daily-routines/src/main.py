@@ -1,10 +1,11 @@
-from swarm import Swarm
 from datetime import datetime
-import pytz
 
-from murmur.clients.swarm import SwarmAgent
-from murmur.agents import daily_routine, science_paper_explainer, friendly_assistant
+import pytz
+from swarm import Swarm
 from utils import run_demo_loop
+
+from murmur.agents import daily_routine, friendly_assistant, science_paper_explainer
+from murmur.clients.swarm import SwarmAgent
 
 ############################################################
 # Instantiate Swarm 🐝
@@ -16,7 +17,7 @@ client = Swarm()
 # Tools
 ############################################################
 
-from murmur.tools import get_open_meteo_weather, get_bitcoin_exchange_rate, get_arxiv_paper    
+from murmur.tools import get_arxiv_paper, get_bitcoin_exchange_rate, get_open_meteo_weather
 
 ############################################################
 # Context Variables
@@ -53,11 +54,7 @@ orchestration_context = """
         3.3. Get the science paper
 """
 
-context_variables = {
-    'system_prompt': system_prompt,
-    'user_context': user_context,
-    'routines': orchestration_context
-}
+context_variables = {'system_prompt': system_prompt, 'user_context': user_context, 'routines': orchestration_context}
 
 instructions = list(context_variables.values())
 
@@ -65,38 +62,33 @@ instructions = list(context_variables.values())
 # Agents
 ############################################################
 
-friendly_assistant_agent = SwarmAgent(
-    friendly_assistant,
-    instructions=instructions
-)
+friendly_assistant_agent = SwarmAgent(friendly_assistant, instructions=instructions)
 
 daily_routine_agent = SwarmAgent(
-    daily_routine,
-    instructions=instructions,
-    tools=[get_open_meteo_weather, get_bitcoin_exchange_rate]
+    daily_routine, instructions=instructions, tools=[get_open_meteo_weather, get_bitcoin_exchange_rate]
 )
 
-science_paper_explainer_agent = SwarmAgent(
-    science_paper_explainer,
-    instructions=instructions,
-    tools=[get_arxiv_paper]
-)
+science_paper_explainer_agent = SwarmAgent(science_paper_explainer, instructions=instructions, tools=[get_arxiv_paper])
 
 ############################################################
 # Hand-off
 ############################################################
 
+
 def transfer_to_daily_routine_agent():
     """Transfer daily routine requesting users."""
     return daily_routine_agent
+
 
 def transfer_to_science_paper_explainer_agent():
     """Transfer science paper explainer requests."""
     return science_paper_explainer_agent
 
+
 def transfer_to_friendly_assistant_agent():
     """Transfer science paper explainer requests."""
     return friendly_assistant_agent
+
 
 friendly_assistant_agent.functions = [transfer_to_daily_routine_agent, transfer_to_science_paper_explainer_agent]
 
@@ -108,5 +100,5 @@ science_paper_explainer_agent.functions.append(transfer_to_friendly_assistant_ag
 # Loop
 ############################################################
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_demo_loop(client, friendly_assistant_agent, context_variables=context_variables, debug=True)
