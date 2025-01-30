@@ -1,8 +1,8 @@
 from collections.abc import Generator
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
-def process_and_print_streaming_response(response: Generator[Dict[str, Any], None, None]) -> Optional[Any]:
+def process_and_print_streaming_response(response: Generator[dict[str, Any], None, None]) -> Optional[Any]:
     content = ''
     last_sender = ''
 
@@ -32,9 +32,11 @@ def process_and_print_streaming_response(response: Generator[Dict[str, Any], Non
         if 'response' in chunk:
             return chunk['response']
 
+    return None
+
 
 def run_demo_loop(
-    client, starting_agent, context_variables: Optional[Dict[str, Any]] = None, debug: bool = False
+    client, starting_agent, context_variables: Optional[dict[str, Any]] = None, debug: bool = False
 ) -> None:
     print('Starting Swarm CLI 🐝')
 
