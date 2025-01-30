@@ -1,9 +1,12 @@
 import logging
 from types import ModuleType
+from typing import Any, Literal
 
+from langchain_core.globals import set_debug
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage
 from langchain_core.messages.base import BaseMessage
+from pydantic import Field, model_validator
 
 from murmur.utils.client_options import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
@@ -12,15 +15,51 @@ from murmur.utils.logging_config import configure_logging
 configure_logging()
 logger = logging.getLogger(__name__)
 
+if logger.getEffectiveLevel() <= logging.DEBUG:
+    set_debug(True)
+
 
 class LangGraphOptions(ClientOptions):
     """Configuration options specific to LangGraphAgent.
 
-    Inherits common options from ClientOptions and adds LangGraph-specific options.
-    Currently uses only common options, but can be extended with LangGraph-specific ones.
+    Inherits common options from ClientOptions and extends them with LangGraph-specific settings.
+    Adapts to match LangGraph's option types based on their supported language model configurations.
+
+    Attributes:
+        instructions (InstructionsMode): Controls instruction handling strategy.
+            Inherited from ClientOptions.
+        parallel_tool_calls (bool | None): Whether to allow multiple tool calls to execute
+            in parallel. None is transformed to False.
+        tool_choice (dict[str, str] | Literal['any', 'auto'] | str | None): Controls how
+            the model selects and uses tools. None is allowed and passed through.
     """
 
-    pass
+    parallel_tool_calls: bool | None = Field(
+        default=None, description='Whether to allow multiple tool calls to execute in parallel'
+    )
+    tool_choice: dict[str, str] | Literal['any', 'auto'] | str | None = Field(
+        default=None, description='Controls whether and how the model uses tools'
+    )
+
+    @model_validator(mode='after')
+    def transform_none_values(self) -> 'LangGraphOptions':
+        """Transform None values to their appropriate defaults after validation."""
+        # Only transform if the field was explicitly set
+        if 'parallel_tool_calls' in self.__pydantic_fields_set__:
+            self.parallel_tool_calls = True if self.parallel_tool_calls is None else self.parallel_tool_calls
+
+        # tool_choice can remain None if set to None
+        return self
+
+    def get_bind_tools_kwargs(self) -> dict[str, Any]:
+        """Get kwargs for bind_tools with proper handling of defaults and None values.
+
+        Returns:
+            Dictionary of non-None arguments to pass to bind_tools
+        """
+        # Only include LangGraph-specific fields, excluding parent class fields
+        langgraph_fields = {'parallel_tool_calls': self.parallel_tool_calls, 'tool_choice': self.tool_choice}
+        return {k: v for k, v in langgraph_fields.items() if v is not None}
 
 
 class LangGraphAgent:
@@ -56,6 +95,7 @@ class LangGraphAgent:
             instructions: Optional list of custom instructions to override defaults
             tools: List of tool functions to make available to the model
             model: LangChain chat model instance for generating responses
+            options: Configuration options for customizing agent behavior and tool usage
 
         Raises:
             TypeError: If model is not an instance of BaseChatModel
@@ -92,9 +132,7 @@ class LangGraphAgent:
         if not messages:
             raise ValueError('Messages list cannot be empty')
 
-        bound_model = self.model.bind_tools(
-            self.tools, parallel_tool_calls=self.options.parallel_tool_execution, tool_choice=self.options.tool_choice
-        )
+        bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
 
         logger.debug(f'Invoking model with {len(messages)} messages')
         logger.debug(f'Instructions: {self.instructions}')

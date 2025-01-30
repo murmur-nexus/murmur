@@ -13,17 +13,3 @@ class InstructionsMode(str, Enum):
 
     APPEND = 'append'
     REPLACE = 'replace'
-
-
-class ToolChoiceMode(str, Enum):
-    """Enum for tool choice modes that control model tool calling behavior.
-
-    Attributes:
-        NONE: Model will not call any tools, only generates messages
-        AUTO: Model can choose between generating messages or calling tools
-        REQUIRED: Model must call one or more tools
-    """
-
-    NONE = 'none'
-    AUTO = 'auto'
-    REQUIRED = 'required'

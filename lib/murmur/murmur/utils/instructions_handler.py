@@ -7,6 +7,7 @@ from ruamel.yaml import YAML
 from .enums import InstructionsMode
 from .logging_config import configure_logging
 
+# Configure logging
 configure_logging()
 logger = logging.getLogger(__name__)
 
@@ -31,35 +32,38 @@ class InstructionsHandler:
     def get_instructions(
         self,
         module: type,
-        provided_instructions: list[str] | None,
+        provided_instructions: str | list[str] | None,
         instructions_mode: InstructionsMode = InstructionsMode.APPEND,
     ) -> str:
         """Get instructions based on the specified mode and available sources.
 
         Args:
             module: The module to get instructions for
-            provided_instructions: List of instructions provided directly
+            provided_instructions: Instructions provided directly, either as a string or list of strings
             instructions_mode: How to handle provided instructions relative to found ones
 
         Returns:
             str: The final combined instructions string
         """
+        if isinstance(provided_instructions, str):
+            provided_instructions = [provided_instructions]
+
         if instructions_mode == InstructionsMode.REPLACE and provided_instructions:
-            logger.debug('Using provided instructions only (replace mode)')
+            logger.debug('Step 1: replacing instructions with provided instructions')
             return ' '.join(provided_instructions)
 
         # Get base instructions from sources
         base_instructions = (
             self._try_root_manifest() or self._try_module_manifest(module) or self._try_module_attributes(module) or ''
-        )
+        ).strip()
 
-        # If we have provided instructions and in append mode (or no base instructions),
-        # combine them
+        # If we have provided instructions and in append mode (or no base instructions)
         if provided_instructions:
+            provided_str = ' '.join(provided_instructions).strip()
             if base_instructions:
                 logger.debug('Appending provided instructions to base instructions')
-                return f"{base_instructions} {' '.join(provided_instructions)}"
-            return ' '.join(provided_instructions)
+                return f'{base_instructions} {provided_str}'
+            return provided_str
 
         return base_instructions
 
