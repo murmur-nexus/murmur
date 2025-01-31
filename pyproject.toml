@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "murmur-nexus"
-version = "0.0.1"
+version = "0.0.2"
 description = "Murmur's monorepo to package, publish and manage AI agents and tools."
 requires-python = ">=3.9"
 authors = [{ name = "E.W. de Graaff", email = "hi@murmur.nexus" }]
