@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -36,23 +37,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install mkdocs-material
 
-      - name: Disable Jekyll
-        run: |
-          mkdir -p ../site
-          echo "" > ../site/.nojekyll
+      - name: Clean previous build
+        working-directory: ${{ inputs.docs-directory }}
+        run: rm -rf ./site || true
 
       - name: Build site
         working-directory: ${{ inputs.docs-directory }}
-        run: mkdocs build -f mkdocs.yml
+        run: |
+          mkdocs build -f mkdocs.yml
+          mkdir -p ./site/docs
+          touch ./site/docs/.nojekyll
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v4
+      - name: Verify .nojekyll file
+        working-directory: ${{ inputs.docs-directory }}
+        run: test -f ./site/docs/.nojekyll || { echo "Docs .nojekyll file missing!"; exit 1; }
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./site
-          name: github-pages
+          name: github-pages-${{ github.run_id }}
 
       - name: Deploy to GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_id }}

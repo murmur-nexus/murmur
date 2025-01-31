@@ -4,10 +4,11 @@ on:
   push:
     branches:
       - main
-      - docs
+      - gh-pages
   pull_request:
     branches:
       - main
+      - gh-pages
   workflow_dispatch:
 
 permissions:
@@ -18,6 +19,7 @@ permissions:
 jobs:
   # Linting and Type Checking Job
   run-lint:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.base_ref == 'main'
     uses: ./.github/workflows/run_lint.yml
     with:
       python-version: '3.12'
@@ -25,8 +27,7 @@ jobs:
 
   # Publish Documentation Job
   publish-docs:
-    needs: run-lint
-    if: github.event_name == 'push' && github.ref == 'refs/heads/gh-pages'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/gh-pages' || github.event_name == 'pull_request' && github.base_ref == 'gh-pages'
     uses: ./.github/workflows/publish_docs.yml
     with:
       python-version: '3.12'
