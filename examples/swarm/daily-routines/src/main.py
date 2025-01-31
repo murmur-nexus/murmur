@@ -28,8 +28,19 @@ system_prompt = f"""
     - Only greet the user once.
     - Help users with their routines, if any. 
     - Routines are time specific. 
-    - Important: Do not say goodbye.
     - Current time is {datetime.now(pytz.timezone('America/Los_Angeles'))}
+    - Routines to choose from:
+        1. Morning Routine
+            1.1. Get the weather
+            1.2. Get the Bitcoin exchange rate
+            1.3. Get the science paper
+        2. Afternoon Routine
+            2.1. Get the weather
+            2.3. Get the science paper
+        3. Evening Routine
+            3.2. Get the Bitcoin exchange rate
+            3.3. Get the science paper
+    - Important: Do not say goodbye.
 """
 
 user_context = """
@@ -42,23 +53,9 @@ user_context = """
     - SCIENCE_TOPIC: genai
 """
 
-orchestration_context = """
-    1. Morning Routine
-        1.1. Get the weather
-        1.2. Get the Bitcoin exchange rate
-        1.3. Get the science paper
-    2. Afternoon Routine
-        2.1. Get the weather
-        2.3. Get the science paper
-    3. Evening Routine
-        3.2. Get the Bitcoin exchange rate
-        3.3. Get the science paper
-"""
-
 context_variables: dict[str, str] = {
     'system_prompt': system_prompt,
-    'user_context': user_context,
-    'routines': orchestration_context,
+    'user_context': user_context
 }
 
 instructions: list[str] = list(context_variables.values())

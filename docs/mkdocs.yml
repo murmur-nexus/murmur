@@ -26,6 +26,7 @@ nav:
   - index.md
   - "Tutorial":
     - Getting Started with the Examples: tutorial/getting-started-with-examples.md
+    - 'Swarm Example: Daily routines': tutorial/swarm-example-daily-routines.md
   - "How-to Guides":
     - Installation:
       - Setup PyPI server: how-to/setup-pypi-server.md
