@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "murmur-nexus"
-version = "0.0.1"
+version = "0.0.2"
 description = "Murmur's monorepo to package, publish and manage AI agents and tools."
 requires-python = ">=3.9"
 authors = [{ name = "E.W. de Graaff", email = "hi@murmur.nexus" }]
@@ -66,7 +66,7 @@ only-include = ["/README.md"]
 line-length = 120
 target-version = "py39"
 exclude = [
-    "murmur/examples/*",
+    "examples/",
 ]
 
 [tool.ruff.lint]
@@ -103,6 +103,7 @@ inline-quotes = "single"
 [tool.mypy]
 mypy_path = ["lib"]
 namespace_packages = true
+exclude = ["examples/"]
 
 # TODO: Remove once solidifying file structure
 ignore_missing_imports = true
