@@ -29,13 +29,13 @@ classifiers = [
 readme = "README.md"
 
 dependencies = [
-    "murmur-slim==0.0.1",
+    "murmur-slim==0.0.2",
     "ruamel.yaml==0.18.6",
 ]
 
 [project.optional-dependencies]
-langgraph = ["murmur-langgraph==0.0.1"]
-swarm = ["murmur-swarm==0.0.1"]
+langgraph = ["murmur-langgraph==0.0.2"]
+swarm = ["murmur-swarm==0.0.2"]
 
 [project.urls]
 Repository = "https://github.com/murmur-nexus/murmur"

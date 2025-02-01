@@ -8,7 +8,7 @@ version = "0.0.2"
 description = "LangGraph client for murmur"
 requires-python = ">=3.9"
 dependencies = [
-    "murmur-slim==0.0.1",
+    "murmur-slim==0.0.2",
     "langchain-core>=0.3.28",
 ]
 authors = [{ name = "E.W. de Graaff", email = "hi@murmur.nexus" }]
