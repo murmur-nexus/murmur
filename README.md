@@ -22,7 +22,7 @@ pip install murmur-nexus
 ```
 Add optional extras to install specific orchestration clients, e.g.
 ```
-pip install murmur-nexus[langgraph]
+pip install 'murmur-nexus[langgraph]'
 ```
 *Options: `langgraph`, `swarm`*. 
 
