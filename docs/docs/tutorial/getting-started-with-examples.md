@@ -20,7 +20,7 @@ source venv/bin/activate
 2. Install `murmur-nexus` and `mur`, both are essential for running the examples. 
 
 ```bash
-pip install murmur-nexus[langgraph,swarm] mur
+pip install 'murmur-nexus[langgraph,swarm]' mur
 ```
 
 !!! note ""
@@ -34,19 +34,19 @@ Verify the installation by running `mur --help`.
 
 !!! bug "Issues?"
 
-    If during the installation process you experience any issues, please join our [:simple-discord: Discord](https://discord.gg/ZFvE8jr9) and ask for help.
+    If during the installation process you experience any issues, please join our [:simple-discord: Discord](https://discord.gg/RGKCfD8HhC) and ask for help.
 
 ## Publish an Agent
-1. Clone the [:simple-github: native-artifacts](https://github.com/murmur-nexus/native-artifacts) repo into your workspace directory.
+1. Clone the [:simple-github: murmur-example-artifacts](https://github.com/murmur-nexus/murmur-example-artifacts/tree/main) repo into your workspace directory.
 
 ```bash
-git clone https://github.com/murmur-nexus/native-artifacts.git
+git clone https://github.com/murmur-nexus/murmur-example-artifacts.git
 ```
 
 2. Build the `friendly-assistant` agent. Optionally edit the `murmur-build.yaml` file first.
 
 ```bash
-cd native-artifacts/agents/friendly-assistant
+cd murmur-example-artifacts/agents/friendly-assistant
 mur build
 ```
 
@@ -56,10 +56,9 @@ You should see something like this:
 Built for agent completed.
 ///
 
-3.	Then in inside the created package directory run:
+3.	Then simply run:
 
 ```bash
-cd friendly_assistant
 mur publish
 ```
 
@@ -76,17 +75,16 @@ mur publish
 4.	You’ve published your first agent 🎉.
 
 ## Publish Tools
-1. Build the `add` tool. Optionally edit the `murmur-build.yaml` file first. In the root project directory where `native-artifacts` resides (`cd ../../../../`) do:
+1. Build the `add` tool. Optionally edit the `murmur-build.yaml` file first. In the root project directory where `murmur-example-artifacts` resides (`cd ../../`) do:
 
 ```bash
-cd native-artifacts/tools/add
+cd tools/add
 mur build
 ```
 
-2.	Then in inside the created package directory run:
+2.	Then run:
 
 ```bash
-cd add
 mur publish
 ```
 
@@ -96,7 +94,7 @@ mur publish
 
 
 ## Install Agents and Tools
-1. Clone the [:simple-github: murmur](https://github.com/murmur-nexus/murmur) repo into your project directory (`/murmur-artifacts`).
+1. Go to your `/murmur-artifacts` directory (`cd ../../`) and clone the [:simple-github: murmur](https://github.com/murmur-nexus/murmur).
 
 ```bash
 git clone https://github.com/murmur-nexus/murmur.git
@@ -142,7 +140,7 @@ pip install -r ../requirements.txt
 5. Create `OPENAI_API_KEY` environment variable. Get [OpenAI API key](https://platform.openai.com/api-keys).
 
 ```bash
-export OPENAI_API_KEY=sk-proj-jTOzfoS...
+export OPENAI_API_KEY=sk-proj-aBCdeFg...
 ```
 
 6.	Install all the agents and tools from `murmur.yaml`:
@@ -162,5 +160,5 @@ You just orchestrated your first agent and tools with Murmur! 🎉
 
 ## Wrap Up
 - You can now run the examples and build your own agents and tools.
-- Star the [:simple-github: murmur](https://github.com/murmur-nexus/murmur) repo 🌟 and join our [:simple-discord: Discord](https://discord.gg/U9x96DCJ) to continue learning.
+- Star the [:simple-github: murmur](https://github.com/murmur-nexus/murmur) repo 🌟 and join our [:simple-discord: Discord](https://discord.gg/RGKCfD8HhC) to continue learning.
 - Submit any [feature requests or bugs](https://github.com/murmur-nexus/murmur/issues); we’d love your feedback.

@@ -1,5 +1,5 @@
 # Swarm Example: Daily routines
-In this example, we will create a swarm of agents that will help you with your daily routines.
+By the end of this tutorial, you will have built a swarm of agents that help you with your daily routines. You'll be ready to create more advanced morning routine orchestration. ☕️
 
 ## Why use OpenAI Swarm? 🐝
 
@@ -23,7 +23,7 @@ OpenAI's Swarm is a educational orchestration framework that allows you to run a
 Graph of agents and tools.
 ///
 
-### Get an update on the latest news while having a ☕️
+### Get an update on the latest news
 
 - Gives today's bitcoin rate for given a currency
 - Gives today's weather for given a location
@@ -160,5 +160,7 @@ Can you add more interesting tools for your morning routine? ☕️ 🥐
 ## Next steps
 
 - [Source code of this example](https://github.com/murmur-nexus/murmur/tree/main/examples/swarm/daily-routines)
+- [Pull agents & tools from this example](https://github.com/murmur-nexus/murmur-example-artifacts/tree/main)
 - [Build your own agents and tools](./getting-started-with-examples.md)
 - [Host your own agents and tools](../how-to/setup-pypi-server.md)
+- Star the [:simple-github: murmur](https://github.com/murmur-nexus/murmur) repo 🌟 and join our [:simple-discord: Discord](https://discord.gg/RGKCfD8HhC) to continue learning.
