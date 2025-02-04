@@ -99,7 +99,6 @@ class LangGraphAgent:
         # Agent-specific setup
         self.is_activate_agent = hasattr(agent, 'invoke') and isinstance(agent, ActivateAgent)
         if not self.is_activate_agent:
-            self.name = agent.name
             instructions_handler = InstructionsHandler()
             self.instructions = instructions_handler.get_instructions(
                 module=agent,
@@ -117,28 +116,25 @@ class LangGraphAgent:
             
         Returns:
             list[BaseMessage]: List of messages including agent's response for LangGraph
+            
+        Raises:
+            ValueError: If messages list is empty or agent execution fails
         """
         if not messages:
             raise ValueError('Messages list cannot be empty')
 
+        bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
+        
+        # Get system message content based on agent type
         if self.is_activate_agent:
-            # Get AgentResponse from ActivateAgent
             agent_response = self.agent_module.invoke(messages, **kwargs)
-            
-            # Transform AgentResponse to BaseMessage for LangGraph
             if not agent_response.success:
                 raise ValueError(f"Agent execution failed: {agent_response.error}")
-            
-            # Create message list with instructions and invoke model
-            bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
-            all_messages = [SystemMessage(content=str(agent_response.value))] + messages
-            return bound_model.invoke(all_messages)
+            system_content = str(agent_response.value)
+        else:
+            system_content = self.instructions
         
-        # Traditional LangGraph workflow
-        bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
-
         logger.debug(f'Invoking model with {len(messages)} messages')
-        logger.debug(f'Instructions: {self.instructions}')
+        logger.debug(f'Instructions: {system_content}')
 
-        all_messages = [SystemMessage(content=self.instructions)] + messages
-        return bound_model.invoke(all_messages)
+        return bound_model.invoke([SystemMessage(content=system_content)] + messages)

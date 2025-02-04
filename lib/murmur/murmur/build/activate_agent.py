@@ -1,5 +1,12 @@
+import logging
 from dataclasses import dataclass
 from typing import Any, Union
+from collections import defaultdict
+import string
+from murmur.utils.logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AgentResponse:
@@ -109,21 +116,41 @@ class ActivateAgent:
         if isinstance(messages, str):
             messages = [messages]
 
-        # FIX Currently errors when msg is a HumanMessage or some sort of object other than string.  
-        # if not messages or not any(msg.strip() for msg in messages):
-        #     raise ValueError("Messages cannot be empty")
+        if not messages:
+            raise ValueError("Messages cannot be empty")
             
         try:
             # Format instructions with provided variables if instructions exist
             parsed_instructions = []
             if self._instructions:
+                # Returns empty string for missing keys
+                format_kwargs = defaultdict(str, kwargs)
+                
                 for instruction in self._instructions:
                     try:
-                        parsed_instruction = instruction.format(**kwargs)
+                        parsed_instruction = string.Formatter().vformat(
+                            instruction, 
+                            args=(), 
+                            kwargs=format_kwargs
+                        )
                         parsed_instructions.append(parsed_instruction)
-                    except KeyError as e:
-                        # Log missing variable but continue with original instruction
-                        parsed_instructions.append(instruction)
+                    except ValueError as e:
+                        # Extract template keys
+                        keys = [fname for _, fname, _, _ in string.Formatter().parse(instruction) if fname]
+                        
+                        # Convert values to strings, use empty string for None
+                        safe_kwargs = {
+                            k: str(format_kwargs[k]) if format_kwargs[k] is not None else ''
+                            for k in keys
+                        }
+                        
+                        # Replace template vars manually
+                        parsed_instruction = instruction
+                        for key, value in safe_kwargs.items():
+                            parsed_instruction = parsed_instruction.replace(f"{{{key}}}", value)
+                                
+                        logger.debug(f"Invalid format string in instruction: {instruction}. Error: {e}")
+                        parsed_instructions.append(parsed_instruction)
             
             result = "\n".join(parsed_instructions).strip() if parsed_instructions else "No further instructions."
             return AgentResponse(
