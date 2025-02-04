@@ -1,7 +1,6 @@
 from murmur.build import ActivateAgent
 
 
-# Agents are often called with a list of chat messages
 def my_instructions_function() -> list[str]:
     prompt = """
         Remember {var1} and also {var2} in your response.

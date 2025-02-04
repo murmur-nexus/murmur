@@ -1,6 +1,6 @@
 import logging
 from types import ModuleType
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
 from langchain_core.globals import set_debug
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -11,6 +11,7 @@ from pydantic import Field, model_validator
 from murmur.utils.client_options import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
+from murmur.build import ActivateAgent
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -63,75 +64,77 @@ class LangGraphOptions(ClientOptions):
 
 
 class LangGraphAgent:
-    """Agent for managing language graph operations with LangChain.
-
-    This class provides an interface for running language models with custom instructions
-    and tools in a LangGraph workflow. It handles proper message formatting, tool binding,
-    and model invocation.
-
-    Attributes:
-        name (str): Name of the agent derived from the agent module
-        instructions (str): Processed instructions for guiding model behavior
-        model (BaseChatModel): LangChain chat model for generating responses
-        tools (list): List of tool functions available to the model
-
-    Raises:
-        TypeError: If provided model is not a BaseChatModel instance
-        ValueError: If messages list is empty during invocation
+    """Agent for managing language graph operations.
+    
+    Supports both ActivateAgent-based modules and traditional agent modules.
+    If the input agent is an ActivateAgent, it will use its invoke functionality.
     """
-
+    
     def __init__(
         self,
         agent: ModuleType,
-        instructions: list[str] | None = None,
+        model: BaseChatModel,
         tools: list = [],
-        model: BaseChatModel | None = None,
+        instructions: list[str] | None = None,
         options: LangGraphOptions | None = None,
     ) -> None:
-        """Initialize a new LangGraphAgent instance.
-
+        """Initialize LangGraphAgent.
+        
         Args:
-            agent: Agent module containing base configuration
-            instructions: Optional list of custom instructions to override defaults
-            tools: List of tool functions to make available to the model
-            model: LangChain chat model instance for generating responses
-            options: Configuration options for customizing agent behavior and tool usage
-
-        Raises:
-            TypeError: If model is not an instance of BaseChatModel
+            agent: Agent module (can be an ActivateAgent-based module)
+            model: LangChain chat model
+            tools: List of tool functions
+            instructions: Optional custom instructions
+            options: Configuration options
         """
         if not isinstance(model, BaseChatModel):
             raise TypeError('model must be an instance of BaseChatModel')
 
-        self.name = agent.__name__
-        self.options = options or LangGraphOptions()
-        instructions_handler = InstructionsHandler()
-        self.instructions = instructions_handler.get_instructions(
-            module=agent, provided_instructions=instructions, instructions_mode=self.options.instructions
-        )
-        logger.debug(f'Generated instructions: {self.instructions[:100]}...')  # Log truncated preview
-
+        # Common setup for all agent types
+        self.agent_module = agent
         self.model = model
         self.tools = tools
+        self.options = options or LangGraphOptions()
+        
+        # Agent-specific setup
+        self.is_activate_agent = hasattr(agent, 'invoke') and isinstance(agent, ActivateAgent)
+        if not self.is_activate_agent:
+            self.name = agent.name
+            instructions_handler = InstructionsHandler()
+            self.instructions = instructions_handler.get_instructions(
+                module=agent,
+                provided_instructions=instructions,
+                instructions_mode=self.options.instructions
+            )
+            logger.debug(f'Generated instructions: {self.instructions[:100]}...')
 
-    def invoke(self, messages: list[BaseMessage]) -> BaseMessage:
-        """Process messages through the model with tools and instructions.
-
-        Takes a list of messages, prepends system instructions, binds available tools
-        to the model, and returns the model's response.
-
+    def invoke(self, messages: list[BaseMessage], **kwargs: Any) -> list[BaseMessage]:
+        """Process messages using either ActivateAgent or LangGraph workflow.
+        
         Args:
-            messages: List of messages to process through the model
-
+            messages: List of messages to process
+            **kwargs: Additional arguments (used for template variables in ActivateAgent)
+            
         Returns:
-            BaseMessage: Model's response message
-
-        Raises:
-            ValueError: If messages list is empty
+            list[BaseMessage]: List of messages including agent's response for LangGraph
         """
         if not messages:
             raise ValueError('Messages list cannot be empty')
 
+        if self.is_activate_agent:
+            # Get AgentResponse from ActivateAgent
+            agent_response = self.agent_module.invoke(messages, **kwargs)
+            
+            # Transform AgentResponse to BaseMessage for LangGraph
+            if not agent_response.success:
+                raise ValueError(f"Agent execution failed: {agent_response.error}")
+            
+            # Create message list with instructions and invoke model
+            bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
+            all_messages = [SystemMessage(content=str(agent_response.value))] + messages
+            return bound_model.invoke(all_messages)
+        
+        # Traditional LangGraph workflow
         bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
 
         logger.debug(f'Invoking model with {len(messages)} messages')

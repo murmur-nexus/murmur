@@ -108,9 +108,10 @@ class ActivateAgent:
         """
         if isinstance(messages, str):
             messages = [messages]
-            
-        if not messages or not any(msg.strip() for msg in messages):
-            raise ValueError("Messages cannot be empty")
+
+        # FIX Currently errors when msg is a HumanMessage or some sort of object other than string.  
+        # if not messages or not any(msg.strip() for msg in messages):
+        #     raise ValueError("Messages cannot be empty")
             
         try:
             # Format instructions with provided variables if instructions exist
@@ -124,7 +125,7 @@ class ActivateAgent:
                         # Log missing variable but continue with original instruction
                         parsed_instructions.append(instruction)
             
-            result = f"Processed with instructions: {parsed_instructions}" if parsed_instructions else "No instructions provided"
+            result = "\n".join(parsed_instructions).strip() if parsed_instructions else "No further instructions."
             return AgentResponse(
                 value=result,
                 success=True,
