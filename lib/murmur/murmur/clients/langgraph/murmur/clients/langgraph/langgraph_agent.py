@@ -1,6 +1,6 @@
 import logging
 from types import ModuleType
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 from langchain_core.globals import set_debug
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -8,10 +8,10 @@ from langchain_core.messages import SystemMessage
 from langchain_core.messages.base import BaseMessage
 from pydantic import Field, model_validator
 
+from murmur.build import ActivateAgent
 from murmur.utils.client_options import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
-from murmur.build import ActivateAgent
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -65,11 +65,11 @@ class LangGraphOptions(ClientOptions):
 
 class LangGraphAgent:
     """Agent for managing language graph operations.
-    
+
     Supports both ActivateAgent-based modules and traditional agent modules.
     If the input agent is an ActivateAgent, it will use its invoke functionality.
     """
-    
+
     def __init__(
         self,
         agent: ModuleType,
@@ -79,7 +79,7 @@ class LangGraphAgent:
         options: LangGraphOptions | None = None,
     ) -> None:
         """Initialize LangGraphAgent.
-        
+
         Args:
             agent: Agent module (can be an ActivateAgent-based module)
             model: LangChain chat model
@@ -96,20 +96,20 @@ class LangGraphAgent:
         self.tools = tools
         self.options = options or LangGraphOptions()
         self.instructions = instructions
-        
+
         # Agent-specific setup
         self.is_activate_agent = hasattr(agent, 'invoke') and isinstance(agent, ActivateAgent)
 
-    def invoke(self, messages: list[BaseMessage], **kwargs: Any) -> list[BaseMessage]:
+    def invoke(self, messages: list[BaseMessage], **kwargs: Any) -> BaseMessage:
         """Process messages using either ActivateAgent or LangGraph workflow.
-        
+
         Args:
             messages: List of messages to process
             **kwargs: Additional arguments (used for template variables in ActivateAgent and instructions)
-            
+
         Returns:
             list[BaseMessage]: List of messages including agent's response for LangGraph
-            
+
         Raises:
             ValueError: If messages list is empty or agent execution fails
         """
@@ -119,12 +119,12 @@ class LangGraphAgent:
         logger.debug(f'kwargs: {kwargs}')
 
         bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
-        
+
         # Get system message content based on agent type
         if self.is_activate_agent:
             agent_response = self.agent_module.invoke(messages, **kwargs)
             if not agent_response.success:
-                raise ValueError(f"Agent execution failed: {agent_response.error}")
+                raise ValueError(f'Agent execution failed: {agent_response.error}')
             system_content = str(agent_response.value)
         else:
             instructions_handler = InstructionsHandler()
@@ -132,11 +132,12 @@ class LangGraphAgent:
                 module=self.agent_module,
                 provided_instructions=self.instructions,
                 instructions_mode=self.options.instructions,
-                **kwargs
+                **kwargs,
             )
             logger.debug(f'Generated instructions: {system_content[:100]}...')
-        
+
         logger.debug(f'Invoking model with {len(messages)} messages')
         logger.debug(f'Instructions: {system_content}')
 
-        return bound_model.invoke([SystemMessage(content=system_content)] + messages)
+        all_messages = [SystemMessage(content=system_content)] + messages
+        return bound_model.invoke(all_messages)

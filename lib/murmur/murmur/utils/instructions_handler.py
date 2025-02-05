@@ -5,6 +5,7 @@ from types import ModuleType
 from typing import Any
 
 from ruamel.yaml import YAML
+
 from .enums import InstructionsMode
 from .logging_config import configure_logging
 
@@ -57,10 +58,10 @@ class InstructionsHandler:
 
         # Get base instructions from sources
         base_instructions = (
-            self._try_root_manifest() or 
-            self._try_module_manifest(module) or 
-            self._try_module_attributes(module, **kwargs) or 
-            ''
+            self._try_root_manifest()
+            or self._try_module_manifest(module)
+            or self._try_module_attributes(module, **kwargs)
+            or ''
         ).strip()
 
         # If we have provided instructions and in append mode (or no base instructions)
@@ -106,7 +107,7 @@ class InstructionsHandler:
 
     def _try_module_attributes(self, module, **kwargs) -> str | None:
         """Attempt to retrieve instructions from the module's attributes.
-        
+
         Supports multiple instruction sources:
         - Instance/class attributes returning list[str]
         - Instance/class methods returning list[str] (can accept kwargs)
@@ -127,19 +128,19 @@ class InstructionsHandler:
             # Handle module-level instructions
             return self._get_instructions_from_source(module, **kwargs)
         except (AttributeError, TypeError) as e:
-            logger.debug(f"Error accessing instructions: {e}")
+            logger.debug(f'Error accessing instructions: {e}')
         return None
 
     def _get_instructions_from_source(self, source: Any, **kwargs) -> str | None:
         """Extract instructions from a source, handling both attributes and callables."""
         if not hasattr(source, 'instructions'):
             return None
-            
+
         instructions = source.instructions
         # Handle callable instructions with kwargs
         if callable(instructions):
             instructions = instructions(**kwargs)
-            
+
         if isinstance(instructions, (list, tuple)):
             return ' '.join(instructions)
         return None
