@@ -95,24 +95,17 @@ class LangGraphAgent:
         self.model = model
         self.tools = tools
         self.options = options or LangGraphOptions()
+        self.instructions = instructions
         
         # Agent-specific setup
         self.is_activate_agent = hasattr(agent, 'invoke') and isinstance(agent, ActivateAgent)
-        if not self.is_activate_agent:
-            instructions_handler = InstructionsHandler()
-            self.instructions = instructions_handler.get_instructions(
-                module=agent,
-                provided_instructions=instructions,
-                instructions_mode=self.options.instructions
-            )
-            logger.debug(f'Generated instructions: {self.instructions[:100]}...')
 
     def invoke(self, messages: list[BaseMessage], **kwargs: Any) -> list[BaseMessage]:
         """Process messages using either ActivateAgent or LangGraph workflow.
         
         Args:
             messages: List of messages to process
-            **kwargs: Additional arguments (used for template variables in ActivateAgent)
+            **kwargs: Additional arguments (used for template variables in ActivateAgent and instructions)
             
         Returns:
             list[BaseMessage]: List of messages including agent's response for LangGraph
@@ -123,6 +116,8 @@ class LangGraphAgent:
         if not messages:
             raise ValueError('Messages list cannot be empty')
 
+        logger.debug(f'kwargs: {kwargs}')
+
         bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
         
         # Get system message content based on agent type
@@ -132,7 +127,14 @@ class LangGraphAgent:
                 raise ValueError(f"Agent execution failed: {agent_response.error}")
             system_content = str(agent_response.value)
         else:
-            system_content = self.instructions
+            instructions_handler = InstructionsHandler()
+            system_content = instructions_handler.get_instructions(
+                module=self.agent_module,
+                provided_instructions=self.instructions,
+                instructions_mode=self.options.instructions,
+                **kwargs
+            )
+            logger.debug(f'Generated instructions: {system_content[:100]}...')
         
         logger.debug(f'Invoking model with {len(messages)} messages')
         logger.debug(f'Instructions: {system_content}')
