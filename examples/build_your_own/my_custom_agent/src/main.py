@@ -7,7 +7,7 @@ def my_instructions_function() -> list[str]:
     """
     return prompt
 
-# Initialize the task execution agent using the generic ActivateAgent
-task_execution = ActivateAgent(
+# Initialize my_custom_agent using the ActivateAgent class
+my_custom_agent = ActivateAgent(
     instructions=my_instructions_function()
 )

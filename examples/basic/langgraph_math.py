@@ -6,20 +6,20 @@ from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from murmur.agents import friendly_assistant, dynamic_assistant
-from murmur.clients.langgraph import LangGraphAgent
+from murmur.clients.langgraph import LangGraphAgent, LangGraphOptions
 from murmur.tools import add, divide, multiply
 
-# Make sure to expose OPENAI_API_KEY in the environment
-
+# Make sure to expose OPENAI_API_KEY in your environment
 
 def main():
     model = ChatOpenAI(model='gpt-4o', temperature=0)
 
     tools = [add, multiply, divide]
-    agent = LangGraphAgent(dynamic_assistant, model=model, tools=tools)
+    options = LangGraphOptions(parallel_tool_calls=False)
+    agent = LangGraphAgent(dynamic_assistant, model=model, tools=tools, options=options)
 
     def assistant_node(state: MessagesState):
-        return {'messages': [agent.invoke(state['messages'], var1='Adam', var2='Eve')]}
+        return {'messages': [agent.invoke(state['messages'])]}
 
     workflow = StateGraph(MessagesState)
 
