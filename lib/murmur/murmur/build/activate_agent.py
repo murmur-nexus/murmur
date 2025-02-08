@@ -2,9 +2,12 @@ import logging
 import string
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Union
+import sys
 
-from murmur.utils.logging_config import configure_logging
+import yaml
+from ..utils.logging_config import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -32,6 +35,58 @@ class AgentResponse:
             self.state = {}
 
 
+def _load_manifest(agent_name: str | None = None) -> dict[str, Any]:
+    """Load the murmur-build.yaml manifest file for the importing agent.
+
+    Args:
+        agent_name: Optional explicit agent name to load manifest for
+
+    Returns:
+        Dict containing manifest data
+
+    Raises:
+        FileNotFoundError: If manifest file doesn't exist with explicit agent_name
+        yaml.YAMLError: If manifest is invalid
+        RuntimeError: If called outside an agent module without agent_name
+    """
+    murmur_path = Path(__file__).parent.parent
+
+    # If agent_name is provided, use it or fail
+    if agent_name is not None:
+        manifest_path = murmur_path / 'agents' / agent_name / 'murmur-build.yaml'
+        try:
+            with open(manifest_path, "r") as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"No murmur-build.yaml found for agent: {agent_name}")
+        except yaml.YAMLError as e:
+            logger.error(f"Invalid YAML in manifest for agent {agent_name}: {e}")
+            raise
+    
+    # Only use frame traversal if no agent_name provided
+    frame = sys._getframe(1)
+    while frame:
+        # Traverse up the frame hierarchy until we find who is creating the ActivateAgent
+        module_name = frame.f_globals['__name__']
+        if module_name.startswith('murmur.agents.'):
+            detected_agent = module_name.split('.')[2]
+            manifest_path = murmur_path / 'agents' / detected_agent / 'murmur-build.yaml'
+            
+            try:
+                with open(manifest_path, "r") as f:
+                    return yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                logger.error(f"Invalid YAML in manifest: {e}")
+                raise
+            
+        frame = frame.f_back
+    
+    raise RuntimeError(
+        "Could not detect agent module. Ensure ActivateAgent is instantiated from an agent module "
+        "or provide an explicit agent_name."
+    )
+
+
 class ActivateAgent:
     """Agent for executing tasks.
 
@@ -39,16 +94,28 @@ class ActivateAgent:
     delegate to the core execution logic. The native interface is through __call__.
     """
 
-    def __init__(self, instructions: str | list[str] | None = None) -> None:
+    def __init__(self, agent_name: str | None = None, instructions: str | list[str] | None = None) -> None:
         """Initialize the ActivateAgent agent.
 
         Args:
+            agent_name: Optional explicit name of the agent to load
             instructions: Custom instructions for the agent as string or list of strings
+
+        Raises:
+            FileNotFoundError: If manifest file cannot be found
+            yaml.YAMLError: If manifest is invalid
+            RuntimeError: If called outside an agent module
         """
-        self._name: str = 'task-execution'
-        self._type: str = 'agent'
-        self._version: str = '1.0.0'
-        self._description: str = 'A task execution agent that helps execute tasks.'
+        self._name: str | None = None
+        self._type: str | None = None
+        self._version: str | None = None
+        self._description: str | None = None
+        self._manifest: dict[str, Any] | None = None
+        
+        # Pass explicit agent_name to _load_manifest if provided
+        if instructions is None:
+            self._manifest = _load_manifest(agent_name)
+            instructions = self.manifest.get("instructions", [])
 
         # Convert string to list if needed
         self._instructions: list[str] | None
@@ -60,23 +127,38 @@ class ActivateAgent:
             self._instructions = None
 
     @property
+    def manifest(self) -> dict[str, Any]:
+        """Lazy load manifest when needed."""
+        if self._manifest is None:
+            self._manifest = _load_manifest()
+        return self._manifest
+
+    @property
     def name(self) -> str:
-        """Get the agent name."""
+        """Get agent name from manifest."""
+        if self._name is None:
+            self._name = self.manifest["name"]
         return self._name
 
     @property
     def type(self) -> str:
-        """Get the agent type."""
+        """Get agent type from manifest."""
+        if self._type is None:
+            self._type = self.manifest["type"]
         return self._type
 
     @property
     def version(self) -> str:
-        """Get the agent version."""
+        """Get agent version from manifest."""
+        if self._version is None:
+            self._version = self.manifest["version"]
         return self._version
 
     @property
     def description(self) -> str:
-        """Get the agent description."""
+        """Get agent description from manifest."""
+        if self._description is None:
+            self._description = self.manifest["description"]
         return self._description
 
     @property
@@ -171,6 +253,10 @@ class ActivateAgent:
                 state={'messages': messages, 'parsed_instructions': None, 'template_variables': kwargs},
             )
 
-
-# Create a singleton instance
-activate_agent = ActivateAgent()
+    def _load_manifest(self) -> None:
+        """Load manifest and set all properties."""
+        manifest = self.manifest
+        self._name = manifest["name"]
+        self._type = manifest["type"]
+        self._version = manifest["version"]
+        self._description = manifest["description"]
