@@ -35,7 +35,7 @@ from murmur_slim.build import ActivateAgent
 my_custom_agent = ActivateAgent()
 ```
 
-The `ActivateAgent` class is a base class that provides a simple interface for your agent. It has some [benefits build in](./apply-custom-logic-to-agents.md), such as state and metadata retrieval. If you still would like to use your own logic, you may find these [custom logic patterns](./apply-custom-logic-to-agents.md) useful.
+The `ActivateAgent` class is a base class that provides a simple interface for your agent. It has some [benefits build in](./benefits-of-using-the-activate-agent-class.md), such as state and metadata retrieval. If you still would like to use your own logic, you may find these [custom logic patterns](./apply-custom-logic-to-agents.md) useful.
 
 
 ## Buid your agent
