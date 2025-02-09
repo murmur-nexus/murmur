@@ -8,6 +8,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.messages.base import BaseMessage
 from pydantic import Field, model_validator
 
+from murmur.build import ActivateAgent
 from murmur.utils.client_options import ClientOptions
 from murmur.utils.instructions_handler import InstructionsHandler
 from murmur.utils.logging_config import configure_logging
@@ -63,79 +64,80 @@ class LangGraphOptions(ClientOptions):
 
 
 class LangGraphAgent:
-    """Agent for managing language graph operations with LangChain.
+    """Agent for managing language graph operations.
 
-    This class provides an interface for running language models with custom instructions
-    and tools in a LangGraph workflow. It handles proper message formatting, tool binding,
-    and model invocation.
-
-    Attributes:
-        name (str): Name of the agent derived from the agent module
-        instructions (str): Processed instructions for guiding model behavior
-        model (BaseChatModel): LangChain chat model for generating responses
-        tools (list): List of tool functions available to the model
-
-    Raises:
-        TypeError: If provided model is not a BaseChatModel instance
-        ValueError: If messages list is empty during invocation
+    Supports both ActivateAgent-based modules and traditional agent modules.
+    If the input agent is an ActivateAgent, it will use its invoke functionality.
     """
 
     def __init__(
         self,
         agent: ModuleType,
-        instructions: list[str] | None = None,
+        model: BaseChatModel,
         tools: list = [],
-        model: BaseChatModel | None = None,
+        instructions: list[str] | None = None,
         options: LangGraphOptions | None = None,
     ) -> None:
-        """Initialize a new LangGraphAgent instance.
+        """Initialize LangGraphAgent.
 
         Args:
-            agent: Agent module containing base configuration
-            instructions: Optional list of custom instructions to override defaults
-            tools: List of tool functions to make available to the model
-            model: LangChain chat model instance for generating responses
-            options: Configuration options for customizing agent behavior and tool usage
-
-        Raises:
-            TypeError: If model is not an instance of BaseChatModel
+            agent: Agent module (can be an ActivateAgent-based module)
+            model: LangChain chat model
+            tools: List of tool functions
+            instructions: Optional custom instructions
+            options: Configuration options
         """
         if not isinstance(model, BaseChatModel):
             raise TypeError('model must be an instance of BaseChatModel')
 
-        self.name = agent.__name__
-        self.options = options or LangGraphOptions()
-        instructions_handler = InstructionsHandler()
-        self.instructions = instructions_handler.get_instructions(
-            module=agent, provided_instructions=instructions, instructions_mode=self.options.instructions
-        )
-        logger.debug(f'Generated instructions: {self.instructions[:100]}...')  # Log truncated preview
-
+        # Common setup for all agent types
+        self.agent_module = agent
         self.model = model
         self.tools = tools
+        self.options = options or LangGraphOptions()
+        self.instructions = instructions
 
-    def invoke(self, messages: list[BaseMessage]) -> BaseMessage:
-        """Process messages through the model with tools and instructions.
+        # Agent-specific setup
+        self.is_activate_agent = hasattr(agent, 'invoke') and isinstance(agent, ActivateAgent)
 
-        Takes a list of messages, prepends system instructions, binds available tools
-        to the model, and returns the model's response.
+    def invoke(self, messages: list[BaseMessage], **kwargs: Any) -> BaseMessage:
+        """Process messages using either ActivateAgent or LangGraph workflow.
 
         Args:
-            messages: List of messages to process through the model
+            messages: List of messages to process
+            **kwargs: Additional arguments (used for template variables in ActivateAgent and instructions)
 
         Returns:
-            BaseMessage: Model's response message
+            list[BaseMessage]: List of messages including agent's response for LangGraph
 
         Raises:
-            ValueError: If messages list is empty
+            ValueError: If messages list is empty or agent execution fails
         """
         if not messages:
             raise ValueError('Messages list cannot be empty')
 
+        logger.debug(f'kwargs: {kwargs}')
+
         bound_model = self.model.bind_tools(self.tools, **self.options.get_bind_tools_kwargs())
 
-        logger.debug(f'Invoking model with {len(messages)} messages')
-        logger.debug(f'Instructions: {self.instructions}')
+        # Get system message content based on agent type
+        if self.is_activate_agent:
+            agent_response = self.agent_module.invoke(messages, **kwargs)
+            if not agent_response.success:
+                raise ValueError(f'Agent execution failed: {agent_response.error}')
+            system_content = str(agent_response.value)
+        else:
+            instructions_handler = InstructionsHandler()
+            system_content = instructions_handler.get_instructions(
+                module=self.agent_module,
+                provided_instructions=self.instructions,
+                instructions_mode=self.options.instructions,
+                **kwargs,
+            )
+            logger.debug(f'Generated instructions: {system_content[:100]}...')
 
-        all_messages = [SystemMessage(content=self.instructions)] + messages
+        logger.debug(f'Invoking model with {len(messages)} messages')
+        logger.debug(f'Instructions: {system_content}')
+
+        all_messages = [SystemMessage(content=system_content)] + messages
         return bound_model.invoke(all_messages)

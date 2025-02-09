@@ -1,6 +1,8 @@
 import inspect
 import logging
 import os
+from types import ModuleType
+from typing import Any
 
 from ruamel.yaml import YAML
 
@@ -31,9 +33,10 @@ class InstructionsHandler:
 
     def get_instructions(
         self,
-        module: type,
+        module: ModuleType,
         provided_instructions: str | list[str] | None,
         instructions_mode: InstructionsMode = InstructionsMode.APPEND,
+        **kwargs: Any,
     ) -> str:
         """Get instructions based on the specified mode and available sources.
 
@@ -41,6 +44,7 @@ class InstructionsHandler:
             module: The module to get instructions for
             provided_instructions: Instructions provided directly, either as a string or list of strings
             instructions_mode: How to handle provided instructions relative to found ones
+            **kwargs: Additional keyword arguments to pass to module instruction methods
 
         Returns:
             str: The final combined instructions string
@@ -54,7 +58,10 @@ class InstructionsHandler:
 
         # Get base instructions from sources
         base_instructions = (
-            self._try_root_manifest() or self._try_module_manifest(module) or self._try_module_attributes(module) or ''
+            self._try_root_manifest()
+            or self._try_module_manifest(module)
+            or self._try_module_attributes(module, **kwargs)
+            or ''
         ).strip()
 
         # If we have provided instructions and in append mode (or no base instructions)
@@ -98,14 +105,44 @@ class InstructionsHandler:
             logger.debug(f'Error loading module manifest: {str(e)}')
         return None
 
-    def _try_module_attributes(self, module) -> str | None:
-        """Attempt to retrieve instructions from the module's attributes."""
+    def _try_module_attributes(self, module, **kwargs) -> str | None:
+        """Attempt to retrieve instructions from the module's attributes.
+
+        Supports multiple instruction sources:
+        - Instance/class attributes returning list[str]
+        - Instance/class methods returning list[str] (can accept kwargs)
+        - Module attributes/functions returning list[str] (can accept kwargs)
+        """
         logger.debug("Step 4: checking module's instructions list")
         try:
-            if hasattr(module, 'instructions'):
-                return ' '.join(module.instructions)
-        except (AttributeError, TypeError):
-            pass
+            # Check if module is a class instance
+            if hasattr(module, '__class__') and not isinstance(module, ModuleType):
+                # Try instance/class level instructions
+                instructions = self._get_instructions_from_source(module, **kwargs)
+                if instructions:
+                    return instructions
+                # Fall back to class-level instructions
+                instructions = self._get_instructions_from_source(module.__class__, **kwargs)
+                if instructions:
+                    return instructions
+            # Handle module-level instructions
+            return self._get_instructions_from_source(module, **kwargs)
+        except (AttributeError, TypeError) as e:
+            logger.debug(f'Error accessing instructions: {e}')
+        return None
+
+    def _get_instructions_from_source(self, source: Any, **kwargs) -> str | None:
+        """Extract instructions from a source, handling both attributes and callables."""
+        if not hasattr(source, 'instructions'):
+            return None
+
+        instructions = source.instructions
+        # Handle callable instructions with kwargs
+        if callable(instructions):
+            instructions = instructions(**kwargs)
+
+        if isinstance(instructions, (list, tuple)):
+            return ' '.join(instructions)
         return None
 
     def _find_project_root(self) -> str:
@@ -117,7 +154,7 @@ class InstructionsHandler:
             # The caller's frame is typically two levels up:
             # [0] is _find_project_root
             # [1] is __init__
-            # [2] is the caller (swarm_example.py)
+            # [2] is the caller
             if len(outer_frames) < 3:
                 raise FileNotFoundError(f"Cannot determine the caller's directory to locate {self.MANIFEST_FILE}.")
             caller_frame = outer_frames[2].frame

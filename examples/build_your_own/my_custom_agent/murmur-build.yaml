@@ -1,0 +1,12 @@
+name: my-custom-agent
+type: agent
+version: 1.0.0
+description: A example custom agent that helps execute tasks.
+instructions:
+  - You are a custom assistant that helps execute tasks.
+metadata:
+  author: Murmur Nexus
+  author_email: hi@example.com
+  project_url:
+    - https://github.com/murmur-nexus/murmur-example-artifacts/tree/main/agents/my-custom-agent
+  requires_python: ">=3.9"
