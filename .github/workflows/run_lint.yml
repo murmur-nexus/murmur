@@ -52,7 +52,15 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
 
       - name: Run Ruff Linting
-        run: hatch -e dev run lint
+        run: |
+          echo "Running linting checks..."
+          hatch -e dev run ruff check .
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Run Ruff Formatting
+        run: |
+          echo "Running format checks..."
+          hatch -e dev run ruff format --check . --diff
         working-directory: ${{ inputs.working-directory }}
 
       - name: Run MyPy Type Checking
