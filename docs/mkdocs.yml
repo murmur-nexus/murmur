@@ -30,6 +30,8 @@ nav:
   - "How-to Guides":
     - Installation:
       - Setup PyPI server: how-to/setup-pypi-server.md
+    - Getting Started:
+      - Create an agent: how-to/create-an-agent.md
 markdown_extensions:
   - attr_list
   - pymdownx.emoji:

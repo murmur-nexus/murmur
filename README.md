@@ -1,6 +1,6 @@
 > `ATTENTION!` Please be aware that we are NOT launching any crypto tokens or meme coins. Safeguard yourself and  avoid being deceived by any of these crypto scams! 
 
-![Swarm Logo](docs/docs/assets/repo-header.png)
+![Swarm Logo](https://raw.githubusercontent.com/murmur-nexus/murmur/main/docs/docs/assets/repo-header.png)
 
 <div align="center">
   <a href="https://github.com/murmur-nexus/murmur/actions/workflows/ci.yml"><img src="https://github.com/murmur-nexus/murmur/actions/workflows/ci.yml/badge.svg" alt="CI Pipeline"></a>
@@ -12,7 +12,7 @@ Murmur is an open-source framework for packaging, publishing and managing AI age
 
 ## Quickstart
 
-To get started quickly, follow our [Getting Started with the Examples](https://murmur-nexus.github.io/murmur/tutorial/getting-started-with-examples/) tutorial.
+To get started quickly, follow our [Getting Started with the Examples](https://murmur-nexus.github.io/murmur/tutorial/getting-started-with-examples/) tutorial. Or [create an agent](https://murmur-nexus.github.io/murmur/how-to/create-an-agent/)!
 
 
 ## Installation
