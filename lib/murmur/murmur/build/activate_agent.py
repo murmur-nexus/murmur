@@ -62,7 +62,7 @@ def _load_build_manifest(agent_name: str) -> dict[str, Any]:
             return yaml.load(f)
     except FileNotFoundError:
         raise FileNotFoundError(
-            f"No murmur-build.yaml found for agent: '{agent_name}'. " 'Are you sure the agent is installed?'
+            f"No murmur-build.yaml found for agent: '{agent_name}'. Are you sure the agent is installed?"
         )
     except Exception as e:
         logger.error(f'Failed to load manifest for agent {agent_name}: {e}')
