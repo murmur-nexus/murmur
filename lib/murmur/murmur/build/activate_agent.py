@@ -4,11 +4,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import yaml
+
+from ruamel.yaml import YAML
+
 from ..utils.logging_config import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AgentResponse:
@@ -31,6 +34,7 @@ class AgentResponse:
         if self.state is None:
             self.state = {}
 
+
 def _load_build_manifest(agent_name: str) -> dict[str, Any]:
     """Load the murmur-build.yaml manifest file for the agent.
 
@@ -46,23 +50,24 @@ def _load_build_manifest(agent_name: str) -> dict[str, Any]:
         yaml.YAMLError: If manifest is invalid
     """
     if not agent_name:
-        raise ValueError("agent_name is required")
-        
+        raise ValueError('agent_name is required')
+
     murmur_path = Path(__file__).parent.parent
     manifest_path = murmur_path / 'agents' / agent_name / 'murmur-build.yaml'
-    logger.debug(f"Manifest path: {manifest_path}")
-    
+    logger.debug(f'Manifest path: {manifest_path}')
+
     try:
-        with open(manifest_path, "r") as f:
-            return yaml.safe_load(f)
+        yaml = YAML(typ='safe')
+        with open(manifest_path, encoding='utf-8') as f:
+            return yaml.load(f)
     except FileNotFoundError:
         raise FileNotFoundError(
-            f"No murmur-build.yaml found for agent: '{agent_name}'. "
-            "Are you sure the agent is installed?"
+            f"No murmur-build.yaml found for agent: '{agent_name}'. " 'Are you sure the agent is installed?'
         )
-    except yaml.YAMLError as e:
-        logger.error(f"Invalid YAML in manifest for agent {agent_name}: {e}")
+    except Exception as e:
+        logger.error(f'Failed to load manifest for agent {agent_name}: {e}')
         raise
+
 
 class ActivateAgent:
     """Agent for executing tasks.
@@ -84,24 +89,23 @@ class ActivateAgent:
         """
         try:
             self._manifest = _load_build_manifest(agent_name)
-            self._name = self._manifest["name"]
-            self._type = self._manifest["type"]
-            self._version = self._manifest["version"]
-            self._description = self._manifest["description"]
+            self._name = self._manifest['name']
+            self._type = self._manifest['type']
+            self._version = self._manifest['version']
+            self._description = self._manifest['description']
         except FileNotFoundError as e:
             raise ValueError(str(e)) from e
 
         # Handle instructions
         if instructions is None:
-            instructions = self._manifest.get("instructions", [])
-
+            self._instructions: list[str] = self._manifest.get('instructions', [])
         # Convert string to list if needed
-        if isinstance(instructions, str):
+        elif isinstance(instructions, str):
             self._instructions = [instructions]
         elif isinstance(instructions, list):
             self._instructions = instructions
         else:
-            self._instructions = None
+            self._instructions = []
 
     @property
     def manifest(self) -> dict[str, Any]:
