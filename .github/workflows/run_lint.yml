@@ -40,10 +40,15 @@ jobs:
             ${{ runner.os }}-hatch-
 
       - name: Install Hatch
-        run: pip install --upgrade hatch
+        run: |
+          pip install --upgrade hatch
+          hatch --version
+          python --version
 
       - name: Create Hatch Environment
-        run: hatch env create
+        run: |
+          hatch env create
+          hatch env show
         working-directory: ${{ inputs.working-directory }}
 
       - name: Run Ruff Linting
