@@ -38,7 +38,7 @@ my_custom_agent = ActivateAgent()
 The `ActivateAgent` class is a base class that provides a simple interface for your agent. It has some [benefits build in](./benefits-of-using-the-activate-agent-class.md), such as state and metadata retrieval. If you still would like to use your own logic, you may find these [custom logic patterns](./apply-custom-logic-to-agents.md) useful.
 
 
-## Buid your agent
+## Build your agent
 Run the following command to build your agent:
 
 ```bash
@@ -53,7 +53,18 @@ mur publish
 ```
 
 ## Install an agent
-Run the following command to install your agent(s) (and tools):
+First go to your project where you have `murmur.yaml` in your root. The `murmur.yaml` file is the orchestration file that defines your project and your agents and tools. It should look something like this:
+
+*murmur.yaml*
+```yaml
+name: my-orchestration-project
+version: 1.0.0
+agents:
+  - name: my-custom-agent
+    version: 0.0.1
+```
+
+Then, run the following command to install your agent(s) (and tools):
 
 ```bash
 mur install
