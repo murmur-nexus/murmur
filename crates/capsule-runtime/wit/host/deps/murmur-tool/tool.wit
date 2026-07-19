@@ -1,0 +1,73 @@
+package murmur:tool@0.1.0;
+
+interface run {
+  enum status {
+    passed,
+    failed,
+    error,
+  }
+
+  record tool-input {
+    data: option<string>,
+    log-path: option<string>,
+  }
+
+  record tool-result {
+    status: status,
+    summary: option<string>,
+    data: option<string>,
+    data-path: option<string>,
+    truncated: bool,
+    /// Free-form key/value channel from a driver or tool back to the host.
+    ///
+    /// Reserved key `"continuation_id"`: an inference driver that holds
+    /// conversation state provider-side (so the host need not resend the full
+    /// transcript on every Turn) opts in by returning this key with a
+    /// non-empty value on any Turn's response. The host persists it for the
+    /// current session loop and, on the next Turn under the same context,
+    /// transmits only the messages appended since the driver last acknowledged
+    /// state, plus this id (as the request-side `continuation_id` field),
+    /// instead of the full `messages` array. Returning the key with an
+    /// empty-string value, or omitting it, means "not continuing": the host
+    /// drops any held id and resends in full. If the list carries more than
+    /// one `continuation_id` tuple, the host uses the first in list order.
+    /// A driver that never sets this key (every driver shipped today) sees no
+    /// behavior change.
+    ///
+    /// Reserved key `"state_effect"`: how this call affected the resource it
+    /// addressed, declared by the tool itself so host observability (e.g.
+    /// `mur trace` redundant-call detection) can reason about it without
+    /// knowing which tool this is. Recognized values: `"read"` (the call only
+    /// observed state — a repeat against the same unchanged resource is
+    /// redundant) and `"mutate"` (the call changed state — it invalidates any
+    /// earlier read of that resource). Any other value, or omitting the key,
+    /// means "unknown": the host treats the call conservatively (like a mutate
+    /// for invalidation purposes) and never credits it as a redundant read. A
+    /// tool that declares nothing is never misreported; it simply gets no
+    /// redundant-read detection of its own. The key is per-call, so one tool
+    /// with several operations declares the effect appropriate to each.
+    ///
+    /// Reserved key `"resource_id"`: which resource this call addressed,
+    /// declared by the tool itself. The value is an opaque, tool-defined
+    /// string that the host records verbatim and never parses — two calls
+    /// address the same resource exactly when their `resource_id` values are
+    /// byte-equal. Declaring it is how a tool tells host observability (e.g.
+    /// `mur trace` redundant-call detection) *what* a call addressed, the
+    /// companion to `state_effect`'s *how it was affected*; the two are only
+    /// useful together. Omitting the key, or returning it with an
+    /// empty-string value, means "undeclared": the host falls back to
+    /// guessing the resource from a path-like field in the call's input,
+    /// which is all it could ever do before this key existed. A tool whose
+    /// resource is not a filesystem path (a symbol, a URI, a query) should
+    /// declare this key — it is the only way such a tool gets correct
+    /// detection, since no input-guessing heuristic can recognize its
+    /// addressing scheme. Scoping the value (e.g. `"sym:Foo::bar"`) keeps it
+    /// from colliding with an unrelated resource that happens to share a
+    /// name. If the list carries more than one `resource_id` tuple, the host
+    /// uses the first in list order. A tool that never sets this key (every
+    /// tool shipped today) sees no behavior change.
+    metadata: list<tuple<string, string>>,
+  }
+
+  run: func(input: tool-input) -> tool-result;
+}

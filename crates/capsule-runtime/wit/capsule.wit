@@ -1,0 +1,5 @@
+package murmur:capsule@0.1.0;
+
+interface run {
+  run: func();
+}

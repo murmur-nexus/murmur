@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  verify-version:
+    name: Verify Cargo.toml matches tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag against Cargo.toml version
+        run: |
+          TAG_VERSION="${{ github.ref_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          CARGO_VERSION=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="murmur-cli") | .version')
+          echo "Tag version:        ${TAG_VERSION}"
+          echo "Cargo.toml version: ${CARGO_VERSION}"
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag v${TAG_VERSION} does not match Cargo.toml version ${CARGO_VERSION}. Bump the workspace version in Cargo.toml to match the tag before releasing."
+            exit 1
+          fi
+
+  build-macos:
+    name: Build macOS (${{ matrix.platform }})
+    needs: verify-version
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - target: x86_64-apple-darwin
+            platform: darwin-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build -p murmur-cli --release --target ${{ matrix.target }}
+      - name: Rename binary
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cp target/${{ matrix.target }}/release/mur \
+             mur-${VERSION}-${{ matrix.platform }}
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mur-${{ matrix.platform }}
+          path: mur-*-${{ matrix.platform }}
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux (linux-x86_64)
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libseccomp-dev
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+      - name: Build
+        run: cargo build -p murmur-cli --release --target x86_64-unknown-linux-gnu
+      - name: Rename binary
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cp target/x86_64-unknown-linux-gnu/release/mur \
+             mur-${VERSION}-linux-x86_64
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mur-linux-x86_64
+          path: mur-*-linux-x86_64
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Compute SHA256 and SHA512 checksums
+        id: checksums
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+
+          # Machine-readable SHA256 manifest, published as a release asset and
+          # consumed by scripts/install.sh. Standard `sha256sum -c` format, so it
+          # can also be verified by hand: sha256sum -c checksums.txt
+          sha256sum mur-${VERSION}-* > checksums.txt
+          cat checksums.txt
+
+          # SHA256 for release notes
+          NOTES="## Checksums\n\`\`\`"
+          for f in mur-${VERSION}-*; do
+            HASH=$(sha256sum "$f" | awk '{print $1}')
+            NOTES="${NOTES}\nsha256  ${f}  ${HASH}"
+          done
+          NOTES="${NOTES}\n\`\`\`"
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          printf "%b\n" "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          # SHA512 for changelog (space-separated to work with shell expansion)
+          BINARIES_ARGS=""
+          for f in mur-${VERSION}-*; do
+            SIZE=$(du -h "$f" | awk '{print $1}')B
+            SHA512=$(sha512sum "$f" | awk '{print $1}')
+            BINARIES_ARGS="${BINARIES_ARGS} ${f}:${SHA512}:${SIZE}"
+          done
+          echo "binaries_args=${BINARIES_ARGS}" >> "$GITHUB_OUTPUT"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install requests
+      - name: Generate changelog
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NO_V="${VERSION#v}"
+
+          # Get previous tag for changelog
+          PREVIOUS_TAG=$(git tag --sort=-version:refname --merged HEAD | grep -v "^${{ github.ref_name }}$" | head -1)
+
+          if [ -z "$PREVIOUS_TAG" ]; then
+            # If no previous tag, use current tag
+            PREVIOUS_TAG="$VERSION"
+          fi
+
+          python .github/scripts/aggregate-release-notes.py \
+            --from "$PREVIOUS_TAG" \
+            --to "${{ github.ref_name }}" \
+            --version "${VERSION_NO_V}" \
+            --binaries ${{ steps.checksums.outputs.binaries_args }} \
+            --previous-version "${PREVIOUS_TAG#v}" \
+            --output markdown \
+            --file "CHANGELOG/v${VERSION_NO_V}.md"
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog-${{ github.ref_name }}
+          path: CHANGELOG/${{ github.ref_name }}.md
+          retention-days: 30
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION_NO_V="${VERSION#v}"
+
+          gh release create "${{ github.ref_name }}" \
+            mur-${VERSION_NO_V}-darwin-aarch64 \
+            mur-${VERSION_NO_V}-darwin-x86_64 \
+            mur-${VERSION_NO_V}-linux-x86_64 \
+            checksums.txt \
+            --repo "${{ github.repository }}" \
+            --title "murmur v${VERSION_NO_V}" \
+            --notes "${{ steps.checksums.outputs.notes }}"

@@ -1,0 +1,89 @@
+name: Validate Release Notes
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  validate-release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.0
+
+      - name: Extract and validate release note
+        id: validate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const script = fs.readFileSync('.github/scripts/validate-release-notes.js', 'utf8');
+            eval(script);
+
+      - name: Apply labels
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+
+            // Remove old release-note labels
+            const oldLabels = ['release-note', 'release-note/none', 'release-note/invalid'];
+            for (const label of oldLabels) {
+              if (labels.includes(label)) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  name: label,
+                });
+              }
+            }
+
+            // Apply new label based on validation result
+            const newLabel = '${{ steps.validate.outputs.label }}';
+            if (newLabel) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: [newLabel],
+              });
+            }
+
+      - name: Comment on PR if invalid
+        if: failure() && steps.validate.outputs.label == 'release-note/invalid'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const lines = [
+              "## Release Note Validation Failed",
+              "",
+              "Your PR is missing or has an invalid release note block.",
+              "",
+              "Every PR must include a release note, even if it's just NONE.",
+              "",
+              "**How to fix:**",
+              "Add this to your PR description:",
+              "",
+              "    ```release-note",
+              "    <your note or NONE>",
+              "    ```",
+              "",
+              "See .github/RELEASE_NOTES.md for guidelines and examples.",
+              "",
+              "Once you've added it, push your changes and this check will re-run."
+            ];
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body: lines.join('\n')
+            });

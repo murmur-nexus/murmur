@@ -1,0 +1,54 @@
+#![forbid(unsafe_code)]
+
+pub mod artifact;
+pub mod artifact_ref;
+pub mod build;
+pub mod dotenv;
+pub mod lockfile;
+pub mod manifest;
+pub mod manifest_path;
+pub mod message_schema;
+pub mod platform;
+pub mod registry;
+pub mod runtime_manifest;
+pub mod secrets;
+pub mod security_warnings;
+pub mod zip_guard;
+
+pub use artifact::{
+    load_manifest_from_artifact, load_manifest_from_artifact_bytes,
+    load_manifest_yaml_from_artifact, load_manifest_yaml_from_artifact_bytes, ArtifactError,
+};
+pub use platform::current_platform;
+pub use artifact_ref::{ArtifactRef, ArtifactRefError};
+pub use build::{build_artifact, BuildError, PACKED_MANIFEST_ENTRY};
+pub use dotenv::{load_dotenv_non_override, DotenvError};
+pub use lockfile::{
+    read_lockfile, write_lockfile_atomic, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
+    LOCK_VERSION,
+};
+pub use manifest::{load_manifest, Manifest, ManifestError};
+pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
+pub use message_schema::{CodeTaskRequest, CodeTaskResult, MurmurMessage};
+pub use registry::{
+    is_reserved_version, sha256_hex, verify_sha256, ArtifactMeta, LocalRegistry, Platform,
+    PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
+};
+pub use runtime_manifest::{
+    load_runtime_manifest, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
+    read_hook_config, read_tool_implementation, AfterTask, ArtifactImplementation, ArtifactRuntime,
+    Capabilities, CompactionConfig, ContextConfig, ConversationMode, EnvCapabilities, EvalConfig,
+    FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode,
+    InferenceConfig, InferenceDriver, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
+    NetworkConfig, ObservabilityConfig, ResourceLimits, RuntimeArtifact, RuntimeManifest,
+    RuntimeManifestError, ScorerConfig, ShellCapabilities, TaskAcceptance, TraceConfig,
+};
+pub use secrets::{scan_yaml_secrets, SecretWarning};
+pub use security_warnings::{
+    security_warning_link, W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005,
+};
+pub use zip_guard::{
+    max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,
+    resolve_within, sanitize_entry_path, ZipGuardError, DEFAULT_MAX_ARTIFACT_DECOMPRESSED_BYTES,
+    MAX_ARTIFACT_DECOMPRESSED_BYTES_ENV,
+};

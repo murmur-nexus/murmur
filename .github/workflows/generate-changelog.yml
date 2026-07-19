@@ -1,0 +1,97 @@
+name: Generate Changelog
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_version:
+        description: "Starting version (e.g., v1.0.0)"
+        required: true
+      to_version:
+        description: "Ending version (default: HEAD)"
+        required: false
+        default: "HEAD"
+      release_version:
+        description: "Version for the changelog header (e.g., v1.1.0)"
+        required: false
+      release_date:
+        description: "Release date (YYYY-MM-DD, default: today)"
+        required: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate changelog
+        id: changelog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python .github/scripts/aggregate-release-notes.py \
+            --from "${{ github.event.inputs.from_version }}" \
+            --to "${{ github.event.inputs.to_version }}" \
+            --version "${{ github.event.inputs.release_version }}" \
+            --date "${{ github.event.inputs.release_date }}" \
+            --output markdown \
+            --file /tmp/changelog.md
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/changelog.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create summary
+        run: |
+          echo "## Generated Changelog" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat /tmp/changelog.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: /tmp/changelog.md
+          retention-days: 30
+
+  summarize:
+    needs: generate
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.0
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+
+      - name: Create summary
+        run: |
+          echo "## Changelog Generated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Release version: **${{ github.event.inputs.release_version }}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "From: ${{ github.event.inputs.from_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "To: ${{ github.event.inputs.to_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review the changelog artifact above" >> $GITHUB_STEP_SUMMARY
+          echo "2. Commit the edited file as CHANGELOG/<version>.md" >> $GITHUB_STEP_SUMMARY
+          echo "3. Add an index entry for it in CHANGELOG.md" >> $GITHUB_STEP_SUMMARY

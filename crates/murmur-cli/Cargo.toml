@@ -1,0 +1,55 @@
+[package]
+name = "murmur-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Murmur command-line tool for packaging, running, and publishing AI-agent capsules."
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "mur"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+console = "0.16"
+capsule-runtime.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+indicatif = "0.18"
+murmur-artifact.workspace = true
+dialoguer = "0.12"
+rayon = "1"
+ureq = { version = "3", features = ["json"] }
+url = "2"
+serde = { version = "1", features = ["derive"] }
+# Not used directly: compiles all dependency `tracing` macros (wasmtime, hyper,
+# tokio, h2) to no-ops in release builds. No subscriber is ever installed, so
+# the events were already unobservable; this just strips the dead call sites.
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_off"] }
+# Not used directly: compiles all dependency `log` macros (cranelift, rustls,
+# hyper, h2) to no-ops in release builds. No `log` subscriber is ever installed,
+# so the records were already unobservable; this strips the dead call sites.
+log = { version = "0.4", default-features = false, features = ["release_max_level_off"] }
+serde_json = "1"
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+beta = []
+# Per-feature Cargo gates are added here as features land:
+beta-mur-new = ["beta"]
+beta-mur-deploy = ["beta"]
+beta-mur-topology = ["beta"]
+# beta-blueprint = ["beta"]
+# beta-dag-topology = ["beta"]
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

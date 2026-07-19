@@ -1,0 +1,8 @@
+package murmur:host@0.1.0;
+
+world runtime-host {
+  import murmur:artifact-manager/manage@0.1.0;
+  import murmur:shell/execute@0.1.0;
+  import murmur:tool-registry/invoke@0.1.0;
+  import murmur:message/send@0.1.0;
+}

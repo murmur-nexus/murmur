@@ -1,0 +1,37 @@
+package murmur:artifact-manager@0.1.0;
+
+interface manage {
+  enum runtime-type {
+    wasm,
+    native,
+  }
+
+  record artifact-summary {
+    name: string,
+    version: string,
+    runtime: runtime-type,
+  }
+
+  record artifact-info {
+    name: string,
+    version: string,
+    description: string,
+    tags: list<string>,
+    runtime: runtime-type,
+    input-schema: option<string>,
+    output-schema: option<string>,
+  }
+
+  record runtime-state {
+    capsule-id: string,
+    installed: list<artifact-summary>,
+    capabilities: string,
+  }
+
+  %list: func() -> list<artifact-summary>;
+  describe: func(name: string) -> result<artifact-info, string>;
+  search: func(query: string) -> result<list<artifact-summary>, string>;
+  pull: func(name: string, version: string) -> result<artifact-summary, string>;
+  remove: func(name: string) -> result<bool, string>;
+  diagnostics: func() -> result<runtime-state, string>;
+}

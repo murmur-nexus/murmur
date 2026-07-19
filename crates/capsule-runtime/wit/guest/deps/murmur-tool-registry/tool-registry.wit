@@ -1,0 +1,7 @@
+package murmur:tool-registry@0.1.0;
+
+interface invoke {
+  use murmur:tool/run@0.1.0.{tool-input, tool-result, status};
+
+  invoke: func(name: string, input: tool-input) -> result<tool-result, string>;
+}

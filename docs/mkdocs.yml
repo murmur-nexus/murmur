@@ -1,0 +1,121 @@
+site_name: murmur
+site_description: The infrastructure layer for AI agents. Package any agent once and run it anywhere, reproducibly and fully isolated.
+site_url: https://docs.murmur.nexus
+repo_url: https://github.com/murmur-nexus/murmur
+repo_name: murmur-nexus/murmur
+docs_dir: content
+
+theme:
+  name: material
+  logo: assets/img/murmur-logo-white.png
+  font:
+    text: Inter
+  features:
+    - content.code.copy
+    - content.tooltips
+    - content.tabs.link
+  palette:
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+extra_css:
+  - assets/extra.css
+  - assets/dracula.css
+
+plugins:
+  - search
+  - macros
+  - copy-to-llm
+  - badges
+  - git-revision-date-localized:
+      fallback_to_build_date: true
+      strict: false
+
+extra:
+  v:
+    model_anthropic: "claude-sonnet-5"
+    model_openai: "o3-mini-high"
+    model_deepseek: "deepseek-r1"
+    model_anthropic_small: "claude-haiku-4-5"
+    model_openai_small: "gpt-4o-mini-2024-07-18"
+    model_deepseek_small: "deepseek-v4-flash"
+    max_tokens_anthropic: 1000000
+    max_tokens_openai: 200000
+    max_tokens_deepseek: 1000000
+    murmur_driver_anthropic: "1.0.0"
+    murmur_driver_openai: "1.0.0"
+    murmur_driver_deepseek: "1.0.0"
+    murmur_hook_compact: "1.0.0"
+    murmur_hook_eval: "1.0.0"
+    murmur_hook_grafana: "1.0.0"
+    murmur_hook_debug: "1.0.0"
+    murmur_tool_create: "1.0.0"
+    murmur_tool_git: "1.0.0"
+    murmur_tool_editor: "1.0.0"
+    murmur_tool_request_input: "1.0.0"
+    murmur_tool_registry_search: "1.0.0"
+    murmur_skill_create_manifest: "1.0.0"
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - abbr
+  - pymdownx.highlight:
+      pygments_style: dracula
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.snippets:
+      base_path:
+        - content
+      auto_append:
+        - includes/abbreviations.md
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Overview: getting-started/overview.md
+      - Quickstart: getting-started/quickstart.md
+  - Concepts:
+      - Capsules: concepts/capsules.md
+      - Registry: concepts/registry.md
+      - Capsule Runtime: concepts/capsule-runtime.md
+  - How-to Guides:
+      - Configure a long-running capsule: how-to/long-running-capsule.md
+      - Give your agent shell access: how-to/agent-shell-access.md
+      - Connect two capsules with A2A messaging: how-to/capsules-a2a-messaging.md
+      - Pause your agent for human input: how-to/hitl-request-input.md
+      - Read your agent's trace and compare two runs: how-to/read-trace-and-diff.md
+      - Score your agent's behavior with eval: how-to/agent-eval-score.md
+      - Shape agent behavior with a system prompt: how-to/capsule-system-prompt.md
+      - Enable context compaction: how-to/context-compaction.md
+      - Package a skill into an artifact: how-to/package-skill-artifact.md
+      - Work with capsule trace spans in Grafana: how-to/grafana-tempo-spans.md
+      - Deploy a capsule to the cloud with mur deploy: how-to/deploy-capsule-cloud.md
+      - Decompose tasks recursively within a single capsule: how-to/task-decomposition-single-capsule.md
+      - Generate a capsule manifest with mur new: how-to/generate-manifest.md
+      - Visualise capsule sessions with mur topology: how-to/topology-view.md
+  - Language Guides:
+      - Python Tool Quickstart (WASM): language-guides/python.md
+      - Python Tool Quickstart (Native): language-guides/python-native.md
+  - Reference:
+      - CLI Commands: reference/cli.md
+      - Manifest Schema: reference/manifest-schema.md
+      - Capsule I/O Schema: reference/capsule-io.md
+      - Security Warnings: reference/security-warnings.md
+      - WIT Interfaces: reference/wit-interfaces.md
+      - Nexus API: reference/nexus-api.md
+      - Roost API: reference/roost-api.md
+  - Contributing:
+      - Overview: contributing/index.md

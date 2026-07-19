@@ -1,0 +1,49 @@
+[package]
+name = "capsule-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The runtime that executes Murmur capsules. Runs packaged AI agents in isolation, enforcing WASI capability grants on a Wasmtime component sandbox."
+repository.workspace = true
+readme.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hmac = "0.12"
+http = "1"
+hyper = { version = "1", default-features = false }
+libc = "0.2"
+murmur-artifact.workspace = true
+getrandom = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tiktoken-rs = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "io-util", "macros", "time", "fs", "process"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "v7"] }
+wasmtime = { version = "46", default-features = false, features = [
+  "runtime",
+  "cranelift",
+  "component-model",
+  "async",
+  "std",
+] }
+wasmtime-wasi = { version = "46", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "46", features = ["default-send-request"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+libseccomp = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+# Dev-only: hand-authored WAT component doubles for the hook-instantiation tests
+# (required-vs-optional lifecycle export resolution). No production impact.
+wat = "=1.251.0"

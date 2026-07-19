@@ -1,0 +1,42 @@
+:root {
+  --md-primary-fg-color: #0000ff;
+  --md-primary-fg-color--light: #3333ff;
+  --md-primary-fg-color--dark: #0000cc;
+  --md-accent-fg-color: #0000ff;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-typeset-a-color: #00f0d0;
+}
+
+[data-md-color-scheme="slate"] .md-typeset a:hover,
+[data-md-color-scheme="slate"] .md-typeset a:active {
+  color: #00f0d0;
+}
+
+/* Hide per-code-block copy-to-llm icons (code blocks already have a built-in copy button) */
+.copy-to-llm-code {
+  display: none !important;
+}
+
+/* "definition" admonition — "What is X?" definition cards */
+:root {
+  --md-admonition-icon--definition: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H7V9h10v2zm0-4H7V5h10v2z'/%3E%3C/svg%3E");
+}
+
+.md-typeset .admonition.definition,
+.md-typeset details.definition {
+  border-color: #5c6bc0;
+}
+
+.md-typeset .admonition.definition > .admonition-title,
+.md-typeset details.definition > summary {
+  background-color: rgba(92, 107, 192, 0.1);
+}
+
+.md-typeset .admonition.definition > .admonition-title::before,
+.md-typeset details.definition > summary::before {
+  background-color: #5c6bc0;
+  -webkit-mask-image: var(--md-admonition-icon--definition);
+          mask-image: var(--md-admonition-icon--definition);
+}

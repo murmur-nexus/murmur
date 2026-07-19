@@ -1,0 +1,8 @@
+package murmur:task@0.1.0;
+
+interface task {
+    /// Suspend the agent loop and request external input.
+    /// Returns the message content from the follow-up message/send call.
+    /// Traps if the optional input_timeout_secs elapses with no response.
+    request-input: func(prompt: string) -> string;
+}

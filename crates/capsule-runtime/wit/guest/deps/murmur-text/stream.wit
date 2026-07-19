@@ -1,0 +1,13 @@
+package murmur:text@0.1.0;
+
+interface chunks {
+    /// Emit one text chunk to the SSE stream.
+    /// Called by the driver once per token while streaming the LLM response.
+    /// Has no effect outside an A2A session (sse is None).
+    emit-chunk: func(chunk: string);
+
+    /// Emit one thinking/reasoning chunk to the SSE stream.
+    /// Called by the driver for content inside <think>…</think> tags or structured
+    /// thinking blocks. Has no effect outside an A2A session.
+    emit-thinking-chunk: func(chunk: string);
+}

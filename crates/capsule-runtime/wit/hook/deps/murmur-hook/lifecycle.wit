@@ -1,0 +1,103 @@
+package murmur:hook@0.2.0;
+
+interface lifecycle {
+    record message {
+        role: string,
+        content: string,
+    }
+
+    record tool-manifest {
+        binary-name: string,
+        content: string,
+    }
+
+    variant hook-output {
+        none,
+        replace-context(list<message>),
+        write-manifests(list<tool-manifest>),
+        /// Emit a structured artifact payload to the SSE event stream.
+        /// The string must be a valid JSON object.
+        artifact(string),
+    }
+
+    record session-context {
+        capsule-name: string,
+        capsule-version: string,
+        session-id: string,
+        model: string,
+        capabilities: list<string>,
+    }
+
+    record stage-event {
+        shell-allow: list<string>,
+    }
+
+    record task-start-event {
+        task-id: string,
+        context-id: string,
+        source: string,
+        input-bytes: u64,
+    }
+
+    record task-end-event {
+        task-id: string,
+        exit-status: string,
+    }
+
+    record inference-event {
+        turn: u32,
+        input-tokens: u64,
+        output-tokens: u64,
+        decision: string,
+        tool-name: option<string>,
+        prompt: option<string>,
+        output: option<string>,
+        tools: option<string>,
+    }
+
+    record tool-event {
+        turn: u32,
+        tool-name: string,
+        input-bytes: u64,
+        output-bytes: u64,
+        duration-ms: u64,
+        status: string,
+    }
+
+    record shell-event {
+        turn: u32,
+        command: string,
+        exit-code: s32,
+        stdout: string,
+        stderr: string,
+        stdout-bytes: u64,
+        stderr-bytes: u64,
+        duration-ms: u64,
+    }
+
+    record compaction-event {
+        messages: list<message>,
+        session-tokens: u64,
+        threshold: f64,
+    }
+
+    record session-end-event {
+        total-turns: u32,
+        total-input-tokens: u64,
+        total-output-tokens: u64,
+        total-tool-calls: u32,
+        total-shell-calls: u32,
+        duration-ms: u64,
+        exit-status: string,
+    }
+
+    on-stage: func(event: stage-event) -> result<hook-output, string>;
+    on-session-start: func(ctx: session-context) -> result<hook-output, string>;
+    on-task-start: func(event: task-start-event) -> result<hook-output, string>;
+    on-inference: func(event: inference-event) -> result<hook-output, string>;
+    on-tool-call: func(event: tool-event) -> result<hook-output, string>;
+    on-shell: func(event: shell-event) -> result<hook-output, string>;
+    on-compaction: func(event: compaction-event) -> result<hook-output, string>;
+    on-task-end: func(event: task-end-event) -> result<hook-output, string>;
+    on-session-end: func(event: session-end-event) -> result<hook-output, string>;
+}

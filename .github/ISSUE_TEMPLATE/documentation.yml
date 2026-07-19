@@ -1,0 +1,37 @@
+name: Documentation
+description: Report missing or incorrect docs
+labels: [documentation]
+body:
+  - type: textarea
+    id: area
+    attributes:
+      label: Area
+      description: Where is the issue? 
+      placeholder: e.g., README, how-to, references...
+    validations:
+      required: true
+  - type: textarea
+    id: issue
+    attributes:
+      label: What's wrong or missing?
+      description: Describe the gap or inaccuracy
+      placeholder: Is something unclear, outdated, or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Suggested fix
+      description: Proposed wording, examples, or structure
+      placeholder: How should it be written instead?
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Links to code, issues, or external docs
+      placeholder: |
+        Related code: ...
+        Similar docs: ...
+        External references: ...

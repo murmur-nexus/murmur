@@ -1,0 +1,21 @@
+package murmur:message@0.1.0;
+
+interface send {
+  record message {
+    message-id: string,
+    context-id: option<string>,
+    text: string,
+  }
+
+  record task-result {
+    task-id: string,
+    context-id: string,
+    state: string,
+  }
+
+  send: func(peer-url: string, message: message) -> result<task-result, string>;
+}
+
+world message-guest {
+  import send;
+}

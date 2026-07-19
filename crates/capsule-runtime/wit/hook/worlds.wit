@@ -1,0 +1,5 @@
+package murmur:runtime@0.1.0;
+
+world hook {
+  export murmur:hook/lifecycle@0.2.0;
+}

@@ -1,0 +1,17 @@
+package murmur:shell@0.1.0;
+
+interface execute {
+  record shell-result {
+    exit-code: s32,
+    stdout: string,
+    stderr: string,
+    truncated: bool,
+    full-output-path: option<string>,
+  }
+
+  run: func(
+    binary: string,
+    args: list<string>,
+    env: list<tuple<string, string>>,
+  ) -> result<shell-result, string>;
+}

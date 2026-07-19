@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+
+# OS-specific
+.DS_Store
+.AppleDouble
+.LSOverride
+.trashes
+Thumbs.db
+Desktop.ini
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+
+# Docs
+docs/.venv/
+docs/site/
+
+# Murmur-specific
+.murmur
+.nexus
+murmur.yaml
