@@ -103,7 +103,7 @@ Murmur grows through improving the runtime, building new artifacts and putting c
 
 - Sign off your commits (`git commit -s`) — a quick [DCO 1.1](https://developercertificate.org/) certification. A bot will verify.
 - Changes touching sandbox, capability, or network-execution code get extra scrutiny before merge.
-- Read [CONTRIBUTING.md](./CONTRIBUTING.md) and join the community on [Discord](https://discord.gg/Y45yJv5rrC).
+- Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) and join the community on [Discord](https://discord.gg/Y45yJv5rrC).
 
 <br>
 <p align="center">
