@@ -5,6 +5,12 @@ repo_url: https://github.com/murmur-nexus/murmur
 repo_name: murmur-nexus/murmur
 docs_dir: content
 
+exclude_docs: |
+  .DS_Store
+  # Snippet partials pulled in via --8<--; not standalone pages.
+  # pymdownx.snippets still resolves them from disk via base_path.
+  includes/
+
 theme:
   name: material
   logo: assets/img/murmur-logo-white.png
