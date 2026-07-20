@@ -51,9 +51,6 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    environment:
-      name: docs
-      url: https://docs.murmur.nexus
     steps:
       - uses: actions/checkout@v4
         with:
