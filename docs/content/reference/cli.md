@@ -398,7 +398,7 @@ mur run [--manifest <path>] [--input <path>] [--json]
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
 | `--task` | — | File to copy into the capsule workdir as `task.md` before launch |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output |
-| `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines — see [CI/CD deployment hardening](../how-to/ci-cd-deployment-hardening.md) |
+| `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory
