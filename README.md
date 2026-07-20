@@ -95,7 +95,7 @@ We strongly believe that if you own the knowledge domain, you should own the har
 - Composable from versioned artifacts
 - OCI-native (deploy to a VM or Kubernetes)
 
-[Read more >](https://murmur.nexus/blog/the-agent-capsule-runtime)
+[Read more >](https://murmur.nexus/blog/the-pharmakon-of-a-billion-capsules)
 
 ## Contributing
 
