@@ -24,6 +24,8 @@
 
 *[inference.compaction.model]: model override for compaction calls · defaults to primary inference model
 
+*[inference.compaction.system_prompt]: system prompt override for compaction calls · passed verbatim to the compaction hook · defaults to none, hook picks its own default
+
 *[inference.system_prompt]: inline system prompt · injected on every API call · exclusive with system_prompt_file
 
 *[inference.system_prompt_file]: file path relative to murmur.yaml · used as system prompt · exclusive with system_prompt

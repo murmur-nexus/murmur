@@ -9,6 +9,7 @@ The relevant manifest options are:
 | [context.max_tokens](../reference/manifest-schema.md#field-context) | Token budget for the session; required to enable compaction |
 | [inference.compaction.threshold](../reference/manifest-schema.md#field-inference) | Fraction of `context.max_tokens` that triggers compaction |
 | [inference.compaction.model](../reference/manifest-schema.md#field-inference) | Model used for the compaction call (optional override) |
+| [inference.compaction.system_prompt](../reference/manifest-schema.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 
 ---
 
@@ -213,6 +214,19 @@ To use a smaller, faster model for compaction calls (saving cost while keeping y
         threshold: 0.85
         model: {{ v.model_deepseek_small }}
     ```
+
+To steer what the compaction call preserves, set `inference.compaction.system_prompt`. The string is passed to the compaction hook verbatim — no trimming, no length limit, no templating:
+
+```yaml
+inference:
+  compaction:
+    threshold: 0.85
+    system_prompt: |
+      task = X, currently editing Y, already tried Z.
+      Preserve this nuance when summarizing.
+```
+
+If left unset, `compaction-event.system-prompt` arrives at the hook as `none`, and the hook falls back to its own built-in default prompt. `model` and `system_prompt` are independent — setting one does not require or affect the other.
 
 ---
 

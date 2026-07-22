@@ -468,6 +468,10 @@ pub fn launch_session(
                 .and_then(|c| c.threshold)
                 .unwrap_or(0.98),
             compaction_model: inference.compaction.as_ref().and_then(|c| c.model.clone()),
+            compaction_system_prompt: inference
+                .compaction
+                .as_ref()
+                .and_then(|c| c.system_prompt.clone()),
         };
 
         // --- Identity and HTTP server setup ---
