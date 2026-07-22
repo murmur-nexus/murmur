@@ -1984,197 +1984,197 @@ pub(crate) async fn invoke_tool_component(
     component: &Component,
     input: murmur::tool::run::ToolInput,
 ) -> Result<murmur::tool::run::ToolResult, String> {
-        let ToolInvokeEnv {
-            engine,
+    let ToolInvokeEnv {
+        engine,
+        accessible_workdir,
+        inference_env,
+        capability_policy,
+        network_allow_rules,
+    } = env;
+    let ToolA2aWiring {
+        sse: a2a_sse,
+        task_id: a2a_task_id,
+        chunk_event_id: a2a_chunk_event_id,
+        chunks_emitted: a2a_chunks_emitted,
+        task_registry: a2a_task_registry,
+        input_timeout_secs,
+    } = a2a;
+
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+        .map_err(|err| format!("failed to add WASI linker for tool '{name}': {err}"))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+        .map_err(|err| format!("failed to add HTTP linker for tool '{name}': {err}"))?;
+
+    // Register murmur:text/chunks host functions (synchronous).
+    // Components that do not import this interface ignore the registrations.
+    // Both functions must be defined in a single .instance() call — Wasmtime
+    // rejects a second .instance() for the same interface name. Registered
+    // under the versioned name only (see WIT_TEXT_CHUNKS_IFACE / wit/VERSIONING.md).
+    {
+        let chunks_iface = WIT_TEXT_CHUNKS_IFACE;
+        let sse_for_chunk = a2a_sse.clone();
+        let task_id_for_chunk = a2a_task_id.clone();
+        let chunk_event_id = Arc::clone(&a2a_chunk_event_id);
+        let chunks_emitted_flag = Arc::clone(&a2a_chunks_emitted);
+        let sse_for_thinking = a2a_sse.clone();
+        let task_id_for_thinking = a2a_task_id.clone();
+        let thinking_event_id = Arc::clone(&a2a_chunk_event_id);
+
+        let mut inst = linker.instance(chunks_iface).map_err(|err| {
+            format!("failed to define {chunks_iface} instance for '{name}': {err}")
+        })?;
+
+        inst.func_wrap(
+            "emit-chunk",
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
+                  (chunk,): (String,)| {
+                chunks_emitted_flag.store(true, Ordering::Relaxed);
+                if let (Some((ref tx, ref buf)), Some(ref tid)) =
+                    (&sse_for_chunk, &task_id_for_chunk)
+                {
+                    emit_chunk_sse(tx, buf, &chunk_event_id, tid, &chunk);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|err| {
+            format!("failed to register emit-chunk for tool '{name}': {err}")
+        })?;
+
+        inst.func_wrap(
+            "emit-thinking-chunk",
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
+                  (chunk,): (String,)| {
+                if let (Some((ref tx, ref buf)), Some(ref tid)) =
+                    (&sse_for_thinking, &task_id_for_thinking)
+                {
+                    emit_thinking_chunk_sse(tx, buf, &thinking_event_id, tid, &chunk);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|err| {
+            format!("failed to register emit-thinking-chunk for tool '{name}': {err}")
+        })?;
+    }
+
+    // Register the murmur:task/task#request-input host function under the
+    // versioned name only (see WIT_TASK_IFACE).
+    // Components that do not import this interface ignore the registration.
+    {
+        let task_iface = WIT_TASK_IFACE;
+        let ri_task_registry = a2a_task_registry.clone();
+        let ri_sse = a2a_sse.clone();
+        let ri_task_id = a2a_task_id.clone();
+        let ri_timeout = input_timeout_secs;
+        linker
+            .instance(task_iface)
+            .map_err(|err| {
+                format!("failed to define {task_iface} instance for '{name}': {err}")
+            })?
+            .func_wrap_async(
+                "request-input",
+                move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
+                      (prompt,): (String,)| {
+                    let reg = ri_task_registry.clone();
+                    let sse = ri_sse.clone();
+                    let tid = ri_task_id.clone();
+                    let fut: std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = wasmtime::Result<(String,)>>
+                                + Send,
+                        >,
+                    > = Box::pin(async move {
+                        let result = match (reg, tid) {
+                            (Some(reg), Some(tid)) => {
+                                request_input_impl(tid, prompt, reg, sse, ri_timeout).await
+                            }
+                            _ => Err(wasmtime::Error::msg(
+                                "request-input is not available outside an A2A task context",
+                            )),
+                        };
+                        result.map(|s| (s,))
+                    });
+                    Box::new(fut)
+                        as Box<
+                            dyn std::future::Future<Output = wasmtime::Result<(String,)>>
+                                + Send
+                                + '_,
+                        >
+                },
+            )
+            .map_err(|err| {
+                format!("failed to register request-input for tool '{name}': {err}")
+            })?;
+    }
+
+    let tool_limits = capability_policy.limits;
+    let state = ToolStoreState {
+        limits: tool_limits.limiter(),
+        table: ResourceTable::new(),
+        wasi: build_wasi_ctx(
             accessible_workdir,
             inference_env,
             capability_policy,
-            network_allow_rules,
-        } = env;
-        let ToolA2aWiring {
-            sse: a2a_sse,
-            task_id: a2a_task_id,
-            chunk_event_id: a2a_chunk_event_id,
-            chunks_emitted: a2a_chunks_emitted,
-            task_registry: a2a_task_registry,
-            input_timeout_secs,
-        } = a2a;
+        )
+        .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
+        http: WasiHttpCtx::new(),
+        http_hooks: NetworkPolicyHooks {
+            network_allow_rules: network_allow_rules.to_vec(),
+        },
+    };
 
-        let mut linker = Linker::new(engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|err| format!("failed to add WASI linker for tool '{name}': {err}"))?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
-            .map_err(|err| format!("failed to add HTTP linker for tool '{name}': {err}"))?;
+    let mut store = Store::new(engine, state);
+    // Registered before instantiation — see the capsule store for why.
+    store.limiter(|state| &mut state.limits);
 
-        // Register murmur:text/chunks host functions (synchronous).
-        // Components that do not import this interface ignore the registrations.
-        // Both functions must be defined in a single .instance() call — Wasmtime
-        // rejects a second .instance() for the same interface name. Registered
-        // under the versioned name only (see WIT_TEXT_CHUNKS_IFACE / wit/VERSIONING.md).
-        {
-            let chunks_iface = WIT_TEXT_CHUNKS_IFACE;
-            let sse_for_chunk = a2a_sse.clone();
-            let task_id_for_chunk = a2a_task_id.clone();
-            let chunk_event_id = Arc::clone(&a2a_chunk_event_id);
-            let chunks_emitted_flag = Arc::clone(&a2a_chunks_emitted);
-            let sse_for_thinking = a2a_sse.clone();
-            let task_id_for_thinking = a2a_task_id.clone();
-            let thinking_event_id = Arc::clone(&a2a_chunk_event_id);
+    store.set_epoch_deadline(tool_limits.deadline_ticks());
+    let instance = linker
+        .instantiate_async(&mut store, component)
+        .await
+        .map_err(|err| format!("failed to instantiate tool '{name}': {err}"))?;
 
-            let mut inst = linker.instance(chunks_iface).map_err(|err| {
-                format!("failed to define {chunks_iface} instance for '{name}': {err}")
-            })?;
-
-            inst.func_wrap(
-                "emit-chunk",
-                move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
-                      (chunk,): (String,)| {
-                    chunks_emitted_flag.store(true, Ordering::Relaxed);
-                    if let (Some((ref tx, ref buf)), Some(ref tid)) =
-                        (&sse_for_chunk, &task_id_for_chunk)
-                    {
-                        emit_chunk_sse(tx, buf, &chunk_event_id, tid, &chunk);
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|err| {
-                format!("failed to register emit-chunk for tool '{name}': {err}")
-            })?;
-
-            inst.func_wrap(
-                "emit-thinking-chunk",
-                move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
-                      (chunk,): (String,)| {
-                    if let (Some((ref tx, ref buf)), Some(ref tid)) =
-                        (&sse_for_thinking, &task_id_for_thinking)
-                    {
-                        emit_thinking_chunk_sse(tx, buf, &thinking_event_id, tid, &chunk);
-                    }
-                    Ok(())
-                },
-            )
-            .map_err(|err| {
-                format!("failed to register emit-thinking-chunk for tool '{name}': {err}")
-            })?;
+    let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
+        .ok_or_else(|| {
+        RuntimeError::ToolExportMissing {
+            name: name.to_string(),
         }
-
-        // Register the murmur:task/task#request-input host function under the
-        // versioned name only (see WIT_TASK_IFACE).
-        // Components that do not import this interface ignore the registration.
-        {
-            let task_iface = WIT_TASK_IFACE;
-            let ri_task_registry = a2a_task_registry.clone();
-            let ri_sse = a2a_sse.clone();
-            let ri_task_id = a2a_task_id.clone();
-            let ri_timeout = input_timeout_secs;
-            linker
-                .instance(task_iface)
-                .map_err(|err| {
-                    format!("failed to define {task_iface} instance for '{name}': {err}")
-                })?
-                .func_wrap_async(
-                    "request-input",
-                    move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
-                          (prompt,): (String,)| {
-                        let reg = ri_task_registry.clone();
-                        let sse = ri_sse.clone();
-                        let tid = ri_task_id.clone();
-                        let fut: std::pin::Pin<
-                            Box<
-                                dyn std::future::Future<Output = wasmtime::Result<(String,)>>
-                                    + Send,
-                            >,
-                        > = Box::pin(async move {
-                            let result = match (reg, tid) {
-                                (Some(reg), Some(tid)) => {
-                                    request_input_impl(tid, prompt, reg, sse, ri_timeout).await
-                                }
-                                _ => Err(wasmtime::Error::msg(
-                                    "request-input is not available outside an A2A task context",
-                                )),
-                            };
-                            result.map(|s| (s,))
-                        });
-                        Box::new(fut)
-                            as Box<
-                                dyn std::future::Future<Output = wasmtime::Result<(String,)>>
-                                    + Send
-                                    + '_,
-                            >
-                    },
-                )
-                .map_err(|err| {
-                    format!("failed to register request-input for tool '{name}': {err}")
-                })?;
-        }
-
-        let tool_limits = capability_policy.limits;
-        let state = ToolStoreState {
-            limits: tool_limits.limiter(),
-            table: ResourceTable::new(),
-            wasi: build_wasi_ctx(
-                accessible_workdir,
-                inference_env,
-                capability_policy,
-            )
-            .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
-            http: WasiHttpCtx::new(),
-            http_hooks: NetworkPolicyHooks {
-                network_allow_rules: network_allow_rules.to_vec(),
-            },
-        };
-
-        let mut store = Store::new(engine, state);
-        // Registered before instantiation — see the capsule store for why.
-        store.limiter(|state| &mut state.limits);
-
-        store.set_epoch_deadline(tool_limits.deadline_ticks());
-        let instance = linker
-            .instantiate_async(&mut store, component)
-            .await
-            .map_err(|err| format!("failed to instantiate tool '{name}': {err}"))?;
-
-        let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
-            .ok_or_else(|| {
+        .to_string()
+    })?;
+    let tool_run = instance
+        .get_export_index(&mut store, Some(&tool_iface), "run")
+        .and_then(|idx| instance.get_func(&mut store, idx))
+        .ok_or_else(|| {
             RuntimeError::ToolExportMissing {
                 name: name.to_string(),
             }
             .to_string()
         })?;
-        let tool_run = instance
-            .get_export_index(&mut store, Some(&tool_iface), "run")
-            .and_then(|idx| instance.get_func(&mut store, idx))
-            .ok_or_else(|| {
-                RuntimeError::ToolExportMissing {
-                    name: name.to_string(),
-                }
-                .to_string()
-            })?;
 
-        let run = tool_run
-            .typed::<(murmur::tool::run::ToolInput,), (murmur::tool::run::ToolResult,)>(&store)
-            .map_err(|err| format!("failed to type-check tool '{name}' run export: {err}"))?;
+    let run = tool_run
+        .typed::<(murmur::tool::run::ToolInput,), (murmur::tool::run::ToolResult,)>(&store)
+        .map_err(|err| format!("failed to type-check tool '{name}' run export: {err}"))?;
 
-        // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
-        // also the driver path (`agent.rs` dispatches the inference driver through here),
-        // which before this slice had no deadline of any kind.
-        store.set_epoch_deadline(tool_limits.deadline_ticks());
-        let called = run.call_async(&mut store, (input,)).await;
-        let (result,) = match called {
-            Ok(result) => result,
-            Err(err) => {
-                // Classified rather than folded into the generic "trapped" string, so a
-                // deadline or limit trap is distinguishable on a path that reports failures
-                // as plain text. `Other` reproduces the pre-slice wording verbatim.
-                let failure = classify_guest_failure(&err, &store.data().limits);
-                return Err(failure.message(&format!("tool '{name}'"), &err));
-            }
-        };
-        run.post_return_async(&mut store)
-            .await
-            .map_err(|err| format!("tool '{name}' post-return failed: {err}"))?;
-        Ok(result)
+    // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
+    // also the driver path (`agent.rs` dispatches the inference driver through here),
+    // which before this slice had no deadline of any kind.
+    store.set_epoch_deadline(tool_limits.deadline_ticks());
+    let called = run.call_async(&mut store, (input,)).await;
+    let (result,) = match called {
+        Ok(result) => result,
+        Err(err) => {
+            // Classified rather than folded into the generic "trapped" string, so a
+            // deadline or limit trap is distinguishable on a path that reports failures
+            // as plain text. `Other` reproduces the pre-slice wording verbatim.
+            let failure = classify_guest_failure(&err, &store.data().limits);
+            return Err(failure.message(&format!("tool '{name}'"), &err));
+        }
+    };
+    run.post_return_async(&mut store)
+        .await
+        .map_err(|err| format!("tool '{name}' post-return failed: {err}"))?;
+    Ok(result)
 }
 
 impl CapsuleStoreState {

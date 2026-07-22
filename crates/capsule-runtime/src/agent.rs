@@ -358,6 +358,10 @@ pub(crate) async fn run_agent_loop(
                 },
             )
             .await;
+        // A hook bound to `on-inference` may have called `run-inference` while
+        // handling the event just emitted above — flush whatever it buffered
+        // before writing this turn's own record.
+        flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
         trace
             .write_inference(
                 turn_u32,
@@ -544,6 +548,7 @@ pub(crate) async fn run_agent_loop(
                                     },
                                 )
                                 .await;
+                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                             if outcome.is_skill {
                                 trace
                                     .write_skill_call(
@@ -604,6 +609,7 @@ pub(crate) async fn run_agent_loop(
                                         },
                                     )
                                     .await;
+                                flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                                 trace
                                     .write_shell(
                                         turn_u32,
@@ -657,6 +663,7 @@ pub(crate) async fn run_agent_loop(
                                     },
                                 )
                                 .await;
+                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                             trace
                                 .write_tool_call(
                                     turn_u32,
@@ -862,6 +869,40 @@ pub(crate) async fn run_agent_loop(
     Ok(())
 }
 
+/// Write every `run-inference` record a hook has buffered since the last flush
+/// through the session's real `TraceWriter`/`OtelEmitter`. Called after any
+/// point a hook may have run — `hooks.rs` can't write these itself, since it
+/// has no access to `trace`/`otel` (see `HookInferenceCtx::records`).
+async fn flush_hook_inference_records(
+    hooks: &HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &OtelEmitter,
+    turn: u32,
+) {
+    for record in hooks.drain_inference_records() {
+        let _ = trace
+            .write_inference(
+                turn,
+                record.input_tokens,
+                record.output_tokens,
+                record.decision.clone(),
+                None,
+                Some(&record.origin),
+            )
+            .await;
+        otel.emit_inference(
+            turn,
+            record.input_tokens,
+            record.output_tokens,
+            &record.decision,
+            None,
+            record.duration_ms,
+            Some(&record.origin),
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
@@ -923,28 +964,7 @@ async fn try_compact_via_hooks(
     // the replacement. A hook that retried after a failure therefore leaves two
     // separately-tagged records rather than one relabelled span.
     let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
-    for record in hooks.drain_inference_records() {
-        let _ = trace
-            .write_inference(
-                turn_u32,
-                record.input_tokens,
-                record.output_tokens,
-                record.decision.clone(),
-                None,
-                Some(&record.origin),
-            )
-            .await;
-        otel.emit_inference(
-            turn_u32,
-            record.input_tokens,
-            record.output_tokens,
-            &record.decision,
-            None,
-            record.duration_ms,
-            Some(&record.origin),
-        )
-        .await;
-    }
+    flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
 
     let Some(new_wit_messages) = replacement else {
         append_bootstrap_log(

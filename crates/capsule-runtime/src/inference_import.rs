@@ -18,8 +18,8 @@ use wasmtime::{
 use crate::{
     agent::{build_driver_payload, count_tokens},
     bindings::{
-        host::murmur::tool::run::{Status, ToolInput},
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
+        host::murmur::tool::run::{Status, ToolInput},
     },
     network_policy::NetworkAllowRule,
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
@@ -74,7 +74,11 @@ pub(crate) struct HookInferenceCtx {
 impl HookInferenceCtx {
     /// Run one completion. `Err` is the string handed straight back to the guest
     /// as the `result`'s error case.
-    async fn run(&self, origin: &str, request: InferenceRequest) -> Result<InferenceResponse, String> {
+    async fn run(
+        &self,
+        origin: &str,
+        request: InferenceRequest,
+    ) -> Result<InferenceResponse, String> {
         // `none` resolves to the manifest's primary model; `some(m)` is sent
         // verbatim and, if the driver rejects it, surfaces as `Err` with no
         // retry — a caller wanting fallback calls again with `none` itself.
@@ -176,7 +180,8 @@ impl HookInferenceCtx {
             return Err(format!("inference driver returned an error: {err}"));
         }
 
-        Ok((raw.clone(), response_text(&response)))
+        let text = response_text(&response);
+        Ok((raw, text))
     }
 
     fn record(&self, record: HookInferenceRecord) {
@@ -248,7 +253,9 @@ pub(crate) fn add_inference_to_linker<T: 'static>(
                 fut
             },
         )
-        .map_err(|e| format!("failed to register {INFERENCE_IFACE_VERSIONED}#run-inference: {e}"))?;
+        .map_err(|e| {
+            format!("failed to register {INFERENCE_IFACE_VERSIONED}#run-inference: {e}")
+        })?;
     Ok(())
 }
 
@@ -272,10 +279,7 @@ pub(crate) mod test_support {
         response: &str,
     ) -> Component {
         let len = response.len();
-        let escaped: String = response
-            .bytes()
-            .map(|b| format!("\\{b:02x}"))
-            .collect();
+        let escaped: String = response.bytes().map(|b| format!("\\{b:02x}")).collect();
         let wat = format!(
             r#"(component
   (core module $m
@@ -420,8 +424,11 @@ mod tests {
         let engine = engine();
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 0, CANNED));
 
-        let resp = block_on(ctx.run("hook:test", request(Some("override-model-with-longer-name"))))
-            .expect("override model still completes against the double");
+        let resp = block_on(ctx.run(
+            "hook:test",
+            request(Some("override-model-with-longer-name")),
+        ))
+        .expect("override model still completes against the double");
 
         assert_eq!(resp.model_used, "override-model-with-longer-name");
         assert_eq!(
@@ -433,7 +440,10 @@ mod tests {
             expected_input_tokens("manifest-model"),
             "the two model names must tokenize differently for this test to discriminate"
         );
-        assert_eq!(ctx.drain_records()[0].origin.model, "override-model-with-longer-name");
+        assert_eq!(
+            ctx.drain_records()[0].origin.model,
+            "override-model-with-longer-name"
+        );
     }
 
     /// A driver-reported error surfaces as `Err` and is **not** retried with any
@@ -469,8 +479,8 @@ mod tests {
         let engine = engine();
         let ctx = ctx(&engine, dir.path(), driver_double(&engine, 2, "boom"));
 
-        let err = block_on(ctx.run("hook:test", request(None)))
-            .expect_err("status: error must surface");
+        let err =
+            block_on(ctx.run("hook:test", request(None))).expect_err("status: error must surface");
         assert!(err.contains("boom"), "got: {err}");
         assert_eq!(ctx.drain_records()[0].decision, "error");
     }
