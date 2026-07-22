@@ -8,6 +8,7 @@ pub(crate) mod agent;
 pub mod artifact;
 pub mod bindings;
 pub(crate) mod checkpoint_sign;
+pub(crate) mod compat;
 pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;

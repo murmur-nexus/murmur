@@ -22,6 +22,7 @@ use crate::{
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
     checkpoint_sign::{sign_existing_checkpoints, verify_and_quarantine_checkpoints},
+    compat::lifecycle_v0_2,
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
@@ -33,25 +34,12 @@ use crate::{
 /// component-type section.
 const OBS_IFACE_V0_3: &str = "murmur:hook/lifecycle@0.3.0";
 
-/// Previous versioned instance export name, still accepted.
-///
-/// `murmur:hook` went `0.2.0 → 0.3.0` because `compaction-event` gained two
-/// fields, which the canonical ABI cannot absorb additively. Every hook other
-/// than `murmur-hook-compact` is unaffected by those fields, so the host keeps
-/// loading `@0.2.0`-compiled hooks rather than forcing a fleet-wide rebuild —
-/// it just sends them the old 3-field `compaction-event` (see
-/// [`CompactionEventV02`]).
-///
-/// This is a **transitional, package-scoped** exception covering exactly two
-/// versions of one package. It is *not* a reinstatement of the general
-/// unversioned-name fallback, which was removed permanently; a hook exporting
-/// the bare `murmur:hook/lifecycle` name still fails hard. See
-/// `wit/VERSIONING.md`.
-const OBS_IFACE_V0_2: &str = "murmur:hook/lifecycle@0.2.0";
-
 /// Which `murmur:hook/lifecycle` version a given component resolved at. The
 /// only dispatch decision it drives is the `on-compaction` record shape — every
 /// other lifecycle record is byte-identical between the two versions.
+///
+/// `V0_2` only exists to route to the [`lifecycle_v0_2`] compat shim — see
+/// `COMPAT_SHIMS.md` at the repo root for its removal condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleVersion {
     V0_3,
@@ -59,9 +47,10 @@ enum LifecycleVersion {
 }
 
 /// Resolve the lifecycle instance export, trying `@0.3.0` first and falling back
-/// to `@0.2.0`. Returns the export index together with the version that matched.
-/// `None` means the component exports neither name, which surfaces as a
-/// missing-export error at the call site.
+/// to the [`lifecycle_v0_2`] compat shim's `@0.2.0` name. Returns the export
+/// index together with the version that matched. `None` means the component
+/// exports neither name, which surfaces as a missing-export error at the call
+/// site.
 fn resolve_lifecycle_iface(
     instance: &wasmtime::component::Instance,
     store: &mut Store<HookStoreState>,
@@ -70,34 +59,17 @@ fn resolve_lifecycle_iface(
         return Some((idx, LifecycleVersion::V0_3));
     }
     instance
-        .get_export_index(&mut *store, None, OBS_IFACE_V0_2)
+        .get_export_index(&mut *store, None, lifecycle_v0_2::IFACE_NAME)
         .map(|idx| (idx, LifecycleVersion::V0_2))
 }
 
 /// Diagnostic naming both accepted lifecycle export names, used wherever
 /// resolution fails.
 fn missing_lifecycle_msg(subject: &str) -> String {
+    let v02 = lifecycle_v0_2::IFACE_NAME;
     format!(
-        "hook {subject} exports neither {OBS_IFACE_V0_3} nor {OBS_IFACE_V0_2}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
+        "hook {subject} exports neither {OBS_IFACE_V0_3} nor {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )
-}
-
-/// The `murmur:hook@0.2.0` shape of `compaction-event`, hand-derived because
-/// bindgen only ever generates the *current* (`@0.3.0`, 5-field) record.
-///
-/// `TypedFunc::typed` checks a component function structurally — field order and
-/// types, not names — so lowering the 5-field [`CompactionEvent`] into a
-/// `@0.2.0`-compiled hook's `on-compaction` fails the type check outright rather
-/// than truncating. Sending this 3-field twin instead is what lets an
-/// un-rebuilt hook keep receiving compaction events unchanged. `Lower` only:
-/// the host builds and sends one, it never lifts one back.
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lower)]
-#[component(record)]
-struct CompactionEventV02 {
-    messages: Vec<Message>,
-    #[component(name = "session-tokens")]
-    session_tokens: u64,
-    threshold: f64,
 }
 
 pub(crate) struct HookRuntime {
@@ -742,7 +714,7 @@ async fn instantiate_blocking_hook(
 
     let iface_name = match lifecycle_version {
         LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
-        LifecycleVersion::V0_2 => OBS_IFACE_V0_2,
+        LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
         RuntimeError::Runtime(format!(
@@ -968,7 +940,7 @@ async fn call_hook(
                     call_typed(hook, "on-compaction", evt).await?
                 }
                 LifecycleVersion::V0_2 => {
-                    let evt = CompactionEventV02 {
+                    let evt = lifecycle_v0_2::CompactionEventV02 {
                         messages: messages.clone(),
                         session_tokens: *session_tokens,
                         threshold: *threshold,
@@ -1060,7 +1032,7 @@ async fn call_async_hook(
 
     let iface_name = match lifecycle_version {
         LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
-        LifecycleVersion::V0_2 => OBS_IFACE_V0_2,
+        LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
         format!("hook {name} missing {iface_name}#{fn_name}")
@@ -1819,7 +1791,7 @@ mod tests {
                 "\n    (field \"model\" (option string))\n    (field \"system-prompt\" (option string))",
                 " i32 i32 i32 i32 i32 i32",
             ),
-            LifecycleVersion::V0_2 => (OBS_IFACE_V0_2, "", ""),
+            LifecycleVersion::V0_2 => (lifecycle_v0_2::IFACE_NAME, "", ""),
         };
         let stubs = REQUIRED_HOOK_FNS
             .iter()
@@ -1982,7 +1954,7 @@ mod tests {
                 vec![staged_double_named(
                     "legacy",
                     HookBinding::All,
-                    hook_spin_double_iface(&engine, OBS_IFACE_V0_2),
+                    hook_spin_double_iface(&engine, lifecycle_v0_2::IFACE_NAME),
                 )],
                 limits,
             )

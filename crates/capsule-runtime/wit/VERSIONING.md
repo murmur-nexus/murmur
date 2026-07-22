@@ -76,29 +76,25 @@ Any of:
 A host built for the old major version cannot safely call a component built for
 the new one, and vice versa.
 
-## Two accepted `murmur:hook/lifecycle` versions
+## Compatibility shims
 
-`murmur:hook`'s `0.2.0 → 0.3.0` bump changed exactly one record,
-`compaction-event`, which only a compaction hook reads. Forcing every hook
-artifact in the fleet to be rebuilt for that would be pure churn, so
-`src/hooks.rs` resolves the lifecycle instance export by trying
-`murmur:hook/lifecycle@0.3.0` first and falling back to
-`murmur:hook/lifecycle@0.2.0`, recording which name matched on each
-`HookInstance`.
+Bumping a package's major version can require the host to keep accepting an
+older interface shape for a transition period, rather than forcing every
+affected artifact to be rebuilt in lockstep with the WIT change. Any such
+fallback is a **compat shim**, and its code, removal condition, and inventory
+row live under the compat-shim policy — see `COMPAT_SHIMS.md` at the repo root
+for the full, current list (e.g. the `murmur:hook/lifecycle@0.2.0` shim that
+`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump).
 
-That recorded version drives exactly one dispatch decision: `on-compaction` is
-sent the 5-field `CompactionEvent` when the hook resolved at `@0.3.0` and a
-hand-derived 3-field `CompactionEventV02` when it resolved at `@0.2.0`.
-`TypedFunc::typed` checks a component function *structurally*, so the wrong-arity
-record does not truncate — it fails the type check outright, which is what makes
-this split load-bearing rather than cosmetic. Every other lifecycle record is
-byte-identical between the two versions, so the single bindgen-generated type
-dispatches correctly to either and no other handler is special-cased.
+This doc stays the place to record *why a version number changed*; the shim
+table is the place to record *what backward-compat code exists because of it,
+and when it can be deleted*. Don't re-describe an active shim's mechanics here
+— point at its row instead.
 
-This is a **transitional exception scoped to two specific versions of one
-package**. It is deliberately *not* a reinstatement of the general unversioned
-fallback described in the next section, which stays permanently removed: a hook
-exporting the bare `murmur:hook/lifecycle` name still fails to instantiate.
+A compat shim is deliberately narrower than the general unversioned-name
+fallback described in the next section, which stays permanently removed: a
+hook exporting only the bare `murmur:hook/lifecycle` name still fails to
+instantiate, shim or no shim.
 
 ## Unversioned artifacts: fallback removed
 
@@ -114,8 +110,8 @@ dynamically-instantiated guest interfaces by the **versioned** instance name
 only:
 
 - `src/hooks.rs` — `resolve_lifecycle_iface` resolves
-  `murmur:hook/lifecycle@0.3.0`, falling back to `@0.2.0` (see the previous
-  section) and to nothing else.
+  `murmur:hook/lifecycle@0.3.0`, falling back to `@0.2.0` via the
+  `lifecycle-v0_2` compat shim (`COMPAT_SHIMS.md`) and to nothing else.
 - `src/runtime.rs` — `resolve_versioned_iface` resolves
   `murmur:capsule/run@0.1.0` and `murmur:tool/run@0.1.0`.
 
