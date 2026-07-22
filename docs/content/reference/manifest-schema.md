@@ -110,6 +110,8 @@ inference:
   compaction:
     threshold: 0.85              # optional; default 0.98
     model: claude-haiku-4-5      # optional; defaults to primary inference model
+    system_prompt: |             # optional; defaults to the compaction hook's own prompt
+      task = X, currently editing Y, already tried Z.
     # The compaction hook is selected by binding, not named here: declare an
     # artifact with `runtime: hook` and `binding: on-compaction` (see artifacts:).
   system_prompt: |              # optional; injected as `system` on every API call
@@ -246,6 +248,7 @@ A WASM guest never inherits the host process's environment: `capabilities.env.al
 | `inference.command` | string | `process` only | CLI binary name to spawn; must be on `PATH`. Invalid for `transport: http`. Defaults to `claude` when omitted. |
 | `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of `context.max_tokens` at which compaction fires. Default: `0.98`. |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
+| `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit, or format check. Defaults to `none`; the compaction hook picks its own default prompt. |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. Mutually exclusive with `inference.system_prompt_file`. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt. Relative to the manifest directory. Mutually exclusive with `inference.system_prompt`. |
 
