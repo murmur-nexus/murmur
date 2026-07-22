@@ -451,8 +451,11 @@ Event points:
 `on-task-start`/`on-task-end` are optional exports: a hook component compiled before these events existed instantiates normally and is simply never dispatched for them. All other handlers, including `on-stage` through `on-session-end` from the original vocabulary, remain required — a component missing one of those fails instantiation with an error naming the missing function.
 
 `compaction-event.model` / `compaction-event.system-prompt` tell a compaction
-hook which model and system prompt to use for its own summarization call. Both
-are currently always `none`; manifest wiring lands in a later slice.
+hook which model and system prompt to use for its own summarization call.
+`model` carries `inference.compaction.model` verbatim (`none` when the manifest
+leaves it unset — the receiving hook, not the host, resolves that to a default).
+`system-prompt` is still always `none`; manifest wiring for it lands in a later
+slice.
 
 **Two accepted lifecycle versions.** Adding those two fields made
 `murmur:hook` `0.3.0`, which the canonical ABI cannot absorb additively. Rather

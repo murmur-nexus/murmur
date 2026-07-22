@@ -29,7 +29,6 @@ pub(crate) struct AgentRunConfig {
     /// Fraction of context_window at which compaction fires (0.0–1.0).
     pub compaction_threshold: f32,
     /// Model override for compaction calls. None = use primary inference model.
-    #[allow(dead_code)]
     pub compaction_model: Option<String>,
 }
 
@@ -432,7 +431,7 @@ pub(crate) async fn run_agent_loop(
         if run_config.context_window > 0 {
             let ratio = session_tokens as f32 / run_config.context_window as f32;
             if ratio >= run_config.compaction_threshold {
-                try_compact_via_hooks(
+                let compacted = try_compact_via_hooks(
                     &mut messages,
                     &mut session_tokens,
                     store_state,
@@ -442,8 +441,41 @@ pub(crate) async fn run_agent_loop(
                     hooks,
                     trace,
                     otel,
+                    run_config.compaction_model.clone(),
                 )
                 .await;
+                // A declared compaction hook that returned `Err` ends the session the
+                // same way a driver inference error does — there is no fallback
+                // compactor behind it, so continuing would mean another turn on a
+                // context we already know is over budget.
+                if let Err(error) = compacted {
+                    eprintln!("compaction failed: {error}");
+                    write_result(workdir, &format!("error: {error}"))
+                        .map_err(RuntimeError::AgentLoopFailed)?;
+                    trace.write_session_end("failed").await.map_err(|e| {
+                        RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
+                    })?;
+                    otel.emit_session_end("failed").await;
+                    if task_id.is_some() {
+                        emit_sse(
+                            &sse,
+                            &mut sse_event_id,
+                            "status",
+                            &TaskStatusUpdateEvent {
+                                id: task_id_str.clone(),
+                                context_id: context_id.clone(),
+                                status: StreamStatus {
+                                    state: "failed".into(),
+                                    message: "session ended".into(),
+                                    response: None,
+                                },
+                                r#final: true,
+                            },
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
             }
         }
 
@@ -914,7 +946,8 @@ async fn try_compact_via_hooks(
     hooks: &mut HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
-) {
+    compaction_model: Option<String>,
+) -> Result<(), String> {
     use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
 
     // The WIT Message{role, content} shape has no room for a "tool" message's sibling
@@ -946,15 +979,16 @@ async fn try_compact_via_hooks(
     let tokens_before = *session_tokens;
     let threshold = f64::from(tokens_before) / f64::from(context_window).max(1.0);
 
-    let replacement = hooks
+    let dispatched = hooks
         .dispatch_compaction(
             wit_messages,
             u64::from(*session_tokens),
             threshold,
-            // Both populated by later slices (`compaction-model-from-manifest`,
-            // `compaction-system-prompt-override`); nothing reads the manifest
-            // for them yet.
-            None,
+            // `inference.compaction.model` verbatim — `None` stays `None`; picking a
+            // default is the receiving hook's job, not this dispatch path's.
+            // `system-prompt` is still populated by a later slice
+            // (`compaction-system-prompt-override`).
+            compaction_model,
             None,
         )
         .await;
@@ -966,12 +1000,19 @@ async fn try_compact_via_hooks(
     let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
     flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
 
+    // A declared compaction hook that failed is a session failure, not a silent
+    // fallback: the caller has no other way to get back under budget, and limping
+    // on with an over-budget context is indistinguishable to the operator from
+    // "no hook was ever bound". The caller turns this into the same observable
+    // failure a driver inference error takes.
+    let replacement = dispatched.map_err(|error| format!("compaction hook failed: {error}"))?;
+
     let Some(new_wit_messages) = replacement else {
         append_bootstrap_log(
             workdir,
             "[compaction] threshold reached but no hook returned replace-context; continuing without compaction",
         );
-        return;
+        return Ok(());
     };
 
     let candidate_messages: Vec<Value> = new_wit_messages
@@ -1031,7 +1072,7 @@ async fn try_compact_via_hooks(
             workdir,
             "[compaction] compacted result has an unresolved tool_call; continuing without compaction",
         );
-        return;
+        return Ok(());
     }
 
     // ── Single replace-context commit site ──────────────────────────────────────
@@ -1069,6 +1110,7 @@ async fn try_compact_via_hooks(
             "[compaction] hook compaction at turn {turn}; new session_tokens: {session_tokens}"
         ),
     );
+    Ok(())
 }
 
 /// Reserved `tool-result.metadata` key by which an inference driver opts into host-side

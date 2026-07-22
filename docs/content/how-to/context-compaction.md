@@ -299,6 +299,29 @@ and verification behavior.
 
 ---
 
+## Compaction failure modes
+
+Two situations can prevent compaction from replacing the context, and the runtime treats them
+differently:
+
+**No hook bound to `on-compaction`.** This is not a failure — it means compaction was never
+configured to begin with. The runtime logs `no hook returned replace-context` to
+`logs/bootstrap.log` and the session continues with the uncompacted history.
+
+**A bound hook ran and returned an error.** This *is* treated as a failure, and it ends the
+session: there is no fallback compactor behind a declared compaction hook, so continuing would
+mean another inference turn on a context already known to be over budget. `out/result.txt`
+records the error, the session's `trace.jsonl` records `session_end` with `exit_status: "failed"`,
+OTel emits `session_end` as `"failed"` (if `observability.otel_endpoint` is configured), and — if
+the session has a `task_id` — the final SSE `status` event reports `state: "failed"`. The agent
+loop does not attempt another turn after this.
+
+If your compaction hook can fail (for example, the model it calls for summarization is
+unreachable), account for the fact that this ends the session rather than silently skipping
+compaction.
+
+---
+
 ## Summary
 
 | Manifest setting | Effect |
@@ -307,5 +330,6 @@ and verification behavior.
 | `murmur-hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
 | `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
-| Compaction failure | Non-fatal — session continues unchanged; error logged to `bootstrap.log` |
+| No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; warning logged to `bootstrap.log` |
+| A bound hook returns an error | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count after compaction | Reset to the count of the new (compacted) history, not to zero |
