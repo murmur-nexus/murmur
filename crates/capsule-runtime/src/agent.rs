@@ -30,6 +30,8 @@ pub(crate) struct AgentRunConfig {
     pub compaction_threshold: f32,
     /// Model override for compaction calls. None = use primary inference model.
     pub compaction_model: Option<String>,
+    /// System prompt override for compaction calls. None = the hook picks its own default.
+    pub compaction_system_prompt: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,6 +444,7 @@ pub(crate) async fn run_agent_loop(
                     trace,
                     otel,
                     run_config.compaction_model.clone(),
+                    run_config.compaction_system_prompt.clone(),
                 )
                 .await;
                 // A declared compaction hook that returned `Err` ends the session the
@@ -947,6 +950,7 @@ async fn try_compact_via_hooks(
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
     compaction_model: Option<String>,
+    compaction_system_prompt: Option<String>,
 ) -> Result<(), String> {
     use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
 
@@ -984,12 +988,11 @@ async fn try_compact_via_hooks(
             wit_messages,
             u64::from(*session_tokens),
             threshold,
-            // `inference.compaction.model` verbatim — `None` stays `None`; picking a
-            // default is the receiving hook's job, not this dispatch path's.
-            // `system-prompt` is still populated by a later slice
-            // (`compaction-system-prompt-override`).
+            // `inference.compaction.model` / `.system_prompt` verbatim — `None` stays
+            // `None`; picking a default is the receiving hook's job, not this dispatch
+            // path's.
             compaction_model,
-            None,
+            compaction_system_prompt,
         )
         .await;
 

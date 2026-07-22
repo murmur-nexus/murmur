@@ -209,8 +209,9 @@ pub(crate) enum HookEvent {
         /// `inference.compaction.model`. `None` when the manifest leaves it unset —
         /// resolving that to a concrete model is the receiving hook's job, not ours.
         model: Option<String>,
-        /// Manifest-configured system-prompt override for that call. Always
-        /// `None` today — `compaction-system-prompt-override` populates it.
+        /// Manifest-configured system-prompt override for that call, from
+        /// `inference.compaction.system_prompt`. `None` when the manifest leaves it
+        /// unset — picking a default prompt is the receiving hook's job, not ours.
         system_prompt: Option<String>,
     },
     /// Fires once per task, immediately after that task's agent loop returns.
@@ -1946,15 +1947,29 @@ mod tests {
         Component::new(engine, &bytes).expect("compaction component double compiles")
     }
 
-    /// Sentinel content a [`hook_compaction_echo_model_double`] reports when the
-    /// `compaction-event.model` it received was `none`. Deliberately not a plausible
-    /// model name, so "the host sent none" can never be mistaken for "the host sent
-    /// the string `none`".
+    /// Sentinel content an echo double reports when the option field it was asked to
+    /// echo arrived as `none`. Deliberately not a plausible model name or prompt, so
+    /// "the host sent none" can never be mistaken for "the host sent the string
+    /// `none`".
     const MODEL_ABSENT_SENTINEL: &str = "<<absent>>";
 
     /// A compaction double that reports back what it saw in `compaction-event.model`:
     /// it returns `ok(replace-context([{role: "model", content: <the model string>}]))`,
     /// substituting [`MODEL_ABSENT_SENTINEL`] when the option arrived as `none`.
+    fn hook_compaction_echo_model_double(engine: &wasmtime::Engine) -> Component {
+        hook_compaction_echo_double(engine, "model", "model")
+    }
+
+    /// The `system-prompt` twin of [`hook_compaction_echo_model_double`] — echoes
+    /// `compaction-event.system-prompt` back as the returned message's content, under
+    /// role `"system-prompt"`.
+    fn hook_compaction_echo_system_prompt_double(engine: &wasmtime::Engine) -> Component {
+        hook_compaction_echo_double(engine, "sp", "system-prompt")
+    }
+
+    /// Shared body of the two echo doubles above: echo the `option<string>` carried by
+    /// the `$<field>-some/-ptr/-len` flattened params back out as the single returned
+    /// message's content, tagged with `role`.
     ///
     /// Echoing the *received* pointer/length straight back into the returned message is
     /// what makes this a real assertion on the wire value rather than on host-side Rust
@@ -1963,17 +1978,23 @@ mod tests {
     /// Return area is laid out by hand at offset 128:
     /// `result` discriminant `0` (ok); `hook-output` discriminant `1`
     /// (`replace-context`) at 132 with its `list<message>` (ptr 160, len 1) at 136/140;
-    /// the one `message` at 160 as `{role ptr/len, content ptr/len}`.
+    /// the one `message` at 160 as `{role ptr/len, content ptr/len}`. The role string
+    /// lives at 200 and the absent-sentinel at 224.
     /// Unlike the other doubles this one needs a genuine bump `realloc` — a fixed
     /// address would lower the messages list, the model string and the system-prompt
-    /// string all on top of each other, and the echoed model bytes would be garbage.
-    fn hook_compaction_echo_model_double(engine: &wasmtime::Engine) -> Component {
+    /// string all on top of each other, and the echoed bytes would be garbage.
+    fn hook_compaction_echo_double(
+        engine: &wasmtime::Engine,
+        field: &str,
+        role: &str,
+    ) -> Component {
         let sentinel_len = MODEL_ABSENT_SENTINEL.len();
+        let role_len = role.len();
         let core = format!(
             r#"    (memory (export "memory") 1)
     (global $bump (mut i32) (i32.const 1024))
-    (data (i32.const 200) "model")
-    (data (i32.const 208) "{MODEL_ABSENT_SENTINEL}")
+    (data (i32.const 200) "{role}")
+    (data (i32.const 224) "{MODEL_ABSENT_SENTINEL}")
     (func (export "realloc") (param i32 i32 i32 i32) (result i32)
       (local $r i32)
       (global.set $bump
@@ -1992,11 +2013,11 @@ mod tests {
       (i32.store (i32.const 136) (i32.const 160))
       (i32.store (i32.const 140) (i32.const 1))
       (i32.store (i32.const 160) (i32.const 200))
-      (i32.store (i32.const 164) (i32.const 5))
+      (i32.store (i32.const 164) (i32.const {role_len}))
       (i32.store (i32.const 168)
-        (select (local.get $model-ptr) (i32.const 208) (local.get $model-some)))
+        (select (local.get ${field}-ptr) (i32.const 224) (local.get ${field}-some)))
       (i32.store (i32.const 172)
-        (select (local.get $model-len) (i32.const {sentinel_len}) (local.get $model-some)))
+        (select (local.get ${field}-len) (i32.const {sentinel_len}) (local.get ${field}-some)))
       (i32.const 128))
     (func (export "noop"))"#
         );
@@ -2029,6 +2050,7 @@ mod tests {
         engine: &wasmtime::Engine,
         double: Component,
         model: Option<String>,
+        system_prompt: Option<String>,
     ) -> Result<Option<Vec<Message>>, String> {
         let mut hooks = new_with_hooks(
             engine,
@@ -2051,7 +2073,7 @@ mod tests {
                 1234,
                 0.98,
                 model,
-                None,
+                system_prompt,
             )
             .await
     }
@@ -2071,11 +2093,60 @@ mod tests {
             &engine,
             hook_compaction_echo_model_double(&engine),
             Some("claude-haiku-4-5".to_string()),
+            None,
         ));
 
         let messages = result.expect("hook succeeded").expect("replace-context");
         assert_eq!(messages[0].role, "model");
         assert_eq!(messages[0].content, "claude-haiku-4-5");
+    }
+
+    /// `inference.compaction.system_prompt` set in the manifest reaches the hook
+    /// verbatim as `compaction-event.system-prompt` — and does so independently of
+    /// `model`, which is left unset here.
+    #[test]
+    fn compaction_hook_receives_manifest_system_prompt() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let prompt = "task = X, currently editing Y, already tried Z.";
+        let result = rt.block_on(dispatch_compaction_with(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_compaction_echo_system_prompt_double(&engine),
+            None,
+            Some(prompt.to_string()),
+        ));
+
+        let messages = result.expect("hook succeeded").expect("replace-context");
+        assert_eq!(messages[0].role, "system-prompt");
+        assert_eq!(messages[0].content, prompt);
+    }
+
+    /// No `system_prompt:` in the manifest arrives as `option::none` — nothing on this
+    /// path substitutes a default prompt. `model` is set here to prove the two fields
+    /// resolve independently.
+    #[test]
+    fn compaction_hook_receives_none_when_system_prompt_unset() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result = rt.block_on(dispatch_compaction_with(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_compaction_echo_system_prompt_double(&engine),
+            Some("claude-haiku-4-5".to_string()),
+            None,
+        ));
+
+        let messages = result.expect("hook succeeded").expect("replace-context");
+        assert_eq!(messages[0].content, MODEL_ABSENT_SENTINEL);
     }
 
     /// Scenario 2: no `model:` in the manifest arrives as `option::none` — nothing on
@@ -2092,6 +2163,7 @@ mod tests {
             accessible.path(),
             &engine,
             hook_compaction_echo_model_double(&engine),
+            None,
             None,
         ));
 
@@ -2114,6 +2186,7 @@ mod tests {
             accessible.path(),
             &engine,
             hook_compaction_err_double(&engine),
+            None,
             None,
         ));
 

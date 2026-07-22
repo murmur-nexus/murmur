@@ -416,6 +416,8 @@ pub struct CompactionConfig {
     pub threshold: Option<f32>,
     /// Model for compaction. None means use the primary inference model.
     pub model: Option<String>,
+    /// System prompt for compaction. None means the compaction hook picks its own default.
+    pub system_prompt: Option<String>,
 }
 
 // Threshold values are validated to (0.0, 1.0] at parse time so NaN is impossible.
@@ -731,6 +733,7 @@ struct RawInferenceConfig {
 struct RawCompactionConfig {
     threshold: Option<f32>,
     model: Option<String>,
+    system_prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1259,6 +1262,7 @@ fn parse_compaction(
     Ok(Some(CompactionConfig {
         threshold: raw.threshold,
         model: raw.model,
+        system_prompt: raw.system_prompt,
     }))
 }
 
@@ -1971,6 +1975,58 @@ inference:
             Some("Always begin with CONFIRMED:".to_string())
         );
         assert!(inference.system_prompt_file.is_none());
+    }
+
+    #[test]
+    fn parses_compaction_system_prompt() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    model: compaction-model
+    system_prompt: "task = X, currently editing Y, already tried Z."
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let compaction = manifest.inference.unwrap().compaction.unwrap();
+        assert_eq!(
+            compaction.system_prompt,
+            Some("task = X, currently editing Y, already tried Z.".to_string())
+        );
+        assert_eq!(compaction.model, Some("compaction-model".to_string()));
+    }
+
+    /// The two override fields resolve independently: `model` set, `system_prompt`
+    /// absent leaves the latter `None` with no default string substituted.
+    #[test]
+    fn compaction_system_prompt_absent_stays_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    model: compaction-model
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let compaction = manifest.inference.unwrap().compaction.unwrap();
+        assert!(compaction.system_prompt.is_none());
+        assert_eq!(compaction.model, Some("compaction-model".to_string()));
     }
 
     #[test]
