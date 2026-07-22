@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -21,27 +22,54 @@ use crate::{
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
     checkpoint_sign::{sign_existing_checkpoints, verify_and_quarantine_checkpoints},
+    compat::lifecycle_v0_2,
     errors::RuntimeError,
+    inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
     types::StagedHookArtifact,
 };
 
-/// Versioned instance export name a hook component built against the semver'd
-/// `murmur:hook@0.2.0` WIT package carries in its component-type section. This
-/// is the only name the host resolves — the legacy unversioned fallback was
-/// removed after the dual-accept runtime shipped (see
-/// `wit/VERSIONING.md`).
-const OBS_IFACE_VERSIONED: &str = "murmur:hook/lifecycle@0.2.0";
+/// Current versioned instance export name: what a hook compiled against
+/// `murmur:hook@0.3.0` (5-field `compaction-event`) carries in its
+/// component-type section.
+const OBS_IFACE_V0_3: &str = "murmur:hook/lifecycle@0.3.0";
 
-/// Resolve the `murmur:hook/lifecycle@0.2.0` instance export by its versioned
-/// name. Returns `None` when the versioned name is absent, so a hook that
-/// exports only the legacy unversioned name (or no recognizable name) surfaces
-/// as a missing-export error at the call site. See `wit/VERSIONING.md`.
+/// Which `murmur:hook/lifecycle` version a given component resolved at. The
+/// only dispatch decision it drives is the `on-compaction` record shape — every
+/// other lifecycle record is byte-identical between the two versions.
+///
+/// `V0_2` only exists to route to the [`lifecycle_v0_2`] compat shim — see
+/// `COMPAT_SHIMS.md` at the repo root for its removal condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleVersion {
+    V0_3,
+    V0_2,
+}
+
+/// Resolve the lifecycle instance export, trying `@0.3.0` first and falling back
+/// to the [`lifecycle_v0_2`] compat shim's `@0.2.0` name. Returns the export
+/// index together with the version that matched. `None` means the component
+/// exports neither name, which surfaces as a missing-export error at the call
+/// site.
 fn resolve_lifecycle_iface(
     instance: &wasmtime::component::Instance,
     store: &mut Store<HookStoreState>,
-) -> Option<wasmtime::component::ComponentExportIndex> {
-    instance.get_export_index(&mut *store, None, OBS_IFACE_VERSIONED)
+) -> Option<(wasmtime::component::ComponentExportIndex, LifecycleVersion)> {
+    if let Some(idx) = instance.get_export_index(&mut *store, None, OBS_IFACE_V0_3) {
+        return Some((idx, LifecycleVersion::V0_3));
+    }
+    instance
+        .get_export_index(&mut *store, None, lifecycle_v0_2::IFACE_NAME)
+        .map(|idx| (idx, LifecycleVersion::V0_2))
+}
+
+/// Diagnostic naming both accepted lifecycle export names, used wherever
+/// resolution fails.
+fn missing_lifecycle_msg(subject: &str) -> String {
+    let v02 = lifecycle_v0_2::IFACE_NAME;
+    format!(
+        "hook {subject} exports neither {OBS_IFACE_V0_3} nor {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
+    )
 }
 
 pub(crate) struct HookRuntime {
@@ -57,6 +85,10 @@ pub(crate) struct HookRuntime {
     blocking_hooks: Vec<HookInstance>,
     async_hooks: Vec<AsyncHookSpec>,
     context: SessionContextData,
+    /// Backing for the `murmur:runtime/inference` host import. `None` when the
+    /// capsule has no usable inference driver — `run-inference` then returns a
+    /// clear `err` instead of the import failing to link.
+    inference: Option<Arc<HookInferenceCtx>>,
     started: Instant,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -84,6 +116,9 @@ struct HookInstance {
     name: String,
     config: HookConfig,
     store: Store<HookStoreState>,
+    /// Lifecycle package version this component's exports resolved at; selects
+    /// the `on-compaction` record shape.
+    lifecycle_version: LifecycleVersion,
     /// Name-based dispatch table keyed by the WIT function name
     /// (e.g. `"on-session-start"`). Always holds every entry in [`REQUIRED_HOOK_FNS`];
     /// entries from [`OPTIONAL_HOOK_FNS`] are present only if the component exports them.
@@ -170,6 +205,12 @@ pub(crate) enum HookEvent {
         messages: Vec<Message>,
         session_tokens: u64,
         threshold: f64,
+        /// Manifest-configured model for the hook's own summarization call.
+        /// Always `None` today — `compaction-model-from-manifest` populates it.
+        model: Option<String>,
+        /// Manifest-configured system-prompt override for that call. Always
+        /// `None` today — `compaction-system-prompt-override` populates it.
+        system_prompt: Option<String>,
     },
     /// Fires once per task, immediately after that task's agent loop returns.
     TaskEnd {
@@ -301,6 +342,10 @@ async fn call_stage_once(
 ) -> Result<HookOutput, String> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    // `on-stage` runs during staging, long before an inference driver exists —
+    // the import is defined so an inference-importing hook still links, and
+    // always errors.
+    add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), None)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -321,12 +366,8 @@ async fn call_stage_once(
             )
         })?;
 
-    let obs_idx = resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| {
-        format!(
-            "hook {}@{} missing export {OBS_IFACE_VERSIONED}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)",
-            staged.name, staged.version
-        )
-    })?;
+    let (obs_idx, _version) = resolve_lifecycle_iface(&instance, &mut store)
+        .ok_or_else(|| missing_lifecycle_msg(&format!("{}@{}", staged.name, staged.version)))?;
 
     let func = instance
         .get_export_index(&mut store, Some(&obs_idx), "on-stage")
@@ -365,6 +406,7 @@ impl HookRuntime {
         context: SessionContextData,
         env_vars: HookEnvVars<'_>,
         limits: ExecutionLimits,
+        inference: Option<Arc<HookInferenceCtx>>,
     ) -> Result<Self, RuntimeError> {
         let mut blocking_hooks = Vec::new();
         let mut async_hooks = Vec::new();
@@ -387,6 +429,7 @@ impl HookRuntime {
                             &staged,
                             &env_vars,
                             limits,
+                            inference.clone(),
                         )
                         .await?;
                     blocking_hooks.push(instance);
@@ -402,6 +445,7 @@ impl HookRuntime {
             blocking_hooks,
             async_hooks,
             context,
+            inference,
             started: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -417,6 +461,17 @@ impl HookRuntime {
     /// aggregate rather than a single task's count.
     pub(crate) fn total_turns(&self) -> u32 {
         self.total_turns
+    }
+
+    /// Take every `run-inference` trace record buffered since the last drain.
+    /// The agent loop calls this after hook dispatch and writes each one through
+    /// the session's `TraceWriter`/`OtelEmitter` — one record per call, success
+    /// or failure, tagged `hook:<name>`.
+    pub(crate) fn drain_inference_records(&self) -> Vec<HookInferenceRecord> {
+        self.inference
+            .as_ref()
+            .map(|ctx| ctx.drain_records())
+            .unwrap_or_default()
     }
 
     /// Dispatch `event` to all bound hooks. Returns every artifact emitted by
@@ -501,6 +556,7 @@ impl HookRuntime {
             let event = event.clone();
             let elapsed = self.started.elapsed();
             let limits = self.limits;
+            let inference = self.inference.clone();
 
             tokio::task::spawn_local(async move {
                 if let Err(err) = call_async_hook(
@@ -513,6 +569,7 @@ impl HookRuntime {
                     elapsed,
                     totals,
                     limits,
+                    inference,
                 )
                 .await
                 {
@@ -581,12 +638,16 @@ impl HookRuntime {
         messages: Vec<Message>,
         session_tokens: u64,
         threshold: f64,
+        model: Option<String>,
+        system_prompt: Option<String>,
     ) -> Option<Vec<Message>> {
         let workdir = self.workdir.clone();
         let event = HookEvent::Compaction {
             messages,
             session_tokens,
             threshold,
+            model,
+            system_prompt,
         };
         self.dispatch(&workdir, event).await.1
     }
@@ -616,10 +677,13 @@ async fn instantiate_blocking_hook(
     staged: &StagedHookArtifact,
     env_vars: &HookEnvVars<'_>,
     limits: ExecutionLimits,
+    inference: Option<Arc<HookInferenceCtx>>,
 ) -> Result<HookInstance, RuntimeError> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), inference)
+        .map_err(RuntimeError::Runtime)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -640,16 +704,21 @@ async fn instantiate_blocking_hook(
             ))
         })?;
 
-    let obs_idx = resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| {
-        RuntimeError::Runtime(format!(
-            "hook {}@{} missing export {OBS_IFACE_VERSIONED}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)",
-            staged.name, staged.version
-        ))
-    })?;
+    let (obs_idx, lifecycle_version) = resolve_lifecycle_iface(&instance, &mut store)
+        .ok_or_else(|| {
+            RuntimeError::Runtime(missing_lifecycle_msg(&format!(
+                "{}@{}",
+                staged.name, staged.version
+            )))
+        })?;
 
+    let iface_name = match lifecycle_version {
+        LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
+        LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
+    };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
         RuntimeError::Runtime(format!(
-            "hook {}@{} missing function {OBS_IFACE_VERSIONED}#{fn_name}",
+            "hook {}@{} missing function {iface_name}#{fn_name}",
             staged.name, staged.version
         ))
     })?;
@@ -659,6 +728,7 @@ async fn instantiate_blocking_hook(
         name: staged.name.clone(),
         config: staged.config.clone(),
         store,
+        lifecycle_version,
     })
 }
 
@@ -851,13 +921,33 @@ async fn call_hook(
             messages,
             session_tokens,
             threshold,
+            model,
+            system_prompt,
         } => {
-            let evt = CompactionEvent {
-                messages: messages.clone(),
-                session_tokens: *session_tokens,
-                threshold: *threshold,
-            };
-            call_typed(hook, "on-compaction", evt).await?
+            // The one record whose shape differs between `murmur:hook@0.2.0`
+            // and `@0.3.0`. `TypedFunc::typed` is structural, so the 5-field
+            // record simply does not type-check against a `@0.2.0`-compiled
+            // hook's `on-compaction`; send it the 3-field twin instead.
+            match hook.lifecycle_version {
+                LifecycleVersion::V0_3 => {
+                    let evt = CompactionEvent {
+                        messages: messages.clone(),
+                        session_tokens: *session_tokens,
+                        threshold: *threshold,
+                        model: model.clone(),
+                        system_prompt: system_prompt.clone(),
+                    };
+                    call_typed(hook, "on-compaction", evt).await?
+                }
+                LifecycleVersion::V0_2 => {
+                    let evt = lifecycle_v0_2::CompactionEventV02 {
+                        messages: messages.clone(),
+                        session_tokens: *session_tokens,
+                        threshold: *threshold,
+                    };
+                    call_typed(hook, "on-compaction", evt).await?
+                }
+            }
         }
         HookEvent::TaskEnd {
             task_id,
@@ -916,9 +1006,11 @@ async fn call_async_hook(
     elapsed: Duration,
     totals: HookTotals,
     limits: ExecutionLimits,
+    inference: Option<Arc<HookInferenceCtx>>,
 ) -> Result<(), String> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    add_inference_to_linker(&mut linker, format!("hook:{name}"), inference)?;
 
     let env = HookEnvVars::default();
     let state = HookStoreState {
@@ -935,14 +1027,15 @@ async fn call_async_hook(
         .await
         .map_err(|e| e.to_string())?;
 
-    let obs_idx = resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| {
-        format!(
-            "hook {name} missing export {OBS_IFACE_VERSIONED}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
-        )
-    })?;
+    let (obs_idx, lifecycle_version) =
+        resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| missing_lifecycle_msg(name))?;
 
+    let iface_name = match lifecycle_version {
+        LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
+        LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
+    };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
-        format!("hook {name} missing {OBS_IFACE_VERSIONED}#{fn_name}")
+        format!("hook {name} missing {iface_name}#{fn_name}")
     })?;
 
     let mut tmp = HookInstance {
@@ -950,6 +1043,7 @@ async fn call_async_hook(
         config: HookConfig::default(),
         funcs,
         store,
+        lifecycle_version,
     };
     // Async hooks fire-and-forget; any committable output is intentionally discarded.
     call_hook(&mut tmp, context, event, elapsed, totals).await.map(|_| ())
@@ -1014,7 +1108,10 @@ async fn log_hook_error(workdir: &Path, hook_name: &str, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint_sign::test_support::{with_home, HOME_LOCK};
+    use crate::{
+        checkpoint_sign::test_support::{with_home, HOME_LOCK},
+        inference_import::INFERENCE_IFACE_VERSIONED,
+    };
     use tempfile::TempDir;
 
     /// Builds a `HookRuntime` with zero registered hooks against a fresh `TempDir` pair,
@@ -1036,6 +1133,7 @@ mod tests {
             },
             HookEnvVars::default(),
             ExecutionLimits::default(),
+            None,
         )
         .await
         .expect("HookRuntime::new should succeed with zero hooks")
@@ -1061,7 +1159,7 @@ mod tests {
         // Default double exports the versioned instance name — the only name the
         // host resolves now that the unversioned fallback is removed — so the
         // required/optional suite exercises real resolution.
-        hook_double_iface(engine, OBS_IFACE_VERSIONED, fn_names)
+        hook_double_iface(engine, OBS_IFACE_V0_3, fn_names)
     }
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
@@ -1136,6 +1234,7 @@ mod tests {
             },
             HookEnvVars::default(),
             limits,
+            None,
         )
         .await
     }
@@ -1384,7 +1483,7 @@ mod tests {
         let engine = hook_test_engine();
         let mut names: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
         names.extend_from_slice(&OPTIONAL_HOOK_FNS);
-        let component = hook_double_iface(&engine, OBS_IFACE_VERSIONED, &names);
+        let component = hook_double_iface(&engine, OBS_IFACE_V0_3, &names);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1432,7 +1531,7 @@ mod tests {
                 Err(e) => e.to_string(),
             };
             assert!(
-                msg.contains(OBS_IFACE_VERSIONED),
+                msg.contains(OBS_IFACE_V0_3),
                 "error must name the versioned lifecycle export, got: {msg}"
             );
             assert!(
@@ -1469,7 +1568,7 @@ mod tests {
                 Err(e) => e.to_string(),
             };
             assert!(
-                msg.contains(OBS_IFACE_VERSIONED),
+                msg.contains(OBS_IFACE_V0_3),
                 "error must name the missing lifecycle export, got: {msg}"
             );
         });
@@ -1613,6 +1712,13 @@ mod tests {
     /// like `string` need no such export, which is why [`hook_double`] gets away without
     /// any of this.
     fn hook_spin_double(engine: &wasmtime::Engine) -> Component {
+        hook_spin_double_iface(engine, OBS_IFACE_V0_3)
+    }
+
+    /// [`hook_spin_double`] under an explicit lifecycle instance name, so the
+    /// same real-signature `on-session-start` can be presented as either
+    /// lifecycle version.
+    fn hook_spin_double_iface(engine: &wasmtime::Engine, iface: &str) -> Component {
         let exports = REQUIRED_HOOK_FNS
             .iter()
             .map(|n| format!("    (export \"{n}\" (func $f))"))
@@ -1658,11 +1764,439 @@ mod tests {
     (export "session-context" (type $session-context))
 {exports}
   )
-  (export "{OBS_IFACE_VERSIONED}" (instance $lc))
+  (export "{iface}" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("spin component WAT parses");
         Component::new(engine, &bytes).expect("spin component double compiles")
+    }
+
+    /// A lifecycle double whose `on-compaction` genuinely declares the record
+    /// shape of `version` and returns `ok(hook-output::none)`.
+    ///
+    /// `TypedFunc::typed` checks structurally, so this is the only way to prove
+    /// the host sends the *right* shape: a 5-field lower against the `@0.2.0`
+    /// double (or vice versa) fails the type check and lands in the hook's error
+    /// log instead of completing silently.
+    ///
+    /// The core function ignores its params and returns a pointer to a
+    /// hand-laid-out `result<hook-output, string>` — discriminant `0` (ok) at
+    /// offset 0, the `hook-output` variant at offset 4 with discriminant `0`
+    /// (`none`). The other five required exports are bare `func() -> ()` stubs;
+    /// only `on-compaction` is ever dispatched here.
+    fn hook_compaction_double(engine: &wasmtime::Engine, version: LifecycleVersion) -> Component {
+        let (iface, extra_fields, extra_params) = match version {
+            LifecycleVersion::V0_3 => (
+                OBS_IFACE_V0_3,
+                "\n    (field \"model\" (option string))\n    (field \"system-prompt\" (option string))",
+                " i32 i32 i32 i32 i32 i32",
+            ),
+            LifecycleVersion::V0_2 => (lifecycle_v0_2::IFACE_NAME, "", ""),
+        };
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-compaction")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "oncompact") (param i32 i32 i64 f64{extra_params}) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)))
+  (type $compaction-event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64){extra_fields}))
+  (type $ft (func (param "event" $compaction-event) (result (result $hook-output (error string)))))
+
+  (func $oc (type $ft)
+    (canon lift (core func $i "oncompact") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "compaction-event" (type $compaction-event))
+    (export "on-compaction" (func $oc))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("compaction component WAT parses");
+        Component::new(engine, &bytes).expect("compaction component double compiles")
+    }
+
+    async fn dispatch_compaction_against(
+        session: &Path,
+        accessible: &Path,
+        engine: &wasmtime::Engine,
+        version: LifecycleVersion,
+    ) {
+        let mut hooks = new_with_hooks(
+            engine,
+            session,
+            accessible,
+            vec![staged_double_named(
+                "compactor",
+                HookBinding::OnCompaction,
+                hook_compaction_double(engine, version),
+            )],
+        )
+        .await
+        .expect("both lifecycle versions must instantiate");
+        assert_eq!(hooks.blocking_hooks[0].lifecycle_version, version);
+
+        let replacement = hooks
+            .dispatch_compaction(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                1234,
+                0.98,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            replacement.is_none(),
+            "the double returns hook-output::none, so no context replacement"
+        );
+    }
+
+    /// A hook still compiled against `murmur:hook/lifecycle@0.2.0` — every hook
+    /// except the future rebuilt `murmur-hook-compact` — instantiates via the
+    /// version fallback and receives `on-compaction` with the old 3-field
+    /// record. Nothing is logged, so the dispatch really completed rather than
+    /// failing `.typed()` and being isolated.
+    #[test]
+    fn v0_2_hook_receives_three_field_compaction_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_compaction_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_2,
+        ));
+
+        assert_eq!(
+            hook_log_lines(session.path(), "compactor"),
+            0,
+            "a @0.2.0 hook must receive on-compaction cleanly, not an ABI mismatch"
+        );
+    }
+
+    /// A hook rebuilt against `@0.3.0` receives the new 5-field record.
+    #[test]
+    fn v0_3_hook_receives_five_field_compaction_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_compaction_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_3,
+        ));
+
+        assert_eq!(hook_log_lines(session.path(), "compactor"), 0);
+    }
+
+    /// A `@0.2.0`-compiled hook keeps receiving every *other* lifecycle event
+    /// too: those records are shape-identical between the two versions, so the
+    /// single bindgen-generated type dispatches to either. Proven by a spin
+    /// double re-exported under the `@0.2.0` instance name — reaching the epoch
+    /// deadline means `on-session-start` type-checked and actually entered the
+    /// guest.
+    #[test]
+    fn v0_2_hook_still_receives_unchanged_lifecycle_records() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let _ticker = crate::limits::EpochTicker::spawn(&engine);
+        let limits = ExecutionLimits {
+            deadline_seconds: 1,
+            ..ExecutionLimits::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks_limited(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "legacy",
+                    HookBinding::All,
+                    hook_spin_double_iface(&engine, lifecycle_v0_2::IFACE_NAME),
+                )],
+                limits,
+            )
+            .await
+            .expect("a @0.2.0 hook must instantiate through the version fallback");
+            assert_eq!(
+                hooks.blocking_hooks[0].lifecycle_version,
+                LifecycleVersion::V0_2
+            );
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+        });
+
+        let log = std::fs::read_to_string(session.path().join("logs").join("hook-legacy.log"))
+            .expect("the spinning @0.2.0 hook logs its deadline");
+        assert!(
+            log.contains("exceeded its 1s execution deadline"),
+            "the call must have entered the guest (deadline), not failed a type check; got: {log}"
+        );
+    }
+
+    /// End-to-end through the real host import: a hook component that imports
+    /// `murmur:runtime/inference@0.2.0` and calls `run-inference` gets back the
+    /// driver double's completion text, which it returns as an `on-inference`
+    /// artifact so the test can read it.
+    #[test]
+    fn hook_importing_run_inference_receives_the_driver_completion() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let driver = crate::inference_import::test_support::driver_double(
+            &engine,
+            0,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"hello from driver"}]}"#,
+        );
+        let ctx = Arc::new(HookInferenceCtx {
+            driver_name: "mock-driver".to_string(),
+            driver_component: driver,
+            model: "manifest-model".to_string(),
+            engine: engine.clone(),
+            accessible_workdir: accessible.path().to_path_buf(),
+            inference_env: Vec::new(),
+            capability_policy: crate::types::CapabilityPolicy::default(),
+            network_allow_rules: Vec::new(),
+            records: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let artifacts = rt.block_on(async {
+            let mut hooks = HookRuntime::new(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "caller",
+                    HookBinding::OnInference,
+                    hook_inference_caller_double(&engine),
+                )],
+                SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "manifest-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                HookEnvVars::default(),
+                ExecutionLimits::default(),
+                Some(Arc::clone(&ctx)),
+            )
+            .await
+            .expect("a hook importing murmur:runtime/inference must link");
+            hooks.emit(session.path(), inference_event()).await
+        });
+
+        assert_eq!(artifacts.len(), 1, "the hook returns run-inference's text");
+        assert_eq!(artifacts[0].payload, "hello from driver");
+        let records = ctx.drain_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].origin.source, "hook:caller");
+        assert_eq!(records[0].origin.model, "manifest-model");
+    }
+
+    /// Same component, but the capsule has no inference driver staged. The
+    /// import still links (so the hook runs at all) and `run-inference` returns
+    /// a clear `err` naming the manifest key to add — never a panic or an
+    /// instantiation failure.
+    #[test]
+    fn hook_run_inference_without_driver_gets_clear_error() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let artifacts = rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "caller",
+                    HookBinding::OnInference,
+                    hook_inference_caller_double(&engine),
+                )],
+            )
+            .await
+            .expect("the import is defined even with no driver, so the hook links");
+            hooks.emit(session.path(), inference_event()).await
+        });
+
+        assert_eq!(artifacts.len(), 1);
+        assert!(
+            artifacts[0].payload.contains("inference driver is not configured")
+                && artifacts[0].payload.contains("inference.driver.artifact"),
+            "got: {}",
+            artifacts[0].payload
+        );
+    }
+
+    fn inference_event() -> HookEvent {
+        HookEvent::Inference {
+            turn: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            decision: "end_turn".to_string(),
+            tool_name: None,
+            prompt: None,
+            output: None,
+            tools: None,
+        }
+    }
+
+    /// A `@0.3.0` lifecycle double that *imports* `murmur:runtime/inference@0.2.0`
+    /// and, on `on-inference`, calls `run-inference` with an empty message list
+    /// and `model: none`, then returns whichever string the call produced —
+    /// the completion text on success, the error message on failure — as
+    /// `hook-output::artifact`. `on-inference` is the one event whose artifact
+    /// `dispatch` forwards, which is what makes the result observable.
+    ///
+    /// Memory and `realloc` live in a separate core module so the lowered import
+    /// can reference them without a cyclic instantiation. `result<inference-response,
+    /// string>` lays `ok`/`err` payloads at the same offset (record align 8 →
+    /// discriminant at 0, payload at 8), so one code path copies either string's
+    /// `(ptr, len)` into the artifact.
+    fn hook_inference_caller_double(engine: &wasmtime::Engine) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-inference")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wat = format!(
+            r#"(component
+  (import "{INFERENCE_IFACE_VERSIONED}" (instance $inf
+    (type (record (field "role" string) (field "content" string)))
+    (export "message" (type (eq 0)))
+    (type (list 1))
+    (type (option string))
+    (type (record
+      (field "messages" 2)
+      (field "system-prompt" 3)
+      (field "model" 3)))
+    (export "inference-request" (type (eq 4)))
+    (type (record
+      (field "text" string)
+      (field "model-used" string)
+      (field "input-tokens" u64)
+      (field "output-tokens" u64)))
+    (export "inference-response" (type (eq 6)))
+    (type (result 7 (error string)))
+    (export "run-inference" (func (param "request" 5) (result 8)))
+  ))
+  (alias export $inf "run-inference" (func $runi))
+
+  (core module $libc
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 1024))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (i32.add (local.get 3) (i32.const 8))))
+      (local.get $p))
+  )
+  (core instance $li (instantiate $libc))
+  (alias core export $li "memory" (core memory $mem))
+  (alias core export $li "realloc" (core func $realloc))
+  (core func $run_lowered
+    (canon lower (func $runi) (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "libc" "memory" (memory 1))
+    (import "inf" "run" (func $run (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+    (func (export "oninf") (param i32) (result i32)
+      (call $run
+        (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 256))
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 3))
+      (i32.store (i32.const 136) (i32.load (i32.const 264)))
+      (i32.store (i32.const 140) (i32.load (i32.const 268)))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m
+    (with "libc" (instance $li))
+    (with "inf" (instance (export "run" (func $run_lowered))))))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)))
+  (type $inference-event (record
+    (field "turn" u32)
+    (field "input-tokens" u64)
+    (field "output-tokens" u64)
+    (field "decision" string)
+    (field "tool-name" (option string))
+    (field "prompt" (option string))
+    (field "output" (option string))
+    (field "tools" (option string))))
+  (type $ft (func (param "event" $inference-event) (result (result $hook-output (error string)))))
+
+  (func $oninf (type $ft)
+    (canon lift (core func $i "oninf") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "inference-event" (type $inference-event))
+    (export "on-inference" (func $oninf))
+{stubs}
+  )
+  (export "{OBS_IFACE_V0_3}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("inference-caller component WAT parses");
+        Component::new(engine, &bytes).expect("inference-caller component double compiles")
     }
 
     /// A hook that never returns from `on-session-start` is cut off at its epoch deadline

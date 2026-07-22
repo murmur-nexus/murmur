@@ -1,4 +1,4 @@
-package murmur:hook@0.2.0;
+package murmur:hook@0.3.0;
 
 interface lifecycle {
     record message {
@@ -79,6 +79,14 @@ interface lifecycle {
         messages: list<message>,
         session-tokens: u64,
         threshold: f64,
+        /// Model the hook should use for its summarization call, when the
+        /// manifest configures one. `none` = use the capsule's primary
+        /// `inference.model`. Always `none` today; populated by a later slice.
+        model: option<string>,
+        /// System prompt override for the hook's summarization call. `none` =
+        /// the hook's own built-in prompt. Always `none` today; populated by a
+        /// later slice.
+        system-prompt: option<string>,
     }
 
     record session-end-event {

@@ -37,6 +37,18 @@ pub(crate) struct TraceWriter {
     pub(crate) active_task_id: Option<String>,
 }
 
+/// Provenance of an inference record that did **not** come from the agent
+/// loop's own turn — today, only a hook's `run-inference` call. `None` at a
+/// `write_inference`/`emit_inference` call site means "ordinary agent-loop
+/// turn", which serializes exactly as it did before this existed.
+#[derive(Debug, Clone)]
+pub(crate) struct InferenceOrigin {
+    /// `hook:<manifest name>` of the hook that made the call.
+    pub(crate) source: String,
+    /// Model string actually sent (the attempted model, on failure).
+    pub(crate) model: String,
+}
+
 // ── Event structs (Serialize → JSONL lines) ──────────────────────────────────
 
 #[derive(Serialize)]
@@ -62,6 +74,17 @@ struct InferenceEvent {
     output_tokens: u64,
     decision: String,
     tool_name: Option<String>,
+    /// Where this inference came from. Absent for an ordinary agent-loop turn,
+    /// so every pre-existing consumer sees a byte-identical record; `"hook:<name>"`
+    /// for a completion that hook ran through `murmur:runtime/inference`'s
+    /// `run-inference`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    /// Model string actually sent for this call (the attempted model, on
+    /// failure). Only written alongside `origin`: an agent-loop turn's model is
+    /// already on the session-start record and is not repeated per turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -260,6 +283,7 @@ impl TraceWriter {
         output_tokens: u64,
         decision: String,
         tool_name: Option<String>,
+        origin: Option<&InferenceOrigin>,
     ) -> std::io::Result<()> {
         let event = InferenceEvent {
             event_type: "inference",
@@ -270,6 +294,8 @@ impl TraceWriter {
             output_tokens,
             decision,
             tool_name,
+            origin: origin.map(|o| o.source.clone()),
+            model: origin.map(|o| o.model.clone()),
         };
         self.write_event(&event).await?;
         self.total_turns = self.total_turns.saturating_add(1);
@@ -600,6 +626,7 @@ mod tests {
             50,
             "tool_call".to_string(),
             Some("bash".to_string()),
+            None,
         )
         .await
         .unwrap();
@@ -772,7 +799,7 @@ mod tests {
     async fn session_end_fields_and_snake_case() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_inference(0, 100, 50, "tool_call".to_string(), None)
+        w.write_inference(0, 100, 50, "tool_call".to_string(), None, None)
             .await
             .unwrap();
         w.write_tool_call(
@@ -869,7 +896,7 @@ mod tests {
         w.write_session_start(10, vec!["bash".to_string()])
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "end_turn".to_string(), None)
+        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -886,7 +913,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, vec![]).await.unwrap();
-        w.write_inference(0, 50, 25, "tool_call".to_string(), Some("bash".to_string()))
+        w.write_inference(0, 50, 25, "tool_call".to_string(), Some("bash".to_string()), None)
             .await
             .unwrap();
         w.write_tool_call(
@@ -906,7 +933,7 @@ mod tests {
         w.write_shell(0, "echo".to_string(), 0, 4, 0, 1)
             .await
             .unwrap();
-        w.write_inference(1, 60, 30, "end_turn".to_string(), None)
+        w.write_inference(1, 60, 30, "end_turn".to_string(), None, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();

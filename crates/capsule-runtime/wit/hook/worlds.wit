@@ -1,5 +1,11 @@
-package murmur:runtime@0.1.0;
+package murmur:runtime@0.2.0;
 
+/// Every hook component is compiled against this world.
+///
+/// `inference` is `murmur:runtime/inference@0.2.0` — the same package this world
+/// is declared in, so it is referenced by its bare interface name (a
+/// fully-qualified self-package reference does not resolve in wit-parser).
 world hook {
-  export murmur:hook/lifecycle@0.2.0;
+  import inference;
+  export murmur:hook/lifecycle@0.3.0;
 }

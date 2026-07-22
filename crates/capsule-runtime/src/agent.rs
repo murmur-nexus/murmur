@@ -358,6 +358,10 @@ pub(crate) async fn run_agent_loop(
                 },
             )
             .await;
+        // A hook bound to `on-inference` may have called `run-inference` while
+        // handling the event just emitted above — flush whatever it buffered
+        // before writing this turn's own record.
+        flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
         trace
             .write_inference(
                 turn_u32,
@@ -365,6 +369,7 @@ pub(crate) async fn run_agent_loop(
                 u64::from(output_tokens),
                 decision.to_string(),
                 hook_tool_name.clone(),
+                None,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -375,6 +380,7 @@ pub(crate) async fn run_agent_loop(
             decision,
             hook_tool_name.as_deref(),
             inference_duration_ms,
+            None,
         )
         .await;
         if stop_reason == "error" {
@@ -542,6 +548,7 @@ pub(crate) async fn run_agent_loop(
                                     },
                                 )
                                 .await;
+                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                             if outcome.is_skill {
                                 trace
                                     .write_skill_call(
@@ -602,6 +609,7 @@ pub(crate) async fn run_agent_loop(
                                         },
                                     )
                                     .await;
+                                flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                                 trace
                                     .write_shell(
                                         turn_u32,
@@ -655,6 +663,7 @@ pub(crate) async fn run_agent_loop(
                                     },
                                 )
                                 .await;
+                            flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
                             trace
                                 .write_tool_call(
                                     turn_u32,
@@ -860,6 +869,40 @@ pub(crate) async fn run_agent_loop(
     Ok(())
 }
 
+/// Write every `run-inference` record a hook has buffered since the last flush
+/// through the session's real `TraceWriter`/`OtelEmitter`. Called after any
+/// point a hook may have run — `hooks.rs` can't write these itself, since it
+/// has no access to `trace`/`otel` (see `HookInferenceCtx::records`).
+async fn flush_hook_inference_records(
+    hooks: &HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &OtelEmitter,
+    turn: u32,
+) {
+    for record in hooks.drain_inference_records() {
+        let _ = trace
+            .write_inference(
+                turn,
+                record.input_tokens,
+                record.output_tokens,
+                record.decision.clone(),
+                None,
+                Some(&record.origin),
+            )
+            .await;
+        otel.emit_inference(
+            turn,
+            record.input_tokens,
+            record.output_tokens,
+            &record.decision,
+            None,
+            record.duration_ms,
+            Some(&record.origin),
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
@@ -904,8 +947,24 @@ async fn try_compact_via_hooks(
     let threshold = f64::from(tokens_before) / f64::from(context_window).max(1.0);
 
     let replacement = hooks
-        .dispatch_compaction(wit_messages, u64::from(*session_tokens), threshold)
+        .dispatch_compaction(
+            wit_messages,
+            u64::from(*session_tokens),
+            threshold,
+            // Both populated by later slices (`compaction-model-from-manifest`,
+            // `compaction-system-prompt-override`); nothing reads the manifest
+            // for them yet.
+            None,
+            None,
+        )
         .await;
+
+    // Every `run-inference` call a hook made while handling this event produced
+    // one buffered record — write them all, success or failure, before acting on
+    // the replacement. A hook that retried after a failure therefore leaves two
+    // separately-tagged records rather than one relabelled span.
+    let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
+    flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
 
     let Some(new_wit_messages) = replacement else {
         append_bootstrap_log(
@@ -1078,7 +1137,7 @@ fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
 /// returns the metadata key sees zero behavior change. Note this is the *wire* payload:
 /// `session_tokens` accounting is always computed from a full-messages payload by the caller,
 /// never from this (possibly smaller) one.
-fn build_driver_payload(
+pub(crate) fn build_driver_payload(
     model: &str,
     messages: &[Value],
     tools: &[Value],
@@ -1153,7 +1212,7 @@ pub(crate) fn append_bootstrap_log(workdir: &Path, message: &str) {
 static CL100K: LazyLock<Option<tiktoken_rs::CoreBPE>> =
     LazyLock::new(|| tiktoken_rs::cl100k_base().ok());
 
-fn count_tokens(text: &str) -> u32 {
+pub(crate) fn count_tokens(text: &str) -> u32 {
     CL100K
         .as_ref()
         .map(|bpe| bpe.encode_with_special_tokens(text).len() as u32)
