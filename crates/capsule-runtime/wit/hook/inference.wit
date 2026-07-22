@@ -1,0 +1,58 @@
+package murmur:runtime@0.2.0;
+
+/// Host-provided capability available to any hook component.
+///
+/// A hook that imports this interface can run exactly **one** LLM completion
+/// through the capsule's already-configured inference driver — the same WASM
+/// driver artifact (`inference.driver.artifact` in `murmur.yaml`) the agent
+/// loop dispatches its own turns through. There is no second HTTP client and no
+/// separate credential path: the host reuses the driver-component invocation it
+/// already performs for an ordinary turn.
+interface inference {
+    use murmur:hook/lifecycle@0.3.0.{message};
+
+    /// One completion request.
+    ///
+    /// `system-prompt` and `model` are genuinely optional — `none` means "the
+    /// host decides", not "empty string".
+    record inference-request {
+        /// Conversation to complete. Same `{role, content}` shape the
+        /// `compaction-event` hands a hook, so a compaction hook can forward
+        /// (a summarized slice of) what it was given without translation.
+        messages: list<message>,
+        /// System prompt for this call. `none` sends no system prompt at all.
+        system-prompt: option<string>,
+        /// Model to run with. `none` resolves to the manifest's primary
+        /// `inference.model`.
+        ///
+        /// A `some(m)` the driver or provider rejects returns `err` — the host
+        /// **never** silently falls back to the primary model. A caller that
+        /// wants fallback-on-failure must call `run-inference` a second time
+        /// with `model: none`, so each attempt produces its own truthful trace
+        /// record and OTel span rather than one span quietly relabelled.
+        model: option<string>,
+    }
+
+    /// One completion result.
+    ///
+    /// The driver wire format carries no usage block and never echoes back a
+    /// confirmed model name (see `docs/murmur-inference-message-format.md`), so
+    /// `model-used` is the model string the host actually sent and the two token
+    /// counts are computed host-side with the same tiktoken convention the agent
+    /// loop uses for its own turns. They are host measurements, not provider
+    /// -reported figures.
+    record inference-response {
+        /// Concatenated text content of the driver's response.
+        text: string,
+        /// The model string the host sent for this call.
+        model-used: string,
+        /// Host-side token count of the outgoing request payload.
+        input-tokens: u64,
+        /// Host-side token count of the raw driver response.
+        output-tokens: u64,
+    }
+
+    /// Run one completion. `err` carries a human-readable reason: no driver
+    /// configured, driver dispatch failure, or a driver-reported error.
+    run-inference: func(request: inference-request) -> result<inference-response, string>;
+}

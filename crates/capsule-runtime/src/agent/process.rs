@@ -568,10 +568,10 @@ async fn read_process_output(
                 };
 
                 let _ = trace
-                    .write_inference(turn_idx, 0, 0, decision.to_string(), None)
+                    .write_inference(turn_idx, 0, 0, decision.to_string(), None, None)
                     .await;
 
-                otel.emit_inference(turn_idx, 0, 0, decision, None, 0).await;
+                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None).await;
 
                 hooks
                     .emit(workdir, HookEvent::Inference {
@@ -769,8 +769,8 @@ async fn read_codex_output(
                             return codex_max_turns_error(max_turns, trace, otel).await;
                         }
                         result_text = item.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                        let _ = trace.write_inference(turns - 1, 0, 0, "end_turn".into(), None).await;
-                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0).await;
+                        let _ = trace.write_inference(turns - 1, 0, 0, "end_turn".into(), None, None).await;
+                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None).await;
                     }
                     "mcp_tool_call" => {
                         turns += 1;
@@ -788,9 +788,9 @@ async fn read_codex_output(
                         let output_bytes = output.len() as u64;
 
                         let _ = trace
-                            .write_inference(turns - 1, 0, 0, "tool_call".into(), Some(tool_name.clone()))
+                            .write_inference(turns - 1, 0, 0, "tool_call".into(), Some(tool_name.clone()), None)
                             .await;
-                        otel.emit_inference(turns - 1, 0, 0, "tool_call", Some(tool_name.as_str()), 0).await;
+                        otel.emit_inference(turns - 1, 0, 0, "tool_call", Some(tool_name.as_str()), 0, None).await;
                         let _ = trace
                             .write_tool_call(
                                 turns - 1,

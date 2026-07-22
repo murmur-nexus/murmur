@@ -111,6 +111,8 @@ impl OtelEmitter {
 
     /// Emit a `capsule.inference` child span.
     /// `duration_ms` is measured by the caller (elapsed since dispatch start).
+    /// `origin` tags a non-agent-loop completion — see the `origin` attribute.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn emit_inference(
         &self,
         turn: u32,
@@ -119,6 +121,7 @@ impl OtelEmitter {
         decision: &str,
         tool_name: Option<&str>,
         duration_ms: u64,
+        origin: Option<&crate::trace::InferenceOrigin>,
     ) {
         if self.endpoint.is_none() {
             return;
@@ -134,6 +137,12 @@ impl OtelEmitter {
         ];
         if let Some(tn) = tool_name {
             attrs.push(kv_str("tool_name", tn));
+        }
+        // Absent for an ordinary agent-loop turn; `hook:<name>` plus the model
+        // actually sent for a completion a hook ran through `run-inference`.
+        if let Some(o) = origin {
+            attrs.push(kv_str("origin", &o.source));
+            attrs.push(kv_str("model", &o.model));
         }
         let span = span_obj(
             &self.trace_id,

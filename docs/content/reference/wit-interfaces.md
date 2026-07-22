@@ -3,7 +3,7 @@
 This page documents the WIT interfaces currently defined under `crates/capsule-runtime/wit/`.
 
 !!! info "Implemented now"
-    `murmur:tool/run`, `murmur:tool-registry/invoke`, `murmur:capsule/run`, `murmur:artifact-manager/manage`, `murmur:shell/execute`, `murmur:message/send`, `murmur:task/task`, `murmur:hook/lifecycle`, plus guest worlds `capsule`, `tool`, `driver`, the `hook` world, and the host-side `runtime-host` world.
+    `murmur:tool/run`, `murmur:tool-registry/invoke`, `murmur:capsule/run`, `murmur:artifact-manager/manage`, `murmur:shell/execute`, `murmur:message/send`, `murmur:task/task`, `murmur:hook/lifecycle`, `murmur:runtime/inference`, plus guest worlds `capsule`, `tool`, `driver`, the `hook` world, and the host-side `runtime-host` world.
 
 ---
 
@@ -328,7 +328,7 @@ Defined in `wit/hook/deps/murmur-hook/lifecycle.wit`.
 Hook artifacts export this interface when declared with `runtime: hook`. The native agent loop calls each handler synchronously. Returning `Err(string)` logs the error to `workdir/logs/hook-<name>.log` and does not abort the loop.
 
 ```wit
-package murmur:hook@0.2.0;
+package murmur:hook@0.3.0;
 
 interface lifecycle {
   record message {
@@ -406,6 +406,8 @@ interface lifecycle {
     messages: list<message>,
     session-tokens: u64,
     threshold: f64,
+    model: option<string>,
+    system-prompt: option<string>,
   }
 
   record session-end-event {
@@ -448,6 +450,77 @@ Event points:
 
 `on-task-start`/`on-task-end` are optional exports: a hook component compiled before these events existed instantiates normally and is simply never dispatched for them. All other handlers, including `on-stage` through `on-session-end` from the original vocabulary, remain required — a component missing one of those fails instantiation with an error naming the missing function.
 
+`compaction-event.model` / `compaction-event.system-prompt` tell a compaction
+hook which model and system prompt to use for its own summarization call. Both
+are currently always `none`; manifest wiring lands in a later slice.
+
+**Two accepted lifecycle versions.** Adding those two fields made
+`murmur:hook` `0.3.0`, which the canonical ABI cannot absorb additively. Rather
+than force every hook to be rebuilt for a record only the compaction hook reads,
+the host resolves the lifecycle instance export by trying
+`murmur:hook/lifecycle@0.3.0` first and falling back to
+`murmur:hook/lifecycle@0.2.0`, and remembers which matched. `on-compaction` — the
+only handler whose record shape differs — is then dispatched with the 5-field
+record to a `@0.3.0` hook and the 3-field record to a `@0.2.0` one; every other
+handler's records are shape-identical across the two versions and need no
+special-casing. This is a transitional exception scoped to exactly these two
+versions of one package, **not** a return of the removed unversioned fallback: a
+hook exporting the bare `murmur:hook/lifecycle` name still fails hard.
+
+---
+
+## `murmur:runtime/inference`
+
+Defined in `wit/hook/inference.wit`. A **host-provided import**, available to any
+hook component that declares it — nothing needs to be exported and nothing else
+in the manifest changes.
+
+```wit
+package murmur:runtime@0.2.0;
+
+interface inference {
+  use murmur:hook/lifecycle@0.3.0.{message};
+
+  record inference-request {
+    messages: list<message>,
+    system-prompt: option<string>,
+    model: option<string>,
+  }
+
+  record inference-response {
+    text: string,
+    model-used: string,
+    input-tokens: u64,
+    output-tokens: u64,
+  }
+
+  run-inference: func(request: inference-request) -> result<inference-response, string>;
+}
+```
+
+`run-inference` runs exactly one LLM completion through the capsule's
+already-configured inference driver (`inference.driver.artifact`), reusing the
+same driver-component invocation an ordinary agent turn uses — there is no second
+HTTP client and no separate credential path.
+
+- `model: none` resolves to the manifest's primary `inference.model`.
+- `model: some(m)` sends `m`. If the driver or provider rejects it the call
+  returns `err`; the host **never** silently falls back. A caller that wants
+  fallback-on-failure calls `run-inference` again with `none`, so each attempt
+  leaves its own truthful trace record and OTel span.
+- `system-prompt: none` sends no system prompt.
+- `model-used` is the model string the host actually sent, and `input-tokens` /
+  `output-tokens` are host-side tiktoken counts of the request payload and the
+  raw driver response — the driver wire format carries neither a usage block nor
+  a model confirmation (see the inference message format reference).
+- With no driver configured, `run-inference` returns a clear `err` naming
+  `inference.driver.artifact`; the import still links, so the hook itself runs.
+
+Every call, success or failure, writes one `inference` record to `trace.jsonl`
+and one `capsule.inference` OTel span carrying `origin: "hook:<hook name>"` and
+`model`. An ordinary agent-loop turn writes neither field, so its records are
+byte-identical to what they were before this interface existed.
+
 ---
 
 ## Runtime worlds
@@ -478,12 +551,17 @@ world driver {
 The hook world is defined in `wit/hook/worlds.wit`:
 
 ```wit
-package murmur:runtime@0.1.0;
+package murmur:runtime@0.2.0;
 
 world hook {
-  export murmur:hook/lifecycle@0.2.0;
+  import inference;
+  export murmur:hook/lifecycle@0.3.0;
 }
 ```
+
+`inference` is `murmur:runtime/inference@0.2.0`, declared in the same package as
+the world (`wit/hook/inference.wit`), which is why it is referenced by its bare
+interface name.
 
 The host side — the interfaces the runtime provides, compiled by
 `wasmtime::component::bindgen!` in `src/bindings.rs` — is the `runtime-host`
@@ -522,8 +600,8 @@ component binary itself.
 | `murmur:shell`              | `0.1.0` |
 | `murmur:message`            | `0.1.0` |
 | `murmur:task`                | `0.1.0` |
-| `murmur:hook`                | `0.2.0` |
-| `murmur:runtime`            | `0.1.0` |
+| `murmur:hook`                | `0.3.0` |
+| `murmur:runtime`            | `0.2.0` |
 | `murmur:runtime-guest`      | `0.1.0` |
 
 **Version-bump policy** (full policy in `crates/capsule-runtime/wit/VERSIONING.md`):
@@ -544,13 +622,15 @@ by trying the versioned instance name first, then falling back to the legacy
 unversioned name, so artifacts built before versioning kept running unmodified.
 That fallback has since been **removed**: the host now resolves each interface by
 its versioned instance name only (`murmur:capsule/run@0.1.0`,
-`murmur:tool/run@0.1.0`, `murmur:hook/lifecycle@0.2.0`). A tool, capsule, or hook
+`murmur:tool/run@0.1.0`, `murmur:hook/lifecycle@0.3.0`). A tool, capsule, or hook
 artifact that still exports only an unversioned `package
 murmur:tool;`/`murmur:capsule;`/`murmur:hook;` interface no longer instantiates —
 it fails with a hard error naming the versioned interface the host expected and a
 rebuild hint (`mur install` for a default artifact, or a source rebuild
 otherwise). Rebuild and republish any artifact still exporting only the
-unversioned name.
+unversioned name. The one exception is the `murmur:hook/lifecycle@0.3.0` →
+`@0.2.0` fallback described above, which is scoped to two specific versions of a
+single package and does not reopen the unversioned window.
 
 See `crates/capsule-runtime/wit/README.md` for which build consumes each copy
 of the tree, and `crates/capsule-runtime/wit/VERSIONING.md` for the version

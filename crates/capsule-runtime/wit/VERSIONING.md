@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.2.0`  |
+| `murmur:hook`            | `0.3.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -20,13 +20,21 @@ Current versions:
 | `murmur:task`            | `0.1.0`  |
 | `murmur:text`            | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
-| `murmur:runtime`         | `0.1.0`  |
+| `murmur:runtime`         | `0.2.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
 
-`murmur:hook` starts at `0.2.0` because its 9-function `lifecycle` interface
-already reflects one prior additive evolution — the original 7-function baseline
-plus `on-task-start`/`on-task-end`. This slice retroactively names that step
+`murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
+already reflected one prior additive evolution — the original 7-function baseline
+plus `on-task-start`/`on-task-end`. Versioning retroactively named that step
 rather than starting the package fresh at `0.1.0`.
+
+`murmur:hook` then went to `0.3.0` when `compaction-event` gained
+`model: option<string>` and `system-prompt: option<string>` — a field addition to
+an existing record, which is always a major bump (see below). In the same step
+`murmur:runtime` went to `0.2.0`: it gained a wholly new interface, `inference`,
+whose single `run-inference` function the host provides as an *import* to any
+hook that declares it (a hook that does not import it is unaffected), which is a
+minor bump.
 
 ## When to bump
 
@@ -68,6 +76,30 @@ Any of:
 A host built for the old major version cannot safely call a component built for
 the new one, and vice versa.
 
+## Two accepted `murmur:hook/lifecycle` versions
+
+`murmur:hook`'s `0.2.0 → 0.3.0` bump changed exactly one record,
+`compaction-event`, which only a compaction hook reads. Forcing every hook
+artifact in the fleet to be rebuilt for that would be pure churn, so
+`src/hooks.rs` resolves the lifecycle instance export by trying
+`murmur:hook/lifecycle@0.3.0` first and falling back to
+`murmur:hook/lifecycle@0.2.0`, recording which name matched on each
+`HookInstance`.
+
+That recorded version drives exactly one dispatch decision: `on-compaction` is
+sent the 5-field `CompactionEvent` when the hook resolved at `@0.3.0` and a
+hand-derived 3-field `CompactionEventV02` when it resolved at `@0.2.0`.
+`TypedFunc::typed` checks a component function *structurally*, so the wrong-arity
+record does not truncate — it fails the type check outright, which is what makes
+this split load-bearing rather than cosmetic. Every other lifecycle record is
+byte-identical between the two versions, so the single bindgen-generated type
+dispatches correctly to either and no other handler is special-cased.
+
+This is a **transitional exception scoped to two specific versions of one
+package**. It is deliberately *not* a reinstatement of the general unversioned
+fallback described in the next section, which stays permanently removed: a hook
+exporting the bare `murmur:hook/lifecycle` name still fails to instantiate.
+
 ## Unversioned artifacts: fallback removed
 
 Artifacts published before WIT package versioning exported the **unversioned**
@@ -82,13 +114,15 @@ dynamically-instantiated guest interfaces by the **versioned** instance name
 only:
 
 - `src/hooks.rs` — `resolve_lifecycle_iface` resolves
-  `murmur:hook/lifecycle@0.2.0`.
+  `murmur:hook/lifecycle@0.3.0`, falling back to `@0.2.0` (see the previous
+  section) and to nothing else.
 - `src/runtime.rs` — `resolve_versioned_iface` resolves
   `murmur:capsule/run@0.1.0` and `murmur:tool/run@0.1.0`.
 
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
-`murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`) are likewise registered
-under the versioned name only.
+`murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
+`murmur:runtime/inference@0.2.0`) are likewise registered under the versioned
+name only.
 
 An artifact that still exports (or imports) only the unversioned name now
 **fails to instantiate** with a hard error naming the versioned interface the

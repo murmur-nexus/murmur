@@ -43,6 +43,7 @@ use crate::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
     },
     identity::{self, CapsuleIdentity},
+    inference_import::HookInferenceCtx,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
     network_policy::{
@@ -562,6 +563,14 @@ pub fn launch_session(
         let dataset_id = staged.dataset_id;
         let capsule_version = staged.capsule_version.clone();
         let inference_model = inference.model.clone();
+        // Non-empty only for the WASM-driver transport; a `transport: process`
+        // capsule has no driver artifact, so a hook's `run-inference` correctly
+        // reports "no driver configured" rather than silently doing nothing.
+        let inference_driver_name = inference
+            .driver
+            .as_ref()
+            .map(|d| d.artifact.clone())
+            .filter(|a| !a.is_empty());
         let trace_include_tool_output = staged.trace_include_tool_output;
         let registry_for_pull = Arc::clone(&staged.registry);
         let lock_path_for_pull = staged.manifest_dir.join("murmur.lock");
@@ -656,6 +665,33 @@ pub fn launch_session(
                         driver_continuation_acked_len: 0,
                     };
 
+                    // Backing for the hooks' `murmur:runtime/inference` import.
+                    // Sourced from `state` (built directly above) so a hook's
+                    // `run-inference` runs the *same* driver component, under the
+                    // same capability policy and network allowlist, as the agent
+                    // loop's own turns. `None` when no driver artifact is staged.
+                    let hook_inference = inference_driver_name
+                        .as_ref()
+                        .and_then(|driver_name| {
+                            state
+                                .tool_components
+                                .get(driver_name)
+                                .map(|component| (driver_name.clone(), component.clone()))
+                        })
+                        .map(|(driver_name, driver_component)| {
+                            Arc::new(HookInferenceCtx {
+                                driver_name,
+                                driver_component,
+                                model: inference_model.clone(),
+                                engine: state.engine.clone(),
+                                accessible_workdir: state.accessible_workdir.clone(),
+                                inference_env: state.inference_env.clone(),
+                                capability_policy: state.capability_policy.clone(),
+                                network_allow_rules: state.network_allow_rules.clone(),
+                                records: std::sync::Mutex::new(Vec::new()),
+                            })
+                        });
+
                     // Create hooks ONCE — session_start fires once per capsule lifetime
                     let mut hooks = HookRuntime::new(
                         &engine,
@@ -676,6 +712,7 @@ pub fn launch_session(
                             dataset_id: dataset_id.as_deref(),
                         },
                         hook_limits,
+                        hook_inference,
                     )
                     .await?;
 
@@ -1889,18 +1926,81 @@ impl manage::Host for CapsuleStoreState {
     }
 }
 
-impl CapsuleStoreState {
-    /// Async WASM tool dispatch — used by the agent loop for drivers and WASM tools.
-    pub(crate) async fn dispatch_tool_async(
-        &self,
-        name: &str,
-        input: murmur::tool::run::ToolInput,
-    ) -> Result<murmur::tool::run::ToolResult, String> {
-        let Some(component) = self.tool_components.get(name) else {
-            return Err(format!("tool '{name}' is not available in this session"));
-        };
+/// Borrowed half of a WASM tool invocation environment: everything
+/// [`invoke_tool_component`] needs that is neither the component nor the A2A
+/// wiring. Grouped into a struct so the hook runtime can assemble one from its
+/// own owned copies without a >7-argument function.
+pub(crate) struct ToolInvokeEnv<'a> {
+    pub(crate) engine: &'a Engine,
+    pub(crate) accessible_workdir: &'a Path,
+    pub(crate) inference_env: &'a [(String, String)],
+    pub(crate) capability_policy: &'a CapabilityPolicy,
+    pub(crate) network_allow_rules: &'a [NetworkAllowRule],
+}
 
-        let mut linker = Linker::new(&self.engine);
+/// Per-session A2A wiring registered on a tool linker.
+///
+/// The two host interfaces it backs (`murmur:text/chunks`, `murmur:task/task`)
+/// are always *defined* — a streaming driver imports them and would fail to
+/// instantiate otherwise — but each function is a no-op when its channel is
+/// absent. [`ToolA2aWiring::silent`] is that all-absent form, used for a
+/// dispatch that is not part of an A2A task turn (a hook's `run-inference`
+/// call, which must not stream chunks into the user's SSE stream or ask the
+/// user for input).
+pub(crate) struct ToolA2aWiring {
+    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    task_id: Option<String>,
+    chunk_event_id: Arc<AtomicU64>,
+    chunks_emitted: Arc<AtomicBool>,
+    task_registry: Option<Arc<Mutex<TaskRegistry>>>,
+    input_timeout_secs: Option<u64>,
+}
+
+impl ToolA2aWiring {
+    pub(crate) fn silent() -> Self {
+        Self {
+            sse: None,
+            task_id: None,
+            chunk_event_id: Arc::new(AtomicU64::new(0)),
+            chunks_emitted: Arc::new(AtomicBool::new(false)),
+            task_registry: None,
+            input_timeout_secs: None,
+        }
+    }
+}
+
+/// Instantiate `component` in a fresh `Linker`/`Store` and call its
+/// `murmur:tool/run@0.1.0#run` export.
+///
+/// This is the single WASM-tool (and therefore inference-driver) invocation
+/// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] is a thin
+/// wrapper that fills `env`/`a2a` from the capsule store; a hook's
+/// `run-inference` host import fills them from its own owned copies. Neither
+/// duplicates any part of the instantiate/type-check/call sequence below.
+pub(crate) async fn invoke_tool_component(
+    env: ToolInvokeEnv<'_>,
+    a2a: ToolA2aWiring,
+    name: &str,
+    component: &Component,
+    input: murmur::tool::run::ToolInput,
+) -> Result<murmur::tool::run::ToolResult, String> {
+        let ToolInvokeEnv {
+            engine,
+            accessible_workdir,
+            inference_env,
+            capability_policy,
+            network_allow_rules,
+        } = env;
+        let ToolA2aWiring {
+            sse: a2a_sse,
+            task_id: a2a_task_id,
+            chunk_event_id: a2a_chunk_event_id,
+            chunks_emitted: a2a_chunks_emitted,
+            task_registry: a2a_task_registry,
+            input_timeout_secs,
+        } = a2a;
+
+        let mut linker = Linker::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|err| format!("failed to add WASI linker for tool '{name}': {err}"))?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
@@ -1913,13 +2013,13 @@ impl CapsuleStoreState {
         // under the versioned name only (see WIT_TEXT_CHUNKS_IFACE / wit/VERSIONING.md).
         {
             let chunks_iface = WIT_TEXT_CHUNKS_IFACE;
-            let sse_for_chunk = self.a2a_sse.clone();
-            let task_id_for_chunk = self.a2a_task_id.clone();
-            let chunk_event_id = Arc::clone(&self.a2a_chunk_event_id);
-            let chunks_emitted_flag = Arc::clone(&self.a2a_chunks_emitted);
-            let sse_for_thinking = self.a2a_sse.clone();
-            let task_id_for_thinking = self.a2a_task_id.clone();
-            let thinking_event_id = Arc::clone(&self.a2a_chunk_event_id);
+            let sse_for_chunk = a2a_sse.clone();
+            let task_id_for_chunk = a2a_task_id.clone();
+            let chunk_event_id = Arc::clone(&a2a_chunk_event_id);
+            let chunks_emitted_flag = Arc::clone(&a2a_chunks_emitted);
+            let sse_for_thinking = a2a_sse.clone();
+            let task_id_for_thinking = a2a_task_id.clone();
+            let thinking_event_id = Arc::clone(&a2a_chunk_event_id);
 
             let mut inst = linker.instance(chunks_iface).map_err(|err| {
                 format!("failed to define {chunks_iface} instance for '{name}': {err}")
@@ -1964,10 +2064,10 @@ impl CapsuleStoreState {
         // Components that do not import this interface ignore the registration.
         {
             let task_iface = WIT_TASK_IFACE;
-            let ri_task_registry = self.a2a_task_registry.clone();
-            let ri_sse = self.a2a_sse.clone();
-            let ri_task_id = self.a2a_task_id.clone();
-            let ri_timeout = self.input_timeout_secs;
+            let ri_task_registry = a2a_task_registry.clone();
+            let ri_sse = a2a_sse.clone();
+            let ri_task_id = a2a_task_id.clone();
+            let ri_timeout = input_timeout_secs;
             linker
                 .instance(task_iface)
                 .map_err(|err| {
@@ -2009,23 +2109,23 @@ impl CapsuleStoreState {
                 })?;
         }
 
-        let tool_limits = self.capability_policy.limits;
+        let tool_limits = capability_policy.limits;
         let state = ToolStoreState {
             limits: tool_limits.limiter(),
             table: ResourceTable::new(),
             wasi: build_wasi_ctx(
-                &self.accessible_workdir,
-                &self.inference_env,
-                &self.capability_policy,
+                accessible_workdir,
+                inference_env,
+                capability_policy,
             )
             .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
             http: WasiHttpCtx::new(),
             http_hooks: NetworkPolicyHooks {
-                network_allow_rules: self.network_allow_rules.clone(),
+                network_allow_rules: network_allow_rules.to_vec(),
             },
         };
 
-        let mut store = Store::new(&self.engine, state);
+        let mut store = Store::new(engine, state);
         // Registered before instantiation — see the capsule store for why.
         store.limiter(|state| &mut state.limits);
 
@@ -2075,6 +2175,39 @@ impl CapsuleStoreState {
             .await
             .map_err(|err| format!("tool '{name}' post-return failed: {err}"))?;
         Ok(result)
+}
+
+impl CapsuleStoreState {
+    /// Async WASM tool dispatch — used by the agent loop for drivers and WASM tools.
+    pub(crate) async fn dispatch_tool_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        let Some(component) = self.tool_components.get(name) else {
+            return Err(format!("tool '{name}' is not available in this session"));
+        };
+        invoke_tool_component(
+            ToolInvokeEnv {
+                engine: &self.engine,
+                accessible_workdir: &self.accessible_workdir,
+                inference_env: &self.inference_env,
+                capability_policy: &self.capability_policy,
+                network_allow_rules: &self.network_allow_rules,
+            },
+            ToolA2aWiring {
+                sse: self.a2a_sse.clone(),
+                task_id: self.a2a_task_id.clone(),
+                chunk_event_id: Arc::clone(&self.a2a_chunk_event_id),
+                chunks_emitted: Arc::clone(&self.a2a_chunks_emitted),
+                task_registry: self.a2a_task_registry.clone(),
+                input_timeout_secs: self.input_timeout_secs,
+            },
+            name,
+            component,
+            input,
+        )
+        .await
     }
 
     /// Dispatch a tool call from the agent loop: native binary, shell, or WASM.
@@ -3743,6 +3876,7 @@ mod tests {
                 },
                 HookEnvVars::default(),
                 crate::limits::ExecutionLimits::default(),
+                None,
             )
             .await
             .unwrap()

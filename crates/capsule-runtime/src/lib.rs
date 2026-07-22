@@ -11,6 +11,7 @@ pub(crate) mod checkpoint_sign;
 pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;
+pub(crate) mod inference_import;
 pub mod limits;
 pub(crate) mod murmur_md;
 pub(crate) mod network_policy;
