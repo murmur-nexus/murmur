@@ -317,7 +317,7 @@ the session has a `task_id` — the final SSE `status` event reports `state: "fa
 loop does not attempt another turn after this.
 
 If your compaction hook can fail (for example, the model it calls for summarization is
-unreachable), account for the fact that this now ends the session rather than silently skipping
+unreachable), account for the fact that this ends the session rather than silently skipping
 compaction.
 
 ---
