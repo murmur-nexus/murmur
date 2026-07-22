@@ -205,8 +205,9 @@ pub(crate) enum HookEvent {
         messages: Vec<Message>,
         session_tokens: u64,
         threshold: f64,
-        /// Manifest-configured model for the hook's own summarization call.
-        /// Always `None` today — `compaction-model-from-manifest` populates it.
+        /// Manifest-configured model for the hook's own summarization call, from
+        /// `inference.compaction.model`. `None` when the manifest leaves it unset —
+        /// resolving that to a concrete model is the receiving hook's job, not ours.
         model: Option<String>,
         /// Manifest-configured system-prompt override for that call. Always
         /// `None` today — `compaction-system-prompt-override` populates it.
@@ -483,16 +484,20 @@ impl HookRuntime {
 
     /// Shared dispatch path used by every Lifecycle Event. Iterates the blocking
     /// hooks (binding-filtered), then spawns each matching async hook fire-and-forget.
-    /// Returns `(artifacts, replacement)`: `artifacts` collects every `on-inference`
-    /// `HookOutput::Artifact`; `replacement` is the first `on-compaction`
-    /// `HookOutput::ReplaceContext`. Event-keyed side effects (checkpoint verify on
+    /// Returns `(artifacts, replacement, first_error)`: `artifacts` collects every
+    /// `on-inference` `HookOutput::Artifact`; `replacement` is the first `on-compaction`
+    /// `HookOutput::ReplaceContext`; `first_error` is the message of the first bound
+    /// hook that returned `Err` for this event. Every caller but `dispatch_compaction`
+    /// discards `first_error` — the error is still logged per-hook and the loop still
+    /// continues, so `emit()`'s observable behaviour is unchanged; only compaction
+    /// promotes it to a session failure. Event-keyed side effects (checkpoint verify on
     /// `SessionStart`, checkpoint sign on `SessionEnd` and on a compaction that
     /// replaced context) run here so all events funnel through one place.
     async fn dispatch(
         &mut self,
         workdir: &Path,
         event: HookEvent,
-    ) -> (Vec<HookArtifact>, Option<Vec<Message>>) {
+    ) -> (Vec<HookArtifact>, Option<Vec<Message>>, Option<String>) {
         if matches!(event, HookEvent::SessionStart) {
             self.verify_checkpoints_on_start(workdir);
         }
@@ -523,6 +528,7 @@ impl HookRuntime {
 
         let mut artifacts: Vec<HookArtifact> = Vec::new();
         let mut replacement: Option<Vec<Message>> = None;
+        let mut first_error: Option<String> = None;
         for hook in &mut self.blocking_hooks {
             if !binding_matches_event(&hook.config.binding, &event) {
                 continue;
@@ -539,6 +545,9 @@ impl HookRuntime {
                 Ok(HookCallResult::None) => {}
                 Err(error) => {
                     log_hook_error(workdir, &hook.name, &error).await;
+                    if first_error.is_none() {
+                        first_error = Some(format!("{}: {error}", hook.name));
+                    }
                 }
             }
         }
@@ -585,7 +594,7 @@ impl HookRuntime {
             self.sign_checkpoints(workdir);
         }
 
-        (artifacts, replacement)
+        (artifacts, replacement, first_error)
     }
 
     /// Verifies checkpoint files under `accessible_workdir/checkpoints` against their `.sig`
@@ -625,14 +634,22 @@ impl HookRuntime {
         }
     }
 
-    /// Fire `on-compaction` on all hooks with a matching binding, returning the first
-    /// `replace-context` output any blocking hook produces (or `None`).
+    /// Fire `on-compaction` on all hooks with a matching binding.
     ///
-    /// Now a thin wrapper over the shared [`Self::dispatch`] path: it builds a
-    /// `HookEvent::Compaction` and returns only the `replacement` half of the result.
+    /// The three outcomes a caller must be able to tell apart:
+    /// - `Ok(Some(messages))` — a blocking hook returned `replace-context`.
+    /// - `Ok(None)` — no compaction-bound hook was invoked at all (or every one of
+    ///   them returned `none`): the caller continues, uncompacted.
+    /// - `Err(message)` — a compaction-bound hook *ran* and returned `Err`. There is
+    ///   no safety net behind a declared compaction hook, so the caller must fail the
+    ///   session rather than limp on with an over-budget context.
+    ///
+    /// A thin wrapper over the shared [`Self::dispatch`] path: it builds a
+    /// `HookEvent::Compaction` and reads both the `replacement` and `first_error`
+    /// halves of the result. An error wins over a replacement produced by some other
+    /// hook in the same dispatch — a partially-failed compaction is still a failure.
     /// Async hooks fire-and-forget; their output is always discarded. Checkpoint
     /// signing after a successful replacement happens inside `dispatch`.
-    #[must_use]
     pub(crate) async fn dispatch_compaction(
         &mut self,
         messages: Vec<Message>,
@@ -640,7 +657,7 @@ impl HookRuntime {
         threshold: f64,
         model: Option<String>,
         system_prompt: Option<String>,
-    ) -> Option<Vec<Message>> {
+    ) -> Result<Option<Vec<Message>>, String> {
         let workdir = self.workdir.clone();
         let event = HookEvent::Compaction {
             messages,
@@ -649,7 +666,11 @@ impl HookRuntime {
             model,
             system_prompt,
         };
-        self.dispatch(&workdir, event).await.1
+        let (_, replacement, first_error) = self.dispatch(&workdir, event).await;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(replacement),
+        }
     }
 }
 
@@ -1102,6 +1123,10 @@ async fn log_hook_error(workdir: &Path, hook_name: &str, error: &str) {
         .await
     {
         let _ = file.write_all(line.as_bytes()).await;
+        // `tokio::fs::File` buffers, and dropping it does NOT flush — without this the
+        // line reaches disk only if the runtime happens to get around to it, which made
+        // "the hook error was logged" a coin flip for anything reading the file back.
+        let _ = file.flush().await;
     }
 }
 
@@ -1846,6 +1871,273 @@ mod tests {
         Component::new(engine, &bytes).expect("compaction component double compiles")
     }
 
+    /// Wrap a hand-written core module in the `@0.3.0` lifecycle component shell.
+    ///
+    /// `core_body` must export `memory`, `realloc`, `oncompact` (lifted as
+    /// `on-compaction`) and `noop` (every other required export). Splitting this out
+    /// keeps the three compaction doubles below down to the wasm that actually
+    /// differs between them; the surrounding type/instance section is a
+    /// component-model validity requirement, not test-specific detail (see
+    /// [`hook_spin_double_iface`]).
+    ///
+    /// `oncompact`'s flat signature is fixed by the canonical ABI lowering of the
+    /// 5-field `compaction-event`: `(list<message> → i32 i32) (u64) (f64)
+    /// (option<string> → i32 i32 i32) (option<string> → i32 i32 i32)`.
+    fn compaction_component_from_core(engine: &wasmtime::Engine, core_body: &str) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-compaction")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = OBS_IFACE_V0_3;
+        let wat = format!(
+            r#"(component
+  (core module $m
+{core_body}
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)))
+  (type $compaction-event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64)
+    (field "model" (option string))
+    (field "system-prompt" (option string))))
+  (type $ft (func (param "event" $compaction-event) (result (result $hook-output (error string)))))
+
+  (func $oc (type $ft)
+    (canon lift (core func $i "oncompact") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "compaction-event" (type $compaction-event))
+    (export "on-compaction" (func $oc))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("compaction component WAT parses");
+        Component::new(engine, &bytes).expect("compaction component double compiles")
+    }
+
+    /// Sentinel content a [`hook_compaction_echo_model_double`] reports when the
+    /// `compaction-event.model` it received was `none`. Deliberately not a plausible
+    /// model name, so "the host sent none" can never be mistaken for "the host sent
+    /// the string `none`".
+    const MODEL_ABSENT_SENTINEL: &str = "<<absent>>";
+
+    /// A compaction double that reports back what it saw in `compaction-event.model`:
+    /// it returns `ok(replace-context([{role: "model", content: <the model string>}]))`,
+    /// substituting [`MODEL_ABSENT_SENTINEL`] when the option arrived as `none`.
+    ///
+    /// Echoing the *received* pointer/length straight back into the returned message is
+    /// what makes this a real assertion on the wire value rather than on host-side Rust
+    /// state — the string the test reads is the one the guest was actually handed.
+    ///
+    /// Return area is laid out by hand at offset 128:
+    /// `result` discriminant `0` (ok); `hook-output` discriminant `1`
+    /// (`replace-context`) at 132 with its `list<message>` (ptr 160, len 1) at 136/140;
+    /// the one `message` at 160 as `{role ptr/len, content ptr/len}`.
+    /// Unlike the other doubles this one needs a genuine bump `realloc` — a fixed
+    /// address would lower the messages list, the model string and the system-prompt
+    /// string all on top of each other, and the echoed model bytes would be garbage.
+    fn hook_compaction_echo_model_double(engine: &wasmtime::Engine) -> Component {
+        let sentinel_len = MODEL_ABSENT_SENTINEL.len();
+        let core = format!(
+            r#"    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 1024))
+    (data (i32.const 200) "model")
+    (data (i32.const 208) "{MODEL_ABSENT_SENTINEL}")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $r i32)
+      (global.set $bump
+        (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (local.set $r (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $r))
+    (func (export "oncompact")
+      (param $msgs-ptr i32) (param $msgs-len i32)
+      (param $tokens i64) (param $threshold f64)
+      (param $model-some i32) (param $model-ptr i32) (param $model-len i32)
+      (param $sp-some i32) (param $sp-ptr i32) (param $sp-len i32)
+      (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 1))
+      (i32.store (i32.const 136) (i32.const 160))
+      (i32.store (i32.const 140) (i32.const 1))
+      (i32.store (i32.const 160) (i32.const 200))
+      (i32.store (i32.const 164) (i32.const 5))
+      (i32.store (i32.const 168)
+        (select (local.get $model-ptr) (i32.const 208) (local.get $model-some)))
+      (i32.store (i32.const 172)
+        (select (local.get $model-len) (i32.const {sentinel_len}) (local.get $model-some)))
+      (i32.const 128))
+    (func (export "noop"))"#
+        );
+        compaction_component_from_core(engine, &core)
+    }
+
+    /// A compaction double whose `on-compaction` unconditionally returns
+    /// `err("boom")` — the "declared compaction hook, no safety net behind it" case.
+    /// Return area at 128: `result` discriminant `1` (err), payload string
+    /// (ptr 300, len 4) at 132/136.
+    fn hook_compaction_err_double(engine: &wasmtime::Engine) -> Component {
+        let core = r#"    (memory (export "memory") 1)
+    (data (i32.const 300) "boom")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "oncompact")
+      (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 1))
+      (i32.store (i32.const 132) (i32.const 300))
+      (i32.store (i32.const 136) (i32.const 4))
+      (i32.const 128))
+    (func (export "noop"))"#;
+        compaction_component_from_core(engine, core)
+    }
+
+    /// Drive one `dispatch_compaction` against a single named double and hand the
+    /// caller the raw result to assert on.
+    async fn dispatch_compaction_with(
+        session: &Path,
+        accessible: &Path,
+        engine: &wasmtime::Engine,
+        double: Component,
+        model: Option<String>,
+    ) -> Result<Option<Vec<Message>>, String> {
+        let mut hooks = new_with_hooks(
+            engine,
+            session,
+            accessible,
+            vec![staged_double_named(
+                "compactor",
+                HookBinding::OnCompaction,
+                double,
+            )],
+        )
+        .await
+        .expect("double instantiates");
+        hooks
+            .dispatch_compaction(
+                vec![Message {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                }],
+                1234,
+                0.98,
+                model,
+                None,
+            )
+            .await
+    }
+
+    /// Scenario 1: `inference.compaction.model` set in the manifest reaches the hook
+    /// verbatim as `compaction-event.model`.
+    #[test]
+    fn compaction_hook_receives_manifest_model() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result = rt.block_on(dispatch_compaction_with(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_compaction_echo_model_double(&engine),
+            Some("claude-haiku-4-5".to_string()),
+        ));
+
+        let messages = result.expect("hook succeeded").expect("replace-context");
+        assert_eq!(messages[0].role, "model");
+        assert_eq!(messages[0].content, "claude-haiku-4-5");
+    }
+
+    /// Scenario 2: no `model:` in the manifest arrives as `option::none` — nothing on
+    /// this path substitutes the primary `inference.model` first.
+    #[test]
+    fn compaction_hook_receives_none_when_model_unset() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result = rt.block_on(dispatch_compaction_with(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_compaction_echo_model_double(&engine),
+            None,
+        ));
+
+        let messages = result.expect("hook succeeded").expect("replace-context");
+        assert_eq!(messages[0].content, MODEL_ABSENT_SENTINEL);
+    }
+
+    /// Scenario 4: a bound compaction hook that returns `Err` surfaces as `Err` to the
+    /// caller — distinct from the `Ok(None)` that "no hook was bound" produces — while
+    /// still logging to the hook's own log exactly as before.
+    #[test]
+    fn compaction_hook_error_surfaces_to_caller() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result = rt.block_on(dispatch_compaction_with(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_compaction_err_double(&engine),
+            None,
+        ));
+
+        let error = result.expect_err("a failing compaction hook must not read as Ok(None)");
+        assert!(
+            error.contains("compactor") && error.contains("boom"),
+            "error must name the hook and carry its message, got {error:?}"
+        );
+        assert_eq!(
+            hook_log_lines(session.path(), "compactor"),
+            1,
+            "per-hook error logging is unchanged"
+        );
+    }
+
+    /// Scenario 3: no compaction-bound hook at all stays `Ok(None)` — the caller
+    /// continues without compaction rather than failing the session.
+    #[test]
+    fn compaction_with_no_bound_hook_is_ok_none() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let result = rt.block_on(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![])
+                .await
+                .expect("empty hook set");
+            hooks
+                .dispatch_compaction(Vec::new(), 1234, 0.98, None, None)
+                .await
+        });
+
+        assert!(matches!(result, Ok(None)));
+    }
+
     async fn dispatch_compaction_against(
         session: &Path,
         accessible: &Path,
@@ -1879,8 +2171,8 @@ mod tests {
             )
             .await;
         assert!(
-            replacement.is_none(),
-            "the double returns hook-output::none, so no context replacement"
+            matches!(replacement, Ok(None)),
+            "the double returns hook-output::none, so no context replacement and no error"
         );
     }
 
