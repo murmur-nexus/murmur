@@ -1809,27 +1809,37 @@ mod tests {
     /// offset 0, the `hook-output` variant at offset 4 with discriminant `0`
     /// (`none`). The other five required exports are bare `func() -> ()` stubs;
     /// only `on-compaction` is ever dispatched here.
+    /// The `@0.3.0` shape shares its wrapper with [`compaction_component_from_core`]:
+    /// only the core `oncompact` body (always `ok(none)`, ignoring every param)
+    /// differs from the doubles below. `@0.2.0` has a genuinely different
+    /// component-type section (3-field event, no `model`/`system-prompt`) and no
+    /// wrapper to share, so it stays inline here.
     fn hook_compaction_double(engine: &wasmtime::Engine, version: LifecycleVersion) -> Component {
-        let (iface, extra_fields, extra_params) = match version {
-            LifecycleVersion::V0_3 => (
-                OBS_IFACE_V0_3,
-                "\n    (field \"model\" (option string))\n    (field \"system-prompt\" (option string))",
-                " i32 i32 i32 i32 i32 i32",
-            ),
-            LifecycleVersion::V0_2 => (lifecycle_v0_2::IFACE_NAME, "", ""),
-        };
-        let stubs = REQUIRED_HOOK_FNS
-            .iter()
-            .filter(|n| **n != "on-compaction")
-            .map(|n| format!("    (export \"{n}\" (func $noop))"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let wat = format!(
-            r#"(component
+        match version {
+            LifecycleVersion::V0_3 => {
+                let core = r#"    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "oncompact") (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))"#;
+                compaction_component_from_core(engine, core)
+            }
+            LifecycleVersion::V0_2 => {
+                let iface = lifecycle_v0_2::IFACE_NAME;
+                let stubs = REQUIRED_HOOK_FNS
+                    .iter()
+                    .filter(|n| **n != "on-compaction")
+                    .map(|n| format!("    (export \"{n}\" (func $noop))"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let wat = format!(
+                    r#"(component
   (core module $m
     (memory (export "memory") 1)
     (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
-    (func (export "oncompact") (param i32 i32 i64 f64{extra_params}) (result i32)
+    (func (export "oncompact") (param i32 i32 i64 f64) (result i32)
       (i32.store (i32.const 128) (i32.const 0))
       (i32.store (i32.const 132) (i32.const 0))
       (i32.const 128))
@@ -1849,7 +1859,7 @@ mod tests {
   (type $compaction-event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
-    (field "threshold" f64){extra_fields}))
+    (field "threshold" f64)))
   (type $ft (func (param "event" $compaction-event) (result (result $hook-output (error string)))))
 
   (func $oc (type $ft)
@@ -1866,9 +1876,11 @@ mod tests {
   )
   (export "{iface}" (instance $lc))
 )"#
-        );
-        let bytes = wat::parse_str(&wat).expect("compaction component WAT parses");
-        Component::new(engine, &bytes).expect("compaction component double compiles")
+                );
+                let bytes = wat::parse_str(&wat).expect("compaction component WAT parses");
+                Component::new(engine, &bytes).expect("compaction component double compiles")
+            }
+        }
     }
 
     /// Wrap a hand-written core module in the `@0.3.0` lifecycle component shell.

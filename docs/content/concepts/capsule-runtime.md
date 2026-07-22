@@ -281,10 +281,20 @@ hard limit:
    and recounts tokens against it.
 5. The agent loop continues — the model's next turn sees the compacted history.
 
-Compaction never consumes a turn slot, and a compaction failure is never fatal: the runtime
-logs a warning and continues the session unchanged. Compaction requires both
-`context.max_tokens` to be set and a hook bound to `on-compaction` to be staged — see [Enable
-context compaction](../how-to/context-compaction.md) for the full configuration and protocol.
+Compaction never consumes a turn slot. Whether a failure to compact is fatal depends on why it
+failed:
+
+- **No hook bound to `on-compaction`** — non-fatal. The runtime logs a warning to
+  `logs/bootstrap.log` and continues the session with the uncompacted history.
+- **A bound hook ran and returned an error** — fatal. There is no fallback compactor behind a
+  declared compaction hook, so the runtime ends the session as failed rather than continuing on
+  a context it already knows is over budget: `out/result.txt` records the error, the trace and
+  OTel (if configured) record `session_end` as `"failed"`, and the SSE stream (if the session has
+  a `task_id`) emits a final `status` event with `state: "failed"`. No further turns run.
+
+Compaction requires both `context.max_tokens` to be set and a hook bound to `on-compaction` to be
+staged — see [Enable context compaction](../how-to/context-compaction.md) for the full
+configuration and protocol.
 
 ### Session trace and structured evaluation
 
