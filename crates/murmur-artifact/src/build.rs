@@ -386,10 +386,7 @@ mod tests {
 
         assert_eq!(
             entry_names(&out),
-            vec![
-                PACKED_MANIFEST_ENTRY.to_string(),
-                "payload.bin".to_string()
-            ],
+            vec![PACKED_MANIFEST_ENTRY.to_string(), "payload.bin".to_string()],
             "the manifest is packed once regardless of how often it is declared"
         );
     }
