@@ -106,7 +106,13 @@ Create `murmur.yaml`:
 name: py-echo-native
 version: "0.1.0"
 runtime: native
+requires_files:
+  - bin/run
 ```
+
+`requires_files:` is what `mur build` packages alongside the manifest. Without it the executable
+built in Step 3 is not put in the artifact — see
+[`requires_files`](../reference/manifest-schema.md).
 
 ---
 

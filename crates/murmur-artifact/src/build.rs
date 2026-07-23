@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -100,8 +101,23 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
             source,
         })?;
 
-    let mut files = collect_files(&source_abs)?;
-    files.sort_by(|a, b| a.1.cmp(&b.1));
+    // An artifact ships what it declares, not what happens to sit next to it. The packed set is
+    // the manifest plus the `requires_files:` entries validated above — so `src/`, `Cargo.toml`,
+    // `README.md`, editor droppings and stray build output stay in the source tree rather than
+    // riding along in every published `.mur.zip`. Order is manifest-first, then declaration
+    // order: deterministic, and the same shape hand-rolled release packaging already produces.
+    let declared = std::iter::once(MANIFEST_FILENAME)
+        .chain(manifest.requires_files.iter().map(String::as_str));
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut packed: HashSet<PathBuf> = HashSet::new();
+    for rel in declared {
+        // Dedup on the resolved path, so a manifest that redundantly lists `murmur.yaml` (or
+        // spells a file two ways) still yields exactly one zip entry per file on disk.
+        let abs = absolute_normalized(&source_abs.join(rel))?;
+        if packed.insert(abs.clone()) {
+            files.push((abs, PathBuf::from(rel)));
+        }
+    }
     files.retain(|(abs, _)| *abs != output_abs);
 
     let output_file = File::create(output_path).map_err(|source| BuildError::CreateOutput {
@@ -113,10 +129,11 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
         FileOptions::default().compression_method(CompressionMethod::Deflated);
 
     for (abs_path, rel_path) in files {
-        // At most one collected file can have a relative path of MANIFEST_FILENAME —
-        // a directory cannot hold two entries under one name — and it is definitionally
-        // the file `resolve_manifest_path` already loaded above. So exactly one file
-        // claims the PACKED_MANIFEST_ENTRY slot, and it is the real manifest.
+        // Exactly one candidate can have a relative path of MANIFEST_FILENAME — it is the
+        // entry seeded above, and the dedup drops any `requires_files:` restatement of it —
+        // so the PACKED_MANIFEST_ENTRY slot is claimed once, by the manifest
+        // `resolve_manifest_path` already loaded. A same-named file in a subdirectory packs
+        // under its own relative path and never displaces it.
         let rel_str = if rel_path == Path::new(MANIFEST_FILENAME) {
             PACKED_MANIFEST_ENTRY.to_string()
         } else {
@@ -149,38 +166,6 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
     })?;
 
     Ok(output_path.to_path_buf())
-}
-
-fn collect_files(source_abs: &Path) -> Result<Vec<(PathBuf, PathBuf)>, BuildError> {
-    let mut out = Vec::new();
-    collect_files_from(source_abs, source_abs, &mut out)?;
-    Ok(out)
-}
-
-fn collect_files_from(
-    base: &Path,
-    current: &Path,
-    out: &mut Vec<(PathBuf, PathBuf)>,
-) -> Result<(), BuildError> {
-    for entry in fs::read_dir(current).map_err(|source| BuildError::ReadSource {
-        path: current.display().to_string(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| BuildError::ReadSource {
-            path: current.display().to_string(),
-            source,
-        })?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            collect_files_from(base, &path, out)?;
-        } else if path.is_file() {
-            let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-            out.push((absolute_normalized(&path)?, rel));
-        }
-    }
-
-    Ok(())
 }
 
 fn absolute_normalized(path: &Path) -> Result<PathBuf, BuildError> {
@@ -292,12 +277,150 @@ mod tests {
         build_artifact(dir.path(), &out).expect("explicit empty requires_files overrides default");
     }
 
+    /// Names every entry in a built archive, in the order the packer wrote them.
+    fn entry_names(archive_path: &Path) -> Vec<String> {
+        let file = File::open(archive_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect()
+    }
+
+    /// The shape the project's own release packaging builds by hand (`zip -j out.mur.zip
+    /// murmur.yaml <name>.wasm`): a declared payload ships, and the source tree it was compiled
+    /// from does not.
+    #[test]
+    fn packs_only_the_manifest_and_declared_files() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: murmur-hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("murmur_hook_compact.wasm"), b"\0asm").unwrap();
+
+        // Everything below is undeclared, so none of it may ship.
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "fn main() {}").unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(dir.path().join("README.md"), "# hook\n").unwrap();
+        fs::write(dir.path().join(".DS_Store"), "junk").unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        build_artifact(dir.path(), &out).unwrap();
+
+        assert_eq!(
+            entry_names(&out),
+            vec![
+                PACKED_MANIFEST_ENTRY.to_string(),
+                "murmur_hook_compact.wasm".to_string()
+            ],
+            "a curated artifact carries its manifest and its declared payload, nothing else"
+        );
+    }
+
+    /// Curation is per declared entry, not per directory: declaring one file in `assets/` does
+    /// not sweep in its neighbours.
+    #[test]
+    fn declaring_a_nested_asset_excludes_its_undeclared_siblings() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: nested\nversion: 0.1.0\nruntime: tool\nrequires_files:\n  - assets/logo.png\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("assets/logo.png"), "png").unwrap();
+        fs::write(dir.path().join("assets/other.txt"), "not declared").unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        build_artifact(dir.path(), &out).unwrap();
+
+        assert_eq!(
+            entry_names(&out),
+            vec![
+                PACKED_MANIFEST_ENTRY.to_string(),
+                "assets/logo.png".to_string()
+            ],
+            "only the declared member of assets/ ships"
+        );
+    }
+
+    /// The accepted consequence of allowlist packing: an artifact that declares no companion
+    /// files gets a manifest-only zip. Nothing infers a payload from the role or the name.
+    #[test]
+    fn empty_requires_files_packs_a_manifest_only_zip() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: undeclared\nversion: 0.1.0\nruntime: tool\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("undeclared.wasm"), b"\0asm").unwrap();
+        fs::write(dir.path().join("notes.txt"), "stray").unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        build_artifact(dir.path(), &out).expect("nothing declared is not an error");
+
+        assert_eq!(
+            entry_names(&out),
+            vec![PACKED_MANIFEST_ENTRY.to_string()],
+            "nothing declared means nothing but the manifest is packed"
+        );
+    }
+
+    /// A manifest that redundantly lists itself is a degenerate declaration, not a request for
+    /// a duplicate entry.
+    #[test]
+    fn requires_files_naming_the_manifest_does_not_double_pack_it() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: redundant\nversion: 0.1.0\nruntime: tool\nrequires_files:\n  - murmur.yaml\n  - payload.bin\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("payload.bin"), "bytes").unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        build_artifact(dir.path(), &out).unwrap();
+
+        assert_eq!(
+            entry_names(&out),
+            vec![
+                PACKED_MANIFEST_ENTRY.to_string(),
+                "payload.bin".to_string()
+            ],
+            "the manifest is packed once regardless of how often it is declared"
+        );
+    }
+
+    /// The declared-file check runs before anything is written, so a build that cannot ship its
+    /// payload leaves no half-formed artifact behind.
+    #[test]
+    fn missing_declared_payload_fails_before_any_zip_is_written() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(MANIFEST_FILENAME),
+            "name: murmur-hook-compact\nversion: 0.3.0\nruntime: hook\nexecution: wasm\nrequires_files:\n  - murmur_hook_compact.wasm\n",
+        )
+        .unwrap();
+
+        let out = dir.path().join("artifact.mur.zip");
+        let err = build_artifact(dir.path(), &out).unwrap_err();
+
+        assert!(
+            matches!(&err, BuildError::MissingRequiredFile { file, .. } if file == "murmur_hook_compact.wasm"),
+            "expected MissingRequiredFile for the declared wasm; got: {err}"
+        );
+        assert!(!out.exists(), "no zip should be created on failure");
+    }
+
     #[test]
     fn builds_zip_with_manifest_at_root() {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: hello\nversion: 0.0.1\nruntime: wasm\n",
+            "name: hello\nversion: 0.0.1\nruntime: wasm\nrequires_files:\n  - assets/file.txt\n",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join("assets")).unwrap();
@@ -347,7 +470,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join(MANIFEST_FILENAME),
-            "name: root\nversion: 0.0.2\nruntime: wasm\n",
+            "name: root\nversion: 0.0.2\nruntime: wasm\nrequires_files:\n  - tools/murmur.yaml\n",
         )
         .unwrap();
         fs::create_dir_all(dir.path().join("tools")).unwrap();

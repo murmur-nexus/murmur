@@ -137,6 +137,10 @@ mur build .
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
 - Scans `murmur.yaml` and optional `murmur.yaml` for literal secret patterns and emits warnings
+- Packages **`murmur.yaml` plus exactly the files listed in `requires_files:`** — the rest of the
+  source directory (`src/`, `Cargo.toml`, `README.md`, editor files, build output) is not packaged.
+  An artifact that declares no `requires_files:` builds to a manifest-only archive; `mur build`
+  never compiles anything, so a `.wasm` payload must already exist on disk and be declared.
 - Output written **inside the source directory** unless `--output` is specified
 
 ### Skill packaging (`--skill`)

@@ -31,3 +31,6 @@ docs/site/
 .murmur
 .nexus
 murmur.yaml
+# …except test fixtures, whose manifests are part of the test input. Without this the CLI
+# integration suite silently depends on untracked files and cannot run from a clean checkout.
+!crates/*/tests/fixtures/**/murmur.yaml

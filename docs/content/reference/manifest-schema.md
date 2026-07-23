@@ -29,14 +29,14 @@ Optional fields:
 | Field | Type | Notes |
 |---|---|---|
 | `execution` | `wasm \| native \| static` | Declares this artifact's registry packaging type directly. When set, it is authoritative for `mur publish` and overrides the role-based derivation (`runtime: skill` → `static`, `runtime: tool` + `implementation: native` → `native`, everything else → `wasm`). Case-insensitive. An unrecognized value is a parse-time error, never a silent fallback. |
-| `requires_files` | list<string> | Companion files `mur build` requires to exist alongside `murmur.yaml` before packaging. Defaults to `["skill.md"]` for `runtime: skill` and to an empty list for every other role. An explicit value — including `[]` — always overrides that default, so a skill can opt out of the `skill.md` requirement by declaring `requires_files: []`. Missing files fail the build with `BuildError::MissingRequiredFile`, naming the first missing entry. |
+| `requires_files` | list<string> | Companion files `mur build` requires to exist alongside `murmur.yaml` — **and the complete list of what it packages** besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Defaults to `["skill.md"]` for `runtime: skill` and to an empty list for every other role. An explicit value — including `[]` — always overrides that default, so a skill can opt out of the `skill.md` requirement by declaring `requires_files: []`. Missing files fail the build with `BuildError::MissingRequiredFile`, naming the first missing entry. An artifact with a compiled payload must declare it here or the built `.mur.zip` will contain nothing but `murmur.yaml`. |
 
 ```yaml
 name: my-tool
 version: "0.1.0"
 runtime: tool
 execution: static      # optional: force registry_runtime() to Static instead of the derived Wasm
-requires_files:        # optional: build_artifact requires these files under source_dir
+requires_files:        # optional: the files build_artifact requires — and packages — under source_dir
   - config.json
 ```
 

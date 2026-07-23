@@ -1,0 +1,6 @@
+name: graduation-capsule
+version: 0.1.0
+artifacts:
+  - name: jsonl-line-count
+    version: 0.1.0
+    runtime: tool
