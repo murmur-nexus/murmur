@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod artifact_ref;
 pub mod build;
+pub mod build_lints;
 pub mod dotenv;
 pub mod lockfile;
 pub mod manifest;
@@ -22,7 +23,11 @@ pub use artifact::{
 };
 pub use platform::current_platform;
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
-pub use build::{build_artifact, BuildError, PACKED_MANIFEST_ENTRY};
+pub use build::{build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY};
+pub use build_lints::{
+    build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
+    W_BLD_002, W_BLD_003,
+};
 pub use dotenv::{load_dotenv_non_override, DotenvError};
 pub use lockfile::{
     read_lockfile, write_lockfile_atomic, LockedArtifact, LockedSha256, LockfileError, MurmurLock,

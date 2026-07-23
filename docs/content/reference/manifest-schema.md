@@ -22,6 +22,9 @@ Rules:
 
 - both fields are required
 - both must be strings
+- `name` is lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing
+  `-`), non-empty and at most 100 characters — anything else fails the build with
+  [`E-BLD-001`](build-lints.md#e-bld-001)
 - reserved versions (`latest`, `stable`, `edge`) cannot be published
 
 Optional fields:
@@ -29,7 +32,7 @@ Optional fields:
 | Field | Type | Notes |
 |---|---|---|
 | `execution` | `wasm \| native \| static` | Declares this artifact's registry packaging type directly. When set, it is authoritative for `mur publish` and overrides the role-based derivation (`runtime: skill` → `static`, `runtime: tool` + `implementation: native` → `native`, everything else → `wasm`). Case-insensitive. An unrecognized value is a parse-time error, never a silent fallback. |
-| `requires_files` | list<string> | Companion files `mur build` requires to exist alongside `murmur.yaml` — **and the complete list of what it packages** besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Defaults to `["skill.md"]` for `runtime: skill` and to an empty list for every other role. An explicit value — including `[]` — always overrides that default, so a skill can opt out of the `skill.md` requirement by declaring `requires_files: []`. Missing files fail the build with `BuildError::MissingRequiredFile`, naming the first missing entry. An artifact with a compiled payload must declare it here or the built `.mur.zip` will contain nothing but `murmur.yaml`. |
+| `requires_files` | list<string> | Companion files `mur build` requires to exist alongside `murmur.yaml` — **and the complete list of what it packages** besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Defaults to `["skill.md"]` for `runtime: skill` and to an empty list for every other role. An explicit value — including `[]` — always overrides that default, so a skill can opt out of the `skill.md` requirement by declaring `requires_files: []`. Missing files fail the build with `BuildError::MissingRequiredFile`, naming the first missing entry. An artifact with a compiled payload must declare it here or the built `.mur.zip` will contain nothing but `murmur.yaml` — for a wasm artifact that is a build failure ([`E-BLD-003`](build-lints.md#e-bld-003)). Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected ([`E-BLD-002`](build-lints.md#e-bld-002)). |
 
 ```yaml
 name: my-tool

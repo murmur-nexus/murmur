@@ -5,8 +5,8 @@ use std::{
 };
 
 use murmur_artifact::{
-    build_artifact, load_manifest, resolve_manifest_path, scan_yaml_secrets, security_warning_link,
-    W_SEC_004,
+    build_artifact, build_warning_link, lint_build_warnings, load_manifest, resolve_manifest_path,
+    scan_yaml_secrets, security_warning_link, W_SEC_004,
 };
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -59,6 +59,18 @@ fn run_build_standard(source: &Path, output_arg: Option<&Path>) -> Result<(), Cl
 
     let default_name = format!("{}-{}.mur.zip", manifest.name, manifest.version);
     let output_path = resolve_output_path(source, output_arg, &default_name);
+
+    // Authoring lints run over the same entry set the build is about to pack, so they print
+    // before the artifact line — and before a payload-shape failure, when there is one.
+    for warning in lint_build_warnings(source, &output_path).map_err(CliError::from)? {
+        eprintln!(
+            "warning[{}]: {}\n  → {}\n  → {}",
+            warning.code,
+            warning.message,
+            warning.hint,
+            build_warning_link(warning.code)
+        );
+    }
 
     let artifact_path = build_artifact(source, &output_path).map_err(CliError::from)?;
 

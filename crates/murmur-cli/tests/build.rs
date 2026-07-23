@@ -101,9 +101,12 @@ fn literal_api_key_warns_but_build_succeeds() {
     let key = ["sk-", "ant-", "abc123456789"].concat();
     fs::write(
         dir.path().join("murmur.yaml"),
-        format!("name: secret-demo\nversion: 0.0.1\nruntime: wasm\napi_key: {key}\n"),
+        format!(
+            "name: secret-demo\nversion: 0.0.1\nruntime: wasm\napi_key: {key}\nrequires_files:\n  - tool.wasm\n"
+        ),
     )
     .unwrap();
+    fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
 
     Command::cargo_bin("mur")
         .unwrap()
@@ -166,6 +169,93 @@ fn skill_artifact_build_fails_without_skill_md() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("skill.md"));
+}
+
+/// A wasm artifact whose payload the runtime could not select is a build failure, with the
+/// message the runtime itself would have printed at launch — and nothing left on disk.
+#[test]
+fn two_root_wasm_files_fail_the_build_with_no_artifact_written() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("murmur.yaml"),
+        "name: ambiguous-tool\nversion: 0.1.0\nruntime: wasm\nrequires_files:\n  - alpha.wasm\n  - zeta.wasm\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("alpha.wasm"), b"\0asm").unwrap();
+    fs::write(dir.path().join("zeta.wasm"), b"\0asm").unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("error[E-BLD-003]:").and(predicate::str::contains(
+                "multiple root .wasm files found: alpha.wasm, zeta.wasm",
+            )),
+        );
+
+    assert!(!dir.path().join("ambiguous-tool-0.1.0.mur.zip").exists());
+}
+
+#[test]
+fn an_invalid_artifact_name_fails_the_build() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("murmur.yaml"),
+        "name: My Tool\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", dir.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("error[E-BLD-001]:")
+                .and(predicate::str::contains("invalid artifact name 'My Tool'")),
+        );
+}
+
+#[test]
+fn a_declared_cargo_toml_warns_but_the_build_still_succeeds() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("murmur.yaml"),
+        "name: sources-shipped\nversion: 0.1.0\nruntime: wasm\nrequires_files:\n  - tool.wasm\n  - Cargo.toml\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("tool.wasm"), b"\0asm").unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("warning[W-BLD-003]:")
+                .and(predicate::str::contains("Cargo.toml")),
+        );
+
+    assert!(dir.path().join("sources-shipped-0.1.0.mur.zip").exists());
+}
+
+/// The lints are silent on a well-formed artifact: the in-workspace fixture builds with an
+/// empty stderr, so a warning line means something actually changed.
+#[test]
+fn the_happy_fixture_builds_without_any_warning() {
+    let fixture = fixture_path("happy");
+    let dir = tempdir().unwrap();
+    copy_dir_all(&fixture, dir.path());
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .args(["build", dir.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
 }
 
 fn fixture_path(name: &str) -> PathBuf {

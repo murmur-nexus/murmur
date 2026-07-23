@@ -31,6 +31,11 @@ pub const E_RUN_010: &str = "E-RUN-010"; // network.internal_port already in use
 pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
 pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared scope
 
+// Build lints
+pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
+pub const E_BLD_002: &str = "E-BLD-002"; // requires_files entry is unsafe or collides in the archive
+pub const E_BLD_003: &str = "E-BLD-003"; // packed entry set is not a launchable payload
+
 // Host I/O
 pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
 pub const E_IO_002: &str = "E-IO-002"; // permission denied (host, not capsule)
@@ -323,6 +328,39 @@ impl From<BuildError> for CliError {
             BuildError::MissingRequiredFile { file, path } => CliError::new(
                 E_IO_003,
                 format!("missing required file '{file}' in {path}"),
+            ),
+            BuildError::InvalidArtifactName { name, reason } => CliError::with_hint(
+                E_BLD_001,
+                format!("invalid artifact name '{name}': {reason}"),
+                "artifact names are lowercase letters, digits and inner hyphens, e.g. my-tool",
+            ),
+            BuildError::UnsafeRequiredPath { entry, reason } => CliError::with_hint(
+                E_BLD_002,
+                format!("requires_files entry '{entry}' has an unsafe path: {reason}"),
+                "declare files by a relative path inside the source directory",
+            ),
+            BuildError::SymlinkedRequiredFile { entry, path } => CliError::with_hint(
+                E_BLD_002,
+                format!(
+                    "requires_files entry '{entry}' is a symlink ({path}); declare the file it points to instead"
+                ),
+                "copy the target into the source directory, or declare its real path",
+            ),
+            BuildError::DuplicateArchiveEntry {
+                first,
+                second,
+                entry,
+            } => CliError::with_hint(
+                E_BLD_002,
+                format!(
+                    "requires_files entries '{first}' and '{second}' both pack as the archive entry '{entry}'"
+                ),
+                "give each packaged file a distinct path inside the artifact",
+            ),
+            BuildError::PayloadShape(error) => CliError::with_hint(
+                E_BLD_003,
+                error.to_string(),
+                "declare exactly one root *.wasm in requires_files: (or name it capsule.wasm)",
             ),
         }
     }
