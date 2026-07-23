@@ -85,7 +85,9 @@ pub enum BuildError {
     SymlinkedRequiredFile { entry: String, path: String },
     /// Two distinct source files claim the same entry name inside the archive, so one would
     /// silently overwrite the other on unpack.
-    #[error("requires_files entries '{first}' and '{second}' both pack as the archive entry '{entry}'")]
+    #[error(
+        "requires_files entries '{first}' and '{second}' both pack as the archive entry '{entry}'"
+    )]
     DuplicateArchiveEntry {
         first: String,
         second: String,
@@ -140,7 +142,9 @@ pub fn build_artifact(source_dir: &Path, output_path: &Path) -> Result<PathBuf, 
     // written. An artifact whose payload cannot be selected is a build failure now rather than
     // a `mur run` failure later; the message is the runtime's, verbatim.
     if manifest.registry_runtime() == RuntimeType::Wasm {
-        select_root_wasm_from_entries(plan.entries.iter().map(|entry| entry.archive_name.as_str()))?;
+        select_root_wasm_from_entries(
+            plan.entries.iter().map(|entry| entry.archive_name.as_str()),
+        )?;
     }
 
     if let Some(parent) = output_path.parent() {
