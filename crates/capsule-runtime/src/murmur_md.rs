@@ -476,6 +476,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
+            max_tokens: None,
         };
         let content = generate_murmur_md(
             tmp.path(),
@@ -797,6 +798,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: Some("sys-skill".to_string()),
             max_turns: 10,
+            max_tokens: None,
         };
         let content = generate_murmur_md(
             tmp.path(),

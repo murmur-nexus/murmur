@@ -240,6 +240,7 @@ A WASM guest never inherits the host process's environment: `capabilities.env.al
 | `inference.transport` | string | yes (if `inference` present) | `http` (WASM driver) or `process` (claude CLI subprocess) |
 | `inference.model` | string | yes (if `inference` present) | model identifier passed to the driver or CLI |
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per session. Default: `10`. Must be > 0. |
+| `inference.max_tokens` | integer | `http` only | Maximum output tokens the model may generate **per turn**, sent as `max_tokens` in the driver wire payload. Default: `8192`. Must be > 0; not clamped at the top end. Invalid for `transport: process`. Distinct from [`context.max_tokens`](#field-context), which is the session-wide budget for compaction. |
 | `inference.endpoint` | string | `http` only | base URL for inference API requests; invalid for `transport: process`. Must be `https://` (any host) or `http://` with a loopback host (`localhost` or an `IpAddr::is_loopback()` address, e.g. `127.0.0.1`, `::1`) — see [Endpoint scheme and host validation](#endpoint-validation) |
 | `inference.api_key` | string | no | literal value or `${ENV_VAR}` reference; `http` transport only; invalid for `transport: process` |
 | `inference.driver.artifact` | string | `http` only | inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`; invalid for `transport: process` |
@@ -256,7 +257,7 @@ A WASM guest never inherits the host process's environment: `capabilities.env.al
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable entirely. Must be > 0. |
+| `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable entirely. Must be > 0. Not to be confused with [`inference.max_tokens`](#field-inference), the per-turn output cap. |
 
 #### `observability` { #field-observability }
 
@@ -296,9 +297,25 @@ inference:
   endpoint: https://api.anthropic.com
   model: claude-opus-4-5
   api_key: ${ANTHROPIC_API_KEY}
+  max_tokens: 4096        # optional per-turn output cap; default 8192
   driver:
     artifact: murmur-driver-anthropic
 ```
+
+#### Output cap: `inference.max_tokens` { #inference-max-tokens }
+
+`inference.max_tokens` is the per-turn **output** cap — the `max_tokens` field of the payload the runtime hands the driver, which every driver forwards verbatim to its provider API. Omit it and the runtime sends `8192`, the value that was previously hard-coded.
+
+Two things it is *not*:
+
+- It is **not** `context.max_tokens`. That one is the session-wide token budget that decides when compaction fires, counted across the whole conversation. This one bounds a single response. They are parsed and validated independently and never share a default.
+- It is **not** a driver-specific setting. It is provider-agnostic and reaches every driver through the same wire field, so no `driver.config` entry is needed for it.
+
+Validation is deliberately one-sided: `0` is rejected at parse time as an authoring mistake, but a value larger than any given model's documented maximum is **not** rejected or clamped — an over-large cap surfaces as the provider's own error at request time rather than as a manifest load failure against a ceiling Murmur would have to guess.
+
+One interaction worth knowing: the anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering this value also squeezes a configured thinking budget.
+
+Hook-initiated completions (e.g. the compaction hook's own summarization call) always use the built-in `8192` default, not this value — it caps the agent's turns, not the runtime's internal calls.
 
 #### Endpoint scheme and host validation { #endpoint-validation }
 
@@ -332,7 +349,7 @@ inference:
 **Field rules for `transport: process`:**
 
 - `command`, `model` — required
-- `endpoint`, `driver.artifact`, `api_key` — all invalid; setting any of these is a manifest error
+- `endpoint`, `driver.artifact`, `api_key`, `max_tokens` — all invalid; setting any of these is a manifest error
 - No WASM driver artifact is needed or staged
 
 **What the subprocess sees:**

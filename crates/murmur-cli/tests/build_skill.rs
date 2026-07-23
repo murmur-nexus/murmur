@@ -306,6 +306,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         system_prompt_file: None,
         system_prompt_artifact: None,
         max_turns: 10,
+        max_tokens: None,
     });
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
