@@ -1243,6 +1243,13 @@ pub fn launch_session(
     })
 }
 
+/// Reads a manifest-relative prompt file, returning the resolved path alongside any I/O
+/// error so the caller can map it to its own `RuntimeError` variant.
+fn read_prompt_file(manifest_dir: &Path, path: &str) -> Result<String, (PathBuf, std::io::Error)> {
+    let prompt_path = manifest_dir.join(path);
+    fs::read_to_string(&prompt_path).map_err(|source| (prompt_path, source))
+}
+
 fn resolve_system_prompt(
     manifest_dir: &Path,
     workdir: &Path,
@@ -1253,10 +1260,9 @@ fn resolve_system_prompt(
     }
 
     if let Some(path) = inference.system_prompt_file.as_ref() {
-        let prompt_path = manifest_dir.join(path);
-        return fs::read_to_string(&prompt_path)
+        return read_prompt_file(manifest_dir, path)
             .map(Some)
-            .map_err(|source| RuntimeError::SystemPromptFileRead {
+            .map_err(|(prompt_path, source)| RuntimeError::SystemPromptFileRead {
                 path: prompt_path.display().to_string(),
                 source,
             });
@@ -1296,13 +1302,12 @@ fn resolve_compaction_system_prompt(
     }
 
     if let Some(path) = compaction.system_prompt_file.as_ref() {
-        let prompt_path = manifest_dir.join(path);
-        return fs::read_to_string(&prompt_path).map(Some).map_err(|source| {
-            RuntimeError::CompactionSystemPromptFileRead {
+        return read_prompt_file(manifest_dir, path).map(Some).map_err(
+            |(prompt_path, source)| RuntimeError::CompactionSystemPromptFileRead {
                 path: prompt_path.display().to_string(),
                 source,
-            }
-        });
+            },
+        );
     }
 
     Ok(None)
