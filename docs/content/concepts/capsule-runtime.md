@@ -278,7 +278,12 @@ hard limit:
    hook by binding, not by name, so no artifact name is configured anywhere. `murmur-hook-compact`
    is the reference implementation, but any hook bound to `on-compaction` works.
 4. The hook returns a condensed message array; the runtime replaces the in-memory history
-   and recounts tokens against it.
+   and recounts tokens against it. Each returned `message.content` (a WIT `string`) may be
+   either a JSON-encoded plain string (e.g. a one-paragraph summary) or a JSON-encoded array
+   of content blocks — the runtime normalizes either shape into a block array before the next
+   driver call, so a custom compaction hook does not need to wrap its summary in blocks
+   itself. A `tool`-role message is only kept if the hook returned it unmodified; any other
+   `tool`-role message is dropped rather than replayed with a synthesized `tool_call_id`.
 5. The agent loop continues — the model's next turn sees the compacted history.
 
 Compaction never consumes a turn slot. Whether a failure to compact is fatal depends on why it
