@@ -16,7 +16,7 @@ use wasmtime::{
 };
 
 use crate::{
-    agent::{build_driver_payload, count_tokens},
+    agent::{build_driver_payload, count_tokens, DEFAULT_MAX_OUTPUT_TOKENS},
     bindings::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
@@ -89,8 +89,12 @@ impl HookInferenceCtx {
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
             .collect();
+        // Hook completions keep the built-in default cap rather than the manifest's
+        // `inference.max_tokens`: that field is documented as the *agent turn* output cap, and a
+        // small value chosen for the agent loop would silently truncate a compaction summary.
         let payload = build_driver_payload(
             &model,
+            DEFAULT_MAX_OUTPUT_TOKENS,
             &messages,
             &[],
             request.system_prompt.as_deref().unwrap_or(""),
@@ -381,7 +385,8 @@ mod tests {
     /// wire, not just into `model-used`.
     fn expected_input_tokens(model: &str) -> u64 {
         let messages = vec![serde_json::json!({"role":"user","content":"summarize this"})];
-        let payload = build_driver_payload(model, &messages, &[], "", None);
+        let payload =
+            build_driver_payload(model, DEFAULT_MAX_OUTPUT_TOKENS, &messages, &[], "", None);
         u64::from(count_tokens(&serde_json::to_string(&payload).unwrap()))
     }
 

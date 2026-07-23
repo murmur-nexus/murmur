@@ -408,6 +408,13 @@ pub struct InferenceConfig {
     /// Maximum LLM turns per capsule task. Defaults to 10 when absent in the manifest.
     /// Enforced as a hard ceiling by the runtime.
     pub max_turns: u32,
+    /// Maximum output tokens the model may generate per turn (`max_tokens` in the driver wire
+    /// payload). None means the manifest didn't set it; the runtime applies its own default.
+    /// `transport: http` only — rejected at parse time under `transport: process`.
+    ///
+    /// Unrelated to [`ContextConfig::max_tokens`], which is the session-wide token budget that
+    /// drives compaction. This one is a per-turn *output* cap.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -727,6 +734,8 @@ struct RawInferenceConfig {
     compaction: Option<RawCompactionConfig>,
     #[serde(default)]
     max_turns: Option<u32>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1114,6 +1123,16 @@ fn parse_inference(
             })?;
             let driver = parse_inference_driver(driver_raw)?;
 
+            // Advisory only: catch an authoring typo at parse time rather than as a confusing
+            // provider 400. Large values are deliberately NOT clamped — a ceiling here would
+            // block a model whose real limit is higher than anything we could hard-code.
+            if raw.max_tokens == Some(0) {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.max_tokens".to_string(),
+                    message: "must be greater than 0".to_string(),
+                });
+            }
+
             Ok(Some(InferenceConfig {
                 transport,
                 endpoint: Some(endpoint),
@@ -1126,6 +1145,7 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
+                max_tokens: raw.max_tokens,
             }))
         }
         "process" => {
@@ -1145,6 +1165,14 @@ fn parse_inference(
             if raw.api_key.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.api_key".to_string(),
+                    message: "is not valid with transport: process".to_string(),
+                });
+            }
+            // The CLI subprocess path never builds a driver payload, so this value would be
+            // silently inert here — reject it rather than let it look effective.
+            if raw.max_tokens.is_some() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.max_tokens".to_string(),
                     message: "is not valid with transport: process".to_string(),
                 });
             }
@@ -1168,6 +1196,7 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
+                max_tokens: None,
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -2627,6 +2656,145 @@ inference:
         let msg = err.to_string();
         assert!(msg.contains("inference.api_key"), "error was: {msg}");
         assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+    }
+
+    #[test]
+    fn process_transport_rejects_max_tokens() {
+        // Rejected even at a perfectly valid value: the CLI subprocess path never builds a
+        // driver payload, so accepting it would leave it silently inert.
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: process
+  command: claude
+  model: claude-haiku-4-5-20251001
+  max_tokens: 4096
+"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("inference.max_tokens"), "error was: {msg}");
+        assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+    }
+
+    #[test]
+    fn inference_max_tokens_round_trips() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_tokens: 4096
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let inference = manifest.inference.unwrap();
+        assert_eq!(inference.max_tokens, Some(4096));
+    }
+
+    #[test]
+    fn inference_max_tokens_absent_is_none() {
+        // Absent means "the manifest didn't set it" all the way down; the 8192 default is
+        // applied once, by the runtime, not smuggled in here.
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.inference.unwrap().max_tokens, None);
+    }
+
+    #[test]
+    fn inference_max_tokens_zero_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_tokens: 0
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("inference.max_tokens"), "error was: {msg}");
+        assert!(msg.contains("must be greater than 0"), "error was: {msg}");
+    }
+
+    #[test]
+    fn inference_max_tokens_large_value_is_accepted() {
+        // Manifest validation stays advisory: an over-large cap is the provider's to reject
+        // at request time, not ours to clamp or block at load time.
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_tokens: 999999
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.inference.unwrap().max_tokens, Some(999_999));
+    }
+
+    #[test]
+    fn inference_and_context_max_tokens_are_independent() {
+        // Two unrelated concepts that happen to share a leaf name: per-turn output cap vs.
+        // session compaction budget. Neither may leak into the other.
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_tokens: 4096
+  driver:
+    artifact: murmur-driver-anthropic
+context:
+  max_tokens: 200000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.inference.unwrap().max_tokens, Some(4096));
+        assert_eq!(manifest.context.unwrap().max_tokens, Some(200_000));
     }
 
     #[test]

@@ -22,6 +22,10 @@ use crate::{
     trace::TraceWriter,
 };
 
+/// Output cap sent to the driver when `inference.max_tokens` is absent from the manifest.
+/// Applied exactly once, at the `AgentRunConfig` population site in runtime.rs.
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8192;
+
 #[derive(Clone)]
 pub(crate) struct AgentRunConfig {
     /// Resolved token budget for this session. 0 means compaction is disabled.
@@ -32,6 +36,9 @@ pub(crate) struct AgentRunConfig {
     pub compaction_model: Option<String>,
     /// System prompt override for compaction calls. None = the hook picks its own default.
     pub compaction_system_prompt: Option<String>,
+    /// Per-turn output cap sent to the driver as `max_tokens`. Resolved from
+    /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`].
+    pub max_output_tokens: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,6 +164,7 @@ pub(crate) async fn run_agent_loop(
         let active_continuation = store_state.active_continuation(context_id.as_deref());
         let payload = build_driver_payload(
             &inference.model,
+            run_config.max_output_tokens,
             &messages,
             &tools,
             &augmented_system,
@@ -174,6 +182,7 @@ pub(crate) async fn run_agent_loop(
         let input_tokens = if active_continuation.is_some() {
             let full_payload = build_driver_payload(
                 &inference.model,
+                run_config.max_output_tokens,
                 &messages,
                 &tools,
                 &augmented_system,
@@ -1184,6 +1193,7 @@ fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
 /// never from this (possibly smaller) one.
 pub(crate) fn build_driver_payload(
     model: &str,
+    max_output_tokens: u32,
     messages: &[Value],
     tools: &[Value],
     augmented_system: &str,
@@ -1198,7 +1208,7 @@ pub(crate) fn build_driver_payload(
     };
     let mut payload = json!({
         "model": model,
-        "max_tokens": 8192,
+        "max_tokens": max_output_tokens,
         "messages": wire_messages,
         "tools": tools,
         "params": {},
@@ -1481,7 +1491,8 @@ mod tests {
         // byte-for-byte the pre-continuation payload shape.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", &msgs, &tools, "sys", None);
+        let payload =
+            build_driver_payload("m", DEFAULT_MAX_OUTPUT_TOKENS, &msgs, &tools, "sys", None);
 
         assert_eq!(payload["messages"].as_array().unwrap().len(), 3);
         assert_eq!(payload["messages"], json!(msgs));
@@ -1503,12 +1514,29 @@ mod tests {
     }
 
     #[test]
+    fn build_driver_payload_uses_configured_max_output_tokens() {
+        // A manifest-supplied inference.max_tokens reaches the wire verbatim, and nothing
+        // else about the payload changes versus the default-valued one.
+        let msgs = sample_messages();
+        let tools = vec![json!({"name": "bash"})];
+        let payload = build_driver_payload("m", 4096, &msgs, &tools, "sys", None);
+
+        assert_eq!(payload["max_tokens"], json!(4096));
+
+        let mut default_payload =
+            build_driver_payload("m", DEFAULT_MAX_OUTPUT_TOKENS, &msgs, &tools, "sys", None);
+        assert_eq!(default_payload["max_tokens"], json!(8192));
+        default_payload["max_tokens"] = json!(4096);
+        assert_eq!(payload, default_payload, "only max_tokens differs");
+    }
+
+    #[test]
     fn build_driver_payload_incremental_slices_from_acked_len() {
         // Scenario 2: continuation active → only messages[acked_len..] + continuation_id key.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
         let payload =
-            build_driver_payload("m", &msgs, &tools, "sys", Some(("cont-abc123", 1)));
+            build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("cont-abc123", 1)));
 
         let wire = payload["messages"].as_array().unwrap();
         assert_eq!(wire.len(), 2, "should send only the tail appended since ack");
@@ -1520,7 +1548,7 @@ mod tests {
     fn build_driver_payload_acked_len_zero_sends_full_with_continuation() {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", &msgs, &tools, "sys", Some(("c", 0)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 0)));
         assert_eq!(payload["messages"], json!(msgs));
         assert_eq!(payload["continuation_id"], json!("c"));
     }
@@ -1529,7 +1557,7 @@ mod tests {
     fn build_driver_payload_acked_len_equals_len_sends_empty_tail() {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", &msgs, &tools, "sys", Some(("c", 3)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 3)));
         assert_eq!(payload["messages"], json!([]));
         assert_eq!(payload["continuation_id"], json!("c"));
     }
@@ -1539,7 +1567,7 @@ mod tests {
         // Defensive: an out-of-range acked_len must not panic; resend in full, no key.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", &msgs, &tools, "sys", Some(("c", 99)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 99)));
         assert_eq!(payload["messages"], json!(msgs));
         assert!(payload.get("continuation_id").is_none());
     }
@@ -1551,13 +1579,13 @@ mod tests {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
 
-        let full_when_inactive = build_driver_payload("m", &msgs, &tools, "sys", None);
+        let full_when_inactive = build_driver_payload("m", 8192, &msgs, &tools, "sys", None);
         // The caller recomputes the full payload with `None` even when continuation is active.
-        let full_when_active = build_driver_payload("m", &msgs, &tools, "sys", None);
+        let full_when_active = build_driver_payload("m", 8192, &msgs, &tools, "sys", None);
         assert_eq!(full_when_inactive, full_when_active);
 
         // And that full payload is strictly larger than the incremental wire it would send.
-        let wire = build_driver_payload("m", &msgs, &tools, "sys", Some(("c", 2)));
+        let wire = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 2)));
         assert!(
             serde_json::to_string(&full_when_active).unwrap().len()
                 > serde_json::to_string(&wire).unwrap().len()

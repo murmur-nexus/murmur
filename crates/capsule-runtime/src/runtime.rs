@@ -472,6 +472,9 @@ pub fn launch_session(
                 .compaction
                 .as_ref()
                 .and_then(|c| c.system_prompt.clone()),
+            max_output_tokens: inference
+                .max_tokens
+                .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
         };
 
         // --- Identity and HTTP server setup ---
@@ -3426,6 +3429,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
+            max_tokens: None,
         };
 
         let request = StageRequest {
@@ -3835,6 +3839,7 @@ mod tests {
                 system_prompt_file: None,
                 system_prompt_artifact: None,
                 max_turns: 10,
+                max_tokens: None,
             }
         }
 

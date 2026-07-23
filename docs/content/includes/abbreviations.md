@@ -16,6 +16,8 @@
 
 *[context.max_tokens]: token budget · required to enable compaction · omit to disable
 
+*[inference.max_tokens]: per-turn output cap · sent to the driver as max_tokens · default 8192 · http transport only · not the compaction budget
+
 *[inference.model]: model identifier string · e.g. claude-sonnet-4-6 · claude-opus-4-7 · claude-haiku-4-5-20251001
 
 *[inference.driver.artifact]: inference driver artifact name · must use runtime: driver
