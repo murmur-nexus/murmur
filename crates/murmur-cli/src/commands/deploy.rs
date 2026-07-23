@@ -300,9 +300,12 @@ fn collect_deploy_artifacts(manifest: &RuntimeManifest) -> Vec<(String, String)>
 ///
 /// Fields checked in `RuntimeManifest`:
 ///   - `inference.system_prompt_file` — path to a local file for the system prompt
+///   - `inference.compaction.system_prompt_file` — path to a local file for the
+///     compaction system prompt
 ///
 /// Fields NOT checked (not local file paths):
 ///   - `inference.system_prompt` — inline string content
+///   - `inference.compaction.system_prompt` — inline string content
 ///   - `inference.api_key` — literal value or `${ENV_VAR}` reference
 ///   - `inference.driver.config` — inline JSON object
 ///   - `observability.otel_endpoint` — HTTP endpoint URL
@@ -317,42 +320,66 @@ fn collect_manifest_files(
 
     if let Some(ref inference) = manifest.inference {
         if let Some(ref spf) = inference.system_prompt_file {
-            let local_path = if std::path::Path::new(spf).is_absolute() {
-                std::path::PathBuf::from(spf)
-            } else {
-                manifest_dir.join(spf)
-            };
+            files.push(resolve_manifest_file(
+                "inference.system_prompt_file",
+                spf,
+                manifest_dir,
+            )?);
+        }
 
-            std::fs::metadata(&local_path).map_err(|_| {
-                CliError::new(
-                    E_IO_001,
-                    format!(
-                        "manifest references inference.system_prompt_file at {} but the file \
-                         does not exist",
-                        local_path.display()
-                    ),
-                )
-            })?;
-
-            let filename = local_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| {
-                    CliError::new(
-                        E_IO_001,
-                        format!(
-                            "inference.system_prompt_file path has no filename: {}",
-                            local_path.display()
-                        ),
-                    )
-                })?
-                .to_string();
-
-            files.push((local_path, filename));
+        if let Some(spf) = inference
+            .compaction
+            .as_ref()
+            .and_then(|c| c.system_prompt_file.as_ref())
+        {
+            files.push(resolve_manifest_file(
+                "inference.compaction.system_prompt_file",
+                spf,
+                manifest_dir,
+            )?);
         }
     }
 
     Ok(files)
+}
+
+/// Resolves one manifest-referenced path into the `(local_absolute_path, remote_filename)`
+/// pair [`collect_manifest_files`] uploads, erroring if the file is missing or the path has
+/// no filename component. `field` is the dotted manifest field name, used verbatim in both
+/// error messages so an author can tell which reference failed.
+fn resolve_manifest_file(
+    field: &str,
+    raw_path: &str,
+    manifest_dir: &Path,
+) -> Result<(std::path::PathBuf, String), CliError> {
+    let local_path = if std::path::Path::new(raw_path).is_absolute() {
+        std::path::PathBuf::from(raw_path)
+    } else {
+        manifest_dir.join(raw_path)
+    };
+
+    std::fs::metadata(&local_path).map_err(|_| {
+        CliError::new(
+            E_IO_001,
+            format!(
+                "manifest references {field} at {} but the file does not exist",
+                local_path.display()
+            ),
+        )
+    })?;
+
+    let filename = local_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            CliError::new(
+                E_IO_001,
+                format!("{field} path has no filename: {}", local_path.display()),
+            )
+        })?
+        .to_string();
+
+    Ok((local_path, filename))
 }
 
 /// Inner implementation of mur binary resolution; takes an explicit home directory so
@@ -1387,6 +1414,65 @@ mod tests {
             "error should mention the missing filename, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn collect_manifest_files_includes_existing_compaction_system_prompt_file() {
+        let dir = tempdir().unwrap();
+        let instructions = dir.path().join("compaction-instructions.md");
+        fs::write(&instructions, "Summarize aggressively.").unwrap();
+
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
+                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+                    compaction:\n    system_prompt_file: compaction-instructions.md\n  \
+                    driver:\n    artifact: murmur-driver-anthropic\n";
+        let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
+
+        let files = collect_manifest_files(&manifest, dir.path()).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, instructions);
+        assert_eq!(files[0].1, "compaction-instructions.md");
+    }
+
+    #[test]
+    fn collect_manifest_files_errors_for_missing_compaction_system_prompt_file() {
+        let dir = tempdir().unwrap();
+        // Do NOT create compaction-instructions.md
+
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
+                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+                    compaction:\n    system_prompt_file: compaction-instructions.md\n  \
+                    driver:\n    artifact: murmur-driver-anthropic\n";
+        let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
+
+        let err = collect_manifest_files(&manifest, dir.path()).unwrap_err();
+        assert!(
+            err.message.contains("compaction-instructions.md")
+                && err.message.contains("inference.compaction.system_prompt_file"),
+            "error should name the field and the missing path, got: {}",
+            err.message
+        );
+    }
+
+    /// Both prompt-file fields set means both files ship — the primary one first.
+    #[test]
+    fn collect_manifest_files_includes_both_prompt_files() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("instructions.md"), "You are an assistant.").unwrap();
+        fs::write(dir.path().join("compaction.md"), "Summarize.").unwrap();
+
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
+                    inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
+                    system_prompt_file: instructions.md\n  \
+                    compaction:\n    system_prompt_file: compaction.md\n  \
+                    driver:\n    artifact: murmur-driver-anthropic\n";
+        let manifest = RuntimeManifest::from_yaml_str(yaml).unwrap();
+
+        let files = collect_manifest_files(&manifest, dir.path()).unwrap();
+
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, vec!["instructions.md", "compaction.md"]);
     }
 
     // ─── resolve_mur_binary_impl ─────────────────────────────────────────────

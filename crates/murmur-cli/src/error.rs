@@ -164,6 +164,12 @@ impl From<RuntimeError> for CliError {
                 E_RUN_009,
                 format!("failed to read inference.system_prompt_file at {path}: {source}"),
             ),
+            RuntimeError::CompactionSystemPromptFileRead { path, source } => CliError::new(
+                E_RUN_009,
+                format!(
+                    "failed to read inference.compaction.system_prompt_file at {path}: {source}"
+                ),
+            ),
             RuntimeError::SystemPromptArtifactRead { name, source } => CliError::new(
                 E_RUN_009,
                 format!(

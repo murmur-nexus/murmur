@@ -60,6 +60,13 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
 
+    #[error("failed to read inference.compaction.system_prompt_file at {path}: {source}")]
+    CompactionSystemPromptFileRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(
         "inference.system_prompt_artifact '{name}': skill.md not found or unreadable; \
          ensure the skill is declared in artifacts: and the capsule was staged"
