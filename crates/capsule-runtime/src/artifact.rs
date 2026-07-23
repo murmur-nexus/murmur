@@ -1,4 +1,7 @@
-use murmur_artifact::zip_guard::{self, sanitize_entry_path};
+use murmur_artifact::payload_shape::{
+    native_binary_entry, select_root_wasm_in_archive, SKILL_MD_ENTRY,
+};
+use murmur_artifact::zip_guard;
 use murmur_artifact::PACKED_MANIFEST_ENTRY;
 use zip::ZipArchive;
 
@@ -30,62 +33,14 @@ fn extract_root_wasm_capped(
         message: err.to_string(),
     })?;
 
-    let mut root_wasm_candidates = Vec::new();
-    for idx in 0..archive.len() {
-        let Ok(file) = archive.by_index(idx) else {
-            continue;
-        };
-
-        let raw_name = file.name().to_string();
-        drop(file);
-
-        if !raw_name.ends_with(".wasm") {
-            continue;
-        }
-
-        // Root-wasm candidates must be a single top-level path component: reject entries
-        // with an unsafe path (e.g. a `..` component) and entries nested in a subdirectory
-        // or carrying a leading '/' (both of which sanitize_entry_path would otherwise
-        // normalize away, but which must never be treated as "the root wasm file").
-        let Ok(sanitized) = sanitize_entry_path(&raw_name) else {
-            continue;
-        };
-        if raw_name.starts_with('/') || sanitized.components().count() != 1 {
-            continue;
-        }
-
-        root_wasm_candidates.push(raw_name);
-    }
-
-    let selected_name = if root_wasm_candidates
-        .iter()
-        .any(|name| name == "capsule.wasm")
-    {
-        "capsule.wasm".to_string()
-    } else {
-        match root_wasm_candidates.len() {
-            1 => root_wasm_candidates.remove(0),
-            0 => {
-                return Err(RuntimeError::ArtifactArchive {
-                    name: artifact_name.to_string(),
-                    version: artifact_version.to_string(),
-                    message: "missing root .wasm file (expected capsule.wasm or one root *.wasm)"
-                        .to_string(),
-                })
-            }
-            _ => {
-                root_wasm_candidates.sort();
-                return Err(RuntimeError::ArtifactArchive {
-                    name: artifact_name.to_string(),
-                    version: artifact_version.to_string(),
-                    message: format!(
-                        "multiple root .wasm files found: {}",
-                        root_wasm_candidates.join(", ")
-                    ),
-                });
-            }
-        }
-    };
+    // Which root entry counts as the wasm payload is the shared payload-shape contract; the
+    // selector (and its error text) lives in murmur_artifact::payload_shape.
+    let selected_name =
+        select_root_wasm_in_archive(&mut archive).map_err(|err| RuntimeError::ArtifactArchive {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            message: err.to_string(),
+        })?;
 
     zip_guard::read_zip_entry_capped(&mut archive, &selected_name, max_bytes).map_err(|err| {
         RuntimeError::ArtifactArchive {
@@ -127,14 +82,14 @@ fn extract_native_binary_capped(
         message: err.to_string(),
     })?;
 
-    let bin_path = format!("bin/{artifact_name}");
+    let bin_path = native_binary_entry(artifact_name);
     zip_guard::read_zip_entry_capped(&mut archive, &bin_path, max_bytes).map_err(|err| {
         RuntimeError::ArtifactArchive {
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
             message: format!(
                 "failed to read native binary at '{bin_path}' from archive (ensure the binary \
-                 is at bin/{artifact_name} inside the .mur.zip): {err}"
+                 is at {bin_path} inside the .mur.zip): {err}"
             ),
         }
     })
@@ -171,13 +126,13 @@ fn extract_skill_md_capped(
         message: err.to_string(),
     })?;
 
-    zip_guard::read_zip_entry_capped(&mut archive, "skill.md", max_bytes).map_err(|err| {
+    zip_guard::read_zip_entry_capped(&mut archive, SKILL_MD_ENTRY, max_bytes).map_err(|err| {
         RuntimeError::ArtifactArchive {
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
             message: format!(
-                "skill.md not found or unreadable at archive root (ensure skill.md is at the \
-                 root of the .mur.zip): {err}"
+                "{SKILL_MD_ENTRY} not found or unreadable at archive root (ensure \
+                 {SKILL_MD_ENTRY} is at the root of the .mur.zip): {err}"
             ),
         }
     })

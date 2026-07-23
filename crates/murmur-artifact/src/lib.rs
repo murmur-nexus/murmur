@@ -8,6 +8,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod manifest_path;
 pub mod message_schema;
+pub mod payload_shape;
 pub mod platform;
 pub mod registry;
 pub mod runtime_manifest;
@@ -30,6 +31,11 @@ pub use lockfile::{
 pub use manifest::{load_manifest, Manifest, ManifestError};
 pub use manifest_path::{resolve_manifest_path, MANIFEST_FILENAME};
 pub use message_schema::{CodeTaskRequest, CodeTaskResult, MurmurMessage};
+pub use payload_shape::{
+    is_root_wasm_candidate, native_binary_entry, root_wasm_candidates, select_root_wasm,
+    select_root_wasm_from_entries, select_root_wasm_in_archive, PayloadShapeError,
+    CAPSULE_WASM_ENTRY, NATIVE_BIN_DIR, SKILL_MD_ENTRY, WASM_EXTENSION,
+};
 pub use registry::{
     is_reserved_version, sha256_hex, verify_sha256, ArtifactMeta, LocalRegistry, Platform,
     PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
