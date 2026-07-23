@@ -120,6 +120,7 @@ nav:
       - Manifest Schema: reference/manifest-schema.md
       - Capsule I/O Schema: reference/capsule-io.md
       - Security Warnings: reference/security-warnings.md
+      - Build Lints: reference/build-lints.md
       - WIT Interfaces: reference/wit-interfaces.md
       - Nexus API: reference/nexus-api.md
       - Roost API: reference/roost-api.md

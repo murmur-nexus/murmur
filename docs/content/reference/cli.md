@@ -139,8 +139,12 @@ mur build .
 - Scans `murmur.yaml` and optional `murmur.yaml` for literal secret patterns and emits warnings
 - Packages **`murmur.yaml` plus exactly the files listed in `requires_files:`** — the rest of the
   source directory (`src/`, `Cargo.toml`, `README.md`, editor files, build output) is not packaged.
-  An artifact that declares no `requires_files:` builds to a manifest-only archive; `mur build`
-  never compiles anything, so a `.wasm` payload must already exist on disk and be declared.
+  `mur build` never compiles anything, so a `.wasm` payload must already exist on disk and be
+  declared. A native or static artifact that declares no `requires_files:` builds to a
+  manifest-only archive; a **wasm** artifact does not — with no root `*.wasm` to pack it fails
+  with [`E-BLD-003`](build-lints.md#e-bld-003).
+- Validates the manifest `name:`, the `requires_files:` paths and the resulting payload shape,
+  and warns about redundant or misplaced declarations — see [Build Lints](build-lints.md)
 - Output written **inside the source directory** unless `--output` is specified
 
 ### Skill packaging (`--skill`)
@@ -1529,6 +1533,9 @@ Remote mode requires:
 | `E-MAN-001` | Missing required manifest field |
 | `E-MAN-002` | YAML syntax error in manifest |
 | `E-MAN-003` | Field type mismatch in manifest |
+| `E-BLD-001` | Manifest `name:` is not a valid artifact identifier ([build lints](build-lints.md#e-bld-001)) |
+| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive ([build lints](build-lints.md#e-bld-002)) |
+| `E-BLD-003` | Packed entry set is not a launchable wasm payload ([build lints](build-lints.md#e-bld-003)) |
 | `E-RUN-001` | Capsule trap, compile failure, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) |
 | `E-RUN-002` | Missing WASI import (linker error) |
 | `E-RUN-003` | Lock version mismatch or missing lock entry |
