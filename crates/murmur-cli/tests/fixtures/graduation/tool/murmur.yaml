@@ -1,0 +1,5 @@
+name: jsonl-line-count
+version: 0.1.0
+runtime: wasm
+requires_files:
+  - jsonl-line-count.wasm

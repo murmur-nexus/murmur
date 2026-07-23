@@ -175,7 +175,12 @@ Create `my-tool/murmur.yaml`:
 ```yaml
 name: jsonl-line-count
 version: "0.1.0"
+requires_files:
+  - tool.wasm
 ```
+
+`requires_files:` is what `mur build` packages alongside the manifest. Without it the compiled
+`tool.wasm` is not put in the artifact — see [`requires_files`](../reference/manifest-schema.md).
 
 ---
 

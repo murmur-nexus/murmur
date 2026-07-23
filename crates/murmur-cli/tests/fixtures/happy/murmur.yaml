@@ -1,0 +1,5 @@
+name: hello-slice
+version: 0.0.1
+runtime: wasm
+requires_files:
+  - tool.wasm
