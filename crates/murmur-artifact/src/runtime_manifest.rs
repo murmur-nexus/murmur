@@ -424,7 +424,12 @@ pub struct CompactionConfig {
     /// Model for compaction. None means use the primary inference model.
     pub model: Option<String>,
     /// System prompt for compaction. None means the compaction hook picks its own default.
+    /// Mutually exclusive with `system_prompt_file`.
     pub system_prompt: Option<String>,
+    /// Path to a local file whose contents are used as the compaction system prompt,
+    /// resolved relative to the manifest directory when the session launches. Mutually
+    /// exclusive with `system_prompt`.
+    pub system_prompt_file: Option<String>,
 }
 
 // Threshold values are validated to (0.0, 1.0] at parse time so NaN is impossible.
@@ -743,6 +748,7 @@ struct RawCompactionConfig {
     threshold: Option<f32>,
     model: Option<String>,
     system_prompt: Option<String>,
+    system_prompt_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1288,10 +1294,20 @@ fn parse_compaction(
         }
     }
 
+    if raw.system_prompt.is_some() && raw.system_prompt_file.is_some() {
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.compaction.system_prompt".to_string(),
+            message: "at most one of inference.compaction.system_prompt, \
+                      inference.compaction.system_prompt_file may be set"
+                .to_string(),
+        });
+    }
+
     Ok(Some(CompactionConfig {
         threshold: raw.threshold,
         model: raw.model,
         system_prompt: raw.system_prompt,
+        system_prompt_file: optional_trimmed_string(raw.system_prompt_file),
     }))
 }
 
@@ -2055,7 +2071,134 @@ inference:
 
         let compaction = manifest.inference.unwrap().compaction.unwrap();
         assert!(compaction.system_prompt.is_none());
+        assert!(compaction.system_prompt_file.is_none());
         assert_eq!(compaction.model, Some("compaction-model".to_string()));
+    }
+
+    /// `system_prompt_file` parses as the second, independent prompt source: the path is
+    /// carried through verbatim (resolution against the manifest dir happens in the
+    /// runtime), the inline field stays `None`, and `model` is unaffected.
+    #[test]
+    fn parses_compaction_system_prompt_file() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    model: compaction-model
+    system_prompt_file: "compaction-instructions.md"
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let compaction = manifest.inference.unwrap().compaction.unwrap();
+        assert_eq!(
+            compaction.system_prompt_file,
+            Some("compaction-instructions.md".to_string())
+        );
+        assert!(compaction.system_prompt.is_none());
+        assert_eq!(compaction.model, Some("compaction-model".to_string()));
+    }
+
+    /// `system_prompt_file` alone, with no `model`, still parses — the two fields do not
+    /// depend on each other in either direction.
+    #[test]
+    fn compaction_system_prompt_file_independent_of_model() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    threshold: 0.5
+    system_prompt_file: "compaction-instructions.md"
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let compaction = manifest.inference.unwrap().compaction.unwrap();
+        assert_eq!(
+            compaction.system_prompt_file,
+            Some("compaction-instructions.md".to_string())
+        );
+        assert!(compaction.model.is_none());
+        assert_eq!(compaction.threshold, Some(0.5));
+    }
+
+    /// Setting both compaction prompt sources is a parse error naming the compaction
+    /// fields — distinguishable from the top-level three-way `inference.system_prompt`
+    /// exclusivity error, and with neither value silently preferred.
+    #[test]
+    fn compaction_prompt_sources_are_mutually_exclusive() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    system_prompt: "inline"
+    system_prompt_file: "compaction-instructions.md"
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .expect_err("both compaction prompt sources set must fail");
+
+        match err {
+            RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                assert_eq!(field, "inference.compaction.system_prompt");
+                assert_eq!(
+                    message,
+                    "at most one of inference.compaction.system_prompt, \
+                     inference.compaction.system_prompt_file may be set"
+                );
+            }
+            other => panic!("expected InvalidInferenceConfig, got {other:?}"),
+        }
+    }
+
+    /// The compaction-level exclusivity check is separate from the top-level one: an
+    /// inline top-level `system_prompt` alongside a compaction `system_prompt_file` is a
+    /// perfectly legal manifest.
+    #[test]
+    fn top_level_and_compaction_prompt_sources_do_not_collide() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  system_prompt: "be helpful"
+  compaction:
+    system_prompt_file: "compaction-instructions.md"
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        let inference = manifest.inference.unwrap();
+        assert_eq!(inference.system_prompt, Some("be helpful".to_string()));
+        assert_eq!(
+            inference.compaction.unwrap().system_prompt_file,
+            Some("compaction-instructions.md".to_string())
+        );
     }
 
     #[test]

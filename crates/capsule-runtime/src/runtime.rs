@@ -456,6 +456,8 @@ pub fn launch_session(
     if let Some(ref inference) = staged.inference {
         let workdir = staged.workdir.clone();
         let system_prompt = resolve_system_prompt(&staged.manifest_dir, &workdir, inference)?;
+        let compaction_system_prompt =
+            resolve_compaction_system_prompt(&staged.manifest_dir, inference.compaction.as_ref())?;
         let session_id = staged.session_id.clone();
         let accessible_workdir = staged.accessible_workdir.clone();
         let context_window = resolve_context_window(staged.context.as_ref());
@@ -468,10 +470,7 @@ pub fn launch_session(
                 .and_then(|c| c.threshold)
                 .unwrap_or(0.98),
             compaction_model: inference.compaction.as_ref().and_then(|c| c.model.clone()),
-            compaction_system_prompt: inference
-                .compaction
-                .as_ref()
-                .and_then(|c| c.system_prompt.clone()),
+            compaction_system_prompt,
             max_output_tokens: inference
                 .max_tokens
                 .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
@@ -1271,6 +1270,39 @@ fn resolve_system_prompt(
                 name: art_name.clone(),
                 source,
             });
+    }
+
+    Ok(None)
+}
+
+/// Resolves the compaction system prompt from the two mutually exclusive manifest
+/// sources — the inline `inference.compaction.system_prompt` string, or the contents of
+/// the file named by `inference.compaction.system_prompt_file`, read relative to the
+/// manifest directory. Absence stays absence: no default prompt is substituted, and the
+/// hook receives `option::none`.
+///
+/// Mutual exclusion is enforced at manifest parse time, so an inline prompt winning here
+/// is unreachable for a manifest that loaded successfully.
+fn resolve_compaction_system_prompt(
+    manifest_dir: &Path,
+    compaction: Option<&murmur_artifact::CompactionConfig>,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(compaction) = compaction else {
+        return Ok(None);
+    };
+
+    if let Some(prompt) = compaction.system_prompt.as_ref() {
+        return Ok(Some(prompt.clone()));
+    }
+
+    if let Some(path) = compaction.system_prompt_file.as_ref() {
+        let prompt_path = manifest_dir.join(path);
+        return fs::read_to_string(&prompt_path).map(Some).map_err(|source| {
+            RuntimeError::CompactionSystemPromptFileRead {
+                path: prompt_path.display().to_string(),
+                source,
+            }
+        });
     }
 
     Ok(None)
@@ -2860,6 +2892,100 @@ mod tests {
             log.contains(&security_warning_link(W_SEC_003)),
             "log should link to the security-warnings doc page: {log}"
         );
+    }
+
+    fn compaction_config(
+        system_prompt: Option<&str>,
+        system_prompt_file: Option<&str>,
+    ) -> murmur_artifact::CompactionConfig {
+        murmur_artifact::CompactionConfig {
+            threshold: None,
+            model: Some("compaction-model".to_string()),
+            system_prompt: system_prompt.map(str::to_string),
+            system_prompt_file: system_prompt_file.map(str::to_string),
+        }
+    }
+
+    /// `system_prompt_file` is read relative to the manifest directory — not the process
+    /// cwd — and its contents reach the hook verbatim, newlines and all.
+    #[test]
+    fn compaction_system_prompt_file_resolves_relative_to_manifest_dir() {
+        let manifest_dir = TempDir::new().unwrap();
+        let body = "Summarize aggressively.\nKeep file paths.\n";
+        fs::write(manifest_dir.path().join("compaction-instructions.md"), body).unwrap();
+
+        let resolved = resolve_compaction_system_prompt(
+            manifest_dir.path(),
+            Some(&compaction_config(None, Some("compaction-instructions.md"))),
+        )
+        .expect("file resolves");
+
+        assert_eq!(resolved, Some(body.to_string()));
+    }
+
+    /// The inline field keeps its pre-existing behavior: returned as-is, no file touched.
+    #[test]
+    fn compaction_inline_system_prompt_resolves_without_reading_a_file() {
+        let manifest_dir = TempDir::new().unwrap();
+
+        let resolved = resolve_compaction_system_prompt(
+            manifest_dir.path(),
+            Some(&compaction_config(Some("inline prompt"), None)),
+        )
+        .expect("inline prompt resolves");
+
+        assert_eq!(resolved, Some("inline prompt".to_string()));
+    }
+
+    /// Neither prompt source set — and no `compaction:` block at all — both stay `None`;
+    /// nothing on this path substitutes a default prompt.
+    #[test]
+    fn compaction_system_prompt_absent_resolves_to_none() {
+        let manifest_dir = TempDir::new().unwrap();
+
+        assert_eq!(
+            resolve_compaction_system_prompt(
+                manifest_dir.path(),
+                Some(&compaction_config(None, None))
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_compaction_system_prompt(manifest_dir.path(), None).unwrap(),
+            None
+        );
+    }
+
+    /// A missing file fails with the compaction-specific variant — distinguishable by
+    /// variant, not just message text, from the primary prompt's `SystemPromptFileRead` —
+    /// and names the resolved path.
+    #[test]
+    fn compaction_system_prompt_file_missing_reports_compaction_variant() {
+        let manifest_dir = TempDir::new().unwrap();
+
+        let err = resolve_compaction_system_prompt(
+            manifest_dir.path(),
+            Some(&compaction_config(None, Some("nope.md"))),
+        )
+        .expect_err("missing file must fail");
+
+        match &err {
+            RuntimeError::CompactionSystemPromptFileRead { path, .. } => {
+                assert!(
+                    path.ends_with("nope.md"),
+                    "error should name the resolved path, got {path}"
+                );
+                assert!(
+                    path.starts_with(&manifest_dir.path().display().to_string()),
+                    "path should be manifest-dir relative, got {path}"
+                );
+            }
+            other => panic!("expected CompactionSystemPromptFileRead, got {other:?}"),
+        }
+        assert!(err
+            .to_string()
+            .contains("inference.compaction.system_prompt_file"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ The relevant manifest options are:
 | [inference.compaction.threshold](../reference/manifest-schema.md#field-inference) | Fraction of `context.max_tokens` that triggers compaction |
 | [inference.compaction.model](../reference/manifest-schema.md#field-inference) | Model used for the compaction call (optional override) |
 | [inference.compaction.system_prompt](../reference/manifest-schema.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
+| [inference.compaction.system_prompt_file](../reference/manifest-schema.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
 
 ---
 
@@ -226,7 +227,18 @@ inference:
       Preserve this nuance when summarizing.
 ```
 
-If left unset, `compaction-event.system-prompt` arrives at the hook as `none`, and the hook falls back to its own built-in default prompt. `model` and `system_prompt` are independent — setting one does not require or affect the other.
+For a longer, versioned instruction set, keep it in its own file and point at it with `system_prompt_file` instead. The path is resolved relative to the manifest directory and read when the session launches, and the file's contents are passed to the hook verbatim:
+
+```yaml
+inference:
+  compaction:
+    threshold: 0.85
+    system_prompt_file: compaction-instructions.md
+```
+
+Setting both `system_prompt` and `system_prompt_file` on the same `compaction:` block is a manifest error — pick one. `mur deploy` uploads the referenced file alongside the manifest, so a remote run resolves it the same way.
+
+If left unset, `compaction-event.system-prompt` arrives at the hook as `none`, and the hook falls back to its own built-in default prompt. `model` and the two prompt-source fields are independent — setting one does not require or affect the other.
 
 ---
 
