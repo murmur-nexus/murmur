@@ -82,13 +82,8 @@ impl HookInferenceCtx {
         // `none` resolves to the manifest's primary model; `some(m)` is sent
         // verbatim and, if the driver rejects it, surfaces as `Err` with no
         // retry — a caller wanting fallback calls again with `none` itself.
+        let messages = wire_messages(&request);
         let model = request.model.unwrap_or_else(|| self.model.clone());
-
-        let messages: Vec<Value> = request
-            .messages
-            .iter()
-            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
-            .collect();
         // Hook completions keep the built-in default cap rather than the manifest's
         // `inference.max_tokens`: that field is documented as the *agent turn* output cap, and a
         // small value chosen for the agent loop would silently truncate a compaction summary.
@@ -201,6 +196,28 @@ impl HookInferenceCtx {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default()
     }
+}
+
+/// Convert a request's WIT `message` records into driver wire messages.
+///
+/// The WIT `message.content` is a plain `string`, but the driver deserializes
+/// each message's `content` into a `Vec<MurmurContentBlock>` — a bare string
+/// fails serde with `invalid type: string, expected a sequence`. Wrap each
+/// message's content in a single text block, matching `build_driver_payload`
+/// and what the agent loop already sends every driver. `role` is passed through
+/// unchanged: `murmur-hook-compact` has already normalized roles to
+/// `user`/`assistant` before calling `run-inference`.
+fn wire_messages(request: &InferenceRequest) -> Vec<Value> {
+    request
+        .messages
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": [{"type": "text", "text": m.content}],
+            })
+        })
+        .collect()
 }
 
 /// Concatenate the `text` blocks of a driver response's `content` array, in
@@ -384,7 +401,8 @@ mod tests {
     /// `input_tokens` against it proves the resolved model really went onto the
     /// wire, not just into `model-used`.
     fn expected_input_tokens(model: &str) -> u64 {
-        let messages = vec![serde_json::json!({"role":"user","content":"summarize this"})];
+        let messages =
+            vec![serde_json::json!({"role":"user","content":[{"type":"text","text":"summarize this"}]})];
         let payload =
             build_driver_payload(model, DEFAULT_MAX_OUTPUT_TOKENS, &messages, &[], "", None);
         u64::from(count_tokens(&serde_json::to_string(&payload).unwrap()))
@@ -475,6 +493,44 @@ mod tests {
             records[0].origin.model, "nope",
             "the failed record must name the model that was actually attempted"
         );
+    }
+
+    /// Regression: the driver deserializes each message's `content` into a
+    /// `Vec<MurmurContentBlock>`, so the host must send it as a JSON array of
+    /// `{"type":"text","text":…}` blocks, never a bare string. Fails if
+    /// `wire_messages` ever emits `content` as a plain string again — the shape
+    /// that made LLM compaction fail against every driver.
+    #[test]
+    fn run_inference_message_content_is_a_sequence_of_text_blocks() {
+        let req = InferenceRequest {
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: "hi there".to_string(),
+                },
+            ],
+            system_prompt: None,
+            model: None,
+        };
+
+        let messages = wire_messages(&req);
+        assert_eq!(messages.len(), 2);
+        for (msg, (role, text)) in messages
+            .iter()
+            .zip([("user", "hello"), ("assistant", "hi there")])
+        {
+            assert_eq!(msg["role"], role);
+            let content = msg["content"]
+                .as_array()
+                .expect("content must be a sequence of blocks, not a bare string");
+            assert_eq!(content.len(), 1, "one text block per message");
+            assert_eq!(content[0]["type"], "text");
+            assert_eq!(content[0]["text"], text);
+        }
     }
 
     /// A non-`passed` tool status from the driver is also an `Err`.
