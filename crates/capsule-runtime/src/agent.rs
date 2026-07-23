@@ -947,6 +947,62 @@ async fn flush_hook_inference_records(
     }
 }
 
+/// Folded into a "tool" message's content before it is handed to a compaction hook, so a
+/// hook that keeps the message verbatim round-trips the sibling fields the WIT
+/// `Message{role, content}` shape has no room for. Lets the reconstruction tell our own
+/// wrapper apart from a real hook-authored summary.
+const TOOL_MARKER: &str = "__murmur_tool_msg__";
+
+/// Rebuild agent-loop messages from the WIT messages a replace-context hook returned.
+///
+/// The one invariant every reconstructed message must satisfy: a non-"tool" message's
+/// `content` is a **sequence of content blocks**, never a bare string. The driver's
+/// `MurmurMessage.content` is a `Vec<MurmurContentBlock>`, so a bare string makes the very
+/// next `build_driver_payload` request fail deserialization with "invalid type: string,
+/// expected a sequence". Hooks are free to JSON-encode their summary as a plain string
+/// (`serde_json::to_string(summary)`) — normalizing it is the host's job, here.
+fn reconstruct_compacted_messages(
+    wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
+) -> Vec<Value> {
+    wit_messages
+        .into_iter()
+        .filter_map(|m| {
+            if m.role == "tool" {
+                // Only keep a "tool" message if our marker round-tripped intact (i.e. the
+                // hook left this message's content untouched) — otherwise we have no way
+                // to recover a valid tool_call_id, and a "tool" message without one is
+                // guaranteed to break the next request. Drop it rather than risk that.
+                let parsed: Value = serde_json::from_str(&m.content).ok()?;
+                if parsed.get(TOOL_MARKER).and_then(Value::as_bool) != Some(true) {
+                    return None;
+                }
+                let tool_call_id = parsed.get("tool_call_id")?.as_str()?.to_string();
+                if tool_call_id.is_empty() {
+                    return None;
+                }
+                Some(json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
+                    "content": parsed.get("body").cloned().unwrap_or(Value::Null),
+                }))
+            } else {
+                // Content from hooks is a JSON string: a verbatim round-trip parses back to
+                // the original block array, a summary parses back to a bare JSON string, and
+                // anything unparseable is raw text. All three have to end up as blocks.
+                let parsed: Value =
+                    serde_json::from_str(&m.content).unwrap_or_else(|_| json!(m.content));
+                let content = match parsed {
+                    Value::Array(_) => parsed,
+                    Value::String(s) => json!([{"type": "text", "text": s}]),
+                    other => json!([{"type": "text", "text": other.to_string()}]),
+                };
+                Some(json!({"role": m.role, "content": content}))
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
@@ -969,7 +1025,6 @@ async fn try_compact_via_hooks(
     // is missing required field 'tool_call_id'"). Fold those fields into the content
     // string we hand the hook so they survive if the hook keeps this message verbatim;
     // TOOL_MARKER lets us tell a real hook-summary payload apart from our own wrapper.
-    const TOOL_MARKER: &str = "__murmur_tool_msg__";
     let wit_messages: Vec<Message> = messages
         .iter()
         .filter_map(|m| {
@@ -1027,36 +1082,7 @@ async fn try_compact_via_hooks(
         return Ok(());
     };
 
-    let candidate_messages: Vec<Value> = new_wit_messages
-        .into_iter()
-        .filter_map(|m| {
-            if m.role == "tool" {
-                // Only keep a "tool" message if our marker round-tripped intact (i.e. the
-                // hook left this message's content untouched) — otherwise we have no way
-                // to recover a valid tool_call_id, and a "tool" message without one is
-                // guaranteed to break the next request. Drop it rather than risk that.
-                let parsed: Value = serde_json::from_str(&m.content).ok()?;
-                if parsed.get(TOOL_MARKER).and_then(Value::as_bool) != Some(true) {
-                    return None;
-                }
-                let tool_call_id = parsed.get("tool_call_id")?.as_str()?.to_string();
-                if tool_call_id.is_empty() {
-                    return None;
-                }
-                Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
-                    "content": parsed.get("body").cloned().unwrap_or(Value::Null),
-                }))
-            } else {
-                // Content from hooks is a JSON string; try to parse back, else use as text.
-                let content: Value = serde_json::from_str(&m.content)
-                    .unwrap_or_else(|_| json!([{"type": "text", "text": m.content}]));
-                Some(json!({"role": m.role, "content": content}))
-            }
-        })
-        .collect();
+    let candidate_messages: Vec<Value> = reconstruct_compacted_messages(new_wit_messages);
 
     // Safety net: an "assistant" message's tool_call blocks and a "tool" message's
     // tool_call_id only round-trip independently of each other — one side can survive
@@ -1590,5 +1616,102 @@ mod tests {
             serde_json::to_string(&full_when_active).unwrap().len()
                 > serde_json::to_string(&wire).unwrap().len()
         );
+    }
+
+    // ── replace-context reconstruction: content is always a sequence of blocks ──────
+
+    use crate::bindings::hook::exports::murmur::hook::lifecycle::Message as WitMessage;
+
+    fn wit(role: &str, content: &str) -> WitMessage {
+        WitMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    /// Regression: a compaction hook JSON-encodes its summary as a plain string
+    /// (`serde_json::to_string(summary)`), which parses back to `Value::String` — the
+    /// reconstruction used to keep that bare string as `content`, and the driver
+    /// (`MurmurMessage.content` is a `Vec<MurmurContentBlock>`) rejected the next turn
+    /// with "invalid type: string, expected a sequence". Fails if a plain-string summary
+    /// ever produces bare-string content again.
+    #[test]
+    fn reconstructed_plain_string_summary_becomes_a_sequence_of_text_blocks() {
+        let summary = "Earlier turns: the agent read two files and ran the tests.";
+        let encoded = serde_json::to_string(summary).unwrap();
+        assert_eq!(
+            encoded,
+            "\"Earlier turns: the agent read two files and ran the tests.\""
+        );
+
+        let msgs = reconstruct_compacted_messages(vec![wit("user", &encoded)]);
+
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        let content = msgs[0]["content"]
+            .as_array()
+            .expect("content must be a sequence of blocks, not a bare string");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], summary);
+
+        // And the payload the very next turn would send carries no bare-string content.
+        let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None);
+        for m in payload["messages"].as_array().unwrap() {
+            assert!(
+                m["content"].is_array(),
+                "driver payload has non-sequence content: {m}"
+            );
+        }
+    }
+
+    /// Every other shape a hook can hand back also lands as a block array: a verbatim
+    /// round-trip (already a JSON array) passes through untouched, unparseable raw text
+    /// becomes one text block, and any other JSON scalar is stringified into one.
+    #[test]
+    fn reconstructed_non_tool_content_is_always_a_block_array() {
+        let verbatim = json!([{"type": "text", "text": "kept as-is"}]);
+        let msgs = reconstruct_compacted_messages(vec![
+            wit("assistant", &verbatim.to_string()),
+            wit("user", "not json at all"),
+            wit("user", "42"),
+        ]);
+
+        assert_eq!(msgs.len(), 3);
+        for m in &msgs {
+            assert!(
+                m["content"].is_array(),
+                "every non-tool message must reconstruct to a block array: {m}"
+            );
+        }
+        assert_eq!(msgs[0]["content"], verbatim, "array content passes through");
+        assert_eq!(
+            msgs[1]["content"],
+            json!([{"type": "text", "text": "not json at all"}])
+        );
+        assert_eq!(msgs[2]["content"], json!([{"type": "text", "text": "42"}]));
+    }
+
+    /// The "tool" branch is untouched by the normalization: a marker-wrapped message still
+    /// recovers its tool_call_id and body, and an unwrapped one is still dropped rather
+    /// than turned into a text block.
+    #[test]
+    fn reconstructed_tool_messages_keep_their_marker_handling() {
+        let wrapped = json!({
+            TOOL_MARKER: true,
+            "tool_call_id": "t1",
+            "is_error": false,
+            "body": [{"type": "text", "text": "ok"}],
+        });
+        let msgs = reconstruct_compacted_messages(vec![
+            wit("tool", &wrapped.to_string()),
+            wit("tool", "\"the hook summarized this away\""),
+        ]);
+
+        assert_eq!(msgs.len(), 1, "the unwrapped tool message must be dropped");
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "t1");
+        assert_eq!(msgs[0]["is_error"], false);
+        assert_eq!(msgs[0]["content"], json!([{"type": "text", "text": "ok"}]));
     }
 }
