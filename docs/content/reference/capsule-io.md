@@ -156,6 +156,44 @@ Set alongside `MURMUR_ROOST_URL` in the capsule's `shell_baseline_env`. Only pre
 
 ---
 
+## out/compaction-summaries.jsonl — Compaction summary log { #compaction-summaries }
+
+**Location:** `<session-workdir>/out/compaction-summaries.jsonl`
+
+Written only when the manifest sets `inference.compaction.dump_summaries: true` (default
+`false`; see [`inference.compaction.dump_summaries`](manifest-schema.md#field-inference)). Not
+part of the `murmur.message.v1` envelope — this is a flat JSONL eval log, one line per
+**committed** compaction, appended in the order compactions occur:
+
+```json
+{"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `turn` | integer | The turn the compaction fired on |
+| `tokens_before` | integer | Session token count immediately before compaction |
+| `tokens_after` | integer | Session token count immediately after the replacement context committed |
+| `summary` | string | The compaction hook's replacement text, verbatim — the exact string that replaced the context, not a re-inferred or re-encoded copy |
+
+**When a line is written.** Only after a compaction hook returns `replace-context` *and* that
+replacement passes the existing tool-call-pairing safety net and actually commits. A compaction
+attempt the safety net rejects, or a session where no hook returns `replace-context` at all,
+appends nothing. This means the file (and the `out/` entry for it) is created lazily on the
+first successful compaction — a run with `dump_summaries: true` that never compacts leaves no
+file behind.
+
+**Failure handling.** A write failure (for example a permission error) is logged to
+`logs/bootstrap.log` and does not fail the session — the compaction itself has already
+committed by the time the write is attempted.
+
+This log exists to capture the summary text itself, which `trace.jsonl`'s `compaction` event
+does not record (it carries only the two token counts). It is unrelated to
+`checkpoints/summary.md` below, which is a signed latest-snapshot resume file rather than an
+append-only eval log.
+
+---
+
 ## Checkpoint files { #checkpoint-files }
 
 The three checkpoint files under `workdir/checkpoints/` (`summary.md`, `plan.json`,
