@@ -192,41 +192,6 @@ does not record (it carries only the two token counts).
 
 ---
 
-## Checkpoint files { #checkpoint-files }
-
-The three checkpoint files under `workdir/checkpoints/` (`summary.md`, `plan.json`,
-`decisions.json`) are HMAC-SHA256-signed by the runtime whenever it has visibility into a
-legitimate write, and verified before the agent gets control on every session start —
-including a resume against a pre-existing workdir via `mur run --workdir <dir>`.
-
-**When signing happens:**
-
-- immediately after a blocking compaction hook returns a replacement context
-- at every session-end lifecycle event, regardless of whether compaction ever fired
-
-For each checkpoint file that exists at that point, the runtime writes a sidecar
-`checkpoints/<name>.sig` containing a hex-encoded HMAC-SHA256 tag over the file's current bytes.
-
-**When verification happens:** at session start, before the first inference call. Each
-checkpoint file's `.sig` is recomputed and compared; a file with a missing, undecodable, or
-mismatched signature is renamed to `checkpoints/<name>.rejected` (its stale `.sig` removed) so
-the trusted path is empty, and a warning naming the file is written to `logs/bootstrap.log`. A
-pre-existing `.rejected` file from an earlier rejection is overwritten, not preserved. Files
-that verify successfully are left untouched.
-
-**Signing key.** A 32-byte key is generated once per capsule workdir (CSPRNG) and persisted at
-`$HOME/.murmur/checkpoint-keys/<sha256 of the canonicalized accessible workdir path>.key` with
-owner-only (`0600`) permissions — a location outside any directory the WASI sandbox pre-opens,
-so no WASM tool, hook, or the agent itself can read or forge it via shell or `wasi:filesystem`.
-
-**Fail-open on infrastructure failure.** If the signing key itself cannot be derived (for
-example `HOME` is unset, or the key directory is unwritable), signing and verification are
-skipped for that session — a warning is logged to `logs/bootstrap.log`, but the session still
-launches and no existing checkpoint file is renamed or deleted as a side effect. A key-derivation
-failure is never treated as a signature mismatch.
-
----
-
 ## Script capsules
 
 Script capsules are not affected by this schema. The `out/result.json` writer is part of the native agent loop only. Script capsules continue to write their own output to `out/result.txt` (or other paths) as before.
