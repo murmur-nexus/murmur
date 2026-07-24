@@ -1086,31 +1086,6 @@ mod tests {
     use crate::inference_import::INFERENCE_IFACE_VERSIONED;
     use tempfile::TempDir;
 
-    /// Builds a `HookRuntime` with zero registered hooks against a fresh `TempDir` pair,
-    /// mirroring the `(workdir, accessible_workdir)` split `stage_session` produces. No
-    /// wasmtime component is ever instantiated since `staged_hooks` is empty, so a plain
-    /// default `Engine` suffices.
-    async fn test_hook_runtime(workdir: &Path, accessible_workdir: &Path) -> HookRuntime {
-        HookRuntime::new(
-            &wasmtime::Engine::default(),
-            workdir,
-            accessible_workdir,
-            Vec::new(),
-            SessionContextData {
-                capsule_name: "test-capsule".to_string(),
-                capsule_version: "0.1.0".to_string(),
-                session_id: "sess-test".to_string(),
-                model: "test-model".to_string(),
-                capabilities: Vec::new(),
-            },
-            HookEnvVars::default(),
-            ExecutionLimits::default(),
-            None,
-        )
-        .await
-        .expect("HookRuntime::new should succeed with zero hooks")
-    }
-
     /// Engine configured like the production one (component model + async + epoch
     /// interruption) so a hand-authored WAT component double can be compiled and
     /// instantiated. Epoch interruption only arms the mechanism — a deadline fires solely
