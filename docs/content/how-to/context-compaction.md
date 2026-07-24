@@ -11,6 +11,7 @@ The relevant manifest options are:
 | [inference.compaction.model](../reference/manifest-schema.md#field-inference) | Model used for the compaction call (optional override) |
 | [inference.compaction.system_prompt](../reference/manifest-schema.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
 | [inference.compaction.system_prompt_file](../reference/manifest-schema.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
+| [inference.compaction.dump_summaries](../reference/manifest-schema.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` (optional; default `false`) |
 
 ---
 
@@ -300,20 +301,29 @@ Compaction **does not consume a turn slot** — `inference.max_turns` counts inf
 
 ---
 
-## Step 6 — inspect the checkpoint files
+## Step 6 — inspect the compaction summaries
 
-When compaction fires, the `murmur-hook-compact` artifact writes files to `workdir/checkpoints/`:
+`trace.jsonl`'s `compaction` event records only the token counts, not the summary text the model
+produced. To persist the summary itself — for understanding what context the agent retained
+versus discarded, or debugging cases where the agent appears to "forget" earlier work after
+compaction — set `dump_summaries: true`:
 
-| File | Contents |
-|---|---|
-| `checkpoints/summary.md` | Human-readable summary of what was compacted, written on each compaction event |
-| `checkpoints/raw-<timestamp>.jsonl` | Raw message history snapshot before compaction |
-
-```bash
-cat workdir/<session_id>/checkpoints/summary.md
+```yaml
+inference:
+  compaction:
+    threshold: 0.85
+    dump_summaries: true
 ```
 
-This file is useful for understanding what context the agent retained versus discarded, and for debugging cases where the agent appears to "forget" earlier work after compaction.
+Each committed compaction then appends one line to `out/compaction-summaries.jsonl`:
+
+```json
+{"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
+```
+
+See [out/compaction-summaries.jsonl](../reference/capsule-io.md#compaction-summaries) for the
+full field reference. The file is only created once the first compaction actually commits, and
+a compaction the tool-call-pairing safety net rejects writes nothing.
 
 **Signed checkpoints.** After compaction signs `summary.md`/`plan.json`/`decisions.json` (whichever
 exist), each gets a sidecar `checkpoints/<name>.sig`. If you hand-edit a checkpoint file and then
@@ -356,6 +366,7 @@ compaction.
 | `murmur-hook-compact` with `runtime: hook` (or any hook bound to `on-compaction`) | Provides the compaction hook; required to enable compaction |
 | `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
+| `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; warning logged to `bootstrap.log` |
 | A bound hook returns an error | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count after compaction | Reset to the count of the new (compacted) history, not to zero |
