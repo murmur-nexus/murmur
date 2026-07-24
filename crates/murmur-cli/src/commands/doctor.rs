@@ -1,10 +1,61 @@
 use capsule_runtime::ArtifactRequest;
-use murmur_artifact::{current_platform, load_runtime_manifest, resolve_manifest_path, LocalRegistry};
+use murmur_artifact::{
+    current_platform, load_runtime_manifest, read_lockfile, resolve_manifest_path, sha256_hex,
+    LocalRegistry, LockfileError, MurmurLock,
+};
 
 use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
-use crate::commands::runtime_manifest_error_to_cli;
+use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::error::CliError;
+
+/// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
+/// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
+/// so a green doctor line means a session would accept the same artifact.
+enum LockVerdict {
+    /// Lock agrees with the manifest pin and with the bytes on disk.
+    Ok,
+    /// No entry for this artifact — `mur run` fails with E-RUN-003.
+    MissingEntry,
+    /// The lock pins a different version than the manifest declares.
+    VersionMismatch { pinned: String },
+    /// The bytes on disk hash to something other than the pinned `sha256.wasm` —
+    /// `mur run` fails with E-REG-002.
+    HashMismatch { expected: String, actual: String },
+}
+
+/// Check one installed artifact against the lockfile the way `stage_session` does:
+/// entry must exist, its `resolved_version` must equal the manifest pin, and its
+/// `sha256.wasm` must equal the hash of the bytes that were actually resolved.
+///
+/// A version mismatch short-circuits the hash comparison — hashing bytes for a version
+/// already known to be wrong would report one drifted artifact as two failures.
+fn check_lock_entry(
+    lock: &MurmurLock,
+    name: &str,
+    version: &str,
+    artifact_bytes: &[u8],
+) -> LockVerdict {
+    let Some(entry) = lock.artifact_for(name) else {
+        return LockVerdict::MissingEntry;
+    };
+
+    if entry.resolved_version != version {
+        return LockVerdict::VersionMismatch {
+            pinned: entry.resolved_version.clone(),
+        };
+    }
+
+    let actual = sha256_hex(artifact_bytes);
+    if actual != entry.sha256.wasm {
+        return LockVerdict::HashMismatch {
+            expected: entry.sha256.wasm.clone(),
+            actual,
+        };
+    }
+
+    LockVerdict::Ok
+}
 
 /// Check every artifact the current project declares against the stores a session
 /// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
@@ -17,6 +68,16 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     let manifest_path = resolve_manifest_path(&project_root);
     let runtime_manifest =
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+
+    // A lockfile is optional. When one is present it is what `mur run` enforces, so
+    // doctor checks against it too; when it is absent doctor reports presence only,
+    // exactly as before. A lockfile that exists but cannot be read is a hard failure
+    // before any checklist line prints — same as a malformed murmur.yaml.
+    let lock = match read_lockfile(&project_root.join("murmur.lock")) {
+        Ok(lock) => Some(lock),
+        Err(LockfileError::NotFound(_)) => None,
+        Err(error) => return Err(lockfile_error_to_cli(error)),
+    };
 
     let project_registry = LocalRegistry::new(project_root.join(".murmur").join("artifacts"));
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
@@ -33,7 +94,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         .unwrap_or(0);
 
     let mut total_pass: u32 = 0;
-    let mut missing: Vec<(String, String)> = Vec::new();
+    let mut fixes: Vec<String> = Vec::new();
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {
@@ -42,39 +103,79 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
         };
-        let ref_str = format!("{}@{}", artifact.name, artifact.version);
+        let name = &artifact.name;
+        let version = &artifact.version;
+        let ref_str = format!("{name}@{version}");
 
         match artifact_presence(&project_registry, &global_registry, &request, platform) {
+            // Local-source artifacts are never registry-resolved and never locked, so
+            // they are exempt from every lock check — the same exemption `mur run` makes.
             ArtifactPresence::LocalSource => {
                 println!("  \u{2713}  {ref_str:<col_width$}   local source");
                 total_pass += 1;
             }
-            ArtifactPresence::Installed => {
-                println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
-                total_pass += 1;
+            ArtifactPresence::Installed(resolved) => {
+                // No lockfile: presence is the whole check, as it has always been.
+                let verdict = match &lock {
+                    Some(lock) => check_lock_entry(lock, name, version, &resolved.bytes),
+                    None => LockVerdict::Ok,
+                };
+
+                match verdict {
+                    LockVerdict::Ok => {
+                        println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
+                        total_pass += 1;
+                    }
+                    LockVerdict::MissingEntry => {
+                        println!(
+                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock missing artifact entry for '{name}'"
+                        );
+                        fixes.push(format!("mur install {ref_str}"));
+                    }
+                    LockVerdict::VersionMismatch { pinned } => {
+                        println!(
+                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock version mismatch for '{name}': manifest requested {version}, lock pinned {pinned}"
+                        );
+                        fixes.push(format!(
+                            "{name}: remove the stale murmur.lock entry, then run mur install {ref_str}"
+                        ));
+                    }
+                    LockVerdict::HashMismatch { expected, actual } => {
+                        println!(
+                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} artifact integrity check failed for {ref_str}"
+                        );
+                        println!("        expected sha256 (murmur.lock): {expected}");
+                        println!("        actual sha256 (on disk):       {actual}");
+                        fixes.push(format!(
+                            "{name}: artifact on disk does not match murmur.lock \u{2014} re-publish or delete the lock"
+                        ));
+                    }
+                }
             }
+            // A missing artifact is already one failure; there is nothing on disk to
+            // hash, so it never also gets a lock line.
             ArtifactPresence::Missing => {
                 println!("  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} missing");
-                missing.push((artifact.name.clone(), artifact.version.clone()));
+                fixes.push(format!("mur install {ref_str}"));
             }
         }
     }
 
     println!();
 
-    if missing.is_empty() {
+    if fixes.is_empty() {
         println!("All checks passed.");
         return Ok(());
     }
 
-    let total_fail = missing.len();
+    let total_fail = fixes.len();
     let ps = if total_pass == 1 { "" } else { "s" };
     let es = if total_fail == 1 { "" } else { "s" };
     println!("{total_pass} check{ps} passed, {total_fail} error{es} found.");
     println!();
 
-    for (name, version) in &missing {
-        println!("Fix: mur install {name}@{version}");
+    for fix in &fixes {
+        println!("Fix: {fix}");
     }
 
     // Exit non-zero so `mur doctor` can be used in CI pre-flight checks.
