@@ -30,7 +30,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes eval.jsonl; hooks get no filesystem by default
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -83,7 +83,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes eval.jsonl; hooks get no filesystem by default
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -136,7 +136,7 @@ The relevant manifest options are:
         runtime: hook
         capabilities:
           filesystem:
-            scope: .          # the hook writes eval.jsonl; hooks get no filesystem by default
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
