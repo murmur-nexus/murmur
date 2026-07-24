@@ -499,53 +499,88 @@ fn install_manifest_deps(
         multi.remove(pb);
     }
 
-    match results.into_iter().collect::<Result<Vec<FetchOutcome>, CliError>>() {
-        Ok(outcomes) => {
-            // Upsert murmur.lock sequentially (not inside the parallel fetch loop) so
-            // concurrent fetches never race on the same lockfile write.
-            for outcome in &outcomes {
-                if let Some((name, version, sha256)) = &outcome.lock_upsert {
-                    upsert_lock_entry(&lock_path, name, version, sha256)?;
-                }
-            }
+    // Partition by artifact index instead of `.collect::<Result<_, _>>()`: collecting into a
+    // Result short-circuits on the first Err, throwing away every other failure *and* every
+    // success — including successes whose bytes are already on disk but whose murmur.lock
+    // entry would then never be written (`mur run` later fails with E-RUN-003).
+    let mut successes: Vec<(usize, FetchOutcome)> = Vec::new();
+    let mut failures: Vec<(usize, CliError)> = Vec::new();
+    for (i, result) in results.into_iter().enumerate() {
+        match result {
+            Ok(outcome) => successes.push((i, outcome)),
+            Err(err) => failures.push((i, err)),
+        }
+    }
 
-            let fetched_bytes: u64 = outcomes
-                .iter()
-                .zip(cached_flags.iter())
-                .filter(|(_, &c)| !c)
-                .map(|(o, _)| o.bytes_len)
-                .sum();
-            let cached_n = cached_flags.iter().filter(|&&c| c).count();
-            let summary = if cached_n == n {
-                format!(
-                    "{} ↓ {} artifact{}  all cached",
-                    style("✓").green().bold(),
-                    n,
-                    s(n)
-                )
-            } else {
-                let note =
-                    if cached_n > 0 { format!("  {} cached", cached_n) } else { String::new() };
-                format!(
-                    "{} ↓ {} artifact{}  {}{}",
-                    style("✓").green().bold(),
-                    n,
-                    s(n),
-                    format_bytes(fetched_bytes),
-                    note
-                )
-            };
-            finish_step(&header_pb, &done_style, summary);
-            Ok(())
+    // Upsert murmur.lock sequentially (not inside the parallel fetch loop) so concurrent
+    // fetches never race on the same lockfile write. Every success is pinned regardless of
+    // how many other artifacts failed.
+    for (_, outcome) in &successes {
+        if let Some((name, version, sha256)) = &outcome.lock_upsert {
+            upsert_lock_entry(&lock_path, name, version, sha256)?;
         }
-        Err(e) => {
-            abandon_step(
-                &header_pb,
-                &done_style,
-                format!("{} ↓ artifacts  failed", style("✗").red().bold()),
-            );
-            Err(e)
+    }
+
+    // Byte/cache accounting covers the successes only — a failed artifact contributed no
+    // bytes and is neither "fetched" nor "cached".
+    let fetched_bytes: u64 = successes
+        .iter()
+        .filter(|(i, _)| !cached_flags[*i])
+        .map(|(_, o)| o.bytes_len)
+        .sum();
+    let cached_n = successes.iter().filter(|(i, _)| cached_flags[*i]).count();
+    let summary_tail = install_summary_tail(successes.len(), cached_n, fetched_bytes);
+
+    if failures.is_empty() {
+        finish_step(
+            &header_pb,
+            &done_style,
+            format!("{} ↓ {}", style("✓").green().bold(), summary_tail),
+        );
+        return Ok(());
+    }
+
+    abandon_step(
+        &header_pb,
+        &done_style,
+        format!("{} ↓ artifacts  failed", style("✗").red().bold()),
+    );
+
+    // Plain `println!` rather than indicatif bar text: MultiProgress writes nothing at all
+    // when stdout/stderr is not a terminal, so bar messages are cosmetic-only and would make
+    // the failure report invisible in CI logs and pipes.
+    println!();
+    println!("{} of {} artifact{} failed to install:", failures.len(), n, s(n));
+    for (i, err) in &failures {
+        let artifact = artifacts[*i];
+        println!();
+        println!("  {}@{}", artifact.name, artifact.version);
+        // CliError's Display renders `error[CODE]: message` plus its hint line; keep every
+        // failure's full text, indented under the artifact that produced it.
+        for line in err.to_string().lines() {
+            println!("    {line}");
         }
+    }
+    if !successes.is_empty() {
+        println!();
+        println!("installed {summary_tail}");
+    }
+
+    // A CliError carries a single code/message/hint and cannot represent "K of N artifacts
+    // failed", so the report is printed above and the process terminates here — same pattern
+    // as `mur doctor`. No destructors run, which is fine: all I/O is done.
+    std::process::exit(1);
+}
+
+/// Render the shared `{count} artifact{s}  {bytes-or-cache-note}` tail used by both the
+/// green indicatif roll-up and the plain-text success roll-up, over an artifact subset.
+fn install_summary_tail(count: usize, cached_n: usize, fetched_bytes: u64) -> String {
+    let s = if count == 1 { "" } else { "s" };
+    if cached_n == count {
+        format!("{count} artifact{s}  all cached")
+    } else {
+        let note = if cached_n > 0 { format!("  {cached_n} cached") } else { String::new() };
+        format!("{count} artifact{s}  {}{note}", format_bytes(fetched_bytes))
     }
 }
 
