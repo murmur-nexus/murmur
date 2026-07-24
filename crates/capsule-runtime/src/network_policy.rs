@@ -26,6 +26,32 @@ impl NetworkAllowRule {
         }
     }
 
+    /// Whether `self` — a capsule-wide ceiling rule — already permits everything `narrower`
+    /// would permit. Used to clamp a per-artifact allow-list to the ceiling: a rule no
+    /// ceiling rule covers is dropped, never granted.
+    ///
+    /// An unset `scheme`/`port` on the ceiling side is a wildcard, so `example.com` covers
+    /// `https://example.com`. The reverse is not true: a bare `example.com` on the artifact
+    /// side spans both schemes and every port, so a ceiling of `https://example.com` does
+    /// not cover it and the entry is dropped. That asymmetry is deliberate — clamping errs
+    /// toward denial rather than silently keeping a broader rule than the ceiling states.
+    pub(crate) fn covers(&self, narrower: &NetworkAllowRule) -> bool {
+        if self.host != narrower.host {
+            return false;
+        }
+
+        if let Some(expected_scheme) = &self.scheme {
+            if narrower.scheme.as_ref() != Some(expected_scheme) {
+                return false;
+            }
+        }
+
+        match self.port {
+            Some(expected_port) => narrower.port == Some(expected_port),
+            None => true,
+        }
+    }
+
     pub(crate) fn matches(&self, target: &RequestTarget) -> bool {
         if self.host != target.host {
             return false;
@@ -247,13 +273,111 @@ impl HookCapabilityGrant {
     }
 }
 
+/// One tool's or driver's capability grant, lowered from the **capsule operator's own**
+/// manifest entry for that artifact (`murmur_artifact::RuntimeArtifact::capabilities`) at
+/// staging time and applied on the shared `invoke_tool_component` dispatch path.
+///
+/// The baseline is the opposite of [`HookCapabilityGrant`]'s, and that is the whole point of
+/// having two types: a hook derives its grant *from nothing* (absent block = deny), whereas a
+/// tool or driver derives it *from the capsule ceiling* (absent block = the capsule-wide
+/// policy, unchanged). Both fields are therefore `Option`-of-narrowing rather than plain
+/// values, and [`Default`] — what an entry with no `capabilities:` block yields — means
+/// "inherit everything", i.e. byte-for-byte today's behavior.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ToolCapabilityGrant {
+    /// Effective allow-rules for this artifact, already clamped to the ceiling. `None` =
+    /// no `capabilities.network` block, so the capsule-wide rules apply untouched.
+    /// `Some(vec![])` is a real narrowing to zero network access, and is what both an
+    /// explicit `allow: []` and an allow-list wholly outside the ceiling lower to.
+    pub(crate) network_allow_rules: Option<Vec<NetworkAllowRule>>,
+    /// Relative path under `accessible_workdir` to preopen as `"."` instead of the whole
+    /// workdir. `None` = no `capabilities.filesystem.scope`, so the artifact keeps seeing
+    /// the entire `accessible_workdir`, as every tool does today.
+    pub(crate) filesystem_scope: Option<String>,
+    /// Declared `network.allow` entries dropped because no ceiling rule covers them. Held
+    /// (rather than warned about in `derive`) so lowering stays pure and unit-testable; the
+    /// staging path turns a non-empty list into a `W-SEC-007` warning.
+    pub(crate) dropped_network_entries: Vec<String>,
+}
+
+impl ToolCapabilityGrant {
+    /// Lower an operator-declared `capabilities:` block into a grant that can only ever be
+    /// narrower than `ceiling_network_allow_rules` (the capsule-wide allow-list, already
+    /// parsed). Validating here rather than at dispatch means a malformed entry fails
+    /// staging instead of surfacing as a confusing denial mid-run.
+    ///
+    /// `None` (no block declared) yields [`ToolCapabilityGrant::default`] — inherit the
+    /// ceiling wholesale. Only `network` and `filesystem` are read; the other sub-blocks a
+    /// [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that
+    /// per-artifact narrowing does not reach (the caller warns `W-SEC-008` for those).
+    pub(crate) fn derive(
+        capabilities: Option<&murmur_artifact::Capabilities>,
+        ceiling_network_allow_rules: &[NetworkAllowRule],
+    ) -> Result<Self, RuntimeError> {
+        let Some(capabilities) = capabilities else {
+            return Ok(Self::default());
+        };
+
+        let mut dropped_network_entries = Vec::new();
+        let network_allow_rules = match capabilities.network.as_ref() {
+            None => None,
+            Some(network) => {
+                let mut kept = Vec::new();
+                for entry in &network.allow {
+                    let rule = NetworkAllowRule::parse(entry)?;
+                    if ceiling_network_allow_rules
+                        .iter()
+                        .any(|ceiling_rule| ceiling_rule.covers(&rule))
+                    {
+                        kept.push(rule);
+                    } else {
+                        dropped_network_entries.push(entry.clone());
+                    }
+                }
+                Some(kept)
+            }
+        };
+
+        let filesystem_scope = capabilities
+            .filesystem
+            .as_ref()
+            .and_then(|filesystem| filesystem.scope.clone());
+        if let Some(scope) = filesystem_scope.as_deref() {
+            validate_filesystem_scope(scope)?;
+        }
+
+        Ok(Self {
+            network_allow_rules,
+            filesystem_scope,
+            dropped_network_entries,
+        })
+    }
+
+}
+
+/// The rules `NetworkPolicyHooks` enforces for one tool/driver dispatch: the artifact's own
+/// clamped set when it declared a `capabilities.network` block, otherwise the capsule ceiling
+/// borrowed unchanged.
+///
+/// Takes the grant as an `Option` because that is how the dispatch path holds it — a name
+/// missing from the session's grant map (no per-artifact block, or an artifact pulled in at
+/// runtime) must land on the ceiling, not on an empty allow-list.
+pub(crate) fn effective_tool_network_rules<'a>(
+    grant: Option<&'a ToolCapabilityGrant>,
+    ceiling_network_allow_rules: &'a [NetworkAllowRule],
+) -> &'a [NetworkAllowRule] {
+    grant
+        .and_then(|grant| grant.network_allow_rules.as_deref())
+        .unwrap_or(ceiling_network_allow_rules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use murmur_artifact::{Capabilities, FilesystemCapabilities, NetworkCapabilities};
 
-    /// A `Capabilities` block carrying only the two sub-blocks a hook grant reads.
-    fn hook_capabilities(
+    /// A `Capabilities` block carrying only the two sub-blocks a per-artifact grant reads.
+    fn capabilities_block(
         network: Option<Vec<&str>>,
         filesystem_scope: Option<&str>,
     ) -> Capabilities {
@@ -296,14 +420,14 @@ mod tests {
     /// the key must not, by itself, widen anything.
     #[test]
     fn hook_grant_empty_capabilities_block_grants_nothing() {
-        let grant = HookCapabilityGrant::derive(Some(&hook_capabilities(None, None))).unwrap();
+        let grant = HookCapabilityGrant::derive(Some(&capabilities_block(None, None))).unwrap();
 
         assert_eq!(grant, HookCapabilityGrant::default());
     }
 
     #[test]
     fn hook_grant_network_allows_exactly_the_declared_host() {
-        let caps = hook_capabilities(Some(vec!["https://telemetry.example.com"]), None);
+        let caps = capabilities_block(Some(vec!["https://telemetry.example.com"]), None);
         let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
 
         let allowed = RequestTarget {
@@ -331,7 +455,7 @@ mod tests {
 
     #[test]
     fn hook_grant_filesystem_scope_is_carried_through() {
-        let caps = hook_capabilities(None, Some("hook-state"));
+        let caps = capabilities_block(None, Some("hook-state"));
         let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
 
         assert_eq!(grant.filesystem_scope.as_deref(), Some("hook-state"));
@@ -342,7 +466,7 @@ mod tests {
     #[test]
     fn hook_grant_rejects_escaping_filesystem_scope() {
         for scope in ["../escape", "/etc"] {
-            let caps = hook_capabilities(None, Some(scope));
+            let caps = capabilities_block(None, Some(scope));
             let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
             assert!(
                 matches!(err, RuntimeError::InvalidFilesystemScope { .. }),
@@ -353,13 +477,179 @@ mod tests {
 
     #[test]
     fn hook_grant_rejects_malformed_network_entry() {
-        let caps = hook_capabilities(Some(vec!["ftp://files.example.com"]), None);
+        let caps = capabilities_block(Some(vec!["ftp://files.example.com"]), None);
         let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
 
         assert!(
             matches!(err, RuntimeError::InvalidNetworkAllowEntry { .. }),
             "got: {err}"
         );
+    }
+
+    /// The capsule ceiling used by the tool/driver narrowing tests: two hosts, one of which
+    /// a narrowed artifact is expected to lose access to.
+    fn ceiling() -> Vec<NetworkAllowRule> {
+        parse_network_allow_rules(&[
+            "https://api.example.com".to_string(),
+            "https://other.example.com".to_string(),
+        ])
+        .unwrap()
+    }
+
+    fn target(host: &str) -> RequestTarget {
+        RequestTarget {
+            scheme: "https".to_string(),
+            host: host.to_string(),
+            port: Some(443),
+        }
+    }
+
+    fn reaches(rules: &[NetworkAllowRule], host: &str) -> bool {
+        rules.iter().any(|rule| rule.matches(&target(host)))
+    }
+
+    /// The no-op invariant: a tool/driver entry with no `capabilities:` block keeps the whole
+    /// ceiling and the whole workdir — byte-for-byte the pre-slice behavior.
+    #[test]
+    fn tool_grant_without_entry_inherits_the_ceiling_unchanged() {
+        let ceiling = ceiling();
+        let grant = ToolCapabilityGrant::derive(None, &ceiling).unwrap();
+
+        assert_eq!(grant, ToolCapabilityGrant::default());
+        assert!(grant.network_allow_rules.is_none());
+        assert!(grant.filesystem_scope.is_none());
+        assert!(grant.dropped_network_entries.is_empty());
+
+        let effective = effective_tool_network_rules(Some(&grant), &ceiling);
+        assert_eq!(effective, ceiling.as_slice());
+        assert!(reaches(effective, "api.example.com"));
+        assert!(reaches(effective, "other.example.com"));
+    }
+
+    /// A declared subset keeps exactly the declared host and loses the rest of the ceiling.
+    #[test]
+    fn tool_grant_subset_of_ceiling_is_kept_and_narrows() {
+        let ceiling = ceiling();
+        let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        let effective = effective_tool_network_rules(Some(&grant), &ceiling);
+        assert!(reaches(effective, "api.example.com"));
+        assert!(!reaches(effective, "other.example.com"));
+        assert!(grant.dropped_network_entries.is_empty());
+    }
+
+    /// Narrowing can only subtract: a host the ceiling never allowed is dropped (and
+    /// reported for `W-SEC-007`), not granted.
+    #[test]
+    fn tool_grant_entry_outside_the_ceiling_is_dropped_not_granted() {
+        let ceiling = ceiling();
+        let caps = capabilities_block(
+            Some(vec!["https://api.example.com", "https://evil.example.com"]),
+            None,
+        );
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        let effective = effective_tool_network_rules(Some(&grant), &ceiling);
+        assert!(reaches(effective, "api.example.com"));
+        assert!(!reaches(effective, "evil.example.com"));
+        assert_eq!(
+            grant.dropped_network_entries,
+            vec!["https://evil.example.com".to_string()]
+        );
+    }
+
+    /// A bare host is broader than a scheme-bound ceiling rule (it spans http too), so it is
+    /// dropped rather than silently widening the artifact past the ceiling.
+    #[test]
+    fn tool_grant_entry_broader_than_the_ceiling_rule_is_dropped() {
+        let ceiling = ceiling();
+        let caps = capabilities_block(Some(vec!["api.example.com"]), None);
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        assert_eq!(grant.network_allow_rules.as_deref(), Some(&[][..]));
+        assert_eq!(
+            grant.dropped_network_entries,
+            vec!["api.example.com".to_string()]
+        );
+    }
+
+    /// An explicit empty allow-list is a real narrowing to zero network access — distinct
+    /// from the key being absent, which inherits the ceiling.
+    #[test]
+    fn tool_grant_empty_network_allow_denies_all_for_that_artifact() {
+        let ceiling = ceiling();
+        let caps = capabilities_block(Some(vec![]), None);
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        let effective = effective_tool_network_rules(Some(&grant), &ceiling);
+        assert!(effective.is_empty());
+        assert!(!reaches(effective, "api.example.com"));
+        assert!(!reaches(effective, "other.example.com"));
+    }
+
+    /// A filesystem-only block leaves the network on the ceiling: narrowing one axis must
+    /// not implicitly clamp the other.
+    #[test]
+    fn tool_grant_filesystem_scope_is_carried_and_leaves_network_inherited() {
+        let ceiling = ceiling();
+        let caps = capabilities_block(None, Some("cache"));
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        assert_eq!(grant.filesystem_scope.as_deref(), Some("cache"));
+        assert!(grant.network_allow_rules.is_none());
+        assert_eq!(effective_tool_network_rules(Some(&grant), &ceiling), ceiling.as_slice());
+    }
+
+    #[test]
+    fn tool_grant_rejects_escaping_filesystem_scope() {
+        for scope in ["../escape", "/etc"] {
+            let caps = capabilities_block(None, Some(scope));
+            let err = ToolCapabilityGrant::derive(Some(&caps), &ceiling()).unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::InvalidFilesystemScope { .. }),
+                "scope {scope} should fail staging, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_grant_rejects_malformed_network_entry() {
+        let caps = capabilities_block(Some(vec!["ftp://files.example.com"]), None);
+        let err = ToolCapabilityGrant::derive(Some(&caps), &ceiling()).unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::InvalidNetworkAllowEntry { .. }),
+            "got: {err}"
+        );
+    }
+
+    /// An empty ceiling already denies everything, so every declared entry drops — a
+    /// per-artifact block can never be the thing that turns network access on.
+    #[test]
+    fn tool_grant_cannot_widen_an_empty_ceiling() {
+        let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &[]).unwrap();
+
+        assert_eq!(grant.network_allow_rules.as_deref(), Some(&[][..]));
+        assert_eq!(
+            grant.dropped_network_entries,
+            vec!["https://api.example.com".to_string()]
+        );
+    }
+
+    /// An unset scheme/port on the ceiling side is a wildcard the narrower rule fits under.
+    #[test]
+    fn ceiling_rule_with_wildcard_scheme_covers_a_scheme_bound_rule() {
+        let ceiling = parse_network_allow_rules(&["api.example.com".to_string()]).unwrap();
+        let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+
+        assert!(grant.dropped_network_entries.is_empty());
+        assert!(reaches(
+            effective_tool_network_rules(Some(&grant), &ceiling),
+            "api.example.com"
+        ));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::{
     bindings::host::murmur::tool::run::ToolResult,
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
-    network_policy::HookCapabilityGrant,
+    network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
 };
 
 pub(crate) struct DispatchOutcome {
@@ -55,9 +55,10 @@ pub struct ArtifactRequest {
     pub source: Option<String>,
     /// Per-artifact capability grant copied verbatim from this artifact's entry in the
     /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::capabilities`).
-    /// Only consumed for `runtime: hook` — the manifest parser rejects the key on any other
-    /// role — and `None` means full default-deny for that hook. Never sourced from the
-    /// artifact's own bundled `murmur.yaml`, so an artifact cannot self-grant.
+    /// Consumed for `runtime: hook` (default-deny baseline, `None` = deny everything) and for
+    /// `runtime: tool`/`runtime: driver` (ceiling baseline, `None` = the capsule-wide policy
+    /// unchanged); the manifest parser rejects the key on `runtime: skill`. Never sourced
+    /// from the artifact's own bundled `murmur.yaml`, so an artifact cannot self-grant.
     pub capabilities: Option<murmur_artifact::Capabilities>,
 }
 
@@ -177,6 +178,12 @@ pub struct StagedSession {
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// Per-artifact narrowing for the tool/driver dispatch path, keyed by artifact name and
+    /// lowered at staging time from the operator's own manifest entries. Holds an entry only
+    /// for artifacts that actually declared a `capabilities:` block — a name absent from this
+    /// map (the overwhelmingly common case) runs on the full capsule ceiling, exactly as
+    /// before per-artifact narrowing existed.
+    pub(crate) artifact_grants: HashMap<String, ToolCapabilityGrant>,
     pub(crate) hook_components: Vec<StagedHookArtifact>,
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) capability_policy: CapabilityPolicy,

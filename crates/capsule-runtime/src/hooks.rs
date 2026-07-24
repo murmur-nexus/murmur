@@ -2266,6 +2266,7 @@ mod tests {
             inference_env: Vec::new(),
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
+            driver_grant: None,
             records: std::sync::Mutex::new(Vec::new()),
         });
 

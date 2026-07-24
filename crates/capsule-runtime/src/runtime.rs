@@ -13,7 +13,8 @@ use murmur_artifact::{
     read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, HookBinding, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
-    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
+    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
+    W_SEC_006, W_SEC_007, W_SEC_008,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -47,8 +48,8 @@ use crate::{
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
     network_policy::{
-        parse_network_allow_rules, validate_filesystem_scope, HookCapabilityGrant,
-        NetworkAllowRule, RequestTarget,
+        effective_tool_network_rules, parse_network_allow_rules, validate_filesystem_scope,
+        HookCapabilityGrant, NetworkAllowRule, RequestTarget, ToolCapabilityGrant,
     },
     otel::OtelEmitter,
     outgoing, sandbox,
@@ -62,8 +63,8 @@ use crate::{
     },
     trace::TraceWriter,
     types::{
-        CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
-        ResolvedLockArtifact, StageRequest, StagedHookArtifact, StagedSession,
+        ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary,
+        LaunchResult, ResolvedLockArtifact, StageRequest, StagedHookArtifact, StagedSession,
     },
 };
 
@@ -139,7 +140,15 @@ pub fn stage_session(
     let mut installed_artifacts = Vec::with_capacity(request.artifacts.len());
     let mut installed_manifests = Vec::with_capacity(request.artifacts.len());
     let mut tool_components = HashMap::with_capacity(request.artifacts.len());
+    // Only tools/drivers that declare a `capabilities:` block get an entry; everything else
+    // stays absent and therefore runs on the unclamped ceiling.
+    let mut artifact_grants: HashMap<String, ToolCapabilityGrant> = HashMap::new();
     let mut hook_components = Vec::new();
+    // The ceiling every per-artifact network grant is clamped against. Re-parsed here rather
+    // than at launch because narrowing is lowered at staging time; `validate_capability_policy`
+    // above already proved these entries parse.
+    let ceiling_network_allow_rules =
+        parse_network_allow_rules(&request.capability_policy.network_allow)?;
     // (name, binary_bytes) for native tool artifacts — installed after workdir creation
     let mut native_binaries: Vec<(String, Vec<u8>)> = Vec::new();
     // (name, skill_md_bytes) for skill artifacts — installed after workdir creation
@@ -224,6 +233,14 @@ pub fn stage_session(
                 artifact_implementation = Some(implementation.clone());
                 match implementation {
                     ArtifactImplementation::Native => {
+                        // A native tool is a host subprocess, not a WASI guest: it never
+                        // reaches `invoke_tool_component`, so nothing would apply a
+                        // per-artifact grant to it. Say so rather than let the block read
+                        // as enforced.
+                        warn_on_unenforceable_native_capabilities(
+                            &artifact.name,
+                            artifact.capabilities.as_ref(),
+                        );
                         let binary = extract_native_binary(
                             &artifact.name,
                             &resolved_version,
@@ -232,6 +249,11 @@ pub fn stage_session(
                         native_binaries.push((artifact.name.clone(), binary));
                     }
                     ArtifactImplementation::Wasm => {
+                        stage_artifact_grant(
+                            artifact,
+                            &ceiling_network_allow_rules,
+                            &mut artifact_grants,
+                        )?;
                         let tool_wasm =
                             extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
                         let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
@@ -246,6 +268,15 @@ pub fn stage_session(
                 }
             }
             ArtifactRuntime::Driver => {
+                // Same call as the WASM-tool arm above, and deliberately so: a driver is
+                // staged into `tool_components` and dispatched through
+                // `invoke_tool_component` like any tool, so narrowing needs no
+                // driver-specific enforcement anywhere downstream.
+                stage_artifact_grant(
+                    artifact,
+                    &ceiling_network_allow_rules,
+                    &mut artifact_grants,
+                )?;
                 let tool_wasm =
                     extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
                 let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
@@ -425,6 +456,7 @@ pub fn stage_session(
         engine,
         capsule_component,
         tool_components,
+        artifact_grants,
         hook_components,
         allowlisted_tools: request.allowlisted_tools,
         capability_policy: request.capability_policy,
@@ -573,6 +605,7 @@ pub fn launch_session(
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
+        let artifact_grants = staged.artifact_grants;
         let allowlisted_tools = staged.allowlisted_tools.clone();
         let installed_artifacts = staged.installed_artifacts;
         let engine = staged.engine.clone();
@@ -655,7 +688,15 @@ pub fn launch_session(
                         // `capability_policy.limits`) that bound this path's guests.
                         limits: capability_policy.limits.limiter(),
                         table: ResourceTable::new(),
-                        wasi: build_wasi_ctx(&accessible_workdir, &all_env, &capability_policy)?,
+                        // The capsule's own store is the ceiling itself, never narrowed:
+                        // per-artifact grants apply to staged tools/drivers, not to the
+                        // agent loop's own context.
+                        wasi: build_wasi_ctx(
+                            &accessible_workdir,
+                            None,
+                            &all_env,
+                            &capability_policy,
+                        )?,
                         http: WasiHttpCtx::new(),
                         http_hooks: NetworkPolicyHooks {
                             network_allow_rules: network_allow_rules.clone(),
@@ -666,6 +707,7 @@ pub fn launch_session(
                         workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
                         tool_components,
+                        artifact_grants,
                         allowlisted_tools,
                         installed_artifacts,
                         session_id: session_id.clone(),
@@ -700,6 +742,9 @@ pub fn launch_session(
                                 .map(|component| (driver_name.clone(), component.clone()))
                         })
                         .map(|(driver_name, driver_component)| {
+                            // Same grant `dispatch_tool_async` would apply to this driver, so
+                            // a hook's `run-inference` cannot route around its narrowing.
+                            let driver_grant = state.artifact_grants.get(&driver_name).cloned();
                             Arc::new(HookInferenceCtx {
                                 driver_name,
                                 driver_component,
@@ -709,6 +754,7 @@ pub fn launch_session(
                                 inference_env: state.inference_env.clone(),
                                 capability_policy: state.capability_policy.clone(),
                                 network_allow_rules: state.network_allow_rules.clone(),
+                                driver_grant,
                                 records: std::sync::Mutex::new(Vec::new()),
                             })
                         });
@@ -1136,6 +1182,8 @@ pub fn launch_session(
         table: ResourceTable::new(),
         wasi: build_wasi_ctx(
             &staged.accessible_workdir,
+            // The capsule component runs on the ceiling, not on any artifact's grant.
+            None,
             &inference_env,
             &staged.capability_policy,
         )?,
@@ -1149,6 +1197,7 @@ pub fn launch_session(
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
         tool_components: staged.tool_components,
+        artifact_grants: staged.artifact_grants,
         allowlisted_tools: staged.allowlisted_tools,
         installed_artifacts: staged.installed_artifacts,
         session_id: staged.session_id.clone(),
@@ -1381,20 +1430,7 @@ fn warn_on_inert_hook_capabilities(
     hook_name: &str,
     capabilities: Option<&murmur_artifact::Capabilities>,
 ) {
-    let Some(capabilities) = capabilities else {
-        return;
-    };
-
-    let inert: Vec<&str> = [
-        ("shell", capabilities.shell.is_some()),
-        ("spawn", capabilities.spawn.is_some()),
-        ("env", capabilities.env.is_some()),
-        ("limits", capabilities.limits.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(name, present)| present.then_some(name))
-    .collect();
-
+    let inert = inert_capability_sub_blocks(capabilities);
     if !inert.is_empty() {
         let link = security_warning_link(W_SEC_006);
         eprintln!(
@@ -1404,6 +1440,113 @@ fn warn_on_inert_hook_capabilities(
             inert.join(", capabilities.")
         );
     }
+}
+
+/// The sub-blocks a per-artifact `capabilities:` grant never reads, whichever role declared
+/// it. Shared by the hook (`W-SEC-006`) and tool/driver (`W-SEC-008`) warnings, which differ
+/// only in code and wording — the hazard, and the set of inert keys, is identical.
+fn inert_capability_sub_blocks(
+    capabilities: Option<&murmur_artifact::Capabilities>,
+) -> Vec<&'static str> {
+    let Some(capabilities) = capabilities else {
+        return Vec::new();
+    };
+
+    [
+        ("shell", capabilities.shell.is_some()),
+        ("spawn", capabilities.spawn.is_some()),
+        ("env", capabilities.env.is_some()),
+        ("limits", capabilities.limits.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect()
+}
+
+/// Lower one tool's or driver's per-artifact grant and record it, warning about anything the
+/// operator declared that narrowing will not honor.
+///
+/// Called from the WASM-tool and driver staging arms only. Inserting nothing when the entry
+/// declares no `capabilities:` block is what makes the absent case a strict no-op: dispatch
+/// looks the artifact up by name and falls back to the session's own policy on a miss.
+fn stage_artifact_grant(
+    artifact: &ArtifactRequest,
+    ceiling_network_allow_rules: &[NetworkAllowRule],
+    artifact_grants: &mut HashMap<String, ToolCapabilityGrant>,
+) -> Result<(), RuntimeError> {
+    let Some(capabilities) = artifact.capabilities.as_ref() else {
+        return Ok(());
+    };
+
+    // Derived from `artifact` — the operator's own manifest entry — and never from the
+    // artifact's bundled `murmur.yaml`, so a tool pulled from a registry cannot scope itself
+    // up. Deriving at staging (not at dispatch) means a malformed grant fails the run before
+    // any guest starts.
+    let grant = ToolCapabilityGrant::derive(Some(capabilities), ceiling_network_allow_rules)?;
+    warn_on_out_of_ceiling_network_entries(&artifact.name, &grant.dropped_network_entries);
+    warn_on_inert_tool_capabilities(&artifact.name, Some(capabilities));
+    artifact_grants.insert(artifact.name.clone(), grant);
+    Ok(())
+}
+
+/// A per-artifact `network.allow` entry the capsule-wide ceiling does not itself allow was
+/// dropped rather than granted — narrowing only ever subtracts. Non-fatal on purpose: the
+/// resulting posture is strictly *tighter* than the operator asked for, so failing staging
+/// would punish a safe mistake, but a silent drop would leave them believing a host is
+/// reachable when it is not.
+fn warn_on_out_of_ceiling_network_entries(artifact_name: &str, dropped: &[String]) {
+    if dropped.is_empty() {
+        return;
+    }
+
+    let link = security_warning_link(W_SEC_007);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_007}]: artifact '{artifact_name}' declares \
+         capabilities.network.allow entries the capsule-wide ceiling does not allow ({}) — \
+         they are dropped, not granted, because per-artifact capabilities can only narrow \
+         ({link})",
+        dropped.join(", ")
+    );
+}
+
+/// The tool/driver counterpart of [`warn_on_inert_hook_capabilities`]: per-artifact narrowing
+/// reads only `network` and `filesystem`, so any other sub-block is structurally valid and
+/// silently inert. Warn rather than reject, matching how every other capability-posture issue
+/// is reported.
+fn warn_on_inert_tool_capabilities(
+    artifact_name: &str,
+    capabilities: Option<&murmur_artifact::Capabilities>,
+) {
+    let inert = inert_capability_sub_blocks(capabilities);
+    if !inert.is_empty() {
+        let link = security_warning_link(W_SEC_008);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
+             capabilities.{} which per-artifact narrowing does not apply — only \
+             capabilities.network and capabilities.filesystem narrow a tool or driver ({link})",
+            inert.join(", capabilities.")
+        );
+    }
+}
+
+/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host
+/// subprocess under the capsule-wide shell/sandbox machinery, never through the WASI tool
+/// path per-artifact grants are applied on. Declaring one is therefore wholly inert, which is
+/// a sharper hazard than an inert sub-block and gets the same `W-SEC-008` treatment.
+fn warn_on_unenforceable_native_capabilities(
+    artifact_name: &str,
+    capabilities: Option<&murmur_artifact::Capabilities>,
+) {
+    if capabilities.is_none() {
+        return;
+    }
+
+    let link = security_warning_link(W_SEC_008);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_008}]: artifact '{artifact_name}' declares \
+         per-artifact 'capabilities:' but ships a native implementation — narrowing applies \
+         only to WASM tools and drivers, so this grant is not enforced ({link})"
+    );
 }
 
 /// Builds the single `Engine` a session runs every guest on.
@@ -1448,8 +1591,15 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 ///
 /// `extra_env` is applied last so a manifest cannot shadow a runtime-owned `MURMUR_*` value
 /// by allowlisting its name.
+///
+/// `filesystem_scope` is a per-artifact narrowing of what gets preopened as `"."`: `None`
+/// preopens `workdir` itself, which is what every caller without a per-artifact grant passes
+/// and is the pre-existing behavior. `Some(scope)` preopens `workdir/scope` instead, created
+/// if missing — already validated as relative and non-escaping by
+/// [`ToolCapabilityGrant::derive`] at staging time.
 fn build_wasi_ctx(
     workdir: &Path,
+    filesystem_scope: Option<&str>,
     extra_env: &[(String, String)],
     policy: &CapabilityPolicy,
 ) -> Result<WasiCtx, RuntimeError> {
@@ -1461,9 +1611,26 @@ fn build_wasi_ctx(
     for (key, value) in extra_env {
         builder.env(key, value);
     }
+
+    let preopen_root = match filesystem_scope {
+        None => workdir.to_path_buf(),
+        Some(scope) => {
+            let scoped_dir = workdir.join(scope);
+            // Hard error rather than a silent fall back to the unscoped workdir (which would
+            // widen the grant) or to no preopen at all (which would look like a guest bug).
+            std::fs::create_dir_all(&scoped_dir).map_err(|err| {
+                RuntimeError::wasi(
+                    scoped_dir.clone(),
+                    format!("failed to create granted filesystem scope '{scope}': {err}"),
+                )
+            })?;
+            scoped_dir
+        }
+    };
+
     builder
-        .preopened_dir(workdir, ".", DirPerms::all(), FilePerms::all())
-        .map_err(|err| RuntimeError::wasi(workdir.to_path_buf(), err.to_string()))?;
+        .preopened_dir(&preopen_root, ".", DirPerms::all(), FilePerms::all())
+        .map_err(|err| RuntimeError::wasi(preopen_root, err.to_string()))?;
 
     Ok(builder.build())
 }
@@ -1631,6 +1798,9 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
     pub(crate) tool_components: HashMap<String, Component>,
+    /// Per-artifact narrowing keyed by artifact name, moved over from
+    /// [`StagedSession::artifact_grants`]. A name absent here dispatches on the full ceiling.
+    pub(crate) artifact_grants: HashMap<String, ToolCapabilityGrant>,
     pub(crate) allowlisted_tools: HashSet<String>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) session_id: String,
@@ -2034,7 +2204,13 @@ pub(crate) struct ToolInvokeEnv<'a> {
     pub(crate) accessible_workdir: &'a Path,
     pub(crate) inference_env: &'a [(String, String)],
     pub(crate) capability_policy: &'a CapabilityPolicy,
+    /// The capsule-wide ceiling. What actually gets enforced is this, clamped by
+    /// `artifact_grant` when the operator declared one.
     pub(crate) network_allow_rules: &'a [NetworkAllowRule],
+    /// This artifact's optional narrowing, from the operator's own manifest entry. `None` —
+    /// no `capabilities:` block on the entry — means the ceiling applies untouched and the
+    /// whole `accessible_workdir` is preopened, exactly as before narrowing existed.
+    pub(crate) artifact_grant: Option<&'a ToolCapabilityGrant>,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -2089,6 +2265,7 @@ pub(crate) async fn invoke_tool_component(
         inference_env,
         capability_policy,
         network_allow_rules,
+        artifact_grant,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -2209,18 +2386,23 @@ pub(crate) async fn invoke_tool_component(
     }
 
     let tool_limits = capability_policy.limits;
+    // Both halves of the grant are resolved here, on the one path every WASM tool and the
+    // inference driver share, so a driver needs no enforcement code of its own.
+    let effective_network_rules = effective_tool_network_rules(artifact_grant, network_allow_rules);
+    let filesystem_scope = artifact_grant.and_then(|grant| grant.filesystem_scope.as_deref());
     let state = ToolStoreState {
         limits: tool_limits.limiter(),
         table: ResourceTable::new(),
         wasi: build_wasi_ctx(
             accessible_workdir,
+            filesystem_scope,
             inference_env,
             capability_policy,
         )
         .map_err(|err| format!("failed to build WASI context for tool '{name}': {err}"))?,
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
-            network_allow_rules: network_allow_rules.to_vec(),
+            network_allow_rules: effective_network_rules.to_vec(),
         },
     };
 
@@ -2293,6 +2475,10 @@ impl CapsuleStoreState {
                 inference_env: &self.inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
+                // Absent for every artifact that declared no `capabilities:` block, and for
+                // anything pulled in at runtime via `manage.pull()` (which has no operator
+                // manifest entry to narrow from) — both keep the full ceiling.
+                artifact_grant: self.artifact_grants.get(name),
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -3696,7 +3882,7 @@ mod tests {
         lock_path: PathBuf,
     ) -> CapsuleStoreState {
         let engine = build_engine().unwrap();
-        let wasi = build_wasi_ctx(&workdir, &[], &CapabilityPolicy::default()).unwrap();
+        let wasi = build_wasi_ctx(&workdir, None, &[], &CapabilityPolicy::default()).unwrap();
         CapsuleStoreState {
             limits: crate::limits::ExecutionLimits::default().limiter(),
             table: ResourceTable::new(),
@@ -3711,6 +3897,7 @@ mod tests {
             workdir: workdir.clone(),
             accessible_workdir: workdir,
             tool_components: HashMap::new(),
+            artifact_grants: HashMap::new(),
             allowlisted_tools: HashSet::new(),
             installed_artifacts: Vec::new(),
             session_id: "ses_test".to_string(),
@@ -4143,5 +4330,346 @@ mod tests {
             !data.contains("leaked-secret"),
             "policy.shell_strip_env pattern must compose for native tool subprocess, got: {data}"
         );
+    }
+
+    // ── Per-artifact grant narrowing for tools and drivers ───────────────────────────
+
+    /// The capsule ceiling the narrowing tests clamp against. Loopback ports nothing listens
+    /// on, so a policy decision is observable without any connection ever completing.
+    fn narrowing_ceiling() -> Vec<NetworkAllowRule> {
+        parse_network_allow_rules(&[
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:2".to_string(),
+        ])
+        .unwrap()
+    }
+
+    fn grant_of(network: Option<Vec<&str>>, scope: Option<&str>) -> ToolCapabilityGrant {
+        let caps = murmur_artifact::Capabilities {
+            network: network.map(|allow| murmur_artifact::NetworkCapabilities {
+                allow: allow.into_iter().map(str::to_string).collect(),
+            }),
+            filesystem: scope.map(|scope| murmur_artifact::FilesystemCapabilities {
+                scope: Some(scope.to_string()),
+            }),
+            shell: None,
+            spawn: None,
+            env: None,
+            limits: None,
+        };
+        ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling()).expect("grant is valid")
+    }
+
+    /// Push a request through the very `NetworkPolicyHooks` a tool store is built with, so
+    /// the assertion is on the real wasi-http gate rather than on the rule list.
+    fn send_through_tool_hooks(rules: &[NetworkAllowRule], uri: &str, use_tls: bool) -> bool {
+        use http_body_util::{BodyExt, Empty};
+
+        let mut hooks = NetworkPolicyHooks {
+            network_allow_rules: rules.to_vec(),
+        };
+        let body = Empty::<bytes::Bytes>::new()
+            .map_err(|err| match err {})
+            .boxed_unsync();
+        let request = hyper::Request::builder()
+            .uri(uri)
+            .body(body)
+            .expect("request builds");
+        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls,
+            connect_timeout: std::time::Duration::from_millis(1),
+            first_byte_timeout: std::time::Duration::from_millis(1),
+            between_bytes_timeout: std::time::Duration::from_millis(1),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { hooks.send_request(request, config).is_ok() })
+    }
+
+    /// The no-op invariant, network half: a tool with no per-artifact entry dispatches on the
+    /// full ceiling, reaching everything the capsule may reach.
+    #[test]
+    fn ungranted_tool_keeps_the_whole_ceiling() {
+        let ceiling = narrowing_ceiling();
+        let rules = effective_tool_network_rules(None, &ceiling);
+
+        assert!(send_through_tool_hooks(rules, "http://127.0.0.1:1/x", false));
+        assert!(send_through_tool_hooks(rules, "http://127.0.0.1:2/x", false));
+    }
+
+    /// A narrowed tool reaches only its declared host; the ceiling's other host is gone for
+    /// that artifact even though a sibling tool still reaches it.
+    #[test]
+    fn narrowed_tool_reaches_only_its_declared_host() {
+        let ceiling = narrowing_ceiling();
+        let grant = grant_of(Some(vec!["http://127.0.0.1:1"]), None);
+        let narrowed = effective_tool_network_rules(Some(&grant), &ceiling);
+
+        assert!(
+            send_through_tool_hooks(narrowed, "http://127.0.0.1:1/x", false),
+            "the declared host stays reachable"
+        );
+        assert!(
+            !send_through_tool_hooks(narrowed, "http://127.0.0.1:2/x", false),
+            "the rest of the ceiling is dropped for this artifact"
+        );
+        // The sibling with no entry is unaffected by its neighbour's narrowing.
+        let sibling = effective_tool_network_rules(None, &ceiling);
+        assert!(send_through_tool_hooks(sibling, "http://127.0.0.1:2/x", false));
+    }
+
+    /// An entry outside the ceiling is dropped rather than granted, and reported so staging
+    /// can raise `W-SEC-007`.
+    #[test]
+    fn out_of_ceiling_entry_is_dropped_and_reported() {
+        let ceiling = narrowing_ceiling();
+        let grant = grant_of(Some(vec!["http://127.0.0.1:1", "https://evil.example.com"]), None);
+        let narrowed = effective_tool_network_rules(Some(&grant), &ceiling);
+
+        assert!(!send_through_tool_hooks(
+            narrowed,
+            "https://evil.example.com/x",
+            true
+        ));
+        assert_eq!(
+            grant.dropped_network_entries,
+            vec!["https://evil.example.com".to_string()]
+        );
+    }
+
+    /// Without a scope the preopened root is the workdir itself — observable because
+    /// `preopened_dir` requires the directory to exist, so a missing workdir is an error.
+    #[test]
+    fn tool_without_filesystem_scope_preopens_the_workdir_itself() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("does-not-exist");
+
+        assert!(
+            build_wasi_ctx(&missing, None, &[], &CapabilityPolicy::default()).is_err(),
+            "an unscoped tool preopens the workdir, which must exist"
+        );
+        build_wasi_ctx(root.path(), None, &[], &CapabilityPolicy::default())
+            .expect("an existing workdir preopens as before");
+        assert!(
+            !missing.exists(),
+            "the unscoped path must not create anything"
+        );
+    }
+
+    /// With a scope the preopened root is `<workdir>/<scope>`, created if absent. Sibling
+    /// paths under the workdir are never mounted, so a guest has no descriptor for them.
+    #[test]
+    fn tool_with_filesystem_scope_preopens_only_the_scoped_subtree() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("secret.txt"), b"capsule state").unwrap();
+
+        build_wasi_ctx(root.path(), Some("cache"), &[], &CapabilityPolicy::default())
+            .expect("a granted scope is created and preopened");
+
+        let scoped = root.path().join("cache");
+        assert!(scoped.is_dir(), "the granted scope is created if missing");
+        std::fs::write(scoped.join("entry.json"), b"{}").unwrap();
+        assert!(scoped.join("entry.json").exists());
+        assert!(
+            root.path().join("secret.txt").exists(),
+            "nothing outside the scope was touched"
+        );
+    }
+
+    /// A scope that cannot be created is a hard error naming the scope, never a silent
+    /// widening back to the whole workdir.
+    #[test]
+    fn unusable_filesystem_scope_is_a_hard_error() {
+        let root = TempDir::new().unwrap();
+        // A regular file where the scope directory would go: `create_dir_all` cannot proceed.
+        std::fs::write(root.path().join("cache"), b"not a directory").unwrap();
+
+        let policy = CapabilityPolicy::default();
+        let err = match build_wasi_ctx(root.path(), Some("cache"), &[], &policy) {
+            Ok(_) => panic!("an uncreatable scope must fail loudly"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("cache"),
+            "the error must name the scope, got: {err}"
+        );
+    }
+
+    /// End-to-end through the one dispatch body every WASM tool and the inference driver
+    /// share: a real component is instantiated and called under a grant, and the scoped
+    /// directory it was granted appears on the host filesystem.
+    #[test]
+    fn real_dispatch_applies_the_filesystem_scope() {
+        let engine = build_engine().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let component = crate::inference_import::test_support::driver_double(
+            &engine,
+            0,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}"#,
+        );
+        let ceiling = narrowing_ceiling();
+        let grant = grant_of(None, Some("tool-cache"));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            invoke_tool_component(
+                ToolInvokeEnv {
+                    engine: &engine,
+                    accessible_workdir: workdir.path(),
+                    inference_env: &[],
+                    capability_policy: &CapabilityPolicy::default(),
+                    network_allow_rules: &ceiling,
+                    artifact_grant: Some(&grant),
+                },
+                ToolA2aWiring::silent(),
+                "scoped-tool",
+                &component,
+                murmur::tool::run::ToolInput {
+                    data: Some("{}".to_string()),
+                    log_path: None,
+                },
+            )
+            .await
+        });
+
+        assert!(result.is_ok(), "the scoped tool still runs: {result:?}");
+        assert!(
+            workdir.path().join("tool-cache").is_dir(),
+            "the real dispatch path preopened the granted scope"
+        );
+    }
+
+    /// The same dispatch with no grant is byte-for-byte the pre-narrowing behavior: the whole
+    /// accessible workdir is the preopen root and no subtree is created.
+    #[test]
+    fn real_dispatch_without_a_grant_is_unchanged() {
+        let engine = build_engine().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let component = crate::inference_import::test_support::driver_double(
+            &engine,
+            0,
+            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"ok"}]}"#,
+        );
+        let ceiling = narrowing_ceiling();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            invoke_tool_component(
+                ToolInvokeEnv {
+                    engine: &engine,
+                    accessible_workdir: workdir.path(),
+                    inference_env: &[],
+                    capability_policy: &CapabilityPolicy::default(),
+                    network_allow_rules: &ceiling,
+                    artifact_grant: None,
+                },
+                ToolA2aWiring::silent(),
+                "plain-tool",
+                &component,
+                murmur::tool::run::ToolInput {
+                    data: Some("{}".to_string()),
+                    log_path: None,
+                },
+            )
+            .await
+        });
+
+        assert!(result.is_ok(), "an ungranted tool runs as before: {result:?}");
+        assert_eq!(
+            std::fs::read_dir(workdir.path()).unwrap().count(),
+            0,
+            "no per-artifact subtree is created when nothing was granted"
+        );
+    }
+
+    /// Staging lowers a grant only for artifacts that declared one, and only from the
+    /// operator's own entry — the map is the single source dispatch consults.
+    #[test]
+    fn staging_records_grants_only_for_declaring_artifacts() {
+        let ceiling = narrowing_ceiling();
+        let mut grants = HashMap::new();
+
+        let declared = ArtifactRequest {
+            name: "scoped-tool".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: ArtifactRuntime::Tool,
+            source: None,
+            capabilities: Some(murmur_artifact::Capabilities {
+                network: Some(murmur_artifact::NetworkCapabilities {
+                    allow: vec!["http://127.0.0.1:1".to_string()],
+                }),
+                filesystem: None,
+                shell: None,
+                spawn: None,
+                env: None,
+                limits: None,
+            }),
+        };
+        let silent = ArtifactRequest {
+            name: "plain-tool".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: ArtifactRuntime::Tool,
+            source: None,
+            capabilities: None,
+        };
+
+        stage_artifact_grant(&declared, &ceiling, &mut grants).unwrap();
+        stage_artifact_grant(&silent, &ceiling, &mut grants).unwrap();
+
+        assert!(grants.contains_key("scoped-tool"));
+        assert!(
+            !grants.contains_key("plain-tool"),
+            "an artifact with no capabilities block must stay absent so dispatch falls back \
+             to the ceiling"
+        );
+    }
+
+    /// A malformed grant fails staging rather than surfacing as a confusing denial once the
+    /// tool is already running.
+    #[test]
+    fn staging_rejects_an_escaping_filesystem_scope() {
+        let mut grants = HashMap::new();
+        let artifact = ArtifactRequest {
+            name: "escaping-tool".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: ArtifactRuntime::Tool,
+            source: None,
+            capabilities: Some(murmur_artifact::Capabilities {
+                network: None,
+                filesystem: Some(murmur_artifact::FilesystemCapabilities {
+                    scope: Some("../escape".to_string()),
+                }),
+                shell: None,
+                spawn: None,
+                env: None,
+                limits: None,
+            }),
+        };
+
+        let err = stage_artifact_grant(&artifact, &narrowing_ceiling(), &mut grants)
+            .expect_err("an escaping scope must fail staging");
+        assert!(matches!(err, RuntimeError::InvalidFilesystemScope { .. }));
+        assert!(grants.is_empty());
+    }
+
+    /// The inert-sub-block set is shared with the hook warning: `network`/`filesystem` are
+    /// consumed, everything else is reported.
+    #[test]
+    fn inert_sub_blocks_are_exactly_the_unconsumed_ones() {
+        let caps = murmur_artifact::Capabilities {
+            network: Some(murmur_artifact::NetworkCapabilities { allow: Vec::new() }),
+            filesystem: Some(murmur_artifact::FilesystemCapabilities { scope: None }),
+            shell: Some(murmur_artifact::ShellCapabilities {
+                allow: vec!["bash".to_string()],
+                strip_env: None,
+                baseline_env: None,
+            }),
+            spawn: None,
+            env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
+            limits: None,
+        };
+
+        assert_eq!(inert_capability_sub_blocks(Some(&caps)), vec!["shell", "env"]);
+        assert!(inert_capability_sub_blocks(None).is_empty());
     }
 }
