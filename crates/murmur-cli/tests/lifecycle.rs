@@ -101,6 +101,7 @@ fn stage_agent(
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            capabilities: artifact.capabilities.clone(),
         });
     }
 

@@ -658,6 +658,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            capabilities: artifact.capabilities.clone(),
         });
     }
 
@@ -674,6 +675,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         version: entry.resolved_version.clone(),
                         runtime: artifact.runtime.clone(),
                         source: None,
+                        capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {
                         name: artifact.name.clone(),

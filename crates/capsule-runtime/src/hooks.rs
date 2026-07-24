@@ -12,6 +12,10 @@ use wasmtime::{
 use wasmtime_wasi::{
     DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
+use wasmtime_wasi_http::{
+    p2::{WasiHttpCtxView, WasiHttpView},
+    WasiHttpCtx,
+};
 
 use murmur_artifact::{HookBinding, HookConfig, HookExecutionMode, PACKED_MANIFEST_ENTRY};
 
@@ -24,6 +28,8 @@ use crate::{
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
+    network_policy::HookCapabilityGrant,
+    runtime::NetworkPolicyHooks,
     types::StagedHookArtifact,
 };
 
@@ -128,6 +134,9 @@ struct AsyncHookSpec {
     name: String,
     config: HookConfig,
     component: Component,
+    /// Retained from staging so each per-event instantiation applies the same grant a
+    /// blocking hook would get — there is no execution mode that escapes the capability model.
+    grant: HookCapabilityGrant,
 }
 
 struct HookStoreState {
@@ -137,6 +146,14 @@ struct HookStoreState {
     limits: ExecutionLimiter,
     table: ResourceTable,
     wasi: WasiCtx,
+    /// wasi-http context. A hook's *only* route to the network: [`build_wasi_ctx`] grants no
+    /// raw WASI socket capability, so `wasi:http/outgoing-handler` — filtered by
+    /// `http_hooks` below — is the whole outbound surface, exactly as for capsules and tools.
+    http: WasiHttpCtx,
+    /// Per-hook allow-list enforcement, built from this hook's `HookCapabilityGrant`. An
+    /// empty rule set (the default, for a hook the operator granted no `capabilities.network`)
+    /// denies every request.
+    http_hooks: NetworkPolicyHooks,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,6 +359,7 @@ async fn call_stage_once(
 ) -> Result<HookOutput, String> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
     // `on-stage` runs during staging, long before an inference driver exists —
     // the import is defined so an inference-importing hook still links, and
     // always errors.
@@ -350,7 +368,11 @@ async fn call_stage_once(
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(workdir, env_vars).map_err(|e| e.to_string())?,
+        wasi: build_wasi_ctx(workdir, env_vars, &staged.grant).map_err(|e| e.to_string())?,
+        http: WasiHttpCtx::new(),
+        http_hooks: NetworkPolicyHooks {
+            network_allow_rules: staged.grant.network_allow_rules.clone(),
+        },
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
@@ -418,6 +440,7 @@ impl HookRuntime {
                         name: staged.name,
                         config: staged.config,
                         component: staged.component,
+                        grant: staged.grant,
                     });
                 }
                 HookExecutionMode::Blocking => {
@@ -560,6 +583,7 @@ impl HookRuntime {
             let elapsed = self.started.elapsed();
             let limits = self.limits;
             let inference = self.inference.clone();
+            let grant = spec.grant.clone();
 
             tokio::task::spawn_local(async move {
                 if let Err(err) = call_async_hook(
@@ -573,6 +597,7 @@ impl HookRuntime {
                     totals,
                     limits,
                     inference,
+                    &grant,
                 )
                 .await
                 {
@@ -653,13 +678,19 @@ async fn instantiate_blocking_hook(
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+        .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
     add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), inference)
         .map_err(RuntimeError::Runtime)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(project_dir, env_vars)?,
+        wasi: build_wasi_ctx(project_dir, env_vars, &staged.grant)?,
+        http: WasiHttpCtx::new(),
+        http_hooks: NetworkPolicyHooks {
+            network_allow_rules: staged.grant.network_allow_rules.clone(),
+        },
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
@@ -738,6 +769,20 @@ impl WasiView for HookStoreState {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
+        }
+    }
+}
+
+/// Routes every hook outbound HTTP request through the same `NetworkPolicyHooks` gate that
+/// `CapsuleStoreState`/`ToolStoreState` use — one enforcement implementation, three guest
+/// kinds. The rules come from the hook's own grant, so a hook is never widened by the
+/// capsule-wide `capabilities.network.allow`.
+impl WasiHttpView for HookStoreState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.http_hooks,
         }
     }
 }
@@ -978,16 +1023,22 @@ async fn call_async_hook(
     totals: HookTotals,
     limits: ExecutionLimits,
     inference: Option<Arc<HookInferenceCtx>>,
+    grant: &HookCapabilityGrant,
 ) -> Result<(), String> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
     add_inference_to_linker(&mut linker, format!("hook:{name}"), inference)?;
 
     let env = HookEnvVars::default();
     let state = HookStoreState {
         limits: limits.limiter(),
         table: ResourceTable::new(),
-        wasi: build_wasi_ctx(root_dir, &env).map_err(|e| e.to_string())?,
+        wasi: build_wasi_ctx(root_dir, &env, grant).map_err(|e| e.to_string())?,
+        http: WasiHttpCtx::new(),
+        http_hooks: NetworkPolicyHooks {
+            network_allow_rules: grant.network_allow_rules.clone(),
+        },
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);
@@ -1020,14 +1071,32 @@ async fn call_async_hook(
     call_hook(&mut tmp, context, event, elapsed, totals).await.map(|_| ())
 }
 
-/// Build a WASI context for a hook instance.
+/// Build a WASI context for a hook instance, governed by `grant` — the capability block the
+/// capsule operator declared on this hook's entry in their own manifest.
 ///
-/// `root_dir` is preopened as `"."` — the hook's current directory.
-/// For blocking hooks this is the project directory (same as tools), so file
-/// reads like `std::fs::read("fibonacci.py")` resolve correctly.
-/// Hooks no longer write any output to the filesystem; structured data is
-/// returned via `HookOutput::Artifact` and forwarded to the SSE stream.
-fn build_wasi_ctx(root_dir: &Path, env: &HookEnvVars<'_>) -> Result<WasiCtx, RuntimeError> {
+/// Default-deny on both axes, and the default is what an ungranted hook gets:
+///
+/// - **Network.** Nothing here grants network capability. `inherit_network()` and
+///   `allow_ip_name_lookup(true)` are deliberately absent, so a hook has no raw WASI sockets
+///   under any grant. Its only outbound route is `wasi:http/outgoing-handler`, linked at each
+///   instantiation site and filtered by `NetworkPolicyHooks` against
+///   `grant.network_allow_rules` — the same gated path capsules and tools use. An empty rule
+///   list denies every request.
+/// - **Filesystem.** No preopened directory unless `grant.filesystem_scope` names one, in
+///   which case exactly one directory is preopened: `root_dir/<scope>`, mounted as the hook's
+///   current directory `"."`. Nothing above or beside that subtree is reachable, because a
+///   guest can only name paths under a preopen. The scope was already validated (relative,
+///   non-escaping) by `HookCapabilityGrant::derive` at staging time; it is created here if it
+///   does not exist, and a creation failure fails the instantiation rather than silently
+///   downgrading to no access.
+///
+/// `root_dir` is the hook's working directory: the session dir for `on-stage`, the project
+/// directory for blocking and async hooks.
+fn build_wasi_ctx(
+    root_dir: &Path,
+    env: &HookEnvVars<'_>,
+    grant: &HookCapabilityGrant,
+) -> Result<WasiCtx, RuntimeError> {
     // No host env inheritance: the explicit `MURMUR_*` injections below are the entire
     // environment a hook component ever sees. Hooks have no manifest-declared allowlist
     // because no hook artifact reads an arbitrary host var.
@@ -1050,12 +1119,18 @@ fn build_wasi_ctx(root_dir: &Path, env: &HookEnvVars<'_>) -> Result<WasiCtx, Run
         builder.env("MURMUR_DATASET_ID", id);
     }
 
-    builder.inherit_network();
-    builder.allow_ip_name_lookup(true);
-
-    builder
-        .preopened_dir(root_dir, ".", DirPerms::all(), FilePerms::all())
-        .map_err(|err| RuntimeError::wasi(root_dir.to_path_buf(), err.to_string()))?;
+    if let Some(scope) = grant.filesystem_scope.as_deref() {
+        let scoped_dir = root_dir.join(scope);
+        std::fs::create_dir_all(&scoped_dir).map_err(|err| {
+            RuntimeError::wasi(
+                scoped_dir.clone(),
+                format!("failed to create granted filesystem scope '{scope}': {err}"),
+            )
+        })?;
+        builder
+            .preopened_dir(&scoped_dir, ".", DirPerms::all(), FilePerms::all())
+            .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;
+    }
 
     Ok(builder.build())
 }
@@ -1133,12 +1208,22 @@ mod tests {
         Component::new(engine, &bytes).expect("component double compiles")
     }
 
+    /// Default-deny staging, matching a manifest hook entry with no `capabilities:` block.
     fn staged_double(component: Component) -> StagedHookArtifact {
+        staged_double_granted(component, HookCapabilityGrant::default())
+    }
+
+    /// [`staged_double`] with an explicit grant, for the capability suite.
+    fn staged_double_granted(
+        component: Component,
+        grant: HookCapabilityGrant,
+    ) -> StagedHookArtifact {
         StagedHookArtifact {
             name: "test-hook".to_string(),
             version: "0.0.1".to_string(),
             component,
             config: HookConfig::default(),
+            grant,
         }
     }
 
@@ -1277,6 +1362,7 @@ mod tests {
                 binding,
                 ..HookConfig::default()
             },
+            grant: HookCapabilityGrant::default(),
         }
     }
 
@@ -2442,5 +2528,400 @@ mod tests {
                 .exists(),
             "dispatch must continue to the next hook after a deadline trap"
         );
+    }
+
+    // ── Per-hook capability grants (default-deny network + filesystem) ────────
+
+    use crate::network_policy::RequestTarget;
+    use murmur_artifact::{Capabilities, FilesystemCapabilities, NetworkCapabilities};
+
+    /// Build the grant a hook entry declaring exactly these two sub-blocks would get,
+    /// going through the same `HookCapabilityGrant::derive` the staging path uses.
+    fn grant_of(network: Option<&str>, scope: Option<&str>) -> HookCapabilityGrant {
+        let caps = Capabilities {
+            network: network.map(|entry| NetworkCapabilities {
+                allow: vec![entry.to_string()],
+            }),
+            filesystem: scope.map(|scope| FilesystemCapabilities {
+                scope: Some(scope.to_string()),
+            }),
+            shell: None,
+            spawn: None,
+            env: None,
+            limits: None,
+        };
+        HookCapabilityGrant::derive(Some(&caps)).expect("grant is valid")
+    }
+
+    /// A hook store built exactly as the three instantiation sites build one, so the
+    /// network suite exercises the real `WasiHttpView` wiring rather than a stand-in.
+    fn hook_store_state(root: &Path, grant: &HookCapabilityGrant) -> HookStoreState {
+        HookStoreState {
+            limits: ExecutionLimits::default().limiter(),
+            table: ResourceTable::new(),
+            wasi: build_wasi_ctx(root, &HookEnvVars::default(), grant).expect("wasi ctx builds"),
+            http: WasiHttpCtx::new(),
+            http_hooks: NetworkPolicyHooks {
+                network_allow_rules: grant.network_allow_rules.clone(),
+            },
+        }
+    }
+
+    /// Ask a hook store's own HTTP gate to send a request, the way
+    /// `wasi:http/outgoing-handler` does. `Err` is a policy denial; `Ok` means the policy
+    /// admitted the request (the returned future is dropped without being driven, so no
+    /// connection is ever completed).
+    fn send_through_hook_store(state: &mut HookStoreState, uri: &str, use_tls: bool) -> bool {
+        use http_body_util::{BodyExt, Empty};
+
+        let body = Empty::<bytes::Bytes>::new()
+            .map_err(|err| match err {})
+            .boxed_unsync();
+        let request = hyper::Request::builder()
+            .uri(uri)
+            .body(body)
+            .expect("request builds");
+        let config = wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls,
+            connect_timeout: Duration::from_millis(1),
+            first_byte_timeout: Duration::from_millis(1),
+            between_bytes_timeout: Duration::from_millis(1),
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { state.http().hooks.send_request(request, config).is_ok() })
+    }
+
+    /// Default-deny, network half: a hook whose operator entry declared no `capabilities:`
+    /// has an empty allow-list, and its store's own HTTP gate denies every request.
+    #[test]
+    fn ungranted_hook_store_denies_every_outbound_request() {
+        let root = TempDir::new().unwrap();
+        let grant = HookCapabilityGrant::default();
+        let mut state = hook_store_state(root.path(), &grant);
+
+        assert!(!send_through_hook_store(
+            &mut state,
+            "https://telemetry.example.com/ingest",
+            true
+        ));
+        assert!(!send_through_hook_store(
+            &mut state,
+            "http://127.0.0.1:1/local",
+            false
+        ));
+    }
+
+    /// Granted network: exactly the declared host is admitted; every other host is denied
+    /// by the same `NetworkPolicyHooks` capsules and tools use.
+    #[test]
+    fn granted_hook_store_admits_only_the_declared_host() {
+        let root = TempDir::new().unwrap();
+        // A loopback port nothing listens on: the policy decision is observable without
+        // the test ever completing a connection.
+        let grant = grant_of(Some("http://127.0.0.1:1"), None);
+        let mut state = hook_store_state(root.path(), &grant);
+
+        assert!(
+            send_through_hook_store(&mut state, "http://127.0.0.1:1/ingest", false),
+            "the granted host must pass the allow-list"
+        );
+        assert!(
+            !send_through_hook_store(&mut state, "http://127.0.0.1:2/ingest", false),
+            "a different port on the granted host must still be denied"
+        );
+        assert!(
+            !send_through_hook_store(&mut state, "https://evil.example.com/x", true),
+            "an undeclared host must be denied"
+        );
+    }
+
+    /// Default-deny, filesystem half: nothing is preopened. Observable because
+    /// `preopened_dir` requires the directory to exist — building a context rooted at a
+    /// path that does not exist can only succeed if no preopen was attempted at all.
+    #[test]
+    fn ungranted_hook_gets_no_preopened_directory() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("does-not-exist");
+
+        build_wasi_ctx(
+            &missing,
+            &HookEnvVars::default(),
+            &HookCapabilityGrant::default(),
+        )
+        .expect("an ungranted hook preopens nothing, so a missing root is not an error");
+
+        assert!(
+            !missing.exists(),
+            "default-deny must not create the working directory either"
+        );
+    }
+
+    /// Granted filesystem: exactly one directory — `<root>/<scope>` — is preopened, and it
+    /// is created if absent. Sibling paths under the same root are never preopened, so a
+    /// guest has no descriptor with which to name them.
+    #[test]
+    fn granted_hook_preopens_only_the_scoped_subtree() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("secret.txt"), b"capsule state").unwrap();
+        let sibling = root.path().join("other-artifact");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let grant = grant_of(None, Some("hook-state"));
+        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant)
+            .expect("a granted scope is created and preopened");
+
+        let scoped = root.path().join("hook-state");
+        assert!(scoped.is_dir(), "the granted scope is created if missing");
+        // Writes inside the scope land on the real host filesystem at that path.
+        std::fs::write(scoped.join("cursor.json"), b"{}").unwrap();
+        assert!(scoped.join("cursor.json").exists());
+        // Nothing else under the root was touched or mounted.
+        assert!(sibling.is_dir());
+        assert!(root.path().join("secret.txt").exists());
+    }
+
+    /// An existing scope directory is reused as-is: granting a scope must not clobber
+    /// state a previous run left there.
+    #[test]
+    fn granted_hook_scope_reuses_an_existing_directory() {
+        let root = TempDir::new().unwrap();
+        let scoped = root.path().join("hook-state");
+        std::fs::create_dir_all(&scoped).unwrap();
+        std::fs::write(scoped.join("cursor.json"), b"{\"seen\":7}").unwrap();
+
+        build_wasi_ctx(
+            root.path(),
+            &HookEnvVars::default(),
+            &grant_of(None, Some("hook-state")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(scoped.join("cursor.json")).unwrap(),
+            "{\"seen\":7}"
+        );
+    }
+
+    /// A scope that cannot be created fails instantiation rather than silently degrading
+    /// to "no filesystem access" — an operator who declared a scope must not have it
+    /// quietly dropped.
+    #[test]
+    fn unusable_scope_fails_instantiation() {
+        let root = TempDir::new().unwrap();
+        // A regular file where the scope directory would go: create_dir_all cannot succeed.
+        std::fs::write(root.path().join("hook-state"), b"not a directory").unwrap();
+
+        let err = match build_wasi_ctx(
+            root.path(),
+            &HookEnvVars::default(),
+            &grant_of(None, Some("hook-state")),
+        ) {
+            Ok(_) => panic!("an uncreatable scope must be a hard error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("hook-state"),
+            "the error must name the scope: {err}"
+        );
+    }
+
+    /// No exempt instantiation path — blocking hooks. `HookRuntime::new` applies the grant
+    /// to the *project* directory, and only the granted subtree there.
+    #[test]
+    fn blocking_hook_instantiation_applies_the_grant() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_double(&engine, &REQUIRED_HOOK_FNS);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_granted(
+                    component,
+                    grant_of(None, Some("hook-state")),
+                )],
+            )
+            .await
+            .expect("a granted blocking hook instantiates");
+        });
+
+        assert!(
+            accessible.path().join("hook-state").is_dir(),
+            "the blocking path preopens the scope under the project dir"
+        );
+        assert!(
+            !session.path().join("hook-state").exists(),
+            "the session dir is not the blocking hook's root and must stay untouched"
+        );
+    }
+
+    /// No exempt instantiation path — blocking hooks, default-deny. Instantiation succeeds
+    /// against a project directory that does not exist, which is only possible because no
+    /// preopen is attempted.
+    #[test]
+    fn ungranted_blocking_hook_instantiates_without_any_preopen() {
+        let session = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_double(&engine, &REQUIRED_HOOK_FNS);
+        let missing_project_dir = session.path().join("no-such-project");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            new_with_hooks(
+                &engine,
+                session.path(),
+                &missing_project_dir,
+                vec![staged_double(component)],
+            )
+            .await
+            .expect("an ungranted blocking hook preopens nothing");
+        });
+
+        assert!(!missing_project_dir.exists());
+    }
+
+    /// No exempt instantiation path — `on-stage`. `call_stage_once` builds its context from
+    /// the same grant; the dispatch itself fails on the stub's signature, which is after
+    /// the WASI context has already been built.
+    #[test]
+    fn on_stage_instantiation_applies_the_grant() {
+        let workdir = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let mut names: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
+        names.push("on-stage");
+        let staged = staged_double_granted(
+            hook_double(&engine, &names),
+            grant_of(None, Some("hook-state")),
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = call_stage_once(
+                &engine,
+                workdir.path(),
+                &staged,
+                &StageEvent {
+                    shell_allow: Vec::new(),
+                },
+                &HookEnvVars::default(),
+                ExecutionLimits::default(),
+            )
+            .await;
+        });
+
+        assert!(
+            workdir.path().join("hook-state").is_dir(),
+            "the on-stage path preopens the scope under the session workdir"
+        );
+    }
+
+    /// No exempt instantiation path — async hooks. Each per-event instantiation applies the
+    /// grant carried on its `AsyncHookSpec`.
+    #[test]
+    fn async_hook_instantiation_applies_the_grant() {
+        let root = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_double(&engine, &REQUIRED_HOOK_FNS);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = call_async_hook(
+                &engine,
+                root.path(),
+                &component,
+                "async-hook",
+                &SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "test-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &HookEvent::SessionStart,
+                Duration::from_secs(0),
+                HookTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    tool_calls: 0,
+                    shell_calls: 0,
+                },
+                ExecutionLimits::default(),
+                None,
+                &grant_of(None, Some("hook-state")),
+            )
+            .await;
+        });
+
+        assert!(
+            root.path().join("hook-state").is_dir(),
+            "the async path preopens the scope like the other two"
+        );
+    }
+
+    /// No self-escalation: the grant is derived from the *operator's* manifest entry, so a
+    /// hook artifact whose own bundled murmur.yaml declares broad capabilities is still
+    /// fully denied when the operator granted it nothing.
+    #[test]
+    fn hook_self_declared_capabilities_do_not_grant_anything() {
+        // The hook artifact's own bundled manifest, self-declaring broad access.
+        let hook_own_manifest = r#"
+name: greedy-hook
+version: 1.0.0
+binding: on-inference
+capabilities:
+  network:
+    allow:
+      - https://evil.example.com
+  filesystem:
+    scope: .
+"#;
+        let config = murmur_artifact::parse_hook_config_from_yaml(hook_own_manifest)
+            .expect("the hook's own manifest still parses for its behavioral contract");
+        assert_eq!(config.binding, HookBinding::OnInference);
+
+        // The operator's own manifest, granting this hook nothing.
+        let operator_manifest = murmur_artifact::RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: greedy-hook
+    version: 1.0.0
+    runtime: hook
+"#,
+        )
+        .unwrap();
+        let grant =
+            HookCapabilityGrant::derive(operator_manifest.artifacts[0].capabilities.as_ref())
+                .unwrap();
+
+        assert_eq!(
+            grant,
+            HookCapabilityGrant::default(),
+            "only the operator's entry may grant; the hook's own manifest is never read"
+        );
+
+        let root = TempDir::new().unwrap();
+        let mut state = hook_store_state(root.path(), &grant);
+        assert!(!send_through_hook_store(
+            &mut state,
+            "https://evil.example.com/exfil",
+            true
+        ));
+        let target = RequestTarget {
+            scheme: "https".to_string(),
+            host: "evil.example.com".to_string(),
+            port: Some(443),
+        };
+        assert!(!grant
+            .network_allow_rules
+            .iter()
+            .any(|rule| rule.matches(&target)));
     }
 }

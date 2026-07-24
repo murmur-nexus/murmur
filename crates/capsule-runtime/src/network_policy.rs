@@ -192,9 +192,175 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
     Ok(())
 }
 
+/// A single hook's capability grant, lowered from the **capsule operator's own** manifest
+/// entry for that hook (`murmur_artifact::RuntimeArtifact::capabilities`) at staging time.
+///
+/// [`Default`] is the default-deny state and is what a hook entry with no `capabilities:`
+/// block lowers to: an empty allow-rule list (every outbound request is denied by
+/// `NetworkPolicyHooks`, and no raw WASI socket capability is granted at all) and no
+/// filesystem scope (no preopened directory of any kind).
+///
+/// Deliberately narrower than [`crate::types::CapabilityPolicy`]: the capsule-wide policy
+/// carries shell/spawn/env/limits, none of which a per-hook grant governs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HookCapabilityGrant {
+    /// Hosts this hook may reach through the gated wasi-http path. Empty = deny all.
+    pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
+    /// Relative path under the hook's working directory to preopen. `None` = preopen
+    /// nothing, so the hook has no `wasi:filesystem` access whatsoever.
+    pub(crate) filesystem_scope: Option<String>,
+}
+
+impl HookCapabilityGrant {
+    /// Lower an operator-declared `capabilities:` block into an enforceable grant,
+    /// validating both halves up front so a malformed grant fails staging rather than
+    /// surfacing as a confusing denial once the hook is already running.
+    ///
+    /// `None` (no block declared) yields [`HookCapabilityGrant::default`] — full
+    /// default-deny. Only `network` and `filesystem` are read; the other sub-blocks a
+    /// [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that a
+    /// per-hook grant does not reach.
+    pub(crate) fn derive(
+        capabilities: Option<&murmur_artifact::Capabilities>,
+    ) -> Result<Self, RuntimeError> {
+        let Some(capabilities) = capabilities else {
+            return Ok(Self::default());
+        };
+
+        let network_allow_rules = match capabilities.network.as_ref() {
+            Some(network) => parse_network_allow_rules(&network.allow)?,
+            None => Vec::new(),
+        };
+
+        let filesystem_scope = capabilities
+            .filesystem
+            .as_ref()
+            .and_then(|filesystem| filesystem.scope.clone());
+        if let Some(scope) = filesystem_scope.as_deref() {
+            validate_filesystem_scope(scope)?;
+        }
+
+        Ok(Self {
+            network_allow_rules,
+            filesystem_scope,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use murmur_artifact::{Capabilities, FilesystemCapabilities, NetworkCapabilities};
+
+    /// A `Capabilities` block carrying only the two sub-blocks a hook grant reads.
+    fn hook_capabilities(
+        network: Option<Vec<&str>>,
+        filesystem_scope: Option<&str>,
+    ) -> Capabilities {
+        Capabilities {
+            network: network.map(|allow| NetworkCapabilities {
+                allow: allow.into_iter().map(str::to_string).collect(),
+            }),
+            filesystem: filesystem_scope.map(|scope| FilesystemCapabilities {
+                scope: Some(scope.to_string()),
+            }),
+            shell: None,
+            spawn: None,
+            env: None,
+            limits: None,
+        }
+    }
+
+    /// A hook entry with no `capabilities:` block gets nothing: no allow rules (so
+    /// `NetworkPolicyHooks` denies every request) and no scope (so nothing is preopened).
+    #[test]
+    fn hook_grant_defaults_to_deny_network_and_filesystem() {
+        let grant = HookCapabilityGrant::derive(None).unwrap();
+
+        assert_eq!(grant, HookCapabilityGrant::default());
+        assert!(grant.network_allow_rules.is_empty());
+        assert!(grant.filesystem_scope.is_none());
+
+        let target = RequestTarget {
+            scheme: "https".to_string(),
+            host: "telemetry.example.com".to_string(),
+            port: Some(443),
+        };
+        assert!(!grant
+            .network_allow_rules
+            .iter()
+            .any(|rule| rule.matches(&target)));
+    }
+
+    /// A declared-but-empty `capabilities:` block is still full default-deny — declaring
+    /// the key must not, by itself, widen anything.
+    #[test]
+    fn hook_grant_empty_capabilities_block_grants_nothing() {
+        let grant = HookCapabilityGrant::derive(Some(&hook_capabilities(None, None))).unwrap();
+
+        assert_eq!(grant, HookCapabilityGrant::default());
+    }
+
+    #[test]
+    fn hook_grant_network_allows_exactly_the_declared_host() {
+        let caps = hook_capabilities(Some(vec!["https://telemetry.example.com"]), None);
+        let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+
+        let allowed = RequestTarget {
+            scheme: "https".to_string(),
+            host: "telemetry.example.com".to_string(),
+            port: Some(443),
+        };
+        let other = RequestTarget {
+            scheme: "https".to_string(),
+            host: "evil.example.com".to_string(),
+            port: Some(443),
+        };
+
+        assert!(grant
+            .network_allow_rules
+            .iter()
+            .any(|rule| rule.matches(&allowed)));
+        assert!(!grant
+            .network_allow_rules
+            .iter()
+            .any(|rule| rule.matches(&other)));
+        // A network grant alone never widens the filesystem.
+        assert!(grant.filesystem_scope.is_none());
+    }
+
+    #[test]
+    fn hook_grant_filesystem_scope_is_carried_through() {
+        let caps = hook_capabilities(None, Some("hook-state"));
+        let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+
+        assert_eq!(grant.filesystem_scope.as_deref(), Some("hook-state"));
+        // A filesystem grant alone never widens the network.
+        assert!(grant.network_allow_rules.is_empty());
+    }
+
+    #[test]
+    fn hook_grant_rejects_escaping_filesystem_scope() {
+        for scope in ["../escape", "/etc"] {
+            let caps = hook_capabilities(None, Some(scope));
+            let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::InvalidFilesystemScope { .. }),
+                "scope {scope} should fail staging, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_grant_rejects_malformed_network_entry() {
+        let caps = hook_capabilities(Some(vec!["ftp://files.example.com"]), None);
+        let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
+
+        assert!(
+            matches!(err, RuntimeError::InvalidNetworkAllowEntry { .. }),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn filesystem_scope_validation_accepts_safe_relative_paths() {

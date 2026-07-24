@@ -78,6 +78,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             version: a.version.clone(),
             runtime: a.runtime.clone(),
             source: a.source.clone(),
+            capabilities: a.capabilities.clone(),
         })
         .collect();
 

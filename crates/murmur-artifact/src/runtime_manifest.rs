@@ -379,6 +379,20 @@ pub struct RuntimeArtifact {
     /// manifest's artifact entry; when absent it defaults to true for `runtime: skill` and
     /// false for every other role.
     pub prompt_payload: bool,
+    /// Per-artifact capability grant, declared via `capabilities:` on this entry in the
+    /// **capsule operator's own** manifest. Only recognized on `runtime: hook` entries —
+    /// any other role carrying the key is rejected at parse time, because nothing would
+    /// enforce it and a silently-ignored grant reads like a scoped artifact.
+    ///
+    /// `None` (the key absent) is the default-deny state: the hook gets no network and no
+    /// preopened directory. Deliberately never sourced from the hook artifact's own bundled
+    /// `murmur.yaml` (see [`parse_hook_config_from_yaml`], which parses that file and knows
+    /// nothing about capabilities) — a hook pulled from a registry cannot self-grant.
+    ///
+    /// Reuses the whole [`Capabilities`] type for vocabulary consistency with the
+    /// capsule-wide block, but only `network` and `filesystem` are consumed by the runtime
+    /// for a hook; the other sub-blocks are inert here.
+    pub capabilities: Option<Capabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,6 +670,8 @@ struct RawArtifact {
     local_source: Option<bool>,
     #[serde(default)]
     prompt_payload: Option<bool>,
+    #[serde(default)]
+    capabilities: Option<RawCapabilities>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -893,6 +909,28 @@ impl RuntimeManifest {
                         })?
                 };
 
+                // Per-artifact `capabilities:` is a hook-only grant. Accepting it on any
+                // other role would leave an operator believing they had scoped a tool when
+                // nothing reads the block, so it is a parse error rather than a no-op.
+                let capabilities = match artifact.capabilities {
+                    None => None,
+                    Some(raw_caps) => {
+                        if runtime != ArtifactRuntime::Hook {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares per-artifact 'capabilities:' but \
+                                     has 'runtime: {}'; per-artifact capabilities are only \
+                                     recognized on 'runtime: hook' entries — use the capsule-wide \
+                                     top-level 'capabilities:' block instead",
+                                    runtime.as_str()
+                                ),
+                            });
+                        }
+                        parse_capabilities(Some(raw_caps))?
+                    }
+                };
+
                 Ok(RuntimeArtifact {
                     name,
                     version,
@@ -900,6 +938,7 @@ impl RuntimeManifest {
                     source,
                     local_source,
                     prompt_payload,
+                    capabilities,
                 })
             })
             .collect::<Result<Vec<_>, RuntimeManifestError>>()?;
@@ -3343,5 +3382,163 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("at most one"), "error was: {msg}");
+    }
+
+    // ── Per-artifact (hook) capability grants ────────────────────────────────
+
+    #[test]
+    fn hook_artifact_capabilities_parse_network_and_filesystem() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: telemetry-hook
+    version: 1.0.0
+    runtime: hook
+    capabilities:
+      network:
+        allow:
+          - https://telemetry.example.com
+      filesystem:
+        scope: hook-state
+"#,
+        )
+        .unwrap();
+
+        let caps = manifest.artifacts[0]
+            .capabilities
+            .as_ref()
+            .expect("hook entry carries a capability grant");
+        assert_eq!(
+            caps.network.as_ref().unwrap().allow,
+            vec!["https://telemetry.example.com".to_string()]
+        );
+        assert_eq!(
+            caps.filesystem.as_ref().unwrap().scope,
+            Some("hook-state".to_string())
+        );
+    }
+
+    /// Default-deny: a hook entry with no `capabilities:` key parses to `None`, which the
+    /// runtime lowers to zero network and zero preopened directories.
+    #[test]
+    fn hook_artifact_without_capabilities_is_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: quiet-hook
+    version: 1.0.0
+    runtime: hook
+"#,
+        )
+        .unwrap();
+
+        assert!(manifest.artifacts[0].capabilities.is_none());
+    }
+
+    #[test]
+    fn non_hook_artifact_capabilities_are_rejected() {
+        for role in ["tool", "driver", "skill"] {
+            let yaml = format!(
+                r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: sneaky
+    version: 1.0.0
+    runtime: {role}
+    capabilities:
+      network:
+        allow:
+          - https://evil.example.com
+"#
+            );
+            let err = match RuntimeManifest::from_yaml_str(&yaml) {
+                Ok(_) => panic!("per-artifact capabilities must be rejected for runtime: {role}"),
+                Err(err) => err,
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("sneaky"), "error was: {msg}");
+            assert!(
+                msg.contains("only recognized on 'runtime: hook' entries"),
+                "error was: {msg}"
+            );
+            assert!(msg.contains(role), "error was: {msg}");
+        }
+    }
+
+    /// The capsule-wide top-level block is untouched by the per-artifact field: both may be
+    /// present in one manifest and neither shadows the other.
+    #[test]
+    fn capsule_wide_and_hook_capabilities_coexist() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: telemetry-hook
+    version: 1.0.0
+    runtime: hook
+    capabilities:
+      network:
+        allow:
+          - https://telemetry.example.com
+capabilities:
+  network:
+    allow:
+      - https://api.anthropic.com
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.capabilities.unwrap().network.unwrap().allow,
+            vec!["https://api.anthropic.com".to_string()]
+        );
+        assert_eq!(
+            manifest.artifacts[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .network
+                .as_ref()
+                .unwrap()
+                .allow,
+            vec!["https://telemetry.example.com".to_string()]
+        );
+    }
+
+    /// No self-escalation: the hook artifact's *own* bundled murmur.yaml is parsed only by
+    /// `parse_hook_config_from_yaml`, which has no capabilities field and no code path that
+    /// reads one. A self-declared `capabilities:` block there is inert.
+    #[test]
+    fn hook_own_manifest_capabilities_are_not_read_into_config() {
+        let config = parse_hook_config_from_yaml(
+            r#"
+name: telemetry-hook
+version: 1.0.0
+binding: on-inference
+execution_mode: blocking
+capabilities:
+  network:
+    allow:
+      - https://evil.example.com
+  filesystem:
+    scope: /
+"#,
+        )
+        .expect("a self-declared capabilities block is ignored, not an error");
+
+        assert_eq!(
+            config,
+            HookConfig {
+                binding: HookBinding::OnInference,
+                execution_mode: HookExecutionMode::Blocking,
+                commit_policy: HookCommitPolicy::None,
+            }
+        );
     }
 }
