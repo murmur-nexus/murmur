@@ -106,6 +106,140 @@ fn install_no_args_installs_manifest_declared_dependency() {
     assert_eq!(entry.sha256.wasm, expected_sha256);
 }
 
+/// Write a project `murmur.yaml` declaring every `(name, version)` in `deps` as an artifact.
+fn write_manifest_with_deps(dir: &Path, deps: &[(&str, &str)]) {
+    let mut manifest = String::from("name: dep-project\nversion: 0.0.1\nartifacts:\n");
+    for (name, version) in deps {
+        manifest.push_str(&format!(
+            "  - name: {name}\n    version: {version}\n    runtime: tool\n"
+        ));
+    }
+    fs::write(dir.join("murmur.yaml"), manifest).unwrap();
+}
+
+/// Publish `name@version` to the registry rooted at `home` and return its sha256.
+fn publish_fixture(work: &TempDir, home: &TempDir, name: &str, version: &str) -> String {
+    let artifact = create_artifact_fixture(work.path(), name, version);
+    let sha256 = sha256_hex(&fs::read(&artifact).unwrap());
+    run_publish_local(&artifact, home).success();
+    sha256
+}
+
+/// Assert `name@version` is both stored in the project store and pinned in `murmur.lock`.
+fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256: &str) {
+    assert!(
+        project
+            .join(format!(".murmur/artifacts/{name}/{version}/{name}-{version}.mur.zip"))
+            .exists(),
+        "{name}@{version} should have been stored despite other artifacts failing"
+    );
+    let lock = read_lockfile(&project.join("murmur.lock")).unwrap();
+    let entry = lock
+        .artifact_for(name)
+        .unwrap_or_else(|| panic!("lock entry for {name}"));
+    assert_eq!(entry.resolved_version, version);
+    assert_eq!(entry.sha256.wasm, sha256);
+}
+
+/// One unpublished artifact must not discard the other two: both successes are stored *and*
+/// pinned, and the failure is named with its own error line on stdout.
+#[test]
+fn install_partial_failure_pins_successes_and_names_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let sha_a = publish_fixture(&work, &home, "partial-a", "1.0.0");
+    let sha_c = publish_fixture(&work, &home, "partial-c", "3.0.0");
+    write_manifest_with_deps(
+        project.path(),
+        &[
+            ("partial-a", "1.0.0"),
+            ("partial-missing", "2.0.0"),
+            ("partial-c", "3.0.0"),
+        ],
+    );
+
+    run_install_manifest_deps(&home, project.path())
+        .failure()
+        .stdout(predicate::str::contains("partial-missing@2.0.0"))
+        .stdout(predicate::str::contains("error[E-REG-001]:"));
+
+    assert_installed_and_pinned(project.path(), "partial-a", "1.0.0", &sha_a);
+    assert_installed_and_pinned(project.path(), "partial-c", "3.0.0", &sha_c);
+    assert!(
+        !project.path().join(".murmur/artifacts/partial-missing").exists(),
+        "the unpublished artifact must not be stored"
+    );
+}
+
+/// Two failures must both be reported — the old `.collect::<Result<_, _>>()` surfaced only
+/// the lowest-index one and silently dropped the rest.
+#[test]
+fn install_multi_failure_reports_every_failing_artifact() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let sha_0 = publish_fixture(&work, &home, "multi-ok-0", "1.0.0");
+    let sha_2 = publish_fixture(&work, &home, "multi-ok-2", "1.0.0");
+    write_manifest_with_deps(
+        project.path(),
+        &[
+            ("multi-ok-0", "1.0.0"),
+            ("multi-gone-1", "1.0.0"),
+            ("multi-ok-2", "1.0.0"),
+            ("multi-gone-3", "1.0.0"),
+        ],
+    );
+
+    let assert = run_install_manifest_deps(&home, project.path())
+        .failure()
+        .stdout(predicate::str::contains("multi-gone-1@1.0.0"))
+        .stdout(predicate::str::contains("multi-gone-3@1.0.0"));
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        stdout.matches("error[E-REG-001]:").count(),
+        2,
+        "each failing artifact gets its own error line; got:\n{stdout}"
+    );
+
+    assert_installed_and_pinned(project.path(), "multi-ok-0", "1.0.0", &sha_0);
+    assert_installed_and_pinned(project.path(), "multi-ok-2", "1.0.0", &sha_2);
+}
+
+/// When every artifact fails there is nothing to pin and nothing to roll up: no lockfile,
+/// no store entries, no success line — but both failures are still named.
+#[test]
+fn install_total_failure_writes_no_lock_and_names_every_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    write_manifest_with_deps(
+        project.path(),
+        &[("total-gone-a", "1.0.0"), ("total-gone-b", "2.0.0")],
+    );
+
+    run_install_manifest_deps(&home, project.path())
+        .failure()
+        .stdout(predicate::str::contains("total-gone-a@1.0.0"))
+        .stdout(predicate::str::contains("total-gone-b@2.0.0"))
+        .stdout(predicate::str::contains("2 of 2 artifacts failed to install:"))
+        .stdout(predicate::str::contains("installed ").not());
+
+    assert!(
+        !project.path().join("murmur.lock").exists(),
+        "no successes means murmur.lock is never created"
+    );
+    assert!(
+        fs::read_dir(project.path().join(".murmur/artifacts"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true),
+        "no artifacts should have been stored"
+    );
+}
+
 /// `find_project_root` walks up to the directory holding `murmur.yaml`, so a nested CWD
 /// still installs into the root's `.murmur/artifacts/`.
 #[test]

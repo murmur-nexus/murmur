@@ -299,6 +299,29 @@ Behavior:
 2. Verify SHA256 integrity
 3. Store into the project-local store (or global store with `-g`)
 
+### Partial failure (`mur install` with no args)
+
+When installing from `murmur.yaml`, every declared artifact is fetched independently — one artifact
+failing to resolve does not discard the others. Every artifact that succeeds is stored **and**
+pinned into `murmur.lock`, even if other artifacts in the same run fail. If any artifact fails,
+`mur install` exits with status `1` and prints a plain-text report naming each failing artifact and
+its error, followed by a roll-up of how many artifacts installed successfully (omitted if none did):
+
+```
+1 of 3 artifacts failed to install:
+
+  smoke-missing@9.9.9
+    error[E-REG-001]: artifact smoke-missing@9.9.9 not found in registry
+      hint: configure a registry.sources entry in ~/.murmur/config.yaml
+
+installed 2 artifacts  567 B
+```
+
+This report is printed with plain `println!` output (not the progress-bar UI), so it is visible even
+when stdout is redirected or piped — for example in CI logs. A subsequent `mur run` will succeed for
+any artifact that installed successfully, without needing to rerun `mur install` for the whole
+project.
+
 ---
 
 ## `mur list`
