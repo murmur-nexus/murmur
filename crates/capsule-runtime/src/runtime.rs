@@ -13,7 +13,7 @@ use murmur_artifact::{
     read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, HookBinding, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
-    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
+    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -1371,7 +1371,12 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
 /// concerns nothing reads per-artifact. Warn rather than reject (the block is structurally
 /// valid) so an operator who declared, say, `shell.allow` on a hook entry learns it is inert
 /// instead of assuming it was applied. Infallible and non-fatal, like
-/// [`warn_if_bash_network_bypass`].
+/// [`warn_if_bash_network_bypass`], and carries the same `W-SEC-*` registry code + doc link
+/// convention as every other non-fatal capability warning (see `security_warnings.rs`).
+///
+/// Not written to `logs/bootstrap.log`, unlike [`warn_if_bash_network_bypass`]: this fires
+/// during artifact staging in [`stage_session`], before the session workdir
+/// `warn_if_bash_network_bypass`/`sandbox::warn_for_enforcement_tier` write into even exists.
 fn warn_on_inert_hook_capabilities(
     hook_name: &str,
     capabilities: Option<&murmur_artifact::Capabilities>,
@@ -1391,10 +1396,11 @@ fn warn_on_inert_hook_capabilities(
     .collect();
 
     if !inert.is_empty() {
+        let link = security_warning_link(W_SEC_006);
         eprintln!(
-            "[capsule-runtime] warning: hook '{hook_name}' declares capabilities.{} which the \
-             runtime does not apply per-hook — only capabilities.network and \
-             capabilities.filesystem govern a hook",
+            "[capsule-runtime] warning[{W_SEC_006}]: hook '{hook_name}' declares capabilities.{} \
+             which the runtime does not apply per-hook — only capabilities.network and \
+             capabilities.filesystem govern a hook ({link})",
             inert.join(", capabilities.")
         );
     }

@@ -22,6 +22,7 @@ Warnings from `mur build` go to stderr only.
 | [`W-SEC-003`](#w-sec-003) | `mur run` | `network.allow` doesn't constrain bash's own outbound connections |
 | [`W-SEC-004`](#w-sec-004) | `mur build` | Literal secret value found in a manifest field |
 | [`W-SEC-005`](#w-sec-005) | `mur run` | Linux kernel enforcement is experimental — never verified on real hardware |
+| [`W-SEC-006`](#w-sec-006) | `mur run` | A hook's `capabilities:` block declares a sub-key that is inert on hooks |
 
 ---
 
@@ -157,3 +158,22 @@ declarations over `bash`, keep `network.allow`/`filesystem.scope` minimal, and u
 [data/action phase-separation pattern](manifest-schema.md#threat-model) for capsules that ingest
 untrusted content. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same unverified
 caveat plus an additional filesystem gap.
+
+---
+
+## W-SEC-006 — Inert sub-key in a hook's `capabilities:` block { #w-sec-006 }
+
+**Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares
+`shell`, `spawn`, `env`, or `limits`. Per-hook grants (see
+[`artifacts[].capabilities`](manifest-schema.md#hook-capabilities)) only read `network` and
+`filesystem` — the other sub-blocks are structurally accepted (for vocabulary consistency with
+the capsule-wide `capabilities:` block) but nothing enforces them per-hook.
+
+**Why it matters:** an operator who declares, say, `capabilities.shell.allow` on a hook entry
+expecting it to scope that hook's shell access would otherwise have no signal that the runtime
+never reads it there — it is silently inert rather than rejected.
+
+**What to do:** remove the inert sub-key from the hook's entry. If you need to scope
+shell/spawn/env/limits at all, that is a capsule-wide concern today — use the top-level
+`capabilities:` block instead. See [Hook capabilities](manifest-schema.md#hook-capabilities) for
+the full rules on what a per-hook grant does and does not cover.

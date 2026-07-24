@@ -218,7 +218,7 @@ Rules:
   workdir via `..`, fails at launch (`E-CAP-002`) before any hook component is instantiated.
 - **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, and `limits` parse
   here but are capsule-wide concerns the runtime does not apply per-hook; declaring one prints a
-  warning to stderr saying so.
+  [`W-SEC-006`](security-warnings.md#w-sec-006) warning saying so.
 
 ##### Local-source artifacts { #local-source-skills }
 
