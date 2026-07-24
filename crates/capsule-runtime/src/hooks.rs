@@ -28,7 +28,7 @@ use crate::{
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
-    network_policy::HookCapabilityGrant,
+    network_policy::{resolve_scoped_dir, HookCapabilityGrant},
     runtime::NetworkPolicyHooks,
     types::StagedHookArtifact,
 };
@@ -1120,13 +1120,7 @@ fn build_wasi_ctx(
     }
 
     if let Some(scope) = grant.filesystem_scope.as_deref() {
-        let scoped_dir = root_dir.join(scope);
-        std::fs::create_dir_all(&scoped_dir).map_err(|err| {
-            RuntimeError::wasi(
-                scoped_dir.clone(),
-                format!("failed to create granted filesystem scope '{scope}': {err}"),
-            )
-        })?;
+        let scoped_dir = resolve_scoped_dir(root_dir, scope)?;
         builder
             .preopened_dir(&scoped_dir, ".", DirPerms::all(), FilePerms::all())
             .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;

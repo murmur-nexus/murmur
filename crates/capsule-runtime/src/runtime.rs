@@ -48,8 +48,9 @@ use crate::{
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
     network_policy::{
-        effective_tool_network_rules, parse_network_allow_rules, validate_filesystem_scope,
-        HookCapabilityGrant, NetworkAllowRule, RequestTarget, ToolCapabilityGrant,
+        effective_tool_network_rules, parse_network_allow_rules, resolve_scoped_dir,
+        validate_filesystem_scope, HookCapabilityGrant, NetworkAllowRule, RequestTarget,
+        ToolCapabilityGrant,
     },
     otel::OtelEmitter,
     outgoing, sandbox,
@@ -1612,20 +1613,11 @@ fn build_wasi_ctx(
         builder.env(key, value);
     }
 
+    // Hard error rather than a silent fall back to the unscoped workdir (which would widen
+    // the grant) or to no preopen at all (which would look like a guest bug).
     let preopen_root = match filesystem_scope {
         None => workdir.to_path_buf(),
-        Some(scope) => {
-            let scoped_dir = workdir.join(scope);
-            // Hard error rather than a silent fall back to the unscoped workdir (which would
-            // widen the grant) or to no preopen at all (which would look like a guest bug).
-            std::fs::create_dir_all(&scoped_dir).map_err(|err| {
-                RuntimeError::wasi(
-                    scoped_dir.clone(),
-                    format!("failed to create granted filesystem scope '{scope}': {err}"),
-                )
-            })?;
-            scoped_dir
-        }
+        Some(scope) => resolve_scoped_dir(workdir, scope)?,
     };
 
     builder

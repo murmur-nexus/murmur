@@ -218,6 +218,24 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
     Ok(())
 }
 
+/// Resolve a validated filesystem `scope` to the directory a guest's preopen should target,
+/// creating it if it does not already exist.
+///
+/// Shared by `hooks.rs::build_wasi_ctx` and `runtime.rs::build_wasi_ctx` — both preopen
+/// `root.join(scope)` as `"."` once a grant declares a scope, and both must fail the same way
+/// (hard error naming the scope) rather than silently falling back to an unscoped preopen,
+/// which would widen the grant.
+pub(crate) fn resolve_scoped_dir(root: &Path, scope: &str) -> Result<std::path::PathBuf, RuntimeError> {
+    let scoped_dir = root.join(scope);
+    std::fs::create_dir_all(&scoped_dir).map_err(|err| {
+        RuntimeError::wasi(
+            scoped_dir.clone(),
+            format!("failed to create granted filesystem scope '{scope}': {err}"),
+        )
+    })?;
+    Ok(scoped_dir)
+}
+
 /// A single hook's capability grant, lowered from the **capsule operator's own** manifest
 /// entry for that hook (`murmur_artifact::RuntimeArtifact::capabilities`) at staging time.
 ///
@@ -352,7 +370,6 @@ impl ToolCapabilityGrant {
             dropped_network_entries,
         })
     }
-
 }
 
 /// The rules `NetworkPolicyHooks` enforces for one tool/driver dispatch: the artifact's own
