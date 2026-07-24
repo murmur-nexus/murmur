@@ -36,6 +36,10 @@ pub(crate) struct AgentRunConfig {
     pub compaction_model: Option<String>,
     /// System prompt override for compaction calls. None = the hook picks its own default.
     pub compaction_system_prompt: Option<String>,
+    /// When true, each committed compaction appends a JSON line to
+    /// `out/compaction-summaries.jsonl`. Resolved from `inference.compaction.dump_summaries`,
+    /// absent = false.
+    pub compaction_dump_summaries: bool,
     /// Per-turn output cap sent to the driver as `max_tokens`. Resolved from
     /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`].
     pub max_output_tokens: u32,
@@ -459,6 +463,7 @@ pub(crate) async fn run_agent_loop(
                     otel,
                     run_config.compaction_model.clone(),
                     run_config.compaction_system_prompt.clone(),
+                    run_config.compaction_dump_summaries,
                 )
                 .await;
                 // A declared compaction hook that returned `Err` ends the session the
@@ -1008,6 +1013,66 @@ fn reconstruct_compacted_messages(
         .collect()
 }
 
+/// The verbatim replacement text a compaction hook produced, read back out of the messages
+/// [`reconstruct_compacted_messages`] built from its `replace-context` payload.
+///
+/// For the single-summary-message case the hook's content is `serde_json::to_string(summary)`,
+/// which reconstruction parses back to a bare string and wraps as one `text` block — so the
+/// text this returns is the hook's own string byte-for-byte, never re-encoded or re-inferred.
+/// A replacement carrying several messages has their text joined in order; `tool` messages are
+/// skipped because their content is a passed-through result body, not summary prose.
+fn extract_compaction_summary_text(messages: &[Value]) -> String {
+    messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) != Some("tool"))
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .map(|blocks| extract_text_content(blocks))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Append one JSON line describing a *committed* compaction to
+/// `out/compaction-summaries.jsonl`, reading the summary text off the post-commit `messages`.
+///
+/// `enabled` is `inference.compaction.dump_summaries`; when false this is a no-op that touches
+/// the filesystem not at all — no `out/` entry is created. Keeping the flag check inside the
+/// single writer (rather than at the call site) is what makes "flag off writes nothing"
+/// directly testable.
+///
+/// Create-and-append (the `append_bootstrap_log` idiom) so repeated compactions in one session
+/// accumulate rather than overwrite. Callers treat a failure here as non-fatal.
+fn dump_compaction_summary(
+    enabled: bool,
+    workdir: &Path,
+    turn: u32,
+    tokens_before: u32,
+    tokens_after: u32,
+    messages: &[Value],
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    let summary = extract_compaction_summary_text(messages);
+    let out_dir = workdir.join("out");
+    fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
+    let line = serde_json::to_string(&json!({
+        "turn": turn,
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "summary": summary,
+    }))
+    .map_err(|e| format!("failed to encode compaction summary: {e}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_dir.join("compaction-summaries.jsonl"))
+        .map_err(|e| format!("failed to open compaction summary log: {e}"))?;
+    file.write_all(line.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|e| format!("failed to write compaction summary: {e}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
@@ -1021,6 +1086,7 @@ async fn try_compact_via_hooks(
     otel: &OtelEmitter,
     compaction_model: Option<String>,
     compaction_system_prompt: Option<String>,
+    dump_summaries: bool,
 ) -> Result<(), String> {
     use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
 
@@ -1147,6 +1213,24 @@ async fn try_compact_via_hooks(
     }
     otel.emit_compaction(u64::from(tokens_before), u64::from(*session_tokens))
         .await;
+    // Placed after the commit on purpose: both early returns above (no hook returned
+    // replace-context, and the safety net rejecting a mismatched tool_call) leave without
+    // reaching here, so the dump records only compactions that actually replaced the context.
+    // Same non-fatal contract as the trace write above — losing the eval log must never cost
+    // the session a context we already successfully compacted.
+    if let Err(e) = dump_compaction_summary(
+        dump_summaries,
+        workdir,
+        turn_u32,
+        tokens_before,
+        *session_tokens,
+        messages,
+    ) {
+        append_bootstrap_log(
+            workdir,
+            &format!("[compaction] summary dump write failed: {e}; continuing"),
+        );
+    }
     append_bootstrap_log(
         workdir,
         &format!(
@@ -1830,5 +1914,154 @@ mod tests {
     fn zero_context_window_never_triggers_compaction() {
         let turns: Vec<(u32, u32)> = (0..20).map(|_| (900_000, 90_000)).collect();
         assert_eq!(first_compacting_turn(&turns, 0, 0.85), None);
+    }
+
+    // ── inference.compaction.dump_summaries: out/compaction-summaries.jsonl ─────────
+
+    /// The dumped summary is the hook's own string byte-for-byte: what the hook encoded with
+    /// `serde_json::to_string` comes back out of the reconstructed messages unescaped and
+    /// unquoted, matching the text block that actually replaced the context.
+    #[test]
+    fn extracted_summary_is_the_hook_string_verbatim() {
+        let summary = "1. THE BUG: a \"quoted\" path\n\tC:\\tmp — and a trailing space ";
+        let msgs = reconstruct_compacted_messages(vec![wit(
+            "user",
+            &serde_json::to_string(summary).unwrap(),
+        )]);
+
+        assert_eq!(extract_compaction_summary_text(&msgs), summary);
+        // Same string that landed in the post-compaction context.
+        assert_eq!(msgs[0]["content"][0]["text"], summary);
+    }
+
+    /// A multi-message replacement joins its text in order, and `tool` messages contribute
+    /// nothing — their content is a passed-through result body, not summary prose.
+    #[test]
+    fn extracted_summary_joins_multiple_messages_and_skips_tool_messages() {
+        let wrapped = json!({
+            TOOL_MARKER: true,
+            "tool_call_id": "t1",
+            "is_error": false,
+            "body": [{"type": "text", "text": "tool output must not appear"}],
+        });
+        let msgs = reconstruct_compacted_messages(vec![
+            wit("user", &serde_json::to_string("first part").unwrap()),
+            wit("tool", &wrapped.to_string()),
+            wit("assistant", &serde_json::to_string("second part").unwrap()),
+        ]);
+
+        assert_eq!(
+            extract_compaction_summary_text(&msgs),
+            "first part\nsecond part"
+        );
+    }
+
+    /// Reconstructed post-commit messages, as `try_compact_via_hooks` would hand them to the
+    /// dumper — a hook returning one JSON-encoded summary string.
+    fn compacted_with_summary(summary: &str) -> Vec<Value> {
+        reconstruct_compacted_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())])
+    }
+
+    fn dump_lines(dir: &Path) -> Vec<Value> {
+        fs::read_to_string(dir.join("out").join("compaction-summaries.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("every line is independently valid JSON"))
+            .collect()
+    }
+
+    /// Flag on: the first compaction creates `out/compaction-summaries.jsonl` carrying all
+    /// four required fields, with `summary` the hook's text verbatim and the two token counts
+    /// the ones `trace.write_compaction` records for the same event.
+    #[test]
+    fn dump_creates_the_file_with_all_four_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary = "1. THE BUG: a \"quoted\" path\n\tC:\\tmp";
+        let path = dir.path().join("out").join("compaction-summaries.jsonl");
+        assert!(!path.exists(), "nothing written before the first call");
+
+        dump_compaction_summary(
+            true,
+            dir.path(),
+            17,
+            81501,
+            334,
+            &compacted_with_summary(summary),
+        )
+        .unwrap();
+
+        let lines = dump_lines(dir.path());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["turn"], 17);
+        assert_eq!(lines[0]["tokens_before"], 81501);
+        assert_eq!(lines[0]["tokens_after"], 334);
+        assert_eq!(lines[0]["summary"], summary);
+        // A newline-bearing summary still occupies exactly one JSONL line.
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "an embedded newline must be escaped, not split the record in two"
+        );
+    }
+
+    /// A second compaction later in the same session appends a second line rather than
+    /// replacing the first.
+    #[test]
+    fn second_compaction_appends_rather_than_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+
+        dump_compaction_summary(
+            true,
+            dir.path(),
+            17,
+            81501,
+            334,
+            &compacted_with_summary("first summary"),
+        )
+        .unwrap();
+        let first = dump_lines(dir.path());
+
+        dump_compaction_summary(
+            true,
+            dir.path(),
+            34,
+            79000,
+            512,
+            &compacted_with_summary("second summary"),
+        )
+        .unwrap();
+
+        let both = dump_lines(dir.path());
+        assert_eq!(
+            both.len(),
+            2,
+            "second compaction must append, not overwrite"
+        );
+        assert_eq!(both[0], first[0], "the first line is left untouched");
+        assert_eq!(both[1]["turn"], 34);
+        assert_eq!(both[1]["summary"], "second summary");
+    }
+
+    /// Flag off (absent or explicitly false) writes nothing at all — not an empty file, not
+    /// an empty line, not even the `out/` directory on this path.
+    #[test]
+    fn dump_disabled_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        dump_compaction_summary(
+            false,
+            dir.path(),
+            17,
+            81501,
+            334,
+            &compacted_with_summary("never dumped"),
+        )
+        .unwrap();
+
+        assert!(!dir
+            .path()
+            .join("out")
+            .join("compaction-summaries.jsonl")
+            .exists());
     }
 }

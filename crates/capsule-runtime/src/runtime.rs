@@ -471,6 +471,11 @@ pub fn launch_session(
                 .unwrap_or(0.98),
             compaction_model: inference.compaction.as_ref().and_then(|c| c.model.clone()),
             compaction_system_prompt,
+            compaction_dump_summaries: inference
+                .compaction
+                .as_ref()
+                .and_then(|c| c.dump_summaries)
+                .unwrap_or(false),
             max_output_tokens: inference
                 .max_tokens
                 .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
@@ -2908,6 +2913,7 @@ mod tests {
             model: Some("compaction-model".to_string()),
             system_prompt: system_prompt.map(str::to_string),
             system_prompt_file: system_prompt_file.map(str::to_string),
+            dump_summaries: None,
         }
     }
 

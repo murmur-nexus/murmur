@@ -430,6 +430,10 @@ pub struct CompactionConfig {
     /// resolved relative to the manifest directory when the session launches. Mutually
     /// exclusive with `system_prompt`.
     pub system_prompt_file: Option<String>,
+    /// When true, every committed compaction appends one JSON line recording the
+    /// replacement summary to `out/compaction-summaries.jsonl` in the session workdir.
+    /// None (the key absent) is equivalent to false: nothing is written.
+    pub dump_summaries: Option<bool>,
 }
 
 // Threshold values are validated to (0.0, 1.0] at parse time so NaN is impossible.
@@ -749,6 +753,7 @@ struct RawCompactionConfig {
     model: Option<String>,
     system_prompt: Option<String>,
     system_prompt_file: Option<String>,
+    dump_summaries: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1308,6 +1313,9 @@ fn parse_compaction(
         model: raw.model,
         system_prompt: raw.system_prompt,
         system_prompt_file: optional_trimmed_string(raw.system_prompt_file),
+        // A plain optional boolean: nothing to validate, and deliberately independent of the
+        // threshold-range and prompt-source checks above.
+        dump_summaries: raw.dump_summaries,
     }))
 }
 
@@ -2134,6 +2142,129 @@ inference:
         );
         assert!(compaction.model.is_none());
         assert_eq!(compaction.threshold, Some(0.5));
+    }
+
+    /// `dump_summaries` is a plain optional boolean: present-true, present-false and absent
+    /// are three distinguishable states, so the runtime can tell "explicitly off" from
+    /// "never configured" even though both resolve to the same behavior.
+    #[test]
+    fn parses_compaction_dump_summaries() {
+        let parse = |line: &str| {
+            RuntimeManifest::from_yaml_str(&format!(
+                r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    model: compaction-model
+{line}  driver:
+    artifact: murmur-driver-anthropic
+"#
+            ))
+            .unwrap()
+            .inference
+            .unwrap()
+            .compaction
+            .unwrap()
+        };
+
+        assert_eq!(
+            parse("    dump_summaries: true\n").dump_summaries,
+            Some(true)
+        );
+        assert_eq!(
+            parse("    dump_summaries: false\n").dump_summaries,
+            Some(false)
+        );
+        assert_eq!(parse("").dump_summaries, None);
+    }
+
+    /// `dump_summaries` is orthogonal to every other compaction field: it neither trips the
+    /// prompt-source exclusivity check nor the threshold range check, and does not disturb
+    /// the values those fields parse to.
+    #[test]
+    fn compaction_dump_summaries_does_not_interact_with_other_fields() {
+        let compaction = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    threshold: 0.5
+    model: compaction-model
+    system_prompt_file: "compaction-instructions.md"
+    dump_summaries: true
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap()
+        .inference
+        .unwrap()
+        .compaction
+        .unwrap();
+
+        assert_eq!(compaction.dump_summaries, Some(true));
+        assert_eq!(compaction.threshold, Some(0.5));
+        assert_eq!(compaction.model, Some("compaction-model".to_string()));
+        assert_eq!(
+            compaction.system_prompt_file,
+            Some("compaction-instructions.md".to_string())
+        );
+        assert!(compaction.system_prompt.is_none());
+
+        // Still mutually exclusive with dump_summaries in the mix...
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    dump_summaries: true
+    system_prompt: "inline"
+    system_prompt_file: "compaction-instructions.md"
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .expect_err("dump_summaries must not suppress the prompt-source exclusivity check");
+        assert!(matches!(
+            err,
+            RuntimeManifestError::InvalidInferenceConfig { ref field, .. }
+                if field == "inference.compaction.system_prompt"
+        ));
+
+        // ...and the threshold range is still enforced.
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  endpoint: http://127.0.0.1:8080
+  model: test-model
+  compaction:
+    dump_summaries: true
+    threshold: 1.5
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .expect_err("dump_summaries must not suppress the threshold range check");
+        assert!(matches!(
+            err,
+            RuntimeManifestError::InvalidInferenceConfig { ref field, .. }
+                if field == "inference.compaction.threshold"
+        ));
     }
 
     /// Setting both compaction prompt sources is a parse error naming the compaction
