@@ -197,11 +197,9 @@ pub(crate) async fn run_agent_loop(
         } else {
             count_tokens(&payload_json)
         };
-        // Assign, never accumulate: `input_tokens` already counts the FULL current context,
+        // Assign: `input_tokens` already counts the FULL current context,
         // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
         // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
-        // Summing across turns made the trigger below fire on cumulative throughput while
-        // the live context was still a small fraction of the window.
         session_tokens = input_tokens;
 
         // Emit "working" status BEFORE the LLM inference call returns (liveness signal)
