@@ -301,25 +301,12 @@ Compaction **does not consume a turn slot** — `inference.max_turns` counts inf
 
 ---
 
-## Step 6 — inspect the checkpoint files
+## Step 6 — inspect the compaction summaries
 
-When compaction fires, the `murmur-hook-compact` artifact writes files to `workdir/checkpoints/`:
-
-| File | Contents |
-|---|---|
-| `checkpoints/summary.md` | Human-readable summary of what was compacted, written on each compaction event |
-| `checkpoints/raw-<timestamp>.jsonl` | Raw message history snapshot before compaction |
-
-```bash
-cat workdir/<session_id>/checkpoints/summary.md
-```
-
-This file is useful for understanding what context the agent retained versus discarded, and for debugging cases where the agent appears to "forget" earlier work after compaction.
-
-**Dumping summaries for evaluation.** `checkpoints/summary.md` only ever holds the *latest*
-compaction's summary — each new compaction overwrites it. To keep a full, append-only log of
-every summary a session's compactions produced (for example to eval whether compaction preserved
-the right detail across a long run), set `dump_summaries: true`:
+`trace.jsonl`'s `compaction` event records only the token counts, not the summary text the model
+produced. To persist the summary itself — for understanding what context the agent retained
+versus discarded, or debugging cases where the agent appears to "forget" earlier work after
+compaction — set `dump_summaries: true`:
 
 ```yaml
 inference:

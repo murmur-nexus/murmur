@@ -188,9 +188,7 @@ file behind.
 committed by the time the write is attempted.
 
 This log exists to capture the summary text itself, which `trace.jsonl`'s `compaction` event
-does not record (it carries only the two token counts). It is unrelated to
-`checkpoints/summary.md` below, which is a signed latest-snapshot resume file rather than an
-append-only eval log.
+does not record (it carries only the two token counts).
 
 ---
 
