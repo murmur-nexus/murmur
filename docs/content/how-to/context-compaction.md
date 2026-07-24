@@ -325,14 +325,6 @@ See [out/compaction-summaries.jsonl](../reference/capsule-io.md#compaction-summa
 full field reference. The file is only created once the first compaction actually commits, and
 a compaction the tool-call-pairing safety net rejects writes nothing.
 
-**Signed checkpoints.** After compaction signs `summary.md`/`plan.json`/`decisions.json` (whichever
-exist), each gets a sidecar `checkpoints/<name>.sig`. If you hand-edit a checkpoint file and then
-resume the same workdir (`mur run --workdir <dir>`), the runtime detects the mismatch before the
-agent's first inference call, renames the file to `checkpoints/<name>.rejected`, and logs the
-rejection to `logs/bootstrap.log` — the tampered content is never silently trusted. See
-[Checkpoint files](../reference/capsule-io.md#checkpoint-files) for the full signing
-and verification behavior.
-
 ---
 
 ## Compaction failure modes

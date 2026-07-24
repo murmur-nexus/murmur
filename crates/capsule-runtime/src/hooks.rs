@@ -16,12 +16,10 @@ use wasmtime_wasi::{
 use murmur_artifact::{HookBinding, HookConfig, HookExecutionMode, PACKED_MANIFEST_ENTRY};
 
 use crate::{
-    agent::append_bootstrap_log,
     bindings::hook::exports::murmur::hook::lifecycle::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
-    checkpoint_sign::{sign_existing_checkpoints, verify_and_quarantine_checkpoints},
     compat::lifecycle_v0_2,
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
@@ -491,18 +489,13 @@ impl HookRuntime {
     /// hook that returned `Err` for this event. Every caller but `dispatch_compaction`
     /// discards `first_error` — the error is still logged per-hook and the loop still
     /// continues, so `emit()`'s observable behaviour is unchanged; only compaction
-    /// promotes it to a session failure. Event-keyed side effects (checkpoint verify on
-    /// `SessionStart`, checkpoint sign on `SessionEnd` and on a compaction that
-    /// replaced context) run here so all events funnel through one place.
+    /// promotes it to a session failure. Event-keyed side effects (the running
+    /// token/tool-call/shell-call totals) run here so all events funnel through one place.
     async fn dispatch(
         &mut self,
         workdir: &Path,
         event: HookEvent,
     ) -> (Vec<HookArtifact>, Option<Vec<Message>>, Option<String>) {
-        if matches!(event, HookEvent::SessionStart) {
-            self.verify_checkpoints_on_start(workdir);
-        }
-
         if let HookEvent::Inference {
             input_tokens,
             output_tokens,
@@ -588,51 +581,7 @@ impl HookRuntime {
             });
         }
 
-        if matches!(event, HookEvent::SessionEnd { .. }) {
-            self.sign_checkpoints(workdir);
-        }
-        if matches!(event, HookEvent::Compaction { .. }) && replacement.is_some() {
-            self.sign_checkpoints(workdir);
-        }
-
         (artifacts, replacement, first_error)
-    }
-
-    /// Verifies checkpoint files under `accessible_workdir/checkpoints` against their `.sig`
-    /// sidecars, quarantining anything missing/invalid before the agent gets control.
-    /// `log_workdir` is where the rejection warning (if any) is logged, matching the
-    /// `workdir` this event's `log_hook_error` calls already use.
-    fn verify_checkpoints_on_start(&self, log_workdir: &Path) {
-        match verify_and_quarantine_checkpoints(&self.accessible_workdir) {
-            Ok(quarantined) if !quarantined.is_empty() => {
-                append_bootstrap_log(
-                    log_workdir,
-                    &format!(
-                        "[checkpoint] rejected unsigned/tampered checkpoint file(s): {}",
-                        quarantined.join(", ")
-                    ),
-                );
-            }
-            Ok(_) => {}
-            Err(err) => {
-                append_bootstrap_log(
-                    log_workdir,
-                    &format!(
-                        "[checkpoint] signing key unavailable, skipping checkpoint verification: {err}"
-                    ),
-                );
-            }
-        }
-    }
-
-    /// Signs whatever checkpoint files currently exist under `accessible_workdir/checkpoints`.
-    fn sign_checkpoints(&self, log_workdir: &Path) {
-        if let Err(err) = sign_existing_checkpoints(&self.accessible_workdir) {
-            append_bootstrap_log(
-                log_workdir,
-                &format!("[checkpoint] signing key unavailable, skipping checkpoint signing: {err}"),
-            );
-        }
     }
 
     /// Fire `on-compaction` on all hooks with a matching binding.
@@ -1134,36 +1083,8 @@ async fn log_hook_error(workdir: &Path, hook_name: &str, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        checkpoint_sign::test_support::{with_home, HOME_LOCK},
-        inference_import::INFERENCE_IFACE_VERSIONED,
-    };
+    use crate::inference_import::INFERENCE_IFACE_VERSIONED;
     use tempfile::TempDir;
-
-    /// Builds a `HookRuntime` with zero registered hooks against a fresh `TempDir` pair,
-    /// mirroring the `(workdir, accessible_workdir)` split `stage_session` produces. No
-    /// wasmtime component is ever instantiated since `staged_hooks` is empty, so a plain
-    /// default `Engine` suffices.
-    async fn test_hook_runtime(workdir: &Path, accessible_workdir: &Path) -> HookRuntime {
-        HookRuntime::new(
-            &wasmtime::Engine::default(),
-            workdir,
-            accessible_workdir,
-            Vec::new(),
-            SessionContextData {
-                capsule_name: "test-capsule".to_string(),
-                capsule_version: "0.1.0".to_string(),
-                session_id: "sess-test".to_string(),
-                model: "test-model".to_string(),
-                capabilities: Vec::new(),
-            },
-            HookEnvVars::default(),
-            ExecutionLimits::default(),
-            None,
-        )
-        .await
-        .expect("HookRuntime::new should succeed with zero hooks")
-    }
 
     /// Engine configured like the production one (component model + async + epoch
     /// interruption) so a hand-authored WAT component double can be compiled and
@@ -1598,122 +1519,6 @@ mod tests {
                 "error must name the missing lifecycle export, got: {msg}"
             );
         });
-    }
-
-    #[test]
-    fn session_end_emit_signs_existing_checkpoints() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = TempDir::new().unwrap();
-        let session = TempDir::new().unwrap();
-        let accessible = TempDir::new().unwrap();
-        let checkpoints = accessible.path().join("checkpoints");
-        std::fs::create_dir_all(&checkpoints).unwrap();
-        std::fs::write(checkpoints.join("summary.md"), "goals: ship it").unwrap();
-
-        with_home(home.path(), || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mut hooks = test_hook_runtime(session.path(), accessible.path()).await;
-                hooks
-                    .emit(
-                        session.path(),
-                        HookEvent::SessionEnd {
-                            total_turns: 1,
-                            exit_status: "ok".to_string(),
-                        },
-                    )
-                    .await;
-            });
-        });
-
-        assert!(
-            checkpoints.join("summary.md.sig").exists(),
-            "SessionEnd dispatch should sign existing checkpoint files"
-        );
-    }
-
-    #[test]
-    fn session_start_emit_quarantines_tampered_checkpoint() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = TempDir::new().unwrap();
-        let session = TempDir::new().unwrap();
-        let accessible = TempDir::new().unwrap();
-        let checkpoints = accessible.path().join("checkpoints");
-        std::fs::create_dir_all(&checkpoints).unwrap();
-        std::fs::write(checkpoints.join("plan.json"), r#"{"tasks":[]}"#).unwrap();
-
-        with_home(home.path(), || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                // Sign it first (simulating a prior session-end), then tamper, then start again.
-                let mut hooks = test_hook_runtime(session.path(), accessible.path()).await;
-                hooks
-                    .emit(
-                        session.path(),
-                        HookEvent::SessionEnd {
-                            total_turns: 1,
-                            exit_status: "ok".to_string(),
-                        },
-                    )
-                    .await;
-                std::fs::write(checkpoints.join("plan.json"), r#"{"tasks":["evil"]}"#).unwrap();
-
-                let mut resumed = test_hook_runtime(session.path(), accessible.path()).await;
-                resumed.emit(session.path(), HookEvent::SessionStart).await;
-            });
-        });
-
-        assert!(
-            !checkpoints.join("plan.json").exists(),
-            "tampered checkpoint should have been renamed away"
-        );
-        assert!(
-            checkpoints.join("plan.json.rejected").exists(),
-            "SessionStart dispatch should quarantine a tampered checkpoint file"
-        );
-        let bootstrap_log =
-            std::fs::read_to_string(session.path().join("logs").join("bootstrap.log"))
-                .unwrap_or_default();
-        assert!(
-            bootstrap_log.contains("plan.json"),
-            "bootstrap.log should name the rejected file, got: {bootstrap_log}"
-        );
-    }
-
-    #[test]
-    fn session_start_emit_leaves_validly_signed_checkpoint_untouched() {
-        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let home = TempDir::new().unwrap();
-        let session = TempDir::new().unwrap();
-        let accessible = TempDir::new().unwrap();
-        let checkpoints = accessible.path().join("checkpoints");
-        std::fs::create_dir_all(&checkpoints).unwrap();
-        std::fs::write(checkpoints.join("decisions.json"), r#"{"decisions":[]}"#).unwrap();
-
-        with_home(home.path(), || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let mut hooks = test_hook_runtime(session.path(), accessible.path()).await;
-                hooks
-                    .emit(
-                        session.path(),
-                        HookEvent::SessionEnd {
-                            total_turns: 1,
-                            exit_status: "ok".to_string(),
-                        },
-                    )
-                    .await;
-
-                let mut resumed = test_hook_runtime(session.path(), accessible.path()).await;
-                resumed.emit(session.path(), HookEvent::SessionStart).await;
-            });
-        });
-
-        assert!(
-            checkpoints.join("decisions.json").exists(),
-            "validly-signed checkpoint must survive verification untouched"
-        );
-        assert!(!checkpoints.join("decisions.json.rejected").exists());
     }
 
     /// A `murmur:hook/lifecycle` double whose every export is one core function that never

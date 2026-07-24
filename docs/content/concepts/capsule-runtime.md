@@ -230,14 +230,6 @@ identity is exposed in `MURMUR.md`, in the WASI env for the driver and WASM tool
 shell tool subprocess env — so the agent, its tools, and its hooks all see one consistent
 identity for the session.
 
-### Checkpoint integrity
-
-Checkpoint files under `workdir/checkpoints/` (`summary.md`, `plan.json`, `decisions.json`)
-are signed by the runtime and verified before the agent gets control on every session start,
-so a hand-edited or tampered checkpoint is rejected rather than silently trusted. See
-[Checkpoint files](../reference/capsule-io.md#checkpoint-files) for the full signing and
-verification behavior.
-
 ### Agent Card & A2A messaging
 
 While an agent session is active, the runtime serves a small HTTP endpoint exposing an Agent
