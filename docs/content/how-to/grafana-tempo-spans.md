@@ -129,6 +129,10 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       - name: murmur-hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
+        capabilities:
+          network:
+            allow:
+              - http://localhost:4318
 
     capabilities:
       network:
@@ -160,6 +164,10 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       - name: murmur-hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
+        capabilities:
+          network:
+            allow:
+              - http://localhost:4318
 
     capabilities:
       network:
@@ -191,6 +199,10 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
       - name: murmur-hook-grafana
         version: "{{ v.murmur_hook_grafana }}"
         runtime: hook
+        capabilities:
+          network:
+            allow:
+              - http://localhost:4318
 
     capabilities:
       network:
@@ -315,7 +327,7 @@ Once spans are flowing into Tempo, the topology view can query the same backend 
 | What to do | How |
 |---|---|
 | Emit spans | Set `observability.otel_endpoint: http://localhost:4318` in `murmur.yaml` |
-| Enrich spans with hook-side data | Declare `murmur-hook-grafana` as a `runtime: hook` artifact |
+| Enrich spans with hook-side data | Declare `murmur-hook-grafana` as a `runtime: hook` artifact, and grant it the collector host via the entry's own `capabilities.network.allow` — hooks have no network by default (see [Hook capabilities](../reference/manifest-schema.md#hook-capabilities)) |
 | Confirm spans arrived | `curl .../api/search?q=...` returns `traces.length > 0` |
 | Find sessions in Grafana | Explore → Tempo → TraceQL `{resource.service.name="my-capsule"}` |
 | Inspect a session | Click a trace ID → flame graph → span detail panel |

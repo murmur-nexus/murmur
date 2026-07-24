@@ -100,6 +100,11 @@ fn create_manifest(project_dir: &std::path::Path, endpoint: &str) -> PathBuf {
             "  - name: {hook_name}\n",
             "    version: {hook_version}\n",
             "    runtime: hook\n",
+            // Hooks are default-deny: murmur-hook-debug writes hook-debug.jsonl to its
+            // working directory, so the operator has to grant it that directory here.
+            "    capabilities:\n",
+            "      filesystem:\n",
+            "        scope: .\n",
             "capabilities:\n",
             "  network:\n",
             "    allow:\n",

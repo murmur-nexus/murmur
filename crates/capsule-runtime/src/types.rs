@@ -14,6 +14,7 @@ use crate::{
     bindings::host::murmur::tool::run::ToolResult,
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
+    network_policy::HookCapabilityGrant,
 };
 
 pub(crate) struct DispatchOutcome {
@@ -52,6 +53,12 @@ pub struct ArtifactRequest {
     /// skill's `skill.md` directly from this path and skips registry resolution entirely.
     /// Relative paths resolve against `StageRequest::manifest_dir`.
     pub source: Option<String>,
+    /// Per-artifact capability grant copied verbatim from this artifact's entry in the
+    /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::capabilities`).
+    /// Only consumed for `runtime: hook` — the manifest parser rejects the key on any other
+    /// role — and `None` means full default-deny for that hook. Never sourced from the
+    /// artifact's own bundled `murmur.yaml`, so an artifact cannot self-grant.
+    pub capabilities: Option<murmur_artifact::Capabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,7 +108,13 @@ pub(crate) struct StagedHookArtifact {
     pub name: String,
     pub version: String,
     pub component: Component,
+    /// Behavioral contract (binding/execution_mode/commit_policy) from the hook artifact's
+    /// *own* bundled manifest. Carries no capability information — see `grant`.
     pub config: HookConfig,
+    /// What this hook is allowed to do, lowered and validated at staging time from the
+    /// operator's own manifest entry. Applied identically by all three hook instantiation
+    /// paths in `hooks.rs`; `HookCapabilityGrant::default()` is full default-deny.
+    pub grant: HookCapabilityGrant,
 }
 
 #[derive(Debug, Clone)]

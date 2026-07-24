@@ -13,7 +13,7 @@ use murmur_artifact::{
     read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, HookBinding, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
-    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
+    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -47,7 +47,8 @@ use crate::{
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
     network_policy::{
-        parse_network_allow_rules, validate_filesystem_scope, NetworkAllowRule, RequestTarget,
+        parse_network_allow_rules, validate_filesystem_scope, HookCapabilityGrant,
+        NetworkAllowRule, RequestTarget,
     },
     otel::OtelEmitter,
     outgoing, sandbox,
@@ -272,11 +273,20 @@ pub fn stage_session(
                         message: err.to_string(),
                     }
                 })?;
+                // The grant comes from `artifact` — the operator's own manifest entry for
+                // this hook — and never from `manifest_yaml`, the hook's bundled manifest
+                // parsed just above for its behavioral contract. A hook pulled from a
+                // registry therefore cannot widen what the host lets it do. Deriving here
+                // (rather than at instantiation) means a malformed grant fails staging,
+                // before any hook component runs.
+                let grant = HookCapabilityGrant::derive(artifact.capabilities.as_ref())?;
+                warn_on_inert_hook_capabilities(&artifact.name, artifact.capabilities.as_ref());
                 hook_components.push(StagedHookArtifact {
                     name: artifact.name.clone(),
                     version: resolved_version.clone(),
                     component: hook_component,
                     config: hook_config,
+                    grant,
                 });
             }
             ArtifactRuntime::Skill => {
@@ -1352,6 +1362,46 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
         agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"),
+        );
+    }
+}
+
+/// A per-hook `capabilities:` block reuses the whole [`murmur_artifact::Capabilities`]
+/// vocabulary, but only `network` and `filesystem` govern a hook — the rest are capsule-wide
+/// concerns nothing reads per-artifact. Warn rather than reject (the block is structurally
+/// valid) so an operator who declared, say, `shell.allow` on a hook entry learns it is inert
+/// instead of assuming it was applied. Infallible and non-fatal, like
+/// [`warn_if_bash_network_bypass`], and carries the same `W-SEC-*` registry code + doc link
+/// convention as every other non-fatal capability warning (see `security_warnings.rs`).
+///
+/// Not written to `logs/bootstrap.log`, unlike [`warn_if_bash_network_bypass`]: this fires
+/// during artifact staging in [`stage_session`], before the session workdir
+/// `warn_if_bash_network_bypass`/`sandbox::warn_for_enforcement_tier` write into even exists.
+fn warn_on_inert_hook_capabilities(
+    hook_name: &str,
+    capabilities: Option<&murmur_artifact::Capabilities>,
+) {
+    let Some(capabilities) = capabilities else {
+        return;
+    };
+
+    let inert: Vec<&str> = [
+        ("shell", capabilities.shell.is_some()),
+        ("spawn", capabilities.spawn.is_some()),
+        ("env", capabilities.env.is_some()),
+        ("limits", capabilities.limits.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect();
+
+    if !inert.is_empty() {
+        let link = security_warning_link(W_SEC_006);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_006}]: hook '{hook_name}' declares capabilities.{} \
+             which the runtime does not apply per-hook — only capabilities.network and \
+             capabilities.filesystem govern a hook ({link})",
+            inert.join(", capabilities.")
         );
     }
 }
@@ -3208,6 +3258,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: None,
@@ -3287,6 +3338,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -3358,6 +3410,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -3428,6 +3481,7 @@ mod tests {
                 version: "0.0.9".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -3579,6 +3633,7 @@ mod tests {
                 version: "local".to_string(),
                 runtime: ArtifactRuntime::Skill,
                 source: Some("skills/my-skill".to_string()),
+                capabilities: None,
             }],
             allowlisted_tools: HashSet::new(),
             lock_expectations: None,

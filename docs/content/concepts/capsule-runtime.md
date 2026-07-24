@@ -46,7 +46,9 @@ turns its manifest into an executing process:
 - Resolves dependencies from local/remote registry sources
 - Configures capability grants (filesystem, network, shell) — explicit and manifest-driven:
   no implicit network access, no implicit host filesystem access, shell access is
-  allowlist-based and auditable
+  allowlist-based and auditable. This holds for every guest kind, hooks included: a hook's
+  grant comes from its entry in the capsule's own manifest and defaults to nothing (see
+  [Hook capabilities](#hook-model))
 - Links and invokes runtime interfaces for tools and artifact management
 - Captures outputs and logs in a predictable workspace layout
 
@@ -194,6 +196,34 @@ execution_mode: blocking         # blocking or async
 commit_policy: replace-context   # none, replace-context, or write-manifests
 description: "Hook description."
 ```
+
+**Hook capabilities** — a hook runs default-deny, and only the capsule operator can widen it.
+The manifest above is the hook artifact's *own* `murmur.yaml`: it declares the hook's
+behavioral contract and nothing else. Capability grants are read exclusively from the artifact
+entry in the **capsule's** `murmur.yaml`, so a hook pulled from a registry can never grant
+itself anything:
+
+```yaml
+# in the capsule's own murmur.yaml
+artifacts:
+  - name: murmur-hook-telemetry
+    version: 1.0.0
+    runtime: hook
+    capabilities:
+      network:
+        allow: [https://telemetry.example.com]
+      filesystem:
+        scope: hook-state
+```
+
+With no `capabilities:` block a hook gets no network (no raw WASI sockets, and an empty
+outbound allow-list so every HTTP request is denied) and no preopened directory at all — it
+cannot read or write any file, including in its own working directory. A granted hook reaches
+declared hosts through the same allow-list gate a capsule's or tool's outbound HTTP goes
+through, and sees exactly one directory, `<workdir>/<scope>`, mounted as its current
+directory. All three hook instantiation paths — `on-stage`, blocking, and async — apply the
+identical grant; no binding or execution mode is exempt. See
+[Hook capabilities](../reference/manifest-schema.md#hook-capabilities) for the full rules.
 
 ### Turn limit (`inference.max_turns`)
 

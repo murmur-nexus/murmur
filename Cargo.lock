@@ -290,8 +290,10 @@ dependencies = [
 name = "capsule-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "http",
+ "http-body-util",
  "hyper",
  "landlock",
  "libc",

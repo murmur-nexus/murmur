@@ -28,6 +28,9 @@ The relevant manifest options are:
       - name: murmur-hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
+        capabilities:
+          filesystem:
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -78,6 +81,9 @@ The relevant manifest options are:
       - name: murmur-hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
+        capabilities:
+          filesystem:
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -128,6 +134,9 @@ The relevant manifest options are:
       - name: murmur-hook-eval
         version: "{{ v.murmur_hook_eval }}"
         runtime: hook
+        capabilities:
+          filesystem:
+            scope: .          # the hook writes the session's eval.jsonl scores here; hooks get no filesystem by default
       - name: murmur-tool-editor
         version: "{{ v.murmur_tool_editor }}"
         runtime: tool
@@ -382,6 +391,7 @@ mur trace show
 | Step | What you do |
 |---|---|
 | Declare `murmur-hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
+| Grant it `capabilities.filesystem.scope` on its own entry | Lets it write `eval.jsonl`; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest-schema.md#hook-capabilities)) |
 | Declare `murmur-tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |

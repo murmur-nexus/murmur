@@ -41,6 +41,10 @@ libseccomp = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+# Dev-only: builds an empty `HyperOutgoingBody` so the hook capability tests can call
+# `NetworkPolicyHooks::send_request` directly through a hook store's `WasiHttpView`.
+bytes = "1"
+http-body-util = "0.1"
 # Dev-only: hand-authored WAT component doubles for the hook-instantiation tests
 # (required-vs-optional lifecycle export resolution). No production impact.
 wat = "=1.251.0"

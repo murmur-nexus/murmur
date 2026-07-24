@@ -27,6 +27,11 @@ pub const W_SEC_004: &str = "W-SEC-004";
 /// assumed to be enforced.
 pub const W_SEC_005: &str = "W-SEC-005";
 
+/// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,
+/// but a per-hook grant only reads `network` and `filesystem` — the other sub-blocks are
+/// structurally accepted and silently inert.
+pub const W_SEC_006: &str = "W-SEC-006";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 

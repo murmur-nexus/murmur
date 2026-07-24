@@ -228,6 +228,7 @@ fn stage_git_tool_session(
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            capabilities: artifact.capabilities.clone(),
         });
     }
 

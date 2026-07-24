@@ -153,6 +153,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            capabilities: artifact.capabilities.clone(),
         });
     }
 
@@ -172,6 +173,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                         version: entry.resolved_version.clone(),
                         runtime: artifact.runtime.clone(),
                         source: artifact.source.clone(),
+                        capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {
                         name: artifact.name.clone(),

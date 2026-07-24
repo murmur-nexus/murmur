@@ -102,6 +102,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            capabilities: artifact.capabilities.clone(),
         };
         let name = &artifact.name;
         let version = &artifact.version;

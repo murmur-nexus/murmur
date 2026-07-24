@@ -171,6 +171,54 @@ mur_version: "0.4.9"
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry — no `.mur.zip`, no `mur publish`. Requires `local_source: true` (see below). See [Local-source artifacts](#local-source-skills) below. |
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default, in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
+| `artifacts[].capabilities` | map | no | **`runtime: hook` only.** Per-hook capability grant. Absent = the hook gets no network and no filesystem access at all. Declaring it on any other role is a manifest validation error (`E-MAN-003`). See [Hook capabilities](#hook-capabilities). |
+
+##### Hook capabilities { #hook-capabilities }
+
+A hook runs **default-deny**: a `runtime: hook` entry with no `capabilities:` block gets zero
+network capability (no raw WASI sockets, and an empty outbound allow-list so every HTTP request
+is denied) and zero preopened directories — it cannot read or write any file, not even in its own
+working directory. Network and filesystem are granted back one hook at a time, from that hook's
+entry in **your own** `murmur.yaml`:
+
+```yaml
+artifacts:
+  # default-deny: no network, no filesystem
+  - name: murmur-hook-observe
+    version: 0.1.0
+    runtime: hook
+
+  # granted exactly one host and exactly one directory
+  - name: murmur-hook-telemetry
+    version: 0.1.0
+    runtime: hook
+    capabilities:
+      network:
+        allow:
+          - https://telemetry.example.com
+      filesystem:
+        scope: hook-state
+```
+
+Rules:
+
+- **Only the capsule operator can grant.** The grant is read from your capsule manifest's artifact
+  entry, never from the hook artifact's own bundled `murmur.yaml`. A `capabilities:` key inside a
+  published hook artifact is inert — nothing carried in a `.mur.zip` can widen what the host lets
+  that hook do.
+- **The grant is per-hook, not shared.** The capsule-wide top-level [`capabilities`](#field-capabilities)
+  block does not reach hooks, and a hook's grant does not widen the capsule.
+- **`network.allow` uses the same entries and the same enforcement as the capsule-wide block** —
+  same `host`, `host:port`, and `scheme://host[:port]` forms, checked by the same allow-list gate a
+  capsule's or tool's outbound HTTP goes through. Anything not listed is denied.
+- **`filesystem.scope` is a real preopen, not advisory.** Exactly one directory —
+  `<workdir>/<scope>` — is mounted as the hook's current directory, and it is created if missing.
+  Paths outside that subtree (a sibling artifact's directory, the workdir root, `..`) are
+  unreachable because no descriptor for them exists. An absolute scope, or one that escapes the
+  workdir via `..`, fails at launch (`E-CAP-002`) before any hook component is instantiated.
+- **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, and `limits` parse
+  here but are capsule-wide concerns the runtime does not apply per-hook; declaring one prints a
+  [`W-SEC-006`](security-warnings.md#w-sec-006) warning saying so.
 
 ##### Local-source artifacts { #local-source-skills }
 
