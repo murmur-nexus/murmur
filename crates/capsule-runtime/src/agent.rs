@@ -142,7 +142,9 @@ pub(crate) async fn run_agent_loop(
         "content": [{"type": "text", "text": task}],
     }));
 
-    let mut session_tokens: u32 = 0;
+    // Current context occupancy, not a running total: every turn assigns its own
+    // full-context input count before anything reads it, so there is no initial value.
+    let mut session_tokens: u32;
     let mut sse_event_id: u64 = 0;
 
     let task_id_str = task_id.clone().unwrap_or_default();
@@ -195,7 +197,10 @@ pub(crate) async fn run_agent_loop(
         } else {
             count_tokens(&payload_json)
         };
-        session_tokens = session_tokens.saturating_add(input_tokens);
+        // Assign: `input_tokens` already counts the FULL current context,
+        // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
+        // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
+        session_tokens = input_tokens;
 
         // Emit "working" status BEFORE the LLM inference call returns (liveness signal)
         if task_id.is_some() {
@@ -1713,5 +1718,117 @@ mod tests {
         assert_eq!(msgs[0]["tool_call_id"], "t1");
         assert_eq!(msgs[0]["is_error"], false);
         assert_eq!(msgs[0]["content"], json!([{"type": "text", "text": "ok"}]));
+    }
+
+    /// Mirrors `run_agent_loop`'s per-turn token accounting and compaction trigger:
+    /// `session_tokens` is ASSIGNED this turn's full-context `input_tokens`, this turn's
+    /// response is then added on top, and the ratio is compared against the threshold
+    /// (only when `context_window > 0`). Returns the 0-based index of the first turn that
+    /// trips the trigger, or `None` if it never does.
+    ///
+    /// The loop's accounting is three inline statements inside an `async fn` that needs a
+    /// live wasm driver, `CapsuleStoreState`, `HookRuntime`, `TraceWriter` and
+    /// `OtelEmitter` to reach, so the sequence is mirrored here rather than extracted.
+    fn first_compacting_turn(
+        turns: &[(u32, u32)],
+        context_window: u32,
+        compaction_threshold: f32,
+    ) -> Option<usize> {
+        // No initial value, exactly as in `run_agent_loop`: each turn assigns its own.
+        let mut session_tokens: u32;
+        for (turn, (input_tokens, output_tokens)) in turns.iter().enumerate() {
+            session_tokens = *input_tokens;
+            session_tokens = session_tokens.saturating_add(*output_tokens);
+            if context_window > 0 {
+                let ratio = session_tokens as f32 / context_window as f32;
+                if ratio >= compaction_threshold {
+                    return Some(turn);
+                }
+            }
+        }
+        None
+    }
+
+    /// The pre-fix accounting, kept so the tests below can show they discriminate between
+    /// the two: `input_tokens` was ACCUMULATED onto the running total every turn, so
+    /// `session_tokens` grew with `turns * context_size` instead of tracking occupancy.
+    fn first_compacting_turn_pre_fix(
+        turns: &[(u32, u32)],
+        context_window: u32,
+        compaction_threshold: f32,
+    ) -> Option<usize> {
+        let mut session_tokens: u32 = 0;
+        for (turn, (input_tokens, output_tokens)) in turns.iter().enumerate() {
+            session_tokens = session_tokens.saturating_add(*input_tokens);
+            session_tokens = session_tokens.saturating_add(*output_tokens);
+            if context_window > 0 {
+                let ratio = session_tokens as f32 / context_window as f32;
+                if ratio >= compaction_threshold {
+                    return Some(turn);
+                }
+            }
+        }
+        None
+    }
+
+    /// A long run whose live context stays far below the threshold must never compact, no
+    /// matter how large the cumulative token throughput gets. This is the observed symptom
+    /// from the astropy exp-0101 run: peak per-turn context ~81k against a 1M window, yet
+    /// compaction fired mid-run on a cumulative figure of ~972k.
+    #[test]
+    fn stable_per_turn_context_never_triggers_compaction() {
+        let context_window = 1_000_000;
+        let threshold = 0.85;
+        let turns: Vec<(u32, u32)> = (0..20).map(|_| (80_000, 2_000)).collect();
+
+        assert_eq!(
+            first_compacting_turn(&turns, context_window, threshold),
+            None,
+            "live context is ~82k of a 1M window (~8%) every turn; compaction must not fire"
+        );
+
+        // Cumulative throughput across these same turns is 20 * 82_000 = 1_640_000 tokens,
+        // far past 0.85 * 1_000_000 — which is exactly what the pre-fix accounting tripped on.
+        assert_eq!(
+            first_compacting_turn_pre_fix(&turns, context_window, threshold),
+            Some(10),
+            "pre-fix accounting fired on cumulative throughput at turn 11 (0-based 10)"
+        );
+    }
+
+    /// A run whose live context genuinely fills must still compact — on exactly the turn
+    /// whose own `input_tokens + output_tokens` crosses `threshold * context_window`,
+    /// neither earlier (from unrelated prior turns) nor later.
+    #[test]
+    fn genuinely_growing_context_triggers_compaction_on_the_crossing_turn() {
+        let context_window = 1_000_000;
+        let threshold = 0.85;
+        // Turn n carries 50_000 * (n + 1) input tokens plus a 5_000-token response, so the
+        // first turn at or above 850_000 is turn 16 (0-based): 850_000 + 5_000.
+        let turns: Vec<(u32, u32)> = (0..20).map(|n| (50_000 * (n + 1), 5_000)).collect();
+
+        assert_eq!(turns[15], (800_000, 5_000), "turn 16 (0-based 15) is under");
+        assert_eq!(turns[16], (850_000, 5_000), "turn 17 (0-based 16) crosses");
+        assert_eq!(
+            first_compacting_turn(&turns, context_window, threshold),
+            Some(16),
+            "compaction must fire on the turn whose own context crosses the threshold"
+        );
+
+        // ...and a run that grows but stops short of the threshold still must not compact.
+        let short: Vec<(u32, u32)> = (0..16).map(|n| (50_000 * (n + 1), 5_000)).collect();
+        assert_eq!(
+            first_compacting_turn(&short, context_window, threshold),
+            None,
+            "peak live context 805_000 < 850_000; compaction must not fire"
+        );
+    }
+
+    /// Compaction is disabled when no context window is resolved (`context.max_tokens`
+    /// absent -> `resolve_context_window` yields 0), regardless of token counts.
+    #[test]
+    fn zero_context_window_never_triggers_compaction() {
+        let turns: Vec<(u32, u32)> = (0..20).map(|_| (900_000, 90_000)).collect();
+        assert_eq!(first_compacting_turn(&turns, 0, 0.85), None);
     }
 }
