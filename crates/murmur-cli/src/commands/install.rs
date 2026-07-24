@@ -550,7 +550,12 @@ fn install_manifest_deps(
     // when stdout/stderr is not a terminal, so bar messages are cosmetic-only and would make
     // the failure report invisible in CI logs and pipes.
     println!();
-    println!("{} of {} artifact{} failed to install:", failures.len(), n, s(n));
+    println!(
+        "{} of {} artifact{} failed to install:",
+        failures.len(),
+        n,
+        s(n)
+    );
     for (i, err) in &failures {
         let artifact = artifacts[*i];
         println!();
@@ -579,7 +584,11 @@ fn install_summary_tail(count: usize, cached_n: usize, fetched_bytes: u64) -> St
     if cached_n == count {
         format!("{count} artifact{s}  all cached")
     } else {
-        let note = if cached_n > 0 { format!("  {cached_n} cached") } else { String::new() };
+        let note = if cached_n > 0 {
+            format!("  {cached_n} cached")
+        } else {
+            String::new()
+        };
         format!("{count} artifact{s}  {}{note}", format_bytes(fetched_bytes))
     }
 }
