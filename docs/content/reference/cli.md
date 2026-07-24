@@ -350,8 +350,8 @@ mur doctor
 
 `mur doctor` takes no flags or arguments. It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
 
-- `✓ name@version   <platform>` — resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`) for the current platform
-- `✓ name@version   local source` — declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry
+- `✓ name@version   <platform>` — resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`) for the current platform, and agrees with `murmur.lock` if one is present (see below)
+- `✓ name@version   local source` — declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry or a lockfile
 - `✗ name@version   <platform>   — missing` — resolved from neither store
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
@@ -377,10 +377,33 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
 Fix: mur install murmur-tool-git@0.3.31
 ```
 
+### Lock integrity
+
+When `murmur.lock` is present in the project, `mur doctor` checks every registry-resolved (non-local-source) artifact against it the same way `mur run` does before staging a session: the lock must have an entry for the artifact, that entry's `resolved_version` must match the version `murmur.yaml` declares, and its recorded sha256 must match the sha256 of the bytes actually installed. Any disagreement turns that artifact's line into a `✗`, counts toward the failure tally, and gets a `Fix:` line — so `mur doctor` never reports "All checks passed." on a project `mur run` would reject. When no `murmur.lock` exists, `mur doctor` falls back to presence-only checking and prints nothing lock-related, exactly as before this check existed.
+
+- `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
+- `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares
+- `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
+
+**Output — lock hash mismatch:**
+
+```text
+Checking /path/to/murmur.yaml for darwin-aarch64...
+  ✗  demo-skill@0.1.0   darwin-aarch64   — artifact integrity check failed for demo-skill@0.1.0
+        expected sha256 (murmur.lock): deadbeef
+        actual sha256 (on disk):       0e29c7e8c291a2800a266a01c28300e24f2a640d4a21a085e4fd9aee01adfaef
+
+0 checks passed, 1 error found.
+
+Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
+```
+
+A `murmur.lock` that exists but fails to parse or fails validation is a hard failure — `mur doctor` reports it and exits before printing any checklist line, the same way a malformed `murmur.yaml` already does.
+
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source)
-- `1` — one or more declared artifacts missing (checklist printed to stdout first), or a setup failure (no checklist printed; error goes to stderr)
+- `0` — every declared artifact resolved (or is local-source), and agrees with `murmur.lock` if one is present
+- `1` — one or more declared artifacts missing, or disagree with `murmur.lock` (checklist printed to stdout first), or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -388,8 +411,9 @@ Fix: mur install murmur-tool-git@0.3.31
 |---|---|
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
+| `E-RUN-003` | `murmur.lock` exists but failed to parse or validate |
 
-A setup failure (no project found, or the manifest fails to load) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest couldn't be read.
+A setup failure (no project found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
 
 ---
 

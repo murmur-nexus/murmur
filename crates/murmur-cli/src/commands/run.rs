@@ -13,7 +13,7 @@ use capsule_runtime::{
 use murmur_artifact::{
     current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
     write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact,
-    LockedSha256, LockfileError, MurmurLock, Registry, LOCK_VERSION,
+    LockedSha256, LockfileError, MurmurLock, Registry, ResolvedArtifact, LOCK_VERSION,
 };
 
 use crate::error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008};
@@ -410,13 +410,16 @@ fn is_on_path(name: &str) -> bool {
 }
 
 /// Whether one declared artifact is available to a session on the current platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ArtifactPresence {
     /// Declared with a local `source:` path — resolved from the filesystem at stage
     /// time, never from a registry, so there is nothing to check.
     LocalSource,
-    /// Resolved from the project store or the global store.
-    Installed,
+    /// Resolved from the project store or the global store. Carries the artifact that
+    /// was resolved, so a caller that wants to inspect the bytes (e.g. `mur doctor`
+    /// hashing them against `murmur.lock`) reads exactly the copy reported here rather
+    /// than re-deriving the store order for itself.
+    Installed(Box<ResolvedArtifact>),
     /// Resolved from neither store.
     Missing,
 }
@@ -432,16 +435,13 @@ pub(crate) fn artifact_presence(
     if artifact.source.is_some() {
         return ArtifactPresence::LocalSource;
     }
-    let resolved = project_registry
+    match project_registry
         .resolve_with_platform(&artifact.name, &artifact.version, Some(platform))
-        .is_ok()
-        || global_registry
-            .resolve_with_platform(&artifact.name, &artifact.version, Some(platform))
-            .is_ok();
-    if resolved {
-        ArtifactPresence::Installed
-    } else {
-        ArtifactPresence::Missing
+        .or_else(|_| {
+            global_registry.resolve_with_platform(&artifact.name, &artifact.version, Some(platform))
+        }) {
+        Ok(resolved) => ArtifactPresence::Installed(Box::new(resolved)),
+        Err(_) => ArtifactPresence::Missing,
     }
 }
 
