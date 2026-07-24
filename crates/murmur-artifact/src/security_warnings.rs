@@ -32,6 +32,16 @@ pub const W_SEC_005: &str = "W-SEC-005";
 /// structurally accepted and silently inert.
 pub const W_SEC_006: &str = "W-SEC-006";
 
+/// A `runtime: tool`/`runtime: driver` artifact entry declares a `capabilities.network.allow`
+/// entry the capsule-wide ceiling does not itself allow. Narrowing can only subtract, so the
+/// entry is dropped from that artifact's effective grant rather than granted.
+pub const W_SEC_007: &str = "W-SEC-007";
+
+/// A `runtime: tool`/`runtime: driver` artifact entry declares `capabilities.shell`/`.spawn`/
+/// `.env`/`.limits`, but per-artifact narrowing only reads `network` and `filesystem` — the
+/// other sub-blocks are structurally accepted and silently inert.
+pub const W_SEC_008: &str = "W-SEC-008";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 

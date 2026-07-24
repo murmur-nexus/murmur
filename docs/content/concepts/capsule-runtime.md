@@ -242,6 +242,35 @@ a `tool_result`; the session continues, no trap occurs. See [Give your agent she
 access](../how-to/agent-shell-access.md) for how the native/shell subprocess environment is
 built.
 
+**Per-tool narrowing** — by default every WASM tool, and the inference driver, runs on the
+capsule-wide `capabilities:` ceiling: the same allow-list and the same preopened workdir. A
+`runtime: tool` or `runtime: driver` entry in the capsule's own `murmur.yaml` may optionally
+declare its own `capabilities:` block to run *below* that ceiling — a narrower host list, a
+subdirectory instead of the whole workdir:
+
+```yaml
+# in the capsule's own murmur.yaml
+artifacts:
+  - name: murmur-tool-fetch
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      network:
+        allow: [https://api.example.com]
+      filesystem:
+        scope: cache
+```
+
+This is the same key and vocabulary hooks use, with the opposite baseline: a hook with no block
+gets nothing, whereas a tool with no block keeps the full ceiling (today's behavior, unchanged).
+The effective grant is always the intersection with the ceiling, so a per-artifact block can only
+subtract — an entry naming a host the capsule itself may not reach is dropped, with a
+[`W-SEC-007`](../reference/security-warnings.md#w-sec-007) warning. Like a hook's, the grant is
+read only from the capsule operator's entry, never from the tool's own bundled manifest. Because
+drivers dispatch through the identical path, the artifact named by `inference.driver.artifact`
+narrows the same way. See [Tool and driver
+capabilities](../reference/manifest-schema.md#tool-capabilities) for the full rules.
+
 ### `MURMUR.md`
 
 For agent capsules, the runtime writes `MURMUR.md` to the capsule workdir root — an

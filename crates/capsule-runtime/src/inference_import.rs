@@ -21,7 +21,7 @@ use crate::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
     },
-    network_policy::NetworkAllowRule,
+    network_policy::{NetworkAllowRule, ToolCapabilityGrant},
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
     trace::InferenceOrigin,
     types::CapabilityPolicy,
@@ -67,6 +67,11 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) capability_policy: CapabilityPolicy,
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
+    /// The driver artifact's own per-artifact narrowing, cloned from the capsule store's
+    /// grant map. `None` = the driver declared no `capabilities:` block, so the ceiling
+    /// applies. Carried here so a hook's `run-inference` runs the driver under exactly the
+    /// grant the agent loop's own turns do, rather than an unnarrowed copy of the ceiling.
+    pub(crate) driver_grant: Option<ToolCapabilityGrant>,
     /// Buffered trace records, drained by the agent loop after hook dispatch.
     pub(crate) records: std::sync::Mutex<Vec<HookInferenceRecord>>,
 }
@@ -147,6 +152,7 @@ impl HookInferenceCtx {
                 inference_env: &self.inference_env,
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
+                artifact_grant: self.driver_grant.as_ref(),
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.
@@ -381,6 +387,7 @@ mod tests {
             inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
+            driver_grant: None,
             records: std::sync::Mutex::new(Vec::new()),
         }
     }

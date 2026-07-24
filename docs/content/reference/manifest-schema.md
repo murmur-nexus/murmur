@@ -171,7 +171,7 @@ mur_version: "0.4.9"
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry — no `.mur.zip`, no `mur publish`. Requires `local_source: true` (see below). See [Local-source artifacts](#local-source-skills) below. |
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default, in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
-| `artifacts[].capabilities` | map | no | **`runtime: hook` only.** Per-hook capability grant. Absent = the hook gets no network and no filesystem access at all. Declaring it on any other role is a manifest validation error (`E-MAN-003`). See [Hook capabilities](#hook-capabilities). |
+| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool`, and `runtime: driver`. The baseline differs by role: on a hook, absent = no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent = the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). Declaring it on `runtime: skill` is a manifest validation error (`E-MAN-003`). |
 
 ##### Hook capabilities { #hook-capabilities }
 
@@ -219,6 +219,63 @@ Rules:
 - **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, and `limits` parse
   here but are capsule-wide concerns the runtime does not apply per-hook; declaring one prints a
   [`W-SEC-006`](security-warnings.md#w-sec-006) warning saying so.
+
+##### Tool and driver capabilities { #tool-capabilities }
+
+A `runtime: tool` or `runtime: driver` entry may carry the same `capabilities:` key, but the
+baseline is the opposite of a hook's: **inherit-and-clamp**, not default-deny. An entry with no
+`capabilities:` block runs on the full capsule-wide [`capabilities`](#field-capabilities) ceiling,
+exactly as every tool did before this key existed. Declaring a block *narrows* that one artifact:
+
+```yaml
+capabilities:            # the capsule-wide ceiling
+  network:
+    allow:
+      - https://api.example.com
+      - https://other.example.com
+
+artifacts:
+  # unchanged: reaches both ceiling hosts, sees the whole workdir
+  - name: broad-tool
+    version: 0.1.0
+    runtime: tool
+
+  # narrowed: one host, and only the `cache/` subtree of the workdir
+  - name: scoped-tool
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      network:
+        allow:
+          - https://api.example.com
+      filesystem:
+        scope: cache
+```
+
+Rules:
+
+- **Narrowing only ever subtracts.** The effective grant is `declaration ∩ ceiling`. An entry
+  naming a host the ceiling does not itself allow is dropped, never granted, and prints a
+  [`W-SEC-007`](security-warnings.md#w-sec-007) warning naming the artifact and the dropped entry.
+  Staging continues — the resulting posture is tighter than asked for, not looser.
+- **A bare host does not fit under a scheme-bound ceiling entry.** `api.example.com` spans both
+  schemes and every port, so a ceiling of `https://api.example.com` does not cover it and it is
+  dropped. Write the narrowing at least as specific as the ceiling entry it sits under.
+- **`network.allow: []` is a real narrowing to zero**, distinct from omitting the key: an explicit
+  empty list denies that artifact all outbound HTTP while its siblings keep the ceiling.
+- **`filesystem.scope` is a real preopen.** `<accessible workdir>/<scope>` is mounted as that
+  artifact's current directory instead of the whole workdir, and is created if missing. `scope: "."`
+  is the explicit "whole workdir" grant. An absolute scope, or one escaping via `..`, fails at
+  staging (`E-CAP-002`) before the tool runs.
+- **Only the capsule operator can grant**, exactly as for hooks: the block is read from your
+  manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
+- **Drivers narrow identically.** The artifact named by `inference.driver.artifact` dispatches
+  through the same path as any WASM tool, so a `capabilities:` block on its entry applies to every
+  driver call — including one made by a hook's `run-inference`.
+- **Only `network` and `filesystem` narrow.** `shell`, `spawn`, `env`, and `limits` parse but are
+  inert here and print a [`W-SEC-008`](security-warnings.md#w-sec-008) warning, as does a grant on a
+  tool with a **native** (non-WASM) implementation, which never runs through the WASI tool path at
+  all.
 
 ##### Local-source artifacts { #local-source-skills }
 
