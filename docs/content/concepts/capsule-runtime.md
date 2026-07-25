@@ -238,8 +238,8 @@ artifact, then the shell allowlist, then a skill artifact (`workdir/tools/<name>
 returned directly with no WASM dispatch), then a WASM-artifact tool, and finally an error if
 nothing matches. Non-zero shell exit codes are data, not errors — only
 spawn/IO failures set `is_error: true`. An undeclared tool feeds an error back to the model as
-a `tool_result`; the session continues, no trap occurs. See [Give your agent shell
-access](../how-to/agent-shell-access.md) for how the native/shell subprocess environment is
+a `tool_result`; the session continues, no trap occurs. See [Lock down a capsule's
+capabilities](../how-to/lock-down-capsule.md) for how the native/shell subprocess environment is
 built.
 
 **Per-tool narrowing** — by default every WASM tool, and the inference driver, runs on the

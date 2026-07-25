@@ -46,6 +46,9 @@ plugins:
   - git-revision-date-localized:
       fallback_to_build_date: true
       strict: false
+  - redirects:
+      redirect_maps:
+        how-to/agent-shell-access.md: how-to/lock-down-capsule.md
 
 extra:
   v:
@@ -99,7 +102,7 @@ nav:
       - Capsule Runtime: concepts/capsule-runtime.md
   - How-to Guides:
       - Configure a long-running capsule: how-to/long-running-capsule.md
-      - Give your agent shell access: how-to/agent-shell-access.md
+      - Lock down a capsule's capabilities: how-to/lock-down-capsule.md
       - Connect two capsules with A2A messaging: how-to/capsules-a2a-messaging.md
       - Pause your agent for human input: how-to/hitl-request-input.md
       - Read your agent's trace and compare two runs: how-to/read-trace-and-diff.md
