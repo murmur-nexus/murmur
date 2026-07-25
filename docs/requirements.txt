@@ -4,3 +4,4 @@ mkdocs-copy-to-llm==0.2.10
 mkdocs-git-revision-date-localized-plugin==1.5.1
 mkdocs-badges==0.5.2
 mkdocs-macros-plugin==1.3.7
+mkdocs-redirects==1.2.2

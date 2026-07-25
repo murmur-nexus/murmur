@@ -8,6 +8,14 @@
 
 *[capabilities.network.allow]: host/URL patterns the agent may connect to
 
+*[capabilities.filesystem.scope]: relative workdir subtree preopened as current directory
+
+*[artifacts[].capabilities]: optional per-artifact grant · narrows one tool/driver below ceiling · absent = full ceiling
+
+*[artifacts[].capabilities.network.allow]: hosts one artifact may reach · intersected with ceiling · [] = deny all
+
+*[artifacts[].capabilities.filesystem.scope]: workdir subtree one artifact preopens instead of whole workdir
+
 *[capabilities.shell.allow]: bare binary names (e.g. bash · jq) the agent may invoke as tools
 
 *[capabilities.shell.strip_env]: glob patterns for env vars to strip from subprocesses

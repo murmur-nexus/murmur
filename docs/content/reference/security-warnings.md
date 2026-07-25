@@ -60,7 +60,7 @@ Both are Linux kernel primitives with no equivalent on macOS or Windows — the 
 tier is not a gap awaiting a future release, it is the permanent ceiling on those platforms.
 Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
 environment variables before the subprocess spawns (see
-[Give your agent shell access](../how-to/agent-shell-access.md#step-4-manage-the-subprocess-environment)),
+[Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)),
 but nothing prevents the subprocess from reading files outside the workdir, executing an
 unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 

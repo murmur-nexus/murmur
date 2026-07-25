@@ -150,7 +150,7 @@ mur run
 
 When the capsule invokes `py-echo-native`, the runtime executes the packaged binary and forwards the normalized result back to the caller.
 
-The binary does not inherit the host's environment as-is: `HOME` is replaced with a session-scoped synthetic directory, credential-shaped variables (`GITHUB_TOKEN`, `*_API_KEY`, `AWS_*`, etc.) are stripped, and only a safe baseline (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, `TERM`) passes through — the same sanitization [shell tool subprocesses](../how-to/agent-shell-access.md#step-4-manage-the-subprocess-environment) get, applied regardless of whether the capsule declares `capabilities.shell.allow`.
+The binary does not inherit the host's environment as-is: `HOME` is replaced with a session-scoped synthetic directory, credential-shaped variables (`GITHUB_TOKEN`, `*_API_KEY`, `AWS_*`, etc.) are stripped, and only a safe baseline (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, `TEMP`, `TMP`, `CARGO_HOME`, `RUSTUP_HOME`, `TERM`) passes through — the same sanitization [shell tool subprocesses](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) get, applied regardless of whether the capsule declares `capabilities.shell.allow`.
 
 ---
 

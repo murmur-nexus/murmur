@@ -170,7 +170,7 @@ The trace is written by the runtime, not the capsule, so it exists after every s
 | Run | `mur run --task task.md` | Stages the artifacts, feeds in `task.md`, and drives the agent loop to completion |
 | Inspect | `mur trace show` | Prints the runtime-written trace for the most recent session |
 
-Pin every artifact to an exact version and the manifest becomes an execution contract you can audit, roll forward, and roll back. From here, grant more capabilities: [give the agent shell access](../how-to/agent-shell-access.md), [shape its behavior with a system prompt](../how-to/capsule-system-prompt.md), or [connect two capsules](../how-to/capsules-a2a-messaging.md).
+Pin every artifact to an exact version and the manifest becomes an execution contract you can audit, roll forward, and roll back. From here, grant more capabilities: [lock down its capabilities](../how-to/lock-down-capsule.md), [shape its behavior with a system prompt](../how-to/capsule-system-prompt.md), or [connect two capsules](../how-to/capsules-a2a-messaging.md).
 
 ---
 
