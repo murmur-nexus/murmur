@@ -869,7 +869,7 @@ by the capsule. It exists even when no hook artifacts are declared.
 `event_type` (discriminator), `session_id` (runtime-generated UUID v7, identical on every line
 in a session), and `timestamp` (Unix milliseconds).
 
-**Event types** — six standard events plus two A2A events and two task events:
+**Event types** — six standard events, plus two A2A events, two task events, and a hook-fault event:
 
 **`session_start`** — written before the first inference call
 
@@ -978,6 +978,16 @@ Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the 
 | `shell_calls` | u32 | Shell calls for this task only |
 
 Written unconditionally after `run_agent_loop`, even on error exit (exit_status will be `"failed"`). Always follows the corresponding `session_end`.
+
+**`hook_dispatch_error`** — written when a hook returns a `hook-output` arm the lifecycle event it fired from does not honor (see [Honored `hook-output` arm per event](wit-interfaces.md#murmurhooklifecycle))
+
+| Field | Type | Notes |
+|---|---|---|
+| `hook_name` | string | Manifest name of the hook that returned the unsupported arm |
+| `event` | string | WIT lifecycle function name, e.g. `"on-tool-call"` |
+| `arm` | string | The unsupported `hook-output` arm name, e.g. `"write-manifests"` |
+
+Non-fatal: the session continues exactly as if the hook had returned `none`. Written just before the `session_end`/`task_end` it precedes, so it always appears earlier in the file than the event that flushed it. Never written for `on-stage` (staging runs before `trace.jsonl` exists) or for async hooks (fire-and-forget; logged to `workdir/logs/hook-<name>.log` only) — both still get a log line, just no trace record.
 
 **Guarantees:**
 
