@@ -172,10 +172,12 @@ struct TaskEndEvent {
 
 /// One `on-task-end` hook reopened the task. New event type; older `mur` binaries
 /// route it through the `Unknown` catch-all, this one surfaces it.
+///
+/// `task_id` is not captured here: `mur trace show` never needs to distinguish
+/// reopens by task, and serde ignores unknown JSON fields by default (no
+/// `deny_unknown_fields` on this struct), so omitting it is not a parse risk.
 #[derive(Debug, Deserialize)]
 struct TaskReopenedEvent {
-    #[allow(dead_code)]
-    task_id: String,
     hook_name: String,
     reason: String,
     reopen_number: u32,

@@ -869,7 +869,7 @@ by the capsule. It exists even when no hook artifacts are declared.
 `event_type` (discriminator), `session_id` (runtime-generated UUID v7, identical on every line
 in a session), and `timestamp` (Unix milliseconds).
 
-**Event types** — six standard events, plus two A2A events, two task events, and a hook-fault event:
+**Event types** — six standard events, plus two A2A events, three task events, and a hook-fault event:
 
 **`session_start`** — written before the first inference call
 
@@ -964,20 +964,34 @@ in a session), and `timestamp` (Unix milliseconds).
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for `task.md` tasks.
 
-**`task_end`** — written after `run_agent_loop` returns, for every task
+**`task_end`** — written after `run_agent_loop` returns (and any hook-requested reopens are resolved), for every task
 
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the agent loop returned `Ok(())`; `"failed"` if it returned `Err(_)` |
-| `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end` |
-| `turns` | u32 | Inference turns for this task only (reset at `task_start`) |
+| `exit_status` | string | `"ok"` if the last attempt returned `Ok(())`; `"failed"` if it returned `Err(_)`; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `inference.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
+| `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
+| `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
 | `output_tokens` | u64 | Output tokens for this task only |
 | `tool_calls` | u32 | Tool calls for this task only |
 | `shell_calls` | u32 | Shell calls for this task only |
+| `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). Absent in traces written before this field existed; readers should default it to `0`. |
 
-Written unconditionally after `run_agent_loop`, even on error exit (exit_status will be `"failed"`). Always follows the corresponding `session_end`.
+Written unconditionally after the task's last attempt, even on error exit (exit_status will be `"failed"` or `"reopen_budget_exhausted"`). Always follows the corresponding `session_end`.
+
+**`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task, when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and the reopen is granted
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task being reopened |
+| `hook_name` | string | Manifest name of the hook that requested the reopen |
+| `reason` | string | Feedback text the hook asked to inject into the reopened task content |
+| `reopen_number` | u32 | 1-based ordinal of this reopen within the task (first reopen = `1`) |
+
+Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
+reopening](../concepts/capsule-runtime.md#task-reopening-commit_policy-reopen-task) for the full
+mechanism.
 
 **`hook_dispatch_error`** — written when a hook returns a `hook-output` arm the lifecycle event it fired from does not honor (see [Honored `hook-output` arm per event](wit-interfaces.md#murmurhooklifecycle))
 

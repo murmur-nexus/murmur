@@ -169,18 +169,22 @@ hook and continues immediately; only valid with `commit_policy: none` at MVP).
 
 **Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
 observability hooks), **`replace-context`** (runtime replaces conversation history; used for
-compaction), or **`write-manifests`** (runtime writes tool manifest records to
+compaction), **`write-manifests`** (runtime writes tool manifest records to
 `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file; used for shell tool
-enrichment during staging).
+enrichment during staging), or **`reopen-task`** (runtime re-runs the task's agent loop with the
+hook's feedback instead of finalizing it; only valid with `binding: on-task-end` — see [Task
+reopening](#task-reopening-commit_policy-reopen-task) below).
 
 | execution_mode | commit_policy | Valid? | Notes |
 |---|---|---|---|
 | `blocking` | `none` | ✓ | Observability that must complete before proceeding |
 | `blocking` | `replace-context` | ✓ | Compaction |
 | `blocking` | `write-manifests` | ✓ | Shell tool enrichment |
+| `blocking` | `reopen-task` | ✓ | Task reopening; only meaningful with `binding: on-task-end` |
 | `async` | `none` | ✓ | Normal observability (Grafana, OTel) |
 | `async` | `replace-context` | ✗ | Not implemented |
 | `async` | `write-manifests` | ✗ | Not implemented |
+| `async` | `reopen-task` | ✗ | Not implemented — a reopen decision must block on the task's outcome |
 | any | any | ✗ if `on-stage` + `async` | Staging must complete before launch |
 
 `write-manifests` is only ever processed for `on-stage`-bound hooks — that binding is the sole
@@ -230,6 +234,45 @@ identical grant; no binding or execution mode is exempt. See
 The turn limit caps how many inference calls a single task may make. It defaults to **10**
 and is set per-capsule in the manifest. When the limit is reached, the loop exits with
 `exit_status: "max_turns_reached"`.
+
+### Task reopening (`commit_policy: reopen-task`) { #task-reopening-commit_policy-reopen-task }
+
+A hook bound to `on-task-end` with `commit_policy: reopen-task` can veto a task's outcome
+instead of just observing it. When it returns `reopen-task(reason)`, the runtime does not
+finalize the task: it re-runs the task's agent loop with `reason` injected into the task
+content as feedback, then fires `on-task-end` again so the hook can re-inspect the new result.
+A hook that never returns `reopen-task` (the common case — plain `none`) sees no behavior
+change from this mechanism.
+
+This repeats up to a per-task budget, `inference.max_task_reopens` (default **1**; `0` disables
+reopening entirely — unlike `max_turns`, an explicit `0` is valid rather than rejected).
+Reopening never grants turns beyond the capsule's `inference.max_turns` ceiling: every attempt
+of a task shares one cumulative turn count, so a task cannot out-run its turn budget just
+because a hook keeps asking for another try.
+
+If the reopen budget (or the turn ceiling) is exhausted while a hook still wants to reopen, the
+task ends as a distinct, non-silent failure: `exit_status: "reopen_budget_exhausted"` rather than
+an ordinary `"ok"`/`"failed"`. The task registry / A2A task state records this the same way as
+any other failed task.
+
+Every reopen is written to `trace.jsonl` as a `task_reopened` event (the hook's name, its
+feedback text, and a 1-based ordinal), and the terminal `task_end` record carries a
+`reopen_count` field — `0` for a task that ran once. See [Session trace
+(`trace.jsonl`) schema](../reference/cli.md#session-trace-tracejsonl) for the exact shapes.
+
+The reopen budget is scoped to a single task, not accumulated across a `task_acceptance: queue`
+session: each task starts with a fresh count of `0` reopens used, regardless of what a prior
+task in the same session consumed.
+
+```yaml
+name: murmur-hook-gatekeeper
+version: 1.0.0
+runtime: hook
+binding: on-task-end
+execution_mode: blocking
+commit_policy: reopen-task
+description: "Rejects a task's result until its own checks pass."
+```
 
 ### Tool dispatch
 
