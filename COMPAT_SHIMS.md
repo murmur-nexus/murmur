@@ -17,3 +17,4 @@ data rows below (`grep -r COMPAT-SHIM` to check).
 | ID | Interface / package | Legacy version | Added in | Remove when | Ref | Module |
 |----|---------------------|-----------------|----------|-------------|-----|--------|
 | lifecycle-v0_2 | `murmur:hook/lifecycle` | `0.2.0` | `0.3.0` | no published artifact still targets `@0.2.0` (check registry first), or next major | card `bd8a67dc` | `crates/capsule-runtime/src/compat/lifecycle_v0_2.rs` |
+| lifecycle-v0_3 | `murmur:hook/lifecycle` | `0.3.0` (and `0.2.0`) | `0.4.0` | no published hook artifact still targets `@0.2.0` or `@0.3.0` (check registry first), or next major | card `ac1e1848` | `crates/capsule-runtime/src/compat/lifecycle_v0_3.rs` |

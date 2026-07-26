@@ -328,7 +328,7 @@ Defined in `wit/hook/deps/murmur-hook/lifecycle.wit`.
 Hook artifacts export this interface when declared with `runtime: hook`. The native agent loop calls each handler synchronously. Returning `Err(string)` logs the error to `workdir/logs/hook-<name>.log` and does not abort the loop.
 
 ```wit
-package murmur:hook@0.3.0;
+package murmur:hook@0.4.0;
 
 interface lifecycle {
   record message {
@@ -346,6 +346,7 @@ interface lifecycle {
     replace-context(list<message>),
     write-manifests(list<tool-manifest>),
     artifact(string),
+    reopen-task(string),
   }
 
   record session-context {
@@ -462,8 +463,16 @@ Event points:
 | `on-tool-call` | none honored |
 | `on-shell` | none honored |
 | `on-compaction` | `replace-context` |
-| `on-task-end` | none honored |
+| `on-task-end` | `reopen-task` |
 | `on-session-end` | none honored |
+
+`reopen-task` is a *control* arm, not a data arm: returning it from `on-task-end` does not
+finalize the task — the runtime re-runs the task's agent loop with the arm's string payload
+injected as feedback, subject to `inference.max_task_reopens`/`inference.max_turns`. See [Task
+reopening](../concepts/capsule-runtime.md#task-reopening-commit_policy-reopen-task) for the full
+mechanism. Returning `reopen-task` from any handler other than `on-task-end` is not honored —
+it falls through to the unsupported-arm fault path described next, exactly like any other
+non-`none` arm the firing handler does not honor.
 
 Returning `none` from any handler is always silent — this is the normal case for a purely observational hook. Returning the handler's honored arm commits it exactly as described above. Returning any other non-`none` arm (e.g. `write-manifests` from `on-task-end`, or `replace-context` from `on-tool-call`) is **not** an error and does not abort the session — instead it is a loud, non-fatal fault:
 
@@ -478,18 +487,23 @@ leaves it unset — the receiving hook, not the host, resolves that to a default
 `system-prompt` is still always `none`; manifest wiring for it lands in a later
 slice.
 
-**Two accepted lifecycle versions.** Adding those two fields made
-`murmur:hook` `0.3.0`, which the canonical ABI cannot absorb additively. Rather
-than force every hook to be rebuilt for a record only the compaction hook reads,
-the host resolves the lifecycle instance export by trying
-`murmur:hook/lifecycle@0.3.0` first and falling back to
-`murmur:hook/lifecycle@0.2.0`, and remembers which matched. `on-compaction` — the
-only handler whose record shape differs — is then dispatched with the 5-field
-record to a `@0.3.0` hook and the 3-field record to a `@0.2.0` one; every other
-handler's records are shape-identical across the two versions and need no
-special-casing. This is a transitional exception scoped to exactly these two
-versions of one package, **not** a return of the removed unversioned fallback: a
-hook exporting the bare `murmur:hook/lifecycle` name still fails hard.
+**Three accepted lifecycle versions.** The host resolves the lifecycle instance export by
+trying `murmur:hook/lifecycle@0.4.0` first, then `@0.3.0`, then `@0.2.0`, and remembers which
+matched. Two independent shape differences are handled this way:
+
+- `on-compaction`'s record shape: 5-field on `@0.4.0`/`@0.3.0`, 3-field on `@0.2.0`. A `@0.2.0`
+  hook is dispatched the 3-field record; every later version gets the 5-field one.
+- `hook-output`'s shape: the current 5-case variant (with `reopen-task`) on `@0.4.0`, the
+  pre-`reopen-task` 4-case variant on `@0.3.0`/`@0.2.0`. `TypedFunc::typed` is structural, so a
+  4-case guest return cannot be lifted directly against the current 5-case host type — the host
+  lifts a `@0.3.0`/`@0.2.0` hook's return through a hand-authored 4-case twin, then widens it
+  into the current type. A `@0.2.0`/`@0.3.0` hook can therefore never produce `reopen-task`,
+  which is correct: `reopen-task` is a `@0.4.0` capability.
+
+Every other handler's records are shape-identical across all three versions and need no
+special-casing. This is a transitional exception scoped to exactly these versions of one
+package, **not** a return of the removed unversioned fallback: a hook exporting the bare
+`murmur:hook/lifecycle` name still fails hard.
 
 ---
 
@@ -503,7 +517,7 @@ in the manifest changes.
 package murmur:runtime@0.2.0;
 
 interface inference {
-  use murmur:hook/lifecycle@0.3.0.{message};
+  use murmur:hook/lifecycle@0.4.0.{message};
 
   record inference-request {
     messages: list<message>,
@@ -579,7 +593,7 @@ package murmur:runtime@0.2.0;
 
 world hook {
   import inference;
-  export murmur:hook/lifecycle@0.3.0;
+  export murmur:hook/lifecycle@0.4.0;
 }
 ```
 
@@ -624,7 +638,7 @@ component binary itself.
 | `murmur:shell`              | `0.1.0` |
 | `murmur:message`            | `0.1.0` |
 | `murmur:task`                | `0.1.0` |
-| `murmur:hook`                | `0.3.0` |
+| `murmur:hook`                | `0.4.0` |
 | `murmur:runtime`            | `0.2.0` |
 | `murmur:runtime-guest`      | `0.1.0` |
 
@@ -646,15 +660,15 @@ by trying the versioned instance name first, then falling back to the legacy
 unversioned name, so artifacts built before versioning kept running unmodified.
 That fallback has since been **removed**: the host now resolves each interface by
 its versioned instance name only (`murmur:capsule/run@0.1.0`,
-`murmur:tool/run@0.1.0`, `murmur:hook/lifecycle@0.3.0`). A tool, capsule, or hook
+`murmur:tool/run@0.1.0`, `murmur:hook/lifecycle@0.4.0`). A tool, capsule, or hook
 artifact that still exports only an unversioned `package
 murmur:tool;`/`murmur:capsule;`/`murmur:hook;` interface no longer instantiates —
 it fails with a hard error naming the versioned interface the host expected and a
 rebuild hint (`mur install` for a default artifact, or a source rebuild
 otherwise). Rebuild and republish any artifact still exporting only the
-unversioned name. The one exception is the `murmur:hook/lifecycle@0.3.0` →
-`@0.2.0` fallback described above, which is scoped to two specific versions of a
-single package and does not reopen the unversioned window.
+unversioned name. The one exception is the `murmur:hook/lifecycle@0.4.0` →
+`@0.3.0` → `@0.2.0` fallback described above, which is scoped to three specific
+versions of a single package and does not reopen the unversioned window.
 
 See `crates/capsule-runtime/wit/README.md` for which build consumes each copy
 of the tree, and `crates/capsule-runtime/wit/VERSIONING.md` for the version

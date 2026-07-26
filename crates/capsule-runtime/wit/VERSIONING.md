@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.3.0`  |
+| `murmur:hook`            | `0.4.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -35,6 +35,20 @@ an existing record, which is always a major bump (see below). In the same step
 whose single `run-inference` function the host provides as an *import* to any
 hook that declares it (a hook that does not import it is unaffected), which is a
 minor bump.
+
+`murmur:hook` then went to `0.4.0` when `hook-output` gained a fifth case,
+`reopen-task(string)` (the `on-task-end` control-return). `hook-output` is the
+return type of every one of the nine `lifecycle` functions, so widening the
+variant changes the wire shape of every export — a major bump. It was **not**
+shippable as a purely additive no-version change: `TypedFunc::typed` is
+structural and does not admit variant subtyping across the call boundary, so
+lifting a pre-`reopen-task` four-case guest return against the new five-case host
+type fails with "type mismatch with results" (verified empirically — see the
+`v0_2_*`/`v0_3_*`/`compaction_hook_*` tests in `src/hooks.rs`, which fail under a
+bare additive change and pass once the host lifts pre-`@0.4.0` hooks through the
+`lifecycle_v0_3` twin). The host keeps loading `@0.3.0`- and `@0.2.0`-compiled
+hooks by lifting their returns through that twin (`src/compat/lifecycle_v0_3.rs`)
+rather than forcing a fleet-wide rebuild.
 
 ## When to bump
 
@@ -84,7 +98,9 @@ affected artifact to be rebuilt in lockstep with the WIT change. Any such
 fallback is a **compat shim**, and its code, removal condition, and inventory
 row live under the compat-shim policy — see `COMPAT_SHIMS.md` at the repo root
 for the full, current list (e.g. the `murmur:hook/lifecycle@0.2.0` shim that
-`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump).
+`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump, and the
+`lifecycle_v0_3` shim that lifts pre-`@0.4.0` four-case `hook-output` returns
+after the `0.3.0 → 0.4.0` bump).
 
 This doc stays the place to record *why a version number changed*; the shim
 table is the place to record *what backward-compat code exists because of it,

@@ -932,6 +932,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
+            max_task_reopens: 1,
             max_tokens: None,
         }
     }

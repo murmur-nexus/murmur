@@ -2527,3 +2527,47 @@ fn show_declared_mutate_clears_redundancy_for_declared_resource_id() {
         .stdout(predicate::str::contains("count:      0"))
         .stdout(predicate::str::contains("re-reads").not());
 }
+
+/// A session whose task was reopened once by an `on-task-end` hook: a `task_reopened`
+/// record sits between two attempts and the `task_end` carries `reopen_count`.
+const FIXTURE_REOPEN: &str = concat!(
+    "{\"event_type\":\"session_start\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3000,",
+    "\"capsule_name\":\"test-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-3-5-sonnet\",",
+    "\"max_turns\":10,\"capabilities\":[\"shell\"],\"tools_declared\":[\"bash\"]}\n",
+
+    "{\"event_type\":\"task_start\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3050,",
+    "\"task_id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"source\":\"a2a\",\"message_parts_bytes\":12}\n",
+
+    "{\"event_type\":\"inference\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3100,",
+    "\"turn\":1,\"input_tokens\":1000,\"output_tokens\":200,\"decision\":\"end_turn\",\"tool_name\":null}\n",
+
+    "{\"event_type\":\"task_reopened\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3150,",
+    "\"task_id\":\"tsk_1\",\"hook_name\":\"gatekeeper\",\"reason\":\"tests still fail\",\"reopen_number\":1}\n",
+
+    "{\"event_type\":\"inference\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3200,",
+    "\"turn\":2,\"input_tokens\":1100,\"output_tokens\":150,\"decision\":\"end_turn\",\"tool_name\":null}\n",
+
+    "{\"event_type\":\"task_end\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3300,",
+    "\"task_id\":\"tsk_1\",\"exit_status\":\"ok\",\"duration_ms\":250,\"turns\":2,\"input_tokens\":2100,",
+    "\"output_tokens\":350,\"tool_calls\":0,\"shell_calls\":0,\"reopen_count\":1}\n",
+
+    "{\"event_type\":\"session_end\",\"session_id\":\"ses_cccccccccccc4ccc8ccc000000000003\",\"timestamp\":3400,",
+    "\"total_turns\":2,\"total_input_tokens\":2100,\"total_output_tokens\":350,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":400,\"exit_status\":\"ok\"}\n"
+);
+
+/// `mur trace show` surfaces the new `task_reopened` event and `reopen_count` field
+/// without crashing, listing the reopen with its hook and feedback.
+#[test]
+fn show_surfaces_reopen_events_and_count() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "reopen.jsonl", FIXTURE_REOPEN);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reopens"))
+        .stdout(predicate::str::contains("gatekeeper"))
+        .stdout(predicate::str::contains("tests still fail"));
+}

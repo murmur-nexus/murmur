@@ -24,7 +24,7 @@ use crate::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
-    compat::lifecycle_v0_2,
+    compat::{lifecycle_v0_2, lifecycle_v0_3},
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
@@ -34,32 +34,38 @@ use crate::{
 };
 
 /// Current versioned instance export name: what a hook compiled against
-/// `murmur:hook@0.3.0` (5-field `compaction-event`) carries in its
+/// `murmur:hook@0.4.0` (5-case `hook-output` with `reopen-task`) carries in its
 /// component-type section.
-const OBS_IFACE_V0_3: &str = "murmur:hook/lifecycle@0.3.0";
+const OBS_IFACE_V0_4: &str = "murmur:hook/lifecycle@0.4.0";
 
-/// Which `murmur:hook/lifecycle` version a given component resolved at. The
-/// only dispatch decision it drives is the `on-compaction` record shape — every
-/// other lifecycle record is byte-identical between the two versions.
+/// Which `murmur:hook/lifecycle` version a given component resolved at. It drives
+/// two dispatch decisions: the `on-compaction` param shape (`V0_2` is 3-field, the
+/// others 5-field) and the `hook-output` return shape (`V0_4` is the current 5-case
+/// variant; `V0_3`/`V0_2` are the pre-`reopen-task` 4-case variant, lifted through
+/// the [`lifecycle_v0_3`] twin).
 ///
-/// `V0_2` only exists to route to the [`lifecycle_v0_2`] compat shim — see
-/// `COMPAT_SHIMS.md` at the repo root for its removal condition.
+/// `V0_3` and `V0_2` only exist to route to the compat shims — see `COMPAT_SHIMS.md`
+/// at the repo root for their removal conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleVersion {
+    V0_4,
     V0_3,
     V0_2,
 }
 
-/// Resolve the lifecycle instance export, trying `@0.3.0` first and falling back
-/// to the [`lifecycle_v0_2`] compat shim's `@0.2.0` name. Returns the export
-/// index together with the version that matched. `None` means the component
-/// exports neither name, which surfaces as a missing-export error at the call
-/// site.
+/// Resolve the lifecycle instance export, trying `@0.4.0` first, then the
+/// [`lifecycle_v0_3`] compat name `@0.3.0`, then the [`lifecycle_v0_2`] compat name
+/// `@0.2.0`. Returns the export index together with the version that matched. `None`
+/// means the component exports none of them, which surfaces as a missing-export error
+/// at the call site.
 fn resolve_lifecycle_iface(
     instance: &wasmtime::component::Instance,
     store: &mut Store<HookStoreState>,
 ) -> Option<(wasmtime::component::ComponentExportIndex, LifecycleVersion)> {
-    if let Some(idx) = instance.get_export_index(&mut *store, None, OBS_IFACE_V0_3) {
+    if let Some(idx) = instance.get_export_index(&mut *store, None, OBS_IFACE_V0_4) {
+        return Some((idx, LifecycleVersion::V0_4));
+    }
+    if let Some(idx) = instance.get_export_index(&mut *store, None, lifecycle_v0_3::IFACE_NAME) {
         return Some((idx, LifecycleVersion::V0_3));
     }
     instance
@@ -67,12 +73,13 @@ fn resolve_lifecycle_iface(
         .map(|idx| (idx, LifecycleVersion::V0_2))
 }
 
-/// Diagnostic naming both accepted lifecycle export names, used wherever
+/// Diagnostic naming every accepted lifecycle export name, used wherever
 /// resolution fails.
 fn missing_lifecycle_msg(subject: &str) -> String {
+    let v03 = lifecycle_v0_3::IFACE_NAME;
     let v02 = lifecycle_v0_2::IFACE_NAME;
     format!(
-        "hook {subject} exports neither {OBS_IFACE_V0_3} nor {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
+        "hook {subject} exports none of {OBS_IFACE_V0_4}, {v03}, {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )
 }
 
@@ -142,7 +149,7 @@ const HONORED_OUTPUT_ARM: &[(&str, Option<&str>)] = &[
     ("on-tool-call", None),
     ("on-shell", None),
     ("on-compaction", Some("replace-context")),
-    ("on-task-end", None),
+    ("on-task-end", Some("reopen-task")),
     ("on-session-end", None),
 ];
 
@@ -166,6 +173,7 @@ fn output_arm_name(output: &HookOutput) -> Option<&'static str> {
         HookOutput::ReplaceContext(_) => Some("replace-context"),
         HookOutput::WriteManifests(_) => Some("write-manifests"),
         HookOutput::Artifact(_) => Some("artifact"),
+        HookOutput::ReopenTask(_) => Some("reopen-task"),
     }
 }
 
@@ -356,11 +364,29 @@ enum HookCallResult {
     Artifact(HookArtifact),
     /// A replacement conversation history (only meaningful for `on-compaction`).
     ReplaceContext(Vec<Message>),
+    /// A control decision to reopen the task (only honored for `on-task-end`).
+    /// Carries the requesting hook's manifest name and its feedback `reason`; the
+    /// agent loop re-runs with that feedback injected into the task content, up to
+    /// the capsule's reopen/turn budget. See [`TaskReopen`].
+    Reopen { hook_name: String, reason: String },
     /// The hook returned a non-`none` arm the event does not honor. Non-fatal: the
     /// caller logs it (and, for the shared dispatch path, buffers it for the trace)
     /// and continues as if the hook had returned `none`. Carries the event's WIT
     /// function name and the discarded arm name.
     UnsupportedArm { event: String, arm: String },
+}
+
+/// A blocking `on-task-end` hook returned `reopen-task(reason)`: a control
+/// decision that the task's agent loop should re-run with `reason` injected as
+/// feedback rather than being finalized. Surfaced by [`HookRuntime::dispatch_task_end`]
+/// and acted on by the runtime's per-task reopen loop, subject to the capsule's
+/// `inference.max_task_reopens` budget and `inference.max_turns` ceiling.
+#[derive(Debug, Clone)]
+pub(crate) struct TaskReopen {
+    /// Manifest name of the hook that requested the reopen.
+    pub hook_name: String,
+    /// Feedback text the hook wants injected into the reopened task's content.
+    pub reason: String,
 }
 
 /// An artifact emitted by a blocking hook via `HookOutput::Artifact`.
@@ -520,7 +546,7 @@ async fn call_stage_once(
             )
         })?;
 
-    let (obs_idx, _version) = resolve_lifecycle_iface(&instance, &mut store)
+    let (obs_idx, version) = resolve_lifecycle_iface(&instance, &mut store)
         .ok_or_else(|| missing_lifecycle_msg(&format!("{}@{}", staged.name, staged.version)))?;
 
     let func = instance
@@ -528,20 +554,54 @@ async fn call_stage_once(
         .and_then(|idx| instance.get_func(&mut store, idx))
         .ok_or_else(|| format!("hook {}@{} missing on-stage", staged.name, staged.version))?;
 
+    // `hook-output` is 5-case on `@0.4.0` and 4-case on the pre-`reopen-task` legacy
+    // tiers; lift through whichever the guest declares (see `call_typed`). `on-stage`
+    // runs on its own throwaway store, so this cannot reuse the blocking-hook path.
+    match version {
+        LifecycleVersion::V0_4 => {
+            call_stage_lift::<HookOutput>(&mut store, &func, evt, &staged.name, limits).await
+        }
+        LifecycleVersion::V0_3 | LifecycleVersion::V0_2 => {
+            call_stage_lift::<lifecycle_v0_3::HookOutputLegacy>(
+                &mut store,
+                &func,
+                evt,
+                &staged.name,
+                limits,
+            )
+            .await
+            .map(HookOutput::from)
+        }
+    }
+}
+
+/// Call `on-stage` on a throwaway store, lifting its `result<O, string>` where `O` is
+/// the version-appropriate `hook-output` type. Returns the hook's own returned error
+/// as the `Err` string, exactly as the pre-versioning inline call did.
+async fn call_stage_lift<O>(
+    store: &mut Store<HookStoreState>,
+    func: &wasmtime::component::Func,
+    evt: &StageEvent,
+    hook_name: &str,
+    limits: ExecutionLimits,
+) -> Result<O, String>
+where
+    O: wasmtime::component::ComponentType + wasmtime::component::Lift + 'static,
+{
     let f = func
-        .typed::<(StageEvent,), (Result<HookOutput, String>,)>(&store)
+        .typed::<(StageEvent,), (Result<O, String>,)>(&*store)
         .map_err(|e| e.to_string())?;
     // Fresh budget for the call itself, so instantiation cost cannot eat into it.
     store.set_epoch_deadline(limits.deadline_ticks());
-    let called = f.call_async(&mut store, (evt.clone(),)).await;
+    let called = f.call_async(&mut *store, (evt.clone(),)).await;
     let (result,) = match called {
         Ok(result) => result,
         Err(err) => {
             let failure = classify_guest_failure(&err, &store.data().limits);
-            return Err(failure.message(&format!("hook '{}' on-stage", staged.name), &err));
+            return Err(failure.message(&format!("hook '{hook_name}' on-stage"), &err));
         }
     };
-    f.post_return_async(&mut store)
+    f.post_return_async(&mut *store)
         .await
         .map_err(|e| e.to_string())?;
     result
@@ -649,19 +709,26 @@ impl HookRuntime {
 
     /// Shared dispatch path used by every Lifecycle Event. Iterates the blocking
     /// hooks (binding-filtered), then spawns each matching async hook fire-and-forget.
-    /// Returns `(artifacts, replacement, first_error)`: `artifacts` collects every
+    /// Returns `(artifacts, replacement, first_error, reopen)`: `artifacts` collects every
     /// `on-inference` `HookOutput::Artifact`; `replacement` is the first `on-compaction`
     /// `HookOutput::ReplaceContext`; `first_error` is the message of the first bound
-    /// hook that returned `Err` for this event. Every caller but `dispatch_compaction`
-    /// discards `first_error` — the error is still logged per-hook and the loop still
-    /// continues, so `emit()`'s observable behaviour is unchanged; only compaction
-    /// promotes it to a session failure. Event-keyed side effects (the running
-    /// token/tool-call/shell-call totals) run here so all events funnel through one place.
+    /// hook that returned `Err` for this event; `reopen` is the first `on-task-end`
+    /// `HookOutput::ReopenTask`. Callers read only the half they need — `emit()` takes
+    /// `artifacts`, `dispatch_compaction` `replacement`/`first_error`, `dispatch_task_end`
+    /// `reopen` — and discard the rest; the per-hook error is still logged and the loop
+    /// still continues, so `emit()`'s observable behaviour is unchanged. Event-keyed side
+    /// effects (the running token/tool-call/shell-call totals) run here so all events
+    /// funnel through one place.
     async fn dispatch(
         &mut self,
         workdir: &Path,
         event: HookEvent,
-    ) -> (Vec<HookArtifact>, Option<Vec<Message>>, Option<String>) {
+    ) -> (
+        Vec<HookArtifact>,
+        Option<Vec<Message>>,
+        Option<String>,
+        Option<TaskReopen>,
+    ) {
         if let HookEvent::Inference {
             input_tokens,
             output_tokens,
@@ -688,6 +755,7 @@ impl HookRuntime {
 
         let mut artifacts: Vec<HookArtifact> = Vec::new();
         let mut replacement: Option<Vec<Message>> = None;
+        let mut reopen: Option<TaskReopen> = None;
         let mut first_error: Option<String> = None;
         // Faults are collected here and appended to `self.dispatch_faults` after the
         // loop: the loop holds `&mut self.blocking_hooks`, so `self` cannot be touched
@@ -704,6 +772,12 @@ impl HookRuntime {
                 Ok(HookCallResult::ReplaceContext(msgs)) => {
                     if replacement.is_none() {
                         replacement = Some(msgs);
+                    }
+                }
+                Ok(HookCallResult::Reopen { hook_name, reason }) => {
+                    // First reopen-requesting hook wins, mirroring `replacement`.
+                    if reopen.is_none() {
+                        reopen = Some(TaskReopen { hook_name, reason });
                     }
                 }
                 Ok(HookCallResult::None) => {}
@@ -770,7 +844,7 @@ impl HookRuntime {
             });
         }
 
-        (artifacts, replacement, first_error)
+        (artifacts, replacement, first_error, reopen)
     }
 
     /// Fire `on-compaction` on all hooks with a matching binding.
@@ -805,11 +879,33 @@ impl HookRuntime {
             model,
             system_prompt,
         };
-        let (_, replacement, first_error) = self.dispatch(&workdir, event).await;
+        let (_, replacement, first_error, _) = self.dispatch(&workdir, event).await;
         match first_error {
             Some(error) => Err(error),
             None => Ok(replacement),
         }
+    }
+
+    /// Fire `on-task-end` on all hooks with a matching binding and surface the first
+    /// [`TaskReopen`] any blocking hook requested via `reopen-task`, or `None` if none
+    /// did. A thin wrapper over the shared [`Self::dispatch`] path, mirroring
+    /// [`Self::dispatch_compaction`]: it builds a `HookEvent::TaskEnd` and reads only
+    /// the `reopen` half of the four-tuple. `on-task-end` honors no artifact or
+    /// replacement arm, so those halves are discarded; async hooks still fire
+    /// fire-and-forget. A hook-returned `Err` is logged per-hook inside `dispatch`
+    /// and does not abort the task, matching `emit`.
+    pub(crate) async fn dispatch_task_end(
+        &mut self,
+        task_id: String,
+        exit_status: String,
+    ) -> Option<TaskReopen> {
+        let workdir = self.workdir.clone();
+        let event = HookEvent::TaskEnd {
+            task_id,
+            exit_status,
+        };
+        let (_, _, _, reopen) = self.dispatch(&workdir, event).await;
+        reopen
     }
 }
 
@@ -879,7 +975,8 @@ async fn instantiate_blocking_hook(
         })?;
 
     let iface_name = match lifecycle_version {
-        LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
+        LifecycleVersion::V0_4 => OBS_IFACE_V0_4,
+        LifecycleVersion::V0_3 => lifecycle_v0_3::IFACE_NAME,
         LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
@@ -970,8 +1067,39 @@ where
         Some(f) => *f,
         None => return Ok(None),
     };
+    // `hook-output` is the return type of every lifecycle function, and its wire shape
+    // depends on the resolved package version: `@0.4.0` returns the current 5-case
+    // variant, while `@0.3.0`/`@0.2.0` return the pre-`reopen-task` 4-case twin. Lift
+    // through whichever the guest actually declares, then widen to the current type —
+    // `TypedFunc::typed` is structural and rejects a 4-case guest return lifted against
+    // the 5-case host type outright, so this is not optional.
+    let out = match hook.lifecycle_version {
+        LifecycleVersion::V0_4 => invoke_typed::<T, HookOutput>(hook, &func, fn_name, arg).await?,
+        LifecycleVersion::V0_3 | LifecycleVersion::V0_2 => {
+            invoke_typed::<T, lifecycle_v0_3::HookOutputLegacy>(hook, &func, fn_name, arg)
+                .await?
+                .into()
+        }
+    };
+    Ok(Some(out))
+}
+
+/// Invoke one component `func` with a single record arg and lift its
+/// `result<O, string>`, where `O` is the version-appropriate `hook-output` type.
+/// Shared by both branches of [`call_typed`]; the `Err` variant carries either an
+/// infra failure or the hook's own returned error string, exactly as before.
+async fn invoke_typed<T, O>(
+    hook: &mut HookInstance,
+    func: &wasmtime::component::Func,
+    fn_name: &str,
+    arg: T,
+) -> Result<O, String>
+where
+    T: wasmtime::component::ComponentType + wasmtime::component::Lower,
+    O: wasmtime::component::ComponentType + wasmtime::component::Lift + 'static,
+{
     let f = func
-        .typed::<(T,), (Result<HookOutput, String>,)>(&hook.store)
+        .typed::<(T,), (Result<O, String>,)>(&hook.store)
         .map_err(|e| e.to_string())?;
 
     // A blocking hook's store outlives every event it handles, so each lifecycle call is
@@ -994,7 +1122,7 @@ where
     f.post_return_async(&mut hook.store)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Some(result?))
+    result
 }
 
 /// Call one hook instance for a runtime event via its name-based dispatch table.
@@ -1104,12 +1232,12 @@ async fn call_hook(
             model,
             system_prompt,
         } => {
-            // The one record whose shape differs between `murmur:hook@0.2.0`
-            // and `@0.3.0`. `TypedFunc::typed` is structural, so the 5-field
-            // record simply does not type-check against a `@0.2.0`-compiled
-            // hook's `on-compaction`; send it the 3-field twin instead.
+            // `compaction-event` is 5-field on `@0.3.0`/`@0.4.0` and 3-field on
+            // `@0.2.0`. `TypedFunc::typed` is structural, so the 5-field record
+            // simply does not type-check against a `@0.2.0`-compiled hook's
+            // `on-compaction`; send it the 3-field twin instead.
             match hook.lifecycle_version {
-                LifecycleVersion::V0_3 => {
+                LifecycleVersion::V0_4 | LifecycleVersion::V0_3 => {
                     let evt = CompactionEvent {
                         messages: messages.clone(),
                         session_tokens: *session_tokens,
@@ -1174,6 +1302,12 @@ async fn call_hook(
                     payload,
                 }),
                 HookOutput::ReplaceContext(msgs) => HookCallResult::ReplaceContext(msgs),
+                // `reopen-task` is honored only by `on-task-end`; the runtime's
+                // reopen loop reads this off `dispatch_task_end`.
+                HookOutput::ReopenTask(reason) => HookCallResult::Reopen {
+                    hook_name: hook.name.clone(),
+                    reason,
+                },
                 // `write-manifests` is honored only by `on-stage`, which is never
                 // dispatched through `call_hook`; no other arm is honored by any of
                 // the eight events reaching here.
@@ -1245,7 +1379,8 @@ async fn call_async_hook(
         resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| missing_lifecycle_msg(name))?;
 
     let iface_name = match lifecycle_version {
-        LifecycleVersion::V0_3 => OBS_IFACE_V0_3,
+        LifecycleVersion::V0_4 => OBS_IFACE_V0_4,
+        LifecycleVersion::V0_3 => lifecycle_v0_3::IFACE_NAME,
         LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
     let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
@@ -1355,6 +1490,12 @@ mod tests {
     use crate::inference_import::INFERENCE_IFACE_VERSIONED;
     use tempfile::TempDir;
 
+    /// The pre-`reopen-task` (`@0.3.0`) lifecycle instance name. Many doubles below
+    /// hand-author the 4-case `hook-output` and must therefore export this name so the
+    /// host lifts their returns through the [`lifecycle_v0_3`] twin. The current-version
+    /// doubles use [`OBS_IFACE_V0_4`].
+    const OBS_IFACE_V0_3: &str = lifecycle_v0_3::IFACE_NAME;
+
     /// Engine configured like the production one (component model + async + epoch
     /// interruption) so a hand-authored WAT component double can be compiled and
     /// instantiated. Epoch interruption only arms the mechanism — a deadline fires solely
@@ -1372,10 +1513,10 @@ mod tests {
     /// or calls them — so these stubs are sufficient to exercise the required-vs-optional
     /// instantiation logic (invariants 5 and 6).
     fn hook_double(engine: &wasmtime::Engine, fn_names: &[&str]) -> Component {
-        // Default double exports the versioned instance name — the only name the
-        // host resolves now that the unversioned fallback is removed — so the
-        // required/optional suite exercises real resolution.
-        hook_double_iface(engine, OBS_IFACE_V0_3, fn_names)
+        // Default double exports the current versioned instance name, so the
+        // required/optional suite exercises real resolution against the version the
+        // host probes first.
+        hook_double_iface(engine, OBS_IFACE_V0_4, fn_names)
     }
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
@@ -1699,10 +1840,10 @@ mod tests {
         });
     }
 
-    /// Transition-window invariant: a hook component built against the *versioned*
-    /// `murmur:hook/lifecycle@0.2.0` interface (the name a freshly-compiled hook
+    /// A hook component built against the *current* versioned
+    /// `murmur:hook/lifecycle@0.4.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
-    /// The versioned name is the one `resolve_lifecycle_iface` probes first.
+    /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
     fn versioned_hook_double_instantiates_and_registers_fns() {
         let session = TempDir::new().unwrap();
@@ -1710,7 +1851,7 @@ mod tests {
         let engine = hook_test_engine();
         let mut names: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
         names.extend_from_slice(&OPTIONAL_HOOK_FNS);
-        let component = hook_double_iface(&engine, OBS_IFACE_V0_3, &names);
+        let component = hook_double_iface(&engine, OBS_IFACE_V0_4, &names);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1902,6 +2043,11 @@ mod tests {
     /// wrapper to share, so it stays inline here.
     fn hook_compaction_double(engine: &wasmtime::Engine, version: LifecycleVersion) -> Component {
         match version {
+            // The current-version (5-case hook-output) compaction path is exercised by
+            // the dedicated reopen/echo doubles; this helper only builds the legacy tiers.
+            LifecycleVersion::V0_4 => {
+                unreachable!("hook_compaction_double builds only the @0.3.0/@0.2.0 legacy tiers")
+            }
             LifecycleVersion::V0_3 => {
                 let core = r#"    (memory (export "memory") 1)
     (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
@@ -3192,6 +3338,166 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
+    /// A *current-version* (`@0.4.0`, 5-case `hook-output`) `on-task-end` double that
+    /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
+    /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
+    /// offset 300 so the host lifts the real bytes the guest declared, exercising the
+    /// typed `reopen-task` wire path end-to-end rather than host-side Rust state.
+    ///
+    /// Return area at 128: `result` discriminant `0` (ok); `hook-output` discriminant
+    /// at 132; the `reopen-task` string `(ptr,len)` at 136/140. `on-task-end`'s flat
+    /// params are the two strings of `task-end-event` (4 i32).
+    fn hook_task_end_arm_double(
+        engine: &wasmtime::Engine,
+        arm_disc: i32,
+        reason: &str,
+    ) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reason_len = reason.len();
+        let iface = OBS_IFACE_V0_4;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (data (i32.const 300) "{reason}")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "ontaskend") (param i32 i32 i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const {arm_disc}))
+      (i32.store (i32.const 136) (i32.const 300))
+      (i32.store (i32.const 140) (i32.const {reason_len}))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)))
+  (type $task-end-event (record
+    (field "task-id" string)
+    (field "exit-status" string)))
+  (type $ft (func (param "event" $task-end-event) (result (result $hook-output (error string)))))
+
+  (func $te (type $ft)
+    (canon lift (core func $i "ontaskend") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "task-end-event" (type $task-end-event))
+    (export "on-task-end" (func $te))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("task-end component WAT parses");
+        Component::new(engine, &bytes).expect("task-end component double compiles")
+    }
+
+    /// Scenario: a blocking `on-task-end` hook returning `reopen-task(reason)` is the one
+    /// honored arm for that event; `dispatch_task_end` surfaces it as a
+    /// [`TaskReopen`] naming the hook and carrying the exact feedback string the guest
+    /// returned, with no dispatch fault logged.
+    #[test]
+    fn on_task_end_reopen_task_is_surfaced_by_dispatch_task_end() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 4 = reopen-task.
+        let component = hook_task_end_arm_double(&engine, 4, "tests still fail");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named("gatekeeper", HookBinding::OnTaskEnd, component)],
+            )
+            .await
+            .expect("task-end double instantiates");
+
+            let reopen = hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await
+                .expect("on-task-end returned reopen-task, so a TaskReopen must surface");
+            assert_eq!(reopen.hook_name, "gatekeeper");
+            assert_eq!(reopen.reason, "tests still fail");
+            assert!(
+                hooks.drain_dispatch_faults().is_empty(),
+                "reopen-task is honored at on-task-end, not a fault"
+            );
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "gatekeeper"),
+            0,
+            "an honored reopen-task must not log a fault"
+        );
+    }
+
+    /// An `on-task-end` hook returning `none` (arm 0) drives no reopen:
+    /// `dispatch_task_end` returns `None`.
+    #[test]
+    fn on_task_end_none_surfaces_no_reopen() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_task_end_arm_double(&engine, 0, "unused");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named("observer", HookBinding::OnTaskEnd, component)],
+            )
+            .await
+            .expect("task-end double instantiates");
+
+            let reopen = hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await;
+            assert!(reopen.is_none(), "none from on-task-end must not request a reopen");
+            assert!(hooks.drain_dispatch_faults().is_empty());
+        });
+    }
+
+    /// Invariant: `reopen-task` returned from any event other than `on-task-end` is a
+    /// dispatch fault, not a silent grant. Bind the same 5-case double to `on-tool-call`
+    /// (its `on-tool-call` export is a bare stub, so dispatching it fails `.typed()` —
+    /// but the point tested here is the honored-arm *table*: `on-tool-call` honors no
+    /// arm, so even if it returned `reopen-task` it would be classified `Fault`, exactly
+    /// as `classify_output` decides generically).
+    #[test]
+    fn reopen_task_is_only_honored_at_on_task_end() {
+        // Pure table check: reopen-task is honored ONLY by on-task-end.
+        for (event, arm) in HONORED_OUTPUT_ARM {
+            let honors_reopen = *arm == Some("reopen-task");
+            assert_eq!(
+                honors_reopen,
+                *event == "on-task-end",
+                "{event} honoring reopen-task must be exactly on-task-end"
+            );
+        }
+    }
+
     /// An `on-stage` double returning `ok(<arm>)`, `arm_disc` as in
     /// [`hook_tool_call_arm_double`]. `on-stage` honors only `write-manifests`
     /// (`2`), so `1` (`replace-context`) is an unsupported-arm fault and `0`
@@ -3630,7 +3936,10 @@ artifacts:
         for (_, arm) in HONORED_OUTPUT_ARM {
             if let Some(arm) = arm {
                 assert!(
-                    matches!(*arm, "replace-context" | "write-manifests" | "artifact"),
+                    matches!(
+                        *arm,
+                        "replace-context" | "write-manifests" | "artifact" | "reopen-task"
+                    ),
                     "honored arm {arm} must be a real hook-output variant"
                 );
             }
