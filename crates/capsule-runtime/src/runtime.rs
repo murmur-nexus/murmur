@@ -11,7 +11,8 @@ use std::{
 use murmur_artifact::{
     current_platform, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
     read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
-    ArtifactImplementation, ArtifactRuntime, ContextConfig, HookBinding, LifecycleConfig, LockedArtifact,
+    ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
+    InferenceConfig, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
     TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008,
@@ -42,6 +43,7 @@ use crate::{
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
+        TaskReopen,
     },
     identity::{self, CapsuleIdentity},
     inference_import::HookInferenceCtx,
@@ -96,6 +98,159 @@ fn resolve_versioned_iface<T>(
     versioned: &str,
 ) -> Option<wasmtime::component::ComponentExportIndex> {
     instance.get_export_index(&mut *store, None, versioned)
+}
+
+/// Run one task's agent loop, honoring `on-task-end` `reopen-task` control decisions.
+///
+/// Fires `on-task-end` after every attempt (via [`HookRuntime::dispatch_task_end`]). If
+/// a blocking hook returns `reopen-task(reason)` and both budgets still allow it — fewer
+/// than `inference.max_task_reopens` reopens used AND cumulative task turns still below
+/// `inference.max_turns` — the task's `accessible_workdir/task.md` is rewritten as the
+/// original content plus every reopen's feedback so far, a `task_reopened` trace record
+/// is written, and the loop runs again. Reopening shares one cumulative turn budget with
+/// the original attempt: each attempt is handed only `max_turns - task_turns()` turns, so
+/// the whole task can never exceed the capsule's turn ceiling.
+///
+/// Writes the terminal `task_end` record (carrying the final `reopen_count`) itself, and
+/// the terminal `on-task-end` dispatch is simply the loop's last one. Returns the task's
+/// final result: the last attempt's own result when a hook was satisfied (or none was
+/// bound), or `Err` when a hook still wanted to reopen but the reopen budget or turn
+/// ceiling was reached — so every existing `.is_err()` branch at the call sites treats an
+/// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
+/// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
+///
+/// `agent_task_id` is what [`agent::run_agent_loop`] receives (governs A2A SSE emission);
+/// `trace_task_id` is the id used for the `task_start`/`task_reopened`/`task_end` records
+/// and the `on-task-end` hook event. The two coincide on the A2A path and differ on the
+/// backward-compat `task.md` paths, which pass `agent_task_id = None`.
+#[allow(clippy::too_many_arguments)]
+async fn run_task_with_reopens(
+    state: &mut CapsuleStoreState,
+    workdir: &Path,
+    inference: &InferenceConfig,
+    system_prompt: Option<String>,
+    run_config: agent::AgentRunConfig,
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    agent_task_id: Option<String>,
+    sse: Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    accessible_workdir: &Path,
+    capsule_name: &str,
+    capsule_version: &str,
+    mode: ConversationMode,
+    context_id: Option<String>,
+    trace_task_id: &str,
+) -> Result<(), RuntimeError> {
+    let task_md_path = accessible_workdir.join("task.md");
+    // Original task content, captured once before any feedback is appended, so repeated
+    // reopens re-inject a fresh copy of every feedback item rather than compounding.
+    let original_task = tokio::fs::read_to_string(&task_md_path)
+        .await
+        .unwrap_or_default();
+    // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
+    let mut feedback: Vec<(String, String)> = Vec::new();
+    let mut reopens_used: u32 = 0;
+
+    loop {
+        // Reopening never grants turns past `max_turns`: hand this attempt only the turns
+        // still unspent by prior attempts of the same task. On the first attempt
+        // `task_turns()` is 0 (reset by the preceding `write_task_start`), so it gets the
+        // full ceiling.
+        let remaining_turns = inference.max_turns.saturating_sub(trace.task_turns());
+        let mut attempt_inference = inference.clone();
+        attempt_inference.max_turns = remaining_turns;
+
+        let result = agent::run_agent_loop(
+            state,
+            workdir,
+            &attempt_inference,
+            system_prompt.clone(),
+            run_config.clone(),
+            hooks,
+            trace,
+            otel,
+            agent_task_id.clone(),
+            sse.clone(),
+            accessible_workdir,
+            capsule_name,
+            capsule_version,
+            mode.clone(),
+            context_id.clone(),
+        )
+        .await;
+
+        let exit_str = if result.is_ok() { "ok" } else { "failed" };
+
+        // Let the `on-task-end` hooks inspect this attempt and decide whether to reopen.
+        let reopen = hooks
+            .dispatch_task_end(trace_task_id.to_string(), exit_str.to_string())
+            .await;
+
+        match reopen {
+            Some(TaskReopen { hook_name, reason }) => {
+                // A hook wants more. Honor it only if a reopen remains in the budget AND
+                // turns remain under the ceiling; otherwise the request is exhausted and
+                // ends the task non-silently.
+                let budget_ok = reopens_used < inference.max_task_reopens;
+                let turns_ok = trace.task_turns() < inference.max_turns;
+                if budget_ok && turns_ok {
+                    reopens_used += 1;
+                    feedback.push((hook_name.clone(), reason.clone()));
+                    let _ = trace
+                        .write_task_reopened(trace_task_id, &hook_name, &reason, reopens_used)
+                        .await;
+                    // Rewrite task.md as original + all feedback so far; the resumed
+                    // attempt picks it up through its normal `read_task`, so neither
+                    // transport's message-building code needs to change.
+                    let rewritten = build_reopen_task_md(&original_task, &feedback);
+                    if let Err(e) = tokio::fs::write(&task_md_path, rewritten.as_bytes()).await {
+                        eprintln!(
+                            "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
+                        );
+                    }
+                    continue;
+                }
+                // Budget or turn ceiling reached while a hook still wanted to reopen: end
+                // the task as a distinct, non-silent failure rather than an ordinary
+                // completion. `Err` keeps every existing `.is_err()` downstream branch.
+                let _ = trace
+                    .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
+                    .await;
+                return Err(RuntimeError::AgentLoopFailed(format!(
+                    "task reopen budget exhausted after {reopens_used} reopen(s): hook \
+                     '{hook_name}' still requested another reopen"
+                )));
+            }
+            None => {
+                // No hook asked to reopen — this attempt is terminal.
+                let _ = trace
+                    .write_task_end(trace_task_id, exit_str, reopens_used)
+                    .await;
+                return result;
+            }
+        }
+    }
+}
+
+/// Compose the reopened task's `task.md`: the original task content followed by a clearly
+/// delimited feedback section for every reopen so far, each naming the hook that produced
+/// it. Used by [`run_task_with_reopens`].
+fn build_reopen_task_md(original: &str, feedback: &[(String, String)]) -> String {
+    let mut out = original.trim_end().to_string();
+    out.push_str(
+        "\n\n---\n\n# Reopen feedback\n\nThe previous attempt was not accepted. Address the \
+         following feedback, then continue.\n",
+    );
+    for (i, (hook_name, reason)) in feedback.iter().enumerate() {
+        out.push_str(&format!(
+            "\n## Reopen {} — from hook `{}`\n\n{}\n",
+            i + 1,
+            hook_name,
+            reason.trim()
+        ));
+    }
+    out
 }
 
 /// Live-delivery buffer: only needs to cover the lag between fastest and slowest
@@ -824,7 +979,10 @@ pub fn launch_session(
                                         .await;
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
-                                    let result = agent::run_agent_loop(
+                                    // run_task_with_reopens fires on-task-end, honors any
+                                    // reopen-task within budget, and writes the terminal
+                                    // task_end (with reopen_count) itself.
+                                    let result = run_task_with_reopens(
                                         &mut state,
                                         &workdir,
                                         inference,
@@ -840,20 +998,9 @@ pub fn launch_session(
                                         &capsule_version,
                                         conversation_mode.clone(),
                                         Some(context_id.clone()),
+                                        &task_id,
                                     )
                                     .await;
-                                    let exit_str =
-                                        if result.is_ok() { "ok" } else { "failed" };
-                                    let _ = trace.write_task_end(&task_id, exit_str).await;
-                                    hooks
-                                        .emit(
-                                            &workdir,
-                                            HookEvent::TaskEnd {
-                                                task_id: task_id.clone(),
-                                                exit_status: exit_str.to_string(),
-                                            },
-                                        )
-                                        .await;
                                     final_loop_result = result;
                                     break 'task_loop;
                                 } else {
@@ -888,7 +1035,7 @@ pub fn launch_session(
                                         .await;
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
-                                    let result = agent::run_agent_loop(
+                                    let result = run_task_with_reopens(
                                         &mut state,
                                         &workdir,
                                         inference,
@@ -904,20 +1051,9 @@ pub fn launch_session(
                                         &capsule_version,
                                         conversation_mode.clone(),
                                         Some(context_id.clone()),
+                                        &task_id,
                                     )
                                     .await;
-                                    let exit_str =
-                                        if result.is_ok() { "ok" } else { "failed" };
-                                    let _ = trace.write_task_end(&task_id, exit_str).await;
-                                    hooks
-                                        .emit(
-                                            &workdir,
-                                            HookEvent::TaskEnd {
-                                                task_id: task_id.clone(),
-                                                exit_status: exit_str.to_string(),
-                                            },
-                                        )
-                                        .await;
                                     let _ = trace.flush().await;
                                     if matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Single) || result.is_err() {
                                         final_loop_result = result;
@@ -1034,7 +1170,7 @@ pub fn launch_session(
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.a2a_task_id = Some(incoming.task_id.clone());
-                        let loop_result = agent::run_agent_loop(
+                        let loop_result = run_task_with_reopens(
                             &mut state,
                             &workdir,
                             inference,
@@ -1050,26 +1186,19 @@ pub fn launch_session(
                             &capsule_version,
                             conversation_mode.clone(),
                             Some(incoming.context_id.clone()),
+                            &incoming.task_id,
                         )
                         .await;
 
                         // ── POST-LOOP SLOT UPDATE ──
+                        // task_end (with reopen_count) and the terminal on-task-end dispatch
+                        // already happened inside run_task_with_reopens; an exhausted reopen
+                        // budget surfaces here as loop_result.is_err(), i.e. a failed task.
                         let exit_state = if loop_result.is_ok() {
                             TaskState::Completed
                         } else {
                             TaskState::Failed
                         };
-                        let exit_str = if loop_result.is_ok() { "ok" } else { "failed" };
-                        let _ = trace.write_task_end(&incoming.task_id, exit_str).await;
-                        hooks
-                            .emit(
-                                &workdir,
-                                HookEvent::TaskEnd {
-                                    task_id: incoming.task_id.clone(),
-                                    exit_status: exit_str.to_string(),
-                                },
-                            )
-                            .await;
                         let _ = trace.flush().await;
                         {
                             let mut reg = task_registry.lock().unwrap();
@@ -3799,6 +3928,7 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
+            max_task_reopens: 1,
             max_tokens: None,
         };
 
@@ -4664,5 +4794,288 @@ mod tests {
 
         assert_eq!(inert_capability_sub_blocks(Some(&caps)), vec!["shell", "env"]);
         assert!(inert_capability_sub_blocks(None).is_empty());
+    }
+
+    // ── End-to-end reopen loop (real Wasmtime hook + real process transport) ──────
+
+    /// Write an executable fake `claude`-dialect CLI that, on each spawn, consumes its
+    /// stdin then emits exactly one assistant text turn and a success result — so every
+    /// agent-loop attempt burns exactly one turn and returns `Ok`.
+    fn write_fake_claude_cli(dir: &Path) -> PathBuf {
+        let script = dir.join("claude");
+        fs::write(
+            &script,
+            "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}'\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+    }
+
+    /// A current-version (`@0.4.0`, 5-case `hook-output`) `on-task-end` hook double that
+    /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
+    /// mutable core global that persists across a blocking hook's reused store) and `none`
+    /// thereafter. `reopen_limit` large ⇒ "always reopen".
+    fn on_task_end_reopen_double(
+        engine: &wasmtime::Engine,
+        reopen_limit: u32,
+        reason: &str,
+    ) -> wasmtime::component::Component {
+        let reason_len = reason.len();
+        let stubs = [
+            "on-session-start",
+            "on-inference",
+            "on-tool-call",
+            "on-shell",
+            "on-compaction",
+            "on-session-end",
+        ]
+        .iter()
+        .map(|n| format!("    (export \"{n}\" (func $noop))"))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (global $count (mut i32) (i32.const 0))
+    (data (i32.const 300) "{reason}")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "ontaskend") (param i32 i32 i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (if (result i32) (i32.lt_u (global.get $count) (i32.const {reopen_limit}))
+        (then
+          (global.set $count (i32.add (global.get $count) (i32.const 1)))
+          (i32.store (i32.const 132) (i32.const 4))
+          (i32.store (i32.const 136) (i32.const 300))
+          (i32.store (i32.const 140) (i32.const {reason_len}))
+          (i32.const 128))
+        (else
+          (i32.store (i32.const 132) (i32.const 0))
+          (i32.const 128))))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)))
+  (type $task-end-event (record
+    (field "task-id" string)
+    (field "exit-status" string)))
+  (type $ft (func (param "event" $task-end-event) (result (result $hook-output (error string)))))
+
+  (func $te (type $ft)
+    (canon lift (core func $i "ontaskend") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "task-end-event" (type $task-end-event))
+    (export "on-task-end" (func $te))
+{stubs}
+  )
+  (export "murmur:hook/lifecycle@0.4.0" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");
+        wasmtime::component::Component::new(engine, &bytes)
+            .expect("on-task-end reopen double compiles")
+    }
+
+    /// Drive `run_task_with_reopens` once, with a real process-transport agent loop (fake
+    /// `claude` CLI, one turn per attempt) and a real Wasmtime `on-task-end` hook that
+    /// reopens `reopen_limit` times. Returns the task result and the parsed `trace.jsonl`.
+    async fn run_reopen_scenario(
+        reopen_limit: u32,
+        max_task_reopens: u32,
+        max_turns: u32,
+    ) -> (Result<(), RuntimeError>, Vec<serde_json::Value>) {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        fs::create_dir_all(workdir.join("tools")).unwrap();
+        fs::write(workdir.join("task.md"), "Original task: build the thing.").unwrap();
+        let cli = write_fake_claude_cli(dir.path());
+
+        let inference = InferenceConfig {
+            transport: "process".into(),
+            endpoint: None,
+            model: "test-model".into(),
+            api_key: None,
+            driver: None,
+            command: Some(cli.to_string_lossy().to_string()),
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns,
+            max_task_reopens,
+            max_tokens: None,
+        };
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+
+        let mut trace = TraceWriter::open(
+            &workdir,
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "0.1.0".to_string(),
+            "test-model".to_string(),
+            Vec::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+
+        let staged_hook = StagedHookArtifact {
+            name: "gatekeeper".to_string(),
+            version: "0.0.1".to_string(),
+            component: on_task_end_reopen_double(&state.engine, reopen_limit, "tests still fail"),
+            config: murmur_artifact::HookConfig {
+                binding: HookBinding::OnTaskEnd,
+                execution_mode: murmur_artifact::HookExecutionMode::Blocking,
+                commit_policy: murmur_artifact::HookCommitPolicy::ReopenTask,
+            },
+            grant: HookCapabilityGrant::default(),
+        };
+
+        let mut hooks = HookRuntime::new(
+            &state.engine,
+            &workdir,
+            &workdir,
+            vec![staged_hook],
+            SessionContextData {
+                capsule_name: "cap".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "ses_test".to_string(),
+                model: "test-model".to_string(),
+                capabilities: Vec::new(),
+            },
+            HookEnvVars::default(),
+            crate::limits::ExecutionLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let run_config = agent::AgentRunConfig {
+            context_window: 0,
+            compaction_threshold: 0.98,
+            compaction_model: None,
+            compaction_system_prompt: None,
+            compaction_dump_summaries: false,
+            max_output_tokens: 1024,
+        };
+
+        // Caller resets per-task counters via write_task_start before the reopen loop.
+        trace
+            .write_task_start("tsk_1", "ctx_1", "task_md", 8)
+            .await
+            .unwrap();
+
+        let result = run_task_with_reopens(
+            &mut state,
+            &workdir,
+            &inference,
+            None,
+            run_config,
+            &mut hooks,
+            &mut trace,
+            &mut otel,
+            None,
+            None,
+            &workdir,
+            "cap",
+            "0.1.0",
+            ConversationMode::Stateless,
+            Some("ctx_1".to_string()),
+            "tsk_1",
+        )
+        .await;
+
+        trace.flush().await.unwrap();
+        let content = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (result, events)
+    }
+
+    fn count_type(events: &[serde_json::Value], ty: &str) -> usize {
+        events.iter().filter(|e| e["event_type"] == ty).count()
+    }
+
+    /// Happy path: one reopen, then the hook is satisfied. The agent loop runs twice, one
+    /// `task_reopened` sits between the attempts naming the hook and its feedback, and the
+    /// terminal `task_end` shows `reopen_count: 1` with the second attempt's real outcome.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_once_then_satisfied_end_to_end() {
+        let (result, events) = run_reopen_scenario(1, 5, 10).await;
+        assert!(result.is_ok(), "a satisfied hook ends the task Ok: {result:?}");
+        assert_eq!(count_type(&events, "inference"), 2, "agent loop ran exactly twice");
+        assert_eq!(count_type(&events, "task_reopened"), 1);
+        let re = events.iter().find(|e| e["event_type"] == "task_reopened").unwrap();
+        assert_eq!(re["hook_name"], "gatekeeper");
+        assert_eq!(re["reason"], "tests still fail");
+        assert_eq!(re["reopen_number"], 1);
+        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        assert_eq!(end["reopen_count"], 1);
+        assert_eq!(end["exit_status"], "ok");
+    }
+
+    /// Budget exhausted: a hook that always reopens with `max_task_reopens: 1` runs the
+    /// loop exactly twice, then ends `reopen_budget_exhausted` (an `Err`, so downstream
+    /// task-failure branches fire) with `reopen_count: 1`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_budget_exhausted_end_to_end() {
+        let (result, events) = run_reopen_scenario(99, 1, 10).await;
+        assert!(result.is_err(), "an exhausted reopen budget is a task failure");
+        assert_eq!(count_type(&events, "inference"), 2, "1 original + 1 reopen");
+        assert_eq!(count_type(&events, "task_reopened"), 1);
+        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        assert_eq!(end["reopen_count"], 1);
+        assert_eq!(end["exit_status"], "reopen_budget_exhausted");
+    }
+
+    /// Turn ceiling respected: `max_turns: 3`, `max_task_reopens: 5`, a hook that always
+    /// reopens, one turn per attempt. Cumulative `inference` records never exceed 3, and
+    /// the task ends `reopen_budget_exhausted` once turns run out even though reopens
+    /// remain in the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_never_exceeds_max_turns_end_to_end() {
+        let (result, events) = run_reopen_scenario(99, 5, 3).await;
+        assert!(result.is_err());
+        assert_eq!(
+            count_type(&events, "inference"),
+            3,
+            "cumulative turns must never exceed max_turns"
+        );
+        assert_eq!(count_type(&events, "task_reopened"), 2, "3 attempts ⇒ 2 reopens");
+        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        assert_eq!(end["reopen_count"], 2);
+        assert_eq!(end["exit_status"], "reopen_budget_exhausted");
     }
 }

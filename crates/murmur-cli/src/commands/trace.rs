@@ -164,6 +164,21 @@ struct TaskEndEvent {
     output_tokens: u64,
     tool_calls: u32,
     shell_calls: u32,
+    /// Times an `on-task-end` hook reopened this task before it ended. Absent in
+    /// pre-slice traces, so it defaults to 0.
+    #[serde(default)]
+    reopen_count: u32,
+}
+
+/// One `on-task-end` hook reopened the task. New event type; older `mur` binaries
+/// route it through the `Unknown` catch-all, this one surfaces it.
+#[derive(Debug, Deserialize)]
+struct TaskReopenedEvent {
+    #[allow(dead_code)]
+    task_id: String,
+    hook_name: String,
+    reason: String,
+    reopen_number: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +193,7 @@ enum TraceEvent {
     SessionEnd(SessionEndEvent),
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
+    TaskReopened(TaskReopenedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -246,6 +262,15 @@ struct TraceMetrics {
     skill_latencies_ms: Vec<u64>,
     skill_call_records: Vec<SkillCallRecord>,
     compaction: Option<CompactionRecord>,
+    /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
+    reopens: Vec<ReopenRecord>,
+}
+
+/// One `task_reopened` trace record, surfaced in `mur trace show`.
+struct ReopenRecord {
+    reopen_number: u32,
+    hook_name: String,
+    reason: String,
 }
 
 impl TraceMetrics {
@@ -324,6 +349,7 @@ struct TaskMetrics {
     output_tokens: u64,
     tool_calls: u32,
     shell_calls: u32,
+    reopen_count: u32,
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
@@ -463,6 +489,7 @@ fn compute_metrics(
     // Per-task state: task_id → partial TaskMetrics (filled in as events arrive)
     let mut task_starts: HashMap<String, (String, String)> = HashMap::new(); // task_id → (context_id, source)
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
+    let mut reopens: Vec<ReopenRecord> = Vec::new();
 
     for event in events {
         match event {
@@ -553,8 +580,16 @@ fn compute_metrics(
                         output_tokens: e.output_tokens,
                         tool_calls: e.tool_calls,
                         shell_calls: e.shell_calls,
+                        reopen_count: e.reopen_count,
                     });
                 }
+            }
+            TraceEvent::TaskReopened(e) => {
+                reopens.push(ReopenRecord {
+                    reopen_number: e.reopen_number,
+                    hook_name: e.hook_name,
+                    reason: e.reason,
+                });
             }
             TraceEvent::Unknown => {}
         }
@@ -600,6 +635,7 @@ fn compute_metrics(
             skill_latencies_ms: skill_latencies,
             skill_call_records,
             compaction,
+            reopens,
         },
         task_metrics,
     ))
@@ -1004,6 +1040,18 @@ fn print_show(m: &TraceMetrics) {
             fmt_thousands(c.tokens_after)
         ),
     }
+
+    if !m.reopens.is_empty() {
+        println!();
+        println!("── Reopens ──────────────────────────────────────");
+        for r in &m.reopens {
+            let reason: String = r.reason.chars().take(80).collect();
+            println!(
+                "reopen {}  by {}  “{}”",
+                r.reopen_number, r.hook_name, reason
+            );
+        }
+    }
 }
 
 pub(crate) fn run_trace_show(session: Option<String>, workdir_arg: Option<PathBuf>) -> Result<(), CliError> {
@@ -1023,15 +1071,21 @@ pub(crate) fn run_trace_show(session: Option<String>, workdir_arg: Option<PathBu
             } else {
                 &t.task_id
             };
+            let reopen_note = if t.reopen_count > 0 {
+                format!("  reopens: {}", t.reopen_count)
+            } else {
+                String::new()
+            };
             println!(
-                "task {}  {}  turns: {}  in: {}  out: {}  {}  {}",
+                "task {}  {}  turns: {}  in: {}  out: {}  {}  {}{}",
                 i + 1,
                 short_id,
                 t.turns,
                 fmt_thousands(t.input_tokens),
                 fmt_thousands(t.output_tokens),
                 t.exit_status,
-                fmt_dur(t.duration_ms)
+                fmt_dur(t.duration_ms),
+                reopen_note
             );
         }
     }

@@ -210,6 +210,26 @@ struct TaskEndEvent {
     output_tokens: u64,
     tool_calls: u32,
     shell_calls: u32,
+    /// How many times this task's agent loop was reopened by an `on-task-end` hook
+    /// before the terminal outcome. `0` for a task that ran once (the common case).
+    reopen_count: u32,
+}
+
+/// One `on-task-end` hook reopened the task: its agent loop is about to re-run with
+/// the hook's feedback injected. Written between two agent-loop attempts for the same
+/// task, so `mur trace show` can show which hook drove each reopen and why.
+#[derive(Serialize)]
+struct TaskReopenedEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    /// Manifest name of the `on-task-end` hook that returned `reopen-task`.
+    hook_name: String,
+    /// Feedback text the hook asked to inject into the reopened task content.
+    reason: String,
+    /// 1-based ordinal of this reopen within the task (first reopen = 1).
+    reopen_number: u32,
 }
 
 #[derive(Serialize)]
@@ -474,6 +494,7 @@ impl TraceWriter {
         &mut self,
         task_id: &str,
         exit_status: &str,
+        reopen_count: u32,
     ) -> std::io::Result<()> {
         let duration_ms = self
             .task_start_instant
@@ -493,9 +514,40 @@ impl TraceWriter {
             output_tokens: self.task_output_tokens,
             tool_calls: self.task_tool_calls,
             shell_calls: self.task_shell_calls,
+            reopen_count,
         };
         self.active_task_id = None;
         self.write_event(&event).await
+    }
+
+    /// Record that an `on-task-end` hook reopened the task. Written by the runtime's
+    /// per-task reopen loop between two agent-loop attempts, once per reopen, before
+    /// the terminal `task_end` record. `reopen_number` is 1-based.
+    pub(crate) async fn write_task_reopened(
+        &mut self,
+        task_id: &str,
+        hook_name: &str,
+        reason: &str,
+        reopen_number: u32,
+    ) -> std::io::Result<()> {
+        let event = TaskReopenedEvent {
+            event_type: "task_reopened",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            hook_name: hook_name.to_string(),
+            reason: reason.to_string(),
+            reopen_number,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Cumulative turns consumed by the active task so far, across however many
+    /// agent-loop attempts have run since the last [`Self::write_task_start`]. Read by
+    /// the reopen loop to compute the remaining `max_turns` budget for the next attempt
+    /// so reopening never grants turns past the capsule's ceiling.
+    pub(crate) fn task_turns(&self) -> u32 {
+        self.task_turns
     }
 
     pub(crate) async fn write_compaction(
@@ -1154,5 +1206,63 @@ mod tests {
             "output must be present when include_tool_output is true"
         );
         assert_eq!(e["output_bytes"], 60);
+    }
+
+    #[tokio::test]
+    async fn task_end_carries_reopen_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        w.write_task_end("tsk_1", "ok", 2).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        assert_eq!(end["task_id"], "tsk_1");
+        assert_eq!(end["exit_status"], "ok");
+        assert_eq!(end["reopen_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn task_reopened_names_hook_reason_and_ordinal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        w.write_task_reopened("tsk_1", "gatekeeper", "tests still fail", 1)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let re = events
+            .iter()
+            .find(|e| e["event_type"] == "task_reopened")
+            .unwrap();
+        assert_eq!(re["task_id"], "tsk_1");
+        assert_eq!(re["hook_name"], "gatekeeper");
+        assert_eq!(re["reason"], "tests still fail");
+        assert_eq!(re["reopen_number"], 1);
+        assert!(re["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    /// `task_turns()` reports the cumulative per-task turn count the reopen loop reads to
+    /// compute the remaining `max_turns` budget: it advances with each `write_inference`
+    /// and resets on `write_task_start`.
+    #[tokio::test]
+    async fn task_turns_accessor_tracks_and_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        assert_eq!(w.task_turns(), 0);
+        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None)
+            .await
+            .unwrap();
+        w.write_inference(1, 10, 5, "end_turn".to_string(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(w.task_turns(), 2);
+        // A new task resets the per-task counter.
+        w.write_task_start("tsk_2", "ctx_2", "a2a", 3).await.unwrap();
+        assert_eq!(w.task_turns(), 0);
     }
 }

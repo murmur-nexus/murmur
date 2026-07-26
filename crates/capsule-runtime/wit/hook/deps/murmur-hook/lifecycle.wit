@@ -1,4 +1,4 @@
-package murmur:hook@0.3.0;
+package murmur:hook@0.4.0;
 
 interface lifecycle {
     record message {
@@ -18,6 +18,13 @@ interface lifecycle {
         /// Emit a structured artifact payload to the SSE event stream.
         /// The string must be a valid JSON object.
         artifact(string),
+        /// Control decision honored only at `on-task-end`: do not finalize the
+        /// task, re-run its agent loop with `reason` injected into the task
+        /// content as feedback, then let this hook re-inspect the result. Bounded
+        /// by the capsule's `inference.max_task_reopens` budget and its
+        /// `inference.max_turns` ceiling. Returned from any other lifecycle event
+        /// it is a non-fatal dispatch fault (logged and traced, never honored).
+        reopen-task(string),
     }
 
     record session-context {

@@ -212,6 +212,9 @@ pub enum HookCommitPolicy {
     ReplaceContext,
     /// `"write-manifests"` — runtime writes tool manifests to workdir/tools/. Valid only with on-stage.
     WriteManifests,
+    /// `"reopen-task"` — runtime re-runs the task's agent loop with the hook's feedback.
+    /// Valid only with on-task-end.
+    ReopenTask,
 }
 
 /// Behavioral contract for a hook artifact, read from its own murmur.yaml.
@@ -293,8 +296,10 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
             "none" => Ok(HookCommitPolicy::None),
             "replace-context" => Ok(HookCommitPolicy::ReplaceContext),
             "write-manifests" => Ok(HookCommitPolicy::WriteManifests),
+            "reopen-task" => Ok(HookCommitPolicy::ReopenTask),
             other => Err(format!(
-                "unknown commit_policy '{other}'; expected: none, replace-context, write-manifests"
+                "unknown commit_policy '{other}'; expected: none, replace-context, write-manifests, \
+                 reopen-task"
             )),
         })
         .transpose()?
@@ -309,6 +314,7 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
                 HookCommitPolicy::None => "none",
                 HookCommitPolicy::ReplaceContext => "replace-context",
                 HookCommitPolicy::WriteManifests => "write-manifests",
+                HookCommitPolicy::ReopenTask => "reopen-task",
             }
         ));
     }
@@ -427,6 +433,11 @@ pub struct InferenceConfig {
     /// Maximum LLM turns per capsule task. Defaults to 10 when absent in the manifest.
     /// Enforced as a hard ceiling by the runtime.
     pub max_turns: u32,
+    /// Maximum times an `on-task-end` hook may reopen a single task (re-run its agent
+    /// loop with injected feedback). Defaults to 1 when absent. `0` disables reopening
+    /// entirely. Unlike `max_turns`, `0` is a valid explicit value. Reopening never
+    /// grants turns past `max_turns` — the two budgets share one cumulative turn count.
+    pub max_task_reopens: u32,
     /// Maximum output tokens the model may generate per turn (`max_tokens` in the driver wire
     /// payload). None means the manifest didn't set it; the runtime applies its own default.
     /// `transport: http` only — rejected at parse time under `transport: process`.
@@ -764,6 +775,8 @@ struct RawInferenceConfig {
     compaction: Option<RawCompactionConfig>,
     #[serde(default)]
     max_turns: Option<u32>,
+    #[serde(default)]
+    max_task_reopens: Option<u32>,
     #[serde(default)]
     max_tokens: Option<u32>,
 }
@@ -1155,6 +1168,10 @@ fn parse_inference(
         Some(n) => n,
     };
 
+    // Unlike `max_turns`, `0` is a valid explicit value here: it disables reopening.
+    // Absent defaults to 1 (one reopen permitted).
+    let max_task_reopens = raw.max_task_reopens.unwrap_or(1);
+
     match transport.as_str() {
         "http" => {
             let endpoint = required_inference_field(raw.endpoint, "endpoint")?;
@@ -1203,6 +1220,7 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
+                max_task_reopens,
                 max_tokens: raw.max_tokens,
             }))
         }
@@ -1254,6 +1272,7 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
+                max_task_reopens,
                 max_tokens: None,
             }))
         }
@@ -3182,6 +3201,32 @@ context:
     }
 
     #[test]
+    fn hook_config_parses_reopen_task_commit_policy() {
+        let yaml = "name: gate\nruntime: hook\nbinding: on-task-end\ncommit_policy: reopen-task\n";
+        let config = parse_hook_config_from_yaml(yaml).unwrap();
+        assert_eq!(config.binding, HookBinding::OnTaskEnd);
+        assert_eq!(config.commit_policy, HookCommitPolicy::ReopenTask);
+    }
+
+    #[test]
+    fn hook_config_unknown_commit_policy_lists_reopen_task() {
+        let yaml = "name: gate\nruntime: hook\ncommit_policy: on-nonsense\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(err.contains("reopen-task"), "error was: {err}");
+    }
+
+    /// The existing, unmodified async/commit validation must also reject
+    /// `commit_policy: reopen-task` combined with `execution_mode: async`.
+    #[test]
+    fn hook_config_async_reopen_task_is_rejected() {
+        let yaml =
+            "name: gate\nruntime: hook\nexecution_mode: async\ncommit_policy: reopen-task\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(err.contains("async-with-commit"), "error was: {err}");
+        assert!(err.contains("reopen-task"), "error was: {err}");
+    }
+
+    #[test]
     fn parse_tool_implementation_defaults_to_wasm() {
         let impl_ = parse_tool_implementation_from_yaml("name: my-tool\nruntime: tool\n");
         assert_eq!(impl_, ArtifactImplementation::Wasm);
@@ -3246,6 +3291,40 @@ context:
         let msg = err.to_string();
         assert!(msg.contains("inference.max_turns"), "error was: {msg}");
         assert!(msg.contains("greater than 0"), "error was: {msg}");
+    }
+
+    #[test]
+    fn inference_max_task_reopens_defaults_to_1() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n",
+        ).unwrap();
+        assert_eq!(manifest.inference.unwrap().max_task_reopens, 1);
+    }
+
+    #[test]
+    fn inference_max_task_reopens_explicit_value() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur-driver-anthropic\n",
+        ).unwrap();
+        assert_eq!(manifest.inference.unwrap().max_task_reopens, 3);
+    }
+
+    /// Unlike `max_turns`, `0` is a valid explicit value — it disables reopening.
+    #[test]
+    fn inference_max_task_reopens_zero_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_task_reopens: 0\n  driver:\n    artifact: murmur-driver-anthropic\n",
+        ).unwrap();
+        assert_eq!(manifest.inference.unwrap().max_task_reopens, 0);
+    }
+
+    /// `max_task_reopens` threads through the `transport: process` construction site too.
+    #[test]
+    fn inference_max_task_reopens_process_transport() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  max_task_reopens: 2\n",
+        ).unwrap();
+        assert_eq!(manifest.inference.unwrap().max_task_reopens, 2);
     }
 
     #[test]

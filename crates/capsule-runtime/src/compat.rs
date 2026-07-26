@@ -5,3 +5,4 @@
 //! code. See that file before adding or removing anything under this module.
 
 pub(crate) mod lifecycle_v0_2;
+pub(crate) mod lifecycle_v0_3;
