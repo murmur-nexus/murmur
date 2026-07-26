@@ -345,6 +345,7 @@ interface lifecycle {
     none,
     replace-context(list<message>),
     write-manifests(list<tool-manifest>),
+    artifact(string),
   }
 
   record session-context {
@@ -449,6 +450,26 @@ Event points:
 `session-id` is generated once per runtime session as a UUID and remains stable for all hook events in that run.
 
 `on-task-start`/`on-task-end` are optional exports: a hook component compiled before these events existed instantiates normally and is simply never dispatched for them. All other handlers, including `on-stage` through `on-session-end` from the original vocabulary, remain required — a component missing one of those fails instantiation with an error naming the missing function.
+
+**Honored `hook-output` arm per event.** A hook may return any `hook-output` arm from any handler, but the runtime only *commits* one specific arm per event — every other non-`none` arm is discarded. This mapping is fixed and applies uniformly across all nine handlers:
+
+| Handler | Honored arm |
+|---|---|
+| `on-stage` | `write-manifests` |
+| `on-session-start` | none honored (only `none` is silent) |
+| `on-task-start` | none honored |
+| `on-inference` | `artifact` |
+| `on-tool-call` | none honored |
+| `on-shell` | none honored |
+| `on-compaction` | `replace-context` |
+| `on-task-end` | none honored |
+| `on-session-end` | none honored |
+
+Returning `none` from any handler is always silent — this is the normal case for a purely observational hook. Returning the handler's honored arm commits it exactly as described above. Returning any other non-`none` arm (e.g. `write-manifests` from `on-task-end`, or `replace-context` from `on-tool-call`) is **not** an error and does not abort the session — instead it is a loud, non-fatal fault:
+
+- One line is appended to `workdir/logs/hook-<name>.log` naming the hook, the handler, and the discarded arm.
+- For every handler except `on-stage` (which runs during capsule staging, before the session's trace file exists), the same fault is also written to `trace.jsonl` as a `hook_dispatch_error` event — see [Session trace (`trace.jsonl`) schema](cli.md#session-trace-tracejsonl).
+- An async hook (`execution_mode: async`) that returns an unsupported arm is logged the same way but never produces a trace record, matching how a genuine `Err` from an async hook is already handled today.
 
 `compaction-event.model` / `compaction-event.system-prompt` tell a compaction
 hook which model and system prompt to use for its own summarization call.
