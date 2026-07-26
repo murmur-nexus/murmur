@@ -1116,6 +1116,7 @@ pub fn launch_session(
                         )
                         .await;
 
+                    agent::flush_hook_dispatch_faults(&mut hooks, &mut trace).await;
                     let _ = trace.write_session_end_if_not_ended("failed").await;
                     otel.emit_session_end_if_not_ended("failed").await;
                     trace.flush().await.map_err(|e| {

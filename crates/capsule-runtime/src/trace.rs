@@ -212,6 +212,16 @@ struct TaskEndEvent {
     shell_calls: u32,
 }
 
+#[derive(Serialize)]
+struct HookDispatchErrorEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    hook_name: String,
+    event: String,
+    arm: String,
+}
+
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
@@ -505,6 +515,28 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Record that a hook returned a `hook-output` arm the lifecycle event does not
+    /// honor. Written by the agent loop from a buffered [`crate::hooks::DispatchFault`]
+    /// drained just before `session_end`. Non-fatal: the session already continued as
+    /// if the hook had returned `none`; this only makes the discard visible to
+    /// `mur trace show` and anything reading the session trace.
+    pub(crate) async fn write_hook_dispatch_error(
+        &mut self,
+        hook_name: &str,
+        event: &str,
+        arm: &str,
+    ) -> std::io::Result<()> {
+        let event = HookDispatchErrorEvent {
+            event_type: "hook_dispatch_error",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            hook_name: hook_name.to_string(),
+            event: event.to_string(),
+            arm: arm.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
     pub(crate) async fn write_session_end(&mut self, exit_status: &str) -> std::io::Result<()> {
         let duration_ms = self
             .session_start_time
@@ -793,6 +825,27 @@ mod tests {
         assert_eq!(e["turn"], 3);
         assert_eq!(e["tokens_before"], 80000);
         assert_eq!(e["tokens_after"], 20000);
+    }
+
+    #[tokio::test]
+    async fn hook_dispatch_error_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_hook_dispatch_error("my-hook", "on-tool-call", "write-manifests")
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let e = &events[0];
+        assert_eq!(e["event_type"], "hook_dispatch_error");
+        assert_eq!(e["session_id"], "test-session-id");
+        assert_eq!(e["hook_name"], "my-hook");
+        assert_eq!(e["event"], "on-tool-call");
+        assert_eq!(e["arm"], "write-manifests");
+        assert!(e["timestamp"].as_u64().unwrap() > 0);
+        // snake_case checks
+        assert!(e.get("hookName").is_none(), "must use snake_case");
     }
 
     #[tokio::test]

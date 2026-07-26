@@ -293,6 +293,7 @@ pub(crate) async fn run_agent_loop(
                 .unwrap_or_else(|| "driver returned error".to_string());
             write_result(workdir, &format!("error: {error_text}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
+            flush_hook_dispatch_faults(hooks, trace).await;
             trace
                 .write_session_end("failed")
                 .await
@@ -411,6 +412,7 @@ pub(crate) async fn run_agent_loop(
             eprintln!("inference error from driver: {error}");
             write_result(workdir, &format!("error: {error}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
+            flush_hook_dispatch_faults(hooks, trace).await;
             trace
                 .write_session_end("failed")
                 .await
@@ -474,6 +476,7 @@ pub(crate) async fn run_agent_loop(
                     eprintln!("compaction failed: {error}");
                     write_result(workdir, &format!("error: {error}"))
                         .map_err(RuntimeError::AgentLoopFailed)?;
+                    flush_hook_dispatch_faults(hooks, trace).await;
                     trace.write_session_end("failed").await.map_err(|e| {
                         RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
                     })?;
@@ -520,6 +523,7 @@ pub(crate) async fn run_agent_loop(
                         "error: response stop_reason=tool_call but no tool_call blocks were present",
                     )
                     .map_err(RuntimeError::AgentLoopFailed)?;
+                    flush_hook_dispatch_faults(hooks, trace).await;
                     trace.write_session_end("failed").await.map_err(|e| {
                         RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
                     })?;
@@ -810,6 +814,7 @@ pub(crate) async fn run_agent_loop(
                     }
                 }
 
+                flush_hook_dispatch_faults(hooks, trace).await;
                 trace.write_session_end("ok").await.map_err(|e| {
                     RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
                 })?;
@@ -868,6 +873,7 @@ pub(crate) async fn run_agent_loop(
                 let error = format!("error: unsupported stop_reason '{other}'");
                 eprintln!("{error}");
                 write_result(workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
+                flush_hook_dispatch_faults(hooks, trace).await;
                 trace.write_session_end("failed").await.map_err(|e| {
                     RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
                 })?;
@@ -897,6 +903,7 @@ pub(crate) async fn run_agent_loop(
 
     write_result(workdir, &format!("error: inference loop exceeded {max_turns} turns"))
         .map_err(RuntimeError::AgentLoopFailed)?;
+    flush_hook_dispatch_faults(hooks, trace).await;
     trace
         .write_session_end("max_turns_reached")
         .await
@@ -954,6 +961,19 @@ async fn flush_hook_inference_records(
             Some(&record.origin),
         )
         .await;
+    }
+}
+
+/// Drain every unsupported-arm fault a blocking hook buffered and write each one to
+/// `trace.jsonl` as a `hook_dispatch_error` event. Called immediately before every
+/// `session_end`/`session_end_if_not_ended` write, so no fault produced during the
+/// run is lost regardless of which exit path the session takes. A no-op when the
+/// buffer is empty (the common case), so calling it at every exit is free.
+pub(crate) async fn flush_hook_dispatch_faults(hooks: &mut HookRuntime, trace: &mut TraceWriter) {
+    for fault in hooks.drain_dispatch_faults() {
+        let _ = trace
+            .write_hook_dispatch_error(&fault.hook_name, &fault.event, &fault.arm)
+            .await;
     }
 }
 

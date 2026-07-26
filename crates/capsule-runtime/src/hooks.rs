@@ -93,6 +93,12 @@ pub(crate) struct HookRuntime {
     /// capsule has no usable inference driver — `run-inference` then returns a
     /// clear `err` instead of the import failing to link.
     inference: Option<Arc<HookInferenceCtx>>,
+    /// Unsupported-arm faults produced by blocking hooks since the last drain, in
+    /// dispatch order. Drained by the agent loop via [`Self::drain_dispatch_faults`]
+    /// and written to `trace.jsonl` as `hook_dispatch_error` events before each
+    /// `session_end` write. Mirrors the drain idiom used for `run-inference`
+    /// records (see [`Self::drain_inference_records`]).
+    dispatch_faults: Vec<DispatchFault>,
     started: Instant,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -115,6 +121,104 @@ const REQUIRED_HOOK_FNS: [&str; 6] = [
 /// Lifecycle functions introduced after the original six. A hook component compiled
 /// before these existed may omit them; it is simply not dispatched for those events.
 const OPTIONAL_HOOK_FNS: [&str; 2] = ["on-task-start", "on-task-end"];
+
+/// Single source of truth for which `hook-output` arm each of the nine lifecycle
+/// events honors. Keyed by the WIT function name; the value is the one non-`none`
+/// arm the runtime commits for that event, or `None` when the event honors nothing
+/// beyond the always-silent `none`.
+///
+/// Both dispatch paths consult this table — the shared [`call_hook`] path (for the
+/// eight events routed through [`HookRuntime::dispatch`]) and the separate
+/// [`dispatch_stage`]/[`call_stage_once`] path (for `on-stage`) — so the
+/// honored-arm decision lives in exactly one place. Any non-`none` arm a hook
+/// returns that is *not* this event's honored arm is a loud, non-fatal
+/// unsupported-arm fault (logged, and for the shared path also traced); see
+/// [`classify_output`].
+const HONORED_OUTPUT_ARM: &[(&str, Option<&str>)] = &[
+    ("on-stage", Some("write-manifests")),
+    ("on-session-start", None),
+    ("on-task-start", None),
+    ("on-inference", Some("artifact")),
+    ("on-tool-call", None),
+    ("on-shell", None),
+    ("on-compaction", Some("replace-context")),
+    ("on-task-end", None),
+    ("on-session-end", None),
+];
+
+/// The `hook-output` arm `event` (a WIT lifecycle function name) honors beyond the
+/// always-silent `none`, or `None` if it honors nothing else. Looks the event up in
+/// [`HONORED_OUTPUT_ARM`]; an unknown name (which cannot occur for the nine declared
+/// events) also yields `None`.
+fn honored_arm(event: &str) -> Option<&'static str> {
+    HONORED_OUTPUT_ARM
+        .iter()
+        .find(|(name, _)| *name == event)
+        .and_then(|(_, arm)| *arm)
+}
+
+/// The `hook-output` variant name a hook returned, or `None` for the `none` arm.
+/// The returned `&'static str` values are the same arm spellings used in
+/// [`HONORED_OUTPUT_ARM`] and in the WIT `variant hook-output`.
+fn output_arm_name(output: &HookOutput) -> Option<&'static str> {
+    match output {
+        HookOutput::None => None,
+        HookOutput::ReplaceContext(_) => Some("replace-context"),
+        HookOutput::WriteManifests(_) => Some("write-manifests"),
+        HookOutput::Artifact(_) => Some("artifact"),
+    }
+}
+
+/// What [`call_hook`] / [`dispatch_stage`] should do with one hook's returned
+/// `hook-output` for a given event, decided solely against [`HONORED_OUTPUT_ARM`].
+enum OutputDisposition {
+    /// The `none` arm — always silent and free, from every event. Nothing committed,
+    /// nothing logged, nothing traced.
+    Ignore,
+    /// The single non-`none` arm this event honors. The caller commits its payload
+    /// exactly as before this table existed.
+    Honored,
+    /// A non-`none` arm this event does not honor — a loud, non-fatal fault. Carries
+    /// the arm name for the log line and trace record.
+    Fault(&'static str),
+}
+
+/// Classify `output` for `event` against the single honored-arm table.
+fn classify_output(event: &str, output: &HookOutput) -> OutputDisposition {
+    match output_arm_name(output) {
+        None => OutputDisposition::Ignore,
+        Some(arm) if Some(arm) == honored_arm(event) => OutputDisposition::Honored,
+        Some(arm) => OutputDisposition::Fault(arm),
+    }
+}
+
+/// The one-line diagnostic written to `logs/hook-<name>.log` (and mirrored in the
+/// `hook_dispatch_error` trace record's fields) when a hook returns a non-`none`
+/// arm the event does not honor. Names the hook, the event's WIT function name, and
+/// the discarded arm so the fault is diagnosable without reading any Rust source.
+fn format_dispatch_fault(hook_name: &str, event: &str, arm: &str) -> String {
+    format!(
+        "hook '{hook_name}' returned unsupported hook-output arm '{arm}' from '{event}'; \
+         this event does not honor that arm, so the value was discarded"
+    )
+}
+
+/// A blocking hook returned a non-`none` `hook-output` arm the event does not honor.
+/// Buffered by [`HookRuntime::dispatch`] and drained via
+/// [`HookRuntime::drain_dispatch_faults`] so the agent loop can write it to
+/// `trace.jsonl` as a `hook_dispatch_error` event. Faults from `on-stage` (which
+/// runs before the trace writer exists) and from async hooks (fire-and-forget) are
+/// logged but never buffered here — matching how those two paths already handle a
+/// genuine hook `Err`.
+#[derive(Debug, Clone)]
+pub(crate) struct DispatchFault {
+    /// Manifest name of the hook that returned the unsupported arm.
+    pub hook_name: String,
+    /// WIT lifecycle function name the arm was returned from (e.g. `on-tool-call`).
+    pub event: String,
+    /// The unsupported `hook-output` arm name (e.g. `write-manifests`).
+    pub arm: String,
+}
 
 struct HookInstance {
     name: String,
@@ -252,6 +356,11 @@ enum HookCallResult {
     Artifact(HookArtifact),
     /// A replacement conversation history (only meaningful for `on-compaction`).
     ReplaceContext(Vec<Message>),
+    /// The hook returned a non-`none` arm the event does not honor. Non-fatal: the
+    /// caller logs it (and, for the shared dispatch path, buffers it for the trace)
+    /// and continues as if the hook had returned `none`. Carries the event's WIT
+    /// function name and the discarded arm name.
+    UnsupportedArm { event: String, arm: String },
 }
 
 /// An artifact emitted by a blocking hook via `HookOutput::Artifact`.
@@ -318,30 +427,53 @@ pub(crate) fn dispatch_stage(
         let evt = StageEvent { shell_allow };
         for staged in &matching {
             match call_stage_once(engine, workdir, staged, &evt, env_vars, limits).await {
-                Ok(HookOutput::WriteManifests(manifests)) => {
-                    for m in manifests {
-                        let dir = workdir.join("tools").join(&m.binary_name);
-                        if let Err(e) = std::fs::create_dir_all(&dir) {
-                            log_hook_error(
-                                workdir,
-                                &staged.name,
-                                &format!("failed to create tool dir for {}: {e}", m.binary_name),
-                            )
-                            .await;
-                            continue;
-                        }
-                        let manifest_path = dir.join(PACKED_MANIFEST_ENTRY);
-                        if let Err(e) = std::fs::write(&manifest_path, &m.content) {
-                            log_hook_error(
-                                workdir,
-                                &staged.name,
-                                &format!("failed to write manifest for {}: {e}", m.binary_name),
-                            )
-                            .await;
+                // `on-stage` runs during staging, before `trace.jsonl` exists, so an
+                // unsupported-arm fault here is logged but never traced — unlike the
+                // shared `dispatch` path. The honored arm is decided by the same
+                // `HONORED_OUTPUT_ARM` table via `classify_output`.
+                Ok(output) => match classify_output("on-stage", &output) {
+                    OutputDisposition::Honored => {
+                        // `on-stage` honors only `write-manifests`.
+                        if let HookOutput::WriteManifests(manifests) = output {
+                            for m in manifests {
+                                let dir = workdir.join("tools").join(&m.binary_name);
+                                if let Err(e) = std::fs::create_dir_all(&dir) {
+                                    log_hook_error(
+                                        workdir,
+                                        &staged.name,
+                                        &format!(
+                                            "failed to create tool dir for {}: {e}",
+                                            m.binary_name
+                                        ),
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                let manifest_path = dir.join(PACKED_MANIFEST_ENTRY);
+                                if let Err(e) = std::fs::write(&manifest_path, &m.content) {
+                                    log_hook_error(
+                                        workdir,
+                                        &staged.name,
+                                        &format!(
+                                            "failed to write manifest for {}: {e}",
+                                            m.binary_name
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
-                }
-                Ok(_) => {}
+                    OutputDisposition::Fault(arm) => {
+                        log_hook_error(
+                            workdir,
+                            &staged.name,
+                            &format_dispatch_fault(&staged.name, "on-stage", arm),
+                        )
+                        .await;
+                    }
+                    OutputDisposition::Ignore => {}
+                },
                 Err(err) => log_hook_error(workdir, &staged.name, &err).await,
             }
         }
@@ -469,6 +601,7 @@ impl HookRuntime {
             async_hooks,
             context,
             inference,
+            dispatch_faults: Vec::new(),
             started: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -495,6 +628,16 @@ impl HookRuntime {
             .as_ref()
             .map(|ctx| ctx.drain_records())
             .unwrap_or_default()
+    }
+
+    /// Take every unsupported-arm fault a blocking hook produced since the last
+    /// drain. The agent loop calls this immediately before each `session_end` write
+    /// and records each one through the session's `TraceWriter` as a
+    /// `hook_dispatch_error` event, so no fault is lost regardless of which exit path
+    /// the session takes. `on-stage` and async faults are never buffered here (they
+    /// are logged only), so this never carries them.
+    pub(crate) fn drain_dispatch_faults(&mut self) -> Vec<DispatchFault> {
+        std::mem::take(&mut self.dispatch_faults)
     }
 
     /// Dispatch `event` to all bound hooks. Returns every artifact emitted by
@@ -546,6 +689,10 @@ impl HookRuntime {
         let mut artifacts: Vec<HookArtifact> = Vec::new();
         let mut replacement: Option<Vec<Message>> = None;
         let mut first_error: Option<String> = None;
+        // Faults are collected here and appended to `self.dispatch_faults` after the
+        // loop: the loop holds `&mut self.blocking_hooks`, so `self` cannot be touched
+        // otherwise while it runs.
+        let mut faults: Vec<DispatchFault> = Vec::new();
         for hook in &mut self.blocking_hooks {
             if !binding_matches_event(&hook.config.binding, &event) {
                 continue;
@@ -560,6 +707,22 @@ impl HookRuntime {
                     }
                 }
                 Ok(HookCallResult::None) => {}
+                Ok(HookCallResult::UnsupportedArm { event: ev, arm }) => {
+                    // Non-fatal: log it, buffer it for the trace, and continue as if the
+                    // hook had returned `none`. It is not an `Err`, so it never becomes
+                    // `first_error` — compaction must not fail the session over it.
+                    log_hook_error(
+                        workdir,
+                        &hook.name,
+                        &format_dispatch_fault(&hook.name, &ev, &arm),
+                    )
+                    .await;
+                    faults.push(DispatchFault {
+                        hook_name: hook.name.clone(),
+                        event: ev,
+                        arm,
+                    });
+                }
                 Err(error) => {
                     log_hook_error(workdir, &hook.name, &error).await;
                     if first_error.is_none() {
@@ -568,6 +731,7 @@ impl HookRuntime {
                 }
             }
         }
+        self.dispatch_faults.append(&mut faults);
 
         for spec in &self.async_hooks {
             if !binding_matches_event(&spec.config.binding, &event) {
@@ -992,22 +1156,50 @@ async fn call_hook(
         }
     };
 
-    // Only on-inference forwards artifacts; only on-compaction forwards a replacement.
-    // Every other event (and every non-matching output) commits nothing.
-    Ok(match event {
-        HookEvent::Inference { .. } => match output {
-            Some(HookOutput::Artifact(payload)) => HookCallResult::Artifact(HookArtifact {
-                hook_name: hook.name.clone(),
-                payload,
-            }),
-            _ => HookCallResult::None,
+    // A single decision against `HONORED_OUTPUT_ARM`: commit the one arm this event
+    // honors (only `on-inference`/`artifact` and `on-compaction`/`replace-context`
+    // among the eight events reaching here), stay silent for `none` and for an
+    // absent optional function, and turn any other non-`none` arm into an
+    // unsupported-arm fault the caller logs and traces.
+    let event_fn = event_fn_name(event);
+    Ok(match output {
+        // Optional function absent from this component — never a fault; the hook
+        // simply is not dispatched for this event.
+        None => HookCallResult::None,
+        Some(out) => match classify_output(event_fn, &out) {
+            OutputDisposition::Ignore => HookCallResult::None,
+            OutputDisposition::Honored => match out {
+                HookOutput::Artifact(payload) => HookCallResult::Artifact(HookArtifact {
+                    hook_name: hook.name.clone(),
+                    payload,
+                }),
+                HookOutput::ReplaceContext(msgs) => HookCallResult::ReplaceContext(msgs),
+                // `write-manifests` is honored only by `on-stage`, which is never
+                // dispatched through `call_hook`; no other arm is honored by any of
+                // the eight events reaching here.
+                _ => HookCallResult::None,
+            },
+            OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
+                event: event_fn.to_string(),
+                arm: arm.to_string(),
+            },
         },
-        HookEvent::Compaction { .. } => match output {
-            Some(HookOutput::ReplaceContext(msgs)) => HookCallResult::ReplaceContext(msgs),
-            _ => HookCallResult::None,
-        },
-        _ => HookCallResult::None,
     })
+}
+
+/// The WIT lifecycle function name a [`HookEvent`] dispatches to. Used to key
+/// [`HONORED_OUTPUT_ARM`] and to name the event in an unsupported-arm fault.
+fn event_fn_name(event: &HookEvent) -> &'static str {
+    match event {
+        HookEvent::SessionStart => "on-session-start",
+        HookEvent::TaskStart { .. } => "on-task-start",
+        HookEvent::Inference { .. } => "on-inference",
+        HookEvent::ToolCall { .. } => "on-tool-call",
+        HookEvent::Shell { .. } => "on-shell",
+        HookEvent::Compaction { .. } => "on-compaction",
+        HookEvent::TaskEnd { .. } => "on-task-end",
+        HookEvent::SessionEnd { .. } => "on-session-end",
+    }
 }
 
 /// Fresh-instantiation call for async hooks (output discarded).
@@ -1068,7 +1260,15 @@ async fn call_async_hook(
         lifecycle_version,
     };
     // Async hooks fire-and-forget; any committable output is intentionally discarded.
-    call_hook(&mut tmp, context, event, elapsed, totals).await.map(|_| ())
+    // An unsupported-arm result is routed to the same `Err` channel a genuine hook
+    // error takes, so the caller's existing `log_hook_error` records it once — logged
+    // but never traced, matching how async errors are already handled.
+    match call_hook(&mut tmp, context, event, elapsed, totals).await? {
+        HookCallResult::UnsupportedArm { event: ev, arm } => {
+            Err(format_dispatch_fault(name, &ev, &arm))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Build a WASI context for a hook instance, governed by `grant` — the capability block the
@@ -2918,5 +3118,522 @@ artifacts:
             .network_allow_rules
             .iter()
             .any(|rule| rule.matches(&target)));
+    }
+
+    // ── Uniform hook-output dispatch: unsupported-arm faults ──────────────────
+
+    /// An `on-tool-call` double returning `ok(<arm>)`, where `arm_disc` selects the
+    /// `hook-output` variant: `0` = `none`, `1` = `replace-context([])`, `2` =
+    /// `write-manifests([])`. `on-tool-call` honors no arm (see
+    /// [`HONORED_OUTPUT_ARM`]), so `1` and `2` are unsupported-arm faults while `0`
+    /// is silent. The list arms return an empty list — `(ptr,len)` left at `(0,0)` —
+    /// so no guest heap layout is needed.
+    ///
+    /// Return area at 128: `result` discriminant `0` (ok); `hook-output`
+    /// discriminant at 132; list `(ptr,len)` at 136/140.
+    fn hook_tool_call_arm_double(engine: &wasmtime::Engine, arm_disc: i32) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-tool-call")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = OBS_IFACE_V0_3;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "ontool")
+      (param i32 i32 i32 i64 i64 i64 i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const {arm_disc}))
+      (i32.store (i32.const 136) (i32.const 0))
+      (i32.store (i32.const 140) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)))
+  (type $tool-event (record
+    (field "turn" u32)
+    (field "tool-name" string)
+    (field "input-bytes" u64)
+    (field "output-bytes" u64)
+    (field "duration-ms" u64)
+    (field "status" string)))
+  (type $ft (func (param "event" $tool-event) (result (result $hook-output (error string)))))
+
+  (func $ot (type $ft)
+    (canon lift (core func $i "ontool") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "tool-event" (type $tool-event))
+    (export "on-tool-call" (func $ot))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("tool-call component WAT parses");
+        Component::new(engine, &bytes).expect("tool-call component double compiles")
+    }
+
+    /// An `on-stage` double returning `ok(<arm>)`, `arm_disc` as in
+    /// [`hook_tool_call_arm_double`]. `on-stage` honors only `write-manifests`
+    /// (`2`), so `1` (`replace-context`) is an unsupported-arm fault and `0`
+    /// (`none`) is silent — exercised through `dispatch_stage`.
+    fn hook_stage_arm_double(engine: &wasmtime::Engine, arm_disc: i32) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = OBS_IFACE_V0_3;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "onstage") (param i32 i32) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const {arm_disc}))
+      (i32.store (i32.const 136) (i32.const 0))
+      (i32.store (i32.const 140) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)))
+  (type $stage-event (record (field "shell-allow" (list string))))
+  (type $ft (func (param "event" $stage-event) (result (result $hook-output (error string)))))
+
+  (func $os (type $ft)
+    (canon lift (core func $i "onstage") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "stage-event" (type $stage-event))
+    (export "on-stage" (func $os))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("stage component WAT parses");
+        Component::new(engine, &bytes).expect("stage component double compiles")
+    }
+
+    fn tool_call_event() -> HookEvent {
+        HookEvent::ToolCall {
+            turn: 0,
+            tool_name: "bash".to_string(),
+            input_bytes: 0,
+            output_bytes: 0,
+            duration_ms: 0,
+            status: "ok".to_string(),
+        }
+    }
+
+    /// Scenario (a): a blocking hook that returns a non-`none` arm the event does not
+    /// honor (`on-tool-call` → `write-manifests`) gets exactly one line in
+    /// `logs/hook-<name>.log` naming the hook/event/arm, and exactly one entry from
+    /// the new drain accessor carrying the same structured fields. The session
+    /// continues — `emit` returns normally with no artifact.
+    #[test]
+    fn unsupported_arm_from_blocking_hook_is_logged_and_buffered() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 2 = write-manifests, unsupported for on-tool-call.
+        let component = hook_tool_call_arm_double(&engine, 2);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "toolhook",
+                    HookBinding::OnToolCall,
+                    component,
+                )],
+            )
+            .await
+            .expect("double instantiates");
+
+            let artifacts = hooks.emit(session.path(), tool_call_event()).await;
+            assert!(
+                artifacts.is_empty(),
+                "an unsupported arm commits nothing, exactly as `none` would"
+            );
+
+            let faults = hooks.drain_dispatch_faults();
+            assert_eq!(faults.len(), 1, "exactly one buffered fault");
+            assert_eq!(faults[0].hook_name, "toolhook");
+            assert_eq!(faults[0].event, "on-tool-call");
+            assert_eq!(faults[0].arm, "write-manifests");
+
+            // Draining is destructive: a second drain yields nothing.
+            assert!(hooks.drain_dispatch_faults().is_empty());
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "toolhook"),
+            1,
+            "exactly one fault line is written to the per-hook log"
+        );
+        let log = std::fs::read_to_string(
+            session.path().join("logs").join("hook-toolhook.log"),
+        )
+        .unwrap();
+        assert!(log.contains("on-tool-call"), "log names the event: {log}");
+        assert!(log.contains("write-manifests"), "log names the arm: {log}");
+        assert!(log.contains("toolhook"), "log names the hook: {log}");
+    }
+
+    /// Scenario (c): `none` from an event that honors no arm produces no fault —
+    /// no log line, no buffered fault.
+    #[test]
+    fn none_from_blocking_hook_produces_no_fault() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 0 = none.
+        let component = hook_tool_call_arm_double(&engine, 0);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "quiet",
+                    HookBinding::OnToolCall,
+                    component,
+                )],
+            )
+            .await
+            .expect("double instantiates");
+
+            hooks.emit(session.path(), tool_call_event()).await;
+            assert!(
+                hooks.drain_dispatch_faults().is_empty(),
+                "`none` must never buffer a fault"
+            );
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "quiet"),
+            0,
+            "`none` must never write a log line"
+        );
+    }
+
+    /// Scenario (b), on-inference/artifact half: the honored arm is committed and
+    /// produces no fault. Uses the inference-caller double (returns `artifact`).
+    #[test]
+    fn honored_inference_artifact_produces_no_fault() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_inference_caller_double(&engine);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "inf",
+                    HookBinding::OnInference,
+                    component,
+                )],
+            )
+            .await
+            .expect("double instantiates");
+
+            let artifacts = hooks.emit(session.path(), inference_event()).await;
+            assert_eq!(artifacts.len(), 1, "the honored artifact arm is committed");
+            assert!(
+                hooks.drain_dispatch_faults().is_empty(),
+                "the honored arm must not be a fault"
+            );
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "inf"),
+            0,
+            "the honored arm must not write a fault line"
+        );
+    }
+
+    /// Scenario (b), on-compaction/replace-context half: the honored arm still
+    /// produces `Ok(Some(messages))` and buffers no fault.
+    #[test]
+    fn honored_compaction_replace_context_produces_no_fault() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "compactor",
+                    HookBinding::OnCompaction,
+                    hook_compaction_echo_model_double(&engine),
+                )],
+            )
+            .await
+            .expect("double instantiates");
+
+            let result = hooks
+                .dispatch_compaction(
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                    }],
+                    1234,
+                    0.98,
+                    Some("claude-haiku-4-5".to_string()),
+                    None,
+                )
+                .await;
+            let messages = result.expect("hook succeeded").expect("replace-context");
+            assert_eq!(messages[0].content, "claude-haiku-4-5");
+            assert!(
+                hooks.drain_dispatch_faults().is_empty(),
+                "the honored replace-context arm must not be a fault"
+            );
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "compactor"),
+            0,
+            "the honored arm must not write a fault line"
+        );
+    }
+
+    /// Scenario (d): an `on-stage` hook returning an unsupported arm
+    /// (`replace-context`) is logged via `dispatch_stage`'s path, and no
+    /// `trace.jsonl` is written — `dispatch_stage` runs before the trace writer
+    /// exists.
+    #[test]
+    fn on_stage_unsupported_arm_is_logged_not_traced() {
+        let workdir = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 1 = replace-context, unsupported for on-stage.
+        let staged = staged_double_named("stager", HookBinding::OnStage, hook_stage_arm_double(&engine, 1));
+
+        dispatch_stage(
+            &engine,
+            workdir.path(),
+            std::slice::from_ref(&staged),
+            Vec::new(),
+            &HookEnvVars::default(),
+            ExecutionLimits::default(),
+        )
+        .expect("dispatch_stage returns Ok even when a hook returns an unsupported arm");
+
+        assert_eq!(
+            hook_log_lines(workdir.path(), "stager"),
+            1,
+            "the on-stage fault is logged once"
+        );
+        let log =
+            std::fs::read_to_string(workdir.path().join("logs").join("hook-stager.log")).unwrap();
+        assert!(log.contains("on-stage"), "log names the event: {log}");
+        assert!(log.contains("replace-context"), "log names the arm: {log}");
+        assert!(
+            !workdir.path().join("trace.jsonl").exists(),
+            "on-stage runs before the trace writer exists, so no trace is attempted"
+        );
+    }
+
+    /// Scenario (d) control: `write-manifests` from `on-stage` is the honored arm —
+    /// it writes the manifest and logs no fault.
+    #[test]
+    fn on_stage_write_manifests_remains_honored() {
+        let workdir = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 2 = write-manifests (honored) — but with an empty list, so nothing is
+        // written; the point is that no fault is logged for the honored arm.
+        let staged = staged_double_named("stager", HookBinding::OnStage, hook_stage_arm_double(&engine, 2));
+
+        dispatch_stage(
+            &engine,
+            workdir.path(),
+            std::slice::from_ref(&staged),
+            Vec::new(),
+            &HookEnvVars::default(),
+            ExecutionLimits::default(),
+        )
+        .expect("dispatch_stage succeeds");
+
+        assert_eq!(
+            hook_log_lines(workdir.path(), "stager"),
+            0,
+            "the honored write-manifests arm must not log a fault"
+        );
+    }
+
+    /// Scenario (e): an async hook returning an unsupported arm is routed to the
+    /// same `Err` channel a genuine async error takes — `call_async_hook` returns
+    /// `Err` naming the event and arm, which the `dispatch` spawn site logs once via
+    /// the unchanged `log_hook_error` path (never traced).
+    #[test]
+    fn async_hook_unsupported_arm_routes_to_error_channel() {
+        let root = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // arm 2 = write-manifests, unsupported for on-tool-call.
+        let component = hook_tool_call_arm_double(&engine, 2);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(async {
+            call_async_hook(
+                &engine,
+                root.path(),
+                &component,
+                "async-hook",
+                &SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "test-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                &tool_call_event(),
+                Duration::from_secs(0),
+                HookTotals {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    tool_calls: 0,
+                    shell_calls: 0,
+                },
+                ExecutionLimits::default(),
+                None,
+                &HookCapabilityGrant::default(),
+            )
+            .await
+            .expect_err("an unsupported arm must surface as an Err on the async path")
+        });
+
+        assert!(err.contains("on-tool-call"), "async fault names the event: {err}");
+        assert!(err.contains("write-manifests"), "async fault names the arm: {err}");
+    }
+
+    /// Scenario (e), full path: an async hook (`execution_mode: async`) returning an
+    /// unsupported arm is logged exactly once to `logs/hook-<name>.log` via the
+    /// fire-and-forget `spawn_local` site in `dispatch`, and buffers no fault (async
+    /// faults are never traced).
+    #[test]
+    fn async_hook_unsupported_arm_logged_once_and_not_buffered() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let component = hook_tool_call_arm_double(&engine, 2);
+
+        let staged = StagedHookArtifact {
+            name: "async-tool".to_string(),
+            version: "0.0.1".to_string(),
+            component,
+            config: HookConfig {
+                binding: HookBinding::OnToolCall,
+                execution_mode: HookExecutionMode::Async,
+                ..HookConfig::default()
+            },
+            grant: HookCapabilityGrant::default(),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            hooks.emit(session.path(), tool_call_event()).await;
+            // The async hook is fire-and-forget via spawn_local; yield until it has
+            // run to completion and logged (bounded so a genuine failure still ends).
+            for _ in 0..2000 {
+                if hook_log_lines(session.path(), "async-tool") >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                hooks.drain_dispatch_faults().is_empty(),
+                "async faults are logged but never buffered for the trace"
+            );
+        });
+
+        assert_eq!(
+            hook_log_lines(session.path(), "async-tool"),
+            1,
+            "the async unsupported-arm fault is logged exactly once"
+        );
+    }
+
+    /// The honored-arm table has exactly one entry per WIT lifecycle function, and
+    /// every entry's arm (when set) is a real `hook-output` variant name. Guards the
+    /// single-source-of-truth invariant against a typo or a missing/extra row.
+    #[test]
+    fn honored_output_arm_table_is_complete_and_consistent() {
+        let mut names: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
+        names.extend_from_slice(&OPTIONAL_HOOK_FNS);
+        names.push("on-stage");
+        assert_eq!(
+            HONORED_OUTPUT_ARM.len(),
+            names.len(),
+            "one honored-arm entry per lifecycle function"
+        );
+        for name in &names {
+            assert!(
+                HONORED_OUTPUT_ARM.iter().any(|(n, _)| n == name),
+                "{name} must have a honored-arm entry"
+            );
+        }
+        for (_, arm) in HONORED_OUTPUT_ARM {
+            if let Some(arm) = arm {
+                assert!(
+                    matches!(*arm, "replace-context" | "write-manifests" | "artifact"),
+                    "honored arm {arm} must be a real hook-output variant"
+                );
+            }
+        }
     }
 }
