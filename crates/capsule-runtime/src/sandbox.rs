@@ -214,7 +214,6 @@ fn is_executable_file(path: &Path) -> bool {
 /// Covers both of this repo's platform targets (`linux/x86_64` and `linux/aarch64`), including the
 /// Debian/Ubuntu multiarch-triplet subdirectories. A later slice or a reviewer targeting a
 /// platform this list didn't anticipate can extend it here — it is the single source of truth.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
@@ -230,7 +229,6 @@ const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
 /// dynamic loader will touch at load time: the interpreter path (`PT_INTERP`), the direct
 /// shared-library dependencies (`DT_NEEDED` sonames), and the runtime library search paths
 /// (`DT_RPATH`/`DT_RUNPATH`, already split on `:`, `$ORIGIN` left unexpanded here).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ElfDependencies {
     pub(crate) interp: Option<String>,
@@ -279,7 +277,6 @@ fn vaddr_to_file_offset(vaddr: u64, loads: &[(u64, u64, u64)]) -> Option<u64> {
 ///
 /// Only ELF64 is parsed: both of this repo's Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
 /// 32-bit image is not a binary this runtime would exec and is treated as unparseable.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     // e_ident (16) + fixed ELF64 header fields extend to offset 64.
     if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
@@ -404,7 +401,6 @@ fn expand_origin(rpath: &str, origin_dir: &Path) -> PathBuf {
 /// a soname containing a `/` is taken as a path (absolute, or relative to the binary's directory);
 /// otherwise the binary's own `DT_RUNPATH`/`DT_RPATH` entries (with `$ORIGIN` expanded) are tried
 /// first, then the standard `search_dirs`. Returns `None` (shrink-not-fail) if nothing matches.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn resolve_soname(
     soname: &str,
     origin_dir: &Path,
@@ -449,7 +445,6 @@ pub(crate) fn resolve_soname(
 /// Every step is shrink-not-fail (a binary that can't be read/parsed, or a soname that doesn't
 /// resolve, contributes nothing further); the returned set is deduplicated and canonical. Runs in
 /// the parent at launch time — never in the forked child's `pre_exec`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn resolve_landlock_grants(exec_allow_paths: &[PathBuf]) -> Vec<PathBuf> {
     let search_dirs: Vec<PathBuf> = DEFAULT_LIBRARY_SEARCH_DIRS
         .iter()
