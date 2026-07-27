@@ -21,10 +21,12 @@ pub const W_SEC_003: &str = "W-SEC-003";
 /// holds a literal value instead of a `${VAR_NAME}` reference.
 pub const W_SEC_004: &str = "W-SEC-004";
 
-/// The host resolved to a Linux kernel-enforcement tier (Landlock/seccomp), but that
-/// enforcement has never been verified on real Linux hardware — treat it as experimental,
-/// not a security boundary. Fires on both Linux tiers so the "full" tier is not silently
-/// assumed to be enforced.
+/// The host resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a
+/// narrow, derived read+execute scope outside the workdir (the allowlisted binaries, their loader,
+/// and their shared libraries — nothing writable), so allowlisted programs can actually run; but
+/// this mechanism has not yet been verified by the team on real Landlock-capable Linux hardware.
+/// Treat it as not-yet-confirmed rather than a hardened boundary. Fires on both Linux tiers so the
+/// "full" tier is not silently assumed to be confirmed-enforced.
 pub const W_SEC_005: &str = "W-SEC-005";
 
 /// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,

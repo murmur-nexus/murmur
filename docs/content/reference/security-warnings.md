@@ -21,21 +21,24 @@ Warnings from `mur build` go to stderr only.
 | [`W-SEC-002`](#w-sec-002) | `mur run` | Linux host without Landlock — filesystem scope unenforced (and seccomp unverified) |
 | [`W-SEC-003`](#w-sec-003) | `mur run` | `network.allow` doesn't constrain bash's own outbound connections |
 | [`W-SEC-004`](#w-sec-004) | `mur build` | Literal secret value found in a manifest field |
-| [`W-SEC-005`](#w-sec-005) | `mur run` | Linux kernel enforcement is experimental — never verified on real hardware |
+| [`W-SEC-005`](#w-sec-005) | `mur run` | Linux kernel enforcement is not yet team-verified on real hardware |
 | [`W-SEC-006`](#w-sec-006) | `mur run` | A hook's `capabilities:` block declares a sub-key that is inert on hooks |
 | [`W-SEC-007`](#w-sec-007) | `mur run` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped |
 | [`W-SEC-008`](#w-sec-008) | `mur run` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply |
 
 ---
 
-!!! warning "Linux kernel enforcement is unverified"
-    The Landlock/seccomp subprocess enforcement has **never been compiled or run
-    on real Linux hardware** — it was implemented and tested only on macOS, where it is a no-op —
-    and a code review found a probable-breaking Landlock-grant bug. Until a real Linux run
-    verifies it, do **not** treat the "Full" or "Seccomp-only" tiers below as a security boundary.
-    Both Linux tiers emit a warning at launch (`W-SEC-005` / `W-SEC-002`) saying exactly this. The
-    only tier whose behavior is verified today is Environment-only (macOS/Windows), because there
-    the enforcement is a documented no-op.
+!!! warning "Linux kernel enforcement is not yet team-verified"
+    The Landlock/seccomp subprocess enforcement has **not yet been verified by the team on real
+    Landlock-capable Linux hardware** — it is implemented and unit-tested, and on the "Full" tier
+    Landlock now grants a narrow, *derived* read+execute scope outside the workdir (the
+    allowlisted binaries, their dynamic loader, and their shared libraries — nothing writable, no
+    directory granted wholesale) so allowlisted programs can actually exec and dynamically link.
+    Until a real Linux run confirms that mechanism end to end, treat the "Full" and "Seccomp-only"
+    tiers below as **not-yet-confirmed**, not a hardened security boundary. Both Linux tiers emit a
+    warning at launch (`W-SEC-005` / `W-SEC-002`) saying exactly this. The only tier whose behavior
+    is verified today is Environment-only (macOS/Windows), because there the enforcement is a
+    documented no-op.
 
 ## Subprocess enforcement tiers
 
@@ -45,15 +48,17 @@ subprocesses declared under `capabilities.shell.allow`.
 
 | Tier | Host | Filesystem | Exec | Network | Verified? |
 |---|---|---|---|---|---|
-| Full | Linux, kernel ≥5.13 (Landlock available) | kernel-enforced¹ | kernel-enforced¹ | kernel-enforced¹ | **No** — never run on Linux |
-| Seccomp-only | Linux, kernel <5.13 (no Landlock) | **not** enforced | kernel-enforced¹ | kernel-enforced¹ | **No** — never run on Linux |
+| Full | Linux, kernel ≥5.13 (Landlock available) | kernel-enforced¹ | kernel-enforced¹ | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
+| Seccomp-only | Linux, kernel <5.13 (no Landlock) | **not** enforced | kernel-enforced¹ | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
 | Environment-only | macOS, Windows, any non-Linux host | **not** enforced | **not** enforced | **not** enforced | Yes — enforcement is a documented no-op here |
 
-¹ *Intended* behavior. This code has never executed on Linux and has a known likely-breaking bug
-(the Landlock grant covers only the capsule workdir, which would deny `bash` itself the ability to
-exec/dynamic-link `/usr/bin/bash` and its libraries). On a real Tier-1 host it may break every
-shell spawn outright rather than scope it. Do not rely on any "kernel-enforced" cell above until a
-real Linux run confirms it.
+¹ *Intended* behavior. On the Full tier the Landlock scope grants the capsule workdir full access
+**and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
+interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
+allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while nothing
+outside the workdir is writable and no directory is granted wholesale. This code is unit-tested but
+has not yet been run end to end by the team on a real Landlock-capable Linux host, so do not treat
+any "kernel-enforced" cell above as a confirmed boundary until that acceptance run lands.
 
 Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify.
 Both are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
@@ -138,28 +143,31 @@ but the artifact should not be published or committed until the literal is remov
 
 ---
 
-## W-SEC-005 — Linux kernel enforcement is unverified { #w-sec-005 }
+## W-SEC-005 — Linux kernel enforcement is not yet team-verified { #w-sec-005 }
 
 **Fires when:** `capabilities.shell.allow` is non-empty and the host resolves to the **Full** tier
 (Linux, kernel ≥5.13 with Landlock available). This tier used to emit no warning at all — silence
-implied everything was enforced, which is precisely the false assurance this warning exists to
-prevent.
+implied everything was confirmed-enforced, which is precisely the false assurance this warning
+exists to prevent.
 
-**Why it matters:** the Landlock + seccomp enforcement layer has **never been
-compiled or run on real Linux hardware**. It was implemented and tested only on macOS, where the
-whole layer is a no-op, and a code review found a probable-breaking bug: the Landlock grant covers
-only the capsule workdir, which would deny `bash` itself the ability to exec and dynamically link
-`/usr/bin/bash` and its shared libraries. On a real Tier-1 host the enforcement may fail closed
-and break every shell spawn, or fail open and enforce nothing — neither has been observed. Until a
-real Linux run verifies it, the filesystem/exec/network isolation it claims to provide is not a
-security boundary you can rely on.
+**Why it matters:** the Landlock + seccomp enforcement layer is implemented and unit-tested, but
+has **not yet been verified by the team on real Landlock-capable Linux hardware**. On this tier
+the Landlock scope grants the capsule workdir full access **and** a narrow, *derived* read+execute
+grant for exactly the `shell.allow` binaries, their ELF interpreter (dynamic loader), and the
+transitive closure of their shared libraries — so an allowlisted program can exec and dynamically
+link outside the workdir, while nothing outside the workdir is writable and no directory is granted
+wholesale. (An earlier revision granted only the workdir, which would have denied every allowlisted
+binary its own `execve`; that has been fixed.) What remains unverified is whether this derived-grant
+mechanism behaves as intended end to end on a real Tier-1 host — the acceptance run happens after
+this ships, not as part of it — so until then, do not rely on the filesystem/exec/network isolation
+it provides as a hardened security boundary.
 
-**What to do:** do not lean on kernel-level subprocess isolation on Linux yet. Until the layer is
-verified, apply the same discipline you would on the Environment-only tier: prefer specific binary
-declarations over `bash`, keep `network.allow`/`filesystem.scope` minimal, and use the
+**What to do:** until the layer is verified end to end on real Linux, apply the same discipline you
+would on the Environment-only tier: prefer specific binary declarations over `bash`, keep
+`network.allow`/`filesystem.scope` minimal, and use the
 [data/action phase-separation pattern](manifest-schema.md#threat-model) for capsules that ingest
-untrusted content. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same unverified
-caveat plus an additional filesystem gap.
+untrusted content. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same not-yet-verified
+caveat plus an additional filesystem gap (no Landlock at all).
 
 ---
 

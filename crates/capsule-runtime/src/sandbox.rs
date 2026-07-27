@@ -188,6 +188,327 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+// ---- derived Landlock read+execute grant set (this slice) ----
+//
+// On `KernelFull`, Landlock scopes the shell subprocess tree to the workdir. The workdir rule
+// grants full access, but — once `restrict_self()` lands — `Execute`/`ReadFile` are then denied
+// on every path *outside* the workdir, including the `shell.allow` binaries themselves, their ELF
+// interpreter (dynamic loader), and every shared library they pull in. That silently defeats the
+// seccomp exec-allowlist: each allowlisted `execve` fails with EACCES before it runs.
+//
+// The functions below derive the exact extra paths that must get a narrow read+execute grant
+// outside the workdir: the canonical `shell.allow` binaries (already resolved by
+// `resolve_exec_allowlist`), each one's `PT_INTERP`, and the transitive closure of the shared
+// libraries their ELF `DT_NEEDED` entries name (resolved via `DT_RPATH`/`DT_RUNPATH` first, then a
+// fixed set of standard library directories). Nothing broader — no directory is granted wholesale.
+//
+// All of this is *parsing and filesystem resolution*, so it runs in the parent at launch time
+// (inside `ShellEnforcement::resolve`) and the resulting `Vec<PathBuf>` is threaded into the
+// forked child's `pre_exec`, which only opens each path and adds a Landlock rule (no parsing in
+// the async-signal-safe window). Every resolution step is shrink-not-fail, matching
+// `resolve_exec_allowlist`: an entry that does not exist, does not parse as ELF, or names a
+// soname that does not resolve simply contributes nothing further — it never errors out.
+
+/// Standard Linux shared-library search directories used as the fallback resolution set for a
+/// `DT_NEEDED` soname when the binary declares no `DT_RPATH`/`DT_RUNPATH` (or it doesn't match).
+/// Covers both of this repo's platform targets (`linux/x86_64` and `linux/aarch64`), including the
+/// Debian/Ubuntu multiarch-triplet subdirectories. A later slice or a reviewer targeting a
+/// platform this list didn't anticipate can extend it here — it is the single source of truth.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+];
+
+/// The subset of an ELF binary's dynamic-linking metadata that decides which extra files the
+/// dynamic loader will touch at load time: the interpreter path (`PT_INTERP`), the direct
+/// shared-library dependencies (`DT_NEEDED` sonames), and the runtime library search paths
+/// (`DT_RPATH`/`DT_RUNPATH`, already split on `:`, `$ORIGIN` left unexpanded here).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ElfDependencies {
+    pub(crate) interp: Option<String>,
+    pub(crate) needed: Vec<String>,
+    pub(crate) runpaths: Vec<String>,
+}
+
+fn read_u16(bytes: &[u8], off: usize, le: bool) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(off..off + 2)?.try_into().ok()?;
+    Some(if le { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) })
+}
+
+fn read_u32(bytes: &[u8], off: usize, le: bool) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
+    Some(if le { u32::from_le_bytes(raw) } else { u32::from_be_bytes(raw) })
+}
+
+fn read_u64(bytes: &[u8], off: usize, le: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
+    Some(if le { u64::from_le_bytes(raw) } else { u64::from_be_bytes(raw) })
+}
+
+/// Reads a NUL-terminated string starting at the beginning of `region` (used for both the
+/// `PT_INTERP` segment and dynamic-string-table entries).
+fn cstr_at_start(region: &[u8]) -> String {
+    let nul = region.iter().position(|&b| b == 0).unwrap_or(region.len());
+    String::from_utf8_lossy(&region[..nul]).into_owned()
+}
+
+/// Maps a virtual address into a file offset using the ELF's `PT_LOAD` segments — required
+/// because `DT_STRTAB` records the string table's virtual address, not its file offset.
+fn vaddr_to_file_offset(vaddr: u64, loads: &[(u64, u64, u64)]) -> Option<u64> {
+    for &(seg_vaddr, seg_off, seg_filesz) in loads {
+        if vaddr >= seg_vaddr && vaddr < seg_vaddr.checked_add(seg_filesz)? {
+            return Some(seg_off + (vaddr - seg_vaddr));
+        }
+    }
+    None
+}
+
+/// Pure ELF64 parser: extracts the dynamic-linking metadata that determines which extra files the
+/// loader touches. Returns `None` for anything that is not a well-formed ELF64 image (bad magic,
+/// 32-bit, truncated headers) — a non-ELF or unparseable binary simply contributes nothing to the
+/// grant set (shrink-not-fail). Deliberately hand-rolled (no crate dependency) and byte-slice-in /
+/// struct-out so it is fully unit-testable off-Linux with synthetic fixtures; it makes no syscalls.
+///
+/// Only ELF64 is parsed: both of this repo's Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
+/// 32-bit image is not a binary this runtime would exec and is treated as unparseable.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
+    // e_ident (16) + fixed ELF64 header fields extend to offset 64.
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    // EI_CLASS: 2 == ELFCLASS64. EI_DATA: 1 == little-endian, 2 == big-endian.
+    if bytes[4] != 2 {
+        return None;
+    }
+    let le = match bytes[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+
+    let e_phoff = read_u64(bytes, 32, le)? as usize;
+    let e_phentsize = read_u16(bytes, 54, le)? as usize;
+    let e_phnum = read_u16(bytes, 56, le)? as usize;
+    // Each Elf64_Phdr is 56 bytes; a smaller entsize means this is not the layout we parse.
+    if e_phentsize < 56 {
+        return None;
+    }
+
+    let mut interp: Option<String> = None;
+    let mut dynamic_region: Option<(u64, u64)> = None; // (file offset, size)
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (p_vaddr, p_offset, p_filesz)
+
+    for i in 0..e_phnum {
+        let base = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let p_type = read_u32(bytes, base, le)?;
+        let p_offset = read_u64(bytes, base + 8, le)?;
+        let p_vaddr = read_u64(bytes, base + 16, le)?;
+        let p_filesz = read_u64(bytes, base + 32, le)?;
+        match p_type {
+            1 => loads.push((p_vaddr, p_offset, p_filesz)), // PT_LOAD
+            2 => dynamic_region = Some((p_offset, p_filesz)), // PT_DYNAMIC
+            3 => {
+                // PT_INTERP: a NUL-terminated interpreter path in the file image.
+                let start = p_offset as usize;
+                let end = start.checked_add(p_filesz as usize)?;
+                interp = Some(cstr_at_start(bytes.get(start..end)?));
+            }
+            _ => {}
+        }
+    }
+
+    // A static binary (no PT_DYNAMIC) contributes only itself — no interp, no needed libs.
+    let Some((dyn_off, dyn_size)) = dynamic_region else {
+        return Some(ElfDependencies { interp, needed: Vec::new(), runpaths: Vec::new() });
+    };
+
+    let mut needed_offsets: Vec<u64> = Vec::new();
+    let mut runpath_offsets: Vec<u64> = Vec::new();
+    let mut strtab_vaddr: Option<u64> = None;
+    let mut strsz: Option<u64> = None;
+
+    let mut off = dyn_off as usize;
+    let dyn_end = off.checked_add(dyn_size as usize)?;
+    while off + 16 <= dyn_end {
+        let d_tag = read_u64(bytes, off, le)?;
+        let d_val = read_u64(bytes, off + 8, le)?;
+        match d_tag {
+            0 => break,                             // DT_NULL — end of dynamic array
+            1 => needed_offsets.push(d_val),        // DT_NEEDED
+            5 => strtab_vaddr = Some(d_val),        // DT_STRTAB (virtual address)
+            10 => strsz = Some(d_val),              // DT_STRSZ
+            15 | 29 => runpath_offsets.push(d_val), // DT_RPATH | DT_RUNPATH
+            _ => {}
+        }
+        off += 16;
+    }
+
+    let mut needed = Vec::new();
+    let mut runpaths = Vec::new();
+    if let (Some(strtab_vaddr), Some(strsz)) = (strtab_vaddr, strsz) {
+        if let Some(strtab_off) = vaddr_to_file_offset(strtab_vaddr, &loads) {
+            let start = strtab_off as usize;
+            // Prefer the declared string-table bounds, but tolerate an over-long DT_STRSZ by
+            // falling back to the rest of the file rather than dropping every soname.
+            let strtab = start
+                .checked_add(strsz as usize)
+                .and_then(|end| bytes.get(start..end))
+                .or_else(|| bytes.get(start..));
+            if let Some(strtab) = strtab {
+                for offset in needed_offsets {
+                    if let Some(region) = strtab.get(offset as usize..) {
+                        needed.push(cstr_at_start(region));
+                    }
+                }
+                for offset in runpath_offsets {
+                    if let Some(region) = strtab.get(offset as usize..) {
+                        for part in cstr_at_start(region).split(':') {
+                            if !part.is_empty() {
+                                runpaths.push(part.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(ElfDependencies { interp, needed, runpaths })
+}
+
+/// Expands a leading/embedded `$ORIGIN` (or `${ORIGIN}`) in an rpath entry to the directory of the
+/// binary that declared it — the dynamic loader's own rule for `DT_RUNPATH`/`DT_RPATH`.
+fn expand_origin(rpath: &str, origin_dir: &Path) -> PathBuf {
+    if rpath.contains("$ORIGIN") {
+        let origin = origin_dir.to_string_lossy();
+        PathBuf::from(
+            rpath
+                .replace("${ORIGIN}", &origin)
+                .replace("$ORIGIN", &origin),
+        )
+    } else {
+        PathBuf::from(rpath)
+    }
+}
+
+/// Resolves one `DT_NEEDED` soname to a canonical file path, mirroring the loader's search order:
+/// a soname containing a `/` is taken as a path (absolute, or relative to the binary's directory);
+/// otherwise the binary's own `DT_RUNPATH`/`DT_RPATH` entries (with `$ORIGIN` expanded) are tried
+/// first, then the standard `search_dirs`. Returns `None` (shrink-not-fail) if nothing matches.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn resolve_soname(
+    soname: &str,
+    origin_dir: &Path,
+    runpaths: &[String],
+    search_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if soname.is_empty() {
+        return None;
+    }
+    if soname.contains('/') {
+        let candidate = if Path::new(soname).is_absolute() {
+            PathBuf::from(soname)
+        } else {
+            origin_dir.join(soname)
+        };
+        return std::fs::canonicalize(&candidate).ok();
+    }
+    for rpath in runpaths {
+        let candidate = expand_origin(rpath, origin_dir).join(soname);
+        if candidate.is_file() {
+            if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+                return Some(canonical);
+            }
+        }
+    }
+    for dir in search_dirs {
+        let candidate = dir.join(soname);
+        if candidate.is_file() {
+            if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+/// Derives the full set of canonical file paths that need a narrow read+execute Landlock grant
+/// *outside* the workdir so the `shell.allow` binaries can actually run: each allowlisted binary,
+/// its ELF interpreter, and the transitive closure of its `DT_NEEDED` shared libraries. Uses the
+/// standard [`DEFAULT_LIBRARY_SEARCH_DIRS`] as the soname fallback search set.
+///
+/// Every step is shrink-not-fail (a binary that can't be read/parsed, or a soname that doesn't
+/// resolve, contributes nothing further); the returned set is deduplicated and canonical. Runs in
+/// the parent at launch time — never in the forked child's `pre_exec`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn resolve_landlock_grants(exec_allow_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let search_dirs: Vec<PathBuf> = DEFAULT_LIBRARY_SEARCH_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    resolve_landlock_grants_in(exec_allow_paths, &search_dirs)
+}
+
+/// Testable core of [`resolve_landlock_grants`], with the library search directories injected so
+/// unit tests can point it at synthetic fixtures instead of the real system directories.
+fn resolve_landlock_grants_in(
+    exec_allow_paths: &[PathBuf],
+    search_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut grants: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut visited: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+
+    for path in exec_allow_paths {
+        // The allowlist paths are already canonical/existing (from `resolve_exec_allowlist`), but
+        // canonicalize defensively — this both makes dedup against interp/library paths exact and
+        // drops any seed that no longer exists (shrink-not-fail: a vanished binary contributes
+        // nothing, and could not be exec'd anyway).
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            queue.push_back(canonical);
+        }
+    }
+
+    while let Some(path) = queue.pop_front() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        // The binary/library itself is granted. If it lives inside the workdir, the workdir's own
+        // full-access rule already covers it and this extra read+execute rule is simply redundant.
+        grants.insert(path.clone());
+
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(deps) = parse_elf_dependencies(&bytes) else {
+            continue;
+        };
+        let origin_dir = path.parent().unwrap_or_else(|| Path::new("/"));
+
+        if let Some(interp) = &deps.interp {
+            if let Ok(canonical) = std::fs::canonicalize(interp) {
+                queue.push_back(canonical);
+            }
+        }
+        for soname in &deps.needed {
+            if let Some(resolved) = resolve_soname(soname, origin_dir, &deps.runpaths, search_dirs) {
+                queue.push_back(resolved);
+            }
+        }
+    }
+
+    grants.into_iter().collect()
+}
+
 /// Identity-based exec decision: canonicalizes the pathname a subprocess passed to
 /// `execve`/`execveat` (relative paths resolved against `base_dir` — the notifying task's
 /// cwd or `execveat` dirfd, read from `/proc` by the Linux supervisor) and allows the exec
@@ -293,6 +614,15 @@ pub(crate) struct ShellEnforcement {
     /// against (never the raw name strings; see `decide_exec_allowed`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) exec_allow_paths: Vec<PathBuf>,
+    /// Canonical file paths that need a narrow read+execute (never write) Landlock grant
+    /// *outside* the workdir so the allowlisted binaries can actually exec and dynamically link:
+    /// the `shell.allow` binaries, their ELF interpreter, and the transitive closure of their
+    /// shared-library dependencies. Derived from `exec_allow_paths` by `resolve_landlock_grants`
+    /// once at launch (in the parent) and threaded into the forked child's `pre_exec`, where
+    /// `apply_landlock_scope` turns each into a per-path `PathBeneath` rule. Only consulted on
+    /// `KernelFull`; resolved on every platform for parity but never read off Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) landlock_grant_paths: Vec<PathBuf>,
 }
 
 impl ShellEnforcement {
@@ -301,10 +631,12 @@ impl ShellEnforcement {
         let tier = detect_enforcement_tier();
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let landlock_grant_paths = resolve_landlock_grants(&exec_allow_paths);
         Ok(Self {
             tier,
             network_allow_ips,
             exec_allow_paths,
+            landlock_grant_paths,
         })
     }
 
@@ -319,6 +651,7 @@ impl ShellEnforcement {
             tier: EnforcementTier::EnvironmentOnly,
             network_allow_ips: Vec::new(),
             exec_allow_paths: Vec::new(),
+            landlock_grant_paths: Vec::new(),
         }
     }
 }
@@ -328,16 +661,20 @@ impl ShellEnforcement {
 /// Full detail lives on the security-warnings doc page (`security_warning_link`); keep each to
 /// one or two concise sentences.
 ///
-/// The Landlock/seccomp enforcement has NEVER been compiled or run on real Linux
-/// hardware — it was implemented and tested only on macOS, where it is a no-op — and a code
-/// review found a probable-breaking Landlock-grant bug. Until a real Linux run verifies it, the
-/// enforcement must not be presented as a trustworthy boundary. That is why `KernelFull` warns
-/// too (`W_SEC_005`): a silent "full" tier would imply everything is enforced, which is exactly
-/// the false assurance to avoid.
+/// The Landlock filesystem scope now derives a narrow read+execute grant (the `shell.allow`
+/// binaries, their ELF interpreter, and their shared-library closure) *outside* the workdir, in
+/// addition to the workdir's full-access grant — so allowlisted programs can actually exec and
+/// dynamically link, and nothing outside the workdir is writable. That derived-grant mechanism has
+/// not yet been verified by the team on real Landlock-capable Linux hardware (the manual
+/// acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a silent
+/// "full" tier would imply everything is confirmed-enforced, which is the false assurance to avoid
+/// until a real Linux run lands.
 const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this host \
-resolved to a Linux kernel-enforcement tier (Landlock/seccomp), but that enforcement has NOT \
-been verified on real Linux hardware — treat filesystem, exec, and network isolation for shell \
-subprocesses as experimental and do not rely on it as a security boundary yet.";
+resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
+derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
+shared libraries — nothing writable, no directory granted wholesale), but this mechanism has not \
+yet been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
+isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -524,6 +861,10 @@ pub(crate) fn prepare_enforcement(
 
     let tier = enforcement.tier;
     let workdir_for_child = workdir.to_path_buf();
+    // Derived read+execute grant set, computed in the parent (all parsing/resolution already done
+    // by `resolve_landlock_grants`) and moved into the closure so the child only opens each path
+    // and adds a Landlock rule — no parsing in the async-signal-safe `pre_exec` window.
+    let landlock_grants_for_child = enforcement.landlock_grant_paths.clone();
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It only
@@ -536,7 +877,12 @@ pub(crate) fn prepare_enforcement(
     unsafe {
         command.pre_exec(move || {
             let fd = child_sock.as_raw_fd();
-            linux_enforce::child_install_enforcement(tier, &workdir_for_child, fd)
+            linux_enforce::child_install_enforcement(
+                tier,
+                &workdir_for_child,
+                &landlock_grants_for_child,
+                fd,
+            )
         });
     }
 
@@ -622,12 +968,14 @@ mod linux_enforce {
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         workdir: &Path,
+        landlock_grant_paths: &[PathBuf],
         child_sock_fd: RawFd,
     ) -> io::Result<()> {
         install_seccomp_filter(child_sock_fd)?;
 
         if tier == EnforcementTier::KernelFull {
-            apply_landlock_scope(workdir).map_err(|error| io::Error::other(error))?;
+            apply_landlock_scope(workdir, landlock_grant_paths)
+                .map_err(|error| io::Error::other(error))?;
         }
 
         Ok(())
@@ -677,7 +1025,29 @@ mod linux_enforce {
         Ok(())
     }
 
-    fn apply_landlock_scope(workdir: &Path) -> Result<(), String> {
+    /// Scopes the shell subprocess tree's filesystem access with Landlock. Two kinds of rule:
+    ///
+    ///   - the workdir gets the **full** access set (read/write/execute) — unchanged from before;
+    ///   - each path in `landlock_grant_paths` (the `shell.allow` binaries, their ELF interpreter,
+    ///     and their shared-library closure, all *outside* the workdir) gets a **narrow
+    ///     read+execute** grant — never write.
+    ///
+    /// Without the second kind of rule, `restrict_self()` denies `Execute`/`ReadFile` on every
+    /// path outside the workdir, so every allowlisted binary's `execve` fails with EACCES before
+    /// it runs (and even a binary placed *inside* the workdir can't be loaded, because its dynamic
+    /// loader must still read `ld-linux`/libc outside it). The narrow grants fix that while keeping
+    /// the security story honest: nothing outside the workdir is writable, so a write to any
+    /// outside path — including one of these read+execute grant paths — is still denied.
+    ///
+    /// `handle_access` must declare the union of every access bit any rule uses; that stays the
+    /// full set because the workdir rule needs it. A grant path that fails to *open* is skipped
+    /// (shrink-not-fail, matching `resolve_exec_allowlist`) rather than failing the whole scope —
+    /// it only narrows what is allowed. A genuine ruleset-construction failure still returns `Err`,
+    /// preserving the module's fail-closed invariant.
+    fn apply_landlock_scope(
+        workdir: &Path,
+        landlock_grant_paths: &[PathBuf],
+    ) -> Result<(), String> {
         use landlock::{
             Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
             RulesetCreatedAttr, ABI,
@@ -685,6 +1055,9 @@ mod linux_enforce {
 
         let abi = ABI::V1;
         let access_all = AccessFs::from_all(abi);
+        // The canonical "read-only-ish" grant (see landlock's own docs): enough for the loader to
+        // open, read, and map-execute a binary or shared library, but no write access.
+        let read_execute = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
 
         let workdir_fd = PathFd::new(workdir).map_err(|error| {
             format!(
@@ -693,14 +1066,35 @@ mod linux_enforce {
             )
         })?;
 
-        Ruleset::default()
+        let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(access_all)
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
             .add_rule(PathBeneath::new(workdir_fd, access_all))
-            .map_err(|error| format!("landlock: add_rule failed: {error}"))?
+            .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
+
+        for grant in landlock_grant_paths {
+            // A grant path that no longer opens (e.g. a library resolved a moment ago in the
+            // parent that has since vanished) is skipped, not fatal — it only shrinks the allow
+            // set. A rule that fails to add with a valid fd is a genuine construction failure and
+            // still propagates as `Err` (fail-closed).
+            let grant_fd = match PathFd::new(grant) {
+                Ok(fd) => fd,
+                Err(_) => continue,
+            };
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(grant_fd, read_execute))
+                .map_err(|error| {
+                    format!(
+                        "landlock: add_rule for grant {} failed: {error}",
+                        grant.display()
+                    )
+                })?;
+        }
+
+        ruleset
             .restrict_self()
             .map_err(|error| format!("landlock: restrict_self failed: {error}"))?;
 
@@ -1166,6 +1560,239 @@ mod tests {
         assert_eq!(resolved, vec![std::fs::canonicalize(&real).unwrap()]);
     }
 
+    // ---- ELF dependency parsing (pure, synthetic fixtures — runs on every OS) ----
+
+    /// Builds a minimal but well-formed ELF64 image exercising exactly the fields
+    /// `parse_elf_dependencies` reads: a single identity-mapped `PT_LOAD` (so virtual address ==
+    /// file offset), an optional `PT_INTERP`, and — when any dynamic metadata is requested — a
+    /// `PT_DYNAMIC` with `DT_NEEDED`/`DT_RUNPATH`/`DT_STRTAB`/`DT_STRSZ`/`DT_NULL` entries.
+    fn build_elf64(interp: Option<&str>, needed: &[&str], runpath: Option<&str>) -> Vec<u8> {
+        let has_dynamic = !needed.is_empty() || runpath.is_some();
+
+        let mut phnum: u16 = 1; // PT_LOAD
+        if interp.is_some() {
+            phnum += 1;
+        }
+        if has_dynamic {
+            phnum += 1;
+        }
+
+        let ehsize = 64usize;
+        let phentsize = 56usize;
+        let phoff = ehsize;
+        let body_start = phoff + phentsize * phnum as usize;
+
+        // Dynamic string table: index 0 is a NUL, then each soname and the runpath.
+        let mut strtab: Vec<u8> = vec![0];
+        let mut needed_offsets = Vec::new();
+        for name in needed {
+            needed_offsets.push(strtab.len() as u64);
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+        }
+        let runpath_offset = runpath.map(|r| {
+            let off = strtab.len() as u64;
+            strtab.extend_from_slice(r.as_bytes());
+            strtab.push(0);
+            off
+        });
+
+        let mut body: Vec<u8> = Vec::new();
+
+        let interp_offset = body_start + body.len();
+        if let Some(i) = interp {
+            body.extend_from_slice(i.as_bytes());
+            body.push(0);
+        }
+
+        // Align the dynamic array to 8 bytes.
+        while !(body_start + body.len()).is_multiple_of(8) {
+            body.push(0);
+        }
+        let dyn_offset = body_start + body.len();
+        let num_dyn = needed.len() + runpath.map_or(0, |_| 1) + 3; // + DT_STRTAB, DT_STRSZ, DT_NULL
+        let dyn_size = num_dyn * 16;
+        let strtab_offset = dyn_offset + dyn_size;
+
+        if has_dynamic {
+            let mut push_dyn = |tag: u64, val: u64| {
+                body.extend_from_slice(&tag.to_le_bytes());
+                body.extend_from_slice(&val.to_le_bytes());
+            };
+            for &o in &needed_offsets {
+                push_dyn(1, o); // DT_NEEDED
+            }
+            if let Some(ro) = runpath_offset {
+                push_dyn(29, ro); // DT_RUNPATH
+            }
+            push_dyn(5, strtab_offset as u64); // DT_STRTAB (vaddr == offset, identity PT_LOAD)
+            push_dyn(10, strtab.len() as u64); // DT_STRSZ
+            push_dyn(0, 0); // DT_NULL
+            assert_eq!(body_start + body.len(), strtab_offset);
+            body.extend_from_slice(&strtab);
+        }
+
+        let total_len = body_start + body.len();
+        let mut out = vec![0u8; total_len];
+        out[0..4].copy_from_slice(b"\x7fELF");
+        out[4] = 2; // ELFCLASS64
+        out[5] = 1; // little-endian
+        out[6] = 1; // EI_VERSION
+        out[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        out[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86_64 (irrelevant)
+        out[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        out[32..40].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
+        out[54..56].copy_from_slice(&(phentsize as u16).to_le_bytes()); // e_phentsize
+        out[56..58].copy_from_slice(&phnum.to_le_bytes()); // e_phnum
+
+        let mut phdrs: Vec<(u32, u64, u64, u64)> = Vec::new(); // (p_type, p_offset, p_vaddr, p_filesz)
+        phdrs.push((1, 0, 0, total_len as u64)); // PT_LOAD identity-maps the whole file
+        if let Some(i) = interp {
+            phdrs.push((3, interp_offset as u64, interp_offset as u64, i.len() as u64 + 1));
+        }
+        if has_dynamic {
+            phdrs.push((2, dyn_offset as u64, dyn_offset as u64, dyn_size as u64));
+        }
+        for (idx, (p_type, p_offset, p_vaddr, p_filesz)) in phdrs.iter().enumerate() {
+            let base = phoff + idx * phentsize;
+            out[base..base + 4].copy_from_slice(&p_type.to_le_bytes());
+            out[base + 8..base + 16].copy_from_slice(&p_offset.to_le_bytes());
+            out[base + 16..base + 24].copy_from_slice(&p_vaddr.to_le_bytes());
+            out[base + 32..base + 40].copy_from_slice(&p_filesz.to_le_bytes());
+        }
+
+        out[body_start..total_len].copy_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn parse_elf_extracts_interp_needed_and_runpath() {
+        let bytes = build_elf64(
+            Some("/lib64/ld-linux-x86-64.so.2"),
+            &["libc.so.6", "libm.so.6"],
+            Some("$ORIGIN/../lib:/opt/custom/lib"),
+        );
+        let deps = parse_elf_dependencies(&bytes).expect("well-formed ELF64 must parse");
+        assert_eq!(deps.interp.as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
+        assert_eq!(deps.needed, vec!["libc.so.6".to_string(), "libm.so.6".to_string()]);
+        assert_eq!(
+            deps.runpaths,
+            vec!["$ORIGIN/../lib".to_string(), "/opt/custom/lib".to_string()],
+            "DT_RUNPATH must be split on ':' with empty parts dropped"
+        );
+    }
+
+    #[test]
+    fn parse_elf_static_binary_contributes_only_itself() {
+        // No PT_INTERP, no PT_DYNAMIC — a statically linked binary.
+        let bytes = build_elf64(None, &[], None);
+        let deps = parse_elf_dependencies(&bytes).expect("a static ELF64 is still valid ELF");
+        assert_eq!(deps, ElfDependencies::default());
+    }
+
+    #[test]
+    fn parse_elf_rejects_non_elf_and_non_elf64() {
+        assert!(parse_elf_dependencies(b"not an elf at all, way too short").is_none());
+        // Correct magic but ELFCLASS32 (byte 4 == 1) must be rejected.
+        let mut elf32 = build_elf64(Some("/lib/ld.so"), &["libc.so.6"], None);
+        elf32[4] = 1;
+        assert!(
+            parse_elf_dependencies(&elf32).is_none(),
+            "32-bit ELF is not a binary this runtime execs and must not parse"
+        );
+    }
+
+    // ---- soname resolution (loader search-order, synthetic fixtures) ----
+
+    #[test]
+    fn resolve_soname_finds_via_search_dirs_and_runpath_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("app");
+        std::fs::create_dir(&origin).unwrap();
+        let libs = temp.path().join("libs");
+        std::fs::create_dir(&libs).unwrap();
+        std::fs::write(libs.join("libc.so.6"), "x").unwrap();
+
+        // Found in a standard search directory.
+        assert_eq!(
+            resolve_soname("libc.so.6", &origin, &[], std::slice::from_ref(&libs)),
+            Some(std::fs::canonicalize(libs.join("libc.so.6")).unwrap())
+        );
+        // Unresolvable soname → None (shrink-not-fail).
+        assert_eq!(
+            resolve_soname("libmissing.so", &origin, &[], std::slice::from_ref(&libs)),
+            None
+        );
+
+        // Found via a `$ORIGIN`-relative DT_RUNPATH, taking precedence over the search dirs.
+        let origin_lib = origin.join("lib");
+        std::fs::create_dir(&origin_lib).unwrap();
+        std::fs::write(origin_lib.join("libfoo.so"), "x").unwrap();
+        assert_eq!(
+            resolve_soname("libfoo.so", &origin, &["$ORIGIN/lib".to_string()], &[]),
+            Some(std::fs::canonicalize(origin_lib.join("libfoo.so")).unwrap())
+        );
+    }
+
+    // ---- transitive Landlock grant derivation (synthetic ELF + fake libs) ----
+
+    #[test]
+    fn resolve_landlock_grants_derives_interp_and_needed_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        let lib_dir = temp.path().join("lib");
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::fs::create_dir(&lib_dir).unwrap();
+
+        // A fake interpreter and a fake shared library, both outside any "workdir".
+        let interp = bin_dir.join("ld-fake.so");
+        std::fs::write(&interp, "not really elf").unwrap();
+        std::fs::write(lib_dir.join("libfake.so.1"), "not really elf").unwrap();
+
+        // A synthetic dynamically-linked binary naming that interp + that soname.
+        let prog = bin_dir.join("prog");
+        let elf = build_elf64(
+            Some(interp.to_str().unwrap()),
+            &["libfake.so.1"],
+            None,
+        );
+        std::fs::write(&prog, &elf).unwrap();
+
+        let grants =
+            resolve_landlock_grants_in(std::slice::from_ref(&prog), std::slice::from_ref(&lib_dir));
+
+        let expect = |p: PathBuf| std::fs::canonicalize(p).unwrap();
+        assert!(grants.contains(&expect(prog)), "the binary itself must be granted: {grants:?}");
+        assert!(grants.contains(&expect(interp)), "the ELF interpreter must be granted: {grants:?}");
+        assert!(
+            grants.contains(&expect(lib_dir.join("libfake.so.1"))),
+            "each resolved DT_NEEDED library must be granted: {grants:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_landlock_grants_skips_unresolvable_deps_and_missing_binaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+
+        // A binary naming a soname that resolves nowhere, plus an interp that doesn't exist.
+        let prog = bin_dir.join("prog");
+        std::fs::write(
+            &prog,
+            build_elf64(Some("/definitely/not/here.so"), &["libnope.so"], None),
+        )
+        .unwrap();
+        let missing = bin_dir.join("does-not-exist");
+
+        let grants =
+            resolve_landlock_grants_in(&[prog.clone(), missing], std::slice::from_ref(&bin_dir));
+
+        // Only the real binary survives; the missing binary, missing interp, and unresolvable
+        // soname each contribute nothing (shrink-not-fail).
+        assert_eq!(grants, vec![std::fs::canonicalize(&prog).unwrap()]);
+    }
+
     // ---- exec decision (canonical identity match; finding #1's attack) ----
 
     /// A tempdir "bin" with a real allowlisted `bash`, plus the canonical allow set for it.
@@ -1334,11 +1961,16 @@ mod tests {
         let log = bootstrap_log_contents(temp.path());
         assert!(
             log.contains(W_SEC_005),
-            "KernelFull must not be silent — it must warn its enforcement is unverified: {log}"
+            "KernelFull must not be silent — it must warn its enforcement is not yet confirmed: {log}"
         );
         assert!(
-            log.contains("not been verified") || log.contains("experimental"),
-            "must state the enforcement is unverified/experimental: {log}"
+            log.contains("not yet been verified"),
+            "must state the derived-grant mechanism is not yet team-verified on real hardware: {log}"
+        );
+        assert!(
+            log.contains("read+execute") && log.contains("outside the workdir"),
+            "must describe what is now actually granted (narrow, derived read+execute outside \
+             the workdir), not an unfixed grant bug: {log}"
         );
         assert!(
             log.contains(&security_warning_link(W_SEC_005)),
@@ -1504,6 +2136,9 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         let result = crate::shell::execute_shell(
@@ -1543,6 +2178,9 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         let result = crate::shell::execute_shell(
@@ -1582,6 +2220,9 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         // Unlike `exit 7` (a builtin), `ls` forces a genuinely *nested* execve from inside
@@ -1632,6 +2273,9 @@ mod linux_integration_tests {
             // Empty resolved allowlist: every destination must be denied.
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         // bash's /dev/tcp is a builtin socket+connect — no extra binary needed, no DNS.
@@ -1676,6 +2320,9 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
@@ -1719,6 +2366,9 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
+            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
+                &policy.shell_allow,
+            )),
         };
 
         let result = crate::shell::execute_shell(
@@ -1734,6 +2384,129 @@ mod linux_integration_tests {
         assert_ne!(
             result.exit_code, 0,
             "reading a file outside the Landlock-scoped workdir must fail under KernelFull"
+        );
+    }
+
+    // NOTE: the two tests below exercise the derived-Landlock-grant fix for this slice. A green
+    // run on THIS repo's CI/dev machine is NOT evidence the fix works: per this card's roadmap,
+    // CI has never actually resolved to `KernelFull` (it silently runs the `KernelSeccompOnly`
+    // path instead), and the dev machine is macOS. Both tests print an unmistakable skip line and
+    // return when the host is not `KernelFull`. Real acceptance is a manual run on a real
+    // Landlock-capable Linux host, done by the team after this card lands.
+
+    #[test]
+    fn kernel_full_runs_nontrivial_shell_allowlist_but_a_pass_here_does_not_prove_the_landlock_fix()
+    {
+        let tier = detect_enforcement_tier();
+        if tier != EnforcementTier::KernelFull {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: \
+                 kernel_full_runs_nontrivial_shell_allowlist_... requires \
+                 EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected {tier:?}. \
+                 This run does NOT execute the derived-grant Landlock code path at all, so a \
+                 green result here is not evidence the workdir-scope exec bug is fixed — only a \
+                 real KernelFull Linux host can prove that."
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        // A non-trivial allowlist: an interpreter (`bash`) plus a second, genuinely nested,
+        // dynamically-linked binary (`cat`). Both are guaranteed present on the target dev/CI
+        // Linux hosts and both live outside the workdir, so this only succeeds if the derived
+        // Landlock grants cover each binary, its ELF interpreter, and its shared libraries.
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "cat".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let enforcement = ShellEnforcement {
+            tier,
+            network_allow_ips: Vec::new(),
+            landlock_grant_paths: resolve_landlock_grants(&exec_allow_paths),
+            exec_allow_paths,
+        };
+
+        // `echo` is a bash builtin; piping it into `cat` forces bash to fork+exec `cat`, a real
+        // nested, dynamically-linked exec — the case the whole fix exists for.
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", "echo landlock-grant-ok | cat"],
+            &[],
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok, not Err");
+
+        assert_eq!(
+            result.exit_code, 0,
+            "bash + cat are both allowlisted and dynamically linked; the derived Landlock grants \
+             must let each exec and dynamic-link outside the workdir (stderr: {})",
+            result.stderr
+        );
+        assert!(
+            result.stdout.contains("landlock-grant-ok"),
+            "the nested `cat` must actually run and pass its stdin through (stdout: {}, stderr: {})",
+            result.stdout,
+            result.stderr
+        );
+    }
+
+    #[test]
+    fn kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix() {
+        let tier = detect_enforcement_tier();
+        if tier != EnforcementTier::KernelFull {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: \
+                 kernel_full_denies_write_outside_workdir_... requires \
+                 EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected {tier:?}. \
+                 This run does NOT execute the Landlock code path, so a green result here is not \
+                 evidence writes outside the workdir are actually denied — only a real KernelFull \
+                 Linux host can prove that."
+            );
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        // A target OUTSIDE the workdir (a separate temp dir). Its parent exists, so the only
+        // reason a write can fail is the Landlock scope — not a missing directory.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("should-not-be-written.txt");
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let enforcement = ShellEnforcement {
+            tier,
+            network_allow_ips: Vec::new(),
+            landlock_grant_paths: resolve_landlock_grants(&exec_allow_paths),
+            exec_allow_paths,
+        };
+
+        // `echo >file` uses only a bash builtin + an open-for-write of an outside path — the
+        // write itself is what Landlock must refuse. The derived read+execute grants never widen
+        // to write, so nothing outside the workdir (grant paths included) is writable.
+        let script = format!("echo pwned > '{}'", target.display());
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", &script],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok with a nonzero exit code, not Err");
+
+        assert!(
+            !target.exists(),
+            "a write to a path outside the Landlock-scoped workdir must be denied under KernelFull"
+        );
+        assert_ne!(
+            result.exit_code, 0,
+            "bash's redirection to an outside path must fail (Landlock denies the open-for-write)"
         );
     }
 }
