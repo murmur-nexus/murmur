@@ -65,6 +65,7 @@ capabilities:
   network:
     allow:
       - https://api.anthropic.com
+    unix_sockets: false  # optional, defaults to false: may shell subprocesses create AF_UNIX sockets?
   filesystem:
     scope: ./workdir
   shell:
@@ -334,7 +335,8 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `capabilities.network.allow` | list<string> | no | host/URL allow entries |
+| `capabilities.network.allow` | list<string> | no | host/URL allow entries. Governs IP destinations only — it has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately |
+| `capabilities.network.unix_sockets` | bool | no | defaults to **`false`**. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`, enforced by seccomp on both Linux tiers. Set `true` only if a shell tool genuinely needs a local daemon socket — it is a coarse, capsule-wide grant, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. `AF_NETLINK` and `AF_PACKET` are always refused and have no equivalent key. No effect on non-Linux hosts, which have no kernel enforcement at all — see [`W-SEC-001`](security-warnings.md#w-sec-001) |
 | `capabilities.filesystem.scope` | string | no | relative scope under workdir |
 | `capabilities.shell.allow` | list<string> | no | shell binaries the agent may invoke (e.g. `bash`); each listed binary gets a synthetic tool manifest staged at launch |
 | `capabilities.shell.strip_env` | list<string> | no | glob patterns for env vars to strip from subprocess environment (e.g. `AWS_*`) |

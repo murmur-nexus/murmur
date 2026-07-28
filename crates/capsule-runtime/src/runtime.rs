@@ -4509,6 +4509,7 @@ mod tests {
         let caps = murmur_artifact::Capabilities {
             network: network.map(|allow| murmur_artifact::NetworkCapabilities {
                 allow: allow.into_iter().map(str::to_string).collect(),
+                unix_sockets: false,
             }),
             filesystem: scope.map(|scope| murmur_artifact::FilesystemCapabilities {
                 scope: Some(scope.to_string()),
@@ -4758,6 +4759,7 @@ mod tests {
             capabilities: Some(murmur_artifact::Capabilities {
                 network: Some(murmur_artifact::NetworkCapabilities {
                     allow: vec!["http://127.0.0.1:1".to_string()],
+                    unix_sockets: false,
                 }),
                 filesystem: None,
                 shell: None,
@@ -4818,7 +4820,10 @@ mod tests {
     #[test]
     fn inert_sub_blocks_are_exactly_the_unconsumed_ones() {
         let caps = murmur_artifact::Capabilities {
-            network: Some(murmur_artifact::NetworkCapabilities { allow: Vec::new() }),
+            network: Some(murmur_artifact::NetworkCapabilities {
+                allow: Vec::new(),
+                unix_sockets: false,
+            }),
             filesystem: Some(murmur_artifact::FilesystemCapabilities { scope: None }),
             shell: Some(murmur_artifact::ShellCapabilities {
                 allow: vec!["bash".to_string()],

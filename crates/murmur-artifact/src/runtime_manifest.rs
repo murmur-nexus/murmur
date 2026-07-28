@@ -508,6 +508,14 @@ pub enum ScorerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkCapabilities {
     pub allow: Vec<String>,
+    /// Whether the capsule's shell subprocess tree may create `AF_UNIX` sockets. `false` unless
+    /// the manifest says otherwise: a local daemon socket — `/var/run/docker.sock` above all —
+    /// is an unmediated path to host root, and the `allow` list above only governs IP
+    /// destinations, so nothing else in this block constrains it. Declaring `true` is the
+    /// deliberate, auditable widening for a capsule that genuinely needs a local daemon socket;
+    /// it is capsule-wide and coarse (a domain, not a per-path allowlist). `AF_NETLINK` and
+    /// `AF_PACKET` have no corresponding key and are always denied.
+    pub unix_sockets: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -768,6 +776,8 @@ struct RawResourceLimits {
 struct RawNetworkCapabilities {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    unix_sockets: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1094,6 +1104,7 @@ fn parse_capabilities(
 
     let network = raw_caps.network.map(|raw_network| NetworkCapabilities {
         allow: raw_network.allow,
+        unix_sockets: raw_network.unix_sockets,
     });
 
     let filesystem = raw_caps
@@ -1926,6 +1937,71 @@ capabilities:
 
         let capabilities = manifest.capabilities.unwrap();
         assert_eq!(capabilities.network.unwrap().allow, Vec::<String>::new());
+    }
+
+    /// `unix_sockets` is optional and denies by default. A capsule that never heard of the key
+    /// must not silently get `AF_UNIX` sockets — that is the whole `/var/run/docker.sock` escape.
+    #[test]
+    fn network_unix_sockets_defaults_to_false_when_key_is_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  network:
+    allow:
+      - https://api.anthropic.com
+"#,
+        )
+        .unwrap();
+
+        let network = manifest.capabilities.unwrap().network.unwrap();
+        assert_eq!(network.allow, vec!["https://api.anthropic.com".to_string()]);
+        assert!(!network.unix_sockets);
+    }
+
+    #[test]
+    fn network_unix_sockets_parses_explicit_false() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  network:
+    unix_sockets: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!manifest.capabilities.unwrap().network.unwrap().unix_sockets);
+    }
+
+    #[test]
+    fn network_unix_sockets_parses_explicit_true() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  network:
+    unix_sockets: true
+"#,
+        )
+        .unwrap();
+
+        let network = manifest.capabilities.unwrap().network.unwrap();
+        assert!(network.unix_sockets);
+        // The opt-in is orthogonal to the IP allowlist — declaring it does not imply any host.
+        assert_eq!(network.allow, Vec::<String>::new());
     }
 
     #[test]

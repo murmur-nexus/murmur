@@ -401,6 +401,7 @@ mod tests {
         Capabilities {
             network: network.map(|allow| NetworkCapabilities {
                 allow: allow.into_iter().map(str::to_string).collect(),
+                unix_sockets: false,
             }),
             filesystem: filesystem_scope.map(|scope| FilesystemCapabilities {
                 scope: Some(scope.to_string()),

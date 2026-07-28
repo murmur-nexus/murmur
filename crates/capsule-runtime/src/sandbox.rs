@@ -15,6 +15,14 @@
 //!     exec'd path canonicalized against the launch-time-resolved real paths of the
 //!     `shell.allow` binaries — see `decide_exec_allowed`), never name/basename strings, so
 //!     renaming an arbitrary binary to an allowlisted name does not allowlist it.
+//!   - **classic seccomp-bpf argument matching** (`SECCOMP_RET_ERRNO`) on `socket(2)`'s `domain`,
+//!     to refuse whole address families outright — see `denied_socket_domains`. Unlike a
+//!     destination `sockaddr`, `domain` is an integer in a register, so the kernel's own BPF can
+//!     compare it with no userspace round-trip and no notification at all. This is what stops a
+//!     capsule reaching `/var/run/docker.sock` (host root) over `AF_UNIX`, which the notify path
+//!     above never covered: its `sockaddr` parser returns `None` for non-IP families and the
+//!     supervisor treats that as allow. `AF_NETLINK`/`AF_PACKET` are denied unconditionally;
+//!     `AF_UNIX` is denied unless `capabilities.network.unix_sockets` says otherwise.
 //!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
 //!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock` — see
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`.
@@ -32,10 +40,11 @@
 //! ## Three-tier model
 //!
 //! - `KernelFull` (Linux, Landlock ABI available — kernel 5.13+): seccomp exec/network
-//!   allowlisting + Landlock filesystem scoping.
+//!   allowlisting + socket-domain denial + Landlock filesystem scoping.
 //! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp exec/network
-//!   allowlisting only. Filesystem scope stays convention-only (`current_dir`) — a
-//!   documented gap, not a bug.
+//!   allowlisting + socket-domain denial only. Filesystem scope stays convention-only
+//!   (`current_dir`) — a documented gap, not a bug. The socket-domain denial is identical on both
+//!   tiers: it is a seccomp rule, so it does not depend on Landlock in any way.
 //! - `EnvironmentOnly` (macOS / any non-Linux target): no kernel primitive attempted at all.
 //!   Permanent, not a placeholder for a future slice.
 //!
@@ -629,6 +638,56 @@ pub(crate) fn network_ip_allowed(ip: IpAddr, network_allow_ips: &[IpAddr]) -> bo
     network_allow_ips.contains(&ip)
 }
 
+// `socket(2)`'s `domain` argument values, as Linux's ABI defines them. Spelled out as literals
+// rather than `libc::AF_*` for the same reason `LINUX_AF_INET` below is: the filter these feed is
+// always compiled *for a Linux child*, so the numbers must be Linux's regardless of what host the
+// build runs on — and `denied_socket_domains` has to stay compilable and unit-testable on a macOS
+// dev machine, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
+// crate defines them only under `linux_like`). `libc::AF_UNIX` does exist on macOS, but taking one
+// of the three from `libc` and two from literals would be worse than taking all three the same
+// way. Values are stable kernel ABI: `include/linux/socket.h`.
+const LINUX_AF_UNIX: i32 = 1;
+const LINUX_AF_NETLINK: i32 = 16;
+const LINUX_AF_PACKET: i32 = 17;
+
+/// The `socket(2)` domains the child's seccomp filter refuses outright, given the capsule's
+/// `capabilities.network.unix_sockets` declaration.
+///
+/// This is the *whole* policy decision behind the `socket()` rule in `install_seccomp_filter` —
+/// deliberately pure, `libseccomp`-free, and platform-independent so it can be tested on any dev
+/// machine (same split as `resolve_landlock_grants` vs. `apply_landlock_scope`).
+///
+/// Why a domain check is a classic BPF rule and not a notify:
+/// `socket()`'s `domain` is a plain integer in a register, so the kernel's own BPF can compare it
+/// directly. That is exactly what `connect()`'s destination address is *not* — it sits behind a
+/// pointer BPF cannot dereference, which is the entire reason `connect`/`sendto` need the
+/// notify+supervisor machinery (see this module's header). Denying the domain at *creation* time
+/// therefore needs no userspace round-trip, and is structurally immune to the TOCTOU class of
+/// problem that reading a pointed-to argument out of another task's memory invites.
+///
+/// The three families, and why they are not symmetric:
+///   - `AF_UNIX` is gated, not banned. `/var/run/docker.sock` is host root, so it cannot be open
+///     by default — but "talk to a local daemon socket" is a legitimate thing for an agent to
+///     need, so a capsule can declare `capabilities.network.unix_sockets: true` and take it back.
+///     Note this is coarse: the opt-in is per *capsule*, per *domain* — not per socket path.
+///   - `AF_NETLINK` (routing tables, interface and firewall state) and `AF_PACKET` (raw frame
+///     capture and injection) are denied unconditionally, with no manifest key to widen them.
+///     Neither has a shell-tool use case comparable to a local daemon socket, and both are
+///     strictly more dangerous than one. Widening them would be a deliberate future decision with
+///     its own justification, not an oversight to be fixed by adding a flag here.
+///
+/// Everything not listed — `AF_INET`, `AF_INET6`, and every other domain — is untouched by this
+/// rule and still governed exactly as before by the `connect`/`sendto` notify path against
+/// `capabilities.network.allow`. This function only ever *adds* denials.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn denied_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
+    let mut denied = vec![LINUX_AF_NETLINK, LINUX_AF_PACKET];
+    if !unix_sockets_allowed {
+        denied.push(LINUX_AF_UNIX);
+    }
+    denied
+}
+
 // The bytes handed to `parse_sockaddr_ip` always come from a *Linux* child's memory (the
 // seccomp-notify supervisor is Linux-only), so the address-family constants and struct
 // layouts here are Linux's — spelled out as literals rather than `libc::AF_*` so the parser
@@ -673,6 +732,14 @@ pub(crate) struct ShellEnforcement {
     // `prepare_enforcement` is a no-op there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) network_allow_ips: Vec<IpAddr>,
+    /// `capabilities.network.unix_sockets`, threaded through to the seccomp `socket()` rule.
+    /// `false` (the default) means the forked child cannot create an `AF_UNIX` socket at all, so
+    /// a local daemon socket — `/var/run/docker.sock` above all — is unreachable regardless of
+    /// what any Landlock ABI does or does not mediate for pathname sockets. Consumed only by
+    /// `linux_enforce::install_seccomp_filter` (via `denied_socket_domains`); resolved on every
+    /// platform for parity but never read off Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) unix_sockets_allowed: bool,
     /// Canonical filesystem paths of the `shell.allow` binaries, resolved once at launch by
     /// `resolve_exec_allowlist` — the identity set the seccomp exec supervisor matches
     /// against (never the raw name strings; see `decide_exec_allowed`).
@@ -713,6 +780,7 @@ impl ShellEnforcement {
         Ok(Self {
             tier,
             network_allow_ips,
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
         })
@@ -728,6 +796,9 @@ impl ShellEnforcement {
         Self {
             tier: EnforcementTier::EnvironmentOnly,
             network_allow_ips: Vec::new(),
+            // Denied, matching every other grant this constructor zeroes out. Inert on this tier
+            // (no seccomp filter is installed at all), but it must not read as "allowed".
+            unix_sockets_allowed: false,
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
         }
@@ -743,7 +814,9 @@ impl ShellEnforcement {
 /// binaries, their ELF interpreter, and their shared-library closure) *outside* the workdir, in
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
-/// dynamically link, and nothing outside the workdir is writable. The forked shell child also
+/// dynamically link, and nothing outside the workdir is writable. Seccomp additionally refuses the
+/// `socket(2)` domains in `denied_socket_domains` — closing the `/var/run/docker.sock` path, which
+/// no Landlock ABI mediates for pathname sockets. The forked shell child also
 /// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
 /// None of this has yet been verified by the team on real Landlock-capable Linux hardware (the
 /// manual acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a
@@ -753,15 +826,20 @@ const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty a
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale). The workdir's own grant also \
-withholds device-node and unix-socket creation, and the forked shell child drops every Linux \
-capability and sets no_new_privs before execve — but this mechanism has not yet been verified by \
-the team on real Landlock-capable Linux hardware — treat shell-subprocess isolation as \
-not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
+withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
+capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET, so a \
+capsule cannot reach a host daemon socket such as /var/run/docker.sock; and the forked shell child \
+drops every Linux capability and sets no_new_privs before execve — but this mechanism has not yet \
+been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
+isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
 kernel-enforced at all, and the seccomp exec/network enforcement that would apply has not been \
-verified on real Linux hardware. The forked shell child still drops every Linux capability and \
+verified on real Linux hardware. Seccomp also refuses socket(AF_UNIX) unless \
+capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET — that \
+rule needs no Landlock and so applies identically on this tier, but it has not been verified \
+either. The forked shell child still drops every Linux capability and \
 sets no_new_privs before execve on this tier, independently of Landlock, but that has not been \
 verified either. Treat shell subprocess isolation as experimental on this host.";
 
@@ -1032,6 +1110,11 @@ pub(crate) fn prepare_enforcement(
     };
 
     let tier = enforcement.tier;
+    // Copied out before the `move` closure below takes ownership of everything it touches, the
+    // same clone-before-move shape `tier` and the Landlock fds already use. Note the notify-fd
+    // socketpair above is created in the *parent*, before fork, so the child's own `sendmsg` over
+    // it is unaffected by a filter that denies `socket(AF_UNIX, ...)`.
+    let unix_sockets_allowed = enforcement.unix_sockets_allowed;
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It performs
@@ -1048,7 +1131,12 @@ pub(crate) fn prepare_enforcement(
     unsafe {
         command.pre_exec(move || {
             let sock_fd = child_sock.as_raw_fd();
-            match linux_enforce::child_install_enforcement(tier, landlock_fds.as_ref(), sock_fd) {
+            match linux_enforce::child_install_enforcement(
+                tier,
+                landlock_fds.as_ref(),
+                sock_fd,
+                unix_sockets_allowed,
+            ) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
@@ -1199,7 +1287,8 @@ mod linux_enforce {
     }
 
     /// Runs inside the forked child, pre-exec: strips the child's Linux capabilities, installs
-    /// the seccomp exec/network-notify filter, hands its notify fd to the parent over
+    /// the seccomp filter (exec/network notify rules plus the `socket()` domain denials keyed on
+    /// `unix_sockets_allowed`), hands its notify fd to the parent over
     /// `child_sock_fd`, and (on `KernelFull`) applies the Landlock filesystem scope. Returning
     /// `Err` here aborts the exec (std's `Command` machinery propagates it back to the parent's
     /// `.spawn()` call as an `io::Error`) — the fail-closed path for setup failures that happen
@@ -1208,6 +1297,7 @@ mod linux_enforce {
         tier: EnforcementTier,
         landlock_fds: Option<&LandlockChildFds>,
         child_sock_fd: RawFd,
+        unix_sockets_allowed: bool,
     ) -> io::Result<()> {
         // First, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
         // capability model are independent, both-must-allow gates, so narrowing the Landlock
@@ -1218,7 +1308,7 @@ mod linux_enforce {
         // failure is its own distinct, fail-closed error path before any filter is installed.
         drop_all_capabilities()?;
 
-        install_seccomp_filter(child_sock_fd)?;
+        install_seccomp_filter(child_sock_fd, unix_sockets_allowed)?;
 
         if tier == EnforcementTier::KernelFull {
             if let Some(fds) = landlock_fds {
@@ -1447,7 +1537,22 @@ mod linux_enforce {
         }
     }
 
-    fn install_seccomp_filter(child_sock_fd: RawFd) -> io::Result<()> {
+    /// Builds and loads the child's seccomp filter, then hands its notify fd to the parent.
+    ///
+    /// Two independent mechanisms live in this one filter, and they are deliberately not the
+    /// same mechanism:
+    ///
+    ///   - `execve`/`execveat`/`connect`/`sendto` get `Notify` rules, because deciding them needs
+    ///     the *contents* of a pointed-to argument (a pathname, a `sockaddr`) that in-kernel BPF
+    ///     cannot dereference — so the userspace supervisor (`classify_and_decide`) resolves each
+    ///     one. Unchanged by the unix-socket work.
+    ///   - `socket` gets classic, register-value `Errno` rules, one per denied domain. `domain` is
+    ///     a plain integer argument, so the comparison compiles straight into the loaded BPF
+    ///     program and is evaluated in-kernel at syscall time: no notification is raised, no
+    ///     supervisor round-trip happens, and no memory of another task is read. That is what
+    ///     makes it structurally immune to the pointer-read TOCTOU concerns that apply to the
+    ///     notify rules above, and why it is a hard deny rather than a supervisor decision.
+    fn install_seccomp_filter(child_sock_fd: RawFd, unix_sockets_allowed: bool) -> io::Result<()> {
         let mut filter = libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Allow)
             .map_err(to_io_err)?;
 
@@ -1455,6 +1560,35 @@ mod linux_enforce {
             let syscall = libseccomp::ScmpSyscall::from_name(name).map_err(to_io_err)?;
             filter
                 .add_rule(libseccomp::ScmpAction::Notify, syscall)
+                .map_err(to_io_err)?;
+        }
+
+        // Deny the dangerous `socket(2)` domains at creation time. `EACCES` (not `EPERM`) matches
+        // what `classify_and_decide`'s `Decision::Deny` already returns for a blocked TCP/UDP
+        // destination, so a capsule sees one consistent errno for "the sandbox refused this
+        // socket" whichever of the two mechanisms refused it.
+        //
+        // `add_rule_conditional` (not `..._exact`) on purpose: the non-exact form lets libseccomp
+        // adapt the rule to the architectures in the filter — on an arch where `socket` is
+        // reached through `socketcall(2)` rather than as its own syscall, the exact form would
+        // fail the whole install instead. Fail-closed is preserved either way, since any error
+        // here propagates out of `pre_exec` and aborts the spawn.
+        //
+        // One rule per domain rather than one rule with three comparators: comparators within a
+        // single rule are AND-ed, and no `socket()` call has a `domain` that is simultaneously
+        // `AF_UNIX` and `AF_NETLINK`, so a combined rule would match nothing.
+        let socket_syscall = libseccomp::ScmpSyscall::from_name("socket").map_err(to_io_err)?;
+        for domain in super::denied_socket_domains(unix_sockets_allowed) {
+            filter
+                .add_rule_conditional(
+                    libseccomp::ScmpAction::Errno(libc::EACCES),
+                    socket_syscall,
+                    &[libseccomp::ScmpArgCompare::new(
+                        0,
+                        libseccomp::ScmpCompareOp::Equal,
+                        domain as u64,
+                    )],
+                )
                 .map_err(to_io_err)?;
         }
 
@@ -2580,6 +2714,94 @@ mod tests {
         assert_eq!(parse_sockaddr_ip(&2u16.to_ne_bytes()), None);
     }
 
+    // ---- `denied_socket_domains` ----------------------------------------------------------
+    //
+    // These are *content* checks on a hand-authored constant list, in the same category as the
+    // `WORKDIR_ACCESS_RIGHTS` bit-membership test below: they assert what the function returns,
+    // NOT that any kernel refuses anything. Nothing here — and no green CI run — is evidence
+    // that `socket(AF_UNIX, ...)` is actually denied on a real host. That claim is verified only
+    // by the manual procedure in `docs/content/reference/security-warnings.md`
+    // ("Manual acceptance procedure — unmediated AF_UNIX sockets"), on real Linux hardware.
+
+    #[test]
+    fn denied_socket_domains_denies_unix_by_default() {
+        let denied = denied_socket_domains(false);
+        assert!(
+            denied.contains(&LINUX_AF_UNIX),
+            "AF_UNIX must be denied when the manifest does not declare \
+             capabilities.network.unix_sockets — this is the /var/run/docker.sock escape"
+        );
+    }
+
+    #[test]
+    fn denied_socket_domains_omits_unix_only_when_explicitly_allowed() {
+        let denied = denied_socket_domains(true);
+        assert!(
+            !denied.contains(&LINUX_AF_UNIX),
+            "a capsule that declared capabilities.network.unix_sockets: true must get no \
+             AF_UNIX deny rule at all"
+        );
+    }
+
+    /// Netlink and packet sockets have no manifest key that widens them: the deny list must be
+    /// identical for both values of the one flag that exists.
+    #[test]
+    fn denied_socket_domains_always_denies_netlink_and_packet() {
+        for unix_sockets_allowed in [false, true] {
+            let denied = denied_socket_domains(unix_sockets_allowed);
+            assert!(
+                denied.contains(&LINUX_AF_NETLINK),
+                "AF_NETLINK must be denied unconditionally (unix_sockets_allowed = \
+                 {unix_sockets_allowed})"
+            );
+            assert!(
+                denied.contains(&LINUX_AF_PACKET),
+                "AF_PACKET must be denied unconditionally (unix_sockets_allowed = \
+                 {unix_sockets_allowed})"
+            );
+        }
+    }
+
+    /// The rule only ever subtracts: IP sockets stay governed by the `connect`/`sendto` notify
+    /// path against `capabilities.network.allow`, never by a domain-level deny.
+    #[test]
+    fn denied_socket_domains_never_denies_ip_families() {
+        const LINUX_AF_INET_DOMAIN: i32 = 2;
+        const LINUX_AF_INET6_DOMAIN: i32 = 10;
+        for unix_sockets_allowed in [false, true] {
+            let denied = denied_socket_domains(unix_sockets_allowed);
+            assert!(!denied.contains(&LINUX_AF_INET_DOMAIN));
+            assert!(!denied.contains(&LINUX_AF_INET6_DOMAIN));
+        }
+    }
+
+    /// Pins the exact sets, so widening either one is a deliberate edit to this test rather than
+    /// an unnoticed side effect of touching the function.
+    #[test]
+    fn denied_socket_domains_returns_exactly_the_documented_sets() {
+        assert_eq!(
+            denied_socket_domains(false),
+            vec![LINUX_AF_NETLINK, LINUX_AF_PACKET, LINUX_AF_UNIX]
+        );
+        assert_eq!(
+            denied_socket_domains(true),
+            vec![LINUX_AF_NETLINK, LINUX_AF_PACKET]
+        );
+    }
+
+    /// The domain constants are Linux ABI numbers spelled as literals (see their doc comment),
+    /// so nothing checks them against `libc` at compile time. On a Linux build machine, assert
+    /// they really do agree with `libc`; on macOS this test compiles away, because
+    /// `libc::AF_NETLINK`/`AF_PACKET` do not exist there at all — which is the whole reason the
+    /// constants are literals.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_socket_domain_constants_match_libc() {
+        assert_eq!(LINUX_AF_UNIX, libc::AF_UNIX);
+        assert_eq!(LINUX_AF_NETLINK, libc::AF_NETLINK);
+        assert_eq!(LINUX_AF_PACKET, libc::AF_PACKET);
+    }
+
     #[test]
     fn network_ip_allowed_matches_only_the_resolved_allowlist() {
         let allow = vec![IpAddr::from([127, 0, 0, 1])];
@@ -2852,6 +3074,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -2894,6 +3117,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -2936,6 +3160,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -2989,6 +3214,7 @@ mod linux_integration_tests {
             tier,
             // Empty resolved allowlist: every destination must be denied.
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -3036,6 +3262,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -3082,6 +3309,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
@@ -3140,6 +3368,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &exec_allow_paths,
             )),
@@ -3201,6 +3430,7 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &exec_allow_paths,
             )),
@@ -3243,6 +3473,7 @@ mod linux_integration_tests {
         ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
         }
@@ -3436,6 +3667,7 @@ mod linux_integration_tests {
         ShellEnforcement {
             tier: EnforcementTier::KernelFull,
             network_allow_ips: Vec::new(),
+            unix_sockets_allowed: false,
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
         }
