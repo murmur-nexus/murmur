@@ -84,6 +84,12 @@ pub struct CapabilityPolicy {
     pub spawn_allow: Vec<String>,
     pub shell_strip_env: Vec<String>,
     pub shell_baseline_env: Vec<String>,
+    /// Typed interpreter-runtime grants from `capabilities.shell.interpreter_runtime`: each
+    /// names an already-allowlisted binary and the exact host directories outside the workdir
+    /// its import machinery needs, with a per-directory `list_dir` enumerability flag. Empty
+    /// unless the manifest declares them. Consumed on `KernelFull` to add narrow Landlock
+    /// grants (see `sandbox::resolve_interpreter_runtime_grants`) and to fire `W-SEC-009`.
+    pub shell_interpreter_runtime: Vec<murmur_artifact::InterpreterRuntimeGrant>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -242,6 +248,10 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.shell.as_ref())
         .and_then(|shell| shell.baseline_env.clone())
         .unwrap_or_default();
+    let shell_interpreter_runtime = caps
+        .and_then(|c| c.shell.as_ref())
+        .map(|shell| shell.interpreter_runtime.clone())
+        .unwrap_or_default();
 
     let spawn_allow = caps
         .and_then(|c| c.spawn.as_ref())
@@ -262,6 +272,7 @@ pub fn capability_policy_from_runtime_manifest(
         spawn_allow,
         shell_strip_env,
         shell_baseline_env,
+        shell_interpreter_runtime,
         env_allow,
         limits,
     }

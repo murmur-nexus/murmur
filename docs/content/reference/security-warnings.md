@@ -25,6 +25,7 @@ Warnings from `mur build` go to stderr only.
 | [`W-SEC-006`](#w-sec-006) | `mur run` | A hook's `capabilities:` block declares a sub-key that is inert on hooks |
 | [`W-SEC-007`](#w-sec-007) | `mur run` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped |
 | [`W-SEC-008`](#w-sec-008) | `mur run` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply |
+| [`W-SEC-009`](#w-sec-009) | `mur run`, `mur doctor` | `capabilities.shell.interpreter_runtime` couples the capsule to a specific host interpreter-version layout |
 
 ---
 
@@ -56,9 +57,13 @@ subprocesses declared under `capabilities.shell.allow`.
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while nothing
-outside the workdir is writable and no directory is granted wholesale. This code is unit-tested but
-has not yet been run end to end by the team on a real Landlock-capable Linux host, so do not treat
-any "kernel-enforced" cell above as a confirmed boundary until that acceptance run lands.
+outside the workdir is writable and no directory is granted wholesale. A capsule may *additionally*
+name specific host directories a path-based interpreter needs (its stdlib) via
+`capabilities.shell.interpreter_runtime` — but only the exact directories named, each with an
+explicit per-directory `list_dir` flag, never a whole install prefix (see
+[`W-SEC-009`](#w-sec-009)). This code is unit-tested but has not yet been run end to end by the team
+on a real Landlock-capable Linux host, so do not treat any "kernel-enforced" cell above as a
+confirmed boundary until that acceptance run lands.
 
 Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify.
 Both are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
@@ -237,3 +242,49 @@ per-artifact narrowing.
 
 Like [`W-SEC-006`](#w-sec-006), this fires during artifact staging — before the session workdir
 exists — so it goes to stderr only, not to `logs/bootstrap.log`.
+
+---
+
+## W-SEC-009 — Interpreter-runtime grant couples the capsule to a host layout { #w-sec-009 }
+
+**Fires when:** the capsule's top-level `capabilities.shell.interpreter_runtime` declares one or
+more grants. Fires once per grant, from both `mur run` (at staging) and `mur doctor`.
+
+**Why it matters:** an `interpreter_runtime` grant widens an already-allowlisted binary's Landlock
+scope to specific host directories *outside* the workdir so a path-based interpreter (e.g. CPython)
+can reach its standard library — the `DT_NEEDED` closure alone reaches only an ELF's linked
+libraries, never the `.so` extension modules the interpreter `dlopen`s at import time or the
+pure-Python stdlib files it discovers by listing each `sys.path` entry. That makes the grant
+necessary to run such an interpreter, but it also **couples the capsule to a specific host
+distro/interpreter-version layout**: a grant naming `/usr/lib/python3.11` stops resolving the moment
+the host ships Python 3.12, and a capsule that runs on Debian may not run on Alpine. This is the
+honest cost, and the reason the durable fix is the still-unbuilt staged runtime bind-mount — this
+grant exists only to bridge until that lands.
+
+**What it grants, exactly:** one Landlock rule per named directory, and nothing else. Each directory
+carries its own required `list_dir`:
+
+- `list_dir: true` → `Execute + ReadFile + ReadDir`. The directory's own entries are enumerable
+  (what CPython's `FileFinder` needs for a `sys.path` entry).
+- `list_dir: false` → `Execute + ReadFile`. Files inside can still be opened **by exact name**
+  (Landlock's read rights apply to the subtree beneath a granted directory), but the directory
+  itself cannot be listed.
+
+There is no field that accepts a prefix and expands it, and `ReadDir` is never inferred — it is
+granted only where an author wrote `list_dir: true`, and only on that one directory, never on its
+parent or siblings. A directory not named in the manifest receives no rule at all.
+
+**What to do:** name the narrowest set of directories that actually works — measure the real
+requirement with `strace -f -e trace=openat,getdents64 <interpreter> -c "import ..."` rather than
+guessing, and set `list_dir: false` on any directory you only open known files inside (do not
+reflexively set `list_dir: true` "to be safe" — it only changes whether the directory can be
+*enumerated*, and files inside a `list_dir: false` directory are still openable by name). Accept
+that the capsule is now pinned to this host's interpreter layout, and plan to drop the grant once
+the staged runtime bind-mount ships.
+
+**Parse-time rejections.** A malformed `interpreter_runtime` fails `mur run`/`mur doctor` at
+manifest parse time (not a warning — a hard error naming the offending value): a `binary` not
+present in the same block's `shell.allow` (this mechanism narrows filesystem access alongside an
+exec grant that already exists — it never itself grants exec), a `dirs[].path` that is not absolute
+(does not start with `/`), a `dirs[]` entry that omits `list_dir` (enumerability is never inferred),
+or an `interpreter_runtime[]` entry with an empty `dirs` list.

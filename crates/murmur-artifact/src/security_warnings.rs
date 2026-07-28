@@ -44,6 +44,13 @@ pub const W_SEC_007: &str = "W-SEC-007";
 /// other sub-blocks are structurally accepted and silently inert.
 pub const W_SEC_008: &str = "W-SEC-008";
 
+/// `capabilities.shell.interpreter_runtime` grants an allowlisted binary specific host
+/// directories outside the workdir. This couples the capsule to a specific host
+/// distro/interpreter-version layout (e.g. `/usr/lib/python3.11` breaks the moment the host
+/// ships Python 3.12); the durable fix is the still-unbuilt staged runtime bind-mount, which
+/// this grant only bridges until. Fires once per declared grant, at staging.
+pub const W_SEC_009: &str = "W-SEC-009";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 

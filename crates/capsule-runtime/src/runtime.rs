@@ -14,8 +14,8 @@ use murmur_artifact::{
     ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
     InferenceConfig, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
-    TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
-    W_SEC_006, W_SEC_007, W_SEC_008,
+    InterpreterRuntimeGrant, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -280,6 +280,10 @@ pub fn stage_session(
     request: StageRequest,
 ) -> Result<StagedSession, RuntimeError> {
     validate_capability_policy(&request.capability_policy)?;
+    // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
+    // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
+    // than in `stage_artifact_grant`.
+    warn_on_interpreter_runtime_grants(&request.capability_policy.shell_interpreter_runtime);
 
     let engine = build_engine()?;
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
@@ -1542,6 +1546,40 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
         agent::append_bootstrap_log(
             workdir,
             &format!("[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"),
+        );
+    }
+}
+
+/// Warns (non-fatal, once per declared grant) for every `capabilities.shell.interpreter_runtime`
+/// entry. Declaring one narrows an allowlisted binary's Landlock scope to specific host
+/// directories so a path-based interpreter can reach its stdlib — but it couples the capsule to a
+/// specific host distro/interpreter-version layout (e.g. `/usr/lib/python3.11` stops resolving the
+/// moment the host ships Python 3.12), which the operator should see plainly. The durable fix is
+/// the still-unbuilt staged runtime bind-mount; this grant only bridges until then.
+///
+/// Shared verbatim between `mur run` (from [`stage_session`]) and `mur doctor`, so both surface
+/// the same code, wording, and doc link. Like [`warn_on_inert_hook_capabilities`], it fires before
+/// any session workdir exists (the capsule-ceiling check runs at the top of `stage_session`, and
+/// `doctor` never launches a session at all), so it goes to stderr only, not `logs/bootstrap.log`.
+pub fn warn_on_interpreter_runtime_grants(grants: &[InterpreterRuntimeGrant]) {
+    for grant in grants {
+        let link = security_warning_link(W_SEC_009);
+        let dirs = grant
+            .dirs
+            .iter()
+            .map(|dir| {
+                let list = if dir.list_dir { "list_dir" } else { "no-list" };
+                format!("{} ({list})", dir.path)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_009}]: capabilities.shell.interpreter_runtime grants \
+             '{}' host directories outside the workdir [{dirs}] — this couples the capsule to a \
+             specific host distro/interpreter-version layout (e.g. /usr/lib/python3.11 breaks the \
+             moment the host ships Python 3.12); the durable fix is the staged runtime bind-mount, \
+             which this grant only bridges until ({link})",
+            grant.binary
         );
     }
 }
@@ -4786,6 +4824,7 @@ mod tests {
                 allow: vec!["bash".to_string()],
                 strip_env: None,
                 baseline_env: None,
+                interpreter_runtime: Vec::new(),
             }),
             spawn: None,
             env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
