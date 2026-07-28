@@ -10,7 +10,8 @@
 pub const W_SEC_001: &str = "W-SEC-001";
 
 /// `capabilities.shell.allow` is non-empty on a Linux host without Landlock (kernel <5.13) —
-/// exec/network are seccomp-enforced but filesystem scope is not.
+/// exec/network are seccomp-enforced and the shell child still drops every Linux capability before
+/// `execve`, but filesystem scope is not enforced at all.
 pub const W_SEC_002: &str = "W-SEC-002";
 
 /// `capabilities.shell.allow` includes `"bash"` and `capabilities.network.allow` is non-empty,
@@ -23,10 +24,13 @@ pub const W_SEC_004: &str = "W-SEC-004";
 
 /// The host resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a
 /// narrow, derived read+execute scope outside the workdir (the allowlisted binaries, their loader,
-/// and their shared libraries — nothing writable), so allowlisted programs can actually run; but
-/// this mechanism has not yet been verified by the team on real Landlock-capable Linux hardware.
-/// Treat it as not-yet-confirmed rather than a hardened boundary. Fires on both Linux tiers so the
-/// "full" tier is not silently assumed to be confirmed-enforced.
+/// and their shared libraries — nothing writable), so allowlisted programs can actually run; the
+/// workdir's own grant withholds character-device, block-device and unix-socket creation, so a
+/// capsule cannot `mknod` a raw disk node inside it; and the forked shell child drops every Linux
+/// capability and sets `no_new_privs` before `execve`. None of this has yet been verified by the
+/// team on real Landlock-capable Linux hardware — treat it as not-yet-confirmed rather than a
+/// hardened boundary. Fires on both Linux tiers so the "full" tier is not silently assumed to be
+/// confirmed-enforced.
 pub const W_SEC_005: &str = "W-SEC-005";
 
 /// A `runtime: hook` artifact entry declares `capabilities.shell`/`.spawn`/`.env`/`.limits`,
