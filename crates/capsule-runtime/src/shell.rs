@@ -142,7 +142,24 @@ pub(crate) fn execute_shell(
     // subprocess with zero enforcement because setup failed.
     let supervisor = crate::sandbox::prepare_enforcement(&mut command, enforcement, workdir)?;
 
-    let child = command.spawn().map_err(|error| error.to_string())?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // A failure inside the `pre_exec` enforcement setup reaches us here only as a bare
+            // errno (std collapses a `pre_exec` `io::Error` to its `raw_os_error()`, defaulting to
+            // EINVAL). Drop `command` first so the parent's captured copy of the diagnostic pipe's
+            // write end closes (letting the read below see EOF), then fold any legible detail the
+            // child wrote into the returned error instead of the undifferentiated
+            // "Invalid argument (os error 22)".
+            drop(command);
+            return Err(match supervisor.read_diagnostic() {
+                Some(detail) if !detail.is_empty() => {
+                    format!("sandbox: shell enforcement setup failed before exec: {detail}")
+                }
+                _ => error.to_string(),
+            });
+        }
+    };
     let output = child
         .wait_with_output()
         .map_err(|error| error.to_string())?;
