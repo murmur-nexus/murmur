@@ -43,7 +43,11 @@ Warnings from `mur build` go to stderr only.
     [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities), and always
     refuse `AF_NETLINK`/`AF_PACKET`, so a capsule cannot reach the host Docker daemon socket — see
     [Manual acceptance procedure — unmediated AF_UNIX sockets](#manual-acceptance-af-unix), which
-    also carries the SWE-bench compatibility check that default-deny still needs.
+    also carries the SWE-bench compatibility check that default-deny still needs. On top of all of
+    that, the seccomp filter's own **default action is now deny**: only a fixed, OCI/Docker-modelled
+    syscall allowlist is permitted outright, so `io_uring`, `bpf`, `userfaultfd`, `perf_event_open`,
+    `ptrace` and similar are refused before their arguments are ever inspected — see
+    [Default-deny syscall allowlist](#default-deny-syscall-allowlist).
     Until a real Linux run confirms these mechanisms end to end, treat the "Full" and "Seccomp-only"
     tiers below as **not-yet-confirmed**, not a hardened security boundary. Both Linux tiers emit a
     warning at launch (`W-SEC-005` / `W-SEC-002`) saying exactly this. The only tier whose behavior
@@ -89,7 +93,10 @@ confirmed boundary until that acceptance run lands — see
 Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify, and
 socket-family denial uses classic seccomp-bpf argument matching (no userspace supervisor — the
 `socket(2)` domain is an integer the kernel's own BPF can compare directly, unlike a `connect()`
-destination address behind a pointer).
+destination address behind a pointer). Underneath all three, the seccomp filter's default action is
+itself a deny — see [Default-deny syscall allowlist](#default-deny-syscall-allowlist) — so a
+syscall named by none of the mechanisms above is refused outright rather than falling through to an
+implicit allow.
 All are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
 tier is not a gap awaiting a future release, it is the permanent ceiling on those platforms.
 Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
@@ -283,13 +290,60 @@ from a root-run capsule's shell subprocess, so it no longer bypasses ordinary fi
 checks. That is intended, but it is a real behavior change for root deployments whose shell steps
 relied on root's usual "can read anything" posture.
 
-**What to do:** until the layer is verified end to end on real Linux, apply the same discipline you
-would on the Environment-only tier: prefer specific binary declarations over `bash`, keep
-`network.allow`/`filesystem.scope` minimal, and use the
+### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
+
+Every mechanism above governs a specific syscall (`socket`, `mknod`) or a specific resource
+(the workdir). The seccomp filter itself used to default to **allow**: any syscall not named by
+one of those specific rules fell through and was permitted, unmediated. On bare metal (no Docker
+in front of `mur run`), that let a capsule shell reach `io_uring_setup`, `bpf`, `userfaultfd`,
+`perf_event_open`, `process_vm_readv`, `open_by_handle_at`, `keyctl` and `add_key` — the same probe
+under Docker's default seccomp profile got `EPERM` for every one of them, because Docker's filter
+defaults to deny. `io_uring` matters most of the specific list: it has historically bypassed LSM
+path hooks, so leaving it reachable is a way to route around the Landlock filesystem boundary
+itself, not just widen the syscall surface.
+
+The filter's default action is now **deny** (`EPERM`) as well, modelled on the OCI/Docker default
+seccomp profile: only a fixed, named allowlist of syscalls is permitted outright
+(`SECCOMP_SYSCALL_ALLOWLIST` in `crates/capsule-runtime/src/sandbox.rs`), and everything named in
+`SECCOMP_MUST_STAY_DENIED` — including the syscalls above — is refused before any argument is even
+read. `execve`/`execveat`/`connect`/`sendto` are unaffected: they stay `Notify` rules decided by the
+supervisor exactly as before, and `socket` stays governed by the per-domain rules described above.
+Applies on **both** Linux tiers identically — it is a plain seccomp rule with no Landlock
+involvement.
+
+**Diagnosability.** A syscall refused by the default action returns `EPERM` to the caller, same as
+always — `SECCOMP_RET_ERRNO` has no channel for anything richer. To make a denial attributable after
+the fact, the filter also turns on kernel audit logging (`SCMP_FLTATR_CTL_LOG`) for every non-allow
+action, so a denial reaches `dmesg`/`journalctl -k`/`ausearch` with the syscall number, pid and
+process name — provided the host's `/proc/sys/kernel/seccomp/actions_logged` includes `errno`,
+which is host configuration `mur` does not control. If the host's libseccomp predates 2.4.0, this
+attribute cannot be set at all; enforcement is unaffected, only its legibility is.
+
+**Compatibility is the load-bearing risk here, not security.** The allowlist is reconciled against
+containerd's own default profile precisely so that a workload already proven to run under Docker's
+seccomp profile keeps working under `mur run`'s equivalent. Whether that holds for the workloads
+this project actually runs on bare metal has not yet been confirmed by the team — see
+[`SECCOMP_ALLOWLIST_VERIFICATION.md`](https://github.com/murmur-nexus/murmur/blob/main/SECCOMP_ALLOWLIST_VERIFICATION.md)
+at the repository root for the full manual, reproducible procedure (the dangerous-syscall probes
+above, reading the audit trail, and the SWE-bench compatibility run), and the same not-automated
+caveat as the [AF_UNIX procedure](#manual-acceptance-af-unix): a green `cargo test`/CI run is not
+evidence for either the security or the compatibility claim, since CI never resolves to a Linux
+kernel enforcement tier. The committed unit tests (`sandbox::tests::allowlist_*`) only assert what
+the two Rust constants contain, so a dangerous syscall cannot be re-permitted by accident — they are
+not evidence that any kernel actually refuses it.
+
+**What to do:** until the layer — including the SWE-bench run in
+`SECCOMP_ALLOWLIST_VERIFICATION.md` — is verified end to end on real Linux, apply the same
+discipline you would on the Environment-only tier: prefer specific binary declarations over `bash`,
+keep `network.allow`/`filesystem.scope` minimal, and use the
 [data/action phase-separation pattern](manifest-schema.md#threat-model) for capsules that ingest
 untrusted content. Do not run `mur run` as root if you can avoid it — non-root was never exposed to
-the device-node escape above. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same
-not-yet-verified caveat plus an additional filesystem gap (no Landlock at all).
+the device-node escape above. Do not assume the syscall surface a shell workload needs is exactly
+the one Docker's default profile permits; if a workload dies on an unexpected `EPERM`, the audit
+trail names the syscall, and whether it belongs in the allowlist or stays denied is a deliberate,
+reviewed edit to `sandbox.rs`, not a default to widen. The Seccomp-only tier
+([W-SEC-002](#w-sec-002)) carries the same not-yet-verified caveat plus an additional filesystem gap
+(no Landlock at all).
 
 ---
 
