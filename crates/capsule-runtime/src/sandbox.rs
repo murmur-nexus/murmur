@@ -15,7 +15,15 @@
 //!     exec'd path canonicalized against the launch-time-resolved real paths of the
 //!     `shell.allow` binaries — see `decide_exec_allowed`), never name/basename strings, so
 //!     renaming an arbitrary binary to an allowlisted name does not allowlist it.
-//!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`.
+//!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
+//!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock` — see
+//!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`.
+//!
+//! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
+//! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
+//! `linux_enforce::drop_all_capabilities`. Landlock and the capability model are independent,
+//! both-must-allow gates: a root-uid capsule keeps `CAP_MKNOD` no matter what Landlock permits,
+//! so the Landlock narrowing above does not subsume this.
 //!
 //! Both are Linux-only. macOS (and any other non-Linux target) has no equivalent kernel
 //! primitive and permanently falls back to the existing, unmodified synthetic-HOME/env-
@@ -192,7 +200,8 @@ fn is_executable_file(path: &Path) -> bool {
 // ---- derived Landlock read+execute grant set (this slice) ----
 //
 // On `KernelFull`, Landlock scopes the shell subprocess tree to the workdir. The workdir rule
-// grants full access, but — once `restrict_self()` lands — `Execute`/`ReadFile` are then denied
+// grants `linux_enforce::WORKDIR_ACCESS_RIGHTS` (everything in ABI v1 except device-node and
+// unix-socket creation), but — once `restrict_self()` lands — `Execute`/`ReadFile` are then denied
 // on every path *outside* the workdir, including the `shell.allow` binaries themselves, their ELF
 // interpreter (dynamic loader), and every shared library they pull in. That silently defeats the
 // seccomp exec-allowlist: each allowlisted `execve` fails with EACCES before it runs.
@@ -1020,13 +1029,16 @@ pub(crate) fn prepare_enforcement(
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It performs
-    // the explicit `no_new_privs` `prctl`, libseccomp filter construction/load (kernel syscalls),
-    // one `sendmsg` call to hand the notify fd to the parent over `child_sock`, and (KernelFull
-    // only) Landlock ruleset construction/`restrict_self` against already-open fds (also kernel
-    // syscalls) — no `open()`/`canonicalize()`, no locks beyond what those syscalls need. On any
-    // failure it writes the real error message to the CLOEXEC diagnostic pipe (best-effort,
-    // bounded, raw `write` loop) before returning `Err`. `child_sock`, `diag_write`, and the
-    // Landlock fds are moved in and close automatically when the closure body finishes.
+    // the capability-dropping `prctl`/`capset` sequence (bounding-set drop, capset clear, and the
+    // explicit `no_new_privs` `prctl`) plus one allocation-free `open`/`read`/`close` of
+    // `/proc/sys/kernel/cap_last_cap`, libseccomp filter construction/load (kernel syscalls), one
+    // `sendmsg` call to hand the notify fd to the parent over `child_sock`, and (KernelFull only)
+    // Landlock ruleset construction/`restrict_self` against already-open fds (also kernel
+    // syscalls) — no `open()`/`canonicalize()` beyond that one `cap_last_cap` read, no locks
+    // beyond what those syscalls need. On any failure it writes the real error message to the
+    // CLOEXEC diagnostic pipe (best-effort, bounded, raw `write` loop) before returning `Err`.
+    // `child_sock`, `diag_write`, and the Landlock fds are moved in and close automatically when
+    // the closure body finishes.
     unsafe {
         command.pre_exec(move || {
             let sock_fd = child_sock.as_raw_fd();
@@ -1066,6 +1078,8 @@ mod linux_enforce {
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
 
+    use landlock::{make_bitflags, AccessFs, BitFlags};
+
     use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
     use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
 
@@ -1083,13 +1097,54 @@ mod linux_enforce {
     }
 
     /// All Landlock file descriptors resolved in the parent for one shell subprocess: the
-    /// workdir's fd (full-access rule) plus each successfully-opened grant fd. Handed by
-    /// reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules against
-    /// these fds without performing a single `open()`.
+    /// workdir's fd (scoped by [`WORKDIR_ACCESS_RIGHTS`]) plus each successfully-opened grant fd.
+    /// Handed by reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules
+    /// against these fds without performing a single `open()`.
     pub(super) struct LandlockChildFds {
         workdir_fd: OwnedFd,
         grants: Vec<OpenLandlockGrant>,
     }
+
+    /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule.
+    ///
+    /// Spelled out variant by variant rather than `AccessFs::from_all(ABI::V1)` for two reasons:
+    /// `from_all` hides what is actually handed to the capsule, and three of ABI v1's thirteen
+    /// rights are deliberately withheld.
+    ///
+    ///   - `MakeChar` / `MakeBlock` — creating a device node inside the workdir escapes this
+    ///     whole scope. A capsule running as root could `mknod` a node for the host's own disk
+    ///     (e.g. major/minor `8:0` = `sda`) *inside* the granted directory — which Landlock
+    ///     permits, because the new inode lives beneath a granted path — then `open()` it and
+    ///     read the raw host filesystem underneath every other restriction. No known workload
+    ///     creates device nodes in its working tree.
+    ///   - `MakeSock` — binding an `AF_UNIX` socket file. Withheld by the same rule (no
+    ///     filesystem object with a kernel-side identity beyond a regular file), but unlike the
+    ///     two device rights this one is a genuine open question: some build tooling and some
+    ///     language-toolchain daemons `bind()` a unix socket in their working tree, and a fix
+    ///     that breaks those is not a fix. The manual acceptance procedure on the
+    ///     security-warnings reference page ("Manual acceptance procedure — workdir device-node
+    ///     escape") carries an explicit unix-socket scenario for exactly this; if the team's
+    ///     real-hardware run finds a workload that needs it, add `MakeSock` back to this list.
+    ///
+    /// `MakeFifo` stays granted: real build tooling does create named pipes in its working tree,
+    /// and a FIFO carries none of the raw-device risk above.
+    ///
+    /// Because `apply_landlock_scope`'s `handle_access` still declares the *full*
+    /// `from_all(ABI::V1)` set, the three withheld rights are not merely "not extra-granted" —
+    /// they become **denied everywhere** in this domain, workdir included, once `restrict_self()`
+    /// takes effect.
+    pub(super) const WORKDIR_ACCESS_RIGHTS: BitFlags<AccessFs> = make_bitflags!(AccessFs::{
+        Execute
+            | WriteFile
+            | ReadFile
+            | ReadDir
+            | RemoveDir
+            | RemoveFile
+            | MakeDir
+            | MakeReg
+            | MakeFifo
+            | MakeSym
+    });
 
     enum Decision {
         Allow,
@@ -1137,21 +1192,25 @@ mod linux_enforce {
         Some(matches!(status.ruleset, RulesetStatus::FullyEnforced))
     }
 
-    /// Runs inside the forked child, pre-exec: installs the seccomp exec/network-notify
-    /// filter, hands its notify fd to the parent over `child_sock_fd`, and (on `KernelFull`)
-    /// applies the Landlock filesystem scope. Returning `Err` here aborts the exec (std's
-    /// `Command` machinery propagates it back to the parent's `.spawn()` call as an `io::Error`)
-    /// — the fail-closed path for setup failures that happen after fork.
+    /// Runs inside the forked child, pre-exec: strips the child's Linux capabilities, installs
+    /// the seccomp exec/network-notify filter, hands its notify fd to the parent over
+    /// `child_sock_fd`, and (on `KernelFull`) applies the Landlock filesystem scope. Returning
+    /// `Err` here aborts the exec (std's `Command` machinery propagates it back to the parent's
+    /// `.spawn()` call as an `io::Error`) — the fail-closed path for setup failures that happen
+    /// after fork.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         landlock_fds: Option<&LandlockChildFds>,
         child_sock_fd: RawFd,
     ) -> io::Result<()> {
-        // Explicitly opt out of gaining privileges via any later `execve` — required for both the
-        // seccomp filter load below (without CAP_SYS_ADMIN) and Landlock's `restrict_self`, so
-        // neither depends implicitly on libseccomp's `SCMP_FLTATR_CTL_NNP` default. Set first so a
-        // failure here is its own distinct, fail-closed error path before any filter is installed.
-        set_no_new_privs()?;
+        // First, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
+        // capability model are independent, both-must-allow gates, so narrowing the Landlock
+        // workdir grant does not by itself take `CAP_MKNOD` away from a root-uid capsule. This
+        // must also run *before* `install_seccomp_filter`, because it is what sets
+        // `no_new_privs` — which `seccomp(2)` requires once `CAP_SYS_ADMIN` is gone. Setting it
+        // here (rather than depending on libseccomp's `SCMP_FLTATR_CTL_NNP` default) also means a
+        // failure is its own distinct, fail-closed error path before any filter is installed.
+        drop_all_capabilities()?;
 
         install_seccomp_filter(child_sock_fd)?;
 
@@ -1164,10 +1223,158 @@ mod linux_enforce {
         Ok(())
     }
 
-    /// Sets `PR_SET_NO_NEW_PRIVS` for the forked child, before any seccomp/Landlock call. Same
-    /// call convention and fail-closed style as `security::harden_process_dumpable`'s
-    /// `PR_SET_DUMPABLE` `prctl`, but a different call site and lifetime: this is per-shell-
-    /// subprocess, inside `pre_exec`, not the once-at-`main()` whole-process hardening.
+    /// Capability-version word for the 64-bit, two-`__u32`-word capability ABI
+    /// (`_LINUX_CAPABILITY_VERSION_3`, Linux 2.6.26+). Passing it tells the kernel the
+    /// `cap_user_data` argument is a **two element** array. The older version-1 word would cover
+    /// only capabilities 0–31 and make the kernel log a deprecation warning.
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    /// Upper bound for the bounding-set loop when `/proc/sys/kernel/cap_last_cap` cannot be read.
+    /// 63 is the architectural ceiling — `capset`'s two 32-bit words address exactly 64
+    /// capabilities — so this can never under-cover. Numbers the running kernel does not define
+    /// return `EINVAL`, which the loop skips.
+    const CAP_LAST_CAP_FALLBACK: u32 = 63;
+
+    /// `cap_user_header_t` from `<linux/capability.h>`. `libc` 0.2 exposes `SYS_capset` but
+    /// neither this struct, its data counterpart, nor a safe `capset()` wrapper — so both are
+    /// hand-rolled here, for the same reason `send_fd_over_socket` hand-rolls its
+    /// `msghdr`/`cmsghdr` handling.
+    ///
+    /// `dead_code` is allowed because the kernel reads these fields through the raw pointer
+    /// handed to `capset(2)`; Rust itself only ever writes them.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct CapUserHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+
+    /// One word of `cap_user_data_t` from `<linux/capability.h>`. Under
+    /// [`LINUX_CAPABILITY_VERSION_3`] the kernel expects an array of exactly two of these: word 0
+    /// carries capabilities 0–31, word 1 carries 32–63. See [`CapUserHeader`] for the `dead_code`
+    /// note.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct CapUserData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    /// Strips every Linux capability from the forked child before `execve()`, in three steps
+    /// whose **order matters**:
+    ///
+    ///   1. drop the whole capability **bounding set** (`PR_CAPBSET_DROP`) — while this process
+    ///      still holds `CAP_SETPCAP` in its *effective* set, because that is exactly what
+    ///      `PR_CAPBSET_DROP` checks (`capabilities(7)`, `prctl(2)`).
+    ///   2. clear this process's own permitted/effective/inheritable sets via `capset(2)`.
+    ///      Shrinking your own permitted set to any subset — including empty — never requires
+    ///      `CAP_SETPCAP`, so running it after step 1 costs nothing. Clearing permitted and
+    ///      inheritable also empties the *ambient* set, which the kernel maintains as a subset of
+    ///      both — that is what covers a non-root capsule handed an unexpected ambient
+    ///      `CAP_MKNOD` (e.g. a systemd unit with `AmbientCapabilities=`).
+    ///   3. set `no_new_privs`, so `execve()` cannot regain privilege through a set-user-ID or
+    ///      file-capability binary, and so the seccomp filter installed next can load without
+    ///      `CAP_SYS_ADMIN` (which step 2 just removed). Setting it here explicitly means this no
+    ///      longer depends on libseccomp's default `SCMP_FLTATR_CTL_NNP` attribute having set it
+    ///      as a side effect.
+    ///
+    /// **Why steps 1 and 2 are in this order** (it is the reverse of the obvious "clear my sets,
+    /// then clear the bounding set"): `PR_CAPBSET_DROP` requires `CAP_SETPCAP` in the *effective*
+    /// set of the caller. Clearing effective first would strip `CAP_SETPCAP`, after which every
+    /// `PR_CAPBSET_DROP` returns `EPERM` — and because `EPERM` is (correctly) non-fatal for a
+    /// genuinely unprivileged caller, the bounding set would silently survive while this function
+    /// still reported success.
+    ///
+    /// **Why the bounding set is the load-bearing step for a root-uid capsule:** `execve(2)`'s
+    /// capability transition treats a file's permitted set as all-ones when the process's real
+    /// uid is 0, so the new program's permitted set comes out as `P(bounding)`. Step 2 alone
+    /// would be undone by the very next `execve`; emptying the bounding set is what makes the
+    /// post-exec permitted (and hence effective) set empty, which is what actually takes
+    /// `CAP_MKNOD` away from the shell.
+    ///
+    /// Note this also removes `CAP_DAC_OVERRIDE` from a root-run capsule's shell subprocess, so
+    /// it no longer bypasses ordinary file-permission checks. That is intended — least privilege
+    /// — and strictly narrows what the subprocess can reach.
+    fn drop_all_capabilities() -> io::Result<()> {
+        drop_capability_bounding_set()?;
+        clear_capability_sets()?;
+        set_no_new_privs()
+    }
+
+    /// Step 1 of [`drop_all_capabilities`]. Two errnos are expected and skipped:
+    ///
+    ///   - `EINVAL` — `cap` is not a capability this kernel defines, so there is nothing to drop.
+    ///   - `EPERM` — the caller holds no `CAP_SETPCAP`, i.e. it is a genuinely unprivileged
+    ///     process that never held the capability being dropped either. Hard-failing here would
+    ///     break every non-root `mur run`.
+    ///
+    /// Any other errno is unexpected and propagates, aborting the exec — this module's
+    /// fail-closed invariant: no silently-unenforced spawn.
+    #[allow(unsafe_code)]
+    fn drop_capability_bounding_set() -> io::Result<()> {
+        let zero: libc::c_ulong = 0;
+
+        for cap in 0..=kernel_last_cap() {
+            let cap_arg = libc::c_ulong::from(cap);
+            // SAFETY: `prctl(PR_CAPBSET_DROP, ...)` takes an integer capability number and three
+            // ignored arguments — no pointers and no borrowed memory are involved.
+            let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap_arg, zero, zero, zero) };
+            if rc == 0 {
+                continue;
+            }
+
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINVAL) | Some(libc::EPERM) => continue,
+                _ => return Err(error),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Step 2 of [`drop_all_capabilities`]. Always expected to succeed: the kernel's `capset`
+    /// checks are all "is the new set a subset of the old one", and the empty set is a subset of
+    /// everything. Any error is therefore unexpected and fails closed.
+    #[allow(unsafe_code)]
+    fn clear_capability_sets() -> io::Result<()> {
+        let header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            // 0 means "the calling thread" — the only pid `capset` accepts for a capability
+            // change since Linux 2.6.25.
+            pid: 0,
+        };
+        let data = [CapUserData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+
+        // SAFETY: both pointers refer to stack locals that outlive this single `capset` call, and
+        // `data` is exactly the two-element array `LINUX_CAPABILITY_VERSION_3` makes the kernel
+        // expect. The kernel only reads through them.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_capset,
+                &header as *const CapUserHeader,
+                data.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Step 3 of [`drop_all_capabilities`]. Setting `no_new_privs` can only ever *reduce* a
+    /// process's privilege and is never refused for a well-formed call, so any error is
+    /// unexpected and fails closed. Same call convention and fail-closed style as
+    /// `security::harden_process_dumpable`'s `PR_SET_DUMPABLE` `prctl`, but a different call site
+    /// and lifetime: this is per-shell-subprocess, inside `pre_exec`, not the once-at-`main()`
+    /// whole-process hardening.
     #[allow(unsafe_code)]
     fn set_no_new_privs() -> io::Result<()> {
         #[cfg(test)]
@@ -1176,16 +1383,61 @@ mod linux_enforce {
                 "sandbox: no_new_privs (prctl PR_SET_NO_NEW_PRIVS, 1) failed (forced by test seam)",
             ));
         }
-        // SAFETY: PR_SET_NO_NEW_PRIVS takes a single int argument (1) and has no pointer/lifetime
-        // requirements; the trailing 0 args are ignored by prctl's variadic C signature.
-        let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "sandbox: prctl(PR_SET_NO_NEW_PRIVS, 1) failed: {}",
-                io::Error::last_os_error()
-            )))
+        // The kernel rejects `PR_SET_NO_NEW_PRIVS` unless arg2 is exactly 1 and arg3/4/5 are
+        // exactly 0, so these are typed as `c_ulong` rather than left as untyped literals whose
+        // upper 32 bits would be unspecified in a variadic call on aarch64.
+        let enable: libc::c_ulong = 1;
+        let zero: libc::c_ulong = 0;
+
+        // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, ...)` takes four integer arguments — no pointers
+        // and no borrowed memory are involved.
+        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, enable, zero, zero, zero) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Highest capability number this kernel defines, read from `/proc/sys/kernel/cap_last_cap`.
+    /// Uses raw `open`/`read` into a stack buffer so it stays allocation-free in the post-`fork()`
+    /// window. Any failure — file absent on a pre-2.6.25 kernel, unreadable, contents that do not
+    /// parse — falls back to [`CAP_LAST_CAP_FALLBACK`], which over-covers rather than
+    /// under-covers, since undefined capability numbers just return the `EINVAL` the caller skips.
+    #[allow(unsafe_code)]
+    fn kernel_last_cap() -> u32 {
+        const PATH: &[u8] = b"/proc/sys/kernel/cap_last_cap\0";
+
+        // SAFETY: `PATH` is a NUL-terminated byte literal with `'static` lifetime, and `open`
+        // only reads through the pointer.
+        let fd = unsafe {
+            libc::open(
+                PATH.as_ptr() as *const libc::c_char,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return CAP_LAST_CAP_FALLBACK;
+        }
+
+        let mut buf = [0u8; 16];
+        // SAFETY: `fd` was just opened successfully; `buf` is a stack array and its exact length
+        // is passed, so `read` cannot write past it.
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        // SAFETY: `fd` is open and exclusively owned here; nothing else holds or will reuse it.
+        unsafe { libc::close(fd) };
+
+        if read <= 0 {
+            return CAP_LAST_CAP_FALLBACK;
+        }
+
+        let parsed = std::str::from_utf8(&buf[..read as usize])
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+
+        match parsed {
+            Some(last) if last <= CAP_LAST_CAP_FALLBACK => last,
+            _ => CAP_LAST_CAP_FALLBACK,
         }
     }
 
@@ -1235,7 +1487,9 @@ mod linux_enforce {
 
     /// Scopes the shell subprocess tree's filesystem access with Landlock. Two kinds of rule:
     ///
-    ///   - the workdir gets the **full** access set (read/write/execute) — unchanged from before;
+    ///   - the workdir gets [`WORKDIR_ACCESS_RIGHTS`] — read/write/execute plus directory,
+    ///     regular-file, FIFO and symlink creation, but **not** `MakeChar`/`MakeBlock`/`MakeSock`
+    ///     (see that constant for why each of the three is withheld);
     ///   - each [`LandlockGrant`] (the `shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure, and any `interpreter_runtime` directory, all *outside* the
     ///     workdir) gets a **narrow read+execute** grant — never write. Whether that grant also
@@ -1253,8 +1507,11 @@ mod linux_enforce {
     /// the security story honest: nothing outside the workdir is writable, so a write to any
     /// outside path — including one of these read+execute grant paths — is still denied.
     ///
-    /// `handle_access` must declare the union of every access bit any rule uses; that stays the
-    /// full set because the workdir rule needs it. A grant path that fails to *open* is skipped
+    /// `handle_access` must declare the union of every access bit any rule uses, and it stays the
+    /// **full** ABI v1 set deliberately: a bit declared there but granted by no rule is denied for
+    /// the whole domain, which is exactly how the three rights missing from
+    /// [`WORKDIR_ACCESS_RIGHTS`] become denied rather than merely un-granted. A grant path that
+    /// fails to *open* is skipped
     /// (shrink-not-fail, matching `resolve_exec_allowlist`) rather than failing the whole scope —
     /// it only narrows what is allowed. A genuine ruleset-construction failure still returns `Err`,
     /// preserving the module's fail-closed invariant.
@@ -1289,7 +1546,7 @@ mod linux_enforce {
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
-            .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), access_all))
+            .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), WORKDIR_ACCESS_RIGHTS))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
 
         for grant in &fds.grants {
@@ -2516,6 +2773,49 @@ mod linux_integration_tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Pure content check on the workdir access-right set: no kernel call, no fork, no spawn.
+    /// It pins *which* Landlock ABI v1 rights `apply_landlock_scope` hands the workdir, so
+    /// re-adding device-node creation becomes a test failure instead of a silent regression.
+    ///
+    /// It proves **nothing** about whether the kernel enforces that set — that is the manual
+    /// acceptance procedure on `docs/content/reference/security-warnings.md`, not this test.
+    /// It lives in this `#[cfg(target_os = "linux")]` module rather than the cross-platform
+    /// `tests` module only because `landlock::AccessFs` is a Linux-only dependency.
+    #[test]
+    fn workdir_landlock_grant_withholds_device_and_socket_creation() {
+        use landlock::{Access, AccessFs, ABI};
+
+        let all_v1 = AccessFs::from_all(ABI::V1);
+        let granted = linux_enforce::WORKDIR_ACCESS_RIGHTS;
+
+        for withheld in [AccessFs::MakeChar, AccessFs::MakeBlock, AccessFs::MakeSock] {
+            assert!(
+                all_v1.contains(withheld),
+                "{withheld:?} is expected to be part of Landlock ABI v1 — if it is not, this \
+                 test's premise (and the workdir grant's comment) needs revisiting"
+            );
+            assert!(
+                !granted.contains(withheld),
+                "the workdir grant must withhold {withheld:?}: with the full ABI v1 set declared \
+                 by handle_access, withholding it here is what makes it denied rather than merely \
+                 un-granted"
+            );
+        }
+
+        assert!(
+            granted.contains(AccessFs::MakeFifo),
+            "MakeFifo stays granted — real build tooling creates named pipes in its working tree"
+        );
+
+        let expected = all_v1 & !(AccessFs::MakeChar | AccessFs::MakeBlock | AccessFs::MakeSock);
+        assert_eq!(
+            granted, expected,
+            "the workdir grant must be exactly Landlock ABI v1 minus MakeChar/MakeBlock/MakeSock \
+             — nothing else may be added or dropped without updating this test and the constant's \
+             comment together"
+        );
+    }
 
     #[test]
     fn prepare_enforcement_is_noop_for_environment_only_tier_even_on_linux() {

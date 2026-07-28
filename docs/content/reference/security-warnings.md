@@ -35,7 +35,11 @@ Warnings from `mur build` go to stderr only.
     Landlock now grants a narrow, *derived* read+execute scope outside the workdir (the
     allowlisted binaries, their dynamic loader, and their shared libraries — nothing writable, no
     directory granted wholesale) so allowlisted programs can actually exec and dynamically link.
-    Until a real Linux run confirms that mechanism end to end, treat the "Full" and "Seccomp-only"
+    The workdir's own grant withholds character-device, block-device and unix-socket creation, and
+    both Linux tiers drop every capability from the shell child before `execve` — see
+    [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) for
+    the exact commands the team runs to confirm those two.
+    Until a real Linux run confirms these mechanisms end to end, treat the "Full" and "Seccomp-only"
     tiers below as **not-yet-confirmed**, not a hardened security boundary. Both Linux tiers emit a
     warning at launch (`W-SEC-005` / `W-SEC-002`) saying exactly this. The only tier whose behavior
     is verified today is Environment-only (macOS/Windows), because there the enforcement is a
@@ -53,17 +57,25 @@ subprocesses declared under `capabilities.shell.allow`.
 | Seccomp-only | Linux, kernel <5.13 (no Landlock) | **not** enforced | kernel-enforced¹ | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
 | Environment-only | macOS, Windows, any non-Linux host | **not** enforced | **not** enforced | **not** enforced | Yes — enforcement is a documented no-op here |
 
-¹ *Intended* behavior. On the Full tier the Landlock scope grants the capsule workdir full access
-**and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
+¹ *Intended* behavior. On the Full tier the Landlock scope grants the capsule workdir a near-full
+access set **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while nothing
 outside the workdir is writable and no directory is granted wholesale. A capsule may *additionally*
 name specific host directories a path-based interpreter needs (its stdlib) via
 `capabilities.shell.interpreter_runtime` — but only the exact directories named, each with an
 explicit per-directory `list_dir` flag, never a whole install prefix (see
-[`W-SEC-009`](#w-sec-009)). This code is unit-tested but has not yet been run end to end by the team
+[`W-SEC-009`](#w-sec-009)). The workdir grant is *not* the full Landlock right-set: character-device
+(`MakeChar`), block-device (`MakeBlock`) and unix-socket (`MakeSock`) creation are withheld, so a
+capsule cannot create a raw disk device node inside its own workdir and read the host filesystem
+through it. Independently of Landlock — and therefore on **both** Linux tiers — the forked shell
+child drops its entire capability bounding set, clears its permitted/effective/inheritable sets, and
+sets `no_new_privs` before `execve`, so a root-operated `mur run` no longer hands the subprocess
+`CAP_MKNOD` (or `CAP_DAC_OVERRIDE`, or anything else) in the first place. This code is unit-tested
+but has not yet been run end to end by the team
 on a real Landlock-capable Linux host, so do not treat any "kernel-enforced" cell above as a
-confirmed boundary until that acceptance run lands.
+confirmed boundary until that acceptance run lands — see
+[Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node).
 
 Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify.
 Both are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
@@ -101,6 +113,13 @@ Seccomp-only tier (Linux, kernel <5.13).
 all on this tier — Landlock requires kernel ≥5.13. The seccomp exec/network enforcement that
 *would* apply here has never been verified on real Linux hardware (see
 [W-SEC-005](#w-sec-005)), so treat shell subprocess isolation as experimental on this host.
+
+The capability drop described under [W-SEC-005](#w-sec-005) *does* apply on this tier — it is a
+`prctl`/`capset` sequence in the forked child, independent of Landlock — so a root-operated `mur run`
+here still hands its shell subprocess an empty capability set. That is also not yet team-verified;
+the capability half of
+[Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) is
+runnable on this tier.
 
 **What to do:** upgrade the host kernel to 5.13+ (moves you to the Full tier), but do not treat
 either Linux tier as a verified boundary until a real Linux run confirms the enforcement works.
@@ -157,22 +176,61 @@ exists to prevent.
 
 **Why it matters:** the Landlock + seccomp enforcement layer is implemented and unit-tested, but
 has **not yet been verified by the team on real Landlock-capable Linux hardware**. On this tier
-the Landlock scope grants the capsule workdir full access **and** a narrow, *derived* read+execute
-grant for exactly the `shell.allow` binaries, their ELF interpreter (dynamic loader), and the
-transitive closure of their shared libraries — so an allowlisted program can exec and dynamically
-link outside the workdir, while nothing outside the workdir is writable and no directory is granted
-wholesale. (An earlier revision granted only the workdir, which would have denied every allowlisted
-binary its own `execve`; that has been fixed.) What remains unverified is whether this derived-grant
-mechanism behaves as intended end to end on a real Tier-1 host — the acceptance run happens after
-this ships, not as part of it — so until then, do not rely on the filesystem/exec/network isolation
-it provides as a hardened security boundary.
+the Landlock scope grants the capsule workdir a near-full access set **and** a narrow, *derived*
+read+execute grant for exactly the `shell.allow` binaries, their ELF interpreter (dynamic loader),
+and the transitive closure of their shared libraries — so an allowlisted program can exec and
+dynamically link outside the workdir, while nothing outside the workdir is writable and no directory
+is granted wholesale. (An earlier revision granted only the workdir, which would have denied every
+allowlisted binary its own `execve`; that has been fixed.) What remains unverified is whether this
+derived-grant mechanism behaves as intended end to end on a real Tier-1 host — the acceptance run
+happens after this ships, not as part of it — so until then, do not rely on the
+filesystem/exec/network isolation it provides as a hardened security boundary.
+
+**"Near-full", not full — the workdir device-node hole.** An earlier revision granted the workdir
+the *complete* Landlock ABI v1 right-set, which includes `MakeChar` and `MakeBlock`. A capsule
+running as root could therefore `mknod` a block-device node for the host's own disk (e.g. `8:0` =
+`sda`) *inside* its workdir — Landlock permits it, because the new inode lives beneath a granted
+path — then `open()` that node and read the entire raw host filesystem, bypassing the workdir scope
+completely. Two independent mechanisms now close this, and **neither is team-verified yet**:
+
+1. The workdir rule's granted right-set is written out explicitly and withholds `MakeChar`,
+   `MakeBlock` and `MakeSock`. Because `handle_access` still declares the full ABI v1 set, those
+   three are *denied* in the capsule's Landlock domain, not merely un-granted. `MakeFifo` stays
+   granted — real build tooling creates named pipes in its working tree.
+2. Before `execve`, the forked shell child drops its entire capability **bounding set**, clears its
+   permitted/effective/inheritable capability sets via `capset(2)`, and sets `no_new_privs`. This is
+   independent of Landlock and applies on **both** Linux tiers, including
+   [Seccomp-only](#w-sec-002).
+
+**Is `CAP_MKNOD` the only gate? Yes, for the device half.** `mknod(2)` for `S_IFBLK`/`S_IFCHR`
+always requires `CAP_MKNOD` in the caller's effective set, independently of Landlock. A genuinely
+non-root capsule — no ambient or inherited `CAP_MKNOD`, no `setcap`'d binary in its exec path —
+could never create a device node, before this fix or after it. The exposure was specifically
+**root-operated `mur run`** deployments (CI runners, some service deployments), which keep the full
+root capability set by default. Mechanism 2 is defense-in-depth that additionally covers a non-root
+capsule handed an unexpected ambient `CAP_MKNOD` — for example a systemd unit with
+`AmbientCapabilities=CAP_MKNOD`.
+
+**Known open question — unix sockets.** Withholding `MakeSock` means a subprocess cannot `bind()` an
+`AF_UNIX` socket file inside the workdir. Some build tooling and some language-toolchain daemons do
+exactly that, so this is the one withheld right that could plausibly break a real workload. The
+acceptance procedure below tests for it explicitly; if the team's real-hardware run finds a workload
+that needs it, `MakeSock` goes back into the workdir grant (`WORKDIR_ACCESS_RIGHTS` in
+`crates/capsule-runtime/src/sandbox.rs`) and this section gets updated. `MakeChar`/`MakeBlock` are
+not up for reconsideration.
+
+**Side effect worth knowing about:** dropping the capability sets also removes `CAP_DAC_OVERRIDE`
+from a root-run capsule's shell subprocess, so it no longer bypasses ordinary file-permission
+checks. That is intended, but it is a real behavior change for root deployments whose shell steps
+relied on root's usual "can read anything" posture.
 
 **What to do:** until the layer is verified end to end on real Linux, apply the same discipline you
 would on the Environment-only tier: prefer specific binary declarations over `bash`, keep
 `network.allow`/`filesystem.scope` minimal, and use the
 [data/action phase-separation pattern](manifest-schema.md#threat-model) for capsules that ingest
-untrusted content. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same not-yet-verified
-caveat plus an additional filesystem gap (no Landlock at all).
+untrusted content. Do not run `mur run` as root if you can avoid it — non-root was never exposed to
+the device-node escape above. The Seccomp-only tier ([W-SEC-002](#w-sec-002)) carries the same
+not-yet-verified caveat plus an additional filesystem gap (no Landlock at all).
 
 ---
 
@@ -288,3 +346,212 @@ present in the same block's `shell.allow` (this mechanism narrows filesystem acc
 exec grant that already exists — it never itself grants exec), a `dirs[].path` that is not absolute
 (does not start with `/`), a `dirs[]` entry that omits `list_dir` (enumerability is never inferred),
 or an `interpreter_runtime[]` entry with an empty `dirs` list.
+
+---
+
+## Manual acceptance procedure — workdir device-node escape { #manual-acceptance-device-node }
+
+This procedure confirms the two mechanisms described under [W-SEC-005](#w-sec-005) — the narrowed
+Landlock workdir grant and the child capability drop — on real hardware. **It is deliberately not
+automated.** There is no committed test that asserts "`mknod` is refused", and a green
+`cargo test`/CI run is not evidence that any of this works: this repo's CI has never resolved to a
+Linux enforcement tier where the code path is even executed. Until someone runs the steps below and
+records the result, the mechanisms are *implemented*, not *verified*.
+
+### Prerequisites
+
+- A **real, uncontainerized** Linux host. Not Docker, not a rootless container, not WSL. Containers
+  routinely drop `CAP_MKNOD` from the container's own bounding set and mask `/dev`, so the "before"
+  half of scenario 1 will not reproduce and the "after" half will pass for the wrong reason.
+- Kernel ≥5.13 for the Landlock half (`KernelFull`). The capability half (scenarios 4 and 5) also
+  runs on `KernelSeccompOnly`.
+- A checkout of this repository and a working `cargo`.
+- `root`. Scenarios 1–3 and 5 must be run as root, because root is the deployment shape that was
+  actually exposed (see scenario 4 for the non-root case).
+
+Confirm the tier the host resolves to before anything else:
+
+```bash
+cd /path/to/murmur
+sudo -E cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::kernel_tier_allows_exec_within_shell_allowlist \
+  -- --nocapture
+```
+
+A `SKIP — PROVES NOTHING` line in that output means the host is not on a kernel tier and **the rest
+of this procedure is meaningless on this machine**. Stop and find a different host.
+
+### Scratch harness
+
+Scenarios 1–3 and 5 drive `shell::execute_shell` directly, which is crate-private, so they run from
+a scratch test appended to `crates/capsule-runtime/src/sandbox.rs`. **Do not commit it.** Append
+this to the end of `mod linux_integration_tests` (just before that module's closing brace):
+
+```rust
+    #[test]
+    fn scratch_manual_acceptance() {
+        let tier = detect_enforcement_tier();
+        eprintln!("TIER: {tier:?}");
+
+        let workdir = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let enforcement = ShellEnforcement {
+            tier,
+            network_allow_ips: Vec::new(),
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &exec_allow_paths,
+            )),
+            exec_allow_paths,
+        };
+
+        // Replace SCRIPT with the script from each scenario below, one at a time.
+        let script = std::env::var("SCRATCH_SCRIPT").expect("set SCRATCH_SCRIPT");
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", &script],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell must return Ok, not Err");
+        eprintln!("EXIT: {}", result.exit_code);
+        eprintln!("OUT: {}", result.stdout);
+        eprintln!("ERR: {}", result.stderr);
+    }
+```
+
+Run one scenario at a time with:
+
+```bash
+sudo -E SCRATCH_SCRIPT='<the script for this scenario>' \
+  cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::scratch_manual_acceptance -- --nocapture --exact
+```
+
+When you are done: `git checkout crates/capsule-runtime/src/sandbox.rs`.
+
+### Scenario 1 — `mknod` of a block device inside the workdir is refused
+
+This is the escape itself. `8:0` is the conventional major/minor for `/dev/sda`; use whatever
+`lsblk -o NAME,MAJ:MIN` reports for a real disk on this host if `8:0` is not present.
+
+```bash
+SCRATCH_SCRIPT='mknod ./pwn b 8 0 && echo MKNOD_OK || echo MKNOD_REFUSED; \
+  dd if=./pwn bs=512 count=1 status=none | head -c 32 | xxd | head -1 || true'
+```
+
+- **Expected (fixed):** `MKNOD_REFUSED`, and no readable device node. The `mknod` fails with
+  `EACCES` (Landlock, on `KernelFull`) or `EPERM` (no `CAP_MKNOD`, on either tier).
+- **Regression (unfixed):** `MKNOD_OK` followed by an `xxd` dump of the host disk's first sector —
+  i.e. raw host-filesystem bytes from inside a sandboxed workdir.
+
+To see the "before" behavior for comparison, `git stash` this card's change to
+`WORKDIR_ACCESS_RIGHTS` **and** the `drop_all_capabilities()` call in `child_install_enforcement`;
+both must be reverted, because either one alone blocks the escape.
+
+Repeat with a character device to cover `MakeChar` as well:
+
+```bash
+SCRATCH_SCRIPT='mknod ./pwnc c 1 3 && echo MKNOD_OK || echo MKNOD_REFUSED'
+```
+
+### Scenario 2 — FIFO creation inside the workdir still works
+
+`MakeFifo` is deliberately still granted. If this scenario fails, the fix broke real build tooling
+and must not ship as-is.
+
+```bash
+SCRATCH_SCRIPT='mkfifo ./p && echo FIFO_OK || echo FIFO_BROKEN; \
+  ( echo hello > ./p & ) ; head -1 ./p'
+```
+
+- **Expected:** `FIFO_OK`, then `hello`. Regular-file and directory creation should also still work:
+
+```bash
+SCRATCH_SCRIPT='mkdir ./d && echo x > ./d/f && cat ./d/f && ln -s ./d/f ./l && \
+  readlink ./l && echo BASIC_FS_OK'
+```
+
+### Scenario 3 — unix-socket creation inside the workdir (the known open question)
+
+`MakeSock` is withheld, which means this scenario is **expected to fail** as shipped. The point of
+running it is to find out whether that failure matters for a real workload before the caveat is
+discovered in production. Record the result either way.
+
+```bash
+SCRATCH_SCRIPT='python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(\"./sock\")
+print(\"SOCK_BIND_OK\")
+" 2>&1 | tail -2'
+```
+
+(`python3` must also be in `shell_allow` for this one — add `"python3".to_string()` to the scratch
+harness's `shell_allow` vector, or use any other tool that binds an `AF_UNIX` path.)
+
+- **Expected as shipped:** a `PermissionError`/`OSError` from `bind`, not `SOCK_BIND_OK`.
+- **Decision to record:** if any tool the team actually runs under `capabilities.shell.allow` needs
+  to bind a unix socket in its working tree, add `MakeSock` back to `WORKDIR_ACCESS_RIGHTS` in
+  `crates/capsule-runtime/src/sandbox.rs`, update the [W-SEC-005](#w-sec-005) section, and re-run
+  scenario 1 to confirm the device-node refusal is unaffected (it is a separate bit — it will be).
+  `MakeChar`/`MakeBlock` are not up for reconsideration either way.
+
+### Scenario 4 — `CAP_MKNOD` is the sole gate for the device half (non-root)
+
+This scenario needs no murmur code at all; it establishes the baseline claim in
+[W-SEC-005](#w-sec-005) that a non-root capsule was never exposed to this escape.
+
+```bash
+# As an ordinary, non-root user, with no ambient capabilities:
+id
+grep CapAmb /proc/self/status          # expect CapAmb: 0000000000000000
+mknod /tmp/nonroot-test b 8 0 ; echo "exit=$?"
+```
+
+- **Expected:** `mknod: /tmp/nonroot-test: Operation not permitted`, `exit=1` — `mknod(2)` for
+  `S_IFBLK`/`S_IFCHR` always requires `CAP_MKNOD` in the effective set, with or without Landlock and
+  with or without this fix. Confirming this is what makes "the severity is about root-operated
+  `mur run`" a documented finding rather than an assumption.
+
+### Scenario 5 — the exec'd shell's capability sets are empty
+
+Confirms mechanism 2 directly, on either Linux tier. Run as root — the whole point is that a root
+parent does not hand its capabilities to the child.
+
+```bash
+SCRATCH_SCRIPT='grep -E "^Cap(Inh|Prm|Eff|Bnd|Amb):" /proc/self/status; \
+  grep -E "^NoNewPrivs:" /proc/self/status'
+```
+
+- **Expected:**
+
+```text
+CapInh: 0000000000000000
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+CapAmb: 0000000000000000
+NoNewPrivs: 1
+```
+
+  `CapBnd` is zero only up to the kernel's own highest defined capability
+  (`cat /proc/sys/kernel/cap_last_cap`); bits above that were never set. If `capsh` is installed,
+  `capsh --print` inside the same script is an equivalent, more readable check.
+- **Regression:** any non-zero `CapEff`/`CapPrm`/`CapBnd` under a root-run parent, or
+  `NoNewPrivs: 0`, means `drop_all_capabilities` did not run or partially failed.
+
+For contrast, the *unfixed* behavior for a root-run parent is `CapEff`/`CapPrm`/`CapBnd` all
+`000001ffffffffff` (or whatever this kernel's full set is).
+
+### Recording the result
+
+Update the [W-SEC-005](#w-sec-005) and [W-SEC-002](#w-sec-002) sections, the callout at the top of
+this page, and the "Verified?" column of the [tier table](#subprocess-enforcement-tiers) with what
+actually happened — including a scenario-3 decision on `MakeSock`. Until that edit lands, every
+"not yet team-verified" statement on this page stands as written.
