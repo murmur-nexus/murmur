@@ -74,7 +74,7 @@ access set **and** a narrow, *derived* read+execute grant for exactly the `shell
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
 allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
 is granted wholesale and the only writable path outside the workdir is `/dev/null` (see
-[the fixed capsule device set](#manual-acceptance-device-set)). A capsule may *additionally*
+[the fixed capsule device set](#capsule-device-set)). A capsule may *additionally*
 name specific host directories a path-based interpreter needs (its stdlib) via
 `capabilities.shell.interpreter_runtime` — but only the exact directories named, each with an
 explicit per-directory `list_dir` flag, never a whole install prefix (see
@@ -137,7 +137,7 @@ all on this tier — Landlock requires kernel ≥5.13. The seccomp exec/network 
 *would* apply here has never been verified on real Linux hardware (see
 [W-SEC-005](#w-sec-005)), so treat shell subprocess isolation as experimental on this host.
 
-The [fixed capsule device set](#manual-acceptance-device-set) does **not** apply on this tier
+The [fixed capsule device set](#capsule-device-set) does **not** apply on this tier
 either, and the direction of that gap is worth being explicit about: it is a Landlock rule list, so
 without Landlock there is nothing to grant *and* nothing to deny. A capsule here can open
 `/dev/null`, `/dev/zero` and `/dev/urandom` — but equally `/dev/random`, `/dev/mem` and any raw
