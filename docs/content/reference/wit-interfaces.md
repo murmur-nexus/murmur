@@ -497,28 +497,16 @@ unaffected and still carries the **argument list alone** (for a shell interprete
 script text passed via `-c`), so a hook that wants to recognize *what ran* must read
 `binary`, not parse `command`.
 
-**Four accepted lifecycle versions.** The host resolves the lifecycle instance export by
-trying `murmur:hook/lifecycle@0.5.0` first, then `@0.4.0`, then `@0.3.0`, then `@0.2.0`, and
-remembers which matched. Three independent shape differences are handled this way:
+**One accepted lifecycle version.** The host resolves the lifecycle instance export by the
+single versioned name shown above and nothing else — no earlier version, and not the bare
+unversioned `murmur:hook/lifecycle`. There is no compatibility fallback.
 
-- `on-shell`'s record shape: 9-field on `@0.5.0` (it gained `binary`), 8-field on
-  `@0.4.0`/`@0.3.0`/`@0.2.0`. Every pre-`@0.5.0` hook is dispatched the unchanged 8-field
-  record and simply never learns which binary ran, which is correct: `binary` is a `@0.5.0`
-  capability.
-- `on-compaction`'s record shape: 5-field on `@0.3.0` and later, 3-field on `@0.2.0`. A
-  `@0.2.0` hook is dispatched the 3-field record; every later version gets the 5-field one.
-- `hook-output`'s shape: the current 5-case variant (with `reopen-task`) on
-  `@0.5.0`/`@0.4.0`, the pre-`reopen-task` 4-case variant on `@0.3.0`/`@0.2.0`.
-  `TypedFunc::typed` is structural, so a 4-case guest return cannot be lifted directly
-  against the current 5-case host type — the host lifts a `@0.3.0`/`@0.2.0` hook's return
-  through a hand-authored 4-case twin, then widens it into the current type. A
-  `@0.2.0`/`@0.3.0` hook can therefore never produce `reopen-task`, which is correct:
-  `reopen-task` is a `@0.4.0` capability.
-
-Every other handler's records are shape-identical across all four versions and need no
-special-casing. This is a transitional exception scoped to exactly these versions of one
-package, **not** a return of the removed unversioned fallback: a hook exporting the bare
-`murmur:hook/lifecycle` name still fails hard.
+A hook built against an earlier version therefore does not load: it fails at instantiation
+with an error naming the version the host expects and a rebuild hint (`mur install` for a
+default artifact, or a source rebuild otherwise). When `murmur:hook` is bumped, every hook
+artifact must be rebuilt and republished against the new version — see
+`crates/capsule-runtime/wit/VERSIONING.md` for the bump rules and why the failure is
+deliberately loud rather than silently degraded.
 
 ---
 
@@ -681,9 +669,9 @@ murmur:tool;`/`murmur:capsule;`/`murmur:hook;` interface no longer instantiates 
 it fails with a hard error naming the versioned interface the host expected and a
 rebuild hint (`mur install` for a default artifact, or a source rebuild
 otherwise). Rebuild and republish any artifact still exporting only the
-unversioned name. The one exception is the `murmur:hook/lifecycle@0.5.0` →
-`@0.4.0` → `@0.3.0` → `@0.2.0` fallback described above, which is scoped to four
-specific versions of a single package and does not reopen the unversioned window.
+unversioned name. There are no exceptions: the host carries no fallback for an
+earlier version of any interface either, so every artifact must be built against
+the versions this tree declares.
 
 See `crates/capsule-runtime/wit/README.md` for which build consumes each copy
 of the tree, and `crates/capsule-runtime/wit/VERSIONING.md` for the version

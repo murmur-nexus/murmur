@@ -43,12 +43,8 @@ variant changes the wire shape of every export — a major bump. It was **not**
 shippable as a purely additive no-version change: `TypedFunc::typed` is
 structural and does not admit variant subtyping across the call boundary, so
 lifting a pre-`reopen-task` four-case guest return against the new five-case host
-type fails with "type mismatch with results" (verified empirically — see the
-`v0_2_*`/`v0_3_*`/`compaction_hook_*` tests in `src/hooks.rs`, which fail under a
-bare additive change and pass once the host lifts pre-`@0.4.0` hooks through the
-`lifecycle_v0_3` twin). The host keeps loading `@0.3.0`- and `@0.2.0`-compiled
-hooks by lifting their returns through that twin (`src/compat/lifecycle_v0_3.rs`)
-rather than forcing a fleet-wide rebuild.
+type fails with "type mismatch with results". Hooks built against `@0.3.0` or
+earlier stopped resolving at this bump and had to be rebuilt.
 
 `murmur:hook` then went to `0.5.0` when `shell-event` gained `binary: string` —
 the canonicalized path of the program a shell tool actually invoked. The record
@@ -56,9 +52,8 @@ previously carried only `command` (the argument list, never the binary name), so
 no hook bound to `on-shell` could tell whether an event was `pytest`, `cargo` or
 `ls`. Adding a field to an existing record is always a major bump, per the rule
 below; the `0.3.0 → 0.4.0` entry above records what happens if you try to ship
-one additively instead. The host keeps sending pre-`@0.5.0` hooks the unchanged
-8-field record through `src/compat/lifecycle_v0_4.rs`, so no already-published
-hook artifact needs a rebuild to keep receiving shell events.
+one additively instead. Hooks built against `@0.4.0` or earlier stopped
+resolving at this bump and had to be rebuilt.
 
 ## When to bump
 
@@ -88,7 +83,12 @@ shape changes: every field/case is positional in the canonical ABI, so any such
 edit is a breaking change even though it "looks additive" in the source. These
 are always **major** bumps.
 
-### Major (`X.0.0`)
+### Major (the breaking tier)
+
+Every `murmur:*` package is pre-1.0, where semver makes the **minor** field the
+breaking axis: a breaking change to `0.4.0` ships as `0.5.0`, not `1.0.0`. This
+tier is called *major* throughout this document in the sense of "breaking", and
+that is what every bump recorded above has done.
 
 Any of:
 
@@ -100,28 +100,28 @@ Any of:
 A host built for the old major version cannot safely call a component built for
 the new one, and vice versa.
 
-## Compatibility shims
+## No compatibility fallbacks
 
-Bumping a package's major version can require the host to keep accepting an
-older interface shape for a transition period, rather than forcing every
-affected artifact to be rebuilt in lockstep with the WIT change. Any such
-fallback is a **compat shim**, and its code, removal condition, and inventory
-row live under the compat-shim policy — see `COMPAT_SHIMS.md` at the repo root
-for the full, current list (e.g. the `murmur:hook/lifecycle@0.2.0` shim that
-`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump, the
-`lifecycle_v0_3` shim that lifts pre-`@0.4.0` four-case `hook-output` returns
-after the `0.3.0 → 0.4.0` bump, and the `lifecycle_v0_4` shim that sends
-pre-`@0.5.0` hooks the eight-field `shell-event` after the `0.4.0 → 0.5.0` bump).
+The host accepts **exactly one version of each interface** — the version
+declared in this tree — and keeps no fallback for any earlier one. There is no
+compat-shim layer, no version-keyed dispatch, and no transition window.
 
-This doc stays the place to record *why a version number changed*; the shim
-table is the place to record *what backward-compat code exists because of it,
-and when it can be deleted*. Don't re-describe an active shim's mechanics here
-— point at its row instead.
+A bump therefore requires every affected artifact to be rebuilt and
+republished. An artifact built against a retired version does not silently
+degrade: it fails at instantiation with an error naming the interface the host
+expects and pointing the author at a rebuild. That is deliberate — a loud
+failure with a known fix is preferable to a compatibility layer that accretes
+one shim per bump and is never removed.
 
-A compat shim is deliberately narrower than the general unversioned-name
-fallback described in the next section, which stays permanently removed: a
-hook exporting only the bare `murmur:hook/lifecycle` name still fails to
-instantiate, shim or no shim.
+Practically, this means the cost of a bump is paid at bump time, by whoever
+makes it: bump the version here, rebuild the artifacts in `default-artifacts`
+(see the sync note in [README.md](README.md)), and republish. Do not reach for
+a fallback to defer that work.
+
+If you are reviewing a change that adds a version fallback of any kind — a
+compat struct mirroring an old shape, a `match` on a legacy version, a
+try-new-then-old resolution chain — that is the thing this policy exists to
+reject.
 
 ## Unversioned artifacts: fallback removed
 
@@ -136,10 +136,9 @@ That fallback has been **removed**. The host now resolves the three
 dynamically-instantiated guest interfaces by the **versioned** instance name
 only:
 
-- `src/hooks.rs` — `resolve_lifecycle_iface` resolves
-  `murmur:hook/lifecycle@0.5.0`, falling back to `@0.4.0`, `@0.3.0` and `@0.2.0`
-  via the `lifecycle-v0_4`/`lifecycle-v0_3`/`lifecycle-v0_2` compat shims
-  (`COMPAT_SHIMS.md`) and to nothing else.
+- `src/hooks.rs` — `resolve_lifecycle_iface` resolves the single
+  `LIFECYCLE_IFACE` name and nothing else: no earlier version, and not the bare
+  unversioned name.
 - `src/runtime.rs` — `resolve_versioned_iface` resolves
   `murmur:capsule/run@0.1.0` and `murmur:tool/run@0.1.0`.
 
