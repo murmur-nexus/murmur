@@ -38,7 +38,12 @@ Warnings from `mur build` go to stderr only.
     The workdir's own grant withholds character-device, block-device and unix-socket creation, and
     both Linux tiers drop every capability from the shell child before `execve` — see
     [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) for
-    the exact commands the team runs to confirm those two.
+    the exact commands the team runs to confirm those two. Both Linux tiers also refuse
+    `socket(AF_UNIX, ...)` unless the manifest declares
+    [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities), and always
+    refuse `AF_NETLINK`/`AF_PACKET`, so a capsule cannot reach the host Docker daemon socket — see
+    [Manual acceptance procedure — unmediated AF_UNIX sockets](#manual-acceptance-af-unix), which
+    also carries the SWE-bench compatibility check that default-deny still needs.
     Until a real Linux run confirms these mechanisms end to end, treat the "Full" and "Seccomp-only"
     tiers below as **not-yet-confirmed**, not a hardened security boundary. Both Linux tiers emit a
     warning at launch (`W-SEC-005` / `W-SEC-002`) saying exactly this. The only tier whose behavior
@@ -68,7 +73,11 @@ explicit per-directory `list_dir` flag, never a whole install prefix (see
 [`W-SEC-009`](#w-sec-009)). The workdir grant is *not* the full Landlock right-set: character-device
 (`MakeChar`), block-device (`MakeBlock`) and unix-socket (`MakeSock`) creation are withheld, so a
 capsule cannot create a raw disk device node inside its own workdir and read the host filesystem
-through it. Independently of Landlock — and therefore on **both** Linux tiers — the forked shell
+through it. Independently of Landlock — and therefore on **both** Linux tiers — seccomp refuses
+`socket(AF_UNIX, ...)` outright unless the manifest declares
+[`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities), and always
+refuses `AF_NETLINK`/`AF_PACKET`, so a capsule cannot reach a host daemon socket such as
+`/var/run/docker.sock` (see [W-SEC-005](#w-sec-005)). Also independently of Landlock, the forked shell
 child drops its entire capability bounding set, clears its permitted/effective/inheritable sets, and
 sets `no_new_privs` before `execve`, so a root-operated `mur run` no longer hands the subprocess
 `CAP_MKNOD` (or `CAP_DAC_OVERRIDE`, or anything else) in the first place. This code is unit-tested
@@ -77,8 +86,11 @@ on a real Landlock-capable Linux host, so do not treat any "kernel-enforced" cel
 confirmed boundary until that acceptance run lands — see
 [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node).
 
-Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify.
-Both are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
+Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify, and
+socket-family denial uses classic seccomp-bpf argument matching (no userspace supervisor — the
+`socket(2)` domain is an integer the kernel's own BPF can compare directly, unlike a `connect()`
+destination address behind a pointer).
+All are Linux kernel primitives with no equivalent on macOS or Windows — the Environment-only
 tier is not a gap awaiting a future release, it is the permanent ceiling on those platforms.
 Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
 environment variables before the subprocess spawns (see
@@ -119,6 +131,14 @@ The capability drop described under [W-SEC-005](#w-sec-005) *does* apply on this
 here still hands its shell subprocess an empty capability set. That is also not yet team-verified;
 the capability half of
 [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) is
+runnable on this tier.
+
+So does the `socket(2)` domain denial described under [W-SEC-005](#w-sec-005): `AF_UNIX` is refused
+with `EACCES` unless `capabilities.network.unix_sockets: true` is declared, and `AF_NETLINK`/
+`AF_PACKET` are refused unconditionally. That rule is pure seccomp with no Landlock involvement, so
+it behaves *identically* on this tier and the Full tier — a host stuck below kernel 5.13 is not
+exposed to the `/var/run/docker.sock` escape. It has not been verified on real hardware either; all
+of [Manual acceptance procedure — unmediated AF_UNIX sockets](#manual-acceptance-af-unix) is
 runnable on this tier.
 
 **What to do:** upgrade the host kernel to 5.13+ (moves you to the Full tier), but do not treat
@@ -218,6 +238,45 @@ acceptance procedure below tests for it explicitly; if the team's real-hardware 
 that needs it, `MakeSock` goes back into the workdir grant (`WORKDIR_ACCESS_RIGHTS` in
 `crates/capsule-runtime/src/sandbox.rs`) and this section gets updated. `MakeChar`/`MakeBlock` are
 not up for reconsideration.
+
+**Unix, netlink and packet sockets are refused at `socket()`, not at `connect()`.** Landlock and the
+`MakeSock` decision above only ever governed *creating a socket file inside the workdir*. They never
+governed *connecting to a socket file that already exists elsewhere on the host* — and the seccomp
+network path did not either: it inspects the destination `sockaddr` of `connect`/`sendto`, and its
+parser returns "not an IP address" for `AF_UNIX`, which the supervisor treated as **allow**. A
+capsule could therefore open `/var/run/docker.sock` (or `/run/docker.sock`) and drive the host
+Docker daemon, which is host root — a full sandbox escape, on both Linux tiers, with no manifest
+declaration of any kind. Landlock does not close this at any ABI: ABI v6's
+`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` scopes *abstract* unix sockets only, and `docker.sock` is a
+*pathname* socket, so no kernel upgrade fixes it.
+
+The fix is a separate, classic seccomp-bpf rule on `socket(2)` itself, keyed on its `domain`
+argument. `domain` is a plain integer in a register, so the comparison compiles directly into the
+loaded BPF program and is evaluated in-kernel — no userspace supervisor, no notification, no reading
+another task's memory. It applies on **both** Linux tiers, because it is a seccomp rule and does not
+involve Landlock at all:
+
+| `socket(2)` domain | Default | Can a manifest widen it? |
+|---|---|---|
+| `AF_UNIX` | denied (`EACCES`) | yes — [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities) |
+| `AF_NETLINK` | denied (`EACCES`) | **no** |
+| `AF_PACKET` | denied (`EACCES`) | **no** |
+| `AF_INET`, `AF_INET6`, everything else | unaffected | governed by `capabilities.network.allow` exactly as before |
+
+`AF_NETLINK` (routing tables, interface and firewall state) and `AF_PACKET` (raw frame capture and
+injection) get no opt-in key: neither has a shell-tool use case comparable to "talk to a local
+daemon", and both are strictly more dangerous than one. `capabilities.network.unix_sockets` is
+coarse on purpose — it is a whole address family, not a per-socket-path allowlist — so declaring it
+`true` re-exposes `docker.sock` along with everything else. Declare it only when a shell tool
+genuinely needs a local daemon socket.
+
+**This is the mechanism most likely to break a real workload.** `AF_UNIX` is how glibc's NSS talks
+to `nscd`, how `syslog(3)` reaches `/dev/log`, and how some locale and D-Bus paths work. Denying it
+by default is the correct posture, but whether it is *survivable* for the workloads this project
+actually runs is an empirical question that has not been answered — see
+[Manual acceptance procedure — unmediated AF_UNIX sockets](#manual-acceptance-af-unix), whose last
+scenario is a full SWE-bench run for exactly this reason. If that run breaks, the recorded outcome
+is a **narrower rule**, not a silent return to allow-by-default.
 
 **Side effect worth knowing about:** dropping the capability sets also removes `CAP_DAC_OVERRIDE`
 from a root-run capsule's shell subprocess, so it no longer bypasses ordinary file-permission
@@ -483,6 +542,14 @@ SCRATCH_SCRIPT='mkdir ./d && echo x > ./d/f && cat ./d/f && ln -s ./d/f ./l && \
 running it is to find out whether that failure matters for a real workload before the caveat is
 discovered in production. Record the result either way.
 
+> **Note:** as of the `socket(2)` domain rule described under [W-SEC-005](#w-sec-005), this scenario
+> now fails *earlier* than it used to and for a different reason. With the default
+> `capabilities.network.unix_sockets: false`, the `socket(socket.AF_UNIX, ...)` constructor itself
+> raises `PermissionError` (`EACCES`) from seccomp, so `bind()` is never reached and the scenario
+> says nothing about `MakeSock` either way. To test `MakeSock` specifically, set
+> `unix_sockets_allowed: true` on the `ShellEnforcement` literal in the scratch harness first —
+> otherwise you will attribute a seccomp denial to Landlock.
+
 ```bash
 SCRATCH_SCRIPT='python3 -c "
 import socket
@@ -555,3 +622,304 @@ Update the [W-SEC-005](#w-sec-005) and [W-SEC-002](#w-sec-002) sections, the cal
 this page, and the "Verified?" column of the [tier table](#subprocess-enforcement-tiers) with what
 actually happened — including a scenario-3 decision on `MakeSock`. Until that edit lands, every
 "not yet team-verified" statement on this page stands as written.
+
+---
+
+## Manual acceptance procedure — unmediated AF_UNIX sockets { #manual-acceptance-af-unix }
+
+This procedure confirms the `socket(2)` domain denial described under [W-SEC-005](#w-sec-005) — that
+a capsule cannot reach `/var/run/docker.sock`, and cannot open netlink or packet sockets at all — on
+real hardware. **It is deliberately not automated.** There is deliberately *no* committed test that
+asserts "`socket(AF_UNIX, ...)` is refused", and a green `cargo test`/CI run is not evidence: this
+repo's CI has never resolved to a Linux enforcement tier where the rule is even installed. The
+committed unit tests (`sandbox::tests::denied_socket_domains_*`) assert only what a pure Rust
+function returns, not what a kernel does. Until someone runs the steps below and records the result,
+the mechanism is *implemented*, not *verified*.
+
+Scenario 5 is a compatibility check rather than a security check, and it is the one most likely to
+come back negative. Run it before treating the default-deny as safe to rely on broadly.
+
+### Prerequisites
+
+- A **real, uncontainerized** Linux host. Not Docker, not a rootless container, not WSL. Scenario 2
+  needs a real host Docker daemon socket to exist and be reachable *without* the sandbox; inside a
+  container you will get a refusal for the wrong reason and a false pass.
+- Either Linux tier works. This rule is pure seccomp — it does not involve Landlock — so a
+  kernel <5.13 (`KernelSeccompOnly`) exercises exactly the same code path as kernel ≥5.13
+  (`KernelFull`). Scenario 1 is the only step that needs a Landlock-capable kernel.
+- A checkout of this repository and a working `cargo`.
+- Docker installed and running, with `/var/run/docker.sock` (or `/run/docker.sock`) present.
+- `root` (or a user in the `docker` group) for scenario 2's "before" half — the point is to confirm
+  the socket is genuinely reachable outside the sandbox, so that a refusal inside it means
+  something.
+
+Confirm the tier the host resolves to before anything else:
+
+```bash
+cd /path/to/murmur
+sudo -E cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::kernel_tier_allows_exec_within_shell_allowlist \
+  -- --nocapture
+```
+
+A `SKIP — PROVES NOTHING` line in that output means the host is not on a kernel tier and **the rest
+of this procedure is meaningless on this machine**. Stop and find a different host.
+
+### Scratch harness
+
+Scenarios 2–4 drive `shell::execute_shell` directly, which is crate-private, so they run from a
+scratch test appended to `crates/capsule-runtime/src/sandbox.rs`. **Do not commit it.** Append this
+to the end of `mod linux_integration_tests` (just before that module's closing brace):
+
+```rust
+    #[test]
+    fn scratch_unix_socket_acceptance() {
+        let tier = detect_enforcement_tier();
+        eprintln!("TIER: {tier:?}");
+
+        let workdir = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "python3".to_string()],
+            // Flip to `true` to exercise the declared-opt-in path (scenario 3).
+            unix_sockets_allowed: std::env::var("SCRATCH_UNIX_SOCKETS").is_ok(),
+            ..CapabilityPolicy::default()
+        };
+        eprintln!("UNIX_SOCKETS_ALLOWED: {}", policy.unix_sockets_allowed);
+        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let enforcement = ShellEnforcement {
+            tier,
+            network_allow_ips: Vec::new(),
+            unix_sockets_allowed: policy.unix_sockets_allowed,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &exec_allow_paths,
+            )),
+            exec_allow_paths,
+        };
+
+        let script = std::env::var("SCRATCH_SCRIPT").expect("set SCRATCH_SCRIPT");
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", &script],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell must return Ok, not Err");
+        eprintln!("EXIT: {}", result.exit_code);
+        eprintln!("OUT: {}", result.stdout);
+        eprintln!("ERR: {}", result.stderr);
+    }
+```
+
+Run one scenario at a time with:
+
+```bash
+sudo -E SCRATCH_SCRIPT='<the script for this scenario>' \
+  cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::scratch_unix_socket_acceptance -- --nocapture --exact
+```
+
+When you are done: `git checkout crates/capsule-runtime/src/sandbox.rs`.
+
+### Scenario 1 — does Landlock mediate `connect()` to a *pathname* unix socket?
+
+**This is a documented finding, not a pass/fail gate.** The fix does not depend on the answer — it
+denies the domain at `socket()` creation, before any `connect()` — but the answer must be on record
+so nobody spends a future card waiting for a kernel upgrade that cannot help. Run it on the
+highest-ABI kernel available.
+
+First, establish what this kernel and this checkout can even express:
+
+```bash
+cd /path/to/murmur
+uname -r                                              # ABI v6 needs 6.12+; v5 needs 6.7+
+grep -n '^landlock' crates/capsule-runtime/Cargo.toml # the pinned crate bounds the ABI we can name
+```
+
+Then probe the kernel and the socket directly, with no murmur code involved — the raw syscall, so no
+crate version affects the answer:
+
+```bash
+# Requires `python3` and a kernel with Landlock. Uses the raw syscalls so no crate version matters.
+sudo python3 - <<'EOF'
+import ctypes, os, socket, struct, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+# landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION) -> highest supported ABI
+abi = libc.syscall(444, None, 0, 1)
+print("kernel Landlock ABI:", abi)
+if abi < 1:
+    print("no Landlock on this kernel — record that and stop"); sys.exit(0)
+print("LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET exists at ABI >= 6:", abi >= 6)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    s.connect("/var/run/docker.sock")
+    print("UNSANDBOXED_CONNECT_OK — the socket is reachable on this host")
+except OSError as e:
+    print("UNSANDBOXED_CONNECT_FAILED:", e, "— fix this before scenario 2, or its result is meaningless")
+EOF
+```
+
+- **Expected finding, to record verbatim in the build summary and here:** even at ABI v6, Landlock's
+  `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` covers *abstract* unix sockets only. `docker.sock` is a
+  pathname socket, so a Landlock filesystem domain does not mediate `connect()` to it at any ABI.
+- **If the run contradicts that** (a Landlock domain does block the connect), record it — it does not
+  change this fix, but it changes what a future per-path allowlist could be built on.
+
+### Scenario 2 — the default deny: `docker.sock` is unreachable
+
+This is the escape itself.
+
+```bash
+SCRATCH_SCRIPT='python3 -c "
+import socket
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+except OSError as e:
+    print(\"SOCKET_REFUSED\", e.errno, e.strerror); raise SystemExit(0)
+try:
+    s.connect(\"/var/run/docker.sock\")
+    s.sendall(b\"GET /version HTTP/1.0\r\n\r\n\")
+    print(\"DOCKER_REACHED\", s.recv(256)[:64])
+except OSError as e:
+    print(\"CONNECT_REFUSED\", e.errno, e.strerror)
+" 2>&1 | tail -3'
+```
+
+- **Expected (fixed):** `SOCKET_REFUSED 13 Permission denied`. Errno 13 is `EACCES` — the same errno
+  `classify_and_decide` returns for a blocked TCP destination, on purpose. The refusal happens at
+  `socket()`, so no `connect()` is ever attempted.
+- **Regression (unfixed):** `DOCKER_REACHED` followed by an HTTP response from the daemon. That
+  response is host root.
+
+Repeat against the other conventional path, which some distros use instead:
+
+```bash
+SCRATCH_SCRIPT='python3 -c "
+import socket
+try:
+    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).connect(\"/run/docker.sock\")
+    print(\"DOCKER_REACHED\")
+except OSError as e:
+    print(\"REFUSED\", e.errno, e.strerror)
+" 2>&1 | tail -2'
+```
+
+Confirm the refusal is domain-specific and did not break IP sockets — `AF_INET` must still be
+governed by `capabilities.network.allow` exactly as before, not by this rule:
+
+```bash
+SCRATCH_SCRIPT='python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)   # creation must SUCCEED
+print(\"AF_INET_SOCKET_OK\")
+try:
+    s.connect((\"127.0.0.1\", 9))
+    print(\"CONNECT_OK\")
+except OSError as e:
+    print(\"CONNECT_REFUSED\", e.errno, e.strerror)      # EACCES here is the pre-existing notify path
+" 2>&1 | tail -2'
+```
+
+- **Expected:** `AF_INET_SOCKET_OK` first. If `socket(AF_INET, ...)` itself fails, the new rule is
+  matching the wrong argument and the whole network path is broken.
+
+### Scenario 3 — the declared opt-in works
+
+Same script as scenario 2, with the opt-in on. This confirms the grant is real and not a
+one-way ratchet.
+
+```bash
+sudo -E SCRATCH_UNIX_SOCKETS=1 SCRATCH_SCRIPT='python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+print(\"SOCKET_OK\")
+try:
+    s.connect(\"/var/run/docker.sock\")
+    print(\"DOCKER_REACHED\")
+except OSError as e:
+    print(\"CONNECT_FAILED\", e.errno, e.strerror)
+" 2>&1 | tail -2' \
+  cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::scratch_unix_socket_acceptance -- --nocapture --exact
+```
+
+- **Expected:** `UNIX_SOCKETS_ALLOWED: true` in the output, then `SOCKET_OK`, then `DOCKER_REACHED`.
+  A capsule that declares `capabilities.network.unix_sockets: true` really does get the daemon
+  socket back — that is what makes the grant a deliberate, auditable widening rather than a
+  decoration.
+- **Regression:** `SOCKET_OK` missing while `UNIX_SOCKETS_ALLOWED: true` — the flag is not reaching
+  the filter, so the opt-in is inert and operators cannot un-break a legitimate workload.
+
+### Scenario 4 — netlink and packet sockets are denied with *and* without the opt-in
+
+There is no manifest key for either, so the result must be identical in both runs.
+
+```bash
+# Run this twice: once as-is, once with SCRATCH_UNIX_SOCKETS=1 prefixed.
+SCRATCH_SCRIPT='python3 -c "
+import socket
+for name, dom in ((\"AF_NETLINK\", 16), (\"AF_PACKET\", 17)):
+    try:
+        socket.socket(dom, socket.SOCK_RAW)
+        print(name, \"CREATED\")
+    except OSError as e:
+        print(name, \"REFUSED\", e.errno, e.strerror)
+" 2>&1 | tail -3'
+```
+
+- **Expected, both runs, identical:** `AF_NETLINK REFUSED 13 Permission denied` and
+  `AF_PACKET REFUSED 13 Permission denied`.
+- **Note:** `AF_PACKET` also needs `CAP_NET_RAW`, which the child capability drop already removes —
+  so a bare `EPERM` (errno 1) means you are seeing the capability drop, not this rule. Errno 13
+  (`EACCES`) is the seccomp rule. Both are refusals; only errno 13 confirms *this* mechanism.
+- **Regression:** either family created in either run, or `AF_NETLINK` refused without the opt-in but
+  created with it — the flag must not touch these two.
+
+### Scenario 5 — full SWE-bench workload compatibility (the one that may fail)
+
+`AF_UNIX` is how glibc's NSS reaches `nscd`, how `syslog(3)` reaches `/dev/log`, and how some locale
+and D-Bus paths work. Denying it by default is the correct posture, but whether the workloads this
+project actually runs survive it is an empirical question. **Run the full SWE-bench workload, not a
+sample**, on a host resolving to a kernel tier:
+
+```bash
+cd /path/to/murmur
+# Baseline first — the same workload with the rule disabled, so a failure can be attributed.
+# Temporarily declare the opt-in in the capsule manifest under test:
+#     capabilities:
+#       network:
+#         unix_sockets: true
+sudo -E <your-swe-bench-invocation> 2>&1 | tee /tmp/swebench-unix-allowed.log
+
+# Then the shipped default — remove the `unix_sockets:` key entirely (do not set it to false;
+# absent is the shape real manifests will have).
+sudo -E <your-swe-bench-invocation> 2>&1 | tee /tmp/swebench-unix-denied.log
+
+# Compare resolved/failed counts and diff the failure sets.
+diff <(grep -E '^(PASS|FAIL)' /tmp/swebench-unix-allowed.log | sort) \
+     <(grep -E '^(PASS|FAIL)' /tmp/swebench-unix-denied.log | sort)
+```
+
+Also check for the specific suspects, which fail quietly rather than loudly:
+
+```bash
+grep -iE 'nscd|getpwnam|getaddrinfo|Name or service not known|syslog|/dev/log|locale' \
+  /tmp/swebench-unix-denied.log | head -40
+```
+
+- **Expected:** an empty diff — identical resolved/failed sets. That is what makes the default-deny
+  safe to rely on.
+- **If the diff is non-empty:** record it here, in full, with the failing task IDs and the mechanism
+  (NSS? syslog? something else?). Then consider a **narrower rule** — for example denying only
+  `SOCK_STREAM`/`SOCK_SEQPACKET` unix sockets while leaving `SOCK_DGRAM` (syslog's shape) alone, via
+  a second `ScmpArgCompare` on `socket()`'s arg 1. **Do not** respond by flipping the default to
+  allow: that restores the `docker.sock` escape in full, and the roadmap explicitly rules it out.
+
+### Recording the result
+
+Update the [W-SEC-005](#w-sec-005) and [W-SEC-002](#w-sec-002) sections, the callout at the top of
+this page, and the "Verified?" column of the [tier table](#subprocess-enforcement-tiers) with what
+actually happened — including the scenario-1 Landlock finding verbatim and the scenario-5
+compatibility outcome. Until that edit lands, every "not yet team-verified" statement on this page
+stands as written.

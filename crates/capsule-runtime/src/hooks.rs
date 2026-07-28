@@ -2882,6 +2882,7 @@ mod tests {
         let caps = Capabilities {
             network: network.map(|entry| NetworkCapabilities {
                 allow: vec![entry.to_string()],
+                unix_sockets: false,
             }),
             filesystem: scope.map(|scope| FilesystemCapabilities {
                 scope: Some(scope.to_string()),

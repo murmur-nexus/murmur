@@ -79,6 +79,13 @@ pub struct ResolvedLockArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityPolicy {
     pub network_allow: Vec<String>,
+    /// From `capabilities.network.unix_sockets`. `false` by default, which makes the shell
+    /// subprocess tree's `socket(AF_UNIX, ...)` calls fail with `EACCES` at the kernel level on
+    /// both Linux tiers — `network_allow` above governs IP destinations only and would otherwise
+    /// leave a local daemon socket (`/var/run/docker.sock` — host root) completely unmediated.
+    /// `true` simply omits that seccomp rule; it is capsule-wide, not per-socket-path. See
+    /// `sandbox::denied_socket_domains`.
+    pub unix_sockets_allowed: bool,
     pub filesystem_scope: Option<String>,
     pub shell_allow: Vec<String>,
     pub spawn_allow: Vec<String>,
@@ -231,6 +238,10 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.network.as_ref())
         .map(|network| network.allow.clone())
         .unwrap_or_default();
+    // Absent `capabilities.network` block, or absent key within it, both mean denied.
+    let unix_sockets_allowed = caps
+        .and_then(|c| c.network.as_ref())
+        .is_some_and(|network| network.unix_sockets);
 
     let filesystem_scope = caps
         .and_then(|c| c.filesystem.as_ref())
@@ -267,6 +278,7 @@ pub fn capability_policy_from_runtime_manifest(
 
     CapabilityPolicy {
         network_allow,
+        unix_sockets_allowed,
         filesystem_scope,
         shell_allow,
         spawn_allow,
@@ -275,5 +287,116 @@ pub fn capability_policy_from_runtime_manifest(
         shell_interpreter_runtime,
         env_allow,
         limits,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_for(manifest_yaml: &str) -> CapabilityPolicy {
+        let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
+            .expect("manifest fixture must parse");
+        capability_policy_from_runtime_manifest(&manifest)
+    }
+
+    /// A manifest with no `capabilities:` block at all denies unix sockets — the field must not
+    /// pick up any implicit widening from the "nothing declared" path.
+    #[test]
+    fn unix_sockets_denied_when_capabilities_block_is_absent() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+"#,
+        );
+
+        assert!(!policy.unix_sockets_allowed);
+    }
+
+    /// A declared `network:` block that never mentions the key still denies.
+    #[test]
+    fn unix_sockets_denied_when_network_block_omits_the_key() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  network:
+    allow:
+      - https://api.anthropic.com
+"#,
+        );
+
+        assert!(!policy.unix_sockets_allowed);
+        assert_eq!(
+            policy.network_allow,
+            vec!["https://api.anthropic.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn unix_sockets_denied_when_declared_false() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  network:
+    unix_sockets: false
+"#,
+        );
+
+        assert!(!policy.unix_sockets_allowed);
+    }
+
+    #[test]
+    fn unix_sockets_allowed_when_declared_true() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  network:
+    unix_sockets: true
+"#,
+        );
+
+        assert!(policy.unix_sockets_allowed);
+    }
+
+    /// The opt-in is independent of the IP allowlist in both directions: a non-empty `allow`
+    /// does not imply unix sockets, and `unix_sockets: true` does not imply any IP destination.
+    #[test]
+    fn unix_sockets_opt_in_is_independent_of_the_ip_allowlist() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  network:
+    unix_sockets: true
+    allow:
+      - https://api.anthropic.com
+"#,
+        );
+
+        assert!(policy.unix_sockets_allowed);
+        assert_eq!(
+            policy.network_allow,
+            vec!["https://api.anthropic.com".to_string()]
+        );
+    }
+
+    /// `CapabilityPolicy::default()` is what the sandbox tests and every `..Default::default()`
+    /// call site start from; it must deny, not inherit whatever a future field ordering implies.
+    #[test]
+    fn default_capability_policy_denies_unix_sockets() {
+        assert!(!CapabilityPolicy::default().unix_sockets_allowed);
     }
 }
