@@ -1769,3 +1769,27 @@ pub(crate) fn run_trace_report(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `trace.jsonl`'s `shell` record gained a `binary` key (the invoked program's
+    /// resolved path) alongside the existing `command`. [`ShellEvent`] declares neither
+    /// and carries no `deny_unknown_fields`, so `mur trace show` keeps parsing the new
+    /// records unchanged — this pins that tolerance so a later `deny_unknown_fields`
+    /// cannot silently break reading every trace the runtime now writes.
+    #[test]
+    fn shell_record_with_binary_key_still_parses() {
+        let line = r#"{"event_type":"shell","session_id":"s","timestamp":1,"turn":2,"binary":"/usr/bin/pytest","command":"-q tests/","exit_code":0,"stdout_bytes":7,"stderr_bytes":0,"duration_ms":12}"#;
+
+        let parsed = serde_json::from_str::<TraceEvent>(line).expect("unknown keys are ignored");
+        match parsed {
+            TraceEvent::Shell(e) => {
+                assert_eq!(e.exit_code, 0);
+                assert_eq!(e.duration_ms, 12);
+            }
+            other => panic!("expected a shell event, got {other:?}"),
+        }
+    }
+}

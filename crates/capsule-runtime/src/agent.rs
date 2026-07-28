@@ -657,6 +657,7 @@ pub(crate) async fn run_agent_loop(
                                         workdir,
                                         HookEvent::Shell {
                                             turn: turn_u32,
+                                            binary: shell.binary.clone(),
                                             command: shell.command.clone(),
                                             exit_code: shell.exit_code,
                                             stdout: shell.stdout.clone(),
@@ -671,6 +672,7 @@ pub(crate) async fn run_agent_loop(
                                 trace
                                     .write_shell(
                                         turn_u32,
+                                        shell.binary.clone(),
                                         shell.command.clone(),
                                         shell.exit_code,
                                         shell.stdout_bytes,

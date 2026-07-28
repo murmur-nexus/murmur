@@ -132,6 +132,10 @@ struct ShellEvent {
     session_id: String,
     timestamp: u64,
     turn: u32,
+    /// The program that ran — a canonical absolute path when the host `PATH` resolved
+    /// the invoked name, else the bare name. `command` carries the argument list alone,
+    /// so this is the only field that says *what* ran.
+    binary: String,
     command: String,
     exit_code: i32,
     stdout_bytes: u64,
@@ -396,9 +400,13 @@ impl TraceWriter {
         // Intentionally does not increment total_tool_calls or task_tool_calls.
     }
 
+    // One positional parameter per JSONL column, as every other `write_*` here does; the
+    // sibling `write_tool_call` carries the same allowance.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_shell(
         &mut self,
         turn: u32,
+        binary: String,
         command: String,
         exit_code: i32,
         stdout_bytes: u64,
@@ -410,6 +418,7 @@ impl TraceWriter {
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            binary,
             command,
             exit_code,
             stdout_bytes,
@@ -849,14 +858,25 @@ mod tests {
     async fn shell_fields() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_shell(0, "echo hi".to_string(), 0, 7, 0, 10)
-            .await
-            .unwrap();
+        w.write_shell(
+            0,
+            "/usr/bin/echo".to_string(),
+            "echo hi".to_string(),
+            0,
+            7,
+            0,
+            10,
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
         let e = &events[0];
         assert_eq!(e["event_type"], "shell");
+        // `binary` names what ran; `command` still carries only the argument list, so
+        // neither can be derived from the other.
+        assert_eq!(e["binary"], "/usr/bin/echo");
         assert_eq!(e["command"], "echo hi");
         assert_eq!(e["exit_code"], 0);
         assert_eq!(e["stdout_bytes"], 7);
@@ -921,7 +941,7 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "ls".to_string(), 0, 3, 0, 2)
+        w.write_shell(0, "/bin/ls".to_string(), "ls".to_string(), 0, 3, 0, 2)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -1035,7 +1055,7 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "echo".to_string(), 0, 4, 0, 1)
+        w.write_shell(0, "/bin/echo".to_string(), "echo".to_string(), 0, 4, 0, 1)
             .await
             .unwrap();
         w.write_inference(1, 60, 30, "end_turn".to_string(), None, None)

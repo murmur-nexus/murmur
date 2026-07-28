@@ -53,6 +53,12 @@ const CREDENTIAL_ENV_PATTERNS: &[&str] = &[
 
 #[derive(Debug)]
 pub(crate) struct ShellResult {
+    /// The program that was actually invoked, resolved to its canonical absolute path
+    /// when the host `PATH` names it, else the bare invoked name — see
+    /// [`crate::sandbox::resolve_invoked_binary_path`]. Carried out of here because the
+    /// invoked name is otherwise lost the moment dispatch returns, leaving every
+    /// downstream observer (`shell-event.binary`, `trace.jsonl`) unable to say what ran.
+    pub(crate) binary: String,
     pub(crate) exit_code: i32,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
@@ -127,6 +133,10 @@ pub(crate) fn execute_shell(
 
     let env = build_shell_env(policy, env_overrides, workdir)?;
 
+    // Resolve before spawning: this is the identity of the binary this call is about to
+    // run, and it is the only point where the invoked name is still in hand.
+    let resolved_binary = crate::sandbox::resolve_invoked_binary_path(binary);
+
     let started = Instant::now();
     let mut command = Command::new(binary);
     command
@@ -189,6 +199,7 @@ pub(crate) fn execute_shell(
     }
 
     Ok(ShellResult {
+        binary: resolved_binary,
         exit_code: output.status.code().unwrap_or(-1),
         stdout,
         stderr,
@@ -374,6 +385,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.exit_code, 42);
+    }
+
+    /// A real subprocess run through the real `execute_shell`: the returned `binary` is the
+    /// canonical absolute path of the interpreter that ran, not the bare invoked name — the
+    /// value that reaches `shell-event.binary` and `trace.jsonl`'s `binary` key.
+    #[test]
+    fn execute_shell_reports_the_resolved_path_of_the_invoked_binary() {
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let result = execute_shell(
+            "bash",
+            &["-c", "exit 0"],
+            &[],
+            temp.path(),
+            &policy,
+            &ShellEnforcement::environment_only(),
+        )
+        .unwrap();
+
+        assert!(
+            Path::new(&result.binary).is_absolute(),
+            "a binary found on PATH must be reported as an absolute path, got {:?}",
+            result.binary
+        );
+        assert!(
+            result.binary.ends_with("bash"),
+            "the reported path must still name bash, got {:?}",
+            result.binary
+        );
+    }
+
+    /// The fallback, exercised end-to-end rather than only against the resolver: a workdir
+    /// -relative program spawns fine (the child resolves it after `chdir`) but has no host
+    /// `PATH` entry to canonicalize against, so `binary` degrades to the invoked name
+    /// unchanged. Nothing else about the call changes — it still runs and still reports its
+    /// exit code.
+    #[test]
+    fn execute_shell_falls_back_to_the_bare_name_when_nothing_resolves() {
+        let temp = tempdir().unwrap();
+        let tool = temp.path().join("local-tool");
+        fs::write(&tool, "#!/bin/sh\nexit 7\n").unwrap();
+        let mut perms = fs::metadata(&tool).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&tool, perms).unwrap();
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["./local-tool".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let result = execute_shell(
+            "./local-tool",
+            &[],
+            &[],
+            temp.path(),
+            &policy,
+            &ShellEnforcement::environment_only(),
+        )
+        .unwrap();
+
+        assert_eq!(result.exit_code, 7, "the subprocess must still have run");
+        assert_eq!(
+            result.binary, "./local-tool",
+            "an unresolvable name degrades to the bare invoked name, never an error"
+        );
     }
 
     #[test]

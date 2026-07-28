@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.4.0`  |
+| `murmur:hook`            | `0.5.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -49,6 +49,16 @@ bare additive change and pass once the host lifts pre-`@0.4.0` hooks through the
 `lifecycle_v0_3` twin). The host keeps loading `@0.3.0`- and `@0.2.0`-compiled
 hooks by lifting their returns through that twin (`src/compat/lifecycle_v0_3.rs`)
 rather than forcing a fleet-wide rebuild.
+
+`murmur:hook` then went to `0.5.0` when `shell-event` gained `binary: string` —
+the canonicalized path of the program a shell tool actually invoked. The record
+previously carried only `command` (the argument list, never the binary name), so
+no hook bound to `on-shell` could tell whether an event was `pytest`, `cargo` or
+`ls`. Adding a field to an existing record is always a major bump, per the rule
+below; the `0.3.0 → 0.4.0` entry above records what happens if you try to ship
+one additively instead. The host keeps sending pre-`@0.5.0` hooks the unchanged
+8-field record through `src/compat/lifecycle_v0_4.rs`, so no already-published
+hook artifact needs a rebuild to keep receiving shell events.
 
 ## When to bump
 
@@ -98,9 +108,10 @@ affected artifact to be rebuilt in lockstep with the WIT change. Any such
 fallback is a **compat shim**, and its code, removal condition, and inventory
 row live under the compat-shim policy — see `COMPAT_SHIMS.md` at the repo root
 for the full, current list (e.g. the `murmur:hook/lifecycle@0.2.0` shim that
-`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump, and the
+`src/compat/lifecycle_v0_2.rs` provides after the `0.2.0 → 0.3.0` bump, the
 `lifecycle_v0_3` shim that lifts pre-`@0.4.0` four-case `hook-output` returns
-after the `0.3.0 → 0.4.0` bump).
+after the `0.3.0 → 0.4.0` bump, and the `lifecycle_v0_4` shim that sends
+pre-`@0.5.0` hooks the eight-field `shell-event` after the `0.4.0 → 0.5.0` bump).
 
 This doc stays the place to record *why a version number changed*; the shim
 table is the place to record *what backward-compat code exists because of it,
@@ -126,8 +137,9 @@ dynamically-instantiated guest interfaces by the **versioned** instance name
 only:
 
 - `src/hooks.rs` — `resolve_lifecycle_iface` resolves
-  `murmur:hook/lifecycle@0.3.0`, falling back to `@0.2.0` via the
-  `lifecycle-v0_2` compat shim (`COMPAT_SHIMS.md`) and to nothing else.
+  `murmur:hook/lifecycle@0.5.0`, falling back to `@0.4.0`, `@0.3.0` and `@0.2.0`
+  via the `lifecycle-v0_4`/`lifecycle-v0_3`/`lifecycle-v0_2` compat shims
+  (`COMPAT_SHIMS.md`) and to nothing else.
 - `src/runtime.rs` — `resolve_versioned_iface` resolves
   `murmur:capsule/run@0.1.0` and `murmur:tool/run@0.1.0`.
 

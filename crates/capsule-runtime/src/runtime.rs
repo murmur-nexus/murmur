@@ -3145,6 +3145,9 @@ fn dispatch_shell_tool(
     match execute_shell(name, &args, env_overrides, workdir, policy, enforcement) {
         Ok(result) => {
             let shell = ShellDispatchInfo {
+                // `name` is the invoked binary (each `capabilities.shell.allow` entry is
+                // exposed as its own tool), resolved to a path by `execute_shell`.
+                binary: result.binary.clone(),
                 command: command.clone(),
                 exit_code: result.exit_code,
                 stdout: result.stdout.clone(),
@@ -4354,6 +4357,119 @@ mod tests {
         script_path
     }
 
+    /// The wiring the shell-event fix depends on: `dispatch_shell_tool` carries the resolved
+    /// binary out of `execute_shell` and into `ShellDispatchInfo`, which is the only channel
+    /// by which `agent.rs` can put it on the hook event and the trace record. `command` keeps
+    /// its pre-existing meaning — the argument list alone, never the binary name.
+    #[test]
+    fn dispatch_shell_tool_reports_the_invoked_binary_separately_from_the_command() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+        );
+
+        let shell = outcome.shell.expect("a successful shell call reports itself");
+        assert!(
+            Path::new(&shell.binary).is_absolute() && shell.binary.ends_with("bash"),
+            "binary must be the resolved path of what ran, got {:?}",
+            shell.binary
+        );
+        assert_eq!(
+            shell.command, "echo hi",
+            "command must still carry only the argument list"
+        );
+        assert_eq!(shell.exit_code, 0);
+    }
+
+    /// The composed path, on real inputs and a real file: dispatch a real shell tool, then
+    /// hand its `ShellDispatchInfo` to a real `TraceWriter` exactly as `agent.rs` does, and
+    /// read the resulting `workdir/trace.jsonl` back. This is the automated stand-in for
+    /// eyeballing a session's trace after `mur run` — the two lines it mirrors in `agent.rs`
+    /// are a straight field pass-through, but the JSONL key and its value are pinned here.
+    #[test]
+    fn shell_dispatch_writes_the_resolved_binary_into_trace_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let workdir = tmp.path().to_path_buf();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let events: Vec<serde_json::Value> = rt.block_on(async {
+            let outcome = dispatch_shell_tool(
+                "bash",
+                murmur::tool::run::ToolInput {
+                    data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                    log_path: None,
+                },
+                &workdir,
+                &[],
+                &policy,
+                &sandbox::ShellEnforcement::environment_only(),
+            );
+            let shell = outcome.shell.expect("the shell call reports itself");
+
+            let mut trace = TraceWriter::open(
+                &workdir,
+                "ses_test".to_string(),
+                "cap".to_string(),
+                "0.1.0".to_string(),
+                "test-model".to_string(),
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            trace
+                .write_shell(
+                    1,
+                    shell.binary.clone(),
+                    shell.command.clone(),
+                    shell.exit_code,
+                    shell.stdout_bytes,
+                    shell.stderr_bytes,
+                    shell.duration_ms,
+                )
+                .await
+                .unwrap();
+            trace.flush().await.unwrap();
+
+            fs::read_to_string(workdir.join("trace.jsonl"))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        });
+
+        let shell_event = events
+            .iter()
+            .find(|e| e["event_type"] == "shell")
+            .expect("trace.jsonl must carry a shell event");
+        let binary = shell_event["binary"]
+            .as_str()
+            .expect("the shell event must carry a `binary` string");
+        assert!(
+            Path::new(binary).is_absolute() && binary.ends_with("bash"),
+            "trace.jsonl's binary must be the resolved absolute path of what ran, got {binary:?}"
+        );
+        assert_eq!(shell_event["command"], "echo hi");
+    }
+
     #[test]
     fn dispatch_native_tool_gets_synthetic_home_matching_execute_shell() {
         let tmp = TempDir::new().unwrap();
@@ -4862,7 +4978,7 @@ mod tests {
         script
     }
 
-    /// A current-version (`@0.4.0`, 5-case `hook-output`) `on-task-end` hook double that
+    /// A current-version (`@0.5.0`, 5-case `hook-output`) `on-task-end` hook double that
     /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
     /// mutable core global that persists across a blocking hook's reused store) and `none`
     /// thereafter. `reopen_limit` large ⇒ "always reopen".
@@ -4934,7 +5050,7 @@ mod tests {
     (export "on-task-end" (func $te))
 {stubs}
   )
-  (export "murmur:hook/lifecycle@0.4.0" (instance $lc))
+  (export "murmur:hook/lifecycle@0.5.0" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");
