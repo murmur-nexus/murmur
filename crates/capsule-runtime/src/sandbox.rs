@@ -606,9 +606,18 @@ pub(crate) fn resolve_interpreter_runtime_grants(
 /// Known residual limit, inherent to `SECCOMP_RET_USER_NOTIF` + continue (see
 /// `seccomp_unotify(2)`): after this check passes, the kernel re-resolves the pathname when
 /// it actually executes the syscall, so a hostile *multithreaded* child retargeting a
-/// symlink in that window can still race it. Closing that fully requires fd-substitution
-/// (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather than continue semantics — out of scope for
-/// this slice; the non-racing rename/copy bypass is what this closes.
+/// symlink in that window can still race it.
+///
+/// Neither exec nor symlinks are what bounds that race — it is the whole class of decision
+/// this supervisor makes by dereferencing a pointer into another task's memory. The
+/// `connect`/`sendto` path reads a `sockaddr` out of the notifying task via the same
+/// `/proc/<pid>/mem` read (`linux_enforce::read_sockaddr_ip_from_child`) and answers with the
+/// same `CONTINUE`, so a second thread can overwrite that buffer between the supervisor's read
+/// and the kernel's post-continue re-use of it exactly as it can retarget a symlink here.
+/// Closing either fully requires fd-substitution (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather
+/// than continue semantics; the non-racing rename/copy bypass is what this closes. Audited,
+/// with citations and a hand-runnable race probe, in
+/// `docs/content/reference/seccomp-notify-toctou-audit.md`.
 // Production callers live inside the Linux-only supervisor; unit tests exercise it on every
 // OS (which is the point of keeping it out of `linux_enforce`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2534,10 +2543,24 @@ mod linux_enforce {
 
             let decision = classify_and_decide(&req, exec_allow, network_allow_ips);
 
-            // TOCTOU-safe pattern: read memory, THEN validate the notification id is still
-            // valid, THEN respond. If the id went stale (the target thread was resumed/killed
-            // via another path between our read and now), treat it as a race and let the
-            // kernel's own handling take over rather than responding to a dead notification.
+            // Read memory, THEN validate the notification id is still valid, THEN respond. If
+            // the id went stale (the target thread was resumed/killed via another path between
+            // our read and now), skip it rather than responding to a dead notification.
+            //
+            // This is a *liveness* check, and explicitly NOT a TOCTOU-safe pattern.
+            // `SECCOMP_IOCTL_NOTIF_ID_VALID` answers "does this notification still exist"; it
+            // does not re-validate that the bytes `classify_and_decide` just read out of the
+            // child are the bytes the kernel will act on when the syscall resumes. Because the
+            // `Decision::Allow` arm below answers with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
+            // (`new_continue`), the kernel re-dereferences the pathname/`sockaddr` pointer
+            // itself after we respond — so a hostile *multithreaded* child that rewrites that
+            // buffer in the window between our read and the syscall's resumption gets the
+            // rewritten value enforced against a decision computed from the original one.
+            // `seccomp_unotify(2)` names this directly and calls continue-based argument
+            // inspection inherently racy. Audited in
+            // `docs/content/reference/seccomp-notify-toctou-audit.md`; a fix is a full
+            // replacement of this architecture (Landlock `Execute` for exec, a network
+            // namespace + egress proxy for network), not a patch here.
             if libseccomp::notify_id_valid(notify_fd, req.id).is_err() {
                 continue;
             }

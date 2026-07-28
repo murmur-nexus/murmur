@@ -1,0 +1,4 @@
+# This package is its own workspace root (see Cargo.toml), so it builds into its own `target/`
+# directory rather than the repo's. The root `.gitignore`'s `/target/` is anchored to the repo
+# root and does not reach here.
+/target/
