@@ -14,7 +14,8 @@ pub const W_SEC_001: &str = "W-SEC-001";
 /// `capabilities.network.unix_sockets` is declared (and `AF_NETLINK`/`AF_PACKET` always are, with
 /// no opt-in), and the shell child still drops every Linux capability before `execve` — but
 /// filesystem scope is not enforced at all. The socket-domain rule is pure seccomp, so it is
-/// identical on this tier and on `W_SEC_005`'s.
+/// identical on this tier and on `W_SEC_005`'s; the fixed capsule device set is the opposite —
+/// pure Landlock, so on this tier it does not apply and every device under `/dev` is reachable.
 pub const W_SEC_002: &str = "W-SEC-002";
 
 /// `capabilities.shell.allow` includes `"bash"` and `capabilities.network.allow` is non-empty,
@@ -27,7 +28,10 @@ pub const W_SEC_004: &str = "W-SEC-004";
 
 /// The host resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a
 /// narrow, derived read+execute scope outside the workdir (the allowlisted binaries, their loader,
-/// and their shared libraries — nothing writable), so allowlisted programs can actually run; the
+/// and their shared libraries — nothing writable), so allowlisted programs can actually run; on top
+/// of that it grants a fixed, non-manifest-derived device set — `/dev/null` read+write (the sole
+/// writable path outside the workdir), `/dev/zero` and `/dev/urandom` read-only, every other device
+/// including `/dev/random` denied; the
 /// workdir's own grant withholds character-device, block-device and unix-socket creation, so a
 /// capsule cannot `mknod` a raw disk node inside it; a classic seccomp rule on `socket(2)`'s
 /// `domain` refuses `AF_UNIX` unless `capabilities.network.unix_sockets` is declared and refuses

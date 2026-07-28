@@ -33,7 +33,10 @@
 //!     the kernel audit trail with a syscall number, pid and comm.
 //!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
 //!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock` — see
-//!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`.
+//!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`. Outside the workdir, alongside the derived
+//!     read+execute grants, a fixed three-device set is granted unconditionally — see
+//!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (the only writable path outside the
+//!     workdir), `/dev/zero` and `/dev/urandom` read-only, and no other device at all.
 //!
 //! Both Linux tiers additionally strip the forked child's **Linux capabilities** (bounding set,
 //! then permitted/effective/inheritable, then `no_new_privs`) before `execve()` — see
@@ -636,6 +639,97 @@ pub(crate) fn resolve_interpreter_runtime_grants(
         })
         .collect()
 }
+
+// ---- fixed capsule device set (this slice) ----------------------------------------------
+//
+// Everything above derives its grants from the manifest: `shell.allow` binaries and their
+// `DT_NEEDED` closure, `interpreter_runtime` directories. The device set below derives from
+// nothing. It is a fixed property of the sandbox, like `linux_enforce::WORKDIR_ACCESS_RIGHTS`,
+// present on every capsule that reaches `KernelFull` — there is no manifest key that adds a
+// device, and none that takes one away.
+//
+// Why it has to exist at all: once `restrict_self()` lands, a path outside the workdir with no
+// matching rule is denied, and `/dev/null` is outside every workdir. Programs treat `/dev/null`
+// as infallible — `open("/dev/null")` failing is a case almost nothing handles — so without an
+// explicit rule an ordinary tool dies in a way that reads as a runtime bug, not a policy denial.
+
+/// One fixed device path granted to every `KernelFull` capsule, with the access level it gets.
+///
+/// Deliberately *not* a [`LandlockGrant`]: that type means "an executable or library path the
+/// manifest asked for, granted read(+list)+execute, never write". A device is a different intent
+/// (I/O access to a character device, possibly writable) and a different lifetime (fixed at
+/// compile time, not resolved per capsule), so it gets its own type rather than overloading
+/// `list_dir` into a third meaning.
+///
+/// `writable` is the whole reason this type exists as more than a path list:
+///
+///   - `false` → `ReadFile` only. The device is readable and nothing more.
+///   - `true` → `ReadFile | WriteFile`. Granted to exactly one path, `/dev/null`, and it is the
+///     only writable path outside the workdir in the entire sandbox.
+///
+/// Only `mod linux_enforce` consumes this outside of tests, so on a non-Linux build the type and
+/// the constant below are dead — the same deliberate cross-platform exception the rest of this
+/// module's Linux-only surface carries.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapsuleDeviceGrant {
+    pub(crate) path: &'static str,
+    pub(crate) writable: bool,
+}
+
+/// The complete device set a capsule's shell subprocess tree can reach outside its workdir.
+/// Three entries, no more — `apply_landlock_scope` adds one `PathBeneath` rule per entry, and
+/// every device path *not* listed here (`/dev/random`, `/dev/full`, `/dev/tty`, `/dev/sda`, …)
+/// stays denied by the same mechanism that already denies every other unlisted path: with
+/// `handle_access` declaring the full ABI v1 right-set, "no rule" means "denied", not "ungoverned".
+///
+///   - **`/dev/null` — read *and* write.** This is the one deliberate exception to "nothing
+///     outside the workdir is writable". A read-only grant would be broken, not merely strict:
+///     bare-host `strace` shows Python's `subprocess.DEVNULL` opening it `O_RDWR|O_CLOEXEC`, and a
+///     shell `2>/dev/null` redirect opening it `O_WRONLY|O_CREAT`. Both fail without `WriteFile`,
+///     and `subprocess.DEVNULL` is reachable from any Python tool a capsule might run. Granting
+///     write on a character device whose write side is defined to discard everything gives up no
+///     confidentiality and no integrity — there is no state behind it to reach.
+///     (The `O_CREAT` in the redirect costs nothing extra: Landlock only checks `MakeReg` when a
+///     file is actually created, and `/dev/null` already exists.)
+///   - **`/dev/zero` — read only.** Zero-fill reads and `MAP_PRIVATE` anonymous-mapping fallbacks
+///     in older allocators. Writes to it are discarded like `/dev/null`'s, but nothing needs to
+///     write there, so it does not get `WriteFile`.
+///   - **`/dev/urandom` — read only.** Not for `getrandom(2)`, which is a syscall needing no
+///     filesystem grant at all, but because OpenSSL and older glibc paths still `open()` the
+///     device outright and fall over if they cannot.
+///
+/// **Why `/dev/random` is excluded.** Not because writing to it is dangerous: a plain `write()` to
+/// `/dev/random` mixes bytes into the pool but credits **zero** entropy — crediting requires the
+/// `RNDADDENTROPY` ioctl, which requires `CAP_SYS_ADMIN`, which the shell child has already
+/// dropped. It is excluded for a duller reason: since Linux 5.6 `/dev/random` blocks until the CRNG
+/// is initialized and `/dev/urandom` does not, and no workload needs the blocking variant when the
+/// non-blocking one is granted. It stays out because nothing has demonstrated a need for it.
+///
+/// Widening this list is allowed but must be evidence-driven: add a fourth entry only after a real
+/// workload has been observed failing on the missing device, and record that failure in the same
+/// place this list is documented (`docs/content/reference/security-warnings.md`, "Manual acceptance
+/// procedure — the fixed capsule device set").
+///
+/// **Future shape.** Enumerating devices path by path is the `scoped`-containment-class answer.
+/// Once a `sealed` class exists, the capsule gets a private `/dev` tmpfs carrying the OCI default
+/// device set, and device access stops being a Landlock rule list entirely. A `sealed`
+/// implementation should *retire* this constant, not merge with it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const CAPSULE_DEVICE_GRANTS: &[CapsuleDeviceGrant] = &[
+    CapsuleDeviceGrant {
+        path: "/dev/null",
+        writable: true,
+    },
+    CapsuleDeviceGrant {
+        path: "/dev/zero",
+        writable: false,
+    },
+    CapsuleDeviceGrant {
+        path: "/dev/urandom",
+        writable: false,
+    },
+];
 
 /// Identity-based exec decision: canonicalizes the pathname a subprocess passed to
 /// `execve`/`execveat` (relative paths resolved against `base_dir` — the notifying task's
@@ -1335,7 +1429,8 @@ impl ShellEnforcement {
 /// binaries, their ELF interpreter, and their shared-library closure) *outside* the workdir, in
 /// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
 /// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
-/// dynamically link, and nothing outside the workdir is writable. Seccomp additionally refuses the
+/// dynamically link, and the only writable path outside the workdir is `/dev/null`, one of the
+/// three fixed devices in `CAPSULE_DEVICE_GRANTS`. Seccomp additionally refuses the
 /// `socket(2)` domains in `denied_socket_domains` — closing the `/var/run/docker.sock` path, which
 /// no Landlock ABI mediates for pathname sockets. The forked shell child also
 /// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
@@ -1346,7 +1441,11 @@ impl ShellEnforcement {
 const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
-shared libraries — nothing writable, no directory granted wholesale). The workdir's own grant also \
+shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
+every capsule gets unconditionally: /dev/null read+write (the only writable path outside the \
+workdir), \
+/dev/zero and /dev/urandom read-only, and no other device — /dev/random, /dev/full, /dev/tty and \
+raw block devices stay denied. The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
 capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET, so a \
 capsule cannot reach a host daemon socket such as /var/run/docker.sock; the seccomp filter now \
@@ -1360,7 +1459,10 @@ isolation as not-yet-confirmed and do not rely on it as a hardened boundary unti
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
 kernel-enforced at all, and the seccomp exec/network enforcement that would apply has not been \
-verified on real Linux hardware. Seccomp also refuses socket(AF_UNIX) unless \
+verified on real Linux hardware. The fixed capsule device set the Full tier applies (/dev/null \
+read+write, /dev/zero and /dev/urandom read-only, every other device denied) is a Landlock \
+mechanism, so it does not apply here either: on this tier every device under /dev is reachable \
+exactly as it would be without any sandbox. Seccomp also refuses socket(AF_UNIX) unless \
 capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET — that \
 rule needs no Landlock and so applies identically on this tier, but it has not been verified \
 either. The same is true of the default-deny syscall allowlist (modelled on the OCI/Docker default \
@@ -1701,7 +1803,7 @@ mod linux_enforce {
     use landlock::{make_bitflags, AccessFs, BitFlags};
 
     use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
-    use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
+    use super::{EnforcementTier, LandlockGrant, SupervisorHandle, CAPSULE_DEVICE_GRANTS};
 
     /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
     /// naming the failed step is far shorter than this; the bound just keeps the best-effort
@@ -1716,13 +1818,26 @@ mod linux_enforce {
         list_dir: bool,
     }
 
+    /// One entry of [`CAPSULE_DEVICE_GRANTS`], opened (`O_PATH | O_CLOEXEC`) in the PARENT before
+    /// fork(), paired with the `writable` bit that decides whether its rule carries `WriteFile` on
+    /// top of `ReadFile`. Structurally a sibling of [`OpenLandlockGrant`] rather than the same
+    /// type, mirroring the split between [`CapsuleDeviceGrant`](super::CapsuleDeviceGrant) and
+    /// [`LandlockGrant`]: read+execute-a-binary and read/write-a-device are different intents and
+    /// their bits must not be confusable.
+    pub(super) struct OpenDeviceGrant {
+        fd: OwnedFd,
+        writable: bool,
+    }
+
     /// All Landlock file descriptors resolved in the parent for one shell subprocess: the
-    /// workdir's fd (scoped by [`WORKDIR_ACCESS_RIGHTS`]) plus each successfully-opened grant fd.
+    /// workdir's fd (scoped by [`WORKDIR_ACCESS_RIGHTS`]), each successfully-opened grant fd, and
+    /// each successfully-opened fixed-device fd.
     /// Handed by reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules
     /// against these fds without performing a single `open()`.
     pub(super) struct LandlockChildFds {
         workdir_fd: OwnedFd,
         grants: Vec<OpenLandlockGrant>,
+        devices: Vec<OpenDeviceGrant>,
     }
 
     /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule.
@@ -2263,7 +2378,7 @@ mod linux_enforce {
         Ok(())
     }
 
-    /// Scopes the shell subprocess tree's filesystem access with Landlock. Two kinds of rule:
+    /// Scopes the shell subprocess tree's filesystem access with Landlock. Three kinds of rule:
     ///
     ///   - the workdir gets [`WORKDIR_ACCESS_RIGHTS`] — read/write/execute plus directory,
     ///     regular-file, FIFO and symlink creation, but **not** `MakeChar`/`MakeBlock`/`MakeSock`
@@ -2276,19 +2391,28 @@ mod linux_enforce {
     ///     meaningful `ReadDir`), while an `interpreter_runtime` directory carries whatever its
     ///     author wrote. `ReadDir` is granted only on the specific inode a rule names — never on
     ///     an ancestor or sibling — so naming one subdirectory never makes `/usr/lib` (or any
-    ///     parent) enumerable.
+    ///     parent) enumerable;
+    ///   - each entry of the fixed [`CAPSULE_DEVICE_GRANTS`] set gets `ReadFile`, plus `WriteFile`
+    ///     if its `writable` bit is set. That bit is set for exactly one path — `/dev/null` — which
+    ///     is therefore the *only* writable path outside the workdir in the whole sandbox. This
+    ///     list is a compile-time constant, not manifest-derived: no capability declaration widens
+    ///     or narrows it. Every device path it does not name stays denied by the ordinary
+    ///     no-matching-rule path below.
     ///
     /// Without the second kind of rule, `restrict_self()` denies `Execute`/`ReadFile` on every
     /// path outside the workdir, so every allowlisted binary's `execve` fails with EACCES before
     /// it runs (and even a binary placed *inside* the workdir can't be loaded, because its dynamic
     /// loader must still read `ld-linux`/libc outside it). The narrow grants fix that while keeping
-    /// the security story honest: nothing outside the workdir is writable, so a write to any
-    /// outside path — including one of these read+execute grant paths — is still denied.
+    /// the security story honest: apart from `/dev/null`, nothing outside the workdir is writable,
+    /// so a write to any other outside path — including one of these read+execute grant paths — is
+    /// still denied.
     ///
     /// `handle_access` must declare the union of every access bit any rule uses, and it stays the
     /// **full** ABI v1 set deliberately: a bit declared there but granted by no rule is denied for
     /// the whole domain, which is exactly how the three rights missing from
-    /// [`WORKDIR_ACCESS_RIGHTS`] become denied rather than merely un-granted. A grant path that
+    /// [`WORKDIR_ACCESS_RIGHTS`] become denied rather than merely un-granted, and it is also what
+    /// makes every device outside [`CAPSULE_DEVICE_GRANTS`] denied. A grant path — or a device
+    /// path, on a host where one of the three is missing — that
     /// fails to *open* is skipped
     /// (shrink-not-fail, matching `resolve_exec_allowlist`) rather than failing the whole scope —
     /// it only narrows what is allowed. A genuine ruleset-construction failure still returns `Err`,
@@ -2314,6 +2438,10 @@ mod linux_enforce {
         let read_execute = AccessFs::Execute | AccessFs::ReadFile;
         // Adds enumerability (`getdents64`) — only for a grant whose author set `list_dir: true`.
         let read_execute_list = read_execute | AccessFs::ReadDir;
+        // Device rights. No `Execute` (a character device is never exec'd) and no `ReadDir` (it is
+        // not a directory) — only the two data bits, with `WriteFile` reserved for `/dev/null`.
+        let device_read: BitFlags<AccessFs> = AccessFs::ReadFile.into();
+        let device_read_write = device_read | AccessFs::WriteFile;
 
         // Every fd here was already opened in the parent (before fork). This function performs no
         // `open()`/`canonicalize()` — only the Landlock ruleset syscalls against already-open fds,
@@ -2341,6 +2469,20 @@ mod linux_enforce {
                 .map_err(|error| format!("landlock: add_rule for grant failed: {error}"))?;
         }
 
+        for device in &fds.devices {
+            // Same convention as the grant loop above: a device that failed to open in the parent
+            // was already dropped, so a failure here is a genuine ruleset-construction failure and
+            // propagates as `Err` (fail-closed).
+            let access = if device.writable {
+                device_read_write
+            } else {
+                device_read
+            };
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(device.fd.as_fd(), access))
+                .map_err(|error| format!("landlock: add_rule for device failed: {error}"))?;
+        }
+
         ruleset
             .restrict_self()
             .map_err(|error| format!("landlock: restrict_self failed: {error}"))?;
@@ -2354,6 +2496,13 @@ mod linux_enforce {
     /// now fails here, synchronously, with a message naming the path — before any subprocess is
     /// spawned — instead of collapsing to a bare EINVAL inside `pre_exec`. A grant path that fails
     /// to open is dropped (shrink-not-fail), matching the previous per-grant `continue`.
+    ///
+    /// The fixed [`CAPSULE_DEVICE_GRANTS`] paths are opened here too, by the same rules: they take
+    /// no argument (the list is a compile-time constant, not manifest-derived), and a host where
+    /// one of the three cannot be opened — unusual, but a broken or minimal `/dev` is possible —
+    /// loses that one device rather than failing the launch. Losing `/dev/null` here degrades to
+    /// exactly the behavior that existed before this mechanism, which is a strictly narrower scope,
+    /// never a wider one.
     pub(super) fn open_landlock_fds(
         workdir: &Path,
         landlock_grants: &[LandlockGrant],
@@ -2376,7 +2525,22 @@ mod linux_enforce {
             }
         }
 
-        Ok(LandlockChildFds { workdir_fd, grants })
+        let mut devices = Vec::with_capacity(CAPSULE_DEVICE_GRANTS.len());
+        for device in CAPSULE_DEVICE_GRANTS {
+            match open_o_path(Path::new(device.path)) {
+                Ok(fd) => devices.push(OpenDeviceGrant {
+                    fd,
+                    writable: device.writable,
+                }),
+                Err(_) => continue,
+            }
+        }
+
+        Ok(LandlockChildFds {
+            workdir_fd,
+            grants,
+            devices,
+        })
     }
 
     /// Opens `path` with `O_PATH | O_CLOEXEC` (identity/lifetime handle only, never a data fd),
@@ -3332,6 +3496,78 @@ mod tests {
                 PathBuf::from("/usr/bin/bash"),
             ]
         );
+    }
+
+    // ---- `CAPSULE_DEVICE_GRANTS` (fixed device set) ----------------------------------------
+    //
+    // *Content* checks on a hand-authored constant, in the same category as the
+    // `WORKDIR_ACCESS_RIGHTS` bit-membership test and the `denied_socket_domains` tests: they
+    // assert what a Rust constant holds, NOT that any kernel grants or refuses anything. Nothing
+    // here — and no green CI run — is evidence that `/dev/null` is actually writable inside a
+    // capsule, or that `/dev/random` is actually refused. Those are enforcement claims about a
+    // real kernel, verified only by the manual procedure in
+    // `docs/content/reference/security-warnings.md` ("Manual acceptance procedure — the fixed
+    // capsule device set"), on real, uncontainerized Linux hardware. This repo's CI has never
+    // resolved to a tier where `apply_landlock_scope` even runs.
+
+    #[test]
+    fn capsule_device_grants_are_exactly_three_devices_with_only_dev_null_writable() {
+        let listed: Vec<(&str, bool)> = CAPSULE_DEVICE_GRANTS
+            .iter()
+            .map(|device| (device.path, device.writable))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("/dev/null", true),
+                ("/dev/zero", false),
+                ("/dev/urandom", false),
+            ],
+            "the capsule device set is fixed at exactly these three paths and these access \
+             levels. /dev/null must stay writable — Python's subprocess.DEVNULL opens it O_RDWR \
+             and a shell `2>/dev/null` redirect opens it O_WRONLY, so a read-only grant breaks \
+             both. Widening this list is allowed only on demonstrated workload failure, and the \
+             failure gets recorded alongside the widening (see the manual acceptance procedure on \
+             the security-warnings reference page)."
+        );
+    }
+
+    #[test]
+    fn capsule_device_grants_exclude_the_devices_deliberately_left_out() {
+        // `/dev/random` is the one with a reasoning trap attached: a plain write() to it credits
+        // *zero* entropy (crediting needs the RNDADDENTROPY ioctl under CAP_SYS_ADMIN, which the
+        // shell child has dropped). It is excluded because nothing needs a blocking RNG when
+        // /dev/urandom is granted — not because writing to it would poison the kernel pool.
+        for excluded in [
+            "/dev/random",
+            "/dev/full",
+            "/dev/tty",
+            "/dev/console",
+            "/dev/mem",
+            "/dev/sda",
+            "/dev",
+        ] {
+            assert!(
+                !CAPSULE_DEVICE_GRANTS
+                    .iter()
+                    .any(|device| device.path == excluded),
+                "{excluded} must not be in the capsule device set — it is denied by the ordinary \
+                 no-matching-rule path, and adding it here would be the only way to change that"
+            );
+        }
+    }
+
+    #[test]
+    fn capsule_device_grants_name_absolute_paths_under_dev() {
+        // The list is opened verbatim with `O_PATH` in the parent: a relative path would resolve
+        // against whatever cwd the host process happens to have.
+        for device in CAPSULE_DEVICE_GRANTS {
+            assert!(
+                device.path.starts_with("/dev/"),
+                "{} must be an absolute path under /dev",
+                device.path
+            );
+        }
     }
 
     // ---- exec decision (canonical identity match; finding #1's attack) ----
