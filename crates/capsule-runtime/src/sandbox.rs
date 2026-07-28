@@ -741,23 +741,29 @@ impl ShellEnforcement {
 ///
 /// The Landlock filesystem scope now derives a narrow read+execute grant (the `shell.allow`
 /// binaries, their ELF interpreter, and their shared-library closure) *outside* the workdir, in
-/// addition to the workdir's full-access grant — so allowlisted programs can actually exec and
-/// dynamically link, and nothing outside the workdir is writable. That derived-grant mechanism has
-/// not yet been verified by the team on real Landlock-capable Linux hardware (the manual
-/// acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a silent
-/// "full" tier would imply everything is confirmed-enforced, which is the false assurance to avoid
-/// until a real Linux run lands.
+/// addition to the workdir's own grant (which withholds device-node and unix-socket creation, see
+/// `linux_enforce::WORKDIR_ACCESS_RIGHTS`) — so allowlisted programs can actually exec and
+/// dynamically link, and nothing outside the workdir is writable. The forked shell child also
+/// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
+/// None of this has yet been verified by the team on real Landlock-capable Linux hardware (the
+/// manual acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a
+/// silent "full" tier would imply everything is confirmed-enforced, which is the false assurance
+/// to avoid until a real Linux run lands.
 const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
-shared libraries — nothing writable, no directory granted wholesale), but this mechanism has not \
-yet been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
-isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
+shared libraries — nothing writable, no directory granted wholesale). The workdir's own grant also \
+withholds device-node and unix-socket creation, and the forked shell child drops every Linux \
+capability and sets no_new_privs before execve — but this mechanism has not yet been verified by \
+the team on real Landlock-capable Linux hardware — treat shell-subprocess isolation as \
+not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
 kernel-enforced at all, and the seccomp exec/network enforcement that would apply has not been \
-verified on real Linux hardware. Treat shell subprocess isolation as experimental on this host.";
+verified on real Linux hardware. The forked shell child still drops every Linux capability and \
+sets no_new_privs before execve on this tier, independently of Landlock, but that has not been \
+verified either. Treat shell subprocess isolation as experimental on this host.";
 
 const ENVIRONMENT_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty but this \
 platform has no kernel-level subprocess sandbox (Landlock/seccomp are Linux-only) — \
