@@ -208,6 +208,52 @@ fn resolve_exec_allowlist_in(shell_allow: &[String], path_dirs: &[PathBuf]) -> V
     resolved.into_iter().collect()
 }
 
+/// Resolves the program name a shell tool invoked to the canonical filesystem path of the
+/// binary that `execvp` would actually run, for reporting purposes: `shell-event.binary`
+/// on the hook side and the `binary` key of `trace.jsonl`'s `shell` record.
+///
+/// Unlike [`resolve_exec_allowlist`] — which collects *every* `PATH` match because the
+/// kernel exec supervisor needs the full identity set — this returns the **first** match,
+/// which is the one `execvp` picks and therefore the one that ran. Resolution rules are
+/// otherwise identical (same `PATH` source, same [`is_executable_file`] test, same
+/// `canonicalize`), so a reported path is always a member of the allowlisted identity set
+/// the supervisor matches against.
+///
+/// A name that resolves to nothing falls back to the bare invoked name, unchanged — never
+/// an error, never a panic, matching `resolve_exec_allowlist`'s "entries that resolve to
+/// nothing are silently skipped" precedent. Observability must not be able to fail a shell
+/// call that the OS is perfectly willing to run.
+pub(crate) fn resolve_invoked_binary_path(binary: &str) -> String {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    resolve_invoked_binary_path_in(binary, &path_dirs)
+}
+
+/// Testable core of [`resolve_invoked_binary_path`], with the `PATH` directory list
+/// injected.
+fn resolve_invoked_binary_path_in(binary: &str, path_dirs: &[PathBuf]) -> String {
+    let fallback = || binary.to_string();
+    if binary.is_empty() {
+        return fallback();
+    }
+    if binary.contains('/') {
+        return match std::fs::canonicalize(binary) {
+            Ok(canonical) => canonical.to_string_lossy().into_owned(),
+            Err(_) => fallback(),
+        };
+    }
+    for dir in path_dirs {
+        let candidate = dir.join(binary);
+        if is_executable_file(&candidate) {
+            if let Ok(canonical) = std::fs::canonicalize(&candidate) {
+                return canonical.to_string_lossy().into_owned();
+            }
+        }
+    }
+    fallback()
+}
+
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -2887,6 +2933,87 @@ mod tests {
         let resolved =
             resolve_exec_allowlist_in(&[link.to_string_lossy().into_owned()], &[]);
         assert_eq!(resolved, vec![std::fs::canonicalize(&real).unwrap()]);
+    }
+
+    // ---- invoked-binary reporting (shell-event.binary / trace.jsonl `binary`) ----
+
+    #[test]
+    fn resolve_invoked_binary_path_resolves_bare_name_via_path_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let tool = bin_dir.join("mytool");
+        make_executable(&tool, "#!/bin/sh\nexit 0\n");
+
+        let resolved = resolve_invoked_binary_path_in("mytool", &[bin_dir]);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&tool)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "a resolvable name must report the canonical absolute path, not the bare name"
+        );
+    }
+
+    #[test]
+    fn resolve_invoked_binary_path_falls_back_to_bare_name_when_unresolvable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path_dirs = [temp.path().to_path_buf()];
+        let resolved = resolve_invoked_binary_path_in("definitely-not-a-real-binary", &path_dirs);
+        assert_eq!(
+            resolved, "definitely-not-a-real-binary",
+            "an unresolvable name must fall back to the bare name, never error"
+        );
+        assert_eq!(resolve_invoked_binary_path_in("", &[]), "");
+    }
+
+    #[test]
+    fn resolve_invoked_binary_path_takes_the_first_path_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        make_executable(&first.join("mytool"), "#!/bin/sh\nexit 0\n");
+        make_executable(&second.join("mytool"), "#!/bin/sh\nexit 1\n");
+
+        let resolved = resolve_invoked_binary_path_in("mytool", &[first.clone(), second]);
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(first.join("mytool"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            "reporting must match execvp: the first PATH hit is the one that ran"
+        );
+    }
+
+    #[test]
+    fn resolve_invoked_binary_path_ignores_non_executable_path_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("mytool"), "not executable").unwrap();
+        assert_eq!(
+            resolve_invoked_binary_path_in("mytool", &[temp.path().to_path_buf()]),
+            "mytool"
+        );
+    }
+
+    #[test]
+    fn resolve_invoked_binary_path_canonicalizes_a_path_entry_through_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real-tool");
+        make_executable(&real, "#!/bin/sh\nexit 0\n");
+        let link = temp.path().join("link-tool");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            resolve_invoked_binary_path_in(&link.to_string_lossy(), &[]),
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
     }
 
     // ---- ELF dependency parsing (pure, synthetic fixtures — runs on every OS) ----

@@ -6,3 +6,4 @@
 
 pub(crate) mod lifecycle_v0_2;
 pub(crate) mod lifecycle_v0_3;
+pub(crate) mod lifecycle_v0_4;

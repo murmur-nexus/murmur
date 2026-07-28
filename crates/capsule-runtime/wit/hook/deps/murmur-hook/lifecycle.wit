@@ -1,4 +1,4 @@
-package murmur:hook@0.4.0;
+package murmur:hook@0.5.0;
 
 interface lifecycle {
     record message {
@@ -73,6 +73,16 @@ interface lifecycle {
 
     record shell-event {
         turn: u32,
+        /// The program that was actually invoked, as a canonicalized absolute
+        /// filesystem path when the host could resolve the invoked name against
+        /// its `PATH` at dispatch time (e.g. `/usr/bin/pytest`). Falls back to
+        /// the bare invoked name when resolution finds nothing — never empty,
+        /// never an error. This is the only field that identifies *what ran*;
+        /// `command` carries the argument list alone.
+        binary: string,
+        /// The argument list the shell tool received — never the binary name
+        /// itself. For a shell interpreter (`bash`/`sh`/...) this is the script
+        /// text passed via `-c`.
         command: string,
         exit-code: s32,
         stdout: string,

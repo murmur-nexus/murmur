@@ -908,6 +908,7 @@ in a session), and `timestamp` (Unix milliseconds).
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | |
+| `binary` | string | The program that ran — canonicalized absolute path when the invoked name resolved against the host `PATH` (e.g. `/usr/bin/pytest`), else the bare invoked name |
 | `command` | string | First 200 characters |
 | `exit_code` | i32 | Non-zero is data, not an error |
 | `stdout_bytes` | u64 | |

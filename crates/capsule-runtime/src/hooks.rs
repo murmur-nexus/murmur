@@ -24,7 +24,7 @@ use crate::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
-    compat::{lifecycle_v0_2, lifecycle_v0_3},
+    compat::{lifecycle_v0_2, lifecycle_v0_3, lifecycle_v0_4},
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
@@ -34,35 +34,41 @@ use crate::{
 };
 
 /// Current versioned instance export name: what a hook compiled against
-/// `murmur:hook@0.4.0` (5-case `hook-output` with `reopen-task`) carries in its
+/// `murmur:hook@0.5.0` (9-field `shell-event` carrying `binary`) carries in its
 /// component-type section.
-const OBS_IFACE_V0_4: &str = "murmur:hook/lifecycle@0.4.0";
+const OBS_IFACE_V0_5: &str = "murmur:hook/lifecycle@0.5.0";
 
 /// Which `murmur:hook/lifecycle` version a given component resolved at. It drives
-/// two dispatch decisions: the `on-compaction` param shape (`V0_2` is 3-field, the
-/// others 5-field) and the `hook-output` return shape (`V0_4` is the current 5-case
-/// variant; `V0_3`/`V0_2` are the pre-`reopen-task` 4-case variant, lifted through
-/// the [`lifecycle_v0_3`] twin).
+/// three dispatch decisions: the `on-shell` param shape (`V0_5` is the 9-field record
+/// with `binary`; every earlier tier is the 8-field one, sent through the
+/// [`lifecycle_v0_4`] twin), the `on-compaction` param shape (`V0_2` is 3-field, the
+/// others 5-field), and the `hook-output` return shape (`V0_5`/`V0_4` are the current
+/// 5-case variant; `V0_3`/`V0_2` are the pre-`reopen-task` 4-case variant, lifted
+/// through the [`lifecycle_v0_3`] twin).
 ///
-/// `V0_3` and `V0_2` only exist to route to the compat shims — see `COMPAT_SHIMS.md`
-/// at the repo root for their removal conditions.
+/// `V0_4`, `V0_3` and `V0_2` only exist to route to the compat shims — see
+/// `COMPAT_SHIMS.md` at the repo root for their removal conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecycleVersion {
+    V0_5,
     V0_4,
     V0_3,
     V0_2,
 }
 
-/// Resolve the lifecycle instance export, trying `@0.4.0` first, then the
-/// [`lifecycle_v0_3`] compat name `@0.3.0`, then the [`lifecycle_v0_2`] compat name
-/// `@0.2.0`. Returns the export index together with the version that matched. `None`
-/// means the component exports none of them, which surfaces as a missing-export error
-/// at the call site.
+/// Resolve the lifecycle instance export, trying `@0.5.0` first, then the
+/// [`lifecycle_v0_4`] compat name `@0.4.0`, then the [`lifecycle_v0_3`] compat name
+/// `@0.3.0`, then the [`lifecycle_v0_2`] compat name `@0.2.0`. Returns the export index
+/// together with the version that matched. `None` means the component exports none of
+/// them, which surfaces as a missing-export error at the call site.
 fn resolve_lifecycle_iface(
     instance: &wasmtime::component::Instance,
     store: &mut Store<HookStoreState>,
 ) -> Option<(wasmtime::component::ComponentExportIndex, LifecycleVersion)> {
-    if let Some(idx) = instance.get_export_index(&mut *store, None, OBS_IFACE_V0_4) {
+    if let Some(idx) = instance.get_export_index(&mut *store, None, OBS_IFACE_V0_5) {
+        return Some((idx, LifecycleVersion::V0_5));
+    }
+    if let Some(idx) = instance.get_export_index(&mut *store, None, lifecycle_v0_4::IFACE_NAME) {
         return Some((idx, LifecycleVersion::V0_4));
     }
     if let Some(idx) = instance.get_export_index(&mut *store, None, lifecycle_v0_3::IFACE_NAME) {
@@ -76,10 +82,11 @@ fn resolve_lifecycle_iface(
 /// Diagnostic naming every accepted lifecycle export name, used wherever
 /// resolution fails.
 fn missing_lifecycle_msg(subject: &str) -> String {
+    let v04 = lifecycle_v0_4::IFACE_NAME;
     let v03 = lifecycle_v0_3::IFACE_NAME;
     let v02 = lifecycle_v0_2::IFACE_NAME;
     format!(
-        "hook {subject} exports none of {OBS_IFACE_V0_4}, {v03}, {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
+        "hook {subject} exports none of {OBS_IFACE_V0_5}, {v04}, {v03}, {v02}; rebuild the hook against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )
 }
 
@@ -317,6 +324,10 @@ pub(crate) enum HookEvent {
     },
     Shell {
         turn: u32,
+        /// The program that ran, canonicalized against the host `PATH` where possible
+        /// (else the bare invoked name). Only sent to a `@0.5.0` hook — earlier tiers
+        /// have no field to receive it (see [`lifecycle_v0_4`]).
+        binary: String,
         command: String,
         exit_code: i32,
         stdout: String,
@@ -402,6 +413,10 @@ pub(crate) struct HookArtifact {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ShellDispatchInfo {
+    /// The program that was actually invoked — a canonical absolute path when the host
+    /// `PATH` resolves the invoked name, else the bare name. Distinct from `command`,
+    /// which carries the argument list alone and therefore never names the binary.
+    pub binary: String,
     pub command: String,
     pub exit_code: i32,
     pub stdout: String,
@@ -554,11 +569,12 @@ async fn call_stage_once(
         .and_then(|idx| instance.get_func(&mut store, idx))
         .ok_or_else(|| format!("hook {}@{} missing on-stage", staged.name, staged.version))?;
 
-    // `hook-output` is 5-case on `@0.4.0` and 4-case on the pre-`reopen-task` legacy
-    // tiers; lift through whichever the guest declares (see `call_typed`). `on-stage`
-    // runs on its own throwaway store, so this cannot reuse the blocking-hook path.
+    // `hook-output` is 5-case on `@0.5.0`/`@0.4.0` and 4-case on the pre-`reopen-task`
+    // legacy tiers; lift through whichever the guest declares (see `call_typed`).
+    // `on-stage` runs on its own throwaway store, so this cannot reuse the
+    // blocking-hook path.
     match version {
-        LifecycleVersion::V0_4 => {
+        LifecycleVersion::V0_5 | LifecycleVersion::V0_4 => {
             call_stage_lift::<HookOutput>(&mut store, &func, evt, &staged.name, limits).await
         }
         LifecycleVersion::V0_3 | LifecycleVersion::V0_2 => {
@@ -975,7 +991,8 @@ async fn instantiate_blocking_hook(
         })?;
 
     let iface_name = match lifecycle_version {
-        LifecycleVersion::V0_4 => OBS_IFACE_V0_4,
+        LifecycleVersion::V0_5 => OBS_IFACE_V0_5,
+        LifecycleVersion::V0_4 => lifecycle_v0_4::IFACE_NAME,
         LifecycleVersion::V0_3 => lifecycle_v0_3::IFACE_NAME,
         LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
@@ -1068,13 +1085,15 @@ where
         None => return Ok(None),
     };
     // `hook-output` is the return type of every lifecycle function, and its wire shape
-    // depends on the resolved package version: `@0.4.0` returns the current 5-case
-    // variant, while `@0.3.0`/`@0.2.0` return the pre-`reopen-task` 4-case twin. Lift
-    // through whichever the guest actually declares, then widen to the current type —
-    // `TypedFunc::typed` is structural and rejects a 4-case guest return lifted against
+    // depends on the resolved package version: `@0.5.0`/`@0.4.0` return the current
+    // 5-case variant, while `@0.3.0`/`@0.2.0` return the pre-`reopen-task` 4-case twin.
+    // Lift through whichever the guest actually declares, then widen to the current type
+    // — `TypedFunc::typed` is structural and rejects a 4-case guest return lifted against
     // the 5-case host type outright, so this is not optional.
     let out = match hook.lifecycle_version {
-        LifecycleVersion::V0_4 => invoke_typed::<T, HookOutput>(hook, &func, fn_name, arg).await?,
+        LifecycleVersion::V0_5 | LifecycleVersion::V0_4 => {
+            invoke_typed::<T, HookOutput>(hook, &func, fn_name, arg).await?
+        }
         LifecycleVersion::V0_3 | LifecycleVersion::V0_2 => {
             invoke_typed::<T, lifecycle_v0_3::HookOutputLegacy>(hook, &func, fn_name, arg)
                 .await?
@@ -1205,6 +1224,7 @@ async fn call_hook(
         }
         HookEvent::Shell {
             turn,
+            binary,
             command,
             exit_code,
             stdout,
@@ -1213,17 +1233,40 @@ async fn call_hook(
             stderr_bytes,
             duration_ms,
         } => {
-            let evt = ShellEvent {
-                turn: *turn,
-                command: command.chars().take(200).collect(),
-                exit_code: *exit_code,
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                stdout_bytes: *stdout_bytes,
-                stderr_bytes: *stderr_bytes,
-                duration_ms: *duration_ms,
-            };
-            call_typed(hook, "on-shell", evt).await?
+            // `shell-event` is 9-field on `@0.5.0` (it gained `binary`) and 8-field on
+            // every earlier tier. `TypedFunc::typed` is structural, so the 9-field record
+            // simply does not type-check against a pre-`@0.5.0` hook's `on-shell`; send
+            // those the 8-field twin instead. `binary` is not truncated the way `command`
+            // is — a clipped path names a different file, or none.
+            match hook.lifecycle_version {
+                LifecycleVersion::V0_5 => {
+                    let evt = ShellEvent {
+                        turn: *turn,
+                        binary: binary.clone(),
+                        command: command.chars().take(200).collect(),
+                        exit_code: *exit_code,
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                        stdout_bytes: *stdout_bytes,
+                        stderr_bytes: *stderr_bytes,
+                        duration_ms: *duration_ms,
+                    };
+                    call_typed(hook, "on-shell", evt).await?
+                }
+                LifecycleVersion::V0_4 | LifecycleVersion::V0_3 | LifecycleVersion::V0_2 => {
+                    let evt = lifecycle_v0_4::ShellEventV04 {
+                        turn: *turn,
+                        command: command.chars().take(200).collect(),
+                        exit_code: *exit_code,
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                        stdout_bytes: *stdout_bytes,
+                        stderr_bytes: *stderr_bytes,
+                        duration_ms: *duration_ms,
+                    };
+                    call_typed(hook, "on-shell", evt).await?
+                }
+            }
         }
         HookEvent::Compaction {
             messages,
@@ -1232,12 +1275,12 @@ async fn call_hook(
             model,
             system_prompt,
         } => {
-            // `compaction-event` is 5-field on `@0.3.0`/`@0.4.0` and 3-field on
+            // `compaction-event` is 5-field on `@0.3.0` and later, and 3-field on
             // `@0.2.0`. `TypedFunc::typed` is structural, so the 5-field record
             // simply does not type-check against a `@0.2.0`-compiled hook's
             // `on-compaction`; send it the 3-field twin instead.
             match hook.lifecycle_version {
-                LifecycleVersion::V0_4 | LifecycleVersion::V0_3 => {
+                LifecycleVersion::V0_5 | LifecycleVersion::V0_4 | LifecycleVersion::V0_3 => {
                     let evt = CompactionEvent {
                         messages: messages.clone(),
                         session_tokens: *session_tokens,
@@ -1379,7 +1422,8 @@ async fn call_async_hook(
         resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| missing_lifecycle_msg(name))?;
 
     let iface_name = match lifecycle_version {
-        LifecycleVersion::V0_4 => OBS_IFACE_V0_4,
+        LifecycleVersion::V0_5 => OBS_IFACE_V0_5,
+        LifecycleVersion::V0_4 => lifecycle_v0_4::IFACE_NAME,
         LifecycleVersion::V0_3 => lifecycle_v0_3::IFACE_NAME,
         LifecycleVersion::V0_2 => lifecycle_v0_2::IFACE_NAME,
     };
@@ -1493,7 +1537,7 @@ mod tests {
     /// The pre-`reopen-task` (`@0.3.0`) lifecycle instance name. Many doubles below
     /// hand-author the 4-case `hook-output` and must therefore export this name so the
     /// host lifts their returns through the [`lifecycle_v0_3`] twin. The current-version
-    /// doubles use [`OBS_IFACE_V0_4`].
+    /// doubles use [`OBS_IFACE_V0_5`].
     const OBS_IFACE_V0_3: &str = lifecycle_v0_3::IFACE_NAME;
 
     /// Engine configured like the production one (component model + async + epoch
@@ -1516,7 +1560,7 @@ mod tests {
         // Default double exports the current versioned instance name, so the
         // required/optional suite exercises real resolution against the version the
         // host probes first.
-        hook_double_iface(engine, OBS_IFACE_V0_4, fn_names)
+        hook_double_iface(engine, OBS_IFACE_V0_5, fn_names)
     }
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
@@ -1841,7 +1885,7 @@ mod tests {
     }
 
     /// A hook component built against the *current* versioned
-    /// `murmur:hook/lifecycle@0.4.0` interface (the name a freshly-compiled hook
+    /// `murmur:hook/lifecycle@0.5.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
     /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
@@ -1851,7 +1895,7 @@ mod tests {
         let engine = hook_test_engine();
         let mut names: Vec<&str> = REQUIRED_HOOK_FNS.to_vec();
         names.extend_from_slice(&OPTIONAL_HOOK_FNS);
-        let component = hook_double_iface(&engine, OBS_IFACE_V0_4, &names);
+        let component = hook_double_iface(&engine, OBS_IFACE_V0_5, &names);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2045,7 +2089,9 @@ mod tests {
         match version {
             // The current-version (5-case hook-output) compaction path is exercised by
             // the dedicated reopen/echo doubles; this helper only builds the legacy tiers.
-            LifecycleVersion::V0_4 => {
+            // `@0.4.0` shares `@0.3.0`'s compaction shape and is covered by the shell
+            // doubles instead, which are what the `@0.5.0` bump actually changed.
+            LifecycleVersion::V0_5 | LifecycleVersion::V0_4 => {
                 unreachable!("hook_compaction_double builds only the @0.3.0/@0.2.0 legacy tiers")
             }
             LifecycleVersion::V0_3 => {
@@ -2581,6 +2627,355 @@ mod tests {
             log.contains("exceeded its 1s execution deadline"),
             "the call must have entered the guest (deadline), not failed a type check; got: {log}"
         );
+    }
+
+    // ---- shell-event: `binary` (the `@0.4.0 → @0.5.0` bump) ----
+
+    /// A double whose `on-shell` declares the **current** 9-field `shell-event`, and which
+    /// verifies what it was handed rather than merely accepting it: the core function
+    /// byte-compares the incoming `binary` string against `expect_binary` and traps on any
+    /// difference. So "zero lines in the hook log" here means the guest received exactly
+    /// the value the host claims it sent — a weaker double could pass while `binary`
+    /// carried garbage.
+    ///
+    /// `on-shell`'s flat params are fixed by the canonical ABI lowering of the 9-field
+    /// record: `u32` + three `string`s (2 each, in field order `binary`, `command`,
+    /// `stdout`, `stderr` — four strings, 8 i32) + `s32` + three `u64`. Unlike the
+    /// constant-pointer `realloc` the other doubles use, this one bump-allocates: four
+    /// strings lowered to the same address would clobber each other, and `binary` is
+    /// lowered first.
+    ///
+    /// The expected bytes live at offset 0 and the `result<hook-output, string>` return
+    /// area at 128, so `expect_binary` must stay well under 128 bytes.
+    fn hook_shell_double_v0_5(engine: &wasmtime::Engine, expect_binary: &str) -> Component {
+        assert!(
+            expect_binary.len() < 128,
+            "expected-binary data segment would overlap the return area at 128"
+        );
+        let expect_len = expect_binary.len();
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-shell")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = OBS_IFACE_V0_5;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (data (i32.const 0) "{expect_binary}")
+    (global $next (mut i32) (i32.const 1024))
+    (func (export "realloc") (param i32 i32 i32) (param $size i32) (result i32)
+      (local $at i32)
+      (local.set $at (global.get $next))
+      (global.set $next (i32.add (local.get $at) (local.get $size)))
+      (local.get $at))
+    (func (export "onshell")
+      (param $turn i32) (param $binp i32) (param $binlen i32)
+      (param i32) (param i32) (param i32) (param i32) (param i32) (param i32) (param i32)
+      (param i64) (param i64) (param i64) (result i32)
+      (local $i i32)
+      (if (i32.ne (local.get $binlen) (i32.const {expect_len})) (then unreachable))
+      (block $done
+        (loop $l
+          (br_if $done (i32.ge_u (local.get $i) (i32.const {expect_len})))
+          (if (i32.ne
+                (i32.load8_u (i32.add (local.get $binp) (local.get $i)))
+                (i32.load8_u (local.get $i)))
+            (then unreachable))
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $l)))
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)))
+  (type $shell-event (record
+    (field "turn" u32)
+    (field "binary" string)
+    (field "command" string)
+    (field "exit-code" s32)
+    (field "stdout" string)
+    (field "stderr" string)
+    (field "stdout-bytes" u64)
+    (field "stderr-bytes" u64)
+    (field "duration-ms" u64)))
+  (type $ft (func (param "event" $shell-event) (result (result $hook-output (error string)))))
+
+  (func $sh (type $ft)
+    (canon lift (core func $i "onshell") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "shell-event" (type $shell-event))
+    (export "on-shell" (func $sh))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("@0.5.0 shell component WAT parses");
+        Component::new(engine, &bytes).expect("@0.5.0 shell component double compiles")
+    }
+
+    /// A double whose `on-shell` declares the **pre-`binary`** 8-field `shell-event` — the
+    /// shape `@0.4.0`, `@0.3.0` and `@0.2.0` all share — exported under `version`'s instance
+    /// name. It ignores its params and returns `ok(none)`; the point is the type check, not
+    /// the body. `hook-output` is 5-case on `@0.4.0` and 4-case on the two older tiers, so
+    /// the double must declare the one its own version really had or `call_typed`'s return
+    /// lift fails for reasons unrelated to `shell-event`.
+    ///
+    /// The 8-field record lowers to 11 flat params: `u32` + three `string`s + `s32` +
+    /// three `u64`.
+    fn hook_shell_double_legacy(engine: &wasmtime::Engine, version: LifecycleVersion) -> Component {
+        let (iface, reopen_case) = match version {
+            LifecycleVersion::V0_5 => {
+                unreachable!("hook_shell_double_legacy builds only the pre-@0.5.0 tiers")
+            }
+            LifecycleVersion::V0_4 => (
+                lifecycle_v0_4::IFACE_NAME,
+                "\n    (case \"reopen-task\" string)",
+            ),
+            LifecycleVersion::V0_3 => (lifecycle_v0_3::IFACE_NAME, ""),
+            LifecycleVersion::V0_2 => (lifecycle_v0_2::IFACE_NAME, ""),
+        };
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-shell")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "onshell")
+      (param i32 i32 i32 i32 i32 i32 i32 i32) (param i64 i64 i64) (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string){reopen_case}))
+  (type $shell-event (record
+    (field "turn" u32)
+    (field "command" string)
+    (field "exit-code" s32)
+    (field "stdout" string)
+    (field "stderr" string)
+    (field "stdout-bytes" u64)
+    (field "stderr-bytes" u64)
+    (field "duration-ms" u64)))
+  (type $ft (func (param "event" $shell-event) (result (result $hook-output (error string)))))
+
+  (func $sh (type $ft)
+    (canon lift (core func $i "onshell") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "shell-event" (type $shell-event))
+    (export "on-shell" (func $sh))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("legacy shell component WAT parses");
+        Component::new(engine, &bytes).expect("legacy shell component double compiles")
+    }
+
+    /// Stage `component` as the sole `on-shell` hook, assert it resolved at `version`, and
+    /// dispatch one shell event carrying `binary`.
+    async fn dispatch_shell_against(
+        session: &Path,
+        accessible: &Path,
+        engine: &wasmtime::Engine,
+        version: LifecycleVersion,
+        component: Component,
+        binary: &str,
+    ) {
+        let mut hooks = new_with_hooks(
+            engine,
+            session,
+            accessible,
+            vec![staged_double_named(
+                "sheller",
+                HookBinding::OnShell,
+                component,
+            )],
+        )
+        .await
+        .expect("every accepted lifecycle version must instantiate");
+        assert_eq!(hooks.blocking_hooks[0].lifecycle_version, version);
+
+        hooks
+            .emit(
+                session,
+                HookEvent::Shell {
+                    turn: 1,
+                    binary: binary.to_string(),
+                    command: "-q tests/".to_string(),
+                    exit_code: 0,
+                    stdout: "ok".to_string(),
+                    stderr: String::new(),
+                    stdout_bytes: 2,
+                    stderr_bytes: 0,
+                    duration_ms: 12,
+                },
+            )
+            .await;
+    }
+
+    /// A hook rebuilt against `@0.5.0` receives the new 9-field `shell-event`, and the
+    /// `binary` it observes is byte-for-byte what the host sent — the whole point of the
+    /// bump. The double traps on any mismatch, so an empty log is the assertion.
+    #[test]
+    fn v0_5_hook_receives_the_invoked_binary_in_shell_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_shell_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_5,
+            hook_shell_double_v0_5(&engine, "/usr/bin/pytest"),
+            "/usr/bin/pytest",
+        ));
+
+        assert_eq!(
+            hook_log_lines(session.path(), "sheller"),
+            0,
+            "a @0.5.0 hook must receive on-shell cleanly with the exact binary the host sent"
+        );
+    }
+
+    /// Guards the test above: the double really does inspect `binary`, so a wrong value
+    /// traps rather than passing silently. Without this, `v0_5_hook_receives_...` would
+    /// still pass if the host sent an empty or stale `binary`.
+    #[test]
+    fn v0_5_shell_double_rejects_a_binary_it_did_not_expect() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_shell_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_5,
+            hook_shell_double_v0_5(&engine, "/usr/bin/pytest"),
+            "/usr/bin/cargo",
+        ));
+
+        let log = std::fs::read_to_string(session.path().join("logs").join("hook-sheller.log"))
+            .expect("the mismatch must be logged");
+        assert!(
+            log.contains("on-shell trapped"),
+            "the double must trap *inside the guest* on an unexpected binary — a `.typed()` \
+             mismatch (which reports differently) would prove nothing about the field's \
+             value; got: {log}"
+        );
+    }
+
+    /// A hook still compiled against `@0.4.0` — every hook artifact published before this
+    /// bump — instantiates via the version fallback and keeps receiving `on-shell` with the
+    /// old 8-field record, unchanged and unnoticed. Nothing is logged, so the dispatch
+    /// really completed rather than failing `.typed()` and being isolated.
+    #[test]
+    fn v0_4_hook_receives_eight_field_shell_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_shell_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_4,
+            hook_shell_double_legacy(&engine, LifecycleVersion::V0_4),
+            "/usr/bin/pytest",
+        ));
+
+        assert_eq!(
+            hook_log_lines(session.path(), "sheller"),
+            0,
+            "a @0.4.0 hook must receive the pre-`binary` shell-event cleanly, not an ABI mismatch"
+        );
+    }
+
+    /// The same holds for the two older tiers: `shell-event` is shape-identical across
+    /// `@0.2.0`/`@0.3.0`/`@0.4.0`, so one twin serves all three.
+    #[test]
+    fn v0_3_hook_receives_eight_field_shell_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_shell_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_3,
+            hook_shell_double_legacy(&engine, LifecycleVersion::V0_3),
+            "/usr/bin/pytest",
+        ));
+
+        assert_eq!(hook_log_lines(session.path(), "sheller"), 0);
+    }
+
+    #[test]
+    fn v0_2_hook_receives_eight_field_shell_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(dispatch_shell_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            LifecycleVersion::V0_2,
+            hook_shell_double_legacy(&engine, LifecycleVersion::V0_2),
+            "/usr/bin/pytest",
+        ));
+
+        assert_eq!(hook_log_lines(session.path(), "sheller"), 0);
     }
 
     /// End-to-end through the real host import: a hook component that imports
@@ -3339,7 +3734,7 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
-    /// A *current-version* (`@0.4.0`, 5-case `hook-output`) `on-task-end` double that
+    /// A *current-version* (`@0.5.0`, 5-case `hook-output`) `on-task-end` double that
     /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
     /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
     /// offset 300 so the host lifts the real bytes the guest declared, exercising the
@@ -3359,7 +3754,7 @@ artifacts:
             .collect::<Vec<_>>()
             .join("\n");
         let reason_len = reason.len();
-        let iface = OBS_IFACE_V0_4;
+        let iface = OBS_IFACE_V0_5;
         let wat = format!(
             r#"(component
   (core module $m
