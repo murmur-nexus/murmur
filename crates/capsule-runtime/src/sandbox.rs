@@ -814,6 +814,7 @@ pub(crate) fn warn_for_enforcement_tier(tier: EnforcementTier, workdir: &Path, p
 /// deadlock — by the time `.spawn()`'s internal blocking read is waiting on the exec-status
 /// pipe, the supervisor thread is already independently waiting to receive the notify fd and
 /// answer requests on it.
+#[derive(Debug)]
 pub(crate) enum SupervisorHandle {
     Noop,
     #[cfg(target_os = "linux")]
