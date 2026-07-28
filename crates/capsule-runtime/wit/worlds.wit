@@ -1,17 +1,17 @@
-package murmur:runtime@0.1.0;
+package murmur:runtime-guest@0.1.0;
 
 world capsule {
-  include wasi:cli/imports@0.2.0;
   import murmur:tool-registry/invoke@0.1.0;
   export murmur:capsule/run@0.1.0;
 }
 
 world tool {
-  include wasi:cli/imports@0.2.0;
+  import murmur:task/task@0.1.0;
+  import murmur:text/chunks@0.1.0;
   export murmur:tool/run@0.1.0;
 }
 
 world driver {
-  include wasi:cli/imports@0.2.0;
+  import murmur:text/chunks@0.1.0;
   export murmur:tool/run@0.1.0;
 }
