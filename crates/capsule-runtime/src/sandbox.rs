@@ -23,6 +23,14 @@
 //!     above never covered: its `sockaddr` parser returns `None` for non-IP families and the
 //!     supervisor treats that as allow. `AF_NETLINK`/`AF_PACKET` are denied unconditionally;
 //!     `AF_UNIX` is denied unless `capabilities.network.unix_sockets` says otherwise.
+//!   - **a default-deny syscall allowlist** modelled on the OCI/Docker default seccomp profile —
+//!     see `SECCOMP_SYSCALL_ALLOWLIST`. The filter's default action is `SECCOMP_RET_ERRNO(EPERM)`,
+//!     so a syscall named by neither that array nor one of the rules above is refused outright,
+//!     with no argument inspection at all. This is what puts `io_uring_*` (historically an
+//!     LSM-path-hook bypass, and so a candidate route around Landlock itself), `bpf`,
+//!     `userfaultfd`, `perf_event_open`, `ptrace` and the rest of `SECCOMP_MUST_STAY_DENIED` out
+//!     of a capsule's reach. The filter also sets `SCMP_FLTATR_CTL_LOG`, so each denial reaches
+//!     the kernel audit trail with a syscall number, pid and comm.
 //!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
 //!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock` — see
 //!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`.
@@ -39,12 +47,13 @@
 //!
 //! ## Three-tier model
 //!
-//! - `KernelFull` (Linux, Landlock ABI available — kernel 5.13+): seccomp exec/network
-//!   allowlisting + socket-domain denial + Landlock filesystem scoping.
-//! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp exec/network
-//!   allowlisting + socket-domain denial only. Filesystem scope stays convention-only
-//!   (`current_dir`) — a documented gap, not a bug. The socket-domain denial is identical on both
-//!   tiers: it is a seccomp rule, so it does not depend on Landlock in any way.
+//! - `KernelFull` (Linux, Landlock ABI available — kernel 5.13+): seccomp syscall allowlist +
+//!   exec/network allowlisting + socket-domain denial + Landlock filesystem scoping.
+//! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp syscall allowlist +
+//!   exec/network allowlisting + socket-domain denial only. Filesystem scope stays convention-only
+//!   (`current_dir`) — a documented gap, not a bug. The syscall allowlist and the socket-domain
+//!   denial are identical on both tiers: they are seccomp rules, so they do not depend on Landlock
+//!   in any way.
 //! - `EnvironmentOnly` (macOS / any non-Linux target): no kernel primitive attempted at all.
 //!   Permanent, not a placeholder for a future slice.
 //!
@@ -676,9 +685,11 @@ const LINUX_AF_PACKET: i32 = 17;
 ///     strictly more dangerous than one. Widening them would be a deliberate future decision with
 ///     its own justification, not an oversight to be fixed by adding a flag here.
 ///
-/// Everything not listed — `AF_INET`, `AF_INET6`, and every other domain — is untouched by this
-/// rule and still governed exactly as before by the `connect`/`sendto` notify path against
-/// `capabilities.network.allow`. This function only ever *adds* denials.
+/// `AF_INET`/`AF_INET6` are never denied here: they stay governed exactly as before by the
+/// `connect`/`sendto` notify path against `capabilities.network.allow`. This function only ever
+/// *adds* denials, and is paired with [`allowed_socket_domains`], which names the families that
+/// get a positive rule — since the filter's default action is a deny, a family named by neither
+/// function is refused with the filter default (`EPERM`) rather than this rule's `EACCES`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn denied_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
     let mut denied = vec![LINUX_AF_NETLINK, LINUX_AF_PACKET];
@@ -687,6 +698,461 @@ pub(crate) fn denied_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
     }
     denied
 }
+
+/// The `socket(2)` domains the child's seccomp filter permits, given the capsule's
+/// `capabilities.network.unix_sockets` declaration. The exact complement of
+/// [`denied_socket_domains`] over the families anything in a shell toolchain actually opens.
+///
+/// This exists because the filter's default action is `Errno(EPERM)`, not `Allow`: `socket` needs
+/// a positive rule or no socket of any family could be created at all. It is deliberately *not*
+/// expressed as one unconditional `Allow` rule on `socket` — see `install_seccomp_filter` for why
+/// that would silently delete the [`denied_socket_domains`] rules — and deliberately not as a
+/// "not any of the denied families" rule either, so the two functions stay a pair of disjoint,
+/// equality-matched sets that a test can check against each other.
+///
+/// The cost of naming families positively is that a family in neither set (`AF_ALG`, `AF_VSOCK`,
+/// `AF_BLUETOOTH`, `AF_XDP`, ...) is now refused rather than allowed. That is stricter than
+/// Docker's default profile, which allows every family except `AF_ALG`/`AF_VSOCK`; no shell,
+/// coreutils, git, compiler or interpreter workload opens one, and the whole point of a
+/// default-deny filter is that an unenumerated case fails closed. Add a family here (with a
+/// reason) if a real workload needs it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn allowed_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
+    let mut allowed = vec![LINUX_AF_INET_DOMAIN, LINUX_AF_INET6_DOMAIN];
+    if unix_sockets_allowed {
+        allowed.push(LINUX_AF_UNIX);
+    }
+    allowed
+}
+
+/// `socket(2)` `domain` values for the two IP families, as `i32` to match
+/// [`allowed_socket_domains`]'s rule-argument type. Derived from the `sockaddr`-parser constants
+/// below rather than re-typed as fresh literals: `AF_INET`'s number is one ABI value, whether it
+/// is being read out of a `sockaddr` or compared against `socket()`'s first argument.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_AF_INET_DOMAIN: i32 = LINUX_AF_INET as i32;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6 as i32;
+
+/// The syscalls the child's seccomp filter permits outright, modelled on the OCI/Docker default
+/// seccomp profile (reconciled against `containerd`'s `contrib/seccomp/seccomp_default.go`, which
+/// is the maintained source of the same list Docker ships).
+///
+/// The filter's **default action is a deny** (`Errno(EPERM)`), so this array is the whole of what
+/// a shell subprocess may call, minus two carve-outs handled by rules rather than by name here:
+///
+///   - `execve`/`execveat`/`connect`/`sendto` are `Notify` rules (argument-content decisions made
+///     by the supervisor). They are deliberately **absent** from this array — adding them would
+///     give them a second, plain `Allow` rule and take them away from the supervisor.
+///   - `socket` is absent for the same structural reason: it carries argument-conditional rules
+///     (see [`denied_socket_domains`] / [`allowed_socket_domains`]), and an unconditional `Allow`
+///     rule would discard them.
+///
+/// Everything else is refused by the default action, which is the point of the card this list
+/// implements: before it, `io_uring_setup`, `bpf`, `userfaultfd`, `perf_event_open`,
+/// `open_by_handle_at`, `keyctl` and `ptrace` were all reachable from a capsule shell on bare
+/// metal, while the same probe under Docker got `EPERM` for each. `io_uring` is the one that
+/// matters most: it has historically bypassed LSM path hooks, so leaving it reachable undermines
+/// the Landlock filesystem boundary rather than merely widening the syscall surface. See
+/// [`SECCOMP_MUST_STAY_DENIED`] for the full set that must never be added back.
+///
+/// Names, not numbers: `libseccomp` resolves each one for the architecture the filter is being
+/// built on. A name this host's `libseccomp` does not know (a syscall newer than the library) or
+/// that does not exist on this architecture (`open`, `dup2`, `poll`, ... on aarch64) is skipped,
+/// leaving that syscall denied by default — see `install_seccomp_filter`. That is why legacy
+/// x86_64-only spellings sit next to their modern equivalents here: on x86_64 glibc uses `open`
+/// and `stat`, on aarch64 it uses `openat` and `newfstatat`, and the same array serves both.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
+    // ---- process / thread lifecycle ----
+    // `clone`/`clone3` are allowed *unconditionally*, which is this filter's one significant
+    // widening relative to Docker: Docker masks `clone`'s namespace-creation flags with an
+    // argument comparison and forces `clone3` to `ENOSYS` so glibc falls back to the masked
+    // `clone`. Reproducing that faithfully is possible for `clone` but pointless in isolation,
+    // and the card scopes this slice to a syscall-name allowlist. `unshare`/`setns`/`mount`/
+    // `pivot_root`/`chroot` all stay denied, so a new namespace stays largely inert.
+    "clone",
+    "clone3",
+    "fork",
+    "vfork",
+    "exit",
+    "exit_group",
+    "wait4",
+    "waitid",
+    "kill",
+    "tkill",
+    "tgkill",
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "rt_sigreturn",
+    "rt_sigsuspend",
+    "rt_sigpending",
+    "rt_sigtimedwait",
+    "rt_sigqueueinfo",
+    "rt_tgsigqueueinfo",
+    "sigaltstack",
+    // The kernel re-issues an interrupted, restartable syscall as `restart_syscall`; denying it
+    // would break every `sleep`/`read` that takes a signal.
+    "restart_syscall",
+    "pause",
+    "set_tid_address",
+    "set_robust_list",
+    "get_robust_list",
+    // glibc 2.35+ registers a restartable sequence on every thread start.
+    "rseq",
+    "prctl",
+    "arch_prctl",
+    "getpid",
+    "getppid",
+    "gettid",
+    "getpgrp",
+    "getpgid",
+    "setpgid",
+    "getsid",
+    "setsid",
+    "getpriority",
+    "setpriority",
+    "ioprio_get",
+    "ioprio_set",
+    "sched_yield",
+    "sched_getaffinity",
+    "sched_setaffinity",
+    "sched_getparam",
+    "sched_setparam",
+    "sched_getscheduler",
+    "sched_setscheduler",
+    "sched_getattr",
+    "sched_setattr",
+    "sched_get_priority_max",
+    "sched_get_priority_min",
+    "sched_rr_get_interval",
+    "getcpu",
+    "capget",
+    "capset",
+    "prlimit64",
+    "getrlimit",
+    "setrlimit",
+    "getrusage",
+    "getitimer",
+    "setitimer",
+    "times",
+    "uname",
+    "sysinfo",
+    // pidfd process handles: they only ever address a process the caller could already signal.
+    "pidfd_open",
+    "pidfd_send_signal",
+    // ---- memory ----
+    "mmap",
+    "munmap",
+    "mprotect",
+    "mremap",
+    "madvise",
+    "brk",
+    "mlock",
+    "mlock2",
+    "munlock",
+    "mlockall",
+    "munlockall",
+    "membarrier",
+    "msync",
+    "mincore",
+    "memfd_create",
+    "pkey_alloc",
+    "pkey_free",
+    "pkey_mprotect",
+    "shmget",
+    "shmat",
+    "shmdt",
+    "shmctl",
+    // ---- file I/O ----
+    "open",
+    "openat",
+    "openat2",
+    "creat",
+    "close",
+    "close_range",
+    "read",
+    "write",
+    "pread64",
+    "pwrite64",
+    "readv",
+    "writev",
+    "preadv",
+    "pwritev",
+    "preadv2",
+    "pwritev2",
+    "lseek",
+    "dup",
+    "dup2",
+    "dup3",
+    "fcntl",
+    "flock",
+    "fsync",
+    "fdatasync",
+    "sync",
+    "syncfs",
+    "sync_file_range",
+    "fadvise64",
+    "readahead",
+    "truncate",
+    "ftruncate",
+    "fallocate",
+    "stat",
+    "fstat",
+    "lstat",
+    "newfstatat",
+    "statx",
+    "access",
+    "faccessat",
+    "faccessat2",
+    "getdents",
+    "getdents64",
+    "getcwd",
+    "chdir",
+    "fchdir",
+    "mkdir",
+    "mkdirat",
+    "rmdir",
+    "unlink",
+    "unlinkat",
+    "rename",
+    "renameat",
+    "renameat2",
+    "link",
+    "linkat",
+    "symlink",
+    "symlinkat",
+    "readlink",
+    "readlinkat",
+    "chmod",
+    "fchmod",
+    "fchmodat",
+    // glibc 2.39+ reaches for `fchmodat2` first; it has no `EPERM` fallback path, only an
+    // `ENOSYS` one, so denying it would surface as a hard `chmod` failure.
+    "fchmodat2",
+    "chown",
+    "fchown",
+    "fchownat",
+    "lchown",
+    "umask",
+    "utime",
+    "utimes",
+    "utimensat",
+    "futimesat",
+    // `mknod`/`mknodat` are allowed at the syscall layer and denied where the actual escape
+    // lives: the Landlock workdir grant withholds `MakeChar`/`MakeBlock`/`MakeSock` (see
+    // `linux_enforce::WORKDIR_ACCESS_RIGHTS`) and the child drops `CAP_MKNOD` before execve.
+    "mknod",
+    "mknodat",
+    "sendfile",
+    "copy_file_range",
+    "splice",
+    "tee",
+    "vmsplice",
+    "ioctl",
+    "poll",
+    "ppoll",
+    "select",
+    "pselect6",
+    "epoll_create",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_wait",
+    "epoll_pwait",
+    "epoll_pwait2",
+    "eventfd",
+    "eventfd2",
+    "pipe",
+    "pipe2",
+    "inotify_init",
+    "inotify_init1",
+    "inotify_add_watch",
+    "inotify_rm_watch",
+    "signalfd",
+    "signalfd4",
+    "timerfd_create",
+    "timerfd_settime",
+    "timerfd_gettime",
+    "getxattr",
+    "lgetxattr",
+    "fgetxattr",
+    "setxattr",
+    "lsetxattr",
+    "fsetxattr",
+    "listxattr",
+    "llistxattr",
+    "flistxattr",
+    "removexattr",
+    "lremovexattr",
+    "fremovexattr",
+    "statfs",
+    "fstatfs",
+    // Harmless without its partner: `open_by_handle_at` (the syscall that turns a handle back
+    // into an open file, ignoring the path it was reached by) stays denied.
+    "name_to_handle_at",
+    // Legacy POSIX AIO. Unlike `io_uring` it operates only on already-open fds and performs no
+    // path resolution of its own, so it carries none of the LSM-bypass property that got the
+    // `io_uring_*` family denied.
+    "io_setup",
+    "io_destroy",
+    "io_submit",
+    "io_cancel",
+    "io_getevents",
+    // ---- sockets ----
+    // `socket` is NOT here (argument-conditional rules — see this array's doc comment), and
+    // neither are `connect`/`sendto` (notify rules).
+    "socketpair",
+    "bind",
+    "listen",
+    "accept",
+    "accept4",
+    "getsockname",
+    "getpeername",
+    "getsockopt",
+    "setsockopt",
+    "shutdown",
+    "sendmsg",
+    "sendmmsg",
+    "recvfrom",
+    "recvmsg",
+    "recvmmsg",
+    // ---- time ----
+    "clock_gettime",
+    "clock_getres",
+    "clock_nanosleep",
+    "nanosleep",
+    "gettimeofday",
+    "time",
+    "timer_create",
+    "timer_settime",
+    "timer_gettime",
+    "timer_getoverrun",
+    "timer_delete",
+    "alarm",
+    // ---- System V / POSIX IPC ----
+    "msgget",
+    "msgsnd",
+    "msgrcv",
+    "msgctl",
+    "semget",
+    "semop",
+    "semctl",
+    "semtimedop",
+    "mq_open",
+    "mq_unlink",
+    "mq_timedsend",
+    "mq_timedreceive",
+    "mq_notify",
+    "mq_getsetattr",
+    // ---- misc ----
+    "getrandom",
+    "futex",
+    "futex_waitv",
+    "getuid",
+    "geteuid",
+    "getgid",
+    "getegid",
+    "setuid",
+    "setgid",
+    "setreuid",
+    "setregid",
+    "setresuid",
+    "setresgid",
+    "getresuid",
+    "getresgid",
+    "getgroups",
+    "setgroups",
+    "setfsuid",
+    "setfsgid",
+];
+
+/// The syscalls that must **never** appear in [`SECCOMP_SYSCALL_ALLOWLIST`], with the reason each
+/// one is out. A `#[test]` asserts the two lists stay disjoint, so re-permitting one of these can
+/// only ever be a deliberate edit to *both* lists rather than an unnoticed line added to the
+/// allowlist while reconciling it against a newer upstream profile.
+///
+/// Three groups, and they are not equally negotiable:
+///
+///   1. **Named in the card's evidence table** — the ones a probe demonstrated were reachable on
+///      bare metal while Docker refused them: `io_uring_setup`/`io_uring_enter`/
+///      `io_uring_register` (historically bypasses LSM path hooks, so it is a candidate route
+///      around Landlock itself), `bpf`, `userfaultfd`, `perf_event_open`, `open_by_handle_at`,
+///      `keyctl`/`add_key`/`request_key`, `process_vm_readv`/`process_vm_writev`, and `ptrace`
+///      (which also has an availability dimension: a probe left wedged in `ptrace_stop` blocked
+///      `mur` in `futex_wait` for twenty minutes). Docker's default profile actually *allows*
+///      `ptrace`/`process_vm_readv`/`process_vm_writev` on kernels ≥ 4.8; this filter is
+///      deliberately stricter there.
+///   2. **Privileged / host-state operations** with no shell-toolchain use case: namespace and
+///      mount manipulation, module loading, reboot, swap, accounting, quota, raw port I/O,
+///      clock setting, NUMA policy, `fanotify`.
+///   3. **Denied instead of argument-conditioned.** Docker allows these only for specific
+///      argument values, which a per-syscall-name allowlist cannot express and which would
+///      otherwise have to be routed through the notify supervisor (out of scope for this slice).
+///      Omitting them outright costs nothing, because nothing in bash, coreutils, git, or a
+///      standard compiler/interpreter toolchain needs them: `personality`, `kcmp`, `seccomp`
+///      itself (a nested filter cannot loosen this one, but it can slow it down for no benefit).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const SECCOMP_MUST_STAY_DENIED: &[&str] = &[
+    // 1. the card's evidence table
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "bpf",
+    "userfaultfd",
+    "perf_event_open",
+    "process_vm_readv",
+    "process_vm_writev",
+    "open_by_handle_at",
+    "keyctl",
+    "add_key",
+    "request_key",
+    "ptrace",
+    // 2. privileged / host-state
+    "mount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "unshare",
+    "setns",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "kexec_load",
+    "kexec_file_load",
+    "reboot",
+    "swapon",
+    "swapoff",
+    "acct",
+    "quotactl",
+    "nfsservctl",
+    "iopl",
+    "ioperm",
+    "vm86",
+    "vm86old",
+    "_sysctl",
+    "sysfs",
+    "uselib",
+    "create_module",
+    "get_kernel_syms",
+    "query_module",
+    "lookup_dcookie",
+    "clock_adjtime",
+    "clock_settime",
+    "settimeofday",
+    "stime",
+    "adjtimex",
+    "set_mempolicy",
+    "get_mempolicy",
+    "mbind",
+    "migrate_pages",
+    "move_pages",
+    "fanotify_init",
+    "fanotify_mark",
+    // 3. denied instead of argument-conditioned
+    "seccomp",
+    "personality",
+    "kcmp",
+];
 
 // The bytes handed to `parse_sockaddr_ip` always come from a *Linux* child's memory (the
 // seccomp-notify supervisor is Linux-only), so the address-family constants and struct
@@ -828,7 +1294,10 @@ derived read+execute scope outside the workdir (the allowlisted binaries, their 
 shared libraries — nothing writable, no directory granted wholesale). The workdir's own grant also \
 withholds device-node and unix-socket creation; seccomp refuses socket(AF_UNIX) outright unless \
 capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET, so a \
-capsule cannot reach a host daemon socket such as /var/run/docker.sock; and the forked shell child \
+capsule cannot reach a host daemon socket such as /var/run/docker.sock; the seccomp filter now \
+defaults to deny and permits only a fixed syscall allowlist modelled on the OCI/Docker default \
+profile, so io_uring, bpf, userfaultfd, perf_event_open, ptrace and similar are refused outright; \
+and the forked shell child \
 drops every Linux capability and sets no_new_privs before execve — but this mechanism has not yet \
 been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
 isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
@@ -839,7 +1308,9 @@ kernel-enforced at all, and the seccomp exec/network enforcement that would appl
 verified on real Linux hardware. Seccomp also refuses socket(AF_UNIX) unless \
 capabilities.network.unix_sockets is declared, and always refuses AF_NETLINK/AF_PACKET — that \
 rule needs no Landlock and so applies identically on this tier, but it has not been verified \
-either. The forked shell child still drops every Linux capability and \
+either. The same is true of the default-deny syscall allowlist (modelled on the OCI/Docker default \
+profile), which refuses io_uring, bpf, userfaultfd, perf_event_open, ptrace and similar on this \
+tier too. The forked shell child still drops every Linux capability and \
 sets no_new_privs before execve on this tier, independently of Landlock, but that has not been \
 verified either. Treat shell subprocess isolation as experimental on this host.";
 
@@ -1537,6 +2008,20 @@ mod linux_enforce {
         }
     }
 
+    /// The Landlock syscalls the child still has to make after its seccomp filter is loaded, each
+    /// with the syscall number to fall back on when this host's libseccomp is too old to resolve
+    /// the name (they were added in libseccomp 2.5.4; Ubuntu 22.04 ships 2.5.3 on a kernel that
+    /// does support Landlock, so this is a real combination, not a hypothetical one).
+    ///
+    /// Linux assigned these numbers uniformly across architectures in 5.13 — 444/445/446 on
+    /// x86_64, aarch64 and every other arch with Landlock — so a single number per name is
+    /// correct for all of them, unlike the legacy syscalls where numbers diverge per arch.
+    const LANDLOCK_SYSCALLS: [(&str, i32); 3] = [
+        ("landlock_create_ruleset", 444),
+        ("landlock_add_rule", 445),
+        ("landlock_restrict_self", 446),
+    ];
+
     /// Builds and loads the child's seccomp filter, then hands its notify fd to the parent.
     ///
     /// Two independent mechanisms live in this one filter, and they are deliberately not the
@@ -1552,9 +2037,42 @@ mod linux_enforce {
     ///     supervisor round-trip happens, and no memory of another task is read. That is what
     ///     makes it structurally immune to the pointer-read TOCTOU concerns that apply to the
     ///     notify rules above, and why it is a hard deny rather than a supervisor decision.
+    ///
+    /// Around both of those sits the filter's **default action**, which is a deny
+    /// (`Errno(EPERM)`): a syscall named by neither [`super::SECCOMP_SYSCALL_ALLOWLIST`] nor a
+    /// rule here is refused, without any argument being inspected. That is what makes
+    /// `io_uring_setup`, `bpf`, `userfaultfd`, `perf_event_open`, `ptrace` and the rest of
+    /// [`super::SECCOMP_MUST_STAY_DENIED`] unreachable — they are simply absent, not
+    /// argument-matched.
     fn install_seccomp_filter(child_sock_fd: RawFd, unix_sockets_allowed: bool) -> io::Result<()> {
-        let mut filter = libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Allow)
-            .map_err(to_io_err)?;
+        // Default-deny. `EPERM` matches what the OCI/Docker default profile returns for a syscall
+        // outside its allowlist, and is deliberately a *different* errno from the `EACCES` that
+        // `classify_and_decide` and the `socket()` domain rules return: `EACCES` means "the
+        // sandbox looked at this call's arguments and refused it", `EPERM` means "this syscall is
+        // not part of the capsule's syscall surface at all". Keeping them distinct is what lets
+        // an operator tell an unmediated-surface problem from a policy decision.
+        let mut filter =
+            libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Errno(libc::EPERM))
+                .map_err(to_io_err)?;
+
+        // Ask the kernel to record every action this filter takes that is not `Allow` in the
+        // audit trail, so a denial is attributable after the fact to a syscall number, pid and
+        // comm. The denied process itself still observes nothing but `EPERM` — `SECCOMP_RET_ERRNO`
+        // has no channel for anything richer — so this is the only way an operator debugging a
+        // workload that dies on an unexpected denial gets a syscall name to look at.
+        //
+        // Best-effort on purpose, and the one place in this function where an error is swallowed:
+        // `SCMP_FLTATR_CTL_LOG` needs libseccomp API level 3 (libseccomp 2.4.0+), and the crate
+        // reports an older runtime library as an error here. That is a *diagnosability* shortfall,
+        // not an enforcement one — the default-deny action and every rule below are unaffected —
+        // and turning it into a hard failure would take a host with an old libseccomp from
+        // "denials are logged less legibly" to "no capsule can spawn a shell at all".
+        //
+        // Setting the attribute is necessary but not sufficient: the kernel only logs an action
+        // whose type also appears in `/proc/sys/kernel/seccomp/actions_logged`, which is host
+        // configuration this process does not control. `SECCOMP_ALLOWLIST_VERIFICATION.md` at the
+        // workspace root carries the check and what to do when `errno` is absent from that list.
+        let _ = filter.set_ctl_log(true);
 
         for name in ["execve", "execveat", "connect", "sendto"] {
             let syscall = libseccomp::ScmpSyscall::from_name(name).map_err(to_io_err)?;
@@ -1589,6 +2107,71 @@ mod linux_enforce {
                         domain as u64,
                     )],
                 )
+                .map_err(to_io_err)?;
+        }
+
+        // The permitted domains need positive rules of their own now that the filter's default is
+        // a deny — without them `socket()` would be refused for every family, IP included.
+        //
+        // Equality rules per allowed domain, and NOT one unconditional `Allow` rule for `socket`:
+        // libseccomp resolves an unconditional rule for a syscall by *discarding* every
+        // argument-conditional chain already recorded for it (`db.c`: "syscall exists with chains
+        // but the new filter has no chains so we need to clear the existing chains"), so a broad
+        // `Allow` here would silently delete the AF_UNIX/AF_NETLINK/AF_PACKET denials directly
+        // above and reopen the `/var/run/docker.sock` path they exist to close. containerd's
+        // default profile carries the same warning against combining a broad `socket` allow with
+        // explicit errno rules, and works around it the same way — with argument-matched rules
+        // only. The two domain sets are disjoint by construction (a test pins that), so no
+        // `socket()` call can match both an allow and a deny rule.
+        for domain in super::allowed_socket_domains(unix_sockets_allowed) {
+            filter
+                .add_rule_conditional(
+                    libseccomp::ScmpAction::Allow,
+                    socket_syscall,
+                    &[libseccomp::ScmpArgCompare::new(
+                        0,
+                        libseccomp::ScmpCompareOp::Equal,
+                        domain as u64,
+                    )],
+                )
+                .map_err(to_io_err)?;
+        }
+
+        // The allowlist proper. Two failure modes are both handled by skipping the name:
+        //
+        //   - `from_name` fails when this host's libseccomp does not know the syscall (a name
+        //     newer than the installed library);
+        //   - `add_rule` fails with `EDOM` when the name resolves to a pseudo-syscall that does
+        //     not exist on this architecture — every legacy x86_64 spelling in the array
+        //     (`open`, `dup2`, `poll`, `stat`, ...) hits this on aarch64.
+        //
+        // Skipping is fail-closed: a name that gets no rule stays denied by the default action,
+        // so the filter can only ever come out *narrower* than intended, never wider. Propagating
+        // instead would abort every single spawn on the first arch-specific name, which is why
+        // this is the deliberate exception to the module's otherwise-strict error handling.
+        for name in super::SECCOMP_SYSCALL_ALLOWLIST {
+            if let Ok(syscall) = libseccomp::ScmpSyscall::from_name(name) {
+                let _ = filter.add_rule(libseccomp::ScmpAction::Allow, syscall);
+            }
+        }
+
+        // Landlock's three syscalls, which `child_install_enforcement` calls *after* this filter
+        // is loaded (`apply_landlock_scope`, on `KernelFull`). Without these rules the default
+        // deny would refuse the child's own filesystem scoping and abort every spawn on that
+        // tier. Allowing them costs nothing: a Landlock domain can only ever narrow the process
+        // that installs it, never widen it, and Docker's default profile allows them too.
+        //
+        // Resolved by name where possible, with the syscall number as a fallback, because these
+        // names only became known to libseccomp in 2.5.4 — the "skip what does not resolve"
+        // policy above would silently turn an older libseccomp into "no capsule can run a shell
+        // on a Landlock-capable host". The numbers are the same on every architecture Linux has
+        // added Landlock to (they were assigned after the syscall-number unification), so the
+        // fallback is not architecture-specific.
+        for (name, fallback_nr) in LANDLOCK_SYSCALLS {
+            let syscall = libseccomp::ScmpSyscall::from_name(name)
+                .unwrap_or_else(|_| libseccomp::ScmpSyscall::from(fallback_nr));
+            filter
+                .add_rule(libseccomp::ScmpAction::Allow, syscall)
                 .map_err(to_io_err)?;
         }
 
@@ -2766,8 +3349,6 @@ mod tests {
     /// path against `capabilities.network.allow`, never by a domain-level deny.
     #[test]
     fn denied_socket_domains_never_denies_ip_families() {
-        const LINUX_AF_INET_DOMAIN: i32 = 2;
-        const LINUX_AF_INET6_DOMAIN: i32 = 10;
         for unix_sockets_allowed in [false, true] {
             let denied = denied_socket_domains(unix_sockets_allowed);
             assert!(!denied.contains(&LINUX_AF_INET_DOMAIN));
@@ -2800,6 +3381,115 @@ mod tests {
         assert_eq!(LINUX_AF_UNIX, libc::AF_UNIX);
         assert_eq!(LINUX_AF_NETLINK, libc::AF_NETLINK);
         assert_eq!(LINUX_AF_PACKET, libc::AF_PACKET);
+        assert_eq!(LINUX_AF_INET_DOMAIN, libc::AF_INET);
+        assert_eq!(LINUX_AF_INET6_DOMAIN, libc::AF_INET6);
+    }
+
+    /// The allow and deny domain sets feed two rule loops on the *same* syscall and argument, so
+    /// an overlap would mean one `socket()` call matching both an `Allow` and an `Errno` rule —
+    /// a filter whose behavior depends on libseccomp's internal rule ordering rather than on
+    /// anything stated here.
+    #[test]
+    fn socket_domain_allow_and_deny_sets_never_overlap() {
+        for unix_sockets_allowed in [false, true] {
+            let denied = denied_socket_domains(unix_sockets_allowed);
+            for domain in allowed_socket_domains(unix_sockets_allowed) {
+                assert!(
+                    !denied.contains(&domain),
+                    "socket domain {domain} is both allowed and denied \
+                     (unix_sockets_allowed = {unix_sockets_allowed})"
+                );
+            }
+        }
+    }
+
+    /// `capabilities.network.unix_sockets` is the only manifest key either set consults, and it
+    /// must move `AF_UNIX` from one set to the other — never leave it in neither, which under a
+    /// default-deny filter would silently keep unix sockets refused even after a capsule declared
+    /// the capability.
+    #[test]
+    fn allowed_socket_domains_takes_unix_back_exactly_when_declared() {
+        assert_eq!(
+            allowed_socket_domains(false),
+            vec![LINUX_AF_INET_DOMAIN, LINUX_AF_INET6_DOMAIN]
+        );
+        assert_eq!(
+            allowed_socket_domains(true),
+            vec![LINUX_AF_INET_DOMAIN, LINUX_AF_INET6_DOMAIN, LINUX_AF_UNIX]
+        );
+    }
+
+    // ---- `SECCOMP_SYSCALL_ALLOWLIST` -------------------------------------------------------
+    //
+    // Same category as the `denied_socket_domains` tests above: *content* checks on a
+    // hand-authored constant list. Nothing here — and no green CI run — is evidence that any
+    // kernel refuses `io_uring_setup` on a real host; CI never resolves to a kernel enforcement
+    // tier, so a green suite has repeatedly meant nothing for this module. The claim that these
+    // syscalls are actually denied is verified only by the manual procedure in
+    // `SECCOMP_ALLOWLIST_VERIFICATION.md`, on real bare-metal Linux hardware. What these tests
+    // *do* buy is that re-permitting one of the dangerous syscalls cannot happen by accident
+    // while reconciling the allowlist against a newer upstream profile.
+
+    #[test]
+    fn allowlist_contains_no_syscall_that_must_stay_denied() {
+        for name in SECCOMP_MUST_STAY_DENIED {
+            assert!(
+                !SECCOMP_SYSCALL_ALLOWLIST.contains(name),
+                "{name} is in SECCOMP_MUST_STAY_DENIED but was added to \
+                 SECCOMP_SYSCALL_ALLOWLIST — if this is deliberate, remove it from the deny list \
+                 in the same edit and say why in the commit"
+            );
+        }
+    }
+
+    /// The four notify syscalls are decided by `classify_and_decide` on their argument *contents*.
+    /// A plain `Allow` rule for any of them would take that decision away from the supervisor
+    /// entirely — exec identity matching and the network allowlist would both stop applying.
+    #[test]
+    fn allowlist_excludes_the_notify_syscalls() {
+        for name in ["execve", "execveat", "connect", "sendto"] {
+            assert!(
+                !SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
+                "{name} is decided by the notify supervisor; a plain Allow rule would bypass it"
+            );
+        }
+    }
+
+    /// `socket` carries argument-conditional rules, and libseccomp resolves an unconditional rule
+    /// for a syscall by discarding every conditional chain already recorded for it. A bare
+    /// `"socket"` in the allowlist array would therefore delete the AF_UNIX/AF_NETLINK/AF_PACKET
+    /// denials at filter-build time, with nothing at runtime to show for it.
+    #[test]
+    fn allowlist_excludes_socket_which_is_ruled_on_by_domain() {
+        assert!(
+            !SECCOMP_SYSCALL_ALLOWLIST.contains(&"socket"),
+            "socket must be permitted per-domain by allowed_socket_domains, never unconditionally"
+        );
+    }
+
+    /// A duplicate is harmless to the kernel but means two edits disagree about the same syscall,
+    /// which is exactly the state where one of them later gets removed and the other is missed.
+    #[test]
+    fn allowlist_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in SECCOMP_SYSCALL_ALLOWLIST {
+            assert!(seen.insert(*name), "{name} appears twice in the allowlist");
+        }
+    }
+
+    /// The whole design is an allowlist. An empty (or near-empty) array would still compile and
+    /// still "pass" every other test here, while denying every syscall a shell needs.
+    #[test]
+    fn allowlist_covers_the_syscalls_no_process_can_run_without() {
+        for name in [
+            "read", "write", "openat", "close", "mmap", "munmap", "brk", "exit_group", "futex",
+            "rt_sigreturn", "clone", "wait4", "getpid", "getdents64",
+        ] {
+            assert!(
+                SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
+                "{name} is missing from the allowlist — no process could run under this filter"
+            );
+        }
     }
 
     #[test]
