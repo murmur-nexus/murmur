@@ -817,7 +817,16 @@ pub(crate) fn warn_for_enforcement_tier(tier: EnforcementTier, workdir: &Path, p
 pub(crate) enum SupervisorHandle {
     Noop,
     #[cfg(target_os = "linux")]
-    Linux(std::sync::mpsc::Receiver<()>),
+    Linux {
+        done_rx: std::sync::mpsc::Receiver<()>,
+        /// Read end of the `CLOEXEC` diagnostic pipe whose write end was moved into the forked
+        /// child's `pre_exec` closure. On a successful `execve` the write end closes
+        /// automatically with nothing written (so a read yields immediate EOF); on a `pre_exec`
+        /// setup failure the child writes the real error message here before returning `Err`,
+        /// letting `execute_shell` fold that legible detail into the error it returns instead of
+        /// the bare, undifferentiated `EINVAL` that `Command::spawn()` surfaces.
+        diag_read: std::os::fd::OwnedFd,
+    },
 }
 
 impl SupervisorHandle {
@@ -830,12 +839,35 @@ impl SupervisorHandle {
         match self {
             SupervisorHandle::Noop => {}
             #[cfg(target_os = "linux")]
-            SupervisorHandle::Linux(done_rx) => {
+            SupervisorHandle::Linux { done_rx, .. } => {
                 let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
                 // Deliberately not joining the underlying `JoinHandle`: dropping it without
                 // joining leaves the thread detached (it keeps running to completion in the
                 // background, reclaimed by the OS on exit), which is fine here since the
                 // `done_rx` signal above already tells us the loop returned.
+            }
+        }
+    }
+
+    /// Best-effort read of any failure detail the forked child wrote to the diagnostic pipe
+    /// before its `pre_exec` closure returned `Err`. Only consulted by `execute_shell` when
+    /// `Command::spawn()` itself returns `Err` — on the success path this is never called, so
+    /// there is zero cost there.
+    ///
+    /// The caller must have already released every *parent-side* copy of the pipe's write end
+    /// (the one captured by the `pre_exec` closure stored in the `Command`) — otherwise the
+    /// read below never sees EOF. `execute_shell` guarantees this by dropping the `Command`
+    /// before calling this. Returns `None` when there is no pipe (the `Noop` handle used for
+    /// `EnvironmentOnly`/non-Linux) or when the child wrote nothing (e.g. a failure with no
+    /// message, or a `spawn` failure that never ran `pre_exec` at all, like `fork()` itself
+    /// failing).
+    pub(crate) fn read_diagnostic(&self) -> Option<String> {
+        match self {
+            SupervisorHandle::Noop => None,
+            #[cfg(target_os = "linux")]
+            SupervisorHandle::Linux { diag_read, .. } => {
+                use std::os::fd::AsRawFd;
+                linux_enforce::read_diagnostic_pipe(diag_read.as_raw_fd())
             }
         }
     }
@@ -859,6 +891,22 @@ fn forced_prepare_failure() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+// Child-side (`pre_exec`) forced-failure seams, one per distinct setup step this slice can fail
+// independently: the explicit `no_new_privs` `prctl` and the Landlock ruleset construction.
+// Unlike `FORCE_PREPARE_FAILURE` (which fails the *outer*, pre-fork `prepare_enforcement` path),
+// these are read from inside the forked child's `pre_exec` closure — `fork()` copy-on-write
+// duplicates the calling thread's TLS block, so a flag set `true` in the parent thread before
+// `command.spawn()` remains readable as `true` inside `pre_exec` with no cross-process IPC.
+// Only compiled into Linux test builds (their only readers — `set_no_new_privs` and
+// `apply_landlock_scope` — are Linux-only); production has no bypass or injection point.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    pub(crate) static FORCE_NO_NEW_PRIVS_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_LANDLOCK_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Installs kernel-level exec/network/filesystem enforcement into `command` so it applies to
@@ -902,6 +950,21 @@ pub(crate) fn prepare_enforcement(
         return Ok(SupervisorHandle::Noop);
     }
 
+    // Resolve/open every Landlock path in the PARENT, before fork(). Failing to open the workdir
+    // is a normal synchronous error here — it names the path and returns before any subprocess is
+    // spawned — rather than an `open()` that, buried inside `pre_exec`, would collapse to a bare
+    // EINVAL at the `.spawn()` call site. Grant paths that fail to open are silently dropped
+    // (shrink-not-fail), exactly as before; only the *where* of the open moved. Landlock rules
+    // only apply on `KernelFull`, so `KernelSeccompOnly` opens nothing.
+    let landlock_fds = if enforcement.tier == EnforcementTier::KernelFull {
+        Some(linux_enforce::open_landlock_fds(
+            workdir,
+            &enforcement.landlock_grants,
+        )?)
+    } else {
+        None
+    };
+
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a 2-element stack array, exactly the size `socketpair` writes into;
     // no other precondition applies.
@@ -928,31 +991,51 @@ pub(crate) fn prepare_enforcement(
         )
     };
 
+    // Dedicated CLOEXEC pipe carrying failure detail out of the child. The write end is moved
+    // into the `pre_exec` closure; because it is CLOEXEC, a successful `execve` closes it with
+    // nothing written (the parent's read then returns immediate EOF — zero cost on the success
+    // path), while any `pre_exec` setup failure writes its real message here before the closure
+    // returns `Err`. Raw `pipe2` mirrors the raw `socketpair` convention used just above.
+    let mut diag_fds = [0i32; 2];
+    // SAFETY: `diag_fds` is a 2-element stack array, exactly the size `pipe2` writes into; no
+    // other precondition applies.
+    let rc = unsafe { libc::pipe2(diag_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(format!(
+            "sandbox: pipe2() for enforcement diagnostics failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: both fds were just returned by the successful pipe2() call above; nothing else has
+    // taken ownership of them yet, so wrapping them in OwnedFd is exclusive/sound.
+    let (diag_read, diag_write) = unsafe {
+        (
+            OwnedFd::from_raw_fd(diag_fds[0]),
+            OwnedFd::from_raw_fd(diag_fds[1]),
+        )
+    };
+
     let tier = enforcement.tier;
-    let workdir_for_child = workdir.to_path_buf();
-    // Derived read+execute grant set, computed in the parent (all parsing/resolution already done
-    // by `resolve_landlock_grants`/`resolve_interpreter_runtime_grants`) and moved into the closure
-    // so the child only opens each path and adds a Landlock rule — no parsing in the
-    // async-signal-safe `pre_exec` window.
-    let landlock_grants_for_child = enforcement.landlock_grants.clone();
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
-    // narrow pre_exec window where only async-signal-safe operations are permitted. It only
-    // performs libseccomp filter construction/load (kernel syscalls), one `sendmsg` call to
-    // hand the notify fd to the parent over `child_sock`, and (KernelFull only) Landlock
-    // ruleset construction/`restrict_self` (also kernel syscalls) — no locks are taken beyond
-    // what those syscalls themselves need. `child_sock` is moved in and closes automatically
-    // when the closure body finishes, i.e. after it has already handed the notify fd to the
-    // parent.
+    // narrow pre_exec window where only async-signal-safe operations are permitted. It performs
+    // the explicit `no_new_privs` `prctl`, libseccomp filter construction/load (kernel syscalls),
+    // one `sendmsg` call to hand the notify fd to the parent over `child_sock`, and (KernelFull
+    // only) Landlock ruleset construction/`restrict_self` against already-open fds (also kernel
+    // syscalls) — no `open()`/`canonicalize()`, no locks beyond what those syscalls need. On any
+    // failure it writes the real error message to the CLOEXEC diagnostic pipe (best-effort,
+    // bounded, raw `write` loop) before returning `Err`. `child_sock`, `diag_write`, and the
+    // Landlock fds are moved in and close automatically when the closure body finishes.
     unsafe {
         command.pre_exec(move || {
-            let fd = child_sock.as_raw_fd();
-            linux_enforce::child_install_enforcement(
-                tier,
-                &workdir_for_child,
-                &landlock_grants_for_child,
-                fd,
-            )
+            let sock_fd = child_sock.as_raw_fd();
+            match linux_enforce::child_install_enforcement(tier, landlock_fds.as_ref(), sock_fd) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
+                    Err(error)
+                }
+            }
         });
     }
 
@@ -962,6 +1045,7 @@ pub(crate) fn prepare_enforcement(
         parent_sock,
         enforcement.exec_allow_paths.clone(),
         enforcement.network_allow_ips.clone(),
+        diag_read,
     ))
 }
 
@@ -977,12 +1061,34 @@ pub(crate) fn prepare_enforcement(
 mod linux_enforce {
     use std::io;
     use std::net::IpAddr;
-    use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
 
     use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
     use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
+
+    /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
+    /// naming the failed step is far shorter than this; the bound just keeps the best-effort
+    /// `write`/`read` loops trivially terminating.
+    const MAX_DIAG_LEN: usize = 1024;
+
+    /// One Landlock grant path, opened (`O_PATH | O_CLOEXEC`) in the PARENT before fork(), paired
+    /// with the `list_dir` bit that decides whether its rule also carries `ReadDir`. Only the
+    /// already-open fd crosses into the child's `pre_exec` — never a path to re-open there.
+    pub(super) struct OpenLandlockGrant {
+        fd: OwnedFd,
+        list_dir: bool,
+    }
+
+    /// All Landlock file descriptors resolved in the parent for one shell subprocess: the
+    /// workdir's fd (full-access rule) plus each successfully-opened grant fd. Handed by
+    /// reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules against
+    /// these fds without performing a single `open()`.
+    pub(super) struct LandlockChildFds {
+        workdir_fd: OwnedFd,
+        grants: Vec<OpenLandlockGrant>,
+    }
 
     enum Decision {
         Allow,
@@ -1037,18 +1143,49 @@ mod linux_enforce {
     /// — the fail-closed path for setup failures that happen after fork.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
-        workdir: &Path,
-        landlock_grants: &[LandlockGrant],
+        landlock_fds: Option<&LandlockChildFds>,
         child_sock_fd: RawFd,
     ) -> io::Result<()> {
+        // Explicitly opt out of gaining privileges via any later `execve` — required for both the
+        // seccomp filter load below (without CAP_SYS_ADMIN) and Landlock's `restrict_self`, so
+        // neither depends implicitly on libseccomp's `SCMP_FLTATR_CTL_NNP` default. Set first so a
+        // failure here is its own distinct, fail-closed error path before any filter is installed.
+        set_no_new_privs()?;
+
         install_seccomp_filter(child_sock_fd)?;
 
         if tier == EnforcementTier::KernelFull {
-            apply_landlock_scope(workdir, landlock_grants)
-                .map_err(|error| io::Error::other(error))?;
+            if let Some(fds) = landlock_fds {
+                apply_landlock_scope(fds).map_err(io::Error::other)?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Sets `PR_SET_NO_NEW_PRIVS` for the forked child, before any seccomp/Landlock call. Same
+    /// call convention and fail-closed style as `security::harden_process_dumpable`'s
+    /// `PR_SET_DUMPABLE` `prctl`, but a different call site and lifetime: this is per-shell-
+    /// subprocess, inside `pre_exec`, not the once-at-`main()` whole-process hardening.
+    #[allow(unsafe_code)]
+    fn set_no_new_privs() -> io::Result<()> {
+        #[cfg(test)]
+        if super::FORCE_NO_NEW_PRIVS_FAILURE.with(|flag| flag.get()) {
+            return Err(io::Error::other(
+                "sandbox: no_new_privs (prctl PR_SET_NO_NEW_PRIVS, 1) failed (forced by test seam)",
+            ));
+        }
+        // SAFETY: PR_SET_NO_NEW_PRIVS takes a single int argument (1) and has no pointer/lifetime
+        // requirements; the trailing 0 args are ignored by prctl's variadic C signature.
+        let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "sandbox: prctl(PR_SET_NO_NEW_PRIVS, 1) failed: {}",
+                io::Error::last_os_error()
+            )))
+        }
     }
 
     fn install_seccomp_filter(child_sock_fd: RawFd) -> io::Result<()> {
@@ -1120,12 +1257,16 @@ mod linux_enforce {
     /// (shrink-not-fail, matching `resolve_exec_allowlist`) rather than failing the whole scope —
     /// it only narrows what is allowed. A genuine ruleset-construction failure still returns `Err`,
     /// preserving the module's fail-closed invariant.
-    fn apply_landlock_scope(
-        workdir: &Path,
-        landlock_grants: &[LandlockGrant],
-    ) -> Result<(), String> {
+    fn apply_landlock_scope(fds: &LandlockChildFds) -> Result<(), String> {
+        #[cfg(test)]
+        if super::FORCE_LANDLOCK_FAILURE.with(|flag| flag.get()) {
+            return Err(
+                "landlock: ruleset construction failed (forced by test seam)".to_string(),
+            );
+        }
+
         use landlock::{
-            Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
+            Access, AccessFs, Compatible, CompatLevel, PathBeneath, Ruleset, RulesetAttr,
             RulesetCreatedAttr, ABI,
         };
 
@@ -1138,45 +1279,30 @@ mod linux_enforce {
         // Adds enumerability (`getdents64`) — only for a grant whose author set `list_dir: true`.
         let read_execute_list = read_execute | AccessFs::ReadDir;
 
-        let workdir_fd = PathFd::new(workdir).map_err(|error| {
-            format!(
-                "landlock: failed to open workdir {} for scoping: {error}",
-                workdir.display()
-            )
-        })?;
-
+        // Every fd here was already opened in the parent (before fork). This function performs no
+        // `open()`/`canonicalize()` — only the Landlock ruleset syscalls against already-open fds,
+        // so a failure here can only be the kernel call itself, not an unrelated path resolution.
         let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(access_all)
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
-            .add_rule(PathBeneath::new(workdir_fd, access_all))
+            .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), access_all))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
 
-        for grant in landlock_grants {
-            // A grant path that no longer opens (e.g. a library resolved a moment ago in the
-            // parent that has since vanished, or an `interpreter_runtime` directory that is not
-            // present on this host) is skipped, not fatal — it only shrinks the allow set. A rule
-            // that fails to add with a valid fd is a genuine construction failure and still
-            // propagates as `Err` (fail-closed).
-            let grant_fd = match PathFd::new(&grant.path) {
-                Ok(fd) => fd,
-                Err(_) => continue,
-            };
+        for grant in &fds.grants {
+            // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
+            // so every fd reaching here is valid. A rule that still fails to add is a genuine
+            // ruleset-construction failure and propagates as `Err` (fail-closed).
             let access = if grant.list_dir {
                 read_execute_list
             } else {
                 read_execute
             };
             ruleset = ruleset
-                .add_rule(PathBeneath::new(grant_fd, access))
-                .map_err(|error| {
-                    format!(
-                        "landlock: add_rule for grant {} failed: {error}",
-                        grant.path.display()
-                    )
-                })?;
+                .add_rule(PathBeneath::new(grant.fd.as_fd(), access))
+                .map_err(|error| format!("landlock: add_rule for grant failed: {error}"))?;
         }
 
         ruleset
@@ -1184,6 +1310,119 @@ mod linux_enforce {
             .map_err(|error| format!("landlock: restrict_self failed: {error}"))?;
 
         Ok(())
+    }
+
+    /// Opens (in the PARENT, before fork) the workdir fd and every grant fd Landlock needs, using
+    /// `O_PATH | O_CLOEXEC` — the exact flags `landlock::PathFd` uses. Moving these `open()` calls
+    /// out of the child's `pre_exec` window is the whole point: a workdir that cannot be resolved
+    /// now fails here, synchronously, with a message naming the path — before any subprocess is
+    /// spawned — instead of collapsing to a bare EINVAL inside `pre_exec`. A grant path that fails
+    /// to open is dropped (shrink-not-fail), matching the previous per-grant `continue`.
+    pub(super) fn open_landlock_fds(
+        workdir: &Path,
+        landlock_grants: &[LandlockGrant],
+    ) -> Result<LandlockChildFds, String> {
+        let workdir_fd = open_o_path(workdir).map_err(|error| {
+            format!(
+                "sandbox: failed to open workdir {} for Landlock scoping: {error}",
+                workdir.display()
+            )
+        })?;
+
+        let mut grants = Vec::with_capacity(landlock_grants.len());
+        for grant in landlock_grants {
+            match open_o_path(&grant.path) {
+                Ok(fd) => grants.push(OpenLandlockGrant {
+                    fd,
+                    list_dir: grant.list_dir,
+                }),
+                Err(_) => continue,
+            }
+        }
+
+        Ok(LandlockChildFds { workdir_fd, grants })
+    }
+
+    /// Opens `path` with `O_PATH | O_CLOEXEC` (identity/lifetime handle only, never a data fd),
+    /// returning an `OwnedFd` suitable for `landlock::PathBeneath`. Same open the vendored
+    /// `landlock::PathFd::new` performs, done in the parent so the resulting fd can be moved into
+    /// the child's `pre_exec` closure.
+    fn open_o_path(path: &Path) -> io::Result<OwnedFd> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(OwnedFd::from(file))
+    }
+
+    /// Best-effort write of a bounded failure message to the child-diagnostic pipe from inside
+    /// `pre_exec`, using a raw `write` loop (allocation for the message itself already happened
+    /// upstream — `child_install_enforcement`'s error paths use `format!`). Never fails the caller:
+    /// a lost diagnostic only costs legibility, never the fail-closed guarantee (the closure still
+    /// returns `Err`, so `execve` is still aborted).
+    #[allow(unsafe_code)]
+    pub(super) fn write_diagnostic(fd: RawFd, message: &str) {
+        let bytes = message.as_bytes();
+        let len = bytes.len().min(MAX_DIAG_LEN);
+        let mut written = 0;
+        while written < len {
+            // SAFETY: `fd` is the valid, open write end of the diagnostic pipe; the pointer/len
+            // name a live sub-slice of `bytes` for the duration of this single `write` call.
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    bytes[written..len].as_ptr() as *const libc::c_void,
+                    len - written,
+                )
+            };
+            if n < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            written += n as usize;
+        }
+    }
+
+    /// Parent-side read of whatever the child wrote to the diagnostic pipe before its `pre_exec`
+    /// closure returned `Err`. Blocks until EOF, which arrives once every write end is closed —
+    /// the child's (on `_exit`) and the parent's captured copy (which `execute_shell` drops before
+    /// calling this). Returns `None` when nothing was written (the success-path EOF, or a `spawn`
+    /// failure that never ran `pre_exec`).
+    #[allow(unsafe_code)]
+    pub(super) fn read_diagnostic_pipe(fd: RawFd) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            // SAFETY: `fd` is the valid, open read end of the diagnostic pipe; `chunk` is a live
+            // stack buffer of exactly the length passed.
+            let n = unsafe {
+                libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
+            };
+            if n < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+            if buf.len() >= MAX_DIAG_LEN {
+                break;
+            }
+        }
+        if buf.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        }
     }
 
     /// Sends one fd (`fd_to_send`) over an already-connected `SOCK_DGRAM` unix socket
@@ -1281,6 +1520,7 @@ mod linux_enforce {
         parent_sock: OwnedFd,
         exec_allow: Vec<PathBuf>,
         network_allow_ips: Vec<IpAddr>,
+        diag_read: OwnedFd,
     ) -> SupervisorHandle {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
@@ -1297,7 +1537,7 @@ mod linux_enforce {
             drop(done_tx);
         });
 
-        SupervisorHandle::Linux(done_rx)
+        SupervisorHandle::Linux { done_rx, diag_read }
     }
 
     /// Reads and responds to notify requests until the notify fd errors/EOFs — which happens
@@ -2841,5 +3081,173 @@ mod linux_integration_tests {
             list_parent.exit_code, 0,
             "a grant on stdlib/ must not make its (ungranted) parent enumerable"
         );
+    }
+
+    // ---- slice ebcc5f51: every distinct pre_exec setup failure is legible + fail-closed ----
+    //
+    // These force each of the three distinct sandbox setup failures and assert each produces its
+    // OWN legible message (not the undifferentiated bare EINVAL), and that the target binary never
+    // executes. One failure is real (an unresolvable workdir, now caught before fork()); two use
+    // the child-side (`pre_exec`) test seams below. All are safe on any Linux host: the workdir
+    // and no_new_privs failures happen before any real kernel enforcement, and the Landlock seam
+    // short-circuits before any real Landlock syscall.
+
+    struct ForceNoNewPrivsFailureGuard;
+
+    impl ForceNoNewPrivsFailureGuard {
+        fn new() -> Self {
+            FORCE_NO_NEW_PRIVS_FAILURE.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceNoNewPrivsFailureGuard {
+        fn drop(&mut self) {
+            FORCE_NO_NEW_PRIVS_FAILURE.with(|flag| flag.set(false));
+        }
+    }
+
+    struct ForceLandlockFailureGuard;
+
+    impl ForceLandlockFailureGuard {
+        fn new() -> Self {
+            FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceLandlockFailureGuard {
+        fn drop(&mut self) {
+            FORCE_LANDLOCK_FAILURE.with(|flag| flag.set(false));
+        }
+    }
+
+    /// A `KernelFull` enforcement over an empty Landlock grant set. The forced-failure tests do not
+    /// depend on any specific grant — they force the failure directly — so this exercises the
+    /// child-side `pre_exec` steps on any Linux host regardless of its real Landlock support.
+    fn kernel_full_empty_grants() -> ShellEnforcement {
+        ShellEnforcement {
+            tier: EnforcementTier::KernelFull,
+            network_allow_ips: Vec::new(),
+            exec_allow_paths: Vec::new(),
+            landlock_grants: Vec::new(),
+        }
+    }
+
+    /// Scenario 1 (real): `prepare_enforcement` with a `KernelFull` tier and a workdir that does
+    /// not exist. Because this slice opens the workdir's Landlock fd in the PARENT, this fails
+    /// synchronously before fork() — `.spawn()` is never called. Returns the error string.
+    fn workdir_resolution_error() -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("does-not-exist-workdir");
+        let marker = temp.path().join("never-spawned.marker");
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(format!("echo ran > '{}'", marker.display()));
+
+        let error = prepare_enforcement(&mut command, &kernel_full_empty_grants(), &missing)
+            .expect_err("an unresolvable workdir must fail before fork()");
+        assert!(
+            !marker.exists(),
+            "prepare_enforcement must never spawn a subprocess: {error}"
+        );
+        error
+    }
+
+    /// Runs `execute_shell` for `bash -c 'echo ran > marker'` under `KernelFull` with `arm`'s
+    /// child-side failure active, asserts the target script never ran (marker absent), and returns
+    /// the resulting error string. The RAII guard `arm` returns stays alive across `.spawn()`.
+    fn child_setup_failure_error<G>(arm: impl FnOnce() -> G) -> String {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let marker = temp.path().join("spawned-anyway.marker");
+        let script = format!("echo ran > '{}'", marker.display());
+
+        let _guard = arm();
+        let error = crate::shell::execute_shell(
+            "bash",
+            &["-c", &script],
+            &[],
+            temp.path(),
+            &policy,
+            &kernel_full_empty_grants(),
+        )
+        .expect_err("a forced child-side setup failure must make execute_shell return Err");
+        assert!(
+            !marker.exists(),
+            "no subprocess may run when pre_exec setup fails: {error}"
+        );
+        error
+    }
+
+    #[test]
+    fn pre_exec_workdir_resolution_failure_is_caught_before_fork() {
+        let error = workdir_resolution_error();
+        assert!(
+            error.contains("workdir") && error.contains("does-not-exist-workdir"),
+            "the error must name the workdir path that failed to resolve: {error}"
+        );
+        assert!(
+            !error.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {error}"
+        );
+    }
+
+    #[test]
+    fn pre_exec_no_new_privs_failure_is_distinct_and_fails_closed() {
+        let error = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
+        assert!(
+            error.contains("no_new_privs"),
+            "the error must name the no_new_privs step specifically: {error}"
+        );
+        assert!(
+            !error.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {error}"
+        );
+    }
+
+    #[test]
+    fn pre_exec_landlock_failure_is_distinct_and_fails_closed() {
+        let error = child_setup_failure_error(ForceLandlockFailureGuard::new);
+        assert!(
+            error.contains("landlock"),
+            "the error must name the Landlock construction step specifically: {error}"
+        );
+        assert!(
+            !error.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {error}"
+        );
+    }
+
+    #[test]
+    fn pre_exec_setup_failures_produce_pairwise_distinct_messages() {
+        let workdir_msg = workdir_resolution_error();
+        let no_new_privs_msg = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
+        let landlock_msg = child_setup_failure_error(ForceLandlockFailureGuard::new);
+
+        assert_ne!(
+            workdir_msg, no_new_privs_msg,
+            "workdir vs no_new_privs must differ"
+        );
+        assert_ne!(
+            workdir_msg, landlock_msg,
+            "workdir vs landlock must differ"
+        );
+        assert_ne!(
+            no_new_privs_msg, landlock_msg,
+            "no_new_privs vs landlock must differ"
+        );
+
+        for message in [&workdir_msg, &no_new_privs_msg, &landlock_msg] {
+            assert!(!message.is_empty(), "a distinct message must not be empty");
+            assert!(
+                !message.contains("os error 22"),
+                "no failure may read as a bare EINVAL: {message}"
+            );
+        }
     }
 }
