@@ -29,7 +29,7 @@ pub mod types;
 pub use errors::RuntimeError;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
-pub use runtime::{launch_session, stage_session};
+pub use runtime::{launch_session, stage_session, warn_on_interpreter_runtime_grants};
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, StageRequest,

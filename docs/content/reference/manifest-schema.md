@@ -74,6 +74,13 @@ capabilities:
       - AWS_*
     baseline_env:      # optional: env var patterns to keep after stripping
       - PATH
+    interpreter_runtime:            # optional: host dirs a path-based interpreter needs (see W-SEC-009)
+      - binary: python3             # MUST already appear in allow above
+        dirs:
+          - path: /usr/lib/python3.11
+            list_dir: true          # Execute+ReadFile+ReadDir — the dir's entries are enumerable
+          - path: /usr/lib/python3.11/lib-dynload
+            list_dir: false         # Execute+ReadFile — files openable by exact name, dir not listable
   env:
     allow:             # optional: host env vars a WASM guest (capsule/tool/driver) may observe
       - MY_APP_REGION
@@ -332,6 +339,11 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.shell.allow` | list<string> | no | shell binaries the agent may invoke (e.g. `bash`); each listed binary gets a synthetic tool manifest staged at launch |
 | `capabilities.shell.strip_env` | list<string> | no | glob patterns for env vars to strip from subprocess environment (e.g. `AWS_*`) |
 | `capabilities.shell.baseline_env` | list<string> | no | glob patterns for env vars to keep after stripping (e.g. `PATH`) |
+| `capabilities.shell.interpreter_runtime` | list<grant> | no | narrows an allowlisted binary's Landlock scope to specific host directories its import machinery needs outside the workdir (a path-based interpreter's stdlib). Fires [`W-SEC-009`](security-warnings.md#w-sec-009) at staging. See below for the per-entry shape. |
+| `capabilities.shell.interpreter_runtime[].binary` | string | yes | a binary that MUST already appear in `capabilities.shell.allow` — this narrows filesystem access alongside an existing exec grant, it never grants exec |
+| `capabilities.shell.interpreter_runtime[].dirs` | list<dir> | yes | the host directories to grant; must name at least one |
+| `capabilities.shell.interpreter_runtime[].dirs[].path` | string | yes | an absolute host path (must start with `/`) outside the workdir |
+| `capabilities.shell.interpreter_runtime[].dirs[].list_dir` | bool | yes | `true` → `Execute+ReadFile+ReadDir` (directory entries enumerable); `false` → `Execute+ReadFile` (files openable by exact name, directory not listable). Never inferred — must be written explicitly. |
 | `capabilities.env.allow` | list<string> | no | host env var names a WASM guest (capsule/tool/driver component) may observe. Omitted or `[]` — a legitimate no-op, not an error — grants nothing beyond the runtime's own `MURMUR_*` injections. |
 | `capabilities.limits.memory_bytes` | integer | no | cap on a guest's linear-memory growth, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
 | `capabilities.limits.table_elements` | integer | no | cap on a guest's table growth, in elements. Default: 100000. Must be > 0. |

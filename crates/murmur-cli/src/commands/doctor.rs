@@ -1,4 +1,4 @@
-use capsule_runtime::ArtifactRequest;
+use capsule_runtime::{warn_on_interpreter_runtime_grants, ArtifactRequest};
 use murmur_artifact::{
     current_platform, load_runtime_manifest, read_lockfile, resolve_manifest_path, sha256_hex,
     LocalRegistry, LockfileError, MurmurLock,
@@ -68,6 +68,19 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     let manifest_path = resolve_manifest_path(&project_root);
     let runtime_manifest =
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+
+    // `mur doctor` validates the manifest without launching a session, but the capsule-ceiling
+    // `interpreter_runtime` grant is a posture warning an operator should see here too — surface
+    // the same `W-SEC-009` a `mur run` would, straight from the parsed manifest's own
+    // `capabilities.shell`. Non-fatal, stderr only, exactly as it fires at staging.
+    if let Some(interpreter_runtime) = runtime_manifest
+        .capabilities
+        .as_ref()
+        .and_then(|caps| caps.shell.as_ref())
+        .map(|shell| shell.interpreter_runtime.as_slice())
+    {
+        warn_on_interpreter_runtime_grants(interpreter_runtime);
+    }
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,

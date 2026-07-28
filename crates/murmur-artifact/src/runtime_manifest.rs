@@ -520,6 +520,40 @@ pub struct ShellCapabilities {
     pub allow: Vec<String>,
     pub strip_env: Option<Vec<String>>,
     pub baseline_env: Option<Vec<String>>,
+    /// Typed grants that widen an already-allowlisted `allow` binary's Landlock filesystem
+    /// scope to the exact host directories its import machinery needs *outside* the workdir
+    /// (a path-based interpreter like CPython, whose stdlib the `DT_NEEDED` closure cannot
+    /// reach). Empty unless the manifest declares `capabilities.shell.interpreter_runtime`.
+    /// This can only ever name specific directories with an explicit per-directory
+    /// enumerability flag — it has no field that expands a whole install prefix.
+    pub interpreter_runtime: Vec<InterpreterRuntimeGrant>,
+}
+
+/// One `capabilities.shell.interpreter_runtime` entry: an already-allowlisted binary plus the
+/// exact host directories outside the workdir its import machinery must reach. Declaring one
+/// couples the capsule to a specific host interpreter-version layout, so it fires `W-SEC-009`
+/// at staging; it exists only to bridge until the staged runtime bind-mount ships.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpreterRuntimeGrant {
+    /// A binary that MUST already appear in this same block's `allow`. This mechanism can only
+    /// narrow filesystem access alongside an exec grant that already exists — it never itself
+    /// grants exec.
+    pub binary: String,
+    /// The host directories to grant. Never empty (a grant with no directories is rejected at
+    /// parse time).
+    pub dirs: Vec<InterpreterRuntimeDir>,
+}
+
+/// One directory inside an [`InterpreterRuntimeGrant`], with its author-declared enumerability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpreterRuntimeDir {
+    /// An absolute host path (must start with `/`) outside the workdir.
+    pub path: String,
+    /// `true` grants `Execute + ReadFile + ReadDir` — the directory's own entries can be
+    /// enumerated (what CPython's `FileFinder` needs for a `sys.path` entry). `false` grants
+    /// `Execute + ReadFile` only — files inside can still be opened by exact name, but the
+    /// directory itself cannot be listed. Never inferred: the author must write it explicitly.
+    pub list_dir: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,6 +784,27 @@ struct RawShellCapabilities {
     strip_env: Option<Vec<String>>,
     #[serde(default)]
     baseline_env: Option<Vec<String>>,
+    #[serde(default)]
+    interpreter_runtime: Vec<RawInterpreterRuntimeGrant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInterpreterRuntimeGrant {
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    dirs: Vec<RawInterpreterRuntimeDir>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawInterpreterRuntimeDir {
+    #[serde(default)]
+    path: Option<String>,
+    // `Option` so an omitted `list_dir` is distinguishable from an explicit `false`: this slice
+    // rejects the omission outright rather than defaulting, because enumerability is never
+    // inferred.
+    #[serde(default)]
+    list_dir: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1060,10 +1115,14 @@ fn parse_capabilities(
                 });
             }
 
+            let interpreter_runtime =
+                parse_interpreter_runtime(&raw_shell.allow, raw_shell.interpreter_runtime)?;
+
             Ok(ShellCapabilities {
                 allow: raw_shell.allow,
                 strip_env: raw_shell.strip_env,
                 baseline_env: raw_shell.baseline_env,
+                interpreter_runtime,
             })
         })
         .transpose()?;
@@ -1086,6 +1145,86 @@ fn parse_capabilities(
         env,
         limits,
     }))
+}
+
+/// Lower and validate `capabilities.shell.interpreter_runtime`. Every rejection is an
+/// [`RuntimeManifestError::InvalidCapabilities`] naming the offending value, matching the rest
+/// of this file's "structurally present but semantically invalid" reporting. Nothing here can
+/// expand a whole install prefix: each grant names specific directories, and each directory
+/// carries an explicit `list_dir` the author had to write — enumerability is never inferred.
+fn parse_interpreter_runtime(
+    allow: &[String],
+    raw_grants: Vec<RawInterpreterRuntimeGrant>,
+) -> Result<Vec<InterpreterRuntimeGrant>, RuntimeManifestError> {
+    let mut grants = Vec::with_capacity(raw_grants.len());
+    for (index, raw_grant) in raw_grants.into_iter().enumerate() {
+        let base = format!("capabilities.shell.interpreter_runtime[{index}]");
+
+        let binary = raw_grant.binary.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
+            RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.binary"),
+                message: "must name a binary".to_string(),
+            }
+        })?;
+
+        // The whole point of this mechanism: it narrows filesystem access alongside an exec
+        // grant that already exists. It can never itself grant exec, so the binary must already
+        // be allowlisted in this same block's `allow`.
+        if !allow.contains(&binary) {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.binary"),
+                message: format!(
+                    "'{binary}' is not in capabilities.shell.allow — interpreter_runtime can \
+                     only narrow filesystem access for an already-allowlisted binary, never \
+                     grant exec"
+                ),
+            });
+        }
+
+        if raw_grant.dirs.is_empty() {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.dirs"),
+                message: "must name at least one directory".to_string(),
+            });
+        }
+
+        let mut dirs = Vec::with_capacity(raw_grant.dirs.len());
+        for (dir_index, raw_dir) in raw_grant.dirs.into_iter().enumerate() {
+            let dir_base = format!("{base}.dirs[{dir_index}]");
+
+            let path = raw_dir.path.filter(|p| !p.trim().is_empty()).ok_or_else(|| {
+                RuntimeManifestError::InvalidCapabilities {
+                    field: format!("{dir_base}.path"),
+                    message: "must name a host directory".to_string(),
+                }
+            })?;
+            if !path.starts_with('/') {
+                return Err(RuntimeManifestError::InvalidCapabilities {
+                    field: format!("{dir_base}.path"),
+                    message: format!(
+                        "'{path}' must be an absolute host path (start with '/') — these are \
+                         filesystem paths outside the workdir"
+                    ),
+                });
+            }
+
+            let list_dir = raw_dir.list_dir.ok_or_else(|| {
+                RuntimeManifestError::InvalidCapabilities {
+                    field: format!("{dir_base}.list_dir"),
+                    message: format!(
+                        "'{path}' must set list_dir explicitly to true or false — \
+                         enumerability is never inferred"
+                    ),
+                }
+            })?;
+
+            dirs.push(InterpreterRuntimeDir { path, list_dir });
+        }
+
+        grants.push(InterpreterRuntimeGrant { binary, dirs });
+    }
+
+    Ok(grants)
 }
 
 /// Lower `capabilities.limits`, rejecting values that can only ever produce a guest that
@@ -1875,6 +2014,133 @@ capabilities:
         let msg = err.to_string();
         assert!(msg.contains("capabilities.shell.allow"));
         assert!(msg.contains("at least one"));
+    }
+
+    #[test]
+    fn interpreter_runtime_parses_accepted_shape() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - python3
+    interpreter_runtime:
+      - binary: python3
+        dirs:
+          - path: /usr/lib/python3.11
+            list_dir: true
+          - path: /usr/lib/python3.11/lib-dynload
+            list_dir: false
+"#,
+        )
+        .unwrap();
+
+        let shell = manifest.capabilities.unwrap().shell.unwrap();
+        assert_eq!(
+            shell.interpreter_runtime,
+            vec![InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![
+                    InterpreterRuntimeDir {
+                        path: "/usr/lib/python3.11".to_string(),
+                        list_dir: true,
+                    },
+                    InterpreterRuntimeDir {
+                        path: "/usr/lib/python3.11/lib-dynload".to_string(),
+                        list_dir: false,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn interpreter_runtime_defaults_to_empty_when_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - python3
+"#,
+        )
+        .unwrap();
+
+        let shell = manifest.capabilities.unwrap().shell.unwrap();
+        assert!(shell.interpreter_runtime.is_empty());
+    }
+
+    /// Shared helper: parse a manifest whose sole `interpreter_runtime` grant is `grant_yaml`
+    /// (indented to sit under `interpreter_runtime:`), returning the error message.
+    fn interpreter_runtime_reject(grant_yaml: &str) -> String {
+        let yaml = format!(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - python3
+    interpreter_runtime:
+{grant_yaml}
+"#,
+        );
+        RuntimeManifest::from_yaml_str(&yaml)
+            .expect_err("grant should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn interpreter_runtime_rejects_binary_not_in_allow() {
+        let msg = interpreter_runtime_reject(
+            "      - binary: ruby\n        dirs:\n          - path: /usr/lib/ruby\n            list_dir: true\n",
+        );
+        assert!(msg.contains("capabilities.shell.interpreter_runtime[0].binary"), "{msg}");
+        assert!(msg.contains("ruby"), "{msg}");
+        assert!(msg.contains("capabilities.shell.allow"), "{msg}");
+    }
+
+    #[test]
+    fn interpreter_runtime_rejects_relative_path() {
+        let msg = interpreter_runtime_reject(
+            "      - binary: python3\n        dirs:\n          - path: usr/lib/python3.11\n            list_dir: true\n",
+        );
+        assert!(
+            msg.contains("capabilities.shell.interpreter_runtime[0].dirs[0].path"),
+            "{msg}"
+        );
+        assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    #[test]
+    fn interpreter_runtime_rejects_missing_list_dir() {
+        let msg = interpreter_runtime_reject(
+            "      - binary: python3\n        dirs:\n          - path: /usr/lib/python3.11\n",
+        );
+        assert!(
+            msg.contains("capabilities.shell.interpreter_runtime[0].dirs[0].list_dir"),
+            "{msg}"
+        );
+        assert!(msg.contains("explicitly"), "{msg}");
+    }
+
+    #[test]
+    fn interpreter_runtime_rejects_empty_dirs() {
+        let msg = interpreter_runtime_reject(
+            "      - binary: python3\n        dirs: []\n",
+        );
+        assert!(
+            msg.contains("capabilities.shell.interpreter_runtime[0].dirs"),
+            "{msg}"
+        );
+        assert!(msg.contains("at least one"), "{msg}");
     }
 
     #[test]

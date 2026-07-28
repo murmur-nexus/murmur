@@ -48,6 +48,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use murmur_artifact::security_warnings::{security_warning_link, W_SEC_001, W_SEC_002, W_SEC_005};
+use murmur_artifact::InterpreterRuntimeGrant;
 
 use crate::types::CapabilityPolicy;
 
@@ -504,6 +505,65 @@ fn resolve_landlock_grants_in(
     grants.into_iter().collect()
 }
 
+/// One resolved Landlock filesystem grant outside the workdir: a canonical path plus whether the
+/// directory's own entries may be enumerated (`ReadDir`).
+///
+/// `list_dir` carries the whole difference between the two grant kinds this runtime issues:
+///
+///   - `false` → `Execute + ReadFile`. Enough for the dynamic loader to open, read, and
+///     map-execute a file; and (Landlock's read rights apply to the whole subtree beneath a
+///     granted directory) enough to open a file *inside* a granted directory by its exact name.
+///     But the directory's own listing (`getdents64`) is denied. This is what every derived
+///     `DT_NEEDED`-closure grant gets — they are individual files, where `ReadDir` was always a
+///     no-op anyway (Landlock's `ReadDir` only has meaning on a directory inode).
+///   - `true` → `Execute + ReadFile + ReadDir`. Adds enumerability, which a path-based
+///     interpreter's import machinery needs on each `sys.path` entry (CPython's `FileFinder`
+///     `listdir`-caches each one). Only ever set by an author writing `list_dir: true` next to a
+///     specific `interpreter_runtime` directory — never inferred, and never applied to an
+///     ancestor or sibling of a granted directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LandlockGrant {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) path: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) list_dir: bool,
+}
+
+impl LandlockGrant {
+    /// Wraps each derived `DT_NEEDED`-closure file path as a non-listable grant. A regular file
+    /// has no meaningful `ReadDir`, so `list_dir: false` is both correct and a pure simplification
+    /// of b3220cb5's old uniform `Execute|ReadFile|ReadDir` — it never changes *which* files are
+    /// granted.
+    fn non_listable_files(paths: Vec<PathBuf>) -> Vec<LandlockGrant> {
+        paths
+            .into_iter()
+            .map(|path| LandlockGrant { path, list_dir: false })
+            .collect()
+    }
+}
+
+/// Turns each `capabilities.shell.interpreter_runtime` directory into a [`LandlockGrant`] carrying
+/// exactly the `list_dir` its author wrote. Pure and syscall-free (the declared paths need not
+/// exist here — `apply_landlock_scope` skips any that fail to open), so it is unit-testable on
+/// every platform including a non-Linux dev machine.
+///
+/// There is deliberately no path here that could widen a grant to a whole install prefix: it emits
+/// one grant per explicitly declared directory and copies the author's `list_dir` verbatim,
+/// inferring enumerability from nothing.
+pub(crate) fn resolve_interpreter_runtime_grants(
+    grants: &[InterpreterRuntimeGrant],
+) -> Vec<LandlockGrant> {
+    grants
+        .iter()
+        .flat_map(|grant| {
+            grant.dirs.iter().map(|dir| LandlockGrant {
+                path: PathBuf::from(&dir.path),
+                list_dir: dir.list_dir,
+            })
+        })
+        .collect()
+}
+
 /// Identity-based exec decision: canonicalizes the pathname a subprocess passed to
 /// `execve`/`execveat` (relative paths resolved against `base_dir` — the notifying task's
 /// cwd or `execveat` dirfd, read from `/proc` by the Linux supervisor) and allows the exec
@@ -609,15 +669,23 @@ pub(crate) struct ShellEnforcement {
     /// against (never the raw name strings; see `decide_exec_allowed`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) exec_allow_paths: Vec<PathBuf>,
-    /// Canonical file paths that need a narrow read+execute (never write) Landlock grant
-    /// *outside* the workdir so the allowlisted binaries can actually exec and dynamically link:
-    /// the `shell.allow` binaries, their ELF interpreter, and the transitive closure of their
-    /// shared-library dependencies. Derived from `exec_allow_paths` by `resolve_landlock_grants`
-    /// once at launch (in the parent) and threaded into the forked child's `pre_exec`, where
-    /// `apply_landlock_scope` turns each into a per-path `PathBeneath` rule. Only consulted on
-    /// `KernelFull`; resolved on every platform for parity but never read off Linux.
+    /// Narrow read+execute (never write) Landlock grants *outside* the workdir so the allowlisted
+    /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
+    /// stdlib. Two origins, combined here:
+    ///
+    ///   - the `DT_NEEDED`-closure files (`shell.allow` binaries, their ELF interpreter, their
+    ///     shared-library closure), from `resolve_landlock_grants` — each wrapped `list_dir: false`
+    ///     (they are individual files, where `ReadDir` was always a no-op);
+    ///   - one grant per `capabilities.shell.interpreter_runtime` directory, from
+    ///     `resolve_interpreter_runtime_grants` — each carrying exactly the `list_dir` its author
+    ///     declared.
+    ///
+    /// Resolved once at launch (in the parent) and threaded into the forked child's `pre_exec`,
+    /// where `apply_landlock_scope` turns each into a per-path `PathBeneath` rule with an access
+    /// set that depends on `list_dir`. Only consulted on `KernelFull`; resolved on every platform
+    /// for parity but never read off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) landlock_grant_paths: Vec<PathBuf>,
+    pub(crate) landlock_grants: Vec<LandlockGrant>,
 }
 
 impl ShellEnforcement {
@@ -626,12 +694,18 @@ impl ShellEnforcement {
         let tier = detect_enforcement_tier();
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
-        let landlock_grant_paths = resolve_landlock_grants(&exec_allow_paths);
+        // The b3220cb5 `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
+        // per author-declared `interpreter_runtime` directory (each with its own `list_dir`). A
+        // directory not named in the manifest never receives a rule, regardless of what it holds.
+        let mut landlock_grants =
+            LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
+        landlock_grants
+            .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
         Ok(Self {
             tier,
             network_allow_ips,
             exec_allow_paths,
-            landlock_grant_paths,
+            landlock_grants,
         })
     }
 
@@ -646,7 +720,7 @@ impl ShellEnforcement {
             tier: EnforcementTier::EnvironmentOnly,
             network_allow_ips: Vec::new(),
             exec_allow_paths: Vec::new(),
-            landlock_grant_paths: Vec::new(),
+            landlock_grants: Vec::new(),
         }
     }
 }
@@ -857,9 +931,10 @@ pub(crate) fn prepare_enforcement(
     let tier = enforcement.tier;
     let workdir_for_child = workdir.to_path_buf();
     // Derived read+execute grant set, computed in the parent (all parsing/resolution already done
-    // by `resolve_landlock_grants`) and moved into the closure so the child only opens each path
-    // and adds a Landlock rule — no parsing in the async-signal-safe `pre_exec` window.
-    let landlock_grants_for_child = enforcement.landlock_grant_paths.clone();
+    // by `resolve_landlock_grants`/`resolve_interpreter_runtime_grants`) and moved into the closure
+    // so the child only opens each path and adds a Landlock rule — no parsing in the
+    // async-signal-safe `pre_exec` window.
+    let landlock_grants_for_child = enforcement.landlock_grants.clone();
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It only
@@ -907,7 +982,7 @@ mod linux_enforce {
     use std::path::{Path, PathBuf};
 
     use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
-    use super::{EnforcementTier, SupervisorHandle};
+    use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
 
     enum Decision {
         Allow,
@@ -963,13 +1038,13 @@ mod linux_enforce {
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         workdir: &Path,
-        landlock_grant_paths: &[PathBuf],
+        landlock_grants: &[LandlockGrant],
         child_sock_fd: RawFd,
     ) -> io::Result<()> {
         install_seccomp_filter(child_sock_fd)?;
 
         if tier == EnforcementTier::KernelFull {
-            apply_landlock_scope(workdir, landlock_grant_paths)
+            apply_landlock_scope(workdir, landlock_grants)
                 .map_err(|error| io::Error::other(error))?;
         }
 
@@ -1023,9 +1098,15 @@ mod linux_enforce {
     /// Scopes the shell subprocess tree's filesystem access with Landlock. Two kinds of rule:
     ///
     ///   - the workdir gets the **full** access set (read/write/execute) — unchanged from before;
-    ///   - each path in `landlock_grant_paths` (the `shell.allow` binaries, their ELF interpreter,
-    ///     and their shared-library closure, all *outside* the workdir) gets a **narrow
-    ///     read+execute** grant — never write.
+    ///   - each [`LandlockGrant`] (the `shell.allow` binaries, their ELF interpreter, their
+    ///     shared-library closure, and any `interpreter_runtime` directory, all *outside* the
+    ///     workdir) gets a **narrow read+execute** grant — never write. Whether that grant also
+    ///     carries `ReadDir` (i.e. the directory's own entries are enumerable) is exactly the
+    ///     grant's `list_dir`: the derived closure files are all `false` (a regular file has no
+    ///     meaningful `ReadDir`), while an `interpreter_runtime` directory carries whatever its
+    ///     author wrote. `ReadDir` is granted only on the specific inode a rule names — never on
+    ///     an ancestor or sibling — so naming one subdirectory never makes `/usr/lib` (or any
+    ///     parent) enumerable.
     ///
     /// Without the second kind of rule, `restrict_self()` denies `Execute`/`ReadFile` on every
     /// path outside the workdir, so every allowlisted binary's `execve` fails with EACCES before
@@ -1041,7 +1122,7 @@ mod linux_enforce {
     /// preserving the module's fail-closed invariant.
     fn apply_landlock_scope(
         workdir: &Path,
-        landlock_grant_paths: &[PathBuf],
+        landlock_grants: &[LandlockGrant],
     ) -> Result<(), String> {
         use landlock::{
             Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -1050,9 +1131,12 @@ mod linux_enforce {
 
         let abi = ABI::V1;
         let access_all = AccessFs::from_all(abi);
-        // The canonical "read-only-ish" grant (see landlock's own docs): enough for the loader to
-        // open, read, and map-execute a binary or shared library, but no write access.
-        let read_execute = AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir;
+        // Enough for the loader to open, read, and map-execute a binary or shared library, and to
+        // open a file inside a granted directory by exact name — but no write access, and (without
+        // `ReadDir`) no enumeration of the directory's own entries.
+        let read_execute = AccessFs::Execute | AccessFs::ReadFile;
+        // Adds enumerability (`getdents64`) — only for a grant whose author set `list_dir: true`.
+        let read_execute_list = read_execute | AccessFs::ReadDir;
 
         let workdir_fd = PathFd::new(workdir).map_err(|error| {
             format!(
@@ -1070,21 +1154,27 @@ mod linux_enforce {
             .add_rule(PathBeneath::new(workdir_fd, access_all))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
 
-        for grant in landlock_grant_paths {
+        for grant in landlock_grants {
             // A grant path that no longer opens (e.g. a library resolved a moment ago in the
-            // parent that has since vanished) is skipped, not fatal — it only shrinks the allow
-            // set. A rule that fails to add with a valid fd is a genuine construction failure and
-            // still propagates as `Err` (fail-closed).
-            let grant_fd = match PathFd::new(grant) {
+            // parent that has since vanished, or an `interpreter_runtime` directory that is not
+            // present on this host) is skipped, not fatal — it only shrinks the allow set. A rule
+            // that fails to add with a valid fd is a genuine construction failure and still
+            // propagates as `Err` (fail-closed).
+            let grant_fd = match PathFd::new(&grant.path) {
                 Ok(fd) => fd,
                 Err(_) => continue,
             };
+            let access = if grant.list_dir {
+                read_execute_list
+            } else {
+                read_execute
+            };
             ruleset = ruleset
-                .add_rule(PathBeneath::new(grant_fd, read_execute))
+                .add_rule(PathBeneath::new(grant_fd, access))
                 .map_err(|error| {
                     format!(
                         "landlock: add_rule for grant {} failed: {error}",
-                        grant.display()
+                        grant.path.display()
                     )
                 })?;
         }
@@ -1788,6 +1878,91 @@ mod tests {
         assert_eq!(grants, vec![std::fs::canonicalize(&prog).unwrap()]);
     }
 
+    // ---- interpreter_runtime → LandlockGrant construction (pure, syscall-free, every OS) ----
+
+    fn interp_grant(binary: &str, dirs: &[(&str, bool)]) -> InterpreterRuntimeGrant {
+        InterpreterRuntimeGrant {
+            binary: binary.to_string(),
+            dirs: dirs
+                .iter()
+                .map(|(path, list_dir)| murmur_artifact::InterpreterRuntimeDir {
+                    path: path.to_string(),
+                    list_dir: *list_dir,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resolve_interpreter_runtime_grants_copies_list_dir_verbatim() {
+        // Two directories under the same binary, opposite `list_dir` — proving enumerability is
+        // per-directory and copied exactly, not inferred or unified.
+        let grants = resolve_interpreter_runtime_grants(&[interp_grant(
+            "python3",
+            &[
+                ("/usr/lib/python3.11", true),
+                ("/usr/lib/python3.11/lib-dynload", false),
+            ],
+        )]);
+
+        assert_eq!(
+            grants,
+            vec![
+                LandlockGrant {
+                    path: PathBuf::from("/usr/lib/python3.11"),
+                    list_dir: true,
+                },
+                LandlockGrant {
+                    path: PathBuf::from("/usr/lib/python3.11/lib-dynload"),
+                    list_dir: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_interpreter_runtime_grants_flattens_multiple_grants_and_needs_no_existing_path() {
+        // The declared paths need not exist on this host (this is pure resolution — `apply_landlock_
+        // scope` skips any that fail to open), and multiple grants flatten in order.
+        let grants = resolve_interpreter_runtime_grants(&[
+            interp_grant("python3", &[("/opt/py/nonexistent", false)]),
+            interp_grant("ruby", &[("/opt/rb/also-nonexistent", true)]),
+        ]);
+
+        assert_eq!(
+            grants,
+            vec![
+                LandlockGrant {
+                    path: PathBuf::from("/opt/py/nonexistent"),
+                    list_dir: false,
+                },
+                LandlockGrant {
+                    path: PathBuf::from("/opt/rb/also-nonexistent"),
+                    list_dir: true,
+                },
+            ]
+        );
+        assert!(resolve_interpreter_runtime_grants(&[]).is_empty());
+    }
+
+    #[test]
+    fn non_listable_files_marks_every_closure_file_non_enumerable() {
+        // The DT_NEEDED closure yields individual files; wrapping them must never set `list_dir`
+        // (ReadDir on a regular file was always a no-op — this is the slice's pure correction).
+        let wrapped = LandlockGrant::non_listable_files(vec![
+            PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+            PathBuf::from("/usr/bin/bash"),
+        ]);
+        assert!(wrapped.iter().all(|grant| !grant.list_dir), "{wrapped:?}");
+        assert_eq!(
+            wrapped.iter().map(|g| g.path.clone()).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
+                PathBuf::from("/usr/bin/bash"),
+            ]
+        );
+    }
+
     // ---- exec decision (canonical identity match; finding #1's attack) ----
 
     /// A tempdir "bin" with a real allowlisted `bash`, plus the canonical allow set for it.
@@ -2131,8 +2306,8 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2173,8 +2348,8 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2215,8 +2390,8 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2268,8 +2443,8 @@ mod linux_integration_tests {
             // Empty resolved allowlist: every destination must be denied.
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2315,8 +2490,8 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2361,8 +2536,8 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grant_paths: resolve_landlock_grants(&resolve_exec_allowlist(
-                &policy.shell_allow,
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &resolve_exec_allowlist(&policy.shell_allow),
             )),
         };
 
@@ -2418,7 +2593,9 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
-            landlock_grant_paths: resolve_landlock_grants(&exec_allow_paths),
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &exec_allow_paths,
+            )),
             exec_allow_paths,
         };
 
@@ -2477,7 +2654,9 @@ mod linux_integration_tests {
         let enforcement = ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
-            landlock_grant_paths: resolve_landlock_grants(&exec_allow_paths),
+            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
+                &exec_allow_paths,
+            )),
             exec_allow_paths,
         };
 
@@ -2502,6 +2681,165 @@ mod linux_integration_tests {
         assert_ne!(
             result.exit_code, 0,
             "bash's redirection to an outside path must fail (Landlock denies the open-for-write)"
+        );
+    }
+
+    /// Builds a KernelFull enforcement for `policy`, combining the derived `DT_NEEDED`-closure
+    /// file grants with the policy's `interpreter_runtime` directory grants — exactly what
+    /// `ShellEnforcement::resolve` does, spelled out so the test controls the tier explicitly.
+    fn kernel_full_enforcement(tier: EnforcementTier, policy: &CapabilityPolicy) -> ShellEnforcement {
+        let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
+        let mut landlock_grants =
+            LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
+        landlock_grants
+            .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
+        ShellEnforcement {
+            tier,
+            network_allow_ips: Vec::new(),
+            exec_allow_paths,
+            landlock_grants,
+        }
+    }
+
+    // NOTE (as above): a green run on THIS repo's CI/dev machine proves nothing — CI has never
+    // resolved to `KernelFull` and the dev machine is macOS. Both tests print an unmistakable skip
+    // line and return when the host is not `KernelFull`. Real acceptance is a manual run on a real
+    // Landlock-capable Linux host.
+
+    #[test]
+    fn kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing() {
+        let tier = detect_enforcement_tier();
+        if tier != EnforcementTier::KernelFull {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: \
+                 kernel_full_interpreter_runtime_list_dir_false_... requires \
+                 EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected {tier:?}. \
+                 This run does NOT execute the interpreter_runtime Landlock code path, so a green \
+                 result here is not evidence list_dir:false behaves correctly — only a real \
+                 KernelFull Linux host can prove that."
+            );
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        // A "stdlib"-shaped directory OUTSIDE the workdir, holding one known file.
+        let stdlib = tempfile::tempdir().unwrap();
+        let module = stdlib.path().join("mod.py");
+        std::fs::write(&module, "x = 1\n").unwrap();
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "cat".to_string(), "ls".to_string()],
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "bash".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: stdlib.path().to_string_lossy().into_owned(),
+                    list_dir: false,
+                }],
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = kernel_full_enforcement(tier, &policy);
+
+        // Opening the file by its exact known name must succeed — Landlock's read rights apply to
+        // the subtree beneath the granted directory.
+        let read = crate::shell::execute_shell(
+            "bash",
+            &["-c", &format!("cat '{}'", module.display())],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok");
+        assert_eq!(
+            read.exit_code, 0,
+            "list_dir:false must still permit opening a known file inside the grant (stderr: {})",
+            read.stderr
+        );
+        assert!(read.stdout.contains("x = 1"), "stdout: {}", read.stdout);
+
+        // Listing the directory's own entries must fail — ReadDir was not granted.
+        let list = crate::shell::execute_shell(
+            "bash",
+            &["-c", &format!("ls '{}'", stdlib.path().display())],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok with a nonzero exit code");
+        assert_ne!(
+            list.exit_code, 0,
+            "list_dir:false must deny enumerating the granted directory's own entries"
+        );
+    }
+
+    #[test]
+    fn kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent() {
+        let tier = detect_enforcement_tier();
+        if tier != EnforcementTier::KernelFull {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: \
+                 kernel_full_interpreter_runtime_list_dir_true_... requires \
+                 EnforcementTier::KernelFull (Landlock ABI, kernel 5.13+); detected {tier:?}. \
+                 This run does NOT execute the interpreter_runtime Landlock code path, so a green \
+                 result here is not evidence list_dir:true (and its non-widening to the parent) \
+                 behaves correctly — only a real KernelFull Linux host can prove that."
+            );
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        // parent/ (NOT granted) contains stdlib/ (granted list_dir:true) contains one file.
+        let parent = tempfile::tempdir().unwrap();
+        let stdlib = parent.path().join("stdlib");
+        std::fs::create_dir(&stdlib).unwrap();
+        std::fs::write(stdlib.join("mod.py"), "x = 1\n").unwrap();
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "ls".to_string()],
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "bash".to_string(),
+                dirs: vec![murmur_artifact::InterpreterRuntimeDir {
+                    path: stdlib.to_string_lossy().into_owned(),
+                    list_dir: true,
+                }],
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = kernel_full_enforcement(tier, &policy);
+
+        // Listing the granted directory must succeed.
+        let list = crate::shell::execute_shell(
+            "bash",
+            &["-c", &format!("ls '{}'", stdlib.display())],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok");
+        assert_eq!(
+            list.exit_code, 0,
+            "list_dir:true must permit enumerating the granted directory (stderr: {})",
+            list.stderr
+        );
+        assert!(list.stdout.contains("mod.py"), "stdout: {}", list.stdout);
+
+        // Listing the PARENT (never named in any grant) must fail — naming one subdirectory does
+        // not widen enumerability to its ancestors. This is the `/usr/lib` ceiling case.
+        let list_parent = crate::shell::execute_shell(
+            "bash",
+            &["-c", &format!("ls '{}'", parent.path().display())],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell should return Ok with a nonzero exit code");
+        assert_ne!(
+            list_parent.exit_code, 0,
+            "a grant on stdlib/ must not make its (ungranted) parent enumerable"
         );
     }
 }
