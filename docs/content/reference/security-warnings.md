@@ -35,6 +35,9 @@ Warnings from `mur build` go to stderr only.
     Landlock now grants a narrow, *derived* read+execute scope outside the workdir (the
     allowlisted binaries, their dynamic loader, and their shared libraries — nothing writable, no
     directory granted wholesale) so allowlisted programs can actually exec and dynamically link.
+    It also grants a fixed three-device set every capsule gets unconditionally — `/dev/null`
+    read **and** write, `/dev/zero` and `/dev/urandom` read-only, no other device at all — see
+    [Manual acceptance procedure — the fixed capsule device set](#manual-acceptance-device-set).
     The workdir's own grant withholds character-device, block-device and unix-socket creation, and
     both Linux tiers drop every capability from the shell child before `execve` — see
     [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) for
@@ -69,8 +72,9 @@ subprocesses declared under `capabilities.shell.allow`.
 ¹ *Intended* behavior. On the Full tier the Landlock scope grants the capsule workdir a near-full
 access set **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
-allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while nothing
-outside the workdir is writable and no directory is granted wholesale. A capsule may *additionally*
+allowlisted program can exec and dynamic-link `/usr/bin/bash` and its libraries while no directory
+is granted wholesale and the only writable path outside the workdir is `/dev/null` (see
+[the fixed capsule device set](#manual-acceptance-device-set)). A capsule may *additionally*
 name specific host directories a path-based interpreter needs (its stdlib) via
 `capabilities.shell.interpreter_runtime` — but only the exact directories named, each with an
 explicit per-directory `list_dir` flag, never a whole install prefix (see
@@ -132,6 +136,13 @@ Seccomp-only tier (Linux, kernel <5.13).
 all on this tier — Landlock requires kernel ≥5.13. The seccomp exec/network enforcement that
 *would* apply here has never been verified on real Linux hardware (see
 [W-SEC-005](#w-sec-005)), so treat shell subprocess isolation as experimental on this host.
+
+The [fixed capsule device set](#manual-acceptance-device-set) does **not** apply on this tier
+either, and the direction of that gap is worth being explicit about: it is a Landlock rule list, so
+without Landlock there is nothing to grant *and* nothing to deny. A capsule here can open
+`/dev/null`, `/dev/zero` and `/dev/urandom` — but equally `/dev/random`, `/dev/mem` and any raw
+block device its uid can reach. The Full tier's device set is a *narrowing* of this tier's
+behavior, never a widening of it.
 
 The capability drop described under [W-SEC-005](#w-sec-005) *does* apply on this tier — it is a
 `prctl`/`capset` sequence in the forked child, independent of Landlock — so a root-operated `mur run`
@@ -206,8 +217,9 @@ has **not yet been verified by the team on real Landlock-capable Linux hardware*
 the Landlock scope grants the capsule workdir a near-full access set **and** a narrow, *derived*
 read+execute grant for exactly the `shell.allow` binaries, their ELF interpreter (dynamic loader),
 and the transitive closure of their shared libraries — so an allowlisted program can exec and
-dynamically link outside the workdir, while nothing outside the workdir is writable and no directory
-is granted wholesale. (An earlier revision granted only the workdir, which would have denied every
+dynamically link outside the workdir, while no directory is granted wholesale and the only writable
+path outside the workdir is `/dev/null` (see [the fixed capsule device set](#capsule-device-set)).
+(An earlier revision granted only the workdir, which would have denied every
 allowlisted binary its own `execve`; that has been fixed.) What remains unverified is whether this
 derived-grant mechanism behaves as intended end to end on a real Tier-1 host — the acceptance run
 happens after this ships, not as part of it — so until then, do not rely on the
@@ -289,6 +301,58 @@ is a **narrower rule**, not a silent return to allow-by-default.
 from a root-run capsule's shell subprocess, so it no longer bypasses ordinary file-permission
 checks. That is intended, but it is a real behavior change for root deployments whose shell steps
 relied on root's usual "can read anything" posture.
+
+### The fixed capsule device set { #capsule-device-set }
+
+**Why `/dev/null` has to be writable.** Before this mechanism, *nothing* outside the workdir was
+writable and only the derived read+execute grants were readable — which meant `/dev/null` was not
+openable at all. That is not a strict-but-workable posture, it is a broken one: programs treat
+`/dev/null` as infallible, so the failure surfaces as an unexplained crash in an ordinary tool
+rather than as a policy denial. Every capsule
+on this tier now gets exactly three extra Landlock rules, fixed at compile time
+(`CAPSULE_DEVICE_GRANTS` in `crates/capsule-runtime/src/sandbox.rs`), with **no manifest key** that
+adds a device or removes one:
+
+| Device | Access | Why |
+|---|---|---|
+| `/dev/null` | read **and** write | The one deliberate exception to "nothing outside the workdir is writable". Bare-host `strace` shows Python's `subprocess.DEVNULL` opening it `O_RDWR\|O_CLOEXEC` and a shell `2>/dev/null` redirect opening it `O_WRONLY\|O_CREAT` — a read-only grant fails **both**, and `subprocess.DEVNULL` is reachable from any Python tool a capsule might run. |
+| `/dev/zero` | read only | Zero-fill reads and older allocators' mapping fallbacks. Nothing needs to write it. |
+| `/dev/urandom` | read only | Not for `getrandom(2)` — that is a syscall and needs no filesystem grant — but because OpenSSL and older glibc paths still `open()` the device outright. |
+
+Granting write on `/dev/null` gives up no confidentiality and no integrity: the write side of that
+character device is defined to discard, so there is no state behind it to reach, corrupt, or read
+back. It is the narrowest possible exception — one inode, not `/dev`, not a directory.
+
+**Every other device path is denied, and that needs no new code.** `handle_access` declares the
+full Landlock ABI v1 right-set for the whole domain, so a path with no matching rule is *refused*,
+not merely un-granted. This mechanism only ever *adds* rules, and it adds exactly three. So
+`/dev/random`, `/dev/full`, `/dev/tty`, `/dev/console`, `/dev/mem` and every raw block device stay
+denied by the same mechanism that already denied them — there is no separate deny list to keep in
+sync, and no way for a fourth device to appear except by editing that constant.
+
+**Why `/dev/random` is excluded — and the reasoning that is *not* the reason.** A plausible-sounding
+argument for excluding it is "writing to `/dev/random` contributes entropy to the kernel pool, so a
+capsule could poison it." That argument is **wrong**, and it should not be repeated: a plain
+`write()` to `/dev/random` mixes bytes into the input pool but credits **zero** entropy. Crediting
+entropy requires the `RNDADDENTROPY` ioctl, which requires `CAP_SYS_ADMIN` — which the shell child
+has already dropped along with every other capability (see the capability drop above), on both Linux
+tiers. The real reason is duller and holds up: since Linux 5.6 `/dev/random` blocks until the CRNG
+is initialized while `/dev/urandom` does not, and no workload needs the blocking variant when the
+non-blocking one is granted. It is excluded because nothing has demonstrated a need for it, which is
+the same standard every other device is held to.
+
+**Widening the set is allowed — evidence-first.** If a real workload is observed failing on a
+missing device, add a fourth entry to `CAPSULE_DEVICE_GRANTS` *and record the observed failure* in
+[the acceptance procedure](#manual-acceptance-device-set) alongside it. A widening with no recorded
+failure behind it is how a fixed three-device set turns into an unaudited `/dev` grant.
+
+**Future shape — this mechanism should be retired, not grown.** Enumerating devices path by path is
+the answer for the `scoped` containment class, which is what exists today. Once a `sealed`
+containment class exists, a capsule will get a private `/dev` **tmpfs** carrying the OCI default
+device set, and device access will stop being a Landlock rule list at all — the kernel-visible
+device namespace becomes the boundary instead of a per-path grant. A `sealed` implementation should
+delete `CAPSULE_DEVICE_GRANTS` outright rather than merge with it: two mechanisms describing the
+same device set is exactly the drift this note exists to prevent.
 
 ### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
@@ -977,3 +1041,336 @@ this page, and the "Verified?" column of the [tier table](#subprocess-enforcemen
 actually happened — including the scenario-1 Landlock finding verbatim and the scenario-5
 compatibility outcome. Until that edit lands, every "not yet team-verified" statement on this page
 stands as written.
+
+---
+
+## Manual acceptance procedure — the fixed capsule device set { #manual-acceptance-device-set }
+
+This procedure confirms the [fixed capsule device set](#capsule-device-set) described under
+[W-SEC-005](#w-sec-005) — that a capsule can read *and write* `/dev/null`, can read but not write
+`/dev/zero` and `/dev/urandom`, and cannot open any other device at all — on real hardware.
+**It is deliberately not automated.** There is deliberately *no* committed test that asserts "a
+capsule can write `/dev/null`" or "a capsule cannot open `/dev/random`", and a green `cargo
+test`/CI run is not evidence for either: this repo's CI has never resolved to a tier where
+`apply_landlock_scope` is even called, and the dev machine is macOS, where the code does not
+compile. The committed unit tests (`sandbox::tests::capsule_device_grants_*`) assert only what a
+Rust constant holds, not what a kernel does. Until someone runs the steps below and records the
+result, the mechanism is *implemented*, not *verified*.
+
+Scenario 1 is the correctness fix (a read-only `/dev/null` breaks ordinary Python and shell code).
+Scenario 4 is the security claim. Scenario 6 is a compatibility check and is the one most likely to
+come back negative — run it before treating the three-device set as broadly safe.
+
+### Prerequisites
+
+- A **real, uncontainerized** Linux host with kernel ≥5.13. Not Docker, not a rootless container,
+  not WSL. Unlike the [AF_UNIX procedure](#manual-acceptance-af-unix), **only the Full tier is
+  meaningful here**: this is a pure Landlock mechanism, so on `KernelSeccompOnly` every scenario
+  below "passes" for the wrong reason (no Landlock domain exists, so nothing is denied) and gives a
+  false pass on scenario 4.
+- A checkout of this repository, a working `cargo`, `python3`, and `strace`.
+- `root` is **not** required and is better avoided — the device grants are uid-independent, and a
+  root run muddies scenario 4 (a non-root refusal could be ordinary DAC rather than Landlock).
+  Where a scenario needs root, it says so.
+
+Confirm the tier the host resolves to before anything else:
+
+```bash
+cd /path/to/murmur
+cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::kernel_tier_allows_exec_within_shell_allowlist \
+  -- --nocapture
+```
+
+A `SKIP — PROVES NOTHING` line in that output means the host is not on a kernel tier and **the rest
+of this procedure is meaningless on this machine**. Stop and find a different host.
+
+### Scenario 0 — re-establish the premise on the bare host (no murmur involved)
+
+The whole reason `/dev/null` is writable is the open flags real code uses. Confirm them on this
+host, outside the sandbox, so the rest of the procedure is anchored to observed behavior rather
+than to this page:
+
+```bash
+# Python's subprocess.DEVNULL — expect O_RDWR|O_CLOEXEC. A read-only Landlock grant fails this.
+strace -f -e trace=openat -o /tmp/devnull-python.strace \
+  python3 -c 'import subprocess; subprocess.run(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'
+grep '/dev/null' /tmp/devnull-python.strace
+
+# A shell 2>/dev/null redirect — expect O_WRONLY|O_CREAT. A read-only grant fails this too.
+strace -f -e trace=openat -o /tmp/devnull-bash.strace bash -c 'ls /nonexistent 2>/dev/null'
+grep '/dev/null' /tmp/devnull-bash.strace
+```
+
+- **Expected:** `O_RDWR|O_CLOEXEC` in the first, `O_WRONLY|O_CREAT` in the second.
+- **If either differs on this host/libc/Python version:** record the actual flags here before
+  going further. They are the justification for the `WriteFile` bit, and if they change, the
+  justification has to be rewritten rather than assumed.
+- Note on the `O_CREAT`: it costs nothing extra. Landlock only checks `MakeReg` when a file is
+  actually created, and `/dev/null` already exists — so the redirect needs `WriteFile` and nothing
+  more. If scenario 1's redirect fails with `EACCES` while the direct write succeeds, that premise
+  is wrong on this kernel and is worth recording.
+
+### Scratch harness
+
+Scenarios 1–5 drive `shell::execute_shell` directly, which is crate-private, so they run from a
+scratch test appended to `crates/capsule-runtime/src/sandbox.rs`. **Do not commit it.** Append this
+to the end of `mod linux_integration_tests` (just before that module's closing brace) — it reuses
+that module's existing `kernel_full_enforcement` helper, so it builds the same enforcement
+`ShellEnforcement::resolve` would:
+
+```rust
+    #[test]
+    fn scratch_device_set_acceptance() {
+        let tier = detect_enforcement_tier();
+        eprintln!("TIER: {tier:?}");
+        if tier != EnforcementTier::KernelFull {
+            eprintln!("SKIP — PROVES NOTHING: device grants only exist on KernelFull");
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "python3".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement = kernel_full_enforcement(tier, &policy);
+
+        let script = std::env::var("SCRATCH_SCRIPT").expect("set SCRATCH_SCRIPT");
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", &script],
+            &[],
+            workdir.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell must return Ok, not Err");
+        eprintln!("EXIT: {}", result.exit_code);
+        eprintln!("OUT: {}", result.stdout);
+        eprintln!("ERR: {}", result.stderr);
+    }
+```
+
+Run one scenario at a time with:
+
+```bash
+SCRATCH_SCRIPT='<the script for this scenario>' \
+  cargo test -p capsule-runtime --lib \
+  sandbox::linux_integration_tests::scratch_device_set_acceptance -- --nocapture --exact
+```
+
+When you are done: `git checkout crates/capsule-runtime/src/sandbox.rs`.
+
+### Scenario 1 — `/dev/null` is readable and writable
+
+This is the correctness fix. All four sub-checks must pass; each one is a distinct open shape.
+
+```bash
+SCRATCH_SCRIPT='
+# 1a: the shell redirect — O_WRONLY|O_CREAT. If bash cannot open /dev/null for the redirect it
+#     never runs the command at all and the `if` takes the else branch.
+if true 2>/dev/null; then echo 1a_REDIRECT_OK; else echo 1a_REDIRECT_FAILED; fi
+# 1b: an explicit write — O_WRONLY
+if echo hello > /dev/null; then echo 1b_WRITE_OK; else echo 1b_WRITE_FAILED; fi
+# 1c: a read — O_RDONLY, must return EOF immediately
+if head -c 1 /dev/null >/dev/null 2>&1; then echo 1c_READ_OK; else echo 1c_READ_FAILED; fi
+# 1d: subprocess.DEVNULL — O_RDWR|O_CLOEXEC, the shape a read-only grant breaks
+python3 -c "
+import subprocess
+try:
+    subprocess.run([\"true\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(\"1d_DEVNULL_OK\")
+except OSError as e:
+    print(\"1d_DEVNULL_FAILED\", e.errno, e.strerror)
+"
+'
+```
+
+- **Expected (fixed):** `1a_REDIRECT_OK`, `1b_WRITE_OK`, `1c_READ_OK`, `1d_DEVNULL_OK`.
+- **Regression (unfixed / read-only grant):** `1a_REDIRECT_FAILED`, `1b_WRITE_FAILED` and/or
+  `1d_DEVNULL_FAILED 13 Permission denied`. Errno 13 is `EACCES` — the Landlock denial. This is the
+  exact failure the `WriteFile` bit exists to prevent, and it is why `/dev/null` cannot be granted
+  read-only.
+- **If `1d` fails but `1b` passes:** the grant is `WriteFile`-only rather than
+  `ReadFile | WriteFile`. `subprocess.DEVNULL` needs both.
+
+Confirm the write really is a discard and not, say, a file shadowed inside the workdir:
+
+```bash
+SCRATCH_SCRIPT='echo some-bytes > /dev/null; echo "SIZE=$(stat -c %s /dev/null)"; stat -c "TYPE=%F" /dev/null'
+```
+
+- **Expected:** `SIZE=0` and `TYPE=character special file`. Anything else means you are not writing
+  to the real device node.
+
+### Scenario 2 — `/dev/zero` and `/dev/urandom` are readable
+
+```bash
+SCRATCH_SCRIPT='
+head -c 16 /dev/zero | od -An -tx1 | tr -d " \n"; echo " <- 2a_ZERO"
+head -c 16 /dev/urandom | wc -c; echo "^ 2b_URANDOM_BYTES"
+python3 -c "
+import ssl, os
+print(\"2c_OPENSSL_RAND\", len(os.urandom(32)))
+with open(\"/dev/urandom\", \"rb\") as f:
+    print(\"2d_EXPLICIT_OPEN_OK\", len(f.read(32)))
+"
+'
+```
+
+- **Expected:** sixteen `00` bytes for `2a`, `16` for `2b`, `2c_OPENSSL_RAND 32`, and
+  `2d_EXPLICIT_OPEN_OK 32`. `2d` is the one that matters — it is the explicit `open()` path
+  OpenSSL and older glibc take, which `getrandom(2)` would not exercise.
+- **Regression:** any `Permission denied`. The read-only grants are not being added.
+
+### Scenario 3 — `/dev/zero` and `/dev/urandom` are **not** writable
+
+The read-only grants must be exactly that. This is what keeps `/dev/null` the *sole* writable path
+outside the workdir.
+
+```bash
+SCRATCH_SCRIPT='
+for dev in /dev/zero /dev/urandom; do
+  if echo x > "$dev" 2>/dev/null; then echo "WRITABLE $dev  <- REGRESSION"; else echo "REFUSED $dev"; fi
+done
+python3 -c "
+for dev in (\"/dev/zero\", \"/dev/urandom\"):
+    try:
+        open(dev, \"wb\").write(b\"x\"); print(\"WRITABLE\", dev, \"<- REGRESSION\")
+    except OSError as e:
+        print(\"REFUSED\", dev, e.errno, e.strerror)
+"
+'
+```
+
+- **Expected:** `REFUSED` for both, errno 13 (`EACCES`).
+- **Note:** on many hosts `/dev/zero` and `/dev/urandom` are mode `0666`, so a *non*-sandboxed
+  write to them succeeds. Run the same two python lines on the bare host first to confirm that —
+  otherwise a `REFUSED` here could be ordinary DAC rather than Landlock, and the scenario proves
+  nothing.
+- **Regression:** `WRITABLE` for either — the `writable` bit is being set for more than
+  `/dev/null`.
+
+### Scenario 4 — every other device is refused
+
+This is the security claim. It needs no new code to hold — `handle_access` declares the full ABI v1
+right-set, so an unlisted path is denied — but "needs no code" is not "verified".
+
+```bash
+SCRATCH_SCRIPT='
+python3 -c "
+import os
+for dev in (\"/dev/random\", \"/dev/full\", \"/dev/tty\", \"/dev/console\", \"/dev/mem\",
+            \"/dev/kmsg\", \"/dev/ptmx\", \"/dev/sda\", \"/dev/nvme0n1\", \"/dev/loop0\"):
+    if not os.path.exists(dev):
+        print(\"ABSENT\", dev); continue
+    try:
+        os.close(os.open(dev, os.O_RDONLY))
+        print(\"OPENED\", dev, \"<- REGRESSION\")
+    except OSError as e:
+        print(\"REFUSED\", dev, e.errno, e.strerror)
+try:
+    print(\"LISTED /dev:\", len(os.listdir(\"/dev\")), \"entries <- REGRESSION\")
+except OSError as e:
+    print(\"REFUSED listdir /dev\", e.errno, e.strerror)
+"
+'
+```
+
+- **Expected:** `REFUSED` (errno 13, `EACCES`) or `ABSENT` for every entry, and
+  `REFUSED listdir /dev` — no rule names `/dev` itself, so the directory is not enumerable and
+  `ReadDir` was never granted on any device.
+- **Substitute the right block device** for this host: run `lsblk -dno NAME` on the bare host and
+  put the real device names into the list. `ABSENT` for every block device is a **weak** result —
+  find one that actually exists, or the most important half of this scenario went untested.
+- **`/dev/mem` and raw block devices need root to be meaningful.** A non-root refusal there is
+  ordinary DAC, not Landlock. Re-run *just this scenario* under `sudo -E` and confirm the refusal
+  is still errno 13: as root without Landlock those opens would succeed, so a root `REFUSED` is
+  the result that carries weight.
+- **Regression:** any `OPENED`, or a successful `/dev` listing. Either means the grant is wider
+  than three inodes — check whether a rule was added on `/dev` rather than on the individual
+  device nodes.
+
+### Scenario 5 — a missing device degrades, it does not crash the launch
+
+The parent skips a device it cannot open (shrink-not-fail in `open_landlock_fds`), the same as an
+unresolvable `shell.allow` grant. A host with a broken or minimal `/dev` must therefore lose that
+one device, not lose the capsule. Reproduce it in a private mount namespace, where a tmpfs over
+`/dev` makes `/dev/urandom` genuinely absent — so the parent's `open()` fails with `ENOENT` for any
+uid, rather than for a permission reason that root would bypass:
+
+```bash
+sudo unshare --mount bash -c '
+  mount -t tmpfs tmpfs /dev
+  mknod /dev/null    c 1 3 && chmod 666 /dev/null
+  mknod /dev/zero    c 1 5 && chmod 666 /dev/zero
+  # /dev/urandom deliberately NOT created — this is the missing-device case.
+  cd /path/to/murmur
+  SCRATCH_SCRIPT="echo probe > /dev/null && echo NULL_STILL_OK; head -c 4 /dev/urandom | wc -c" \
+    cargo test -p capsule-runtime --lib \
+    sandbox::linux_integration_tests::scratch_device_set_acceptance -- --nocapture --exact
+'
+```
+
+- **Expected:** the test still prints `TIER:`/`EXIT:`/`OUT:`/`ERR:` — the launch **succeeds** — with
+  `NULL_STILL_OK` in the output and the `/dev/urandom` read failing. Losing one device narrows the
+  scope and leaves the other two intact; it must never abort the capsule.
+- **Regression:** `execute_shell` returns `Err`, or the test panics on its `.expect`. That would
+  make a broken `/dev` entry a launch-killing failure, which is the opposite of the intended
+  shrink-not-fail behavior.
+- **If the namespace trick is impractical on this host** (some `cargo`/toolchain setups object to a
+  synthetic `/dev`), record this scenario as **not run** rather than as passed. Do not substitute
+  `chmod 000 /dev/urandom`: the harness runs as root there, and root's `CAP_DAC_OVERRIDE` makes the
+  parent `open()` succeed anyway, so it tests nothing.
+
+### Scenario 6 — full SWE-bench workload compatibility (the one that may fail)
+
+Three devices is a deliberate floor, not a survey of what real tooling opens. Whether it is
+*sufficient* for the workloads this project runs is an empirical question. **Run the full SWE-bench
+workload, not a sample**, on a host resolving to `KernelFull`:
+
+```bash
+cd /path/to/murmur
+# Baseline first — with the device set in place, since there is no "off" switch to compare against
+# (this is not a manifest flag). To get a true baseline, temporarily comment out the device loop in
+# `apply_landlock_scope` and rebuild; that is the pre-card behavior.
+<your-swe-bench-invocation> 2>&1 | tee /tmp/swebench-devices-none.log
+
+# Then the shipped behavior — restore the loop, rebuild, run again.
+<your-swe-bench-invocation> 2>&1 | tee /tmp/swebench-devices-three.log
+
+# Compare resolved/failed counts and diff the failure sets.
+diff <(grep -E '^(PASS|FAIL)' /tmp/swebench-devices-none.log | sort) \
+     <(grep -E '^(PASS|FAIL)' /tmp/swebench-devices-three.log | sort)
+```
+
+Then check for the specific suspects — a missing device usually fails quietly, as a confusing
+downstream error rather than a named denial:
+
+```bash
+grep -iE '/dev/(null|zero|urandom|random|tty|full|pts)|Permission denied.*dev|No such device|not a tty|Inappropriate ioctl' \
+  /tmp/swebench-devices-three.log | head -40
+```
+
+- **Expected:** the three-device run is **strictly better than or equal to** the baseline — every
+  task that passed before still passes, and some that failed on a `/dev/null` denial now pass. That
+  asymmetry is the point: this card only ever adds grants, so it cannot make a workload worse
+  unless something else regressed.
+- **If a task fails only in the three-device run:** that is not a widening problem, it is a bug —
+  investigate before shipping.
+- **If a task fails in *both* runs on a device that is not in the set** (`/dev/tty` for an
+  interactive-terminal check, `/dev/pts/*` for a pty, `/dev/fd/*` for process substitution): record
+  the task ID, the device, and the exact failing call **here**, then decide whether to add a fourth
+  entry to `CAPSULE_DEVICE_GRANTS`. Add it *with* the recorded failure. Do **not** widen to `/dev`
+  wholesale, and do not add a device on suspicion alone.
+
+### Recording the result
+
+Update the [W-SEC-005](#w-sec-005) and [W-SEC-002](#w-sec-002) sections, the
+[fixed capsule device set](#capsule-device-set) subsection, the callout at the top of this page, and
+the "Verified?" column of the [tier table](#subprocess-enforcement-tiers) with what actually
+happened — including scenario 0's observed `openat` flags verbatim, scenario 4's result under root
+against a real block device, and the scenario-6 compatibility outcome. If scenario 6 justified a
+fourth device, the recorded failure goes in scenario 6 above, next to the widening it caused. Until
+that edit lands, every "not yet team-verified" statement on this page stands as written.
