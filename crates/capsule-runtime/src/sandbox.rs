@@ -1788,6 +1788,9 @@ pub(crate) fn attach_process_limits(
             }
             Ok(())
         });
+    }
+}
+
 /// Lowest file descriptor the fd-hygiene step touches. Everything from here upward is marked
 /// close-on-exec in the forked child; fds 0, 1 and 2 are deliberately left alone.
 ///
