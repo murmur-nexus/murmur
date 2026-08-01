@@ -2897,6 +2897,7 @@ mod tests {
             spawn: None,
             env: None,
             limits: None,
+            containment: None,
         };
         HookCapabilityGrant::derive(Some(&caps)).expect("grant is valid")
     }

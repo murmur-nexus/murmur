@@ -4,7 +4,9 @@ mod common;
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use capsule_runtime::{stage_session, ArtifactRequest, CapabilityPolicy, StageRequest};
-use murmur_artifact::{ArtifactRuntime, InferenceConfig, InferenceDriver, LocalRegistry};
+use murmur_artifact::{
+    ArtifactRuntime, ContainmentClass, InferenceConfig, InferenceDriver, LocalRegistry,
+};
 
 const SHELL_DESC_DRIVER_NAME: &str = "murmur-driver-shell-desc";
 const SHELL_DESC_DRIVER_VERSION: &str = "0.1.0";
@@ -99,6 +101,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .expect("stage_session should succeed");
@@ -194,6 +197,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -292,6 +296,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .expect("stage_session should succeed");

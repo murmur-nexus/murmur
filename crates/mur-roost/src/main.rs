@@ -310,6 +310,13 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         bind_addr: "127.0.0.1".to_string(),
         internal_port: manifest.network.as_ref().and_then(|n| n.internal_port),
         job_id: Some(job_id.clone()),
+        // The spawned child's own manifest is the only source of a floor here — roost has no
+        // CLI flag and reads no workspace config on the child's behalf.
+        declared_containment_floor: manifest
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.containment)
+            .unwrap_or_default(),
     };
     {
         let mut jobs = state.jobs.lock().unwrap();

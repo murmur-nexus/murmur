@@ -3,6 +3,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use murmur_artifact::ContainmentClass;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -17,6 +18,8 @@ pub(crate) struct TraceWriter {
     capsule_version: String,
     model: String,
     capabilities: Vec<String>,
+    containment_declared: ContainmentClass,
+    containment_achieved: ContainmentClass,
     include_tool_output: bool,
     session_start_time: Instant,
     session_started: bool,
@@ -62,6 +65,12 @@ struct SessionStartEvent {
     max_turns: u32,
     capabilities: Vec<String>,
     tools_declared: Vec<String>,
+    /// Strongest containment class any source asked for. A *requirement*, not an observation.
+    containment_declared: ContainmentClass,
+    /// What the host's kernel actually provided, derived from the probed enforcement tier
+    /// alone. Reading these two together is how a session's trace shows whether the capsule
+    /// ran under the containment its operator asked for.
+    containment_achieved: ContainmentClass,
 }
 
 #[derive(Serialize)]
@@ -249,6 +258,7 @@ struct HookDispatchErrorEvent {
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         workdir: &Path,
         session_id: String,
@@ -256,6 +266,8 @@ impl TraceWriter {
         capsule_version: String,
         model: String,
         capabilities: Vec<String>,
+        containment_declared: ContainmentClass,
+        containment_achieved: ContainmentClass,
         include_tool_output: bool,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
@@ -270,6 +282,8 @@ impl TraceWriter {
             capsule_version,
             model,
             capabilities,
+            containment_declared,
+            containment_achieved,
             include_tool_output,
             session_start_time: Instant::now(),
             session_started: false,
@@ -304,6 +318,8 @@ impl TraceWriter {
             max_turns,
             capabilities: self.capabilities.clone(),
             tools_declared,
+            containment_declared: self.containment_declared,
+            containment_achieved: self.containment_achieved,
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -671,6 +687,8 @@ mod tests {
             "1.0.0".to_string(),
             "claude-test".to_string(),
             vec!["shell".to_string()],
+            ContainmentClass::Advisory,
+            ContainmentClass::Advisory,
             include_tool_output,
         )
         .await
@@ -706,7 +724,35 @@ mod tests {
         assert_eq!(e["max_turns"], 10);
         assert_eq!(e["capabilities"], serde_json::json!(["shell"]));
         assert_eq!(e["tools_declared"], serde_json::json!(["bash"]));
+        assert_eq!(e["containment_declared"], "advisory");
+        assert_eq!(e["containment_achieved"], "advisory");
         assert!(e["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    /// A declared floor and an achieved class are recorded independently — the trace shows
+    /// what was asked for next to what the host actually gave, not one derived from the other.
+    #[tokio::test]
+    async fn session_start_records_declared_and_achieved_containment_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = TraceWriter::open(
+            dir.path(),
+            "test-session-id".to_string(),
+            "test-capsule".to_string(),
+            "1.0.0".to_string(),
+            "claude-test".to_string(),
+            Vec::new(),
+            ContainmentClass::Scoped,
+            ContainmentClass::Scoped,
+            false,
+        )
+        .await
+        .unwrap();
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events[0]["containment_declared"], "scoped");
+        assert_eq!(events[0]["containment_achieved"], "scoped");
     }
 
     #[tokio::test]

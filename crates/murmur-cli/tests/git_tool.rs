@@ -23,7 +23,10 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
     StageRequest,
 };
-use murmur_artifact::{load_runtime_manifest, ArtifactMeta, ArtifactRuntime, LocalRegistry, Registry, RuntimeType};
+use murmur_artifact::{
+    load_runtime_manifest, ArtifactMeta, ArtifactRuntime, ContainmentClass, LocalRegistry, Registry,
+    RuntimeType,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
@@ -257,6 +260,7 @@ fn stage_git_tool_session(
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .unwrap()

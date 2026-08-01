@@ -6,16 +6,18 @@ use std::{
 };
 
 use capsule_runtime::{
-    capability_policy_from_runtime_manifest, launch_session, stage_session, AfterTask,
-    ArtifactRequest, LifecycleOverride, LockExpectation, RuntimeError, StageRequest,
+    capability_policy_from_runtime_manifest, explain_scope, launch_session, stage_session,
+    AfterTask, ArtifactRequest, LifecycleOverride, LockExpectation, RuntimeError, StageRequest,
     TaskAcceptance,
 };
 use murmur_artifact::{
-    current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
-    write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact,
-    LockedSha256, LockfileError, MurmurLock, Registry, ResolvedArtifact, LOCK_VERSION,
+    current_platform, effective_containment_floor, load_dotenv_non_override,
+    load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
+    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, Registry,
+    ResolvedArtifact, LOCK_VERSION,
 };
 
+use crate::config::load_effective_mur_config_if_any_exists;
 use crate::error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008};
 
 use super::{fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus};
@@ -30,6 +32,7 @@ fn fail(session_id: &str, workdir: &std::path::Path, error: CliError, json: bool
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_run(
     manifest_arg: &Path,
     task_arg: Option<&str>,
@@ -40,6 +43,8 @@ pub(crate) fn run_run(
     verbose: bool,
     bind_addr: &str,
     no_env_file: bool,
+    containment_arg: Option<&str>,
+    explain_scope_only: bool,
 ) -> Result<(), CliError> {
     let mut session_id = "n/a".to_string();
     let mut workdir = std::env::current_dir()
@@ -102,6 +107,43 @@ pub(crate) fn run_run(
         }
     }
 
+    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+
+    // The containment floor is the strongest class any of the three sources asked for. This is
+    // the only reason `mur run` reads a MurConfig at all — no other run behavior is configurable
+    // from the workspace files.
+    let cli_containment = parse_containment_flag(containment_arg, &session_id, &workdir, json)?;
+    let workspace_containment = load_effective_mur_config_if_any_exists()
+        .map_err(|error| fail(&session_id, &workdir, error, json))?
+        .and_then(|config| config.containment);
+    let declared_containment_floor = effective_containment_floor(
+        workspace_containment,
+        runtime_manifest
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.containment),
+        cli_containment,
+    );
+
+    // A diagnostic, not an enforcement gate: it reports even when the floor is unmet and exits
+    // 0. Placed ahead of every side effect — no PATH pre-flight, no registry, no workdir, no
+    // staging — so it stays fast and read-only.
+    if explain_scope_only {
+        let report = explain_scope(&capability_policy, declared_containment_floor);
+        if json {
+            let line = serde_json::to_string(&report).map_err(|source| {
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to serialize scope report: {source}"),
+                )
+            })?;
+            println!("{line}");
+        } else {
+            print!("{}", report.render());
+        }
+        return Ok(());
+    }
+
     // Pre-flight: for process transport, verify the CLI binary is on PATH before staging.
     if let Some(ref inference) = runtime_manifest.inference {
         if inference.transport == "process" {
@@ -120,8 +162,6 @@ pub(crate) fn run_run(
             }
         }
     }
-
-    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::with_capacity(runtime_manifest.artifacts.len());
@@ -268,6 +308,7 @@ pub(crate) fn run_run(
         bind_addr: bind_addr.to_string(),
         internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
         job_id: None,
+        declared_containment_floor,
     };
 
     let staged = stage_session(Arc::new(local_registry), stage_request)
@@ -472,6 +513,30 @@ fn check_artifacts_installed(
         format!("missing artifacts: {}", missing.join(", ")),
         "run `mur install` to install all manifest dependencies",
     ))
+}
+
+/// Validates `--containment` against the three class names, with the same shape as
+/// `parse_lifecycle_override` below: a bad value is an `E-IO-003` naming the accepted set and
+/// the offending input, not a bespoke error code for this one flag. `None` in means the flag was
+/// not passed, which contributes nothing to the floor.
+fn parse_containment_flag(
+    value: Option<&str>,
+    session_id: &str,
+    workdir: &std::path::Path,
+    json: bool,
+) -> Result<Option<ContainmentClass>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    value.parse::<ContainmentClass>().map(Some).map_err(|error| {
+        fail(
+            session_id,
+            workdir,
+            CliError::new(E_IO_003, format!("--containment {error}")),
+            json,
+        )
+    })
 }
 
 fn parse_lifecycle_override(
