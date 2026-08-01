@@ -60,6 +60,7 @@ fn hook_debug_writes_lifecycle_jsonl() {
     assert_eq!(
         names,
         vec![
+            "stage",
             "session-start",
             "inference",
             "tool-call",
@@ -69,7 +70,17 @@ fn hook_debug_writes_lifecycle_jsonl() {
         ]
     );
 
-    let session_id = events[0]["session_id"].as_str().unwrap();
+    // Look events up by name, never by index. The lifecycle gains events over time
+    // (`stage` arrived exactly this way), and a positional index silently starts
+    // asserting against the wrong event when it does.
+    let find = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["event"] == name)
+            .unwrap_or_else(|| panic!("no {name} event in {names:?}"))
+    };
+
+    let session_id = find("session-start")["session_id"].as_str().unwrap();
     assert!(
         session_id.starts_with("ses_"),
         "session_id must start with ses_"
@@ -79,7 +90,7 @@ fn hook_debug_writes_lifecycle_jsonl() {
         36,
         "session_id must be 36 chars (ses_ + 32 hex)"
     );
-    assert_eq!(events[5]["exit_status"], "ok");
+    assert_eq!(find("session-end")["exit_status"], "ok");
 }
 
 fn create_manifest(project_dir: &std::path::Path, endpoint: &str) -> PathBuf {
