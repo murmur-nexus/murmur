@@ -454,6 +454,8 @@ mur run [--manifest <path>] [--input <path>] [--json]
 | `--task` | — | File to copy into the capsule workdir as `task.md` before launch |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
+| `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](manifest-schema.md#field-containment) |
+| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no registry pull, no component compile, no workdir. Reports even when the declared floor is not met. See [`--explain-scope`](manifest-schema.md#explain-scope) |
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory
@@ -510,6 +512,15 @@ Field semantics:
 **Startup latency:** The JSON line is written after the TCP port is bound and the HTTP server is listening, but callers should connect with retry/backoff since a small window exists between port binding and the accept loop processing the first request.
 
 **Error behavior:** If `mur run --json` fails before port binding (e.g. bad manifest path, missing artifact), stdout is empty — no JSON is emitted and no human-readable output appears on stdout. The error message goes to stderr. Exit code is non-zero.
+
+### Containment floor
+
+Before any registry resolution, component compile, or workdir creation, `mur run` checks the
+declared containment floor against what the host can actually achieve. If the host falls short,
+the run is refused with `error[E-CAP-003]` and no workdir is created. See
+[Containment class](manifest-schema.md#field-containment) for the declaration sources and
+[`--explain-scope`](manifest-schema.md#explain-scope) for a read-only way to inspect the floor
+without launching.
 
 ---
 
@@ -881,6 +892,8 @@ in a session), and `timestamp` (Unix milliseconds).
 | `max_turns` | u32 |
 | `capabilities` | string[] |
 | `tools_declared` | string[] |
+| `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the effective declared floor, always present even when no manifest/config/flag ever declared one (defaults to `"advisory"`) |
+| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — derived from the host's kernel capability alone, never from the manifest |
 
 **`inference`** — written after each driver response is parsed
 
@@ -1438,6 +1451,7 @@ Where both files set a value, the effective config is built per field:
 | `inference.api_key` | **Always** the global value — see below |
 | `registry.sources` | Union by `name`: a project entry sharing a global entry's name replaces it in place (position preserved); a project entry with a new name is appended; global-only entries are never dropped |
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
+| `containment` | **Strongest wins**, not project-wins — see [Containment class](manifest-schema.md#field-containment) |
 
 If the project file does not exist, the effective config is exactly the global config (with
 built-in defaults applied where global is also empty).
@@ -1616,6 +1630,7 @@ Remote mode requires:
 | `E-RUN-006` | Inference driver artifact not installed |
 | `E-RUN-007` | Agent loop failed at runtime |
 | `E-RUN-008` | Required artifact not installed locally |
+| `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host |
 | `E-IO-001` | File or directory not found |
 | `E-IO-003` | General I/O error (read/write failure) |
 | `E-DEPLOY-003` | SSH connection or remote command failed |

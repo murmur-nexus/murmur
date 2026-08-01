@@ -37,10 +37,10 @@ use crate::{
     a2a::{IncomingTask, TaskRegistry, TaskState},
     agent,
     artifact::{extract_manifest_yaml, extract_native_binary, extract_root_wasm, extract_skill_md},
-    containment::{check_containment_floor, detect_achieved_containment},
     bindings::host::murmur::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
+    containment::{check_containment_floor, detect_achieved_containment},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,

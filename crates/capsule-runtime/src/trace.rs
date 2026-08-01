@@ -741,7 +741,7 @@ mod tests {
             "1.0.0".to_string(),
             "claude-test".to_string(),
             Vec::new(),
-            ContainmentClass::Scoped,
+            ContainmentClass::Sealed,
             ContainmentClass::Scoped,
             false,
         )
@@ -751,7 +751,7 @@ mod tests {
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
-        assert_eq!(events[0]["containment_declared"], "scoped");
+        assert_eq!(events[0]["containment_declared"], "sealed");
         assert_eq!(events[0]["containment_achieved"], "scoped");
     }
 

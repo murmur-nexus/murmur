@@ -201,23 +201,15 @@ impl From<RuntimeError> for CliError {
             // Delegate the message to the RuntimeError Display text so the declared/achieved
             // pair and the missing-mechanism reason cannot drift from capsule-runtime's
             // `containment` module, which is what actually decided the refusal.
-            RuntimeError::ContainmentFloorUnmet {
-                declared,
-                achieved,
-                reason,
+            error @ RuntimeError::ContainmentFloorUnmet {
+                declared, achieved, ..
             } => {
                 let hint = format!(
                     "lower the declared floor to '{achieved}' (capabilities.containment in \
                      murmur.yaml, containment in .murmur/config.yaml, or --containment), or run \
                      on a host that provides '{declared}'"
                 );
-                let message = RuntimeError::ContainmentFloorUnmet {
-                    declared,
-                    achieved,
-                    reason,
-                }
-                .to_string();
-                CliError::with_hint(E_CAP_003, message, hint)
+                CliError::with_hint(E_CAP_003, error.to_string(), hint)
             }
             // Delegate to the RuntimeError Display text so the versioned interface
             // name and rebuild hint can't drift from capsule-runtime's errors.rs.

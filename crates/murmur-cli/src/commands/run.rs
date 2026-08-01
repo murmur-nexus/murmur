@@ -17,8 +17,10 @@ use murmur_artifact::{
     ResolvedArtifact, LOCK_VERSION,
 };
 
-use crate::config::load_effective_mur_config_if_any_exists;
-use crate::error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008};
+use crate::{
+    config::load_effective_mur_config_if_any_exists,
+    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008},
+};
 
 use super::{fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus};
 
