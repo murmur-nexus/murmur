@@ -351,6 +351,16 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.limits.table_elements` | integer | no | cap on a guest's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | cap on the number of instances a single store may create. Default: 1000. Must be > 0. |
 | `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single guest invocation (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes). Must be > 0. |
+| `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how many processes past the runtime's own uid baseline its tree may add. Default: 128. Must be > 0. See the per-uid note below. |
+| `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
+| `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
+| `capabilities.resources.cpu_seconds` | integer | no | `RLIMIT_CPU` hard ceiling on each native subprocess, in CPU-seconds. Default: 3600 (1 hour). Must be > 0. |
+| `capabilities.resources.memory_bytes` | integer | no | `RLIMIT_AS` (Linux) hard ceiling on each native subprocess's address space, in bytes. Default: 2147483648 (2 GiB). Must be > 0. macOS maps this to `RLIMIT_DATA`, which its kernel does not enforce — see the platform note below. |
+| `capabilities.resources.cgroup_memory_bytes` | integer | no | cgroup v2 `memory.max` — aggregate memory across the whole subprocess tree, in bytes. Default: 4294967296 (4 GiB). Must be > 0. Linux only. |
+| `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
+| `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
+| `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
+| `capabilities.resources.workdir_max_bytes` | integer | no | ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
 | `capabilities.containment` | string | no | minimum containment class this capsule requires: `advisory`, `scoped`, or `sealed` (ascending strength). Omitted means the capsule states no requirement — see [Containment class](#field-containment) below. Only meaningful capsule-wide; declaring it on a per-artifact (tool/driver/hook) entry has no effect and warns at staging |
 | `network.internal_port` | integer | no | Capsule-declared internal service port. The local runtime currently binds an OS-assigned external localhost port for `MURMUR_CAPSULE_URL`; when omitted, the intended internal default is `14159`. |
 
@@ -798,6 +808,84 @@ capabilities:
   fired; a guest that grows past `memory_bytes` or `table_elements` traps with an `E-RUN-001`
   naming the limit and the size it tried to reach. Both are distinguishable from a plain guest
   panic — see [CLI error codes](cli.md#error-codes).
+
+### Host resource limits
+
+`capabilities.resources` bounds the **operating-system processes** the runtime spawns for
+`capabilities.shell.allow` binaries and for native-implementation tool artifacts. It is a
+different subject from `capabilities.limits` above, which bounds a WASM *guest* inside its
+wasmtime store: a capsule that cannot escape its containment can still wedge its host by forking,
+allocating, opening files or writing without bound. That is denial of service, not a containment
+escape — nothing outside the capsule's granted scope is read, written, or reached — but the host
+is wedged either way.
+
+Every field is optional and independently defaulted; omitting the whole block is equivalent to
+omitting every field. **A silent manifest means defaults, never "unlimited"** — the same rule
+`capabilities.limits` already follows.
+
+```yaml
+capabilities:
+  shell:
+    allow: [bash]
+  resources:
+    max_processes: 32
+    max_open_files: 64
+    cpu_seconds: 60
+    cgroup_pids_max: 64
+    workdir_max_bytes: 1073741824   # 1 GiB
+```
+
+Three mechanisms enforce these, in descending order of portability:
+
+- **`setrlimit(2)` ceilings**, applied to every spawned subprocess before `execve` on every
+  platform. They are set as **hard** limits (`rlim_cur == rlim_max`), not soft ones: an
+  unprivileged process may raise its own soft limit up to the hard one at any time, so a
+  soft-only cap is advisory against a hostile capsule. From inside a capsule, `ulimit -Hn`
+  reports the configured ceiling and any attempt to raise past it is refused by the kernel. A
+  value above the runtime's own inherited hard limit is clamped down to it rather than rejected.
+  `RLIMIT_CORE` is additionally pinned to `0` with no manifest surface at all.
+
+    `max_processes` is the one field applied as **headroom rather than an absolute number**, and
+    the reason is `RLIMIT_NPROC`'s own semantics: it counts every process owned by the *uid*, not
+    the ones in the capsule's tree. A workstation account routinely runs several hundred, so a
+    literal hard ceiling of 128 would not bound the capsule at 128 processes — it would make the
+    subprocess's very first `fork()` fail with `EAGAIN` before the capsule did anything. The
+    runtime therefore measures the uid's process count once at launch and sets
+    `RLIMIT_NPROC = baseline + max_processes`. The Linux cgroup `pids.max` needs no such
+    adjustment, because it counts only the tasks in the capsule's own scope — which is exactly
+    why it, and not this field, is the bound that actually stops a fork bomb.
+- **A cgroup v2 scope** around the whole subprocess tree (`cgroup_*` fields), **Linux only**.
+  This is what rlimits structurally cannot do: `RLIMIT_NPROC` is a per-**uid** ceiling, so a fork
+  bomb of distinct, short-lived processes evades it; `pids.max` on a cgroup does not.
+- **A periodic workdir-size check** (`workdir_max_bytes`), on every platform. A breach is caught
+  within one poll interval — not at the instant it happens — and terminates the session with
+  `E-RUN-013`. The interval is an internal constant, not a manifest key.
+
+Setting any field to `0` is rejected at manifest-parse time with `E-MAN-003`, before any WASM
+executes:
+
+```
+error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.resources.max_processes': must be greater than zero
+```
+
+**Platform behavior.** On Linux, a capsule that can spawn *any* native subprocess
+(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact)
+refuses to launch with `E-RUN-012` when the host cannot delegate a cgroup — running that tree
+with no aggregate ceiling is worse than not running it. This requires systemd user delegation
+(`Delegate=yes` for `memory pids cpu io` on the unit `mur` runs under); see
+[Resource limits: manual verification](resource-limits-manual-verification.md). A capsule that
+declares no subprocess capability at all is never blocked — there is no process tree to bound.
+On macOS (and any non-Linux host) cgroups cannot exist, so the launch always proceeds with
+rlimits only and `W-SEC-010` documents the residual gap: no aggregate bound, and — because macOS
+has no `RLIMIT_AS` and does not enforce `RLIMIT_DATA` — no per-process memory bound either.
+
+When a subprocess is killed for exceeding a limit and the kernel's own evidence names exactly
+one, the `shell` event in `trace.jsonl` carries a `resource_limit` field naming it
+(`cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes`, `cgroup_pids_max`). Cases the
+kernel does not identify unambiguously — `RLIMIT_AS`/`RLIMIT_DATA` (surfaces as `ENOMEM` inside
+the child's allocator), `RLIMIT_NPROC` and `RLIMIT_NOFILE` (fail a `fork()`/`open()` with
+`EAGAIN`/`EMFILE` inside the child, killing nothing) — are deliberately left unattributed rather
+than guessed at.
 
 ## Threat model: prompt injection and network-bypass posture { #threat-model }
 

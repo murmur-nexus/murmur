@@ -410,6 +410,7 @@ mod tests {
             spawn: None,
             env: None,
             limits: None,
+            resources: None,
             containment: None,
         }
     }

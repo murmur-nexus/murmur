@@ -40,6 +40,7 @@ use crate::{
     bindings::host::murmur::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
+    cgroup,
     containment::{check_containment_floor, detect_achieved_containment},
     errors::RuntimeError,
     hooks::{
@@ -56,7 +57,7 @@ use crate::{
         ToolCapabilityGrant,
     },
     otel::OtelEmitter,
-    outgoing, sandbox,
+    outgoing, resources, sandbox,
     shell::{
         build_shell_env, build_wasi_env_allowlist, execute_shell, is_shell_interpreter,
         shell_tool_manifest_yaml, split_shell_words, ShellResult,
@@ -656,8 +657,38 @@ pub fn launch_session(
     on_url: impl FnOnce(&str),
 ) -> Result<LaunchResult, RuntimeError> {
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
+
+    // --- Host-process bounding, before any WASM is instantiated ------------------------------
+    //
+    // A capsule that can reach a native subprocess by any route (`shell.allow`, `spawn.allow`,
+    // or a native-implementation artifact) needs a cgroup scope around that process tree. On
+    // Linux, failing to get one is fatal here — refusing the launch is strictly better than
+    // running the tree with no aggregate memory/pids/cpu ceiling, and it must happen before
+    // instantiation so no subprocess is ever spawned unbounded. Off Linux there is no cgroup to
+    // get, so `prepare_scope` returns `None` and the gap is reported as `W-SEC-010` instead.
+    let has_native_artifact = staged.installed_artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.implementation,
+            Some(murmur_artifact::ArtifactImplementation::Native)
+        )
+    });
+    let requires_process_bounding =
+        cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
+    let cgroup_scope = cgroup::prepare_scope(
+        requires_process_bounding,
+        &staged.capability_policy.resources,
+        &staged.session_id,
+        &staged.workdir,
+    )
+    .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+    let workdir_guard = Some(resources::WorkdirGuard::spawn(
+        &staged.workdir,
+        staged.capability_policy.resources.workdir_max_bytes,
+    ));
+
     let shell_enforcement = sandbox::ShellEnforcement::resolve(&staged.capability_policy)
-        .map_err(RuntimeError::Runtime)?;
+        .map_err(RuntimeError::Runtime)?
+        .with_host_bounding(cgroup_scope, workdir_guard);
     let inference_env = staged
         .inference
         .as_ref()
@@ -739,6 +770,11 @@ pub fn launch_session(
         );
 
         sandbox::warn_for_enforcement_tier(shell_enforcement.tier, &workdir, &staged.capability_policy);
+        sandbox::warn_for_missing_aggregate_bounding(
+            &workdir,
+            requires_process_bounding,
+            shell_enforcement.cgroup_scope.is_some(),
+        );
 
         let agent_card = identity::build_agent_card(
             &capsule_identity,
@@ -1641,6 +1677,10 @@ fn inert_capability_sub_blocks(
         ("spawn", capabilities.spawn.is_some()),
         ("env", capabilities.env.is_some()),
         ("limits", capabilities.limits.is_some()),
+        // Same hazard as its siblings: host-process bounds are session-scoped (one cgroup scope,
+        // one workdir guard, one set of rlimits per spawned process), so a per-artifact or
+        // per-hook `resources:` block is structurally accepted and silently inert.
+        ("resources", capabilities.resources.is_some()),
         // The containment floor is capsule-wide, resolved before staging — a per-artifact
         // declaration of it is read by nothing.
         ("containment", capabilities.containment.is_some()),
@@ -2689,6 +2729,7 @@ impl CapsuleStoreState {
                     &native_bin,
                     &self.accessible_workdir,
                     &self.capability_policy,
+                    &self.shell_enforcement,
                 )
             })
             .map(DispatchOutcome::tool);
@@ -3028,6 +3069,7 @@ fn dispatch_native_tool(
     binary_path: &Path,
     workdir: &Path,
     policy: &CapabilityPolicy,
+    enforcement: &sandbox::ShellEnforcement,
 ) -> Result<murmur::tool::run::ToolResult, String> {
     use std::{
         io::Write,
@@ -3039,6 +3081,8 @@ fn dispatch_native_tool(
         "log_path": input.log_path,
     }))
     .map_err(|e| format!("failed to serialize input for native tool '{name}': {e}"))?;
+
+    enforcement.check_workdir_budget()?;
 
     let env = build_shell_env(policy, &[], workdir)?;
 
@@ -3053,6 +3097,12 @@ fn dispatch_native_tool(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Before this slice this path had no `pre_exec` hook of any kind, so a native-implementation
+    // artifact ran completely unbounded while `execute_shell` did not. It now carries the same
+    // hard rlimits and the same cgroup membership. It still installs no seccomp filter and no
+    // Landlock scope — that asymmetry is a pre-existing, separately-tracked gap this slice
+    // deliberately does not close.
+    sandbox::attach_process_limits(&mut command, enforcement);
     // Mark every fd >= 3 close-on-exec in the forked child, so this subprocess inherits only the
     // stdio pipes configured just above and nothing that merely happened to be open in the
     // runtime process. Fds 0/1/2 are deliberately excluded: this function writes the tool's
@@ -3192,6 +3242,7 @@ fn dispatch_shell_tool(
                 stdout_bytes: result.stdout.len() as u64,
                 stderr_bytes: result.stderr.len() as u64,
                 duration_ms: result.duration_ms,
+                resource_limit: result.resource_limit_hit.clone(),
             };
             DispatchOutcome {
                 result: shell_result_to_tool_result(&command, result),
@@ -4487,6 +4538,7 @@ mod tests {
                     shell.stdout_bytes,
                     shell.stderr_bytes,
                     shell.duration_ms,
+                    shell.resource_limit.clone(),
                 )
                 .await
                 .unwrap();
@@ -4529,6 +4581,7 @@ mod tests {
             &binary,
             tmp.path(),
             &policy,
+            &sandbox::ShellEnforcement::environment_only(),
         )
         .unwrap();
 
@@ -4557,6 +4610,7 @@ mod tests {
             &binary,
             tmp.path(),
             &policy,
+            &sandbox::ShellEnforcement::environment_only(),
         )
         .unwrap();
         std::env::remove_var("GITHUB_TOKEN");
@@ -4584,6 +4638,7 @@ mod tests {
             &binary,
             tmp.path(),
             &policy,
+            &sandbox::ShellEnforcement::environment_only(),
         )
         .unwrap();
         std::env::remove_var("STRIPE_API_KEY");
@@ -4611,6 +4666,7 @@ mod tests {
             &binary,
             tmp.path(),
             &policy,
+            &sandbox::ShellEnforcement::environment_only(),
         )
         .unwrap();
         std::env::remove_var("CARGO_HOME");
@@ -4642,6 +4698,7 @@ mod tests {
             &binary,
             tmp.path(),
             &policy,
+            &sandbox::ShellEnforcement::environment_only(),
         )
         .unwrap();
         std::env::remove_var("MYCOMPANY_SECRET");
@@ -4678,6 +4735,7 @@ mod tests {
             spawn: None,
             env: None,
             limits: None,
+            resources: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling()).expect("grant is valid")
@@ -4927,6 +4985,7 @@ mod tests {
                 spawn: None,
                 env: None,
                 limits: None,
+                resources: None,
                 containment: None,
             }),
         };
@@ -4968,6 +5027,7 @@ mod tests {
                 spawn: None,
                 env: None,
                 limits: None,
+                resources: None,
                 containment: None,
             }),
         };
@@ -4997,6 +5057,7 @@ mod tests {
             spawn: None,
             env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
             limits: None,
+            resources: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 

@@ -131,6 +131,30 @@ pub enum RuntimeError {
     #[error("capsule execution exceeded its configured resource limits: {message}")]
     CapsuleResourceLimit { message: String },
 
+    #[error(
+        "shell subprocess '{binary}' was killed for exceeding \
+         capabilities.resources.{limit}: {detail}"
+    )]
+    ShellResourceLimitExceeded {
+        binary: String,
+        limit: String,
+        detail: String,
+    },
+
+    #[error(
+        "this capsule can spawn native subprocesses but no cgroup v2 scope could be created to \
+         bound them ({reason}); on Linux the runtime refuses to launch rather than run a \
+         subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user \
+         delegation requirement in docs/content/reference/resource-limits-manual-verification.md"
+    )]
+    CgroupDelegationUnavailable { reason: String },
+
+    #[error(
+        "session workdir grew to {observed_bytes} bytes, past the {max_bytes} byte ceiling \
+         (capabilities.resources.workdir_max_bytes)"
+    )]
+    WorkdirSizeExceeded { max_bytes: u64, observed_bytes: u64 },
+
     #[error("failed to initialize WASI for {path}: {message}")]
     WasiInit { path: String, message: String },
 

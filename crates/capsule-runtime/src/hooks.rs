@@ -386,6 +386,10 @@ pub(crate) struct ShellDispatchInfo {
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub duration_ms: u64,
+    /// The `capabilities.resources` field this call was killed for exceeding, when the evidence
+    /// names exactly one. Carried alongside `exit_code` rather than folded into it because a
+    /// signal-killed process has no exit code to fold it into.
+    pub resource_limit: Option<String>,
 }
 
 /// Env vars injected into every hook's WASI context. Group avoids a >7-arg constructor.
@@ -2897,6 +2901,7 @@ mod tests {
             spawn: None,
             env: None,
             limits: None,
+            resources: None,
             containment: None,
         };
         HookCapabilityGrant::derive(Some(&caps)).expect("grant is valid")

@@ -107,6 +107,13 @@ pub struct CapabilityPolicy {
     /// each field `capabilities.limits` omits, so there is no "unset" state here and a
     /// silent manifest yields [`ExecutionLimits::default`] rather than no limits.
     pub limits: ExecutionLimits,
+    /// OS-level bounds applied to every *native subprocess* the session spawns — rlimits, the
+    /// Linux cgroup v2 scope, and the workdir-size ceiling. Resolved on exactly the same terms
+    /// as `limits` above (each omitted `capabilities.resources` field replaced by its default,
+    /// no "unset" state), but a completely different subject: `limits` bounds a WASM guest
+    /// inside its wasmtime store, this bounds the processes the host forks. See
+    /// [`crate::resources`].
+    pub resources: crate::resources::HostResourceLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +296,8 @@ pub fn capability_policy_from_runtime_manifest(
 
     let limits = ExecutionLimits::resolve(caps.and_then(|c| c.limits.as_ref()));
 
+    let resources = crate::resources::resolve(caps.and_then(|c| c.resources.as_ref()));
+
     CapabilityPolicy {
         network_allow,
         unix_sockets_allowed,
@@ -300,6 +309,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_interpreter_runtime,
         env_allow,
         limits,
+        resources,
     }
 }
 
