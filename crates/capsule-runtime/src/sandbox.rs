@@ -4462,6 +4462,21 @@ mod linux_integration_tests {
 
     use super::*;
 
+    /// Spread-base supplying the four *host-bounding* fields (`resource_limits`,
+    /// `nproc_baseline`, `cgroup_scope`, `workdir_guard`) to the enforcement literals below,
+    /// which spell out the policy half by hand because they need to pin `tier` explicitly.
+    ///
+    /// These tests exercise seccomp, Landlock and the network allowlist — not rlimits or
+    /// cgroups — so they take exactly what `ShellEnforcement::resolve` produces before
+    /// `with_host_bounding` attaches a live session's handles: the real default ceilings (not
+    /// "unbounded" — zeroing them would misrepresent what a real host does, and the rlimit half
+    /// of the child `pre_exec` runs on every tier), the real uid baseline, and no cgroup scope
+    /// or workdir guard. The `tier` it carries is always overridden by the literal that spreads
+    /// it; only the host-bounding tail is ever consumed from here.
+    fn host_bounding_base() -> ShellEnforcement {
+        ShellEnforcement::environment_only()
+    }
+
     /// Pure content check on the workdir access-right set: no kernel call, no fork, no spawn.
     /// It pins *which* Landlock ABI v1 rights `apply_landlock_scope` hands the workdir, so
     /// re-adding device-node creation becomes a test failure instead of a silent regression.
@@ -4539,6 +4554,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         let result = crate::shell::execute_shell(
@@ -4582,6 +4598,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         let result = crate::shell::execute_shell(
@@ -4625,6 +4642,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         // Unlike `exit 7` (a builtin), `ls` forces a genuinely *nested* execve from inside
@@ -4679,6 +4697,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         // bash's /dev/tcp is a builtin socket+connect — no extra binary needed, no DNS.
@@ -4727,6 +4746,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
@@ -4774,6 +4794,7 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
+            ..host_bounding_base()
         };
 
         let result = crate::shell::execute_shell(
@@ -4833,6 +4854,7 @@ mod linux_integration_tests {
                 &exec_allow_paths,
             )),
             exec_allow_paths,
+            ..host_bounding_base()
         };
 
         // `echo` is a bash builtin; piping it into `cat` forces bash to fork+exec `cat`, a real
@@ -4895,6 +4917,7 @@ mod linux_integration_tests {
                 &exec_allow_paths,
             )),
             exec_allow_paths,
+            ..host_bounding_base()
         };
 
         // `echo >file` uses only a bash builtin + an open-for-write of an outside path — the
@@ -4936,6 +4959,7 @@ mod linux_integration_tests {
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
+            ..host_bounding_base()
         }
     }
 
@@ -5130,6 +5154,7 @@ mod linux_integration_tests {
             unix_sockets_allowed: false,
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
+            ..host_bounding_base()
         }
     }
 
