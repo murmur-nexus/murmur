@@ -3068,6 +3068,8 @@ fn dispatch_native_tool(
 
     let env = build_shell_env(policy, &[], workdir)?;
 
+    // Bound to a local before spawning (rather than chained straight into `.spawn()`) so a
+    // `pre_exec` step can be attached to it, mirroring `execute_shell`'s shape.
     let mut command = Command::new(binary_path);
     command
         .current_dir(workdir)
@@ -3083,6 +3085,19 @@ fn dispatch_native_tool(
     // Landlock scope — that asymmetry is a pre-existing, separately-tracked gap this slice
     // deliberately does not close.
     sandbox::attach_process_limits(&mut command, enforcement);
+    // Mark every fd >= 3 close-on-exec in the forked child, so this subprocess inherits only the
+    // stdio pipes configured just above and nothing that merely happened to be open in the
+    // runtime process. Fds 0/1/2 are deliberately excluded: this function writes the tool's
+    // `ToolInput` JSON to the child's stdin and parses its `ToolResult` JSON back off stdout, so
+    // stdio inheritance across `execve` is the point, not a leak — see
+    // `sandbox::FD_HYGIENE_FIRST_FD` for the full recorded decision.
+    //
+    // This is the shared helper `execute_shell`'s path also runs (as the first step of
+    // `sandbox::linux_enforce::child_install_enforcement`), so the two spawn paths cannot drift
+    // apart on this dimension. It takes no policy input — fd hygiene is unconditional — and it
+    // deliberately does not bring seccomp/Landlock enforcement with it; kernel sandboxing of
+    // native tool subprocesses remains the documented gap it was.
+    crate::sandbox::apply_fd_hygiene(&mut command);
 
     let mut child = command
         .spawn()
