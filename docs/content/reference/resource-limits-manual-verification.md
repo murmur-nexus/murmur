@@ -397,7 +397,7 @@ mechanism that *is* available, and it is stated rather than hidden.
 Verify the Linux refusal is real, and that it is correctly scoped.
 
 **7a — subprocess-capable capsule, no delegation → refuse.** Temporarily remove the drop-in from
-[the install section](#install-requirement--systemd-user-cgroup-delegation) (or run under a unit
+[the install section](#install-requirement-systemd-user-cgroup-delegation) (or run under a unit
 without `Delegate=`), then:
 
 ```bash
