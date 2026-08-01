@@ -15,7 +15,7 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, stage_session, ArtifactRequest, StageRequest,
     StagedSession,
 };
-use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, LocalRegistry};
+use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
@@ -129,6 +129,7 @@ pub fn stage_agent_session(
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .unwrap()

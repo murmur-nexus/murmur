@@ -186,6 +186,20 @@ enum Commands {
         /// environment variables from a vault or secrets manager instead.
         #[arg(long)]
         no_env_file: bool,
+
+        /// Require at least this containment class (advisory|scoped|sealed).
+        /// Combined with capabilities.containment in murmur.yaml and containment in
+        /// .murmur/config.yaml by taking the strongest — this flag can raise the floor
+        /// but never lower one another source already set. `mur run` refuses to launch
+        /// when the host's kernel cannot provide the resulting class.
+        #[arg(long, value_name = "CLASS")]
+        containment: Option<String>,
+
+        /// Print the effective grant set and the declared/achieved containment classes,
+        /// then exit 0 without staging or launching anything. Read-only: it reports even
+        /// when the declared floor is not met, and never creates a workdir.
+        #[arg(long)]
+        explain_scope: bool,
     },
     /// Analyze trace.jsonl files from past sessions
     Trace {
@@ -366,6 +380,8 @@ fn main() {
             verbose,
             bind,
             no_env_file,
+            containment,
+            explain_scope,
         } => run_run(
             &manifest,
             task.as_deref(),
@@ -376,6 +392,8 @@ fn main() {
             verbose,
             &bind,
             no_env_file,
+            containment.as_deref(),
+            explain_scope,
         ),
         Commands::Trace { command } => match command {
             TraceCommand::Show { session, workdir } => run_trace_show(session, workdir),

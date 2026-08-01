@@ -1,6 +1,6 @@
 use std::{fs, net::IpAddr, path::Path};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
@@ -636,6 +636,111 @@ pub struct ResourceCapabilities {
     pub workdir_max_bytes: Option<u64>,
 }
 
+// ── Containment class ─────────────────────────────────────────────────────────
+
+/// How strongly the host must contain a capsule's *subprocess* tree, declared as a floor
+/// by the operator and satisfied (or not) by the host's kernel.
+///
+/// Declaration order is enforcement order — the `Ord` derive is load-bearing, so variants
+/// must stay listed weakest-first. Combining floors from several sources is `max`, never
+/// `min` (see [`effective_containment_floor`]): no source can lower what another raised.
+///
+/// The class an operator *declares* is a requirement. The class a host actually *achieves*
+/// is derived only from a live kernel probe (`capsule_runtime::containment`), never from
+/// this declaration.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentClass {
+    /// No kernel mechanism required. Capability declarations are honored by the runtime's
+    /// own dispatch layer and by convention; anything the host cannot mediate is warned
+    /// about, not refused. Every host satisfies this, including macOS. The default.
+    #[default]
+    Advisory,
+    /// Landlock filesystem mediation + seccomp exec/network allowlisting over the *host*
+    /// filesystem: every path outside the workdir must be an explicit manifest grant.
+    /// Requires Linux 5.13+ with a usable Landlock ABI.
+    Scoped,
+    /// A private filesystem root: mount-namespace + `pivot_root` isolation, so the host
+    /// filesystem is not merely mediated but absent. **No host can provide this today** —
+    /// the mechanism does not exist in this runtime (`sandbox::SECCOMP_MUST_STAY_DENIED`
+    /// actively denies `pivot_root`/`mount`/`unshare` to every subprocess). Declaring it
+    /// refuses to launch everywhere until a future slice implements the mechanism.
+    Sealed,
+}
+
+impl ContainmentClass {
+    /// The lowercase wire name, identical in the manifest, the workspace config, the
+    /// `--containment` flag, `trace.jsonl`, and `--explain-scope` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Scoped => "scoped",
+            Self::Sealed => "sealed",
+        }
+    }
+
+    /// Every value, weakest first — the single source for the "must be one of: …" text.
+    pub const ALL: [ContainmentClass; 3] = [Self::Advisory, Self::Scoped, Self::Sealed];
+}
+
+impl std::fmt::Display for ContainmentClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A string that is not one of the three containment class names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseContainmentClassError {
+    pub value: String,
+}
+
+impl std::fmt::Display for ParseContainmentClassError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "must be one of: advisory, scoped, sealed; got '{}'",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for ParseContainmentClassError {}
+
+impl std::str::FromStr for ContainmentClass {
+    type Err = ParseContainmentClassError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "advisory" => Ok(Self::Advisory),
+            "scoped" => Ok(Self::Scoped),
+            "sealed" => Ok(Self::Sealed),
+            other => Err(ParseContainmentClassError {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+/// The one floor a single `mur run` invocation must clear: the *strongest* class any source
+/// asked for, defaulting to [`ContainmentClass::Advisory`] when no source declares one.
+///
+/// Monotonic by construction — an absent source does not participate, and no present source
+/// can lower what another raised. Argument order carries no precedence.
+pub fn effective_containment_floor(
+    workspace_default: Option<ContainmentClass>,
+    manifest_declared: Option<ContainmentClass>,
+    cli_flag: Option<ContainmentClass>,
+) -> ContainmentClass {
+    [workspace_default, manifest_declared, cli_flag]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub network: Option<NetworkCapabilities>,
@@ -645,6 +750,10 @@ pub struct Capabilities {
     pub env: Option<EnvCapabilities>,
     pub limits: Option<ResourceLimits>,
     pub resources: Option<ResourceCapabilities>,
+    /// Minimum containment class this capsule declares. `None` (the overwhelmingly common
+    /// case) means the capsule states no requirement and inherits whatever the workspace
+    /// config or `--containment` asks for, defaulting to `advisory`.
+    pub containment: Option<ContainmentClass>,
 }
 
 #[derive(Debug, Error)]
@@ -788,6 +897,11 @@ struct RawCapabilities {
     limits: Option<RawResourceLimits>,
     #[serde(default)]
     resources: Option<RawResourceCapabilities>,
+    /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
+    /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
+    /// "unknown variant" error attributed to the whole `capabilities:` block.
+    #[serde(default)]
+    containment: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1219,6 +1333,21 @@ fn parse_capabilities(
         .map(parse_resource_capabilities)
         .transpose()?;
 
+    let containment = raw_caps
+        .containment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<ContainmentClass>()
+                .map_err(|error| RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.containment".to_string(),
+                    message: error.to_string(),
+                })
+        })
+        .transpose()?;
+
     Ok(Some(Capabilities {
         network,
         filesystem,
@@ -1227,6 +1356,7 @@ fn parse_capabilities(
         env,
         limits,
         resources,
+        containment,
     }))
 }
 
@@ -4259,5 +4389,204 @@ capabilities:
                 commit_policy: HookCommitPolicy::None,
             }
         );
+    }
+
+    // ── Containment class ────────────────────────────────────────────────────
+
+    #[test]
+    fn containment_classes_order_weakest_to_strongest() {
+        assert!(ContainmentClass::Advisory < ContainmentClass::Scoped);
+        assert!(ContainmentClass::Scoped < ContainmentClass::Sealed);
+        assert!(ContainmentClass::Advisory < ContainmentClass::Sealed);
+        assert_eq!(
+            ContainmentClass::ALL.iter().copied().max(),
+            Some(ContainmentClass::Sealed)
+        );
+    }
+
+    #[test]
+    fn containment_class_defaults_to_advisory() {
+        assert_eq!(ContainmentClass::default(), ContainmentClass::Advisory);
+    }
+
+    #[test]
+    fn containment_class_round_trips_through_string() {
+        for class in ContainmentClass::ALL {
+            assert_eq!(
+                class.to_string().parse::<ContainmentClass>(),
+                Ok(class),
+                "{class} must survive Display -> FromStr"
+            );
+        }
+        assert_eq!(ContainmentClass::Advisory.as_str(), "advisory");
+        assert_eq!(ContainmentClass::Scoped.as_str(), "scoped");
+        assert_eq!(ContainmentClass::Sealed.as_str(), "sealed");
+    }
+
+    #[test]
+    fn containment_class_rejects_unknown_names() {
+        let err = "paranoid".parse::<ContainmentClass>().unwrap_err();
+        assert_eq!(err.value, "paranoid");
+        assert_eq!(
+            err.to_string(),
+            "must be one of: advisory, scoped, sealed; got 'paranoid'"
+        );
+        // Case-sensitive by design: the wire form is lowercase everywhere.
+        assert!("Sealed".parse::<ContainmentClass>().is_err());
+    }
+
+    #[test]
+    fn containment_class_serializes_as_its_wire_name() {
+        assert_eq!(
+            serde_json::to_string(&ContainmentClass::Scoped).unwrap(),
+            "\"scoped\""
+        );
+        assert_eq!(
+            serde_yaml::from_str::<ContainmentClass>("sealed").unwrap(),
+            ContainmentClass::Sealed
+        );
+    }
+
+    #[test]
+    fn effective_floor_is_advisory_when_nothing_is_declared() {
+        assert_eq!(
+            effective_containment_floor(None, None, None),
+            ContainmentClass::Advisory
+        );
+    }
+
+    #[test]
+    fn effective_floor_takes_the_strongest_across_every_presence_combination() {
+        use ContainmentClass::{Advisory, Scoped, Sealed};
+
+        // Exactly one source present: that source wins outright.
+        assert_eq!(effective_containment_floor(Some(Scoped), None, None), Scoped);
+        assert_eq!(effective_containment_floor(None, Some(Scoped), None), Scoped);
+        assert_eq!(effective_containment_floor(None, None, Some(Scoped)), Scoped);
+        assert_eq!(effective_containment_floor(Some(Sealed), None, None), Sealed);
+        assert_eq!(effective_containment_floor(None, Some(Sealed), None), Sealed);
+        assert_eq!(effective_containment_floor(None, None, Some(Sealed)), Sealed);
+
+        // Two sources present: the stronger wins regardless of which slot holds it, and a
+        // weaker source can never pull the stronger one down.
+        assert_eq!(
+            effective_containment_floor(Some(Advisory), Some(Sealed), None),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Sealed), Some(Advisory), None),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Advisory), None, Some(Scoped)),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Scoped), None, Some(Advisory)),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(None, Some(Advisory), Some(Scoped)),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(None, Some(Scoped), Some(Advisory)),
+            Scoped
+        );
+
+        // All three present: max wins from every slot, and all-equal is a fixed point.
+        assert_eq!(
+            effective_containment_floor(Some(Sealed), Some(Advisory), Some(Scoped)),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Advisory), Some(Sealed), Some(Scoped)),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Advisory), Some(Scoped), Some(Sealed)),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Scoped), Some(Scoped), Some(Scoped)),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Advisory), Some(Advisory), Some(Advisory)),
+            Advisory
+        );
+    }
+
+    #[test]
+    fn manifest_parses_each_declared_containment_class() {
+        for class in ContainmentClass::ALL {
+            let manifest = RuntimeManifest::from_yaml_str(&format!(
+                r#"
+name: cap
+version: 0.0.1
+capabilities:
+  containment: {class}
+"#
+            ))
+            .expect("a valid containment class parses");
+
+            assert_eq!(
+                manifest.capabilities.unwrap().containment,
+                Some(class),
+                "capabilities.containment: {class}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_without_containment_key_declares_nothing() {
+        // Absent `capabilities:` block entirely.
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+"#,
+        )
+        .unwrap();
+        assert!(manifest.capabilities.is_none());
+
+        // Present `capabilities:` block that simply omits the key: still None, never a
+        // silently-defaulted Advisory floor stored as if the operator had written it.
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  network:
+    allow:
+      - https://api.example.com
+"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.capabilities.unwrap().containment, None);
+    }
+
+    #[test]
+    fn manifest_rejects_an_unknown_containment_class() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  containment: paranoid
+"#,
+        )
+        .expect_err("an unknown containment class is rejected at parse time");
+
+        match err {
+            RuntimeManifestError::InvalidCapabilities { field, message } => {
+                assert_eq!(field, "capabilities.containment");
+                assert_eq!(
+                    message,
+                    "must be one of: advisory, scoped, sealed; got 'paranoid'"
+                );
+            }
+            other => panic!("expected InvalidCapabilities, got {other:?}"),
+        }
     }
 }

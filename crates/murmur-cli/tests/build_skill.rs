@@ -232,7 +232,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         capability_policy_from_runtime_manifest, stage_session, ArtifactRequest, StageRequest,
     };
     use murmur_artifact::{
-        load_runtime_manifest, InferenceConfig, InferenceDriver, LocalRegistry,
+        load_runtime_manifest, ContainmentClass, InferenceConfig, InferenceDriver, LocalRegistry,
     };
     use std::collections::HashSet;
     use tempfile::TempDir;
@@ -337,6 +337,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .unwrap();

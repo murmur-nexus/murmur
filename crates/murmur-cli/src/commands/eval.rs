@@ -739,6 +739,13 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             bind_addr: "127.0.0.1".to_string(),
             internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
             job_id: None,
+            // `mur eval` has no --containment flag and reads no workspace config, so the
+            // manifest is the only source of a floor here.
+            declared_containment_floor: runtime_manifest
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.containment)
+                .unwrap_or_default(),
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {

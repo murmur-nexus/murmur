@@ -15,7 +15,9 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
     LifecycleConfig, StageRequest,
 };
-use murmur_artifact::{load_runtime_manifest, ArtifactRuntime, LocalRegistry, TaskAcceptance};
+use murmur_artifact::{
+    load_runtime_manifest, ArtifactRuntime, ContainmentClass, LocalRegistry, TaskAcceptance,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 use zip::{
@@ -185,6 +187,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path, lifecycle: Option<Lifecycle
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .unwrap()

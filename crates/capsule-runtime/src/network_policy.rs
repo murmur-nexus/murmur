@@ -411,6 +411,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            containment: None,
         }
     }
 

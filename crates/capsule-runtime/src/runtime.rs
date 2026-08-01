@@ -41,6 +41,7 @@ use crate::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
     cgroup,
+    containment::{check_containment_floor, detect_achieved_containment},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
@@ -281,6 +282,12 @@ pub fn stage_session(
     request: StageRequest,
 ) -> Result<StagedSession, RuntimeError> {
     validate_capability_policy(&request.capability_policy)?;
+    // Before any registry pull, component compile or workdir creation: if this host cannot
+    // back the declared floor, refuse rather than launch something weaker than was asked for.
+    // `achieved` comes from a live kernel probe only — the manifest never gets a vote in what
+    // the host is reported to provide.
+    let achieved_containment = detect_achieved_containment();
+    check_containment_floor(request.declared_containment_floor, achieved_containment)?;
     // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
@@ -634,6 +641,8 @@ pub fn stage_session(
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         job_id: request.job_id,
+        declared_containment_floor: request.declared_containment_floor,
+        achieved_containment,
         registry,
         _epoch_ticker: epoch_ticker,
     })
@@ -797,6 +806,8 @@ pub fn launch_session(
 
         let capsule_name = staged.capsule_name.clone();
         let capabilities = capability_names(&staged.capability_policy);
+        let containment_declared = staged.declared_containment_floor;
+        let containment_achieved = staged.achieved_containment;
 
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
@@ -844,6 +855,8 @@ pub fn launch_session(
                 capsule_version.clone(),
                 inference_model.clone(),
                 capabilities.clone(),
+                containment_declared,
+                containment_achieved,
                 trace_include_tool_output,
             )
             .await
@@ -1449,6 +1462,8 @@ pub fn launch_session(
                 staged.capsule_version.clone(),
                 String::new(),
                 Vec::new(),
+                staged.declared_containment_floor,
+                staged.achieved_containment,
                 false,
             )
             .await
@@ -1666,6 +1681,9 @@ fn inert_capability_sub_blocks(
         // one workdir guard, one set of rlimits per spawned process), so a per-artifact or
         // per-hook `resources:` block is structurally accepted and silently inert.
         ("resources", capabilities.resources.is_some()),
+        // The containment floor is capsule-wide, resolved before staging — a per-artifact
+        // declaration of it is read by nothing.
+        ("containment", capabilities.containment.is_some()),
     ]
     .into_iter()
     .filter_map(|(name, present)| present.then_some(name))
@@ -3695,6 +3713,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -3779,6 +3798,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -3851,6 +3871,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -3922,6 +3943,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -4071,6 +4093,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
         let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();
@@ -4500,6 +4523,8 @@ mod tests {
                 "0.1.0".to_string(),
                 "test-model".to_string(),
                 Vec::new(),
+                murmur_artifact::ContainmentClass::Advisory,
+                murmur_artifact::ContainmentClass::Advisory,
                 false,
             )
             .await
@@ -4711,6 +4736,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling()).expect("grant is valid")
     }
@@ -4960,6 +4986,7 @@ mod tests {
                 env: None,
                 limits: None,
                 resources: None,
+                containment: None,
             }),
         };
         let silent = ArtifactRequest {
@@ -5001,6 +5028,7 @@ mod tests {
                 env: None,
                 limits: None,
                 resources: None,
+                containment: None,
             }),
         };
 
@@ -5030,9 +5058,13 @@ mod tests {
             env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
             limits: None,
             resources: None,
+            containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 
-        assert_eq!(inert_capability_sub_blocks(Some(&caps)), vec!["shell", "env"]);
+        assert_eq!(
+            inert_capability_sub_blocks(Some(&caps)),
+            vec!["shell", "env", "containment"]
+        );
         assert!(inert_capability_sub_blocks(None).is_empty());
     }
 
@@ -5181,6 +5213,8 @@ mod tests {
             "0.1.0".to_string(),
             "test-model".to_string(),
             Vec::new(),
+            murmur_artifact::ContainmentClass::Advisory,
+            murmur_artifact::ContainmentClass::Advisory,
             false,
         )
         .await

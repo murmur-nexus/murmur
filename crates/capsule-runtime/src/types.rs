@@ -179,6 +179,12 @@ pub struct StageRequest {
     /// spawned child capsules can set `spawned_by` when calling POST /spawn on mur-roost.
     /// None when not launched via mur-roost (direct CLI, tests).
     pub job_id: Option<String>,
+    /// Minimum containment class this session must achieve, already combined across every
+    /// source that asked for one (manifest / workspace config / `--containment`) by taking the
+    /// strongest. Required rather than optional: "nobody declared anything" is
+    /// [`ContainmentClass::Advisory`], an explicit floor every host clears, not an absence.
+    /// `stage_session` refuses to stage when the host cannot meet it.
+    pub declared_containment_floor: murmur_artifact::ContainmentClass,
 }
 
 pub struct StagedSession {
@@ -221,6 +227,13 @@ pub struct StagedSession {
     pub(crate) internal_port: Option<u16>,
     /// Job ID from mur-roost (copied from StageRequest::job_id).
     pub(crate) job_id: Option<String>,
+    /// Floor this session was staged against (copied from
+    /// StageRequest::declared_containment_floor).
+    pub(crate) declared_containment_floor: murmur_artifact::ContainmentClass,
+    /// What the host actually provided, derived at staging time from the probed
+    /// `EnforcementTier` alone. Recorded in `trace.jsonl`'s `session_start`. Never sourced from
+    /// the manifest — see `containment::achieved_class_for_tier`.
+    pub(crate) achieved_containment: murmur_artifact::ContainmentClass,
     /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,

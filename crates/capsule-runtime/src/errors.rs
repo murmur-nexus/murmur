@@ -96,6 +96,18 @@ pub enum RuntimeError {
     #[error("invalid filesystem capability scope '{scope}': {message}")]
     InvalidFilesystemScope { scope: String, message: String },
 
+    /// The declared containment floor is stronger than what this host's kernel can back.
+    /// Raised in the stage/launch seam, before any registry pull, component compile or workdir
+    /// creation — `achieved` always comes from a live host probe, never from the manifest.
+    #[error(
+        "declared containment class '{declared}' is not achievable on this host (achieved: '{achieved}'): {reason}"
+    )]
+    ContainmentFloorUnmet {
+        declared: murmur_artifact::ContainmentClass,
+        achieved: murmur_artifact::ContainmentClass,
+        reason: String,
+    },
+
     #[error(
         "capsule component missing export murmur:capsule/run@0.1.0#run; rebuild the artifact against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )]

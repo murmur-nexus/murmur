@@ -33,6 +33,7 @@ pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabiliti
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
 pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared scope
+pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared containment class
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -224,6 +225,19 @@ impl From<RuntimeError> for CliError {
                 E_CAP_002,
                 format!("invalid filesystem scope '{scope}': {message}"),
             ),
+            // Delegate the message to the RuntimeError Display text so the declared/achieved
+            // pair and the missing-mechanism reason cannot drift from capsule-runtime's
+            // `containment` module, which is what actually decided the refusal.
+            error @ RuntimeError::ContainmentFloorUnmet {
+                declared, achieved, ..
+            } => {
+                let hint = format!(
+                    "lower the declared floor to '{achieved}' (capabilities.containment in \
+                     murmur.yaml, containment in .murmur/config.yaml, or --containment), or run \
+                     on a host that provides '{declared}'"
+                );
+                CliError::with_hint(E_CAP_003, error.to_string(), hint)
+            }
             // Delegate to the RuntimeError Display text so the versioned interface
             // name and rebuild hint can't drift from capsule-runtime's errors.rs.
             error @ RuntimeError::CapsuleExportMissing => {

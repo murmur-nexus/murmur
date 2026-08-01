@@ -13,8 +13,8 @@ use capsule_runtime::{
     LockExpectation, StageRequest,
 };
 use murmur_artifact::{
-    load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, LocalRegistry,
-    LockedArtifact, LockedSha256, LockfileError, MurmurLock, LOCK_VERSION,
+    load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
+    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, LOCK_VERSION,
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -215,6 +215,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             job_id: None,
+            declared_containment_floor: ContainmentClass::Advisory,
         },
     )
     .unwrap();

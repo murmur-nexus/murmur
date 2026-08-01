@@ -130,6 +130,13 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         bind_addr: "127.0.0.1".to_string(),
         internal_port: None,
         job_id: None,
+        // Ephemeral generator capsule: it declares no containment, so this is the default
+        // floor every host clears rather than an inherited one.
+        declared_containment_floor: runtime_manifest
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.containment)
+            .unwrap_or_default(),
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).

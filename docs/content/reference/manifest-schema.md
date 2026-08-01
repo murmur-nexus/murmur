@@ -361,11 +361,95 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
 | `capabilities.resources.workdir_max_bytes` | integer | no | ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
+| `capabilities.containment` | string | no | minimum containment class this capsule requires: `advisory`, `scoped`, or `sealed` (ascending strength). Omitted means the capsule states no requirement — see [Containment class](#field-containment) below. Only meaningful capsule-wide; declaring it on a per-artifact (tool/driver/hook) entry has no effect and warns at staging |
 | `network.internal_port` | integer | no | Capsule-declared internal service port. The local runtime currently binds an OS-assigned external localhost port for `MURMUR_CAPSULE_URL`; when omitted, the intended internal default is `14159`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the kernel-level (Landlock/seccomp) enforcement set used for `capabilities.shell.allow` subprocesses. This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
 
 A WASM guest never inherits the host process's environment: `capabilities.env.allow` is the only way to expose a host variable, and even a name declared there is dropped if it is credential-shaped (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the exact pattern list — the same backstop applies here) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable is silently omitted, not an error.
+
+### Containment class { #field-containment }
+
+A containment class is a floor requirement — "don't launch me unless the host can actually enforce
+at least this much" — as opposed to a capability grant like `network.allow` or `shell.allow`, which
+describe *what* is allowed once a session is running. Three classes exist, weakest to strongest:
+
+| Class | Meaning |
+|---|---|
+| `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
+| `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
+| `sealed` | Mount-namespace + `pivot_root` isolation. **No host can provide this today** — the mechanism does not exist anywhere in `capsule-runtime` yet. Declaring `sealed` refuses to launch on every host, including a Landlock-capable Linux one. This is deliberate, not a bug: a future runtime change that implements `pivot_root` isolation is what will ever let `sealed` succeed. |
+
+**Declaring a floor.** Three independent sources can each declare a minimum class, and they combine
+by taking the **strongest** requested — never the weakest:
+
+1. `capabilities.containment` in `murmur.yaml` (this field)
+2. `containment` in `.murmur/config.yaml`, global or project scope (see [Configuration files](cli.md#configuration-files); note this key uses strongest-wins merging, not the usual project-wins rule)
+3. `mur run --containment <advisory|scoped|sealed>` on the command line
+
+Any source left undeclared contributes nothing; if all three are undeclared, the effective floor is
+`advisory`. A CLI flag or workspace default can only *raise* the floor a manifest already set —
+never lower it.
+
+**Achieved class.** `mur run` derives the class the host can *actually* provide by probing the
+kernel directly (never by trusting the manifest): a Landlock-capable Linux 5.13+ host achieves
+`scoped`; every other host (older Linux without Landlock, or macOS) achieves `advisory`. Granting a
+`scoped` capsule access to host paths outside the workdir via
+`capabilities.shell.interpreter_runtime` never changes the achieved class — it stays `scoped`, never
+`sealed`.
+
+**Refusal.** If the achieved class is weaker than the effective declared floor, `mur run` refuses to
+launch before any registry pull, artifact compile, or workdir creation, with `error[E-CAP-003]`
+naming both classes and the reason (missing mechanism, e.g. "Landlock filesystem mediation is
+unavailable on this host"):
+
+```text
+error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): scoped requires Landlock filesystem mediation (Linux 5.13+ with a usable Landlock ABI); this host provides no kernel filesystem mediation, so paths outside the workdir are constrained by convention only
+  hint: lower the declared floor to 'advisory' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'scoped'
+```
+
+A manifest that never declares `capabilities.containment` is never gated by this check — the
+effective floor resolves to `advisory`, which every host satisfies.
+
+#### `mur run --explain-scope` { #explain-scope }
+
+Prints the declared floor (and which source supplied it), the achieved class, whether the floor is
+met, and the resolved capability grant set (network allow, `unix_sockets` policy, filesystem scope,
+shell allow, and Landlock grant paths) — then exits `0` without contacting the registry, compiling
+any component, creating a workdir, or launching a session, even when the floor would not be met on
+this host:
+
+```text
+Containment
+  declared:  sealed
+  achieved:  advisory
+  floor met: no
+  reason:    sealed requires mount-namespace + pivot_root isolation, which this runtime does not implement yet; no host can provide it today
+  mechanism: none
+
+Effective grants
+  filesystem scope: <none>
+  network allow:
+    - https://api.anthropic.com
+  unix sockets:     false
+  shell allow:
+    - python3
+  spawn allow: <none>
+  env allow: <none>
+  interpreter runtime:
+    - python3: /usr/lib/python3.11 (list_dir)
+
+This is a report only — `mur run` without --explain-scope would refuse to launch here.
+```
+
+Pass `--json` alongside `--explain-scope` for a single machine-readable JSON line instead. The
+report shows *declared* network destinations, not resolved IPs — it deliberately skips DNS
+resolution and the shell allowlist's DT_NEEDED closure to stay fast and read-only.
+
+**`trace.jsonl`** records both classes on every session, in the `session_start` event's
+`containment_declared` and `containment_achieved` fields (see [session trace
+schema](cli.md#session-trace-tracejsonl)) — regardless of whether `capabilities.containment` was
+ever declared.
 
 #### `inference` { #field-inference }
 

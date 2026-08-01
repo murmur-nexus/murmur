@@ -8,6 +8,7 @@ pub(crate) mod agent;
 pub mod artifact;
 pub mod bindings;
 pub(crate) mod cgroup;
+pub mod containment;
 pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;
@@ -27,6 +28,10 @@ pub(crate) mod streaming;
 pub(crate) mod trace;
 pub mod types;
 
+pub use containment::{
+    check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
+    explain_scope, ScopeReport,
+};
 pub use errors::RuntimeError;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};

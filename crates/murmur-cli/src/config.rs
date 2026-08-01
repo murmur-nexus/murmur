@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use murmur_artifact::{LocalRegistry, Registry};
+use murmur_artifact::{ContainmentClass, LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -52,6 +52,12 @@ pub struct MurConfig {
     pub inference: Option<InferenceConfig>,
     #[serde(default)]
     pub beta: BetaConfig,
+    /// Workspace-wide minimum containment class. `None` means this workspace states no
+    /// requirement — it does not mean `advisory`, so a manifest or `--containment` that asks
+    /// for more is not contradicted. Merged as a max, never a project-wins override (see
+    /// [`merge_containment`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<ContainmentClass>,
 }
 
 /// The default artifact source is a Rust literal compiled into the `murmur-cli`
@@ -78,6 +84,7 @@ impl Default for MurConfig {
             },
             inference: None,
             beta: BetaConfig::default(),
+            containment: None,
         }
     }
 }
@@ -314,6 +321,22 @@ pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurCo
         beta: BetaConfig {
             enabled: merge_beta_enabled(global.beta.enabled, project.beta.enabled),
         },
+        containment: merge_containment(global.containment, project.containment),
+    }
+}
+
+/// Merges the two `containment` declarations as a **max**, deliberately breaking this file's
+/// project-wins rule: a containment class is a floor, so a project file must be able to raise
+/// what the global file asked for but never to lower it. `None` on a side means that side asked
+/// for nothing and does not participate; `None` on both stays `None` (no declaration at all,
+/// which is distinct from an explicit `advisory`).
+pub fn merge_containment(
+    global: Option<ContainmentClass>,
+    project: Option<ContainmentClass>,
+) -> Option<ContainmentClass> {
+    match (global, project) {
+        (Some(global), Some(project)) => Some(global.max(project)),
+        (value, None) | (None, value) => value,
     }
 }
 
@@ -762,6 +785,60 @@ registry:
 
         assert_eq!(merged.inference.as_ref().map(|i| i.api_key.as_str()), Some(""));
         assert_eq!(merged.inference.as_ref().map(|i| i.model.as_str()), Some("claude"));
+    }
+
+    #[test]
+    fn merge_containment_takes_the_stronger_of_the_two_files() {
+        use ContainmentClass::{Advisory, Scoped, Sealed};
+
+        // Neither file declares anything: still nothing, not a defaulted advisory.
+        assert_eq!(merge_containment(None, None), None);
+
+        // One side only: that side's value survives untouched, from either slot.
+        assert_eq!(merge_containment(Some(Scoped), None), Some(Scoped));
+        assert_eq!(merge_containment(None, Some(Scoped)), Some(Scoped));
+
+        // Both sides: the stronger wins regardless of which file holds it — the project file
+        // may raise the global floor but must never lower it.
+        assert_eq!(merge_containment(Some(Advisory), Some(Sealed)), Some(Sealed));
+        assert_eq!(merge_containment(Some(Sealed), Some(Advisory)), Some(Sealed));
+        assert_eq!(merge_containment(Some(Advisory), Some(Scoped)), Some(Scoped));
+        assert_eq!(merge_containment(Some(Scoped), Some(Advisory)), Some(Scoped));
+        assert_eq!(merge_containment(Some(Scoped), Some(Scoped)), Some(Scoped));
+    }
+
+    #[test]
+    fn merge_mur_configs_raises_but_never_lowers_the_containment_floor() {
+        let global = MurConfig {
+            containment: Some(ContainmentClass::Sealed),
+            ..MurConfig::default()
+        };
+        let project = MurConfig {
+            containment: Some(ContainmentClass::Advisory),
+            ..MurConfig::default()
+        };
+
+        let merged = merge_mur_configs(global, Some(project));
+
+        assert_eq!(merged.containment, Some(ContainmentClass::Sealed));
+    }
+
+    #[test]
+    fn containment_parses_from_and_survives_a_config_yaml_round_trip() {
+        let parsed: MurConfig = serde_yaml::from_str("containment: scoped\n").unwrap();
+        assert_eq!(parsed.containment, Some(ContainmentClass::Scoped));
+
+        let rendered = serde_yaml::to_string(&parsed).unwrap();
+        assert!(
+            rendered.contains("containment: scoped"),
+            "expected the wire name in {rendered}"
+        );
+
+        // Absent key stays absent on the way back out, so writing a config file never
+        // silently pins a floor the operator did not ask for.
+        let bare: MurConfig = serde_yaml::from_str("registry:\n  default: official\n").unwrap();
+        assert_eq!(bare.containment, None);
+        assert!(!serde_yaml::to_string(&bare).unwrap().contains("containment"));
     }
 
     #[test]
