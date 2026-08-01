@@ -1396,7 +1396,6 @@ pub(crate) struct ShellEnforcement {
     /// Linux only for capsules with no subprocess capability at all — a Linux capsule that *can*
     /// spawn one and could not be given a scope never reaches here, because the launch is
     /// refused first with `RuntimeError::CgroupDelegationUnavailable`.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
     /// The session's periodic workdir-size check. Consulted before every subprocess spawn, so a
     /// disk filler stops writing at the first spawn after the ceiling is crossed rather than

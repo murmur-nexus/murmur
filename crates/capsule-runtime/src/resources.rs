@@ -176,7 +176,9 @@ impl HostResourceLimits {
 /// matters (`types::capability_policy_from_runtime_manifest`), so the two sibling limit blocks
 /// read identically there.
 #[must_use]
-pub fn resolve(declared: Option<&murmur_artifact::ResourceCapabilities>) -> HostResourceLimits {
+pub(crate) fn resolve(
+    declared: Option<&murmur_artifact::ResourceCapabilities>,
+) -> HostResourceLimits {
     HostResourceLimits::resolve(declared)
 }
 

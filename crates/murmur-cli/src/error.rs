@@ -115,38 +115,24 @@ impl From<RuntimeError> for CliError {
             // The three host-process (OS-level) resource bounds, kept distinct from E-RUN-001's
             // WASM-guest limits above: those fire from a wasmtime trap inside the store, these
             // from rlimits, a cgroup, or the workdir check applied to native subprocesses.
-            RuntimeError::ShellResourceLimitExceeded {
-                binary,
-                limit,
-                detail,
-            } => CliError::with_hint(
+            // Delegate to the RuntimeError Display text so the message can't drift from
+            // capsule-runtime's errors.rs — see the ToolExportMissing precedent below.
+            error @ RuntimeError::ShellResourceLimitExceeded { .. } => CliError::with_hint(
                 E_RUN_011,
-                format!(
-                    "shell subprocess '{binary}' was killed for exceeding \
-                     capabilities.resources.{limit}: {detail}"
-                ),
+                error.to_string(),
                 "the subprocess crossed a host resource ceiling — raise that field under \
                  capabilities.resources in murmur.yaml if the work genuinely needs more, or fix \
                  the runaway that hit it",
             ),
-            RuntimeError::CgroupDelegationUnavailable { reason } => CliError::with_hint(
+            error @ RuntimeError::CgroupDelegationUnavailable { .. } => CliError::with_hint(
                 E_RUN_012,
-                format!(
-                    "this capsule can spawn native subprocesses but no cgroup v2 scope could be \
-                     created to bound them: {reason}"
-                ),
+                error.to_string(),
                 "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
                  cpu and io — see docs/content/reference/resource-limits-manual-verification.md",
             ),
-            RuntimeError::WorkdirSizeExceeded {
-                max_bytes,
-                observed_bytes,
-            } => CliError::with_hint(
+            error @ RuntimeError::WorkdirSizeExceeded { .. } => CliError::with_hint(
                 E_RUN_013,
-                format!(
-                    "session workdir grew to {observed_bytes} bytes, past the {max_bytes} byte \
-                     ceiling"
-                ),
+                error.to_string(),
                 "raise capabilities.resources.workdir_max_bytes in murmur.yaml if the capsule \
                  legitimately writes this much, or find what is filling the workdir",
             ),

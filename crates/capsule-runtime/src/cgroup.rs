@@ -523,7 +523,8 @@ fn probe_delegation() -> Result<PathBuf, String> {
 
     // The probe must confirm we can actually *create* a child here, not just read the directory:
     // a readable cgroup with no write permission is the exact shape of an undelegated host.
-    let probe_dir = base.join("murmur-delegation-probe");
+    // Named per-pid so two `mur` processes probing concurrently never race on the same path.
+    let probe_dir = base.join(format!("murmur-delegation-probe-{}", std::process::id()));
     let _ = std::fs::remove_dir(&probe_dir);
     std::fs::create_dir(&probe_dir).map_err(|error| {
         format!(
@@ -611,20 +612,13 @@ fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn open_write_only(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let mut c_path = Vec::with_capacity(path.as_os_str().as_bytes().len() + 1);
-    c_path.extend_from_slice(path.as_os_str().as_bytes());
-    c_path.push(0);
-
-    // SAFETY: `c_path` is a NUL-terminated byte string that outlives the call.
-    let fd = unsafe { libc::open(c_path.as_ptr().cast(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just returned by a successful `open` and nothing else owns it.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)
+        .map(std::os::fd::OwnedFd::from)
 }
 
 #[cfg(test)]

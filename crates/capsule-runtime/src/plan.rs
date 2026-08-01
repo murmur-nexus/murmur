@@ -143,7 +143,7 @@ fn execute_inner(
     let cgroup_scope = match crate::cgroup::prepare_scope(
         crate::cgroup::requires_process_bounding(&ctx.capability_policy, false),
         &ctx.capability_policy.resources,
-        "plan",
+        &plan.id,
         &ctx.workdir,
     ) {
         Ok(scope) => scope,
