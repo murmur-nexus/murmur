@@ -1631,6 +1631,71 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Lowest file descriptor the fd-hygiene step touches. Everything from here upward is marked
+/// close-on-exec in the forked child; fds 0, 1 and 2 are deliberately left alone.
+///
+/// **The stdio decision, recorded here so no future reader has to re-derive it: stdio is NOT
+/// marked close-on-exec, and is NOT reopened.** The whole point of the `Stdio::piped()` handles
+/// both spawn paths install *before* `pre_exec` runs is that the exec'd program inherits them
+/// across its own `execve` and talks to the parent over them — `execute_shell` reads the
+/// subprocess's stdout/stderr, and `dispatch_native_tool` additionally writes its `ToolInput`
+/// JSON to the subprocess's stdin and parses its `ToolResult` JSON back off stdout. Marking
+/// 0/1/2 close-on-exec would leave the exec'd program with those descriptors closed, breaking
+/// every invocation on both paths; and there is no meaningful thing to "reopen" them onto,
+/// because the pipes themselves are the intended destination, not an accident of inheritance.
+/// Stdio inheritance is the correct outcome. The gap this constant closes is everything
+/// *above* stdio, where inheritance was never intended and was only ever prevented by the
+/// empirical accident of nothing else happening to be open at spawn time.
+///
+/// Its only non-test reader is Linux-only (`linux_enforce::mark_inherited_fds_cloexec`), so this
+/// carries the same cross-platform `dead_code` exception the other Linux-consumed items in this
+/// module carry.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const FD_HYGIENE_FIRST_FD: u32 = 3;
+
+/// Non-Linux counterpart of [`apply_fd_hygiene`]: a documented no-op.
+///
+/// `close_range(2)` is Linux-only, and this mirrors the shape `prepare_enforcement` already
+/// uses on non-Linux targets — no `pre_exec` closure is installed at all, rather than one that
+/// does nothing. macOS is `EnforcementTier::EnvironmentOnly` by construction; there is no
+/// kernel primitive here to call.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn apply_fd_hygiene(_command: &mut std::process::Command) {}
+
+/// Attaches the fd-hygiene step — mark every fd >= [`FD_HYGIENE_FIRST_FD`] close-on-exec — to a
+/// `Command` that is about to be spawned, for spawn paths that do **not** go through
+/// `prepare_enforcement`.
+///
+/// This exists so `runtime::dispatch_native_tool` (which has no `ShellEnforcement`, no tier and
+/// no kernel sandboxing of its own) gets exactly the same fd-inheritance guarantee
+/// `execute_shell` gets, without pulling the seccomp/Landlock apparatus into it. It is
+/// deliberately a free function over `&mut Command` taking no policy input: fd hygiene is
+/// unconditional — it is not derived from `CapabilityPolicy`, the manifest, or the enforcement
+/// tier, and there is no configuration under which a subprocess should inherit an fd the
+/// runtime did not deliberately hand it.
+///
+/// Do **not** call this on a `Command` that also goes through `prepare_enforcement`:
+/// `linux_enforce::child_install_enforcement` already performs the same step as its first
+/// statement, and `pre_exec` closures run in registration order, so a second one would be a
+/// redundant syscall rather than an additional guarantee.
+///
+/// On a kernel older than 5.11 this makes `.spawn()` itself fail — see
+/// [`linux_enforce::mark_inherited_fds_cloexec`] for that fail-closed consequence, which
+/// applies identically here.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn apply_fd_hygiene(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
+    // narrow pre_exec window where only async-signal-safe operations are permitted. Its body is
+    // a single `close_range(2)` syscall plus, on failure only, one `io::Error` construction: no
+    // allocation on the success path, no locks, no captured state at all.
+    unsafe {
+        command.pre_exec(linux_enforce::mark_inherited_fds_cloexec);
+    }
+}
+
 /// Installs kernel-level exec/network/filesystem enforcement into `command` so it applies to
 /// the spawned process and everything it forks/execs. No-op when
 /// `enforcement.tier == EnvironmentOnly` — does not even attempt a Landlock/seccomp call in
@@ -1940,7 +2005,23 @@ mod linux_enforce {
         child_sock_fd: RawFd,
         unix_sockets_allowed: bool,
     ) -> io::Result<()> {
-        // First, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
+        // Before anything else in this window, on every kernel tier: shut the fd-inheritance
+        // door. Landlock (KernelFull only) mediates *new* filesystem operations against the
+        // ruleset installed further down this function — it can do nothing about a descriptor
+        // the child already holds open at that point, because that fd was opened before the
+        // ruleset existed and there is no operation left for the ruleset to intercept. Until
+        // this call existed, the only thing stopping a spawned shell from inheriting an
+        // arbitrary open fd was the empirical accident that nothing else happened to be open in
+        // the runtime process at spawn time; one `open()` added anywhere before a spawn — a
+        // config read, a lock file, a log handle — would have leaked silently into every
+        // subsequent subprocess, on every platform and every tier, with no test to catch it.
+        //
+        // Running it first is also what makes it cover this function's *own* descriptors: the
+        // notify socketpair end, the diagnostic pipe and the Landlock grant fds are all used
+        // below but must never survive the `execve`.
+        mark_inherited_fds_cloexec()?;
+
+        // Next, and on every kernel tier (not just `KernelFull`): Landlock and the Linux
         // capability model are independent, both-must-allow gates, so narrowing the Landlock
         // workdir grant does not by itself take `CAP_MKNOD` away from a root-uid capsule. This
         // must also run *before* `install_seccomp_filter`, because it is what sets
@@ -1957,6 +2038,48 @@ mod linux_enforce {
             }
         }
 
+        Ok(())
+    }
+
+    /// Marks every file descriptor at or above [`super::FD_HYGIENE_FIRST_FD`] close-on-exec, so
+    /// the only descriptors that survive into the exec'd program are the ones the runtime
+    /// deliberately set up (stdio) rather than whatever happened to be open.
+    ///
+    /// `CLOSE_RANGE_CLOEXEC` sets the flag rather than closing the descriptors outright. That is
+    /// the required semantics here, not a softer variant of it: several fds in this range are
+    /// still needed *inside* this `pre_exec` window — the notify socketpair end that
+    /// `install_seccomp_filter` sends the seccomp notify fd over, the diagnostic pipe a failure
+    /// further down writes to, and the Landlock grant fds `apply_landlock_scope` builds rules
+    /// from. Closing them here would break the very enforcement setup that follows; flagging
+    /// them means they keep working until `execve`, which then closes them for us.
+    ///
+    /// The range starts at 3, never 0 — see [`super::FD_HYGIENE_FIRST_FD`] for the recorded
+    /// stdio decision and its reasoning.
+    ///
+    /// **Kernel range narrowing, stated plainly:** `close_range(2)` landed in Linux 5.9 and
+    /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
+    /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
+    /// so every shell spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
+    /// now fails rather than silently running without fd hygiene. That is deliberate and it is
+    /// this module's established fail-closed discipline (`drop_all_capabilities`,
+    /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
+    /// error rather than degrade), but it is a real, user-visible narrowing of the supported
+    /// kernel range for kernel-enforcement tiers, not a side effect worth burying.
+    pub(super) fn mark_inherited_fds_cloexec() -> io::Result<()> {
+        // SAFETY: `close_range` takes three scalar arguments and dereferences nothing. It is a
+        // single syscall, so it is safe to call in the post-fork/pre-exec window. `c_uint::MAX`
+        // as the `last` argument is the documented "to the end of the table" spelling from
+        // `close_range(2)`.
+        let rc = unsafe {
+            libc::close_range(
+                super::FD_HYGIENE_FIRST_FD,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -2925,6 +3048,25 @@ mod linux_enforce {
 mod tests {
     use super::*;
     use murmur_artifact::security_warnings::W_SEC_003;
+
+    /// Content check only, deliberately: this asserts the *constant* the fd-hygiene call is
+    /// built from, not the security property itself. A test that opened an extra fd, spawned a
+    /// real subprocess and asserted the child could not see it would pass vacuously on every
+    /// runner this repo's CI uses (macOS has no `close_range`; Linux CI never resolves to a
+    /// kernel-enforcement tier), which would read as evidence while proving nothing. The
+    /// property is verified by hand — see
+    /// `docs/content/reference/subprocess-fd-hygiene-verification.md`.
+    ///
+    /// What this does catch is the one silent, catastrophic edit: a `0` here would mark stdio
+    /// close-on-exec and break every subprocess invocation on both spawn paths.
+    #[test]
+    fn fd_hygiene_range_starts_above_stdio() {
+        assert_eq!(
+            FD_HYGIENE_FIRST_FD, 3,
+            "fd hygiene must start at 3 — 0/1/2 are the stdio pipes both spawn paths need to \
+             survive execve"
+        );
+    }
 
     #[test]
     fn tier_from_probe_non_linux_is_always_environment_only() {
