@@ -65,6 +65,13 @@ pub const W_SEC_008: &str = "W-SEC-008";
 /// this grant only bridges until. Fires once per declared grant, at staging.
 pub const W_SEC_009: &str = "W-SEC-009";
 
+/// The capsule can spawn native subprocesses on a host where no cgroup v2 scope can exist
+/// (macOS, or any non-Linux target). Per-process `rlimit(2)` ceilings still apply, but every
+/// *aggregate* bound does not: nothing caps memory, pid count or CPU across the subprocess tree
+/// as a whole. `RLIMIT_NPROC` is not a substitute — it is per-**uid**, so a fork bomb of
+/// distinct, short-lived processes evades it. Permanent on this platform, like [`W_SEC_001`].
+pub const W_SEC_010: &str = "W-SEC-010";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 

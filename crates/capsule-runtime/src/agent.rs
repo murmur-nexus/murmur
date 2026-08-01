@@ -164,6 +164,16 @@ pub(crate) async fn run_agent_loop(
     for turn in 0..max_turns as usize {
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
+        // Session-level half of the workdir bound. The subprocess spawn paths already refuse to
+        // start another writer once the periodic check latches a breach; this is what actually
+        // ends the session rather than letting it grind on against a full disk.
+        if let Some(breach) = store_state.shell_enforcement.workdir_breach() {
+            return Err(RuntimeError::WorkdirSizeExceeded {
+                max_bytes: breach.max_bytes,
+                observed_bytes: breach.observed_bytes,
+            });
+        }
+
         // How many logical messages the driver will know once this transmit lands. A held,
         // same-context continuation lets us wire only messages[acked_len..]; otherwise resend all.
         let send_len = messages.len();
@@ -678,6 +688,7 @@ pub(crate) async fn run_agent_loop(
                                         shell.stdout_bytes,
                                         shell.stderr_bytes,
                                         shell.duration_ms,
+                                        shell.resource_limit.clone(),
                                     )
                                     .await
                                     .map_err(|e| {

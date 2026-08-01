@@ -52,13 +52,13 @@ pub use runtime_manifest::{
     FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode,
     InferenceConfig, InferenceDriver, InterpreterRuntimeDir, InterpreterRuntimeGrant,
     LifecycleConfig, LifecycleOverride, NetworkCapabilities, NetworkConfig, ObservabilityConfig,
-    ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
-    ShellCapabilities, TaskAcceptance, TraceConfig,
+    ResourceCapabilities, ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError,
+    ScorerConfig, ShellCapabilities, TaskAcceptance, TraceConfig,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{
     security_warning_link, W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006,
-    W_SEC_007, W_SEC_008, W_SEC_009,
+    W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_010,
 };
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,

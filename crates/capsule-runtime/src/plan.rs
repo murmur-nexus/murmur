@@ -135,10 +135,44 @@ fn execute_inner(
         });
     }
 
+    // Aggregate process bounding for this plan's shell steps, on the same fail-closed terms as
+    // `runtime::launch_session`: a plan that can run a subprocess on Linux does not start at all
+    // unless its tree can be put in a cgroup scope. `has_native_artifact` is `false` here — a
+    // plan step reaches native binaries only through `invoke_tool`, which routes back into the
+    // session that already established its own scope.
+    let cgroup_scope = match crate::cgroup::prepare_scope(
+        crate::cgroup::requires_process_bounding(&ctx.capability_policy, false),
+        &ctx.capability_policy.resources,
+        &plan.id,
+        &ctx.workdir,
+    ) {
+        Ok(scope) => scope,
+        Err(reason) => {
+            return Ok(ExecutionReport {
+                plan_id: plan.id,
+                results: vec![StepResult {
+                    step_id: "plan".to_string(),
+                    status: StepStatus::Failed,
+                    output: None,
+                    error: Some(
+                        crate::errors::RuntimeError::CgroupDelegationUnavailable { reason }
+                            .to_string(),
+                    ),
+                }],
+                completed: false,
+                failed_step: Some("plan".to_string()),
+            });
+        }
+    };
+    let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
+        &ctx.workdir,
+        ctx.capability_policy.resources.workdir_max_bytes,
+    ));
+
     // Host-probed kernel enforcement tier + resolved network allowlist for this plan's shell
     // steps — resolved once, up front, same cadence as `runtime::launch_session`.
     let shell_enforcement = match sandbox::ShellEnforcement::resolve(&ctx.capability_policy) {
-        Ok(enforcement) => enforcement,
+        Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {
             return Ok(ExecutionReport {
                 plan_id: plan.id,
@@ -512,7 +546,26 @@ fn dispatch_shell_step(
             output: Some(result.stdout),
             error: None,
         },
-        Ok(result) => failed(&step.id, result.stderr),
+        // A step killed for exceeding a host resource limit fails with the limit named, not with
+        // whatever the dying process managed to write to stderr — for `SIGXCPU`/`SIGXFSZ` and the
+        // cgroup kills that is usually nothing at all, which would otherwise report an empty
+        // error for a step that was very deliberately terminated.
+        Ok(result) => match result.resource_limit_hit {
+            Some(limit) => failed(
+                &step.id,
+                crate::errors::RuntimeError::ShellResourceLimitExceeded {
+                    binary: result.binary,
+                    limit,
+                    detail: if result.stderr.trim().is_empty() {
+                        format!("exit code {}", result.exit_code)
+                    } else {
+                        result.stderr
+                    },
+                }
+                .to_string(),
+            ),
+            None => failed(&step.id, result.stderr),
+        },
         Err(error) => failed(&step.id, error),
     }
 }

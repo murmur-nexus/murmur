@@ -65,6 +65,11 @@ pub(crate) struct ShellResult {
     pub(crate) duration_ms: u64,
     pub(crate) truncated: bool,
     pub(crate) full_output_path: Option<String>,
+    /// The `capabilities.resources` field this subprocess was killed for exceeding, when the
+    /// evidence names exactly one — see [`classify_resource_limit`]. `None` covers both "ran
+    /// normally" and "died for a reason no single limit can be pinned to", which are
+    /// deliberately not distinguished here: inventing an attribution is worse than declining one.
+    pub(crate) resource_limit_hit: Option<String>,
 }
 
 pub(crate) fn is_shell_interpreter(binary: &str) -> bool {
@@ -131,6 +136,10 @@ pub(crate) fn execute_shell(
         ));
     }
 
+    // Refuse before spawning, not after: once the workdir ceiling is crossed, the cheapest way
+    // to stop it growing further is to not start the next process that would write to it.
+    enforcement.check_workdir_budget()?;
+
     let env = build_shell_env(policy, env_overrides, workdir)?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
@@ -149,8 +158,16 @@ pub(crate) fn execute_shell(
 
     // Fail-closed: if kernel enforcement setup fails unexpectedly, propagate the error and
     // never call `.spawn()` at all — no code path here lets a Linux host silently run this
-    // subprocess with zero enforcement because setup failed.
+    // subprocess with zero enforcement because setup failed. This also installs the hard
+    // rlimits and (where a scope exists) cgroup membership for the child.
     let supervisor = crate::sandbox::prepare_enforcement(&mut command, enforcement, workdir)?;
+
+    // Snapshotted before the child runs so attribution keys on this call's delta rather than on
+    // a session-cumulative total an earlier call could have moved.
+    let cgroup_counters_before = enforcement
+        .cgroup_scope
+        .as_ref()
+        .map(|scope| scope.event_counters());
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -176,6 +193,13 @@ pub(crate) fn execute_shell(
     supervisor.join_best_effort();
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
+    let resource_limit_hit = classify_resource_limit(
+        &output.status,
+        enforcement.cgroup_scope.as_deref(),
+        cgroup_counters_before,
+    );
+    let exit_code = exit_code_of(&output.status);
+
     let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let mut truncated = false;
@@ -192,7 +216,7 @@ pub(crate) fn execute_shell(
             workdir,
             binary,
             args,
-            output.status.code().unwrap_or(-1),
+            exit_code,
             &String::from_utf8_lossy(&output.stdout),
             &String::from_utf8_lossy(&output.stderr),
         )?);
@@ -200,13 +224,68 @@ pub(crate) fn execute_shell(
 
     Ok(ShellResult {
         binary: resolved_binary,
-        exit_code: output.status.code().unwrap_or(-1),
+        exit_code,
         stdout,
         stderr,
         duration_ms,
         truncated,
         full_output_path,
+        resource_limit_hit,
     })
+}
+
+/// Exit code for a finished subprocess, keeping the signal that killed it legible.
+///
+/// `ExitStatus::code()` returns `None` for every signal-killed process on Unix, so a bare
+/// `.unwrap_or(-1)` collapses a `SIGXCPU` from `RLIMIT_CPU`, a cgroup OOM `SIGKILL` and an
+/// unrelated crash into one indistinguishable `-1`. `128 + signal` is the long-standing shell
+/// convention for exactly this case and keeps the cause readable in the trace even where
+/// [`classify_resource_limit`] declines to name a limit.
+fn exit_code_of(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(-1)
+}
+
+/// Name the `capabilities.resources` field a subprocess was killed for exceeding, or `None`.
+///
+/// Two independent sources of evidence, both kernel-maintained facts rather than inference:
+///
+///   * the kill signal, for the two rlimits that raise a signal unique to themselves
+///     (`SIGXCPU` → `cpu_seconds`, `SIGXFSZ` → `max_file_size_bytes`);
+///   * this call's delta on the cgroup scope's `memory.events`/`pids.events` counters
+///     (`oom_kill` → `cgroup_memory_bytes`, `max` → `cgroup_pids_max`).
+///
+/// The signal is checked first: where both fire, it identifies the individual process that died,
+/// which is the more specific claim.
+///
+/// The `pids.max` case is reported even when the process exited normally, because that is how it
+/// presents — `pids.max` refuses a `fork()` rather than killing anything, so a fork bomb held by
+/// the cgroup usually shows up as a shell exiting non-zero with `EAGAIN` on stderr. Without the
+/// counter there would be nothing distinguishing it from any other failure.
+///
+/// Nothing else is attributed. See [`crate::resources::limit_from_signal`] for why
+/// `RLIMIT_AS`/`RLIMIT_DATA`, `RLIMIT_NPROC` and `RLIMIT_NOFILE` are deliberately left
+/// unattributed rather than guessed at.
+fn classify_resource_limit(
+    status: &std::process::ExitStatus,
+    cgroup_scope: Option<&crate::cgroup::CgroupScope>,
+    counters_before: Option<crate::cgroup::CgroupEventCounters>,
+) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(limit) = status.signal().and_then(crate::resources::limit_from_signal) {
+        return Some(limit.to_string());
+    }
+
+    let (scope, before) = (cgroup_scope?, counters_before?);
+    scope
+        .event_counters()
+        .attribution_since(before)
+        .map(str::to_string)
 }
 
 pub(crate) fn build_shell_env(
@@ -350,6 +429,63 @@ mod tests {
 
     use super::*;
     use crate::sandbox::ShellEnforcement;
+
+    /// The `pre_exec` rlimit plumbing, end to end on whatever platform runs the suite: a
+    /// declared `capabilities.resources.max_open_files` must reach the child as its **hard**
+    /// ceiling, which is what `ulimit -Hn` reports. This asserts the mechanism (the value was
+    /// applied to `rlim_max`, not only `rlim_cur`), not a security outcome — the hostile-capsule
+    /// scenarios are hand-run on real Linux hardware, per this slice's manual-verification doc.
+    #[test]
+    fn execute_shell_applies_the_declared_limit_as_a_hard_ceiling() {
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            resources: crate::resources::HostResourceLimits {
+                max_open_files: 64,
+                ..crate::resources::HostResourceLimits::default()
+            },
+            ..CapabilityPolicy::default()
+        };
+        let mut enforcement = ShellEnforcement::environment_only();
+        enforcement.resource_limits = policy.resources;
+
+        let result = execute_shell(
+            "bash",
+            &["-c", "ulimit -Hn"],
+            &[],
+            temp.path(),
+            &policy,
+            &enforcement,
+        )
+        .expect("bash must run");
+
+        assert_eq!(result.stdout.trim(), "64", "stderr was: {}", result.stderr);
+        assert_eq!(result.resource_limit_hit, None);
+    }
+
+    /// A subprocess that exits normally must never be reported as limit-killed — the negative
+    /// half of attribution, and the one that keeps `resource_limit_hit` meaningful in the trace.
+    #[test]
+    fn execute_shell_reports_no_resource_limit_for_an_ordinary_exit() {
+        let temp = tempdir().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let result = execute_shell(
+            "bash",
+            &["-c", "exit 3"],
+            &[],
+            temp.path(),
+            &policy,
+            &ShellEnforcement::environment_only(),
+        )
+        .expect("bash must run");
+
+        assert_eq!(result.exit_code, 3);
+        assert_eq!(result.resource_limit_hit, None);
+    }
 
     #[test]
     fn execute_shell_blocks_binary_not_in_allowlist() {

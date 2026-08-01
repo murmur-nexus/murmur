@@ -1616,6 +1616,11 @@ Remote mode requires:
 | `E-RUN-006` | Inference driver artifact not installed |
 | `E-RUN-007` | Agent loop failed at runtime |
 | `E-RUN-008` | Required artifact not installed locally |
+| `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read |
+| `E-RUN-010` | `network.internal_port` is already bound |
+| `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit ([host resource limits](manifest-schema.md#host-resource-limits)) |
+| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) — see [manual verification](resource-limits-manual-verification.md) |
+| `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` |
 | `E-IO-001` | File or directory not found |
 | `E-IO-003` | General I/O error (read/write failure) |
 | `E-DEPLOY-003` | SSH connection or remote command failed |
