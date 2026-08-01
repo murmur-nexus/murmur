@@ -597,6 +597,45 @@ pub struct ResourceLimits {
     pub deadline_seconds: Option<u64>,
 }
 
+/// Host-process (OS-level) resource bounds from `capabilities.resources`.
+///
+/// Distinct from [`ResourceLimits`] (`capabilities.limits`) in both mechanism and subject:
+/// that block bounds a WASM *guest* inside its wasmtime store, this one bounds every *native
+/// subprocess* the runtime spawns — `rlimit(2)` ceilings applied before `execve`, a Linux
+/// cgroup v2 scope around the whole process tree, and a periodic workdir-size check. A capsule
+/// that cannot escape containment can still wedge its host by forking, allocating, or writing
+/// without bound; this is the block that stops that.
+///
+/// Every field is `Option` for the same reason [`ResourceLimits`]'s are: this type carries only
+/// what the manifest actually declared, and the runtime substitutes its own default for
+/// anything omitted (see `capsule_runtime::resources::HostResourceLimits`). An omitted field —
+/// or an omitted block — means defaults, never "unlimited".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceCapabilities {
+    /// `RLIMIT_NPROC` hard ceiling on each spawned subprocess.
+    pub max_processes: Option<u64>,
+    /// `RLIMIT_NOFILE` hard ceiling on each spawned subprocess.
+    pub max_open_files: Option<u64>,
+    /// `RLIMIT_FSIZE` hard ceiling, in bytes, on each spawned subprocess.
+    pub max_file_size_bytes: Option<u64>,
+    /// `RLIMIT_CPU` hard ceiling, in CPU-seconds, on each spawned subprocess.
+    pub cpu_seconds: Option<u64>,
+    /// `RLIMIT_AS` (Linux) / `RLIMIT_DATA` (macOS) hard ceiling, in bytes, on each spawned
+    /// subprocess.
+    pub memory_bytes: Option<u64>,
+    /// cgroup v2 `memory.max`, in bytes — aggregate across the whole subprocess tree. Linux only.
+    pub cgroup_memory_bytes: Option<u64>,
+    /// cgroup v2 `pids.max` — aggregate across the whole subprocess tree. Linux only.
+    pub cgroup_pids_max: Option<u64>,
+    /// cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores). Linux only.
+    pub cgroup_cpu_percent: Option<u32>,
+    /// cgroup v2 `io.max` read+write bytes/sec on the workdir's backing device. Linux only,
+    /// best-effort (the backing device cannot always be resolved).
+    pub cgroup_io_bytes_per_sec: Option<u64>,
+    /// Ceiling on total workdir size, in bytes, enforced by a periodic check on every platform.
+    pub workdir_max_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub network: Option<NetworkCapabilities>,
@@ -605,6 +644,7 @@ pub struct Capabilities {
     pub spawn: Option<SpawnCapabilities>,
     pub env: Option<EnvCapabilities>,
     pub limits: Option<ResourceLimits>,
+    pub resources: Option<ResourceCapabilities>,
 }
 
 #[derive(Debug, Error)]
@@ -746,6 +786,8 @@ struct RawCapabilities {
     env: Option<RawEnvCapabilities>,
     #[serde(default)]
     limits: Option<RawResourceLimits>,
+    #[serde(default)]
+    resources: Option<RawResourceCapabilities>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -770,6 +812,30 @@ struct RawResourceLimits {
     instances: Option<usize>,
     #[serde(default)]
     deadline_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawResourceCapabilities {
+    #[serde(default)]
+    max_processes: Option<u64>,
+    #[serde(default)]
+    max_open_files: Option<u64>,
+    #[serde(default)]
+    max_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    cpu_seconds: Option<u64>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
+    #[serde(default)]
+    cgroup_memory_bytes: Option<u64>,
+    #[serde(default)]
+    cgroup_pids_max: Option<u64>,
+    #[serde(default)]
+    cgroup_cpu_percent: Option<u32>,
+    #[serde(default)]
+    cgroup_io_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    workdir_max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1148,6 +1214,11 @@ fn parse_capabilities(
 
     let limits = raw_caps.limits.map(parse_resource_limits).transpose()?;
 
+    let resources = raw_caps
+        .resources
+        .map(parse_resource_capabilities)
+        .transpose()?;
+
     Ok(Some(Capabilities {
         network,
         filesystem,
@@ -1155,6 +1226,7 @@ fn parse_capabilities(
         spawn,
         env,
         limits,
+        resources,
     }))
 }
 
@@ -1269,6 +1341,49 @@ fn parse_resource_limits(raw: RawResourceLimits) -> Result<ResourceLimits, Runti
         table_elements: raw.table_elements,
         instances: raw.instances,
         deadline_seconds: raw.deadline_seconds,
+    })
+}
+
+/// Lower and validate `capabilities.resources`. Mirrors [`parse_resource_limits`]: nothing is
+/// defaulted here (the runtime owns the defaults, so "omitted" must stay distinguishable from
+/// "declared"), and a declared `0` is rejected outright on every field — a zero ceiling is
+/// never what an author means, and letting it through would turn a typo into a subprocess that
+/// cannot fork, open a file, or run for a single CPU-second.
+fn parse_resource_capabilities(
+    raw: RawResourceCapabilities,
+) -> Result<ResourceCapabilities, RuntimeManifestError> {
+    let reject_zero = |value: Option<u64>, field: &str| -> Result<(), RuntimeManifestError> {
+        match value {
+            Some(0) => Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("capabilities.resources.{field}"),
+                message: "must be greater than zero".to_string(),
+            }),
+            _ => Ok(()),
+        }
+    };
+
+    reject_zero(raw.max_processes, "max_processes")?;
+    reject_zero(raw.max_open_files, "max_open_files")?;
+    reject_zero(raw.max_file_size_bytes, "max_file_size_bytes")?;
+    reject_zero(raw.cpu_seconds, "cpu_seconds")?;
+    reject_zero(raw.memory_bytes, "memory_bytes")?;
+    reject_zero(raw.cgroup_memory_bytes, "cgroup_memory_bytes")?;
+    reject_zero(raw.cgroup_pids_max, "cgroup_pids_max")?;
+    reject_zero(raw.cgroup_cpu_percent.map(u64::from), "cgroup_cpu_percent")?;
+    reject_zero(raw.cgroup_io_bytes_per_sec, "cgroup_io_bytes_per_sec")?;
+    reject_zero(raw.workdir_max_bytes, "workdir_max_bytes")?;
+
+    Ok(ResourceCapabilities {
+        max_processes: raw.max_processes,
+        max_open_files: raw.max_open_files,
+        max_file_size_bytes: raw.max_file_size_bytes,
+        cpu_seconds: raw.cpu_seconds,
+        memory_bytes: raw.memory_bytes,
+        cgroup_memory_bytes: raw.cgroup_memory_bytes,
+        cgroup_pids_max: raw.cgroup_pids_max,
+        cgroup_cpu_percent: raw.cgroup_cpu_percent,
+        cgroup_io_bytes_per_sec: raw.cgroup_io_bytes_per_sec,
+        workdir_max_bytes: raw.workdir_max_bytes,
     })
 }
 
@@ -1686,6 +1801,122 @@ fn is_valid_env_variable(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resources_block_is_optional_and_absent_stays_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  shell:
+    allow: [bash]
+"#,
+        )
+        .unwrap();
+
+        // `None` here is "the manifest said nothing", not "unlimited" — the runtime substitutes
+        // its own defaults (see `capsule_runtime::resources::HostResourceLimits::resolve`), and
+        // keeping the two states distinct is what lets it own them in one place.
+        let caps = manifest.capabilities.expect("shell block must parse");
+        assert_eq!(caps.resources, None);
+    }
+
+    #[test]
+    fn resources_fields_parse_and_each_stays_independently_optional() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  resources:
+    max_processes: 32
+    max_open_files: 16
+    max_file_size_bytes: 1048576
+    cpu_seconds: 30
+    memory_bytes: 268435456
+    cgroup_memory_bytes: 536870912
+    cgroup_pids_max: 64
+    cgroup_cpu_percent: 50
+    cgroup_io_bytes_per_sec: 1048576
+    workdir_max_bytes: 2097152
+"#,
+        )
+        .unwrap();
+
+        let resources = manifest
+            .capabilities
+            .and_then(|caps| caps.resources)
+            .expect("resources block must parse");
+        assert_eq!(resources.max_processes, Some(32));
+        assert_eq!(resources.max_open_files, Some(16));
+        assert_eq!(resources.max_file_size_bytes, Some(1_048_576));
+        assert_eq!(resources.cpu_seconds, Some(30));
+        assert_eq!(resources.memory_bytes, Some(268_435_456));
+        assert_eq!(resources.cgroup_memory_bytes, Some(536_870_912));
+        assert_eq!(resources.cgroup_pids_max, Some(64));
+        assert_eq!(resources.cgroup_cpu_percent, Some(50));
+        assert_eq!(resources.cgroup_io_bytes_per_sec, Some(1_048_576));
+        assert_eq!(resources.workdir_max_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn resources_partial_block_leaves_undeclared_fields_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  resources:
+    max_open_files: 16
+"#,
+        )
+        .unwrap();
+
+        let resources = manifest
+            .capabilities
+            .and_then(|caps| caps.resources)
+            .expect("resources block must parse");
+        assert_eq!(resources.max_open_files, Some(16));
+        assert_eq!(resources.max_processes, None);
+        assert_eq!(resources.workdir_max_bytes, None);
+    }
+
+    /// Every field rejects `0` at parse time, naming its own path. A zero ceiling is never what
+    /// an author means, and accepting one would turn a typo into a subprocess that cannot fork,
+    /// open a file, or run for a single CPU-second — discovered at runtime instead of at parse.
+    #[test]
+    fn resources_zero_is_rejected_on_every_field() {
+        for field in [
+            "max_processes",
+            "max_open_files",
+            "max_file_size_bytes",
+            "cpu_seconds",
+            "memory_bytes",
+            "cgroup_memory_bytes",
+            "cgroup_pids_max",
+            "cgroup_cpu_percent",
+            "cgroup_io_bytes_per_sec",
+            "workdir_max_bytes",
+        ] {
+            let yaml = format!(
+                "name: cap\nversion: 0.0.1\ncapabilities:\n  resources:\n    {field}: 0\n"
+            );
+            let error = RuntimeManifest::from_yaml_str(&yaml)
+                .expect_err("a zero {field} must not parse");
+
+            match error {
+                RuntimeManifestError::InvalidCapabilities {
+                    field: reported,
+                    message,
+                } => {
+                    assert_eq!(reported, format!("capabilities.resources.{field}"));
+                    assert_eq!(message, "must be greater than zero");
+                }
+                other => panic!("expected InvalidCapabilities for {field}, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn artifact_runtime_defaults_to_tool() {

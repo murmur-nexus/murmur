@@ -75,8 +75,11 @@
 
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use murmur_artifact::security_warnings::{security_warning_link, W_SEC_001, W_SEC_002, W_SEC_005};
+use murmur_artifact::security_warnings::{
+    security_warning_link, W_SEC_001, W_SEC_002, W_SEC_005, W_SEC_010,
+};
 use murmur_artifact::InterpreterRuntimeGrant;
 
 use crate::types::CapabilityPolicy;
@@ -1377,10 +1380,36 @@ pub(crate) struct ShellEnforcement {
     /// for parity but never read off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) landlock_grants: Vec<LandlockGrant>,
+    /// Fully-resolved OS-level bounds for every subprocess this session spawns — `rlimit(2)`
+    /// ceilings applied before `execve`, plus the values the cgroup scope below was built from.
+    /// Unlike everything above it, this is enforced on **every** platform: `setrlimit` is POSIX,
+    /// so macOS gets the per-process half of this slice even though it can never get the
+    /// aggregate half. See [`crate::resources`].
+    pub(crate) resource_limits: crate::resources::HostResourceLimits,
+    /// The runtime's own uid process count, measured once here in the parent. `RLIMIT_NPROC` is a
+    /// per-uid limit, so `resource_limits.max_processes` is applied as headroom above this rather
+    /// than as an absolute ceiling — see `crate::resources::apply_hard_rlimits`. `0` when the host
+    /// cannot be asked, which makes the declared value apply literally (the tighter reading).
+    pub(crate) nproc_baseline: u64,
+    /// The session's cgroup v2 scope, when the host could delegate one (Linux only, and only
+    /// for capsules that can actually spawn a native subprocess). `None` on macOS always, and on
+    /// Linux only for capsules with no subprocess capability at all — a Linux capsule that *can*
+    /// spawn one and could not be given a scope never reaches here, because the launch is
+    /// refused first with `RuntimeError::CgroupDelegationUnavailable`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
+    /// The session's periodic workdir-size check. Consulted before every subprocess spawn, so a
+    /// disk filler stops writing at the first spawn after the ceiling is crossed rather than
+    /// only at the next agent turn.
+    pub(crate) workdir_guard: Option<Arc<crate::resources::WorkdirGuard>>,
 }
 
 impl ShellEnforcement {
     /// Resolves tier + network allowlist + canonical exec allowlist once, at launch time.
+    ///
+    /// The rlimit half of [`crate::resources`] is resolved here too (it needs nothing but the
+    /// policy), while the cgroup scope and workdir guard are session-scoped live handles the
+    /// caller creates and attaches with [`Self::with_host_bounding`].
     pub(crate) fn resolve(policy: &CapabilityPolicy) -> Result<Self, String> {
         let tier = detect_enforcement_tier();
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
@@ -1398,7 +1427,48 @@ impl ShellEnforcement {
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
+            resource_limits: policy.resources,
+            nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
+            cgroup_scope: None,
+            workdir_guard: None,
         })
+    }
+
+    /// Attach the session-scoped host-bounding handles: the cgroup v2 scope (Linux, when the
+    /// capsule can spawn a subprocess) and the workdir-size guard (every platform).
+    ///
+    /// Separate from [`Self::resolve`] because both are *live* per-session resources with
+    /// lifetimes and side effects — a directory under `/sys/fs/cgroup` and a running thread —
+    /// while `resolve` is a pure resolution of manifest and host facts. The caller owns their
+    /// creation so the fail-closed launch refusal can happen with a typed error before this is
+    /// ever reached.
+    pub(crate) fn with_host_bounding(
+        mut self,
+        cgroup_scope: Option<Arc<crate::cgroup::CgroupScope>>,
+        workdir_guard: Option<Arc<crate::resources::WorkdirGuard>>,
+    ) -> Self {
+        self.cgroup_scope = cgroup_scope;
+        self.workdir_guard = workdir_guard;
+        self
+    }
+
+    /// The latched workdir-size breach, if the guard has seen one.
+    pub(crate) fn workdir_breach(&self) -> Option<crate::resources::WorkdirBreach> {
+        self.workdir_guard
+            .as_ref()
+            .and_then(|guard| guard.breach())
+    }
+
+    /// Refuse to spawn once the workdir ceiling has been crossed.
+    ///
+    /// Called by both subprocess spawn paths before `Command::spawn()`. Stopping at the spawn
+    /// boundary is what keeps a disk filler from writing another byte while the session unwinds:
+    /// the periodic check notices the breach, and the very next subprocess never starts.
+    pub(crate) fn check_workdir_budget(&self) -> Result<(), String> {
+        match self.workdir_breach() {
+            Some(breach) => Err(crate::resources::workdir_breach_message(breach)),
+            None => Ok(()),
+        }
     }
 
     /// The permanent macOS/non-Linux value, and also what tests should construct directly to
@@ -1416,6 +1486,13 @@ impl ShellEnforcement {
             unix_sockets_allowed: false,
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
+            // Defaults, not "no limits": the rlimit ceilings are the one part of this slice that
+            // applies unchanged on this tier, so zeroing them out here would misrepresent what a
+            // real macOS host does.
+            resource_limits: crate::resources::HostResourceLimits::default(),
+            nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
+            cgroup_scope: None,
+            workdir_guard: None,
         }
     }
 }
@@ -1500,6 +1577,50 @@ pub(crate) fn tier_warning(
         EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING)),
         EnforcementTier::KernelSeccompOnly => Some((W_SEC_002, SECCOMP_ONLY_WARNING)),
         EnforcementTier::EnvironmentOnly => Some((W_SEC_001, ENVIRONMENT_ONLY_WARNING)),
+    }
+}
+
+const NO_AGGREGATE_BOUNDING_WARNING: &str = "this capsule can spawn native subprocesses, but \
+this platform has no cgroup v2 (Linux-only), so no aggregate bound exists across the subprocess \
+tree: nothing caps its total memory, task count or CPU. Per-process rlimits from \
+capabilities.resources still apply (hard, not soft), but RLIMIT_NPROC is a per-uid ceiling and \
+does NOT stop a fork bomb of distinct, short-lived processes — only a cgroup's pids.max does. \
+This is permanent on this platform, not a placeholder for a future slice.";
+
+/// Pure decision for the aggregate-bounding warning, split out of
+/// [`warn_for_missing_aggregate_bounding`] the same way [`tier_warning`] is split out of
+/// [`warn_for_enforcement_tier`], so tests can assert it without capturing stderr.
+///
+/// Fires only where the gap is both real and unclosable: a non-Linux host running a capsule that
+/// can spawn a subprocess. On Linux the same condition is not a warning at all — a capsule that
+/// can spawn a subprocess and has no scope never launches (`CgroupDelegationUnavailable`), so
+/// there is no running session left to warn about.
+pub(crate) fn aggregate_bounding_warning(
+    is_linux: bool,
+    requires_bounding: bool,
+    has_scope: bool,
+) -> Option<(&'static str, &'static str)> {
+    if is_linux || !requires_bounding || has_scope {
+        return None;
+    }
+    Some((W_SEC_010, NO_AGGREGATE_BOUNDING_WARNING))
+}
+
+/// Fires at every launch, not just once.
+pub(crate) fn warn_for_missing_aggregate_bounding(
+    workdir: &Path,
+    requires_bounding: bool,
+    has_scope: bool,
+) {
+    let is_linux = cfg!(target_os = "linux");
+    if let Some((code, message)) = aggregate_bounding_warning(is_linux, requires_bounding, has_scope)
+    {
+        let link = security_warning_link(code);
+        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::agent::append_bootstrap_log(
+            workdir,
+            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
+        );
     }
 }
 
@@ -1631,13 +1752,55 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Attach the OS-level *process* bounds — hard rlimits, and cgroup membership where a scope
+/// exists — to `command`, so they apply to the spawned process and everything it forks.
+///
+/// Deliberately independent of the tier machinery above. Landlock and seccomp are Linux kernel
+/// primitives that exist on some hosts; `setrlimit` is POSIX and exists on all of them, and the
+/// cgroup self-move is a single `write(2)` to a descriptor the parent already opened. Splitting
+/// this out is what lets the two subprocess spawn paths converge: `execute_shell` gets it as
+/// part of `prepare_enforcement`, and `dispatch_native_tool` — which installs no seccomp or
+/// Landlock at all, a pre-existing gap this slice does not close — gets it on its own.
+///
+/// Everything the returned closure does runs in the forked child between `fork` and `execve`,
+/// so it is restricted to syscalls: `getrlimit`/`setrlimit` pairs and one `write`. No
+/// allocation, no locking, no path resolution.
+#[cfg(unix)]
+pub(crate) fn attach_process_limits(
+    command: &mut std::process::Command,
+    enforcement: &ShellEnforcement,
+) {
+    use std::os::unix::process::CommandExt;
+
+    let limits = enforcement.resource_limits;
+    let nproc_baseline = enforcement.nproc_baseline;
+    let cgroup_scope = enforcement.cgroup_scope.clone();
+
+    // SAFETY: the closure runs in the forked child before `execve`, where only async-signal-safe
+    // operations are permitted. It performs `getrlimit`/`setrlimit` pairs and, when a cgroup
+    // scope exists, a single `write` to a descriptor opened by the parent before the fork —
+    // no allocation, no locks, no path lookups.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            crate::resources::apply_hard_rlimits(&limits, nproc_baseline)?;
+            if let Some(scope) = cgroup_scope.as_ref() {
+                scope.join_current_process()?;
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Installs kernel-level exec/network/filesystem enforcement into `command` so it applies to
-/// the spawned process and everything it forks/execs. No-op when
-/// `enforcement.tier == EnvironmentOnly` — does not even attempt a Landlock/seccomp call in
-/// that case.
+/// the spawned process and everything it forks/execs. The Landlock/seccomp half is a no-op when
+/// `enforcement.tier == EnvironmentOnly` — it does not even attempt those calls in that case —
+/// but the rlimit half below is not: `setrlimit` is POSIX and applies on every platform this
+/// runtime targets, so a macOS capsule still gets per-process ceilings even though this tier has
+/// no kernel sandbox at all.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn prepare_enforcement(
-    _command: &mut std::process::Command,
+    command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
     _workdir: &Path,
 ) -> Result<SupervisorHandle, String> {
@@ -1649,6 +1812,7 @@ pub(crate) fn prepare_enforcement(
         EnforcementTier::EnvironmentOnly,
         "non-Linux targets must always resolve to EnforcementTier::EnvironmentOnly"
     );
+    attach_process_limits(command, enforcement);
     Ok(SupervisorHandle::Noop)
 }
 
@@ -1669,6 +1833,9 @@ pub(crate) fn prepare_enforcement(
     forced_prepare_failure()?;
 
     if enforcement.tier == EnforcementTier::EnvironmentOnly {
+        // No kernel sandbox to install, but the POSIX rlimit ceilings still apply — this tier is
+        // only reachable on Linux from tests, and even there it must not read as "unbounded".
+        attach_process_limits(command, enforcement);
         return Ok(SupervisorHandle::Noop);
     }
 
@@ -1743,6 +1910,12 @@ pub(crate) fn prepare_enforcement(
     // socketpair above is created in the *parent*, before fork, so the child's own `sendmsg` over
     // it is unaffected by a filter that denies `socket(AF_UNIX, ...)`.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
+    // Same clone-before-move shape. `HostResourceLimits` is `Copy`; the cgroup scope is an `Arc`
+    // whose `cgroup.procs` descriptor was opened in the parent at scope-creation time, so the
+    // child performs no path lookup to join it.
+    let resource_limits = enforcement.resource_limits;
+    let nproc_baseline = enforcement.nproc_baseline;
+    let cgroup_scope = enforcement.cgroup_scope.clone();
 
     // SAFETY: this closure runs in the forked child, after fork() but before execve() — the
     // narrow pre_exec window where only async-signal-safe operations are permitted. It performs
@@ -1758,6 +1931,21 @@ pub(crate) fn prepare_enforcement(
     // the closure body finishes.
     unsafe {
         command.pre_exec(move || {
+            // Ordered first, before any seccomp filter is installed: these are the bounds that
+            // must hold even if a later step in this closure fails, and `prlimit64`/`setrlimit`
+            // plus `write` are all already in `SECCOMP_SYSCALL_ALLOWLIST` either way.
+            if let Err(error) = crate::resources::apply_hard_rlimits(&resource_limits, nproc_baseline)
+            {
+                linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
+                return Err(error);
+            }
+            if let Some(scope) = cgroup_scope.as_ref() {
+                if let Err(error) = scope.join_current_process() {
+                    linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
+                    return Err(error);
+                }
+            }
+
             let sock_fd = child_sock.as_raw_fd();
             match linux_enforce::child_install_enforcement(
                 tier,
@@ -3916,6 +4104,61 @@ mod tests {
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
         assert_eq!(tier_warning(EnforcementTier::KernelSeccompOnly, true), None);
         assert_eq!(tier_warning(EnforcementTier::EnvironmentOnly, true), None);
+    }
+
+    /// The aggregate-bounding gap is warned about exactly where it is real *and* permanent: a
+    /// non-Linux host running a capsule that can spawn a subprocess. Never on Linux — there the
+    /// same condition refuses the launch outright, so a warning would describe a session that
+    /// does not exist — and never for a capsule with no process tree to bound.
+    #[test]
+    fn aggregate_bounding_warns_only_off_linux_and_only_with_a_subprocess_route() {
+        assert_eq!(
+            aggregate_bounding_warning(false, true, false),
+            Some((W_SEC_010, NO_AGGREGATE_BOUNDING_WARNING))
+        );
+        assert_eq!(
+            aggregate_bounding_warning(false, false, false),
+            None,
+            "a capsule that cannot spawn a subprocess has nothing to bound"
+        );
+        assert_eq!(
+            aggregate_bounding_warning(true, true, false),
+            None,
+            "on Linux this case is a refused launch, not a warning"
+        );
+        assert_eq!(
+            aggregate_bounding_warning(true, true, true),
+            None,
+            "a scope exists, so there is no gap"
+        );
+    }
+
+    /// The warning must name the per-uid nature of `RLIMIT_NPROC` explicitly: "rlimits are still
+    /// applied" reads as reassurance, and the whole point is that the one rlimit an operator
+    /// would expect to stop a fork bomb does not.
+    #[test]
+    fn aggregate_bounding_warning_states_why_rlimit_nproc_is_insufficient() {
+        let (_, message) = aggregate_bounding_warning(false, true, false).unwrap();
+        assert!(message.contains("per-uid"), "message was: {message}");
+        assert!(message.contains("fork bomb"), "message was: {message}");
+        assert!(message.contains("pids.max"), "message was: {message}");
+    }
+
+    #[test]
+    fn warn_for_missing_aggregate_bounding_writes_the_code_and_link_to_bootstrap_log() {
+        let temp = tempfile::tempdir().unwrap();
+        warn_for_missing_aggregate_bounding(temp.path(), true, false);
+        let log = bootstrap_log_contents(temp.path());
+
+        if cfg!(target_os = "linux") {
+            assert!(
+                log.is_empty(),
+                "Linux refuses the launch instead of warning: {log}"
+            );
+        } else {
+            assert!(log.contains(W_SEC_010), "log was: {log}");
+            assert!(log.contains(&security_warning_link(W_SEC_010)), "log was: {log}");
+        }
     }
 
     fn warning_test_policy() -> CapabilityPolicy {

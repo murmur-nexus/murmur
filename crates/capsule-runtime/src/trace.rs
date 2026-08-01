@@ -141,6 +141,13 @@ struct ShellEvent {
     stdout_bytes: u64,
     stderr_bytes: u64,
     duration_ms: u64,
+    /// The `capabilities.resources` field this subprocess was killed for exceeding, when the
+    /// kernel's own evidence names exactly one (`SIGXCPU`/`SIGXFSZ`, or a cgroup
+    /// `memory.events`/`pids.events` counter that moved). Omitted from the JSONL entirely
+    /// otherwise — including for a subprocess that died for a reason no single limit can be
+    /// pinned to, which must not read as "no limit was involved".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_limit: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -412,6 +419,7 @@ impl TraceWriter {
         stdout_bytes: u64,
         stderr_bytes: u64,
         duration_ms: u64,
+        resource_limit: Option<String>,
     ) -> std::io::Result<()> {
         let event = ShellEvent {
             event_type: "shell",
@@ -424,6 +432,7 @@ impl TraceWriter {
             stdout_bytes,
             stderr_bytes,
             duration_ms,
+            resource_limit,
         };
         self.write_event(&event).await?;
         self.total_shell_calls = self.total_shell_calls.saturating_add(1);
@@ -866,6 +875,7 @@ mod tests {
             7,
             0,
             10,
+            None,
         )
         .await
         .unwrap();
@@ -941,7 +951,7 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "/bin/ls".to_string(), "ls".to_string(), 0, 3, 0, 2)
+        w.write_shell(0, "/bin/ls".to_string(), "ls".to_string(), 0, 3, 0, 2, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -1055,7 +1065,7 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "/bin/echo".to_string(), "echo".to_string(), 0, 4, 0, 1)
+        w.write_shell(0, "/bin/echo".to_string(), "echo".to_string(), 0, 4, 0, 1, None)
             .await
             .unwrap();
         w.write_inference(1, 60, 30, "end_turn".to_string(), None, None)

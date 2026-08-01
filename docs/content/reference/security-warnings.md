@@ -26,6 +26,7 @@ Warnings from `mur build` go to stderr only.
 | [`W-SEC-007`](#w-sec-007) | `mur run` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped |
 | [`W-SEC-008`](#w-sec-008) | `mur run` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply |
 | [`W-SEC-009`](#w-sec-009) | `mur run`, `mur doctor` | `capabilities.shell.interpreter_runtime` couples the capsule to a specific host interpreter-version layout |
+| [`W-SEC-010`](#w-sec-010) | `mur run` | No cgroup on this platform — the subprocess tree has no aggregate memory/pids/cpu bound |
 
 ---
 
@@ -523,6 +524,46 @@ present in the same block's `shell.allow` (this mechanism narrows filesystem acc
 exec grant that already exists — it never itself grants exec), a `dirs[].path` that is not absolute
 (does not start with `/`), a `dirs[]` entry that omits `list_dir` (enumerability is never inferred),
 or an `interpreter_runtime[]` entry with an empty `dirs` list.
+
+---
+
+## W-SEC-010 — No aggregate bound on the subprocess tree { #w-sec-010 }
+
+**Fires when:** the capsule can spawn a native subprocess by any route
+(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact) and
+the host is not Linux — so no cgroup v2 scope can exist for its process tree.
+
+**Why it matters:** `capabilities.resources` bounds subprocesses with two independent mechanisms,
+and only the weaker one survives on this platform. Per-process `setrlimit(2)` ceilings still
+apply, and still apply as **hard** limits the capsule cannot raise. But every *aggregate* bound —
+`cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` — is a
+cgroup v2 feature, and cgroups are Linux-only. Nothing caps the subprocess tree's total memory,
+task count, or CPU.
+
+**`RLIMIT_NPROC` is not a substitute, and this is the specific reason cgroups are required.** It
+is a per-**uid** ceiling, not a per-tree one: a fork bomb of distinct, short-lived processes that
+fork and exit faster than the count is observed slips past it in practice even when it is set
+correctly. Only a cgroup's `pids.max` bounds the tree as a whole. Two further gaps on macOS
+specifically: it has no `RLIMIT_AS`, and its `RLIMIT_DATA` is present in the headers but not
+enforceable (the kernel rejects any finite value with `EINVAL`), so
+`capabilities.resources.memory_bytes` has no effect there either — a subprocess's memory is
+bounded neither per-process nor in aggregate.
+
+**What this is not.** This is denial of service, not a containment escape. A capsule that
+exhausts host resources has not read, written, or reached anything outside its granted scope. Do
+not read this warning as an escape finding.
+
+**What to do:** run capsules that spawn subprocesses on a Linux host with systemd user cgroup
+delegation configured, where the aggregate bounds are real — see
+[Resource limits: manual verification](resource-limits-manual-verification.md). On this platform,
+treat `capabilities.resources`' `cgroup_*` fields as declared-but-inert and do not rely on them.
+This is **permanent** on this platform, exactly like [`W-SEC-001`](#w-sec-001): no future slice
+will add cgroups to a kernel that does not have them.
+
+Note the asymmetry with Linux, which is deliberate: there, the same condition (can spawn a
+subprocess, no cgroup scope available) is a **refused launch** with `E-RUN-012`, not a warning —
+on Linux a missing scope is a host misconfiguration an operator can fix, while here it is a
+property of the platform.
 
 ---
 

@@ -7,6 +7,7 @@ pub(crate) mod a2a;
 pub(crate) mod agent;
 pub mod artifact;
 pub mod bindings;
+pub(crate) mod cgroup;
 pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;
@@ -17,6 +18,7 @@ pub(crate) mod network_policy;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod plan;
+pub mod resources;
 pub mod runtime;
 pub(crate) mod sandbox;
 pub mod security;
@@ -28,6 +30,7 @@ pub mod types;
 pub use errors::RuntimeError;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
+pub use resources::HostResourceLimits;
 pub use runtime::{launch_session, stage_session, warn_on_interpreter_runtime_grants};
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,

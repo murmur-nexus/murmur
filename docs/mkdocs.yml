@@ -124,6 +124,7 @@ nav:
       - Capsule I/O Schema: reference/capsule-io.md
       - Security Warnings: reference/security-warnings.md
       - Seccomp-notify TOCTOU Audit: reference/seccomp-notify-toctou-audit.md
+      - Resource Limits — Manual Verification: reference/resource-limits-manual-verification.md
       - Build Lints: reference/build-lints.md
       - WIT Interfaces: reference/wit-interfaces.md
       - Nexus API: reference/nexus-api.md

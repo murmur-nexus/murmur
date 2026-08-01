@@ -26,6 +26,9 @@ pub const E_RUN_007: &str = "E-RUN-007"; // agent loop failed at runtime
 pub const E_RUN_008: &str = "E-RUN-008"; // required artifact not installed locally
 pub const E_RUN_009: &str = "E-RUN-009"; // system prompt file could not be read
 pub const E_RUN_010: &str = "E-RUN-010"; // network.internal_port already in use
+pub const E_RUN_011: &str = "E-RUN-011"; // subprocess killed for exceeding a capabilities.resources limit
+pub const E_RUN_012: &str = "E-RUN-012"; // no cgroup v2 scope could be delegated on Linux
+pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabilities.resources.workdir_max_bytes
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
@@ -108,6 +111,44 @@ impl From<RuntimeError> for CliError {
                 format!("capsule execution exceeded its configured resource limits: {message}"),
                 "the capsule requested more memory or table space than capabilities.limits allows — \
                  check for a runaway allocation, or raise the limit in murmur.yaml",
+            ),
+            // The three host-process (OS-level) resource bounds, kept distinct from E-RUN-001's
+            // WASM-guest limits above: those fire from a wasmtime trap inside the store, these
+            // from rlimits, a cgroup, or the workdir check applied to native subprocesses.
+            RuntimeError::ShellResourceLimitExceeded {
+                binary,
+                limit,
+                detail,
+            } => CliError::with_hint(
+                E_RUN_011,
+                format!(
+                    "shell subprocess '{binary}' was killed for exceeding \
+                     capabilities.resources.{limit}: {detail}"
+                ),
+                "the subprocess crossed a host resource ceiling — raise that field under \
+                 capabilities.resources in murmur.yaml if the work genuinely needs more, or fix \
+                 the runaway that hit it",
+            ),
+            RuntimeError::CgroupDelegationUnavailable { reason } => CliError::with_hint(
+                E_RUN_012,
+                format!(
+                    "this capsule can spawn native subprocesses but no cgroup v2 scope could be \
+                     created to bound them: {reason}"
+                ),
+                "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
+                 cpu and io — see docs/content/reference/resource-limits-manual-verification.md",
+            ),
+            RuntimeError::WorkdirSizeExceeded {
+                max_bytes,
+                observed_bytes,
+            } => CliError::with_hint(
+                E_RUN_013,
+                format!(
+                    "session workdir grew to {observed_bytes} bytes, past the {max_bytes} byte \
+                     ceiling"
+                ),
+                "raise capabilities.resources.workdir_max_bytes in murmur.yaml if the capsule \
+                 legitimately writes this much, or find what is filling the workdir",
             ),
             RuntimeError::ArtifactNotFound { name, version } => CliError::with_hint(
                 E_REG_001,
