@@ -482,8 +482,17 @@ string the trace carried, and whether the host stayed responsive. Until that edi
 claim on this page is a design intent, not a verified result, and the "not yet verified" framing
 in [Security Warnings](security-warnings.md) stands as written.
 
-These scenarios are written to be lifted verbatim into the escape-conformance harness once that
-lands (it does not exist in this repository today; its roadmap card already lists "resource
-exhaustion: fork bomb, disk filler, memory hog, fd exhauster — reported as its own category" as a
-required case, and expects this slice's output to slot in). When it does, resource exhaustion goes
-in as **its own category** — denial of service — never merged into the escape findings.
+Scenarios 1, 2, 3, 5 and 6 are also driven automatically by the maintainer conformance procedure
+described in [Security Warnings](security-warnings.md#w-sec-005), where resource exhaustion is
+reported as **its own category** — denial of service — and is never merged into the escape
+findings. That is not a substitute for running them here: it grades each scenario from a single
+automated signal, while the scenarios above also ask a person to watch the host stay responsive and
+to read `dmesg`, `pids.events` and `memory.events` directly.
+
+One finding from that work is worth carrying here, because it changes what a manifest should
+declare: on the Linux Full tier the rlimits are applied *before* the seccomp filter is installed,
+and installing the filter needs file descriptors of its own. A `max_open_files` in the low tens —
+including the `16` declared by [the test capsule](#the-test-capsule) above — makes **every**
+subprocess spawn fail outright with a libseccomp setup error rather than merely capping descriptors.
+Use a ceiling with headroom (64 was the lowest value observed to both spawn and still bite) when the
+intent is to bound a real workload rather than to demonstrate the limit.

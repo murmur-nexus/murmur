@@ -1,0 +1,61 @@
+# Standalone, hand-run escape-conformance harness for the containment boundary that
+# `crates/capsule-runtime/src/sandbox.rs` enforces. See
+# `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root.
+#
+# Deliberately NOT a member of the root workspace (`/Cargo.toml`'s `members` list names exactly
+# four crates and this is not one of them). That is the whole mechanism keeping this package out
+# of `cargo check --workspace`, `cargo build --workspace` and `cargo test --workspace` — and out
+# of CI's `cargo check --workspace --all-targets` — without any `exclude` entry. The roadmap card
+# is explicit that a CI-wired suite would skip its way to green and certify nothing, so this
+# exclusion is load-bearing, not incidental.
+#
+# The empty `[workspace]` table below is what makes that legal: it declares this directory its own
+# workspace root, so cargo does not object to a package living under a workspace directory without
+# being a member of it. Removing it makes `cargo build` here fail outright, which is the intended
+# tripwire if someone tries to fold this into the workspace.
+#
+# This mirrors `crates/capsule-runtime/racecheck/` exactly. That package is a *different* suite
+# (seccomp-notify TOCTOU races) and the two must not be merged — see
+# `docs/content/reference/seccomp-notify-toctou-audit.md`.
+[workspace]
+
+[package]
+name = "escape-conformance"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Hand-run escape-conformance release gate for the capsule-runtime containment boundary"
+
+# The gate itself: parses `--class`, refuses when the host cannot back it, runs the case
+# registry, writes the dated record.
+[[bin]]
+name = "escape-conformance"
+path = "src/main.rs"
+
+# The scripted inference CLI each boundary case runs behind. `mur run`'s `transport: process`
+# spawns whatever `inference.command` names and talks to it over the Claude Bridge; this binary
+# stands in for a subscription CLI and makes exactly one, predetermined tool call. That is what
+# turns a case into a deterministic probe instead of a live model's guess — see
+# `src/probe_driver.rs` for the full rationale.
+[[bin]]
+name = "probe-driver"
+path = "src/probe_driver.rs"
+
+[lib]
+name = "escape_conformance"
+path = "src/lib.rs"
+
+[dependencies]
+# The containment-class gate is a library call, not a subprocess: `detect_achieved_containment`
+# probes this host directly, so nothing between the harness and the kernel can soften the answer.
+# `containment` is a `pub mod` (unlike `sandbox`/`shell`, which are `pub(crate)`), which is why
+# this works from outside the crate at all.
+capsule-runtime = { path = ".." }
+# `ContainmentClass` itself lives here; `capsule-runtime` does not re-export it.
+murmur-artifact = { path = "../../murmur-artifact" }
+# The one non-path dependency. The probe driver speaks JSON-RPC to the Claude Bridge and the
+# runner reads `trace.jsonl`; hand-rolling either would be a source of harness bugs that look
+# like enforcement findings. Everything else (argument parsing, the record format, the date
+# stamp) is hand-rolled so a reviewer can read the whole harness in one sitting.
+serde_json = "1"
