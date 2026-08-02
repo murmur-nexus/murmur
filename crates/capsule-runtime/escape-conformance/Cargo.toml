@@ -1,6 +1,6 @@
 # Standalone, hand-run escape-conformance harness for the containment boundary that
 # `crates/capsule-runtime/src/sandbox.rs` enforces. See
-# `docs/content/reference/escape-conformance-harness.md`.
+# `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root.
 #
 # Deliberately NOT a member of the root workspace (`/Cargo.toml`'s `members` list names exactly
 # four crates and this is not one of them). That is the whole mechanism keeping this package out

@@ -69,7 +69,7 @@ OPTIONS:
                            nothing and writes no record.
     -h, --help             This text.
 
-See docs/content/reference/escape-conformance-harness.md for the full procedure.
+See ESCAPE_CONFORMANCE_HARNESS.md at the repository root for the full procedure.
 ";
 
 struct Options {

@@ -226,14 +226,22 @@ derived-grant mechanism behaves as intended end to end on a real Tier-1 host —
 happens after this ships, not as part of it — so until then, do not rely on the
 filesystem/exec/network isolation it provides as a hardened security boundary.
 
-**How this warning gets retired.** Not by a green build. The
-[escape-conformance harness](escape-conformance-harness.md) is the hand-run gate that asserts every
-claim below — 23 boundary cases and 5 resource-exhaustion cases, per containment class, on real
-bare-metal Linux — and writes a dated record file. It is deliberately excluded from the Cargo
-workspace so no CI run can ever produce that record. **The recorded run is what gates this wording,
-not the other way round**; until one exists, everything below is implemented and unverified. See
-[Recording the result](escape-conformance-harness.md#recording-the-result) for the current status,
-including a blocker that stops the shipped `mur` from running the suite as a non-root user.
+**How this warning gets retired.** Not by a green build. CI never resolves to a Linux kernel
+enforcement tier, so no automated run — here or in your own pipeline — is evidence that this layer
+holds. Confirmation is a maintainer procedure, run by hand on real bare-metal Linux, once per
+containment class, that attempts a fixed set of escapes and resource-exhaustion attacks against a
+live capsule and writes a dated record of the results. **That record is what retires this warning**;
+until one exists, everything below is implemented and unverified. *(No run has been recorded yet.
+Maintainers: the procedure and its current status are in
+[`ESCAPE_CONFORMANCE_HARNESS.md`](https://github.com/murmur-nexus/murmur/blob/main/ESCAPE_CONFORMANCE_HARNESS.md)
+at the repository root.)*
+
+**What that means for a capsule you are about to run.** Everything described on this page is applied
+at launch — this warning is about missing independent confirmation, not a known hole. Treat the
+Full tier as a strong best effort rather than a boundary you would stake untrusted input on: keep
+`shell.allow`, `network.allow` and `filesystem.scope` as narrow as the task genuinely needs, prefer
+running unattended capsules under an OS-level isolation layer you already trust, and don't run
+`mur run` as root if you can avoid it.
 
 **"Near-full", not full — the workdir device-node hole.** An earlier revision granted the workdir
 the *complete* Landlock ABI v1 right-set, which includes `MakeChar` and `MakeBlock`. A capsule
@@ -396,23 +404,18 @@ attribute cannot be set at all; enforcement is unaffected, only its legibility i
 **Compatibility is the load-bearing risk here, not security.** The allowlist is reconciled against
 containerd's own default profile precisely so that a workload already proven to run under Docker's
 seccomp profile keeps working under `mur run`'s equivalent. Whether that holds for the workloads
-this project actually runs on bare metal has not yet been confirmed by the team — see the
-[Escape-conformance harness](escape-conformance-harness.md) for the full manual, reproducible
-procedure. The six dangerous-syscall probes named above are cases in its registry
-(`syscall-io-uring-setup`, `syscall-userfaultfd`, `syscall-bpf`, `syscall-open-by-handle-at`,
-`syscall-perf-event-open`, `syscall-keyctl`), and its dated record file is what the claim on this
-page is meant to rest on. (An earlier revision of this section pointed at a
-`SECCOMP_ALLOWLIST_VERIFICATION.md` at the repository root; that file was promised and never
-created, and the harness is what fulfils the promise. Reading the audit trail and the SWE-bench
-compatibility run are not yet covered by it and remain outstanding.) The same not-automated
-caveat applies as to the [AF_UNIX procedure](#manual-acceptance-af-unix): a green `cargo test`/CI run is not
+this project actually runs on bare metal has not yet been confirmed by the team. The refusals
+themselves are checked by the same hand-run maintainer procedure that gates
+[`W-SEC-005`](#w-sec-005); the *compatibility* question — whether a real workload survives the
+allowlist — is still open and is not answered by it. The same not-automated caveat applies as to
+the [AF_UNIX procedure](#manual-acceptance-af-unix): a green `cargo test`/CI run is not
 evidence for either the security or the compatibility claim, since CI never resolves to a Linux
 kernel enforcement tier. The committed unit tests (`sandbox::tests::allowlist_*`) only assert what
 the two Rust constants contain, so a dangerous syscall cannot be re-permitted by accident — they are
 not evidence that any kernel actually refuses it.
 
-**What to do:** until the layer is verified end to end on real Linux by a recorded
-[escape-conformance run](escape-conformance-harness.md#recording-the-result), apply the same
+**What to do:** until the layer is verified end to end on real Linux (see
+[how this warning gets retired](#w-sec-005)), apply the same
 discipline you would on the Environment-only tier: prefer specific binary declarations over `bash`,
 keep `network.allow`/`filesystem.scope` minimal, and use the
 [data/action phase-separation pattern](manifest-schema.md#threat-model) for capsules that ingest

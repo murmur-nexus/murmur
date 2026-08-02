@@ -1,7 +1,7 @@
 //! Escape-conformance harness — a hand-run release gate for the containment boundary
 //! `crates/capsule-runtime/src/sandbox.rs` enforces.
 //!
-//! Read `docs/content/reference/escape-conformance-harness.md` first; it carries the exact build
+//! Read `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root first; it carries the exact build
 //! and run commands and the full case list. This module documentation covers only what a reader
 //! of the code needs.
 //!

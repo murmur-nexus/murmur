@@ -482,16 +482,17 @@ string the trace carried, and whether the host stayed responsive. Until that edi
 claim on this page is a design intent, not a verified result, and the "not yet verified" framing
 in [Security Warnings](security-warnings.md) stands as written.
 
-Scenarios 1, 2, 3, 5 and 6 have since been lifted into the
-[escape-conformance harness](escape-conformance-harness.md) as its five `resource-*` cases, where
-resource exhaustion is reported as **its own category** — denial of service — and is never merged
-into the escape findings, in the stdout summary, the exit code or the dated record.
+Scenarios 1, 2, 3, 5 and 6 are also driven automatically by the maintainer conformance procedure
+described in [Security Warnings](security-warnings.md#w-sec-005), where resource exhaustion is
+reported as **its own category** — denial of service — and is never merged into the escape
+findings. That is not a substitute for running them here: it grades each scenario from a single
+automated signal, while the scenarios above also ask a person to watch the host stay responsive and
+to read `dmesg`, `pids.events` and `memory.events` directly.
 
-Running them there is not a substitute for running them here: the harness grades each case from a
-single automated signal, while the scenarios above also ask a person to watch the host stay
-responsive and to read `dmesg`, `pids.events` and `memory.events` directly. It does, however,
-record three deviations from this page that are findings rather than preferences — a declared
-`max_open_files: 16` makes every subprocess spawn fail outright on the full enforcement tier, the
-fork-bomb attribution needs `max_processes` well above `cgroup_pids_max`, and the aggregate workdir
-ceiling refuses the *next spawn* rather than terminating the session as [scenario 6](#scenario-6)
-says. See that document's "Deviations" section before trusting the numbers on this page.
+One finding from that work is worth carrying here, because it changes what a manifest should
+declare: on the Linux Full tier the rlimits are applied *before* the seccomp filter is installed,
+and installing the filter needs file descriptors of its own. A `max_open_files` in the low tens —
+including the `16` declared by [the test capsule](#the-test-capsule) above — makes **every**
+subprocess spawn fail outright with a libseccomp setup error rather than merely capping descriptors.
+Use a ceiling with headroom (64 was the lowest value observed to both spawn and still bite) when the
+intent is to bound a real workload rather than to demonstrate the limit.

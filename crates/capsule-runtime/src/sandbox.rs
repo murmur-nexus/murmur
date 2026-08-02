@@ -2551,7 +2551,7 @@ mod linux_enforce {
         // Setting the attribute is necessary but not sufficient: the kernel only logs an action
         // whose type also appears in `/proc/sys/kernel/seccomp/actions_logged`, which is host
         // configuration this process does not control.
-        // `docs/content/reference/escape-conformance-harness.md` carries the hand-run procedure
+        // `ESCAPE_CONFORMANCE_HARNESS.md` at the repository root carries the hand-run procedure
         // these denials are verified by.
         let _ = filter.set_ctl_log(true);
 
