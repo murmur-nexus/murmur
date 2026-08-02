@@ -482,8 +482,16 @@ string the trace carried, and whether the host stayed responsive. Until that edi
 claim on this page is a design intent, not a verified result, and the "not yet verified" framing
 in [Security Warnings](security-warnings.md) stands as written.
 
-These scenarios are written to be lifted verbatim into the escape-conformance harness once that
-lands (it does not exist in this repository today; its roadmap card already lists "resource
-exhaustion: fork bomb, disk filler, memory hog, fd exhauster — reported as its own category" as a
-required case, and expects this slice's output to slot in). When it does, resource exhaustion goes
-in as **its own category** — denial of service — never merged into the escape findings.
+Scenarios 1, 2, 3, 5 and 6 have since been lifted into the
+[escape-conformance harness](escape-conformance-harness.md) as its five `resource-*` cases, where
+resource exhaustion is reported as **its own category** — denial of service — and is never merged
+into the escape findings, in the stdout summary, the exit code or the dated record.
+
+Running them there is not a substitute for running them here: the harness grades each case from a
+single automated signal, while the scenarios above also ask a person to watch the host stay
+responsive and to read `dmesg`, `pids.events` and `memory.events` directly. It does, however,
+record three deviations from this page that are findings rather than preferences — a declared
+`max_open_files: 16` makes every subprocess spawn fail outright on the full enforcement tier, the
+fork-bomb attribution needs `max_processes` well above `cgroup_pids_max`, and the aggregate workdir
+ceiling refuses the *next spawn* rather than terminating the session as [scenario 6](#scenario-6)
+says. See that document's "Deviations" section before trusting the numbers on this page.

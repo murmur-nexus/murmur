@@ -126,6 +126,7 @@ nav:
       - Seccomp-notify TOCTOU Audit: reference/seccomp-notify-toctou-audit.md
       - Resource Limits — Manual Verification: reference/resource-limits-manual-verification.md
       - Subprocess fd Hygiene Verification: reference/subprocess-fd-hygiene-verification.md
+      - Escape-conformance Harness: reference/escape-conformance-harness.md
       - Build Lints: reference/build-lints.md
       - WIT Interfaces: reference/wit-interfaces.md
       - Nexus API: reference/nexus-api.md

@@ -1,0 +1,8 @@
+# This package is its own workspace root (see Cargo.toml), so it builds into its own `target/`
+# directory rather than the repo's. The root `.gitignore`'s `/target/` is anchored to the repo
+# root and does not reach here.
+/target/
+
+# Dated record files are evidence for a specific run on a specific host. They are written next to
+# wherever the harness was invoked by default (`--record-dir`), never committed from here.
+escape-conformance-*.md

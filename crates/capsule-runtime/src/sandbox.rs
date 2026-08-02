@@ -2550,8 +2550,9 @@ mod linux_enforce {
         //
         // Setting the attribute is necessary but not sufficient: the kernel only logs an action
         // whose type also appears in `/proc/sys/kernel/seccomp/actions_logged`, which is host
-        // configuration this process does not control. `SECCOMP_ALLOWLIST_VERIFICATION.md` at the
-        // workspace root carries the check and what to do when `errno` is absent from that list.
+        // configuration this process does not control.
+        // `docs/content/reference/escape-conformance-harness.md` carries the hand-run procedure
+        // these denials are verified by.
         let _ = filter.set_ctl_log(true);
 
         for name in ["execve", "execveat", "connect", "sendto"] {
@@ -4140,8 +4141,9 @@ mod tests {
     // hand-authored constant list. Nothing here — and no green CI run — is evidence that any
     // kernel refuses `io_uring_setup` on a real host; CI never resolves to a kernel enforcement
     // tier, so a green suite has repeatedly meant nothing for this module. The claim that these
-    // syscalls are actually denied is verified only by the manual procedure in
-    // `SECCOMP_ALLOWLIST_VERIFICATION.md`, on real bare-metal Linux hardware. What these tests
+    // syscalls are actually denied is verified only by the hand-run escape-conformance harness
+    // (`crates/capsule-runtime/escape-conformance/`, cases `syscall-*`), on real bare-metal Linux
+    // hardware. What these tests
     // *do* buy is that re-permitting one of the dangerous syscalls cannot happen by accident
     // while reconciling the allowlist against a newer upstream profile.
 
