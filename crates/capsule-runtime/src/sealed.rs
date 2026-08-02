@@ -807,6 +807,11 @@ mod linux {
     /// Hand-rolled rather than `format!` because this runs in a forked child: the parent may have
     /// been mid-allocation on another thread when `fork()` returned, so touching the allocator
     /// here can deadlock. `id` never exceeds `u32::MAX`, so ten digits is the whole range.
+    ///
+    /// # Safety
+    /// Must only be called from the post-`fork()`, pre-exec window in the child, before any other
+    /// thread could exist in this process — the same async-signal-safety constraint documented on
+    /// [`construct_composed_root`]'s `unsafe` block, which this function's callers all sit inside.
     unsafe fn write_decimal_map(
         path: &std::ffi::CStr,
         id: Option<libc::uid_t>,
@@ -1142,6 +1147,12 @@ mod linux {
 
     /// Executes one planned step. `Err(())` carries no detail — the caller pairs the index with
     /// the spec's pre-rendered label and the live errno.
+    ///
+    /// # Safety
+    /// Must only be called from the post-`fork()`, pre-exec window: every branch is a bare
+    /// syscall over `CStr` pointers borrowed from `step`, which the caller guarantees outlives
+    /// the call, and none may allocate or take a lock that a sibling thread could hold frozen at
+    /// `fork()` time.
     unsafe fn execute_step(step: &CStep) -> Result<(), ()> {
         match &step.kind {
             CStepKind::MkDir(path) => {
@@ -1261,6 +1272,11 @@ mod linux {
 
     /// `open`/`write`/`close` over a static path, with no allocation — the `/proc/self/*_map`
     /// writes are the only file I/O the composed-root construction performs.
+    ///
+    /// # Safety
+    /// Must only be called from the post-`fork()`, pre-exec window, for the same reason as
+    /// [`execute_step`]: `path` and `data` are borrowed for the duration of the call only, and the
+    /// raw `open`/`write`/`close` sequence must stay allocation- and lock-free in that window.
     unsafe fn write_file(path: &std::ffi::CStr, data: &[u8]) -> Result<(), ()> {
         let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
         if fd < 0 {
