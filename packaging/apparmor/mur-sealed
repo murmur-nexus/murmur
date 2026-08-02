@@ -1,0 +1,98 @@
+# mur-sealed — AppArmor profile permitting `mur` to create an unprivileged user
+# namespace, so `capabilities.containment: sealed` is achievable on this host.
+#
+# Install:
+#     sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed
+#     sudo apparmor_parser -r /etc/apparmor.d/mur-sealed
+#
+# Verify it parses without loading:
+#     apparmor_parser -Q /etc/apparmor.d/mur-sealed
+#
+# Verify it is attached to the running binary:
+#     cat /proc/self/attr/current            # from a shell — expect "unconfined"
+#     mur run --explain-scope                # expect achieved: sealed
+#
+#
+# WHY THIS FILE EXISTS
+#
+# Ubuntu 23.10 and later ship `kernel.apparmor_restrict_unprivileged_userns=1`.
+# Contrary to a widely repeated claim, this does not block unprivileged user
+# namespaces: the namespace *is* created, and the creating process is then
+# transitioned into the restricted `unprivileged_userns` profile, which denies
+# CAP_SYS_ADMIN. The audit trail says so plainly:
+#
+#     apparmor="AUDIT"  operation="userns_create" ... target="unprivileged_userns"
+#     apparmor="DENIED" operation="capable"       ... capability=21 capname="sys_admin"
+#
+# Every mount(2) after that fails, so the composed root cannot be built. A profile
+# carrying `userns,` opts the named binary out of that transition. This is exactly
+# the mechanism Ubuntu itself ships for Chrome (/etc/apparmor.d/chrome) and Firefox,
+# and the one bubblewrap and rootless podman are packaged around.
+#
+#
+# WHY flags=(unconfined)
+#
+# This is a *permission* profile, not a confinement profile. `mur` is not confined
+# by AppArmor here and this file does not attempt to be a sandbox — the sandbox is
+# the mount namespace, the seccomp filter, the Landlock ruleset and the capability
+# drop the runtime installs itself, none of which AppArmor is involved in. Writing a
+# genuinely confining profile would mean enumerating every file a capsule's shell
+# allowlist may touch, which is the curated-per-path model `sealed` exists to delete.
+#
+# `flags=(unconfined)` therefore means: attach to this binary, grant `userns`, and
+# otherwise stay out of the way. The security claim rests entirely on the runtime's
+# own mechanism, and a host without AppArmor at all (Fedora, Arch, …) needs no
+# profile and loses nothing.
+#
+#
+# ATTACHMENT PATHS
+#
+# Two profiles, because an AppArmor profile carries a single attachment
+# specification and `mur` is installed either system-wide or per-user (see
+# `detect_install_dir` in scripts/install.sh). Both are recognised by the runtime's
+# probe, which reads /proc/self/attr/current and accepts any profile whose name
+# begins with "mur-sealed".
+#
+# Building from source and running out of ./target? Add your own attachment in
+# /etc/apparmor.d/local/mur-sealed — the include below picks it up. For example:
+#
+#     # /etc/apparmor.d/local/mur-sealed
+#     # (nothing needed here; instead add a third profile in a file of your own:)
+#     # abi <abi/4.0>,
+#     # include <tunables/global>
+#     # profile mur-sealed-dev @{HOME}/src/murmur/target/{debug,release}/mur flags=(unconfined) {
+#     #   userns,
+#     # }
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+# System-wide installs: /usr/local/bin/mur, /usr/bin/mur, /opt/mur/bin/mur.
+profile mur-sealed /{usr/local/,usr/,opt/mur/}bin/mur flags=(unconfined) {
+  # The one rule that matters: do not transition into `unprivileged_userns` when
+  # this binary calls unshare(CLONE_NEWUSER).
+  userns,
+
+  # Stated explicitly even though `flags=(unconfined)` already permits them, so the
+  # file documents the full set of privileged operations the composed root needs and
+  # so the profile keeps working if it is ever tightened into a confining one.
+  capability sys_admin,
+  mount,
+  umount,
+  pivot_root,
+
+  include if exists <local/mur-sealed>
+}
+
+# Per-user installs: ~/.local/bin/mur, ~/.cargo/bin/mur.
+profile mur-sealed-home @{HOME}/{.local,.cargo}/bin/mur flags=(unconfined) {
+  userns,
+
+  capability sys_admin,
+  mount,
+  umount,
+  pivot_root,
+
+  include if exists <local/mur-sealed>
+}

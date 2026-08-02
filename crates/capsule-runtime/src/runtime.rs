@@ -287,7 +287,14 @@ pub fn stage_session(
     // `achieved` comes from a live kernel probe only — the manifest never gets a vote in what
     // the host is reported to provide.
     let achieved_containment = detect_achieved_containment();
-    check_containment_floor(request.declared_containment_floor, achieved_containment)?;
+    check_containment_floor(
+        request.declared_containment_floor,
+        achieved_containment,
+        // Probed only so the refusal can name *which* part of the sealed mechanism is missing —
+        // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself. Reads
+        // the same cached host probe the tier decision above used, so the two cannot disagree.
+        crate::containment::detect_sealed_blocker(),
+    )?;
     // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
@@ -627,7 +634,14 @@ pub fn stage_session(
         artifact_grants,
         hook_components,
         allowlisted_tools: request.allowlisted_tools,
-        capability_policy: request.capability_policy,
+        // The combined floor (manifest + workspace config + `--containment`) replaces the
+        // manifest-only value the policy was built with, so every later reader — including
+        // `ShellEnforcement::resolve`, which decides whether this session installs a composed
+        // root — sees the class that was actually asked for.
+        capability_policy: CapabilityPolicy {
+            containment_floor: request.declared_containment_floor,
+            ..request.capability_policy
+        },
         otel_endpoint: request.otel_endpoint,
         eval_config_json: request.eval_config_json,
         case_id: request.case_id,
@@ -686,8 +700,11 @@ pub fn launch_session(
         staged.capability_policy.resources.workdir_max_bytes,
     ));
 
-    let shell_enforcement = sandbox::ShellEnforcement::resolve(&staged.capability_policy)
-        .map_err(RuntimeError::Runtime)?
+    let shell_enforcement = sandbox::ShellEnforcement::resolve(
+        &staged.capability_policy,
+        staged.declared_containment_floor,
+    )
+    .map_err(RuntimeError::Runtime)?
         .with_host_bounding(cgroup_scope, workdir_guard);
     let inference_env = staged
         .inference

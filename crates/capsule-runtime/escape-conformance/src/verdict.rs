@@ -77,17 +77,31 @@ pub enum Expectation {
     /// asserting "mknod is refused" there would be asserting something the class does not
     /// provide, which is exactly the false-assurance failure this suite exists to prevent.
     NotAsserted,
-    /// The class's mechanism does not exist in this runtime, so the expectation is documented but
-    /// structurally unreachable. Only `sealed` uses this: `achieved_class_for_tier` has no
-    /// `Sealed` arm, so the class gate refuses before any case runs, on every host.
-    Unreachable(Verdict),
+    /// The class's intended verdict, recorded but **not graded**.
+    ///
+    /// Only `sealed` uses this. The column was written while `achieved_class_for_tier` had no
+    /// `Sealed` arm at all — it was documentation for a mechanism that did not exist, and the
+    /// variant was called `Unreachable` because the class gate refused on every host before a
+    /// single case could run.
+    ///
+    /// That is no longer true: the mount-namespace + `pivot_root` mechanism exists, and a host
+    /// with the shipped AppArmor profile and unprivileged user namespaces reaches
+    /// `EnforcementTier::KernelSealed`. What has *not* happened is anyone validating these
+    /// expectations against a real composed root — see
+    /// `docs/content/reference/sealed-containment-manual-verification.md`, still marked PENDING.
+    /// Grading a release on a column nobody has checked would be exactly the false assurance this
+    /// suite exists to prevent, so the verdicts run and are recorded in full and gate nothing.
+    ///
+    /// Promoting these to [`Expectation::Must`] is the follow-up, and it belongs to whoever runs
+    /// that manual procedure and can say what a real sealed host actually does.
+    Documented(Verdict),
 }
 
 impl Expectation {
     /// The verdict this expectation names, if it names one.
     pub fn verdict(self) -> Option<Verdict> {
         match self {
-            Expectation::Must(v) | Expectation::Unreachable(v) => Some(v),
+            Expectation::Must(v) | Expectation::Documented(v) => Some(v),
             Expectation::NotAsserted => None,
         }
     }
@@ -97,7 +111,7 @@ impl Expectation {
         match self {
             Expectation::Must(v) => v.as_str().to_string(),
             Expectation::NotAsserted => "not-asserted".to_string(),
-            Expectation::Unreachable(v) => format!("{} (unreachable)", v.as_str()),
+            Expectation::Documented(v) => format!("{} (not graded)", v.as_str()),
         }
     }
 
@@ -109,7 +123,7 @@ impl Expectation {
     pub fn is_satisfied_by(self, actual: Verdict) -> bool {
         match self {
             Expectation::Must(expected) => actual == expected,
-            Expectation::NotAsserted | Expectation::Unreachable(_) => true,
+            Expectation::NotAsserted | Expectation::Documented(_) => true,
         }
     }
 

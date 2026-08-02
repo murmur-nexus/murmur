@@ -18,6 +18,12 @@ DEFAULT_REPO="murmur-nexus/murmur"
 REPO="${MUR_REPO:-$DEFAULT_REPO}"
 CHECKSUMS_FILE="checksums.txt"
 
+# AppArmor profile that lets `mur` create an unprivileged user namespace, which is
+# what `capabilities.containment: sealed` needs on Ubuntu 23.10+ and any other host
+# with kernel.apparmor_restrict_unprivileged_userns=1. See packaging/apparmor/mur-sealed.
+APPARMOR_PROFILE_NAME="mur-sealed"
+APPARMOR_PROFILE_DIR="/etc/apparmor.d"
+
 TMPDIR_INSTALL=""
 
 # ---------------------------------------------------------------- output helpers
@@ -207,6 +213,100 @@ The download may be corrupt or tampered with. Nothing was installed."
     fi
 }
 
+# ---------------------------------------------------------------- apparmor
+
+# Installs and loads the `mur-sealed` AppArmor profile, which is what makes
+# `capabilities.containment: sealed` achievable on an AppArmor host.
+#
+# Warns and continues on every failure, never `die`s. `mur` must still install and
+# run at `scoped` or `advisory` on a host with no AppArmor (Fedora, Arch, macOS), on
+# a host where this script is not root, and on a host whose operator does not want
+# `sealed` at all. A missing profile costs one containment class, not the install.
+#
+# Like the rest of this script it never invokes sudo — it prints the two commands to
+# run instead. Prompting for a password inside `curl | sh` is both hostile and
+# unreliable.
+install_apparmor_profile() {
+    # Not Linux, or no AppArmor: nothing to install and nothing missing.
+    [ "$os_tag" = "linux" ] || return 0
+    if [ ! -d /sys/module/apparmor ]; then
+        return 0
+    fi
+
+    manual="  sudo install -m 644 <murmur checkout>/packaging/apparmor/${APPARMOR_PROFILE_NAME} ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}
+  sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
+
+    if ! command -v apparmor_parser >/dev/null 2>&1; then
+        warn "AppArmor is enabled on this host but apparmor_parser was not found, so the ${APPARMOR_PROFILE_NAME} profile was not installed.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. Install the AppArmor userspace tools (Debian/Ubuntu: apparmor-utils) and then run:
+${manual}"
+        return 0
+    fi
+
+    # Prefer a copy sitting next to this script in a checkout; fall back to the
+    # release asset for the version being installed. An asset that is present in
+    # checksums.txt is verified against it — an unverified file is never written
+    # into /etc/apparmor.d, matching how the binary itself is handled above.
+    script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null)" || script_dir=""
+    profile_src=""
+    if [ -n "$script_dir" ] && [ -f "${script_dir}/../packaging/apparmor/${APPARMOR_PROFILE_NAME}" ]; then
+        profile_src="${script_dir}/../packaging/apparmor/${APPARMOR_PROFILE_NAME}"
+    elif [ -n "${TMPDIR_INSTALL:-}" ]; then
+        asset_name="${APPARMOR_PROFILE_NAME}.apparmor"
+        if download "${base_url}/${asset_name}" "${TMPDIR_INSTALL}/${asset_name}" 2>/dev/null; then
+            if awk -v name="$asset_name" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
+                "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"; then
+                verify_checksum "${TMPDIR_INSTALL}/${asset_name}" "$asset_name" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"
+                profile_src="${TMPDIR_INSTALL}/${asset_name}"
+            else
+                warn "the ${APPARMOR_PROFILE_NAME} AppArmor profile is not listed in ${CHECKSUMS_FILE} for this release, so it was not installed — this script does not write unverified files into ${APPARMOR_PROFILE_DIR}.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+${manual}"
+                return 0
+            fi
+        fi
+    fi
+
+    if [ -z "$profile_src" ]; then
+        warn "could not obtain the ${APPARMOR_PROFILE_NAME} AppArmor profile, so it was not installed.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+${manual}"
+        return 0
+    fi
+
+    if [ "$(id -u)" != "0" ]; then
+        warn "installing the ${APPARMOR_PROFILE_NAME} AppArmor profile needs root, and this script never invokes sudo.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. Run:
+  sudo install -m 644 ${profile_src} ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}
+  sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
+        return 0
+    fi
+
+    # Parse before writing, so a profile this host's AppArmor cannot understand never
+    # reaches /etc/apparmor.d — the same "verify, then move into place" ordering the
+    # binary install uses.
+    if ! apparmor_parser -Q "$profile_src" >/dev/null 2>&1; then
+        warn "the ${APPARMOR_PROFILE_NAME} AppArmor profile did not parse on this host's AppArmor version, so it was not installed. Nothing was written to ${APPARMOR_PROFILE_DIR}.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here."
+        return 0
+    fi
+
+    if ! install -m 644 "$profile_src" "${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}" 2>/dev/null; then
+        warn "could not write ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded."
+        return 0
+    fi
+
+    if ! apparmor_parser -r "${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}" >/dev/null 2>&1; then
+        warn "wrote ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME} but could not load it.
+mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until it loads. Retry with:
+  sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
+        return 0
+    fi
+
+    info "loaded AppArmor profile ${APPARMOR_PROFILE_NAME} (capabilities.containment: sealed is now available)"
+}
+
 # ---------------------------------------------------------------- main
 
 main() {
@@ -267,6 +367,8 @@ The release may not include a binary for ${PLATFORM}. See https://github.com/${R
     fi
 
     info "installed mur ${VERSION} to ${target}"
+
+    install_apparmor_profile
 
     if ! on_path "$INSTALL_DIR"; then
         warn "${INSTALL_DIR} is not on your PATH. Add it to your shell profile:

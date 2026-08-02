@@ -29,6 +29,7 @@ pub const E_RUN_010: &str = "E-RUN-010"; // network.internal_port already in use
 pub const E_RUN_011: &str = "E-RUN-011"; // subprocess killed for exceeding a capabilities.resources limit
 pub const E_RUN_012: &str = "E-RUN-012"; // no cgroup v2 scope could be delegated on Linux
 pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabilities.resources.workdir_max_bytes
+pub const E_RUN_014: &str = "E-RUN-014"; // a sealed session's composed root could not be built after the host probe had cleared it
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
@@ -130,6 +131,19 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 "the systemd user unit `mur` runs under needs `Delegate=yes` for memory, pids, \
                  cpu and io — see docs/content/reference/resource-limits-manual-verification.md",
+            ),
+            // Distinct from E-CAP-003 on purpose: that one is a pre-launch refusal by a host that
+            // never claimed to offer `sealed`, so the remedy is to lower the floor or move hosts.
+            // This one is a host that cleared the probe and then failed to build the root, so the
+            // remedy is to look at what moved underneath it.
+            error @ RuntimeError::SealedRootConstructionFailed { .. } => CliError::with_hint(
+                E_RUN_014,
+                error.to_string(),
+                "the host cleared the sealed probe at launch and then failed to construct the \
+                 composed root — check that the mount namespace was not restricted mid-session \
+                 (AppArmor profile reloaded, container policy changed), re-run `mur run \
+                 --explain-scope` to re-probe, and see \
+                 docs/content/reference/sealed-containment-manual-verification.md",
             ),
             error @ RuntimeError::WorkdirSizeExceeded { .. } => CliError::with_hint(
                 E_RUN_013,

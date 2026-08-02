@@ -114,6 +114,19 @@ pub struct CapabilityPolicy {
     /// inside its wasmtime store, this bounds the processes the host forks. See
     /// [`crate::resources`].
     pub resources: crate::resources::HostResourceLimits,
+    /// The containment class this capsule asked for, from `capabilities.containment`.
+    ///
+    /// Unlike every other field here it is a *requirement*, not a grant — and unlike
+    /// `StageRequest::declared_containment_floor` it is only the manifest's own vote, before the
+    /// workspace config and `--containment` are folded in. `stage_session` overwrites it with the
+    /// combined floor as soon as that is known, so anything reading it off a `StagedSession` sees
+    /// the effective value; the manifest-only value exists so a `CapabilityPolicy` built straight
+    /// from a manifest is still self-consistent.
+    ///
+    /// Read by `sandbox::ShellEnforcement::resolve` to decide whether a sealed-capable host
+    /// actually installs a composed root for this session — a capsule that declared `scoped` must
+    /// keep getting `scoped`'s mechanism. See `sandbox::applied_tier`.
+    pub containment_floor: murmur_artifact::ContainmentClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +323,9 @@ pub fn capability_policy_from_runtime_manifest(
         env_allow,
         limits,
         resources,
+        containment_floor: caps
+            .and_then(|c| c.containment)
+            .unwrap_or_default(),
     }
 }
 

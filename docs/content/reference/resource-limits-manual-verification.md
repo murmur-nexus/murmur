@@ -385,10 +385,18 @@ error[E-RUN-013]: session workdir grew to 57671680 bytes, past the 52428800 byte
 
 **Scope note, stated so it is not read as a missed requirement.** This slice ships the *periodic
 check*, not a structurally-bounded (tmpfs-backed, size-mounted) workdir. The structural version
-needs a mount namespace this runtime cannot create — nothing here runs as root, and the
-`sealed-containment-runtime` work that would provide one is a separate, unbuilt roadmap card whose
-own text acknowledges this dependency. The one-interval detection lag is the honest cost of the
-mechanism that *is* available, and it is stated rather than hidden.
+needs a mount namespace, which the runtime could not create when this was written.
+
+That dependency has since landed — see [sealed containment](sealed-containment-manual-verification.md) —
+but the periodic check is what still enforces the ceiling, on every class including `sealed`, and it
+is unaffected by the composed root: the watcher runs in the parent process against host paths,
+before any `pivot_root`. A tmpfs-backed workdir remains available and unbuilt. The one-interval
+detection lag is the honest cost of the mechanism that *is* wired up, and it is stated rather than
+hidden.
+
+One thing the composed root does change here: a `sealed` capsule's `/tmp` is backed by
+`<workdir>/.mur-tmp`, so temporary files now count against `workdir_max_bytes` where previously they
+landed on the host's `/tmp` and counted against nothing.
 
 ---
 

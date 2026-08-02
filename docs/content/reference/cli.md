@@ -1635,6 +1635,7 @@ Remote mode requires:
 | `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit ([host resource limits](manifest-schema.md#host-resource-limits)) |
 | `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) — see [manual verification](resource-limits-manual-verification.md) |
 | `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` |
+| `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess — see [manual verification](sealed-containment-manual-verification.md) |
 | `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host |
 | `E-IO-001` | File or directory not found |
 | `E-IO-003` | General I/O error (read/write failure) |

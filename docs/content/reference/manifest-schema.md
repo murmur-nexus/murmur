@@ -378,7 +378,7 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 |---|---|
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace + `pivot_root` isolation. **No host can provide this today** — the mechanism does not exist anywhere in `capsule-runtime` yet. Declaring `sealed` refuses to launch on every host, including a Landlock-capable Linux one. This is deliberate, not a bug: a future runtime change that implements `pivot_root` isolation is what will ever let `sealed` succeed. |
+| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and `/proc` masked with `hidepid`. Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification — sealed containment](sealed-containment-manual-verification.md). |
 
 **Declaring a floor.** Three independent sources can each declare a minimum class, and they combine
 by taking the **strongest** requested — never the weakest:
@@ -392,11 +392,20 @@ Any source left undeclared contributes nothing; if all three are undeclared, the
 never lower it.
 
 **Achieved class.** `mur run` derives the class the host can *actually* provide by probing the
-kernel directly (never by trusting the manifest): a Landlock-capable Linux 5.13+ host achieves
-`scoped`; every other host (older Linux without Landlock, or macOS) achieves `advisory`. Granting a
-`scoped` capsule access to host paths outside the workdir via
-`capabilities.shell.interpreter_runtime` never changes the achieved class — it stays `scoped`, never
-`sealed`.
+kernel directly (never by trusting the manifest). The probe is a conjunction, and every element has
+to hold for the next class up: a Landlock-capable Linux 5.13+ host achieves `scoped`; a host that
+also creates an unprivileged user+mount namespace and mounts inside it — verified by really doing
+it in a forked child, not by reading a version string — achieves `sealed`; every other host (older
+Linux without Landlock, or macOS) achieves `advisory`. Granting a `scoped` capsule access to host
+paths outside the workdir via `capabilities.shell.interpreter_runtime` never changes the achieved
+class.
+
+**A weaker declaration is never silently upgraded.** On a `sealed`-capable host, a capsule
+declaring `scoped` still runs with `scoped`'s mechanism — Landlock and seccomp over the host
+filesystem, no composed root. Installing one anyway would delete the host paths its
+`interpreter_runtime` grants legitimately name, which is a regression dressed up as extra security.
+The achieved class reported in the trace still says what the *host* can back; the mechanism
+installed follows what the capsule *asked for*.
 
 **Refusal.** If the achieved class is weaker than the effective declared floor, `mur run` refuses to
 launch before any registry pull, artifact compile, or workdir creation, with `error[E-CAP-003]`
@@ -407,6 +416,28 @@ unavailable on this host"):
 error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): scoped requires Landlock filesystem mediation (Linux 5.13+ with a usable Landlock ABI); this host provides no kernel filesystem mediation, so paths outside the workdir are constrained by convention only
   hint: lower the declared floor to 'advisory' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'scoped'
 ```
+
+For `sealed` the reason names the *specific* missing piece and the command that fixes it, because
+"no mount namespace here" has several completely different causes. On an AppArmor host without the
+shipped profile:
+
+```text
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. To turn the restriction off host-wide instead: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+  hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
+```
+
+Inside a container without `CAP_SYS_ADMIN` — the case a CI or SWE-bench-style harness hits — the
+same declaration refuses with a different remediation, and never falls back to `scoped`:
+
+```text
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires unshare(CLONE_NEWUSER | CLONE_NEWNS), which this host refused. This is the usual answer inside a container: CAP_SYS_ADMIN is absent, or the container's own seccomp filter blocks unshare(2). Either add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run mur inside it. The runtime will not fall back to a weaker class.
+  hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
+```
+
+A `sealed` host that clears the probe at launch and *then* fails to build the composed root for a
+particular subprocess is a different event and gets its own code, `E-RUN-014` — see
+`RuntimeError::SealedRootConstructionFailed`. It means something moved underneath the runtime
+mid-session (a profile reloaded, a container policy changed), not that the floor was mis-declared.
 
 A manifest that never declares `capabilities.containment` is never gated by this check — the
 effective floor resolves to `advisory`, which every host satisfies.
@@ -424,7 +455,7 @@ Containment
   declared:  sealed
   achieved:  advisory
   floor met: no
-  reason:    sealed requires mount-namespace + pivot_root isolation, which this runtime does not implement yet; no host can provide it today
+  reason:    sealed requires a Linux mount namespace + pivot_root; this platform has no such primitive and never will (macOS and every non-Linux target stay at advisory permanently)
   mechanism: none
 
 Effective grants
@@ -445,6 +476,15 @@ This is a report only — `mur run` without --explain-scope would refuse to laun
 Pass `--json` alongside `--explain-scope` for a single machine-readable JSON line instead. The
 report shows *declared* network destinations, not resolved IPs — it deliberately skips DNS
 resolution and the shell allowlist's DT_NEEDED closure to stay fast and read-only.
+
+`mechanism:` is a stable wire name for the probed host tier, not a `Debug` rendering:
+
+| `mechanism` | achieved class | what the host provides |
+|---|---|---|
+| `mountns+pivot_root+landlock+seccomp` | `sealed` | private mount namespace pivoted onto a composed root, with Landlock and seccomp inside it |
+| `landlock+seccomp` | `scoped` | Landlock filesystem mediation + the seccomp syscall allowlist over the host filesystem |
+| `seccomp-only` | `advisory` | Linux without a usable Landlock ABI: seccomp only, filesystem scope by convention |
+| `none` | `advisory` | no kernel sandboxing primitive (macOS and every non-Linux target) |
 
 **`trace.jsonl`** records both classes on every session, in the `session_start` event's
 `containment_declared` and `containment_achieved` fields (see [session trace

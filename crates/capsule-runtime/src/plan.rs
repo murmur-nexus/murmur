@@ -171,7 +171,10 @@ fn execute_inner(
 
     // Host-probed kernel enforcement tier + resolved network allowlist for this plan's shell
     // steps — resolved once, up front, same cadence as `runtime::launch_session`.
-    let shell_enforcement = match sandbox::ShellEnforcement::resolve(&ctx.capability_policy) {
+    let shell_enforcement = match sandbox::ShellEnforcement::resolve(
+        &ctx.capability_policy,
+        ctx.capability_policy.containment_floor,
+    ) {
         Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {
             return Ok(ExecutionReport {

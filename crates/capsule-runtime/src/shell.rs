@@ -180,6 +180,14 @@ pub(crate) fn execute_shell(
             // "Invalid argument (os error 22)".
             drop(command);
             return Err(match supervisor.read_diagnostic() {
+                // A composed-root failure gets its own typed error rather than being folded into
+                // the generic enforcement-setup message: it means a host that *did* clear the
+                // pre-launch sealed probe then failed to build the root, which is a different
+                // event from a Landlock or seccomp step failing and points somewhere else.
+                Some(detail) if detail.contains(crate::sealed::SEALED_ROOT_FAILURE_PREFIX) => {
+                    crate::errors::RuntimeError::SealedRootConstructionFailed { detail }
+                        .to_string()
+                }
                 Some(detail) if !detail.is_empty() => {
                     format!("sandbox: shell enforcement setup failed before exec: {detail}")
                 }
