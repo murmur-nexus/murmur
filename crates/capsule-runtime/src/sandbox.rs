@@ -1927,6 +1927,47 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     pub(crate) static FORCE_LANDLOCK_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Fails the composed-root step of a `KernelSealed` launch. Exists because the real step can
+    /// only fail on a host that can attempt it at all, and the thing under test — that a
+    /// composed-root failure keeps its identity from the child's diagnostic pipe all the way to
+    /// the CLI's `E-RUN-014` — must be verifiable on any Linux host, including the CI containers
+    /// that can never reach `KernelSealed`. Short-circuits before any real namespace syscall.
+    pub(crate) static FORCE_SEALED_ROOT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII arm for [`FORCE_SEALED_ROOT_FAILURE`]. Lives beside the flag rather than in one test
+/// module because two of them need it: `sandbox`'s (which checks what `execute_shell` returns)
+/// and `runtime`'s (which checks what the dispatch layer does with it).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ForceSealedRootFailureGuard;
+
+#[cfg(all(test, target_os = "linux"))]
+impl ForceSealedRootFailureGuard {
+    pub(crate) fn new() -> Self {
+        FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ForceSealedRootFailureGuard {
+    fn drop(&mut self) {
+        FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
+/// A `KernelSealed` enforcement with no grants, for the forced-failure tests. The parent-side
+/// half of the sealed mechanism still runs for real against it (the composed root is planned and
+/// its spec built); only the child's execution of that spec is short-circuited by the seam above,
+/// which is what makes these tests run identically on a sealed-capable host and on one that could
+/// never reach `KernelSealed` at all.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
+    ShellEnforcement {
+        tier: EnforcementTier::KernelSealed,
+        ..ShellEnforcement::environment_only()
+    }
 }
 
 /// Attach the OS-level *process* bounds — hard rlimits, and cgroup membership where a scope
@@ -2483,6 +2524,13 @@ mod linux_enforce {
         // re-scope the same inodes under their new pathnames. Defence in depth, in that order.
         if tier == EnforcementTier::KernelSealed {
             if let Some(spec) = sealed_spec {
+                #[cfg(test)]
+                if super::FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.get()) {
+                    return Err(io::Error::other(format!(
+                        "{} unshare(CLONE_NEWUSER|CLONE_NEWNS) failed (forced by test seam)",
+                        crate::sealed::SEALED_ROOT_FAILURE_PREFIX
+                    )));
+                }
                 crate::sealed::construct_composed_root(spec)
                     .map_err(|failure| io::Error::other(spec.describe(failure)))?;
             }
@@ -4952,7 +5000,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("sandbox"),
+                error.to_string().contains("sandbox"),
                 "the error must name what failed to initialize: {error}"
             );
             assert!(
@@ -5720,6 +5768,17 @@ mod linux_integration_tests {
     /// child-side failure active, asserts the target script never ran (marker absent), and returns
     /// the resulting error string. The RAII guard `arm` returns stays alive across `.spawn()`.
     fn child_setup_failure_error<G>(arm: impl FnOnce() -> G) -> String {
+        child_setup_failure_typed(&kernel_full_empty_grants(), arm).to_string()
+    }
+
+    /// [`child_setup_failure_error`] without the lossy `.to_string()`, and over a caller-chosen
+    /// enforcement. Tests that care which *kind* of failure happened — not merely what it reads
+    /// like — use this: the whole point of the sealed composed-root failure is that it keeps its
+    /// identity out to the CLI instead of arriving as one more error string.
+    fn child_setup_failure_typed<G>(
+        enforcement: &ShellEnforcement,
+        arm: impl FnOnce() -> G,
+    ) -> crate::shell::ShellExecError {
         let temp = tempfile::tempdir().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
@@ -5735,7 +5794,7 @@ mod linux_integration_tests {
             &[],
             temp.path(),
             &policy,
-            &kernel_full_empty_grants(),
+            enforcement,
         )
         .expect_err("a forced child-side setup failure must make execute_shell return Err");
         assert!(
@@ -5826,5 +5885,66 @@ mod linux_integration_tests {
                 "no failure may read as a bare EINVAL: {message}"
             );
         }
+    }
+
+    /// The first half of the composed-root failure path this slice promises: a `pre_exec`
+    /// composed-root failure comes back out of `execute_shell` as the *typed*
+    /// `SealedRootConstructionFailed`, carrying the child's diagnostic, and reports itself as
+    /// session-fatal. `runtime::tests` covers the second half (what the dispatch layer then
+    /// does with it) and `murmur-cli`'s error test covers the third (`E-RUN-014`).
+    #[test]
+    fn a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message() {
+        let error =
+            child_setup_failure_typed(&sealed_test_enforcement(), ForceSealedRootFailureGuard::new);
+
+        assert!(
+            matches!(
+                error,
+                crate::shell::ShellExecError::SealedRootConstructionFailed { .. }
+            ),
+            "a sealed-root diagnostic must survive as its own variant, not collapse into \
+             ShellExecError::Failed: {error}"
+        );
+        let fatal = error
+            .session_fatal()
+            .expect("a composed-root failure must end the session, not just the tool call");
+        assert!(
+            matches!(
+                fatal,
+                crate::errors::RuntimeError::SealedRootConstructionFailed { .. }
+            ),
+            "must map to the RuntimeError the CLI renders as E-RUN-014: {fatal}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("composed root") && rendered.contains("unshare"),
+            "the message must name both the mechanism and the step that failed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {rendered}"
+        );
+    }
+
+    /// The contrast that makes the assertion above mean something: an equally fatal-looking
+    /// `pre_exec` failure that is *not* the composed root stays an ordinary failure, so nothing
+    /// in this path ends a session for a Landlock or `no_new_privs` problem.
+    #[test]
+    fn an_ordinary_pre_exec_failure_is_not_session_fatal() {
+        let landlock =
+            child_setup_failure_typed(&kernel_full_empty_grants(), ForceLandlockFailureGuard::new);
+        assert!(
+            landlock.session_fatal().is_none(),
+            "a Landlock setup failure is the tool call's problem, not the session's: {landlock}"
+        );
+
+        let no_new_privs = child_setup_failure_typed(
+            &kernel_full_empty_grants(),
+            ForceNoNewPrivsFailureGuard::new,
+        );
+        assert!(
+            no_new_privs.session_fatal().is_none(),
+            "a no_new_privs failure is the tool call's problem, not the session's: {no_new_privs}"
+        );
     }
 }

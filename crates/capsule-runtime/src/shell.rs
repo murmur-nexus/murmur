@@ -72,6 +72,70 @@ pub(crate) struct ShellResult {
     pub(crate) resource_limit_hit: Option<String>,
 }
 
+/// Why [`execute_shell`] produced no result.
+///
+/// Two kinds, and the distinction is the whole point of the type: an ordinary failure is the
+/// capsule's business (it sees a failed tool call and can decide what to do next), while a
+/// [`Self::SealedRootConstructionFailed`] is the *session's* business — the containment boundary
+/// the session declared stopped being establishable, so there is nothing sensible for the capsule
+/// to retry and the run has to end with that named as the cause. Before this type existed both
+/// collapsed into a `String` and the second was indistinguishable from the first by the time it
+/// reached a caller that could act on it.
+#[derive(Debug)]
+pub(crate) enum ShellExecError {
+    /// Binary not in `capabilities.shell.allow`, env construction failure, workdir budget
+    /// breach, enforcement setup failure, spawn failure — everything that leaves the rest of
+    /// the session viable.
+    Failed(String),
+    /// A `sealed` session's composed root could not be built for this subprocess, *after* the
+    /// pre-launch probe reported the mechanism available. `detail` is what the child wrote to
+    /// the `pre_exec` diagnostic pipe: the exact step and its errno.
+    SealedRootConstructionFailed { detail: String },
+}
+
+impl ShellExecError {
+    /// The typed, session-fatal error this failure represents, or `None` when the failure is a
+    /// tool-level one the capsule can be told about and carry on from.
+    ///
+    /// Callers that own the session (the agent turn loop) return this; callers that only own a
+    /// single dispatch pass it upward alongside the tool result rather than deciding themselves.
+    pub(crate) fn session_fatal(&self) -> Option<crate::errors::RuntimeError> {
+        match self {
+            Self::Failed(_) => None,
+            Self::SealedRootConstructionFailed { detail } => Some(
+                crate::errors::RuntimeError::SealedRootConstructionFailed {
+                    detail: detail.clone(),
+                },
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ShellExecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) => f.write_str(message),
+            // Delegate to the `RuntimeError` Display text so the message an operator reads cannot
+            // drift from the one `E-RUN-014` renders — the same reason the CLI's error mapping
+            // delegates rather than restating.
+            Self::SealedRootConstructionFailed { detail } => write!(
+                f,
+                "{}",
+                crate::errors::RuntimeError::SealedRootConstructionFailed {
+                    detail: detail.clone(),
+                }
+            ),
+        }
+    }
+}
+
+/// Lets the many `Result<_, String>` helpers `execute_shell` calls keep flowing through `?`.
+impl From<String> for ShellExecError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
 pub(crate) fn is_shell_interpreter(binary: &str) -> bool {
     SHELL_INTERPRETERS.contains(&binary)
 }
@@ -129,11 +193,11 @@ pub(crate) fn execute_shell(
     workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
-) -> Result<ShellResult, String> {
+) -> Result<ShellResult, ShellExecError> {
     if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
-        return Err(format!(
+        return Err(ShellExecError::Failed(format!(
             "binary '{binary}' is not in capabilities.shell.allow"
-        ));
+        )));
     }
 
     // Refuse before spawning, not after: once the workdir ceiling is crossed, the cheapest way
@@ -180,18 +244,18 @@ pub(crate) fn execute_shell(
             // "Invalid argument (os error 22)".
             drop(command);
             return Err(match supervisor.read_diagnostic() {
-                // A composed-root failure gets its own typed error rather than being folded into
-                // the generic enforcement-setup message: it means a host that *did* clear the
+                // A composed-root failure keeps its own variant all the way out of here rather
+                // than being flattened into a message: it means a host that *did* clear the
                 // pre-launch sealed probe then failed to build the root, which is a different
-                // event from a Landlock or seccomp step failing and points somewhere else.
+                // event from a Landlock or seccomp step failing, points somewhere else, and ends
+                // the session instead of the tool call. See [`ShellExecError::session_fatal`].
                 Some(detail) if detail.contains(crate::sealed::SEALED_ROOT_FAILURE_PREFIX) => {
-                    crate::errors::RuntimeError::SealedRootConstructionFailed { detail }
-                        .to_string()
+                    ShellExecError::SealedRootConstructionFailed { detail }
                 }
-                Some(detail) if !detail.is_empty() => {
-                    format!("sandbox: shell enforcement setup failed before exec: {detail}")
-                }
-                _ => error.to_string(),
+                Some(detail) if !detail.is_empty() => ShellExecError::Failed(format!(
+                    "sandbox: shell enforcement setup failed before exec: {detail}"
+                )),
+                _ => ShellExecError::Failed(error.to_string()),
             });
         }
     };
@@ -508,7 +572,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("capabilities.shell.allow"));
+        assert!(error.to_string().contains("capabilities.shell.allow"));
     }
 
     #[test]
@@ -654,7 +718,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains(".capsule-home"));
+        assert!(error.to_string().contains(".capsule-home"));
     }
 
     #[test]

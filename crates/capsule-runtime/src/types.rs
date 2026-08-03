@@ -24,6 +24,17 @@ pub(crate) struct DispatchOutcome {
     /// a binary or WASM component. Used by the agent loop to write a `skill_call` trace
     /// event instead of a `tool_call` event.
     pub is_skill: bool,
+    /// Set when this dispatch failed in a way that ends the *session* rather than just this
+    /// tool call — today only a `sealed` composed-root construction failure
+    /// ([`crate::shell::ShellExecError::session_fatal`]). `result` still describes the failed
+    /// call so the trace records what was attempted; the agent turn loop then returns this
+    /// error instead of feeding the failure back to the model for another turn.
+    ///
+    /// A dispatch that merely failed leaves this `None`: a capsule reacting to a broken tool
+    /// call is ordinary, whereas a capsule continuing to run after its declared containment
+    /// boundary stopped being establishable is the silent-degradation failure mode the whole
+    /// containment-class mechanism exists to prevent.
+    pub fatal: Option<crate::errors::RuntimeError>,
 }
 
 impl DispatchOutcome {
@@ -32,6 +43,7 @@ impl DispatchOutcome {
             result,
             shell: None,
             is_skill: false,
+            fatal: None,
         }
     }
 
@@ -40,6 +52,7 @@ impl DispatchOutcome {
             result,
             shell: None,
             is_skill: true,
+            fatal: None,
         }
     }
 }

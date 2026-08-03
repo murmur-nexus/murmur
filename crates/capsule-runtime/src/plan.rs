@@ -569,7 +569,11 @@ fn dispatch_shell_step(
             ),
             None => failed(&step.id, result.stderr),
         },
-        Err(error) => failed(&step.id, error),
+        // Including a sealed composed-root failure, which fails the step carrying its full
+        // named text. Unlike the agent turn loop (which owns a session and ends it — see
+        // `agent::run_agent_loop`), this scheduler owns nothing above the step it is running,
+        // so naming the cause in the step's error is the whole of what it can do.
+        Err(error) => failed(&step.id, error.to_string()),
     }
 }
 

@@ -588,7 +588,11 @@ pub(crate) async fn run_agent_loop(
                         )
                         .await
                     {
-                        Ok(outcome) => {
+                        Ok(mut outcome) => {
+                            // Taken before the result is consumed below; acted on at the end of
+                            // this arm so the failed call is traced and hooked like any other
+                            // before the session ends on it.
+                            let fatal = outcome.fatal.take();
                             let is_error = !matches!(outcome.result.status, Status::Passed);
                             // Read the tool's self-declared state effect and resource identity
                             // before the result's owned fields are consumed below.
@@ -714,6 +718,17 @@ pub(crate) async fn run_agent_loop(
                                     },
                                 )
                                 .await;
+                            }
+                            // A session-fatal dispatch failure ends the run here rather than
+                            // being handed back to the model as one more failed tool call.
+                            // Today that is exactly one thing: a `sealed` session whose composed
+                            // root could not be built for a subprocess after the host cleared the
+                            // pre-launch probe. Letting the loop continue would keep running the
+                            // capsule at whatever weaker enforcement the failed launch left —
+                            // the silent degradation the containment class exists to refuse.
+                            // Surfaces to the CLI as `E-RUN-014` via `RuntimeError`.
+                            if let Some(fatal) = fatal {
+                                return Err(fatal);
                             }
                             (is_error, text)
                         }

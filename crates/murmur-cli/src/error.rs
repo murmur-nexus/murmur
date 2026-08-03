@@ -531,4 +531,34 @@ mod tests {
             cli.message
         );
     }
+
+    /// The last hop of the composed-root failure path: `capsule-runtime` returns this variant out
+    /// of the agent turn loop (see `runtime::tests::a_sealed_composed_root_failure_ends_the_
+    /// session_not_just_the_tool_call` for where it is produced), and it must land on its own
+    /// code with its own remediation rather than on `E-CAP-003`'s "lower your declared floor",
+    /// which would be the wrong instruction for a host that already cleared the probe.
+    #[test]
+    fn sealed_root_construction_failure_has_its_own_code_and_remediation() {
+        let cli = CliError::from(RuntimeError::SealedRootConstructionFailed {
+            detail: "sealed-root: bind (ro) /usr -> /tmp/usr failed: No such file or directory \
+                     (os error 2)"
+                .to_string(),
+        });
+
+        assert_eq!(cli.code, E_RUN_014);
+        assert_ne!(
+            cli.code, E_CAP_003,
+            "a mid-session construction failure is not the pre-launch refusal"
+        );
+        assert!(
+            cli.message.contains("composed root") && cli.message.contains("/usr"),
+            "message should say what failed and carry the child's diagnostic: {}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("--explain-scope"),
+            "hint should point at the re-probe command: {hint}"
+        );
+    }
 }
