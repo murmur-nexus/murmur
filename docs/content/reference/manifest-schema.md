@@ -378,7 +378,20 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 |---|---|
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and `/proc` masked with `hidepid`. Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification — sealed containment](sealed-containment-manual-verification.md). |
+| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and a `/proc` (masked with `hidepid` where the kernel allows it; see the note below). Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification — sealed containment](sealed-containment-manual-verification.md). |
+
+!!! note "`sealed`'s one documented exception: `/proc`"
+
+    Mounting a private `procfs` unprivileged requires `CAP_SYS_ADMIN` over the user namespace that
+    owns the *PID* namespace, which an unprivileged user namespace never has. `sealed` does not
+    create a PID namespace (that changes reaping and signal semantics for the whole subprocess
+    tree and is out of scope), so on a bare host the composed root carries a **bind of the host's
+    `/proc`** — `nosuid,nodev,noexec`, but not `hidepid`-masked. Host process metadata is therefore
+    *visible* under `/proc` inside a `sealed` root, exactly as it is under `scoped`; opens through
+    it are still refused by Landlock. Every other axis of the root — `/etc`, `/dev`, block devices,
+    sockets, other users' homes — is absent, not merely denied. `mount -t proc` with `hidepid` is
+    still attempted first and succeeds where the process does hold that privilege (as root, or in a
+    container run with `--cap-add SYS_ADMIN`).
 
 **Declaring a floor.** Three independent sources can each declare a minimum class, and they combine
 by taking the **strongest** requested — never the weakest:

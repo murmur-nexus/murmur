@@ -91,18 +91,21 @@ fn sealed_refuses_with_an_actionable_reason_unless_the_host_can_back_it() {
         .stderr(predicate::str::contains("E-CAP-003"))
         .stderr(predicate::str::contains("'sealed'"));
 
-    // Exactly one of the mechanism-specific remediations, never a generic "not supported".
+    // Exactly one of the mechanism-specific reasons, never a generic "not supported".
+    //
+    // Compared against `SealedBlocker::ALL` rather than a hand-written list of substrings. The
+    // hand-written version was wrong the moment a variant was added: the refusal was correct and
+    // specific, the list had not heard of it, and the failure read as "this host cannot do sealed"
+    // when the real defect was in the test. Deriving the expected set from the enum means a new
+    // blocker can never make this assert lie again.
     let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
-    let remediations = [
-        "apparmor_parser -r",          // the profile is not loaded
-        "--cap-add SYS_ADMIN",         // a container without CAP_SYS_ADMIN
-        "user.max_user_namespaces",    // the kernel has no user namespaces
-        "Linux 5.13+",                 // no usable Landlock ABI underneath it
-        "never will",                  // not Linux at all
-    ];
+    let matched = capsule_runtime::sealed::SealedBlocker::ALL
+        .iter()
+        .find(|blocker| stderr.contains(&blocker.reason()));
     assert!(
-        remediations.iter().any(|hint| stderr.contains(hint)),
-        "the sealed refusal must name a mechanism-specific remediation, got: {stderr}"
+        matched.is_some(),
+        "the sealed refusal must be one of SealedBlocker's mechanism-specific reasons, got: \
+         {stderr}"
     );
 
     // The refusal lands ahead of workdir creation, so nothing was left behind.

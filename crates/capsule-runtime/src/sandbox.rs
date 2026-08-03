@@ -1700,11 +1700,14 @@ isolation as not-yet-confirmed and do not rely on it as a hardened boundary unti
 const KERNEL_SEALED_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
 namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
-the only writable path, a private /dev tmpfs carrying the OCI default device set, /proc masked \
-with hidepid), with Landlock and seccomp still installed inside it as defence in depth. Paths \
-outside that root are absent rather than denied. This mechanism has not yet been verified by the \
-team on real hardware — see docs/content/reference/sealed-containment-manual-verification.md — so \
-treat the containment boundary as not-yet-confirmed until that procedure has been run.";
+the only writable path, a private /dev tmpfs carrying the OCI default device set), with Landlock \
+and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
+rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
+private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
+so host process metadata stays visible there exactly as it is under scoped. This mechanism has \
+been checked by hand on one host and not yet by the team on hardware of their own — see \
+docs/content/reference/sealed-containment-manual-verification.md — so treat the containment \
+boundary as not-yet-confirmed until that procedure has been run again independently.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -2465,37 +2468,87 @@ mod linux_enforce {
         }
     }
 
-    /// Probes real Landlock support by actually building a ruleset and calling
-    /// `restrict_self()`, granting itself full access to `/` so the probe has no observable
-    /// effect on the calling (host) process beyond placing it into a Landlock domain that
-    /// permits everything — Landlock domains only ever get *stricter* on further nesting, and
-    /// the real per-shell-call restriction (scoped to `workdir`) is applied separately, inside
-    /// each spawned child's own `pre_exec`, not here. This is the "runtime capability probe"
-    /// the tier detection requires, without functionally sandboxing the whole host process
-    /// from a mere capability check.
+    /// Probes real Landlock support by building a ruleset granting full access to `/` and
+    /// calling `restrict_self()` **in a forked child**, so the host process is never placed
+    /// into a Landlock domain by a mere capability check.
+    ///
+    /// Forking is required, not defensive. An earlier version restricted the calling process
+    /// on the grounds that a domain permitting everything has "no observable effect" — that is
+    /// false, and the rights the ruleset grants are beside the point. Entering *any* Landlock
+    /// domain permanently forbids the mount family to the task and every descendant it will
+    /// ever have; Landlock is designed that way precisely to stop a sandbox being escaped
+    /// through a nested namespace. Since `host_probe` runs this before the sealed probe, and
+    /// both run inside `ShellEnforcement::resolve` before any fork that would build a composed
+    /// root, restricting in-process poisoned `sealed` on every host, on every invocation — the
+    /// namespace was created and then `mount` was refused, with nothing in the error to
+    /// suggest the runtime had done it to itself.
+    ///
+    /// The ruleset is built in the parent because creating one and adding rules restricts
+    /// nothing; only `restrict_self` applies it. That keeps everything the child does after
+    /// the fork down to a `prctl` and one syscall.
     pub(super) fn probe_landlock_full_access() -> Option<bool> {
         use landlock::{
             Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
             RulesetCreatedAttr, RulesetStatus, ABI,
         };
 
+        // The child reports which of the three outcomes it reached through its exit status;
+        // nothing else crosses the fork.
+        const PROBE_FULLY_ENFORCED: i32 = 0;
+        const PROBE_PARTIAL: i32 = 1;
+        const PROBE_FAILED: i32 = 2;
+
         let abi = ABI::V1;
         let access_all = AccessFs::from_all(abi);
 
         let root_fd = PathFd::new("/").ok()?;
 
-        let status = Ruleset::default()
+        let ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(access_all)
             .ok()?
             .create()
             .ok()?
             .add_rule(PathBeneath::new(root_fd, access_all))
-            .ok()?
-            .restrict_self()
             .ok()?;
 
-        Some(matches!(status.ruleset, RulesetStatus::FullyEnforced))
+        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
+        // confines itself to async-signal-safe work. Everything this child does is the
+        // `restrict_self` syscall pair and `_exit`; the allocating part of building the
+        // ruleset already happened above, in the parent.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return None;
+        }
+        if pid == 0 {
+            let code = match ruleset.restrict_self() {
+                Ok(status) => {
+                    if matches!(status.ruleset, RulesetStatus::FullyEnforced) {
+                        PROBE_FULLY_ENFORCED
+                    } else {
+                        PROBE_PARTIAL
+                    }
+                }
+                Err(_) => PROBE_FAILED,
+            };
+            // SAFETY: forked-child context; `_exit` skips every destructor and atexit hook,
+            // which is what keeps the parent's state untouched.
+            unsafe { libc::_exit(code) }
+        }
+
+        let mut wait_status: libc::c_int = 0;
+        // SAFETY: `pid` is the child just forked; `wait_status` is a live local.
+        let waited = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
+        if waited < 0 || !libc::WIFEXITED(wait_status) {
+            return None;
+        }
+        match libc::WEXITSTATUS(wait_status) {
+            PROBE_FULLY_ENFORCED => Some(true),
+            PROBE_PARTIAL => Some(false),
+            // A `restrict_self` that errored tells us nothing either way, which is the same
+            // answer the pre-fork version gave by propagating `None` out of `.ok()?`.
+            _ => None,
+        }
     }
 
     /// Runs inside the forked child, pre-exec: strips the child's Linux capabilities, installs
@@ -3758,9 +3811,10 @@ mod tests {
             EnforcementTier::KernelFull
         );
 
-        // The container case, and its two other namespace failure modes.
+        // The container case, and its three other namespace failure modes.
         for namespace in [
             NamespaceProbe::Denied,
+            NamespaceProbe::MapDenied,
             NamespaceProbe::MountDenied,
             NamespaceProbe::Unsupported,
         ] {
@@ -5026,6 +5080,34 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
+mod landlock_probe_isolation {
+    /// The Landlock probe must leave the calling process exactly as it found it.
+    ///
+    /// Stated as "the sealed probe gives the same answer before and after" rather than by
+    /// inspecting the process's Landlock domain, because there is no API to ask whether a task
+    /// is landlocked — and because that framing is what actually broke: the probe restricted
+    /// itself, and every later attempt to build a composed root was refused, on every host, in
+    /// a way that looked like the host's fault.
+    ///
+    /// Host-independent by construction. On a machine that cannot do `sealed` at all, both
+    /// halves report the same failure and this passes trivially; on a capable one, an
+    /// in-process `restrict_self` turns the second answer into a mount denial and fails it.
+    #[test]
+    fn the_landlock_probe_does_not_restrict_the_calling_process() {
+        let before = crate::sealed::probe_sealed_support().namespace;
+        let _ = super::linux_enforce::probe_landlock_full_access();
+        let after = crate::sealed::probe_sealed_support().namespace;
+
+        assert_eq!(
+            before, after,
+            "the Landlock probe changed what the sealed probe reports ({before:?} -> {after:?}) — \
+             it has restricted the calling process instead of a forked child, which permanently \
+             forbids the mount family to this process and everything it spawns",
+        );
+    }
+}
+
 #[cfg(test)]
 mod linux_integration_tests {
     use std::path::Path;

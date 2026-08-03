@@ -19,7 +19,9 @@
 //!      root inside it: the host runtime directories ([`SEALED_RUNTIME_PATHS`]) and a fixed,
 //!      narrow `/etc` set ([`SEALED_ETC_PATHS`]) bind-mounted **read-only**, the session workdir
 //!      bind-mounted **read-write at its own absolute path**, a private `/dev` tmpfs carrying the
-//!      OCI default device set ([`SEALED_DEVICE_NODES`]), and `/proc` mounted with `hidepid`.
+//!      OCI default device set ([`SEALED_DEVICE_NODES`]), and a `/proc` — masked with `hidepid`
+//!      where the kernel permits it, bound from the host where it does not
+//!      ([`PROC_HIDEPID_OPTIONS`] documents which is which, and why).
 //!   4. `pivot_root`s onto it, detaches the old root, remounts the new root read-only, and
 //!      `chdir`s back into the workdir.
 //!
@@ -27,6 +29,12 @@
 //! pathname for `/etc/shadow`, for a Docker socket, or for `/dev/sda`, so the escape classes that
 //! `scoped` has to enumerate and refuse (pathname unix sockets, device nodes, metadata visibility,
 //! stdlib directory enumeration) stop being reachable rather than being individually denied.
+//!
+//! `/proc` is the one documented exception to that sentence, and it is stated here rather than in a
+//! footnote: mounting a private `procfs` unprivileged needs a PID namespace this slice deliberately
+//! does not create, so on a bare host the composed root carries a bind of the host's `/proc` and
+//! host process metadata stays *visible* there (opens through it are still Landlock's to refuse).
+//! See [`PROC_HIDEPID_OPTIONS`].
 //!
 //! ## What it does *not* replace
 //!
@@ -85,6 +93,9 @@ pub enum SealedBlocker {
     /// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` was refused outright — the container case: no
     /// `CAP_SYS_ADMIN`, or the container's own seccomp filter blocking the syscall.
     NamespaceCreationDenied,
+    /// The namespace was created, but writing the identity `uid_map`/`gid_map` was refused, so the
+    /// process cannot own it. Nothing to do with `CAP_SYS_ADMIN` or containers.
+    IdMapDenied,
     /// The namespace was created, but `mount(2)` inside it was refused. The signature of a
     /// confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN`.
     MountDenied,
@@ -98,6 +109,20 @@ pub enum SealedBlocker {
 }
 
 impl SealedBlocker {
+    /// Every variant, so a caller that has to reason about "which refusal did this host give"
+    /// cannot silently miss one. Added because a hand-maintained list of the expected refusal
+    /// texts in `murmur-cli`'s CLI test drifted the moment a variant was added, and the drift
+    /// showed up as a failing assertion about the *host* rather than about the list.
+    pub const ALL: &'static [SealedBlocker] = &[
+        SealedBlocker::NotLinux,
+        SealedBlocker::AppArmorProfileMissing,
+        SealedBlocker::NamespaceCreationDenied,
+        SealedBlocker::IdMapDenied,
+        SealedBlocker::MountDenied,
+        SealedBlocker::KernelUnsupported,
+        SealedBlocker::LandlockUnavailable,
+    ];
+
     /// One sentence naming the missing mechanism, plus the exact remediation. Rendered into
     /// `RuntimeError::ContainmentFloorUnmet`'s `reason`, so this is the text an operator sees
     /// under `E-CAP-003`.
@@ -126,6 +151,15 @@ impl SealedBlocker {
                  SYS_ADMIN` to the container invocation, or establish the mount namespace outside \
                  the container and run mur inside it. The runtime will not fall back to a weaker \
                  class."
+                    .to_string()
+            }
+            SealedBlocker::IdMapDenied => {
+                "sealed created a user+mount namespace, but writing the identity uid_map/gid_map \
+                 into it was refused, so the process cannot own the namespace it just made. This \
+                 is an id-mapping problem, not a missing capability: check that \
+                 /proc/sys/user/max_user_namespaces is non-zero, that no LSM policy blocks \
+                 uid_map writes for this binary, and that mur is not already running inside an \
+                 unmapped user namespace. The runtime will not fall back to a weaker class."
                     .to_string()
             }
             SealedBlocker::MountDenied => format!(
@@ -166,6 +200,12 @@ pub(crate) enum NamespaceProbe {
     Ok,
     /// `unshare` itself was refused (`EPERM`).
     Denied,
+    /// `unshare` succeeded, but writing the identity `uid_map`/`gid_map` did not — the namespace
+    /// exists and cannot be owned. Distinct from [`Denied`](Self::Denied) because the remediation
+    /// is completely different: `Denied` points at `CAP_SYS_ADMIN` and container flags, while this
+    /// points at id-mapping policy. Collapsing the two sent an operator hunting a container
+    /// problem on a host that had created the namespace perfectly well.
+    MapDenied,
     /// `unshare` succeeded, `mount(2)` inside the namespace did not.
     MountDenied,
     /// The kernel does not implement it (`ENOSYS`/`EINVAL`), or the probe could not run at all.
@@ -216,6 +256,7 @@ pub(crate) fn sealed_blocker(
             }
         }
         NamespaceProbe::Denied => Some(SealedBlocker::NamespaceCreationDenied),
+        NamespaceProbe::MapDenied => Some(SealedBlocker::IdMapDenied),
         NamespaceProbe::MountDenied => Some(SealedBlocker::MountDenied),
         NamespaceProbe::Unsupported => Some(SealedBlocker::KernelUnsupported),
     }
@@ -358,12 +399,32 @@ const OLD_ROOT_NAME: &str = ".mur-oldroot";
 /// directories the composed root goes on to bind-mount from.
 pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "/mnt", "/media"];
 
-/// `hidepid` spellings tried, in order, when mounting the composed root's `/proc`.
+/// `hidepid` spellings tried, in order, when mounting the composed root's `/proc` with
+/// `mount -t proc`. The numeric form is the legacy parser's; `invisible` is the Linux 5.8+
+/// spelling; the empty string is a plain private `procfs` with no masking.
 ///
-/// The numeric form is the legacy parser's; `invisible` is the Linux 5.8+ spelling. A kernel that
-/// accepts neither still gets a `/proc`, because a `/proc` that fails to mount breaks far more
-/// than an unmasked one leaks — but the fallback is recorded here rather than hidden, and the
-/// manual-verification document checks which one a given host landed on.
+/// **On a bare host none of the three succeeds, and that is a kernel rule, not a bug here.**
+/// `proc_fill_super` requires `CAP_SYS_ADMIN` over the user namespace *owning the PID namespace*.
+/// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` leaves the process in the host's initial PID namespace,
+/// whose owner is the initial user namespace — where an unprivileged process has no capabilities
+/// at all — so every `mount -t proc` returns `EPERM`. Adding `CLONE_NEWPID` does not help either:
+/// `unshare` moves only *future children* into the new PID namespace, so the mounting process is
+/// still judged against the old one. Mounting a private `procfs` unprivileged genuinely requires
+/// forking so the child becomes PID 1, which changes reaping and signal semantics for the whole
+/// capsule subprocess tree and is out of scope here (see the PID-namespace note in
+/// `docs/content/reference/sealed-containment-manual-verification.md`).
+///
+/// They are still tried first, and in this order, because they *do* succeed where the process has
+/// that privilege — as root, and inside a container run with `--cap-add SYS_ADMIN` — and because
+/// a later PID-namespace slice makes them succeed everywhere without touching this list.
+///
+/// When they all fail the executor binds the host's `/proc` instead. What that costs is recorded
+/// rather than buried: the capsule can enumerate host PIDs and read the `/proc/<pid>/root` and
+/// `/proc/<pid>/cwd` symlinks, so `/proc` is the one part of the composed root where "outside does
+/// not exist" degrades to `scoped`'s "outside is denied" — Landlock's ruleset covers no path under
+/// `/proc`, so opens through it are refused, and `ptrace_may_access` gates the rest. Every other
+/// axis of the root stays absolute. The alternative is a capsule with no `/proc` at all, which
+/// breaks `/dev/fd`, process substitution and every runtime that reads `/proc/self/*`.
 const PROC_HIDEPID_OPTIONS: &[&str] = &["hidepid=2", "hidepid=invisible", ""];
 
 // ---------------------------------------------------------------- host layout (test seam)
@@ -422,7 +483,9 @@ pub(crate) enum RootOp {
     Bind { source: PathBuf, target: PathBuf, read_only: bool },
     /// A fresh `tmpfs`.
     Tmpfs { target: PathBuf, options: &'static str },
-    /// A fresh `procfs`, masked with `hidepid`.
+    /// A `/proc`: a fresh `procfs` masked with `hidepid` where the kernel permits one, a bind of
+    /// the host's where it does not. Which of the two a host gets is decided at execution time, not
+    /// here — see [`PROC_HIDEPID_OPTIONS`].
     Proc { target: PathBuf },
     /// A fresh `devpts` instance, so the capsule can allocate its own ptys without seeing the
     /// host's.
@@ -532,32 +595,41 @@ pub(crate) fn plan_composed_root(
     }
     builder.push(RootOp::RemountReadOnly(dev), false);
 
-    // 4. /proc, masked with hidepid.
+    // 4. /proc — masked with hidepid where the kernel allows it, bound from the host where it does
+    //    not. See `PROC_HIDEPID_OPTIONS`.
     let proc = base.join("proc");
     builder.push(RootOp::MkDir(proc.clone()), true);
     builder.push(RootOp::Proc { target: proc }, true);
 
-    // 5. The session workdir, at its own absolute path, read-write — the only writable path in the
-    //    composed root, and the backing store for /tmp below.
-    let workdir_target = rebase(base, workdir);
-    builder.mkdir_p(&workdir_target);
-    builder.push(
-        RootOp::Bind {
-            source: workdir.to_path_buf(),
-            target: workdir_target,
-            read_only: false,
-        },
-        true,
-    );
-
-    // 6. /tmp, backed by a directory inside the workdir so it stays inside the one writable path
+    // 5. /tmp, backed by a directory inside the workdir so it stays inside the one writable path
     //    and inside the workdir size budget.
+    //
+    //    Before the workdir, not after, and the ordering is load-bearing rather than tidy. A
+    //    session workdir under `/tmp` is not an edge case — it is `mur run`'s default, since
+    //    `--workdir` falls back to a temporary directory. With the workdir reproduced first, this
+    //    mount landed *on top of* the path leading to it, the workdir bind vanished under it, and
+    //    the construction died at `chdir into the workdir inside the root: ENOENT` — after the
+    //    pivot, with the host root already detached. Mounting `/tmp` first means the workdir's path
+    //    components are created inside it, so the deeper mount is the one that survives.
     let tmp = base.join("tmp");
     builder.push(RootOp::MkDir(tmp.clone()), true);
     builder.push(
         RootOp::Bind {
             source: workdir.join(SEALED_TMP_DIR_NAME),
             target: tmp,
+            read_only: false,
+        },
+        true,
+    );
+
+    // 6. The session workdir, at its own absolute path, read-write — the only writable path in the
+    //    composed root, and the backing store for /tmp above.
+    let workdir_target = rebase(base, workdir);
+    builder.mkdir_p(&workdir_target);
+    builder.push(
+        RootOp::Bind {
+            source: workdir.to_path_buf(),
+            target: workdir_target,
             read_only: false,
         },
         true,
@@ -728,6 +800,62 @@ mod linux {
             .filter(|value| !value.is_empty())
     }
 
+    /// Flips `PR_SET_DUMPABLE` for the duration of the identity-map writes, and back again.
+    ///
+    /// Not optional, and the single hardest-won line in this module. `mur` marks itself
+    /// non-dumpable at startup (`security::harden_process_dumpable`, `prctl(PR_SET_DUMPABLE, 0)`)
+    /// so that no same-uid process can read its `/proc/<pid>/environ`. That flag is inherited
+    /// across `fork()`, and the kernel's `task_dump_owner()` reassigns *every* `/proc/<pid>/*`
+    /// entry of a non-dumpable task to root — including `setgroups`, `uid_map` and `gid_map`. An
+    /// unprivileged process therefore cannot open its own `uid_map` for writing, and the namespace
+    /// it just created is one it can never own.
+    ///
+    /// The symptom this produced was maximally misleading: `unshare` succeeded, the map write
+    /// failed with `EACCES`, and the refusal blamed the host's id-mapping policy — on a host whose
+    /// id-mapping policy was fine, and where the identical syscall sequence run from any other
+    /// program succeeded. `sealed` was unreachable on every host for this reason alone.
+    ///
+    /// The window is reopened for exactly the three `open`/`write`/`close` pairs that need it and
+    /// closed again before the first mount, so the child spends no longer readable than the map
+    /// writes take.
+    ///
+    /// [`restore_dumpable`] puts back whatever the flag *was*, read here and returned, rather than
+    /// assuming `0`. Hardcoding `0` looked equivalent — `mur` always runs non-dumpable — and was
+    /// not: it also cleared the flag for every process that had *not* hardened itself, which
+    /// includes this crate's own integration tests, and a non-dumpable child is one whose
+    /// `/proc/<pid>/mem` the seccomp-notify supervisor cannot read. Every allowlisted `execve`
+    /// then fail-closed to `EACCES`.
+    ///
+    /// # Safety
+    /// Post-`fork()`, pre-exec child context only — `prctl(2)` is async-signal-safe, but the
+    /// dumpable window this reopens is only sound while this process is the single-threaded child
+    /// that is about to `execve` a sandboxed binary.
+    unsafe fn make_dumpable_for_map_writes() -> libc::c_int {
+        // SAFETY: both `prctl` calls take four integer arguments; no pointers cross the boundary.
+        // `PR_GET_DUMPABLE` returning `-1` means the query failed, in which case the restore below
+        // is skipped rather than guessing.
+        unsafe {
+            let previous = libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0);
+            libc::prctl(libc::PR_SET_DUMPABLE, 1 as libc::c_int, 0, 0, 0);
+            previous
+        }
+    }
+
+    /// Undoes [`make_dumpable_for_map_writes`], restoring the exact value it found.
+    ///
+    /// # Safety
+    /// Same window and same constraints as [`make_dumpable_for_map_writes`]; `previous` must be
+    /// the value that call returned.
+    unsafe fn restore_dumpable(previous: libc::c_int) {
+        if previous < 0 {
+            return;
+        }
+        // SAFETY: integer-only `prctl`, in the post-fork child.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, previous, 0, 0, 0);
+        }
+    }
+
     // Exit codes the probe child reports. Kept as small distinct integers so the parent learns the
     // *step* that failed without any IPC beyond `waitpid`.
     const PROBE_OK: i32 = 0;
@@ -737,9 +865,19 @@ mod linux {
     const PROBE_MAP_DENIED: i32 = 4;
 
     fn probe_namespace() -> NamespaceProbe {
+        // Read before the fork, and therefore before `unshare`: inside a fresh user namespace
+        // with no mapping written yet, `getuid()`/`getgid()` report the *overflow* ids (65534),
+        // not the real ones. Writing `65534 65534 1` into `uid_map` is refused with `EPERM` on
+        // every host, so reading them after the unshare made the probe fail everywhere and
+        // report the host as the culprit. This is the one ordering in this function that is
+        // load-bearing.
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child below calls `unshare`,
-        // `mount` and `_exit` and nothing else — no allocation, no locks, no stdio.
+        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps, and
+        // `_exit` — every one of them async-signal-safe, and no allocation, no locks, no stdio.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return NamespaceProbe::Unsupported;
@@ -759,12 +897,18 @@ mod linux {
                 // does: a host can allow the namespace and still refuse to let the process own
                 // it, and finding that out at spawn time instead of at launch time is exactly
                 // the surprise this probe exists to prevent.
-                let uid = libc::getuid();
-                let gid = libc::getgid();
+                //
+                // `uid`/`gid` come from before the fork — see `probe_namespace`.
+                //
+                // Dumpable for the map writes only, and restored immediately: see
+                // `make_dumpable_for_map_writes` for why an inherited non-dumpable flag makes
+                // these three files root-owned.
+                let previous_dumpable = make_dumpable_for_map_writes();
                 let _ = write_decimal_map(c"/proc/self/setgroups", None, 0);
-                if write_decimal_map(c"/proc/self/uid_map", Some(uid), uid).is_err()
-                    || write_decimal_map(c"/proc/self/gid_map", Some(gid), gid).is_err()
-                {
+                let mapped = write_decimal_map(c"/proc/self/uid_map", Some(uid), uid).is_ok()
+                    && write_decimal_map(c"/proc/self/gid_map", Some(gid), gid).is_ok();
+                restore_dumpable(previous_dumpable);
+                if !mapped {
                     libc::_exit(PROBE_MAP_DENIED);
                 }
 
@@ -793,9 +937,12 @@ mod linux {
         }
         match libc::WEXITSTATUS(status) {
             PROBE_OK => NamespaceProbe::Ok,
-            // A namespace this process cannot map itself into is a namespace it cannot use, and
-            // the remediation is the same one `Denied` names.
-            PROBE_UNSHARE_DENIED | PROBE_MAP_DENIED => NamespaceProbe::Denied,
+            PROBE_UNSHARE_DENIED => NamespaceProbe::Denied,
+            // Kept apart from `Denied`: the child already told us which step failed, and
+            // throwing that away made a map failure indistinguishable from the kernel refusing
+            // the namespace outright — so the reported cause, and the remediation offered with
+            // it, named the wrong thing entirely.
+            PROBE_MAP_DENIED => NamespaceProbe::MapDenied,
             PROBE_MOUNT_DENIED => NamespaceProbe::MountDenied,
             _ => NamespaceProbe::Unsupported,
         }
@@ -1050,11 +1197,20 @@ mod linux {
             //    an unprivileged process may write `gid_map`. A host without `setgroups` (pre-3.19)
             //    is tolerated; a failing `uid_map` is not, because running as the overflow uid
             //    would leave the capsule unable to write its own workdir.
+            //
+            //    Dumpable is flipped on for exactly these three writes and put back before the
+            //    first mount: `mur` runs non-dumpable, and a non-dumpable task's `/proc/self/*`
+            //    entries are owned by root, which makes its own `uid_map` unopenable. See
+            //    [`make_dumpable_for_map_writes`].
+            let previous_dumpable = make_dumpable_for_map_writes();
             let _ = write_file(c"/proc/self/setgroups", b"deny");
-            if write_file(c"/proc/self/uid_map", &spec.uid_map).is_err() {
+            let uid_mapped = write_file(c"/proc/self/uid_map", &spec.uid_map).is_ok();
+            let gid_mapped = uid_mapped && write_file(c"/proc/self/gid_map", &spec.gid_map).is_ok();
+            restore_dumpable(previous_dumpable);
+            if !uid_mapped {
                 return Err(SealedRootFailure::stage("write /proc/self/uid_map"));
             }
-            if write_file(c"/proc/self/gid_map", &spec.gid_map).is_err() {
+            if !gid_mapped {
                 return Err(SealedRootFailure::stage("write /proc/self/gid_map"));
             }
 
@@ -1214,9 +1370,8 @@ mod linux {
                 }
             }
             CStepKind::Proc { target } => {
-                // Try each `hidepid` spelling in turn. The unmasked fallback is the last entry,
-                // and it is a fallback rather than a failure because a capsule with no `/proc` at
-                // all breaks in far more ways than one with an unmasked `/proc` leaks.
+                // Try each `hidepid` spelling in turn, then a recursive bind of the host's
+                // `/proc` — see `PROC_HIDEPID_OPTIONS` for why the bind exists and what it costs.
                 for option in PROC_HIDEPID_OPTIONS {
                     let mut buffer = [0u8; 32];
                     let bytes = option.as_bytes();
@@ -1240,7 +1395,39 @@ mod linux {
                         return Ok(());
                     }
                 }
-                return Err(());
+
+                // Last resort: bind the host's `/proc` in. `mount -t proc` needs `CAP_SYS_ADMIN`
+                // over the *PID* namespace's user namespace, which an unprivileged user namespace
+                // never has, so on a bare host every spelling above fails with `EPERM` and this is
+                // the branch that actually runs. A bind of an existing mount needs no such
+                // privilege. Recursive so the `/proc` submounts a modern host carries come with it
+                // rather than leaving empty stubs.
+                if libc::mount(
+                    c"/proc".as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REC,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    return Err(());
+                }
+                // Best-effort hardening of the bind. `MS_REMOUNT | MS_BIND` changes per-mount
+                // flags only — unlike `hidepid`, which is a superblock option and stays refused —
+                // so this narrows what the bind can do without touching the host's own `/proc`.
+                // Not fatal: a `/proc` that is present and merely unhardened beats no `/proc`.
+                libc::mount(
+                    std::ptr::null(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT
+                        | libc::MS_BIND
+                        | libc::MS_NOSUID
+                        | libc::MS_NODEV
+                        | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                );
+                return Ok(());
             }
             CStepKind::DevPts { target } => {
                 if libc::mount(
@@ -1469,6 +1656,44 @@ mod tests {
         }));
     }
 
+    /// The composed root's own `/tmp` must not land on top of the path leading to the workdir.
+    ///
+    /// This is `mur run`'s default layout, not a curiosity: with no `--workdir`, the session
+    /// workdir is a temporary directory, which is under `/tmp`. Planned in the other order, the
+    /// `/tmp` bind hid the workdir bind underneath it and the construction died at `chdir` —
+    /// *after* `pivot_root`, with the host root already detached, so the failure arrived as a bare
+    /// `ENOENT` from inside a root that no longer had a way back.
+    #[test]
+    fn a_workdir_under_tmp_survives_the_composed_tmp_mounted_over_its_path() {
+        let workdir = "/tmp/session-1234/w";
+        let plan = plan_for(workdir);
+        let operations = ops(&plan);
+
+        // A workdir under /tmp forces a base other than /tmp, so both mounts are still expressible.
+        assert_eq!(
+            choose_root_base(Path::new(workdir), SEALED_ROOT_BASE_CANDIDATES, |_| true),
+            Some(PathBuf::from("/run")),
+        );
+
+        let tmp_index = operations
+            .iter()
+            .position(|op| {
+                matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp"))
+            })
+            .expect("the composed /tmp is bound");
+        let workdir_index = operations
+            .iter()
+            .position(|op| {
+                matches!(op, RootOp::Bind { source, .. } if source == Path::new(workdir))
+            })
+            .expect("the workdir is bound");
+        assert!(
+            tmp_index < workdir_index,
+            "/tmp must be mounted before the workdir path is built inside it, or the workdir bind \
+             is hidden by it",
+        );
+    }
+
     #[test]
     fn dev_carries_the_oci_default_set_and_is_sealed_afterwards() {
         let plan = plan_for("/home/u/w");
@@ -1501,11 +1726,22 @@ mod tests {
         assert!(tmpfs_index < sealed_index, "the device nodes must be bound before /dev is sealed");
     }
 
+    /// The plan always asks for a masked `/proc`; whether the kernel grants one is a runtime
+    /// question the executor answers, and on a bare host the answer is no — see
+    /// [`PROC_HIDEPID_OPTIONS`] for the `CAP_SYS_ADMIN`-over-the-PID-namespace rule that forces
+    /// the bind fallback. What this pins is the *preference order*: masking is tried first, and
+    /// the unmasked private `procfs` is the last of the three before the fallback, never the
+    /// first.
     #[test]
-    fn proc_is_mounted_and_masked() {
+    fn proc_is_planned_and_masking_is_preferred_over_an_unmasked_mount() {
         let plan = plan_for("/home/u/w");
         assert!(ops(&plan).contains(&RootOp::Proc { target: PathBuf::from("/tmp/proc") }));
         assert_eq!(PROC_HIDEPID_OPTIONS[0], "hidepid=2");
+        assert_eq!(
+            PROC_HIDEPID_OPTIONS.last(),
+            Some(&""),
+            "the unmasked spelling must be tried last, after every masked one",
+        );
     }
 
     #[test]
@@ -1566,6 +1802,85 @@ mod tests {
     }
 
     #[test]
+    fn a_map_failure_is_not_reported_as_the_container_case() {
+        // These two used to collapse into `Denied`, so a host that created the
+        // namespace perfectly well and then refused the id mapping was told to go
+        // add `--cap-add SYS_ADMIN` to a container it wasn't running in.
+        let probe = SealedProbe {
+            apparmor_permits_userns: true,
+            namespace: NamespaceProbe::MapDenied,
+        };
+        assert_eq!(sealed_blocker(true, true, probe), Some(SealedBlocker::IdMapDenied));
+
+        let reason = SealedBlocker::IdMapDenied.reason();
+        assert!(reason.contains("uid_map"), "must name the step that failed: {reason}");
+        assert!(
+            !reason.contains("CAP_SYS_ADMIN") && !reason.contains("--cap-add"),
+            "must not send the operator after a capability that isn't the problem: {reason}",
+        );
+
+        // And the container case must keep its own, different advice.
+        let denied = SealedProbe {
+            apparmor_permits_userns: true,
+            namespace: NamespaceProbe::Denied,
+        };
+        assert_eq!(
+            sealed_blocker(true, true, denied),
+            Some(SealedBlocker::NamespaceCreationDenied)
+        );
+        assert_ne!(
+            SealedBlocker::IdMapDenied.reason(),
+            SealedBlocker::NamespaceCreationDenied.reason(),
+        );
+    }
+
+    /// `SealedBlocker::ALL` is what `murmur-cli`'s containment test matches a refusal against, so a
+    /// variant missing from it makes that test assert something false about the *host*. Adding a
+    /// variant must break this test — loudly, here — rather than surface three crates away.
+    #[test]
+    fn every_blocker_is_listed_in_all_with_its_own_actionable_reason() {
+        // The exhaustive match is the mechanism: a new variant fails to compile until it is added
+        // here, and the `contains` below then forces it into `ALL` too.
+        for blocker in SealedBlocker::ALL {
+            let named = match blocker {
+                SealedBlocker::NotLinux
+                | SealedBlocker::AppArmorProfileMissing
+                | SealedBlocker::NamespaceCreationDenied
+                | SealedBlocker::IdMapDenied
+                | SealedBlocker::MountDenied
+                | SealedBlocker::KernelUnsupported
+                | SealedBlocker::LandlockUnavailable => *blocker,
+            };
+            assert!(
+                SealedBlocker::ALL.contains(&named),
+                "{named:?} is missing from SealedBlocker::ALL",
+            );
+        }
+
+        let reasons: Vec<String> = SealedBlocker::ALL
+            .iter()
+            .map(|blocker| blocker.reason())
+            .collect();
+        for reason in &reasons {
+            assert!(reason.starts_with("sealed "), "got: {reason}");
+            assert!(!reason.contains('\n'), "got: {reason}");
+            assert!(
+                reason.len() > 80,
+                "a blocker reason must name the mechanism and its remediation, not just fail: \
+                 {reason}",
+            );
+        }
+        let mut unique = reasons.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            reasons.len(),
+            "two blockers share a reason, so the refusal cannot say which one applies",
+        );
+    }
+
+    #[test]
     fn blocker_is_none_only_when_every_precondition_holds() {
         let ok = SealedProbe {
             apparmor_permits_userns: true,
@@ -1593,22 +1908,6 @@ mod tests {
             ),
             Some(SealedBlocker::KernelUnsupported)
         );
-    }
-
-    #[test]
-    fn every_blocker_reason_names_a_mechanism_and_stays_one_paragraph() {
-        for blocker in [
-            SealedBlocker::NotLinux,
-            SealedBlocker::AppArmorProfileMissing,
-            SealedBlocker::NamespaceCreationDenied,
-            SealedBlocker::MountDenied,
-            SealedBlocker::KernelUnsupported,
-            SealedBlocker::LandlockUnavailable,
-        ] {
-            let reason = blocker.reason();
-            assert!(reason.starts_with("sealed "), "got: {reason}");
-            assert!(!reason.contains('\n'), "got: {reason}");
-        }
     }
 
     #[test]

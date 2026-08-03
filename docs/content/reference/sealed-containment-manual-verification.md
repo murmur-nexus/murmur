@@ -1,15 +1,18 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! danger "Status: **PENDING — not yet run.** No result has been recorded, and none should be inferred."
+!!! success "Status: **RUN — 2026-08-03, partial.** Steps 1–4 pass on a real host; step 5 (container) was not run."
 
-    The mechanism described below is implemented, compiles, and is covered by unit tests for its
-    *decision* logic. The procedure on this page has **not** been executed on a real Linux host.
+    Steps 0–4 were executed on a bare Ubuntu host on 2026-08-03 and every expected result on this
+    page was observed. Step 5 (the container refusal) was **not** run — no container runtime is
+    installed on that host — and step 3's probes were driven through a hand-run harness rather than
+    through a live capsule, because a *separate, pre-existing* defect blocks shell tools under
+    `mur run` at **every** class. Both are recorded verbatim, with their exact evidence, in
+    [Recording the result](#recording-the-result). Read that section before treating this page as a
+    clean pass.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
     [What this deliberately is not](#what-this-deliberately-is-not).
-
-    See [Recording the result](#recording-the-result) for what to replace when someone runs it.
 
 ## What this verifies
 
@@ -89,29 +92,46 @@ other is the expected, correct behaviour — not a bug in either.
 
 ## Step 0 — build the test capsule
 
-Start from a real, runnable capsule rather than a bare `murmur.yaml`. `mur run` resolves the
-capsule component *before* the containment gate, so a directory containing only a manifest reports
-`E-RUN-004` (no capsule component) and you never reach the refusal this page is about.
+Start from a real, runnable capsule rather than a bare `murmur.yaml`. `mur` has no `init`
+subcommand — create the project directory and write `murmur.yaml` by hand:
 
 ```sh
-cd ~ && mur init sealed-check && cd sealed-check
-mur install
+mkdir -p ~/sealed-check && cd ~/sealed-check
 ```
 
-Then add the two keys this procedure needs to `murmur.yaml`, under the existing `capabilities:`
-block:
+An **agent** capsule (one that declares `inference:`) is manifest-only — `mur run` never looks for
+a root `*.wasm` for it, so no placeholder component is needed. `capabilities.containment: sealed`
+and a `bash` shell allowlist are what this procedure needs; `inference.transport: process` drives
+the agent loop through a locally installed provider CLI (`command: claude` here) rather than a
+hosted API key, the same pattern as the
+[quickstart](../getting-started/quickstart.md#want-to-use-a-subscription) — swap in whatever CLI
+the host has installed (`command: codex` for OpenAI's Codex CLI, etc.):
 
 ```yaml
+name: sealed-check
+version: 0.1.0
+
 capabilities:
   containment: sealed
   shell:
     allow:
       - bash
+
+inference:
+  transport: process
+  command: claude
+  model: claude-sonnet-4-5
+  max_turns: 4
 ```
 
+(A **script** capsule — one with no `inference:` block — needs a root `capsule.wasm` instead, and
+`mur run` resolves it *before* the containment gate: a directory with only a manifest and no
+component reports `error[E-RUN-004]` and never reaches the refusal this page is about. The agent
+capsule above sidesteps that path entirely.)
+
 Confirm the declared floor is what you think it is, without launching anything. `--explain-scope`
-reads the manifest and probes the host, and does not resolve the capsule component — so it works
-whether or not step 0's build succeeded:
+reads and validates the manifest and probes the host, but does not launch the capsule or start an
+agent turn:
 
 ```sh
 mur run --explain-scope
@@ -439,50 +459,83 @@ Expected:
 probe
 ```
 
-### 3e — `/proc` masking
+### 3e — `/proc`
 
 ```sh
-ls /proc/1 2>&1 | head -1
-grep -c . /proc/mounts
+grep " /proc " /proc/self/mountinfo
+ls /proc | grep -c '^[0-9]'
 ```
 
-Expected: `/proc` exists (so tooling that reads `/proc/self/*` keeps working) but carries `hidepid`,
-so other users' processes are invisible. Record `cat /proc/self/mountinfo | grep ' /proc '` verbatim
-and note which `hidepid` spelling this kernel accepted — the runtime tries `hidepid=2`, then
-`hidepid=invisible`, then an unmasked mount, in that order (`sealed::PROC_HIDEPID_OPTIONS`).
+Expected: `/proc` exists (so tooling that reads `/proc/self/*` keeps working), carries
+`nosuid,nodev,noexec`, and — on a bare host — is a **bind of the host's `/proc`**, so the pid count
+on the second line is the host's:
 
-!!! warning "Known limitation, not a defect to file"
+```text
+2096 2072 0:26 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+356
+```
 
-    This slice creates a mount namespace, not a PID namespace. `hidepid` hides processes belonging
-    to *other* users; the capsule's own uid still sees its own host processes in `/proc`. Closing
-    that needs `CLONE_NEWPID`, which changes process and reaping semantics and is deliberately out
-    of scope here.
+!!! warning "Known limitation, not a defect to file: `/proc` is not masked on a bare host"
+
+    Mounting a private `procfs` needs `CAP_SYS_ADMIN` over the user namespace owning the **PID**
+    namespace. `unshare(CLONE_NEWUSER | CLONE_NEWNS)` leaves the process in the host's initial PID
+    namespace, owned by the initial user namespace, where an unprivileged process has nothing — so
+    all three `hidepid` spellings the runtime tries (`hidepid=2`, `hidepid=invisible`, unmasked;
+    `sealed::PROC_HIDEPID_OPTIONS`) return `EPERM` and the executor falls back to binding the
+    host's `/proc`. Adding `CLONE_NEWPID` does not fix it: `unshare` moves only *future children*
+    into the new PID namespace, so the mounting process is still judged against the old one. The
+    real fix is to fork so the child becomes PID 1, which changes reaping and signal semantics for
+    the whole capsule subprocess tree and is deliberately out of scope here.
+
+    What this costs, stated plainly: host PIDs are enumerable and `/proc/<pid>/cmdline`,
+    `/proc/<pid>/root` and `/proc/<pid>/cwd` are nameable from inside the composed root. `/proc` is
+    the **one** part of the root where "outside does not exist" degrades to `scoped`'s "outside is
+    denied" — Landlock's ruleset covers no path under `/proc`, so opens through it are refused, and
+    `ptrace_may_access` gates the rest. Every other axis (steps 3a–3d) is absolute. Verify it
+    yourself here rather than taking this paragraph's word for it:
+
+    ```sh
+    cat /proc/1/cmdline; echo
+    cat /proc/1/environ 2>&1 | head -c 60; echo
+    ```
+
+    Expected — the host's init is *nameable* but its environment is not readable:
+
+    ```text
+    /sbin/init splash
+    cat: /proc/1/environ: Permission denied
+    ```
+
+    On a host where `mount -t proc` *does* succeed (running as root, or in a container started with
+    `--cap-add SYS_ADMIN`), the mountinfo line reads `- proc proc rw,hidepid=...` instead and the
+    pid count drops to the capsule's own processes. Record which of the two you got.
 
 ## Step 4 — `trace.jsonl`
 
-From the host, after the session:
+The trace lives under `<workdir>/.murmur/<session-id>/trace.jsonl`, one directory per session — not
+at the top of the workdir. From the host, after the session:
 
 ```sh
-head -1 ~/sealed-check/workdir/trace.jsonl | python3 -m json.tool | grep containment
+find ~/sealed-check/workdir -name trace.jsonl \
+  -exec grep -o '"containment_[a-z]*":"[a-z]*"' {} \; | head -2
 ```
 
 Expected:
 
 ```text
-    "containment_declared": "sealed",
-    "containment_achieved": "sealed",
-```
-
-Or, without `python3`:
-
-```sh
-grep -o '"containment_achieved":"[a-z]*"' ~/sealed-check/workdir/trace.jsonl | head -1
-```
-
-Expected:
-
-```text
+"containment_declared":"sealed"
 "containment_achieved":"sealed"
+```
+
+Launching at all needs a delegated cgroup scope, exactly as
+[resource-limits verification](resource-limits-manual-verification.md) requires — without it the
+launch refuses with `E-RUN-012` before reaching `session_start`, and the workdir must already
+exist:
+
+```sh
+mkdir -p ~/sealed-check/workdir
+systemd-run --user --scope --property=Delegate=yes -q \
+  mur run --workdir ~/sealed-check/workdir
 ```
 
 ## Step 5 — the container refusal
@@ -543,26 +596,79 @@ claims and the result must not be recorded as a pass.
 
 ## Recording the result
 
-**PENDING — not yet run. No result has been recorded, and none should be inferred.**
+### Run of 2026-08-03 — steps 1–4 pass, step 5 not run, step 3 driven by a harness
 
-No real uncontainerised Linux host was available when this document was written. Everything above
-is derived from the code — the mount plan in `sealed::plan_composed_root`, the device list in
-`sealed::SEALED_DEVICE_NODES`, the `/etc` allowlist in `sealed::SEALED_ETC_PATHS`, the refusal
-strings in `sealed::SealedBlocker::reason` — and the expected outputs are what that code implies,
-not observed output.
+**Host.** `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC x86_64`, Ubuntu 24.04,
+`systemd-detect-virt --container` → `none`, `CapBnd: 000001ffffffffff`, `Seccomp: 0`, PID 1 is
+`systemd`, non-root (`uid=1000`). `/sys/module/apparmor/parameters/restrict_unprivileged_userns`
+does not exist on this kernel build; `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` is the
+live knob, as step 1 anticipates. Profiles loaded: `mur-sealed.166`, `mur-sealed-home.167`.
 
-When someone runs the procedure, replace this subsection with:
+**Step 1 — AppArmor-absent refusal: PASS.** With the profile unloaded and the restriction on,
+`mur run` refused with `error[E-CAP-003]`, `achieved: 'scoped'`, naming the profile and the exact
+`apparmor_parser -r` command, exit 1, and no workdir or trace was created.
 
-- `uname -r`, the distribution, `systemd-detect-virt --container`, and
-  `cat /sys/module/apparmor/parameters/restrict_unprivileged_userns`;
-- the verbatim `mur run --explain-scope` output from steps 1 and 2;
-- the verbatim output of every probe in step 3, including the `/proc` mountinfo line and which
-  `hidepid` spelling was accepted;
-- the `containment_achieved` line from step 4;
-- both container outputs from step 5, and whether `--security-opt seccomp=unconfined` was needed;
-- the step 6 negative-control output, showing `Permission denied` under `scoped` where step 3a
-  showed `No such file or directory`;
-- any deviation from the commands as written, and why.
+**Step 2 — the host reaches `sealed`: PASS.**
+
+```text
+Containment
+  declared:  sealed
+  achieved:  sealed
+  floor met: yes
+  mechanism: mountns+pivot_root+landlock+seccomp
+```
+
+**Step 3 — the composed root: PASS, with the deviation below.** Every probe in 3a–3e produced the
+output this page states. Notably: all nine 3a targets reported `No such file or directory` (never
+`Permission denied`); `ls -1 /` produced exactly `bin dev etc home lib lib64 proc sbin tmp usr`;
+`ls -1 /etc` produced only the `SEALED_ETC_PATHS` entries this host has; `/dev` carried exactly the
+OCI default set at `1:3 1:5 1:7 1:8 1:9` with `/dev/null` still writable and no block device
+reachable; the workdir was writable at its own absolute path while `/usr`, `/etc` and `/` reported
+`Read-only file system`; and `/tmp` was backed by `<workdir>/.mur-tmp`. `/proc` came out as the
+bind fallback (`- proc proc rw`, `nosuid,nodev,noexec`, 356 host PIDs visible), which is the
+documented outcome for a bare host — see the warning under step 3e.
+
+*Deviation:* the 3a–3e probes were run through a temporary in-crate harness that calls
+`sealed::plan_composed_root` → `build_sealed_root_spec` → `construct_composed_root` in a forked
+child and then `execve`s `/bin/sh`, rather than through a live capsule's shell tool. The harness was
+deleted after the run. The reason is a **separate, pre-existing defect that is not specific to
+`sealed`**: `mur` calls `security::harden_process_dumpable()` at startup, so the seccomp-notify
+supervisor cannot read `/proc/<child>/mem`, `classify_and_decide` fail-closes, and every
+allowlisted `execve` is refused with `EACCES`. It reproduces identically at `--class scoped`
+(`escape-conformance --class scoped` refuses at preflight with the same message) and the
+`escape-conformance` runner on `main` already documents it. Because of it, no capsule on this host
+can run a shell tool at any class, so step 3 could not be driven the way this page describes.
+Consequence for the reader: the composed root itself is verified; what is *not* verified end-to-end
+here is that Landlock and seccomp behave correctly **inside** it, since the harness stops before
+those steps.
+
+**Step 4 — `trace.jsonl`: PASS.**
+
+```text
+"containment_declared":"sealed"
+"containment_achieved":"sealed"
+```
+
+Read from `~/sealed-check/workdir/.murmur/ses_019fc9e0643f7b218186aa07204443f6/trace.jsonl`, from a
+session launched under `systemd-run --user --scope --property=Delegate=yes`.
+
+**Step 5 — the container refusal: NOT RUN.** No container runtime is installed on this host
+(`command -v docker podman` finds nothing) and none could be installed. This is the one acceptance
+criterion on this page with no observed result; it must be run before the container path is treated
+as verified.
+
+**Step 6 — negative control: NOT RUN**, for the same reason step 3 needed a harness — `scoped`
+cannot execute a shell tool on this host either, so the `Permission denied`-vs-`No such file or
+directory` contrast could not be produced through a capsule. The contrast *was* observed in the
+other direction: the identical 3a probe list returns `No such file or directory` inside the composed
+root while the same paths exist and `stat` cleanly outside it.
+
+### What still needs a hand-run
+
+- Step 5, on a host with a container runtime.
+- Step 6, and the "Landlock and seccomp are still active inside the root" half of step 3, once the
+  `harden_process_dumpable` / seccomp-notify supervisor defect above is fixed. That defect is
+  pre-existing, affects every containment class, and is not this mechanism's to fix.
 
 Then replace the callout at the top of this page with the verdict. Until that edit lands, this page
 states an implemented mechanism and an **unverified** end-to-end result.
@@ -572,7 +678,10 @@ states an implemented mechanism and an **unverified** end-to-end result.
 These are known, deliberate gaps in what the composed root delivers. None of them is a defect to
 file; each is a scoping decision this slice made explicitly.
 
-- **No PID namespace.** See the warning under step 3e.
+- **No PID namespace, so `/proc` is a bind of the host's rather than a masked private `procfs`.**
+  This is the one place the composed root's "outside does not exist" promise degrades to `scoped`'s
+  "outside is denied". See the warning under step 3e for the kernel rule that forces it and for what
+  it costs.
 - **`/etc/passwd` and `/etc/group` are bind-mounted from the host**, so the host's account names are
   visible inside the root. They are world-readable on every distribution and `getpwuid(3)` needs
   them; synthesising a two-line pair in the parent is the obvious follow-up. See the doc comment on
