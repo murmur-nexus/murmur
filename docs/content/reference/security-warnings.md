@@ -259,6 +259,16 @@ completely. Two independent mechanisms now close this, and **neither is team-ver
    independent of Landlock and applies on **both** Linux tiers, including
    [Seccomp-only](#w-sec-002).
 
+**The forked child is deliberately left `ptrace`-able by same-UID processes.** In that same
+pre-`execve` window the child also re-enables its own `dumpable` flag, which the runtime process
+sets to `0` for itself and which `fork()` would otherwise have passed down. It has to: the
+seccomp-notify supervisor reads the child's `/proc/<pid>/mem` to recover each `execve` pathname, and
+a non-dumpable target refuses that read to any non-root reader — so without it, every allowlisted
+binary is denied for a non-root `mur run`. The consequence is that any other same-UID process on the
+host can attach to a running shell-tool subprocess and read its memory and environment for as long
+as it runs. The runtime process itself stays non-dumpable throughout. Full reasoning, and why the
+trade is accepted, in [Sandboxed Child Dumpability](child-dumpable-tradeoff.md).
+
 **Is `CAP_MKNOD` the only gate? Yes, for the device half.** `mknod(2)` for `S_IFBLK`/`S_IFCHR`
 always requires `CAP_MKNOD` in the caller's effective set, independently of Landlock. A genuinely
 non-root capsule — no ambient or inherited `CAP_MKNOD`, no `setcap`'d binary in its exec path —
