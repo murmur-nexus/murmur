@@ -2490,8 +2490,8 @@ mod linux_enforce {
     /// child's environment is the `shell::DEFAULT_ENV_BASELINE`-filtered subset plus explicit
     /// overrides that `shell::build_shell_env` produced, never the runtime's own raw environment.
     /// The runtime process itself stays non-dumpable for its entire life; nothing in this function
-    /// touches it. Recorded for the next reader in
-    /// `docs/content/reference/child-dumpable-tradeoff.md`.
+    /// touches it. The resulting exposure is stated in
+    /// `docs/content/reference/security-warnings.md`.
     ///
     /// **Fail-closed.** `PR_SET_DUMPABLE` with arg2 `1` is never refused for a well-formed call, so
     /// any error is unexpected: it aborts the spawn (via the diagnostic-pipe path in `pre_exec`)
