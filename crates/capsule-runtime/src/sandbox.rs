@@ -1735,8 +1735,9 @@ fn forced_prepare_failure() -> Result<(), String> {
     Ok(())
 }
 
-// Child-side (`pre_exec`) forced-failure seams, one per distinct setup step this slice can fail
-// independently: the explicit `no_new_privs` `prctl` and the Landlock ruleset construction.
+// Child-side (`pre_exec`) forced-failure seams, one per distinct setup step that can fail
+// independently: the explicit `no_new_privs` `prctl`, the `dumpable` restore `prctl`, and the
+// Landlock ruleset construction.
 // Unlike `FORCE_PREPARE_FAILURE` (which fails the *outer*, pre-fork `prepare_enforcement` path),
 // these are read from inside the forked child's `pre_exec` closure — `fork()` copy-on-write
 // duplicates the calling thread's TLS block, so a flag set `true` in the parent thread before
@@ -1746,6 +1747,8 @@ fn forced_prepare_failure() -> Result<(), String> {
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     pub(crate) static FORCE_NO_NEW_PRIVS_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    pub(crate) static FORCE_DUMPABLE_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     pub(crate) static FORCE_LANDLOCK_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -2217,6 +2220,24 @@ mod linux_enforce {
         // failure is its own distinct, fail-closed error path before any filter is installed.
         drop_all_capabilities()?;
 
+        // Last thing before the filter goes in, on every kernel tier: undo — for this child only —
+        // the `dumpable = 0` it inherited from the runtime process. Without it the seccomp-notify
+        // supervisor cannot read `/proc/<child>/mem`, every notified `execve` fails closed, and no
+        // allowlisted binary runs at all for a non-root user. See
+        // [`restore_child_dumpable`] for the full reasoning and the security trade it makes.
+        //
+        // Ordered here rather than at the top of this function for two reasons, both load-bearing:
+        //
+        // * `drop_all_capabilities` must come first. `commit_creds` resets a task's `dumpable` to
+        //   `/proc/sys/fs/suid_dumpable` whenever its permitted capability set shrinks, so a
+        //   root-uid capsule whose caps are dropped *after* this call would have the flag silently
+        //   reset out from under it (to `0` or `2` on a hardened host) and the defect would return
+        //   for exactly the hosts least likely to be testing for it.
+        // * Everything above narrows what an attacker could reach through the window this opens:
+        //   once the child is dumpable, any same-uid process can `ptrace`-attach it, so the
+        //   inherited fds are already CLOEXEC and the capabilities already gone by then.
+        restore_child_dumpable()?;
+
         install_seccomp_filter(child_sock_fd, unix_sockets_allowed)?;
 
         if tier == EnforcementTier::KernelFull {
@@ -2441,6 +2462,68 @@ mod linux_enforce {
         let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, enable, zero, zero, zero) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Re-enables `dumpable` for the forked shell-tool child, so the seccomp-notify supervisor
+    /// running back in the runtime process can read the child's `/proc/<pid>/mem`.
+    ///
+    /// **Why this is needed.** `main()` marks the runtime process non-dumpable
+    /// (`security::harden_process_dumpable`) to close the `/proc/<pid>/environ` side channel on
+    /// *its own* environment, which may still hold raw, unfiltered secrets. `fork()` copies the
+    /// `mm` flags, so the child starts non-dumpable too — and the kernel's `ptrace_may_access`
+    /// check (which gates every `/proc/<pid>/*` read) then refuses a non-root, non-`CAP_SYS_PTRACE`
+    /// reader even when it shares the target's uid and is the target's own parent. The supervisor
+    /// is exactly such a reader: `read_cstr_from_child` opens `/proc/<pid>/mem` to recover the
+    /// pathname of every notified `execve`, `classify_and_decide` fails closed to `Decision::Deny`
+    /// when that read fails, and the loop answers `-EACCES`. The net effect for a non-root user was
+    /// that *every* allowlisted `execve` was denied with a bare `Permission denied (os error 13)`,
+    /// on both kernel tiers and at every containment class.
+    ///
+    /// **What it costs, stated plainly.** For as long as this child lives, any same-uid process on
+    /// the host can `ptrace`-attach it and read its `/proc/<pid>/mem` and `/proc/<pid>/environ`, or
+    /// obtain a core dump of it where core dumps are enabled. That is the same side channel
+    /// `harden_process_dumpable` closes for the runtime process — deliberately reopened here, for
+    /// the child only, because the two processes hold different things: by the time this runs, the
+    /// child's environment is the `shell::DEFAULT_ENV_BASELINE`-filtered subset plus explicit
+    /// overrides that `shell::build_shell_env` produced, never the runtime's own raw environment.
+    /// The runtime process itself stays non-dumpable for its entire life; nothing in this function
+    /// touches it. The resulting exposure is stated in
+    /// `docs/content/reference/security-warnings.md`.
+    ///
+    /// **Fail-closed.** `PR_SET_DUMPABLE` with arg2 `1` is never refused for a well-formed call, so
+    /// any error is unexpected: it aborts the spawn (via the diagnostic-pipe path in `pre_exec`)
+    /// rather than continuing with a child whose every `execve` would be denied anyway. Same call
+    /// convention and lifetime distinction as [`set_no_new_privs`]: per-shell-subprocess, inside
+    /// `pre_exec`, not the once-at-`main()` whole-process hardening. The success path is a single
+    /// syscall and allocates nothing; the named message on the failure path does allocate, which is
+    /// the same trade the surrounding `pre_exec` error path already makes when it calls
+    /// `error.to_string()` before writing to the diagnostic pipe.
+    #[allow(unsafe_code)]
+    fn restore_child_dumpable() -> io::Result<()> {
+        #[cfg(test)]
+        if super::FORCE_DUMPABLE_FAILURE.with(|flag| flag.get()) {
+            return Err(io::Error::other(
+                "sandbox: restore child dumpable (prctl PR_SET_DUMPABLE, 1) failed (forced by test seam)",
+            ));
+        }
+        // Typed as `c_ulong` for the same reason as in `set_no_new_privs`: the upper 32 bits of an
+        // untyped literal are unspecified in a variadic call on aarch64, and the kernel requires
+        // arg3/4/5 to be exactly 0.
+        let enable: libc::c_ulong = 1;
+        let zero: libc::c_ulong = 0;
+
+        // SAFETY: `prctl(PR_SET_DUMPABLE, ...)` takes four integer arguments — no pointers and no
+        // borrowed memory are involved, and it is a single syscall, so it is safe in the
+        // post-`fork()`/pre-`execve()` window.
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, enable, zero, zero, zero) };
+        if rc != 0 {
+            return Err(io::Error::other(format!(
+                "sandbox: restore child dumpable (prctl PR_SET_DUMPABLE, 1) failed: {}",
+                io::Error::last_os_error()
+            )));
         }
 
         Ok(())
@@ -5131,6 +5214,21 @@ mod linux_integration_tests {
         }
     }
 
+    struct ForceDumpableFailureGuard;
+
+    impl ForceDumpableFailureGuard {
+        fn new() -> Self {
+            FORCE_DUMPABLE_FAILURE.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for ForceDumpableFailureGuard {
+        fn drop(&mut self) {
+            FORCE_DUMPABLE_FAILURE.with(|flag| flag.set(false));
+        }
+    }
+
     struct ForceLandlockFailureGuard;
 
     impl ForceLandlockFailureGuard {
@@ -5236,6 +5334,22 @@ mod linux_integration_tests {
         );
     }
 
+    /// The `dumpable` restore is what makes the notify supervisor able to read the child at all,
+    /// so a failure there must abort the spawn rather than leave a child whose every `execve`
+    /// would be denied — and it must say which step failed.
+    #[test]
+    fn pre_exec_dumpable_restore_failure_is_distinct_and_fails_closed() {
+        let error = child_setup_failure_error(ForceDumpableFailureGuard::new);
+        assert!(
+            error.contains("dumpable"),
+            "the error must name the dumpable-restore step specifically: {error}"
+        );
+        assert!(
+            !error.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {error}"
+        );
+    }
+
     #[test]
     fn pre_exec_landlock_failure_is_distinct_and_fails_closed() {
         let error = child_setup_failure_error(ForceLandlockFailureGuard::new);
@@ -5253,22 +5367,22 @@ mod linux_integration_tests {
     fn pre_exec_setup_failures_produce_pairwise_distinct_messages() {
         let workdir_msg = workdir_resolution_error();
         let no_new_privs_msg = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
+        let dumpable_msg = child_setup_failure_error(ForceDumpableFailureGuard::new);
         let landlock_msg = child_setup_failure_error(ForceLandlockFailureGuard::new);
 
-        assert_ne!(
-            workdir_msg, no_new_privs_msg,
-            "workdir vs no_new_privs must differ"
-        );
-        assert_ne!(
-            workdir_msg, landlock_msg,
-            "workdir vs landlock must differ"
-        );
-        assert_ne!(
-            no_new_privs_msg, landlock_msg,
-            "no_new_privs vs landlock must differ"
-        );
+        let messages = [
+            ("workdir", &workdir_msg),
+            ("no_new_privs", &no_new_privs_msg),
+            ("dumpable", &dumpable_msg),
+            ("landlock", &landlock_msg),
+        ];
+        for (i, (left_name, left)) in messages.iter().enumerate() {
+            for (right_name, right) in &messages[i + 1..] {
+                assert_ne!(left, right, "{left_name} vs {right_name} must differ");
+            }
+        }
 
-        for message in [&workdir_msg, &no_new_privs_msg, &landlock_msg] {
+        for message in [&workdir_msg, &no_new_privs_msg, &dumpable_msg, &landlock_msg] {
             assert!(!message.is_empty(), "a distinct message must not be empty");
             assert!(
                 !message.contains("os error 22"),

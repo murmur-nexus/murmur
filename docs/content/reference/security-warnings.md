@@ -259,6 +259,10 @@ completely. Two independent mechanisms now close this, and **neither is team-ver
    independent of Landlock and applies on **both** Linux tiers, including
    [Seccomp-only](#w-sec-002).
 
+**The forked child is deliberately left `ptrace`-able by same-UID processes.** Any other process
+running as the same user can attach to a running shell-tool subprocess and read its memory and
+environment for as long as it runs. The runtime process itself stays non-dumpable throughout.
+
 **Is `CAP_MKNOD` the only gate? Yes, for the device half.** `mknod(2)` for `S_IFBLK`/`S_IFCHR`
 always requires `CAP_MKNOD` in the caller's effective set, independently of Landlock. A genuinely
 non-root capsule — no ambient or inherited `CAP_MKNOD`, no `setcap`'d binary in its exec path —

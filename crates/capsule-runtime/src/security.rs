@@ -7,6 +7,18 @@
 //! control. Marking the runtime process non-dumpable closes that channel: the kernel's
 //! `ptrace_may_access` check (which gates `/proc/pid/environ` reads) fails for a
 //! non-dumpable target even when the reader shares the same UID.
+//!
+//! **Scope: this process, not its descendants.** The flag is inherited across `fork()`, but the
+//! forked shell-tool child deliberately undoes it for itself
+//! (`sandbox::linux_enforce::restore_child_dumpable`, inside `pre_exec`, before the seccomp filter
+//! is installed). It has to: the same `ptrace_may_access` check that closes this side channel also
+//! blocks the seccomp-notify supervisor thread — which lives in *this* process — from reading the
+//! child's `/proc/<pid>/mem` to recover the pathname of a notified `execve`, so every allowlisted
+//! `execve` was denied for a non-root user until the child re-enabled its own flag. The
+//! asymmetry is the point: this process may hold raw, unfiltered secrets in its environment, while
+//! the child's environment is already reduced to `shell::DEFAULT_ENV_BASELINE` plus explicit
+//! overrides by `shell::build_shell_env` before it is spawned. The resulting exposure is stated
+//! in `docs/content/reference/security-warnings.md`.
 
 /// Marks the current process non-dumpable so no same-UID process — including its own
 /// shell descendants — can read this process's `/proc/<pid>/environ`.
@@ -15,6 +27,10 @@
 /// crate and can reach `execute_shell`, before any argument parsing or subprocess-capable
 /// code runs. A future binary that links `capsule-runtime` and reaches `execute_shell`
 /// inherits the same obligation.
+///
+/// Covers this process for its entire life and nothing else. The spawned shell-tool child
+/// re-enables its own flag from `pre_exec` — see this module's header for why that is required
+/// and what it trades away.
 ///
 /// No-op on non-Linux targets: `/proc/<pid>/environ` and `prctl(2)` don't exist there,
 /// so there is no side channel to close.
