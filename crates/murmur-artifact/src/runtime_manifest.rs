@@ -662,11 +662,13 @@ pub enum ContainmentClass {
     /// filesystem: every path outside the workdir must be an explicit manifest grant.
     /// Requires Linux 5.13+ with a usable Landlock ABI.
     Scoped,
-    /// A private filesystem root: mount-namespace + `pivot_root` isolation, so the host
-    /// filesystem is not merely mediated but absent. **No host can provide this today** —
-    /// the mechanism does not exist in this runtime (`sandbox::SECCOMP_MUST_STAY_DENIED`
-    /// actively denies `pivot_root`/`mount`/`unshare` to every subprocess). Declaring it
-    /// refuses to launch everywhere until a future slice implements the mechanism.
+    /// A private filesystem root: mount-namespace + `pivot_root` isolation onto a composed
+    /// root, so the host filesystem is not merely mediated but absent. Achievable on an
+    /// uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces,
+    /// and — where AppArmor's `restrict_unprivileged_userns` is active — the shipped
+    /// `mur-sealed` profile loaded. A host that cannot back it refuses the launch with a
+    /// mechanism-specific reason rather than silently degrading to `Scoped` or `Advisory`.
+    /// See `docs/content/reference/sealed-containment-manual-verification.md`.
     Sealed,
 }
 

@@ -1,14 +1,19 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-03, partial.** Steps 1–4 pass on a real host; step 5 (container) was not run."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run."
 
-    Steps 0–4 were executed on a bare Ubuntu host on 2026-08-03 and every expected result on this
-    page was observed. Step 5 (the container refusal) was **not** run — no container runtime is
-    installed on that host — and step 3's probes were driven through a hand-run harness rather than
-    through a live capsule, because a *separate, pre-existing* defect blocks shell tools under
-    `mur run` at **every** class. Both are recorded verbatim, with their exact evidence, in
-    [Recording the result](#recording-the-result). Read that section before treating this page as a
-    clean pass.
+    Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
+    live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
+    expected result on this page was observed — including the negative control (step 6), which was
+    not previously reproducible. The `harden_process_dumpable`/seccomp-notify defect that forced the
+    2026-08-03 run to fall back to a hand-run harness for step 3 has since been fixed
+    (`security::harden_process_dumpable` / `sandbox::linux_enforce::restore_child_dumpable`); step 3
+    is therefore now also confirmed end to end, including Landlock and seccomp running correctly
+    **inside** the composed root, which the harness-driven run could not observe. Step 5 (the
+    container refusal) is still **not** run — no container runtime is installed on this host — and
+    remains the one acceptance criterion on this page with no observed result. Recorded verbatim,
+    with exact evidence, in [Recording the result](#recording-the-result). Read that section before
+    treating this page as a clean pass.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
@@ -596,6 +601,57 @@ claims and the result must not be recorded as a pass.
 
 ## Recording the result
 
+### Run of 2026-08-05 — steps 1–4 and 6 pass through a live capsule, step 5 not run
+
+**Host.** Same machine as the 2026-08-03 run: `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP`,
+Ubuntu 24.04, no container runtime, non-root (`uid=1000`). Profile reloaded and verified
+byte-identical to `packaging/apparmor/mur-sealed` before relying on it.
+
+**Step 1 — PASS**, reproduced live: profile unloaded, restriction on → `error[E-CAP-003]`,
+`achieved: 'scoped'`, naming the profile and the exact remediation, no workdir created. Host
+restored (`kernel.apparmor_restrict_unprivileged_userns=0`, profile reloaded) immediately after.
+
+**Step 2 — PASS**, reproduced live via `mur run --explain-scope`.
+
+**Step 3 — PASS, driven through a real, live capsule session (not a harness).** A capsule
+declaring `containment: sealed` with `shell.allow: [bash, ls, cat, stat, readlink]`, launched
+under `systemd-run --user --scope --property=Delegate=yes`, with the `claude` CLI as
+`inference.command`, issued real `bash` tool calls. Observed, byte for byte:
+
+- `cat /etc/shadow` → `No such file or directory`.
+- The full 3a target list (`/etc/shadow`, `/root`, `/var/run/docker.sock`, `/run/docker.sock`,
+  `/dev/sda`, `/dev/nvme0n1`, `/etc/sudoers`, `/etc/ssh`) → `stat` reports every one absent
+  (`cannot statx ...: No such file or directory`); `/home` alone reports present, which is the
+  documented workdir-scaffold exception.
+- `echo hi > /usr/testfile` → `Read-only file system`; `echo hi > "$PWD/canary.txt"` → succeeds,
+  and the byte written is visible at the same path on the host (the bind-mount identity holds).
+- `ls /` and `ls /etc` → `Permission denied` (Landlock denying `ReadDir` on paths outside the
+  workdir and outside any derived exec grant) — a stricter outcome than a bare "absent" claim
+  requires, and direct, live evidence that Landlock is still mediating access **inside** the
+  composed root, not just at the mount-namespace boundary. This closes the one gap the
+  2026-08-03 run left open (the harness stopped before Landlock/seccomp installed).
+- One environmental note for future runs on a busy host: `capabilities.resources.max_processes`
+  (default 128 headroom) is computed against a *process* count, not the uid's total *thread*
+  count; on a host running many multi-threaded processes under the same uid, `RLIMIT_NPROC` can
+  land below the uid's actual task count and every `fork()` inside the sandbox fails with
+  `bash: fork: retry: Resource temporarily unavailable` — reproduced identically at `scoped`, so
+  it is unrelated to the composed root. Declaring a larger `max_processes` in the test manifest
+  works around it. This is pre-existing (`resources::uid_process_count`, untouched by this
+  slice) and out of scope here; flagged for a follow-up.
+
+**Step 4 — PASS**, reproduced live: `trace.jsonl`'s `session_start` carries
+`"containment_declared":"sealed"` / `"containment_achieved":"sealed"`.
+
+**Step 5 — still NOT RUN.** No container runtime is installed on this host and none could be
+installed. Still the one acceptance criterion on this page with no observed result.
+
+**Step 6 — PASS, reproduced live for the first time.** A second capsule declaring
+`containment: scoped` (otherwise identical), run through the same live shell-tool path:
+`cat /etc/shadow` → `Permission denied`; `stat /etc/shadow` → succeeds, with real metadata
+(`size=1338 mode=100640 uid=0`). This is the exact contrast step 6 requires — `sealed` reports
+absence, `scoped` reports permission-denied-on-a-visible-file — and it had not been produced
+through a live capsule before this run.
+
 ### Run of 2026-08-03 — steps 1–4 pass, step 5 not run, step 3 driven by a harness
 
 **Host.** `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC x86_64`, Ubuntu 24.04,
@@ -665,13 +721,8 @@ root while the same paths exist and `stat` cleanly outside it.
 
 ### What still needs a hand-run
 
-- Step 5, on a host with a container runtime.
-- Step 6, and the "Landlock and seccomp are still active inside the root" half of step 3, once the
-  `harden_process_dumpable` / seccomp-notify supervisor defect above is fixed. That defect is
-  pre-existing, affects every containment class, and is not this mechanism's to fix.
-
-Then replace the callout at the top of this page with the verdict. Until that edit lands, this page
-states an implemented mechanism and an **unverified** end-to-end result.
+- Step 5, on a host with a container runtime. This is the only remaining gap; every other step has
+  now been run end to end through a live capsule's shell tool (see the 2026-08-05 run above).
 
 ## Residuals recorded here rather than buried
 

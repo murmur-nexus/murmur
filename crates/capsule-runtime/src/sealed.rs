@@ -871,6 +871,7 @@ mod linux {
         // every host, so reading them after the unshare made the probe fail everywhere and
         // report the host as the culprit. This is the one ordering in this function that is
         // load-bearing.
+        // SAFETY: getuid/getgid take no arguments, dereference nothing and cannot fail.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
 

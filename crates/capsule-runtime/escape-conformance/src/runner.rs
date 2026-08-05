@@ -168,11 +168,19 @@ fn tight_resources_yaml() -> &'static str {
 }
 
 /// The manifest one case runs under.
-fn manifest_yaml(case: &Case, config: &RunnerConfig) -> String {
+///
+/// Declares `capabilities.containment: <class>` explicitly. Without this, every case would run at
+/// the manifest default (`advisory`), and on a `sealed`-capable host `applied_tier` would still
+/// install `KernelFull` (Landlock+seccomp, `scoped`'s mechanism) — never the composed root — no
+/// matter what `--class` was passed to this binary. The banner and grading table would say
+/// `sealed` while every probe actually ran under `scoped`, which is exactly the "false assurance"
+/// this harness exists to prevent (see `lib.rs`'s module docs).
+fn manifest_yaml(case: &Case, config: &RunnerConfig, class: murmur_artifact::ContainmentClass) -> String {
     let mut yaml = String::new();
     yaml.push_str(&format!("name: escape-conformance-{}\n", case.id));
     yaml.push_str("version: 0.0.1\n\n");
     yaml.push_str("capabilities:\n");
+    yaml.push_str(&format!("  containment: {class}\n"));
     yaml.push_str("  shell:\n");
     // `bash` is allowlisted so `exec-renamed-disallowed-binary` has an allowlisted basename to
     // wear; `python3` is what every probe actually runs as.
@@ -201,7 +209,11 @@ fn manifest_yaml(case: &Case, config: &RunnerConfig) -> String {
 }
 
 /// Stages one case's directory and returns `(case_dir, capsule_workdir, manifest_path)`.
-fn stage(case: &Case, config: &RunnerConfig) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
+fn stage(
+    case: &Case,
+    config: &RunnerConfig,
+    class: murmur_artifact::ContainmentClass,
+) -> io::Result<(PathBuf, PathBuf, PathBuf)> {
     let case_dir = config.work_root.join(case.id);
     let workdir = case_dir.join("wd");
     fs::create_dir_all(&workdir)?;
@@ -214,7 +226,7 @@ fn stage(case: &Case, config: &RunnerConfig) -> io::Result<(PathBuf, PathBuf, Pa
         )?;
     }
     let manifest = case_dir.join("murmur.yaml");
-    fs::write(&manifest, manifest_yaml(case, config))?;
+    fs::write(&manifest, manifest_yaml(case, config, class))?;
 
     match case.prepare {
         Prepare::None | Prepare::LeakFdIntoMur { .. } => {}
@@ -492,7 +504,7 @@ pub fn run_case(
 ) -> CaseOutcome {
     let expectation = case.expectation(class);
 
-    let (case_dir, workdir, manifest) = match stage(case, config) {
+    let (case_dir, workdir, manifest) = match stage(case, config, class) {
         Ok(paths) => paths,
         Err(err) => {
             return CaseOutcome {
@@ -680,7 +692,7 @@ mod tests {
     #[test]
     fn boundary_manifest_has_no_resource_block_and_declares_no_network() {
         let case = cases::find("read-etc-shadow").unwrap();
-        let yaml = manifest_yaml(case, &config());
+        let yaml = manifest_yaml(case, &config(), murmur_artifact::ContainmentClass::Scoped);
         assert!(yaml.contains("allow:\n      - bash\n      - python3"));
         assert!(!yaml.contains("resources:"));
         // Nothing may be declared network-reachable, or the four network cases assert nothing.
@@ -689,9 +701,23 @@ mod tests {
     }
 
     #[test]
+    fn manifest_declares_the_containment_class_under_test() {
+        let case = cases::find("read-etc-shadow").unwrap();
+        for class in murmur_artifact::ContainmentClass::ALL {
+            let yaml = manifest_yaml(case, &config(), class);
+            assert!(
+                yaml.contains(&format!("containment: {class}\n")),
+                "manifest for class {class} must declare it, or applied_tier never installs \
+                 that class's mechanism and the case's verdict is measuring the wrong class \
+                 entirely: {yaml}"
+            );
+        }
+    }
+
+    #[test]
     fn resource_manifest_carries_the_tight_ceilings() {
         let case = cases::find("resource-fork-bomb").unwrap();
-        let yaml = manifest_yaml(case, &config());
+        let yaml = manifest_yaml(case, &config(), murmur_artifact::ContainmentClass::Scoped);
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
         // 64, not the manual-verification document's 16: below roughly 64 the seccomp filter

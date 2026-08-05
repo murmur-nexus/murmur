@@ -187,25 +187,48 @@ on_path() {
 
 # ---------------------------------------------------------------- checksum
 
-# verify_checksum <file> <asset_name> <checksums_file>
+# verify_checksum <file> <asset_name> <checksums_file> [soft]
+#
+# Dies on any failure by default — the main `mur` binary must never be installed
+# unverified. Pass "soft" for an optional asset (the AppArmor profile) whose own
+# doc comment promises it never aborts the install: with "soft", a bad checksum
+# warns and returns 1 instead of calling `die`, so a corrupt or tampered profile
+# download costs one containment class, not the whole run.
 verify_checksum() {
     file="$1"
     asset="$2"
     sums="$3"
+    soft="${4:-}"
 
     expected="$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$sums")"
-    [ -n "$expected" ] ||
+    if [ -z "$expected" ]; then
+        if [ "$soft" = "soft" ]; then
+            warn "no checksum for ${asset} in ${CHECKSUMS_FILE} — not installing an unverified file."
+            return 1
+        fi
         die "no checksum for ${asset} in ${CHECKSUMS_FILE} — refusing to install an unverified binary."
+    fi
 
     if command -v sha256sum >/dev/null 2>&1; then
         actual="$(sha256sum "$file" | awk '{print $1}')"
     elif command -v shasum >/dev/null 2>&1; then
         actual="$(shasum -a 256 "$file" | awk '{print $1}')"
     else
+        if [ "$soft" = "soft" ]; then
+            warn "need sha256sum or shasum to verify ${asset}, found neither — not installing an unverified file."
+            return 1
+        fi
         die "need sha256sum or shasum to verify the download, found neither."
     fi
 
     if [ "$actual" != "$expected" ]; then
+        if [ "$soft" = "soft" ]; then
+            warn "checksum mismatch for ${asset}
+  expected: ${expected}
+  actual:   ${actual}
+The download may be corrupt or tampered with. Not installed."
+            return 1
+        fi
         die "checksum mismatch for ${asset}
   expected: ${expected}
   actual:   ${actual}
@@ -256,8 +279,14 @@ ${manual}"
         if download "${base_url}/${asset_name}" "${TMPDIR_INSTALL}/${asset_name}" 2>/dev/null; then
             if awk -v name="$asset_name" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
                 "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"; then
-                verify_checksum "${TMPDIR_INSTALL}/${asset_name}" "$asset_name" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"
-                profile_src="${TMPDIR_INSTALL}/${asset_name}"
+                if verify_checksum "${TMPDIR_INSTALL}/${asset_name}" "$asset_name" \
+                    "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}" soft; then
+                    profile_src="${TMPDIR_INSTALL}/${asset_name}"
+                else
+                    warn "mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+${manual}"
+                    return 0
+                fi
             else
                 warn "the ${APPARMOR_PROFILE_NAME} AppArmor profile is not listed in ${CHECKSUMS_FILE} for this release, so it was not installed — this script does not write unverified files into ${APPARMOR_PROFILE_DIR}.
 mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
