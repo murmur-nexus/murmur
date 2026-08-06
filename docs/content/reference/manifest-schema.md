@@ -360,9 +360,15 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
-| `capabilities.resources.workdir_max_bytes` | integer | no | ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. |
+| `capabilities.resources.workdir_max_bytes` | integer | no | ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp` — see the note below. |
 | `capabilities.containment` | string | no | minimum containment class this capsule requires: `advisory`, `scoped`, or `sealed` (ascending strength). Omitted means the capsule states no requirement — see [Containment class](#field-containment) below. Only meaningful capsule-wide; declaring it on a per-artifact (tool/driver/hook) entry has no effect and warns at staging |
 | `network.internal_port` | integer | no | Capsule-declared internal service port. The local runtime currently binds an OS-assigned external localhost port for `MURMUR_CAPSULE_URL`; when omitted, the intended internal default is `14159`. |
+
+Under the [`sealed` containment class](#field-containment), `/tmp` inside the composed root is
+writable, and it is backed by a directory *inside* the session workdir. Writes to `/tmp` therefore
+count against `capabilities.resources.workdir_max_bytes` like any other workdir write, and are
+discarded when the session ends — a `sealed` capsule cannot use `/tmp` to escape its workdir ceiling
+or to leave anything behind on the host.
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the kernel-level (Landlock/seccomp) enforcement set used for `capabilities.shell.allow` subprocesses. This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
 
@@ -378,7 +384,7 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 |---|---|
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and a `/proc` (masked with `hidepid` where the kernel allows it; see the note below). Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification — sealed containment](sealed-containment-manual-verification.md). |
+| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and a `/proc` (masked with `hidepid` where the kernel allows it; see the note below). Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification](verification.md) for how this class is checked by hand against a real host. |
 
 !!! note "`sealed`'s one documented exception: `/proc`"
 
@@ -926,7 +932,7 @@ error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.resou
 refuses to launch with `E-RUN-012` when the host cannot delegate a cgroup — running that tree
 with no aggregate ceiling is worse than not running it. This requires systemd user delegation
 (`Delegate=yes` for `memory pids cpu io` on the unit `mur` runs under); see
-[Resource limits: manual verification](resource-limits-manual-verification.md). A capsule that
+[Verification](verification.md) for how these bounds are checked by hand. A capsule that
 declares no subprocess capability at all is never blocked — there is no process tree to bound.
 On macOS (and any non-Linux host) cgroups cannot exist, so the launch always proceeds with
 rlimits only and `W-SEC-010` documents the residual gap: no aggregate bound, and — because macOS
