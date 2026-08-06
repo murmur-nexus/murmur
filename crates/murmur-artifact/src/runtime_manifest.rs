@@ -535,6 +535,12 @@ pub struct ShellCapabilities {
     /// This can only ever name specific directories with an explicit per-directory
     /// enumerability flag — it has no field that expands a whole install prefix.
     pub interpreter_runtime: Vec<InterpreterRuntimeGrant>,
+    /// Typed staged-runtime grants that name a pinned host runtime tree to bind-mount read-only
+    /// into a `sealed` capsule's composed root. Empty unless the manifest declares
+    /// `capabilities.shell.staged_runtime`. Mutually exclusive with [`Self::interpreter_runtime`]
+    /// per binary: staging the tree *into* the root is what makes widening Landlock *out to* the
+    /// host unnecessary, so declaring both for one binary is a contradiction, not a layering.
+    pub staged_runtime: Vec<StagedRuntimeGrant>,
 }
 
 /// One `capabilities.shell.interpreter_runtime` entry: an already-allowlisted binary plus the
@@ -562,6 +568,39 @@ pub struct InterpreterRuntimeDir {
     /// `Execute + ReadFile` only — files inside can still be opened by exact name, but the
     /// directory itself cannot be listed. Never inferred: the author must write it explicitly.
     pub list_dir: bool,
+}
+
+/// One `capabilities.shell.staged_runtime` entry: an already-allowlisted binary, the absolute host
+/// path of a pinned runtime tree that already exists on the launch host, and the `pin` string
+/// identifying which build that tree is.
+///
+/// The mechanism this describes is the inverse of [`InterpreterRuntimeGrant`]. That one widens a
+/// capsule's Landlock scope *outwards* so an interpreter can reach its stdlib where the host
+/// happens to keep it — which couples the capsule to one host's directory layout and is why it
+/// fires `W-SEC-009`. This one moves the tree *inwards*: the composed root of a `sealed` capsule
+/// carries the runtime at the same absolute path, bind-mounted read-only, so nothing outside the
+/// root has to stay reachable. Declaring it therefore requires an effective `sealed` floor — there
+/// is no composed root to stage into below that — and it is refused alongside an
+/// `interpreter_runtime` grant for the same binary.
+///
+/// `source_path` is deliberately a path to an *already-pinned tree* (a vendored toolchain
+/// directory, a baked-in conda env), never a bare install prefix guessed at random: the runtime
+/// does not resolve, discover or version-sniff it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedRuntimeGrant {
+    /// A binary that MUST already appear in this same block's `allow`. Like
+    /// [`InterpreterRuntimeGrant::binary`], this mechanism never itself grants exec — it only says
+    /// where the runtime behind an existing exec grant comes from.
+    pub binary: String,
+    /// Absolute host path of the runtime tree to stage. Bind-mounted read-only at this same
+    /// absolute path inside the composed root, so `sys.prefix`, shebangs and anything a previous
+    /// turn recorded keep resolving.
+    pub source_path: String,
+    /// Non-empty, explicit identifier of *which build* the tree at `source_path` is. Never
+    /// inferred from the tree's contents: it exists so a human can compare the declared pin across
+    /// two hosts and confirm the same interpreter build shipped to both. The runtime treats it as
+    /// an opaque string and does not parse it.
+    pub pin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -978,6 +1017,8 @@ struct RawShellCapabilities {
     baseline_env: Option<Vec<String>>,
     #[serde(default)]
     interpreter_runtime: Vec<RawInterpreterRuntimeGrant>,
+    #[serde(default)]
+    staged_runtime: Vec<RawStagedRuntimeGrant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -997,6 +1038,19 @@ struct RawInterpreterRuntimeDir {
     // inferred.
     #[serde(default)]
     list_dir: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStagedRuntimeGrant {
+    #[serde(default)]
+    binary: Option<String>,
+    #[serde(default)]
+    source_path: Option<String>,
+    // `Option` so an omitted `pin` reaches `parse_staged_runtime` and is rejected there with a
+    // field-naming message, rather than defaulting to an empty string that would silently mean
+    // "unpinned" — the one thing this field exists to make impossible.
+    #[serde(default)]
+    pin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1310,12 +1364,20 @@ fn parse_capabilities(
 
             let interpreter_runtime =
                 parse_interpreter_runtime(&raw_shell.allow, raw_shell.interpreter_runtime)?;
+            // Parsed after `interpreter_runtime` because the mutual-exclusion rule needs the
+            // already-validated grant list to test against.
+            let staged_runtime = parse_staged_runtime(
+                &raw_shell.allow,
+                &interpreter_runtime,
+                raw_shell.staged_runtime,
+            )?;
 
             Ok(ShellCapabilities {
                 allow: raw_shell.allow,
                 strip_env: raw_shell.strip_env,
                 baseline_env: raw_shell.baseline_env,
                 interpreter_runtime,
+                staged_runtime,
             })
         })
         .transpose()?;
@@ -1437,6 +1499,109 @@ fn parse_interpreter_runtime(
         }
 
         grants.push(InterpreterRuntimeGrant { binary, dirs });
+    }
+
+    Ok(grants)
+}
+
+/// Lower and validate `capabilities.shell.staged_runtime`, given this same block's `allow` list
+/// and its already-validated `interpreter_runtime` grants. Every rejection is a
+/// [`RuntimeManifestError::InvalidCapabilities`] naming the offending field, matching
+/// [`parse_interpreter_runtime`] and the rest of this file.
+///
+/// Four rules, each of them a thing that would otherwise be silently wrong at launch rather than
+/// loudly wrong here:
+///
+///   1. `binary` must already be in `allow` — staging a runtime tree never itself grants exec.
+///   2. `binary` must not also carry an `interpreter_runtime` grant — the two are alternatives,
+///      and declaring both means the author expects a host-widening grant that a composed root
+///      makes both unnecessary and (once Landlock re-installs inside the root) meaningless.
+///   3. `source_path` must be absolute — it is a host path outside the workdir, resolved by the
+///      launch host and not relative to anything the runtime knows.
+///   4. `pin` must be present and non-empty — it is the value a human compares across two hosts,
+///      so an absent one defeats the field's only purpose.
+///
+/// Nothing here touches the filesystem: whether `source_path` exists on *this* host is a launch
+/// -time fact, not a manifest-validity one, and a manifest must stay parseable on a machine that
+/// will never run it (`mur build` on a laptop for a Linux fleet).
+fn parse_staged_runtime(
+    allow: &[String],
+    interpreter_runtime: &[InterpreterRuntimeGrant],
+    raw_grants: Vec<RawStagedRuntimeGrant>,
+) -> Result<Vec<StagedRuntimeGrant>, RuntimeManifestError> {
+    let mut grants = Vec::with_capacity(raw_grants.len());
+    for (index, raw_grant) in raw_grants.into_iter().enumerate() {
+        let base = format!("capabilities.shell.staged_runtime[{index}]");
+
+        let binary = raw_grant
+            .binary
+            .filter(|b| !b.trim().is_empty())
+            .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.binary"),
+                message: "must name a binary".to_string(),
+            })?;
+
+        if !allow.contains(&binary) {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.binary"),
+                message: format!(
+                    "'{binary}' is not in capabilities.shell.allow — staged_runtime can only \
+                     stage the runtime tree behind an already-allowlisted binary, never grant exec"
+                ),
+            });
+        }
+
+        if interpreter_runtime
+            .iter()
+            .any(|grant| grant.binary == binary)
+        {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.binary"),
+                message: format!(
+                    "'{binary}' also has a capabilities.shell.interpreter_runtime grant — the two \
+                     are mutually exclusive per binary: staged_runtime bind-mounts the runtime \
+                     tree into the capsule's own root, which is what makes widening the capsule's \
+                     host filesystem scope unnecessary rather than something to add to it. Remove \
+                     the interpreter_runtime grant for '{binary}'"
+                ),
+            });
+        }
+
+        let source_path = raw_grant
+            .source_path
+            .filter(|p| !p.trim().is_empty())
+            .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.source_path"),
+                message: "must name the host directory holding the pinned runtime tree".to_string(),
+            })?;
+        if !source_path.starts_with('/') {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.source_path"),
+                message: format!(
+                    "'{source_path}' must be an absolute host path (start with '/') — \
+                     staged-runtime sources are host filesystem paths outside the workdir"
+                ),
+            });
+        }
+
+        let pin = raw_grant
+            .pin
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                field: format!("{base}.pin"),
+                message: format!(
+                    "'{source_path}' must declare a non-empty pin identifying which build this \
+                     tree is — it is never inferred, because it is the value a human compares \
+                     across two hosts to confirm the same runtime shipped to both"
+                ),
+            })?;
+
+        grants.push(StagedRuntimeGrant {
+            binary,
+            source_path,
+            pin,
+        });
     }
 
     Ok(grants)
@@ -2580,6 +2745,135 @@ capabilities:
             "{msg}"
         );
         assert!(msg.contains("at least one"), "{msg}");
+    }
+
+    #[test]
+    fn staged_runtime_parses_accepted_shape() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  containment: sealed
+  shell:
+    allow:
+      - python3
+      - bash
+    staged_runtime:
+      - binary: python3
+        source_path: /opt/testbed/conda/envs/django__django
+        pin: conda-4.10.3/python-3.9.19/testbed-2024-05-01
+"#,
+        )
+        .unwrap();
+
+        let shell = manifest.capabilities.unwrap().shell.unwrap();
+        assert_eq!(
+            shell.staged_runtime,
+            vec![StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/testbed/conda/envs/django__django".to_string(),
+                pin: "conda-4.10.3/python-3.9.19/testbed-2024-05-01".to_string(),
+            }]
+        );
+        // The two mechanisms are alternatives, so an accepted `staged_runtime` grant leaves the
+        // interpreter_runtime list untouched rather than populating it as a side effect.
+        assert!(shell.interpreter_runtime.is_empty());
+    }
+
+    #[test]
+    fn staged_runtime_defaults_to_empty_when_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - python3
+"#,
+        )
+        .unwrap();
+
+        let shell = manifest.capabilities.unwrap().shell.unwrap();
+        assert!(shell.staged_runtime.is_empty());
+    }
+
+    /// Shared helper: parse a manifest whose sole `staged_runtime` grant is `grant_yaml` (indented
+    /// to sit under `staged_runtime:`), returning the error message. `extra` is spliced into the
+    /// same `shell` block, which is how the mutual-exclusion case adds an `interpreter_runtime`.
+    fn staged_runtime_reject(grant_yaml: &str, extra: &str) -> String {
+        let yaml = format!(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - python3
+{extra}    staged_runtime:
+{grant_yaml}
+"#,
+        );
+        RuntimeManifest::from_yaml_str(&yaml)
+            .expect_err("grant should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn staged_runtime_rejects_binary_not_in_allow() {
+        let msg = staged_runtime_reject(
+            "      - binary: ruby\n        source_path: /opt/ruby\n        pin: ruby-3.2.2\n",
+            "",
+        );
+        assert!(msg.contains("capabilities.shell.staged_runtime[0].binary"), "{msg}");
+        assert!(msg.contains("ruby"), "{msg}");
+        assert!(msg.contains("capabilities.shell.allow"), "{msg}");
+    }
+
+    #[test]
+    fn staged_runtime_rejects_binary_also_in_interpreter_runtime() {
+        let msg = staged_runtime_reject(
+            "      - binary: python3\n        source_path: /opt/py\n        pin: cpython-3.9.19\n",
+            "    interpreter_runtime:\n      - binary: python3\n        dirs:\n          - path: /usr/lib/python3.9\n            list_dir: true\n",
+        );
+        assert!(msg.contains("capabilities.shell.staged_runtime[0].binary"), "{msg}");
+        assert!(msg.contains("python3"), "{msg}");
+        assert!(msg.contains("interpreter_runtime"), "{msg}");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+    }
+
+    #[test]
+    fn staged_runtime_rejects_relative_source_path() {
+        let msg = staged_runtime_reject(
+            "      - binary: python3\n        source_path: opt/testbed/conda\n        pin: cpython-3.9.19\n",
+            "",
+        );
+        assert!(
+            msg.contains("capabilities.shell.staged_runtime[0].source_path"),
+            "{msg}"
+        );
+        assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    #[test]
+    fn staged_runtime_rejects_missing_or_empty_pin() {
+        // Omitted entirely, and present-but-blank: both are "unpinned", and the field exists
+        // precisely so that state is unrepresentable.
+        for grant in [
+            "      - binary: python3\n        source_path: /opt/testbed/conda\n",
+            "      - binary: python3\n        source_path: /opt/testbed/conda\n        pin: \"   \"\n",
+        ] {
+            let msg = staged_runtime_reject(grant, "");
+            assert!(
+                msg.contains("capabilities.shell.staged_runtime[0].pin"),
+                "{msg}"
+            );
+            assert!(msg.contains("never inferred"), "{msg}");
+        }
     }
 
     #[test]

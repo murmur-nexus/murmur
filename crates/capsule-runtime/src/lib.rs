@@ -24,6 +24,7 @@ pub mod runtime;
 pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
+pub mod staged_runtime;
 pub(crate) mod shell;
 pub(crate) mod streaming;
 pub(crate) mod trace;
@@ -39,6 +40,7 @@ pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 pub use resources::HostResourceLimits;
 pub use runtime::{launch_session, stage_session, warn_on_interpreter_runtime_grants};
+pub use staged_runtime::check_staged_runtime_floor;
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, StageRequest,

@@ -110,6 +110,15 @@ pub struct CapabilityPolicy {
     /// unless the manifest declares them. Consumed on `KernelFull` to add narrow Landlock
     /// grants (see `sandbox::resolve_interpreter_runtime_grants`) and to fire `W-SEC-009`.
     pub shell_interpreter_runtime: Vec<murmur_artifact::InterpreterRuntimeGrant>,
+    /// Typed staged-runtime grants from `capabilities.shell.staged_runtime`: each names an
+    /// already-allowlisted binary, the absolute host path of a pinned runtime tree, and the `pin`
+    /// identifying that tree's build. Empty unless the manifest declares them.
+    ///
+    /// Consumed at staging to enforce that declaring one requires an effective `sealed` floor (see
+    /// `crate::staged_runtime::check_staged_runtime_floor`) and to render the `staged runtime`
+    /// section of `--explain-scope`. Per-binary mutually exclusive with
+    /// [`Self::shell_interpreter_runtime`], which the manifest parser already guarantees.
+    pub shell_staged_runtime: Vec<murmur_artifact::StagedRuntimeGrant>,
     /// Host env var names a WASM guest may observe, from `capabilities.env.allow`. Empty by
     /// default: a guest sees only the runtime's own `MURMUR_*` injection unless the manifest
     /// names a variable here. `shell_strip_env` and the credential patterns still apply on
@@ -309,6 +318,10 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.shell.as_ref())
         .map(|shell| shell.interpreter_runtime.clone())
         .unwrap_or_default();
+    let shell_staged_runtime = caps
+        .and_then(|c| c.shell.as_ref())
+        .map(|shell| shell.staged_runtime.clone())
+        .unwrap_or_default();
 
     let spawn_allow = caps
         .and_then(|c| c.spawn.as_ref())
@@ -333,6 +346,7 @@ pub fn capability_policy_from_runtime_manifest(
         shell_strip_env,
         shell_baseline_env,
         shell_interpreter_runtime,
+        shell_staged_runtime,
         env_allow,
         limits,
         resources,
@@ -350,6 +364,59 @@ mod tests {
         let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
             .expect("manifest fixture must parse");
         capability_policy_from_runtime_manifest(&manifest)
+    }
+
+    /// `capabilities.shell.staged_runtime` lowers onto the policy verbatim — binary, source path
+    /// and pin all survive, since the pin is what a human later compares across two hosts.
+    #[test]
+    fn staged_runtime_grants_lower_onto_the_policy() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  containment: sealed
+  shell:
+    allow:
+      - python3
+    staged_runtime:
+      - binary: python3
+        source_path: /opt/testbed/conda/envs/django__django
+        pin: conda-4.10.3/python-3.9.19
+"#,
+        );
+
+        assert_eq!(
+            policy.shell_staged_runtime,
+            vec![murmur_artifact::StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/testbed/conda/envs/django__django".to_string(),
+                pin: "conda-4.10.3/python-3.9.19".to_string(),
+            }]
+        );
+        // The two mechanisms stay separate all the way down: lowering one must not populate the
+        // other.
+        assert!(policy.shell_interpreter_runtime.is_empty());
+    }
+
+    /// A shell block that declares no staged runtime lowers to an empty list, not to a default
+    /// grant of any kind.
+    #[test]
+    fn absent_staged_runtime_lowers_to_empty() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  shell:
+    allow:
+      - bash
+"#,
+        );
+
+        assert!(policy.shell_staged_runtime.is_empty());
     }
 
     /// A manifest with no `capabilities:` block at all denies unix sockets — the field must not

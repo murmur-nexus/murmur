@@ -108,6 +108,30 @@ pub enum RuntimeError {
         reason: String,
     },
 
+    /// A capsule declares `capabilities.shell.staged_runtime` without an effective `sealed`
+    /// containment floor.
+    ///
+    /// Deliberately distinct from [`Self::ContainmentFloorUnmet`]: that one compares the declared
+    /// floor against what the *host* can back, and its remedy is to lower the floor or move hosts.
+    /// This one is decided against the declared floor alone and never looks at the host at all, so
+    /// it fires identically on a machine that could deliver `sealed` — a staged runtime has no
+    /// composed root to be staged into unless the capsule asked for one, and quietly launching it
+    /// without the mount would leave the interpreter simply absent. Its remedy is to raise the
+    /// declared floor (or drop the grant), which is the opposite advice.
+    ///
+    /// `binaries` names every offending `staged_runtime` binary so the operator does not have to
+    /// re-run to find the second one.
+    #[error(
+        "capabilities.shell.staged_runtime is declared for {} but the effective containment floor \
+         is '{declared}' — staging a runtime tree requires the 'sealed' floor, because there is no \
+         composed root to bind-mount it into below that",
+        .binaries.join(", ")
+    )]
+    StagedRuntimeRequiresSealed {
+        binaries: Vec<String>,
+        declared: murmur_artifact::ContainmentClass,
+    },
+
     /// A `sealed` session's composed root could not be built in the forked child, *after* the
     /// pre-launch probe reported the mechanism available.
     ///

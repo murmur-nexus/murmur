@@ -295,6 +295,15 @@ pub fn stage_session(
         // the same cached host probe the tier decision above used, so the two cannot disagree.
         crate::containment::detect_sealed_blocker(),
     )?;
+    // A second, independent floor question, deliberately asked right here next to the first: not
+    // "can this host back what was declared?" but "did the capsule declare enough for what it
+    // asks for?". A `staged_runtime` grant needs a composed root to be staged into, and one is
+    // only built for a capsule that declared `sealed` — so this refuses on the declared floor
+    // alone and never consults the host probe above.
+    crate::staged_runtime::check_staged_runtime_floor(
+        &request.capability_policy.shell_staged_runtime,
+        request.declared_containment_floor,
+    )?;
     // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
@@ -5155,6 +5164,7 @@ mod tests {
                 strip_env: None,
                 baseline_env: None,
                 interpreter_runtime: Vec::new(),
+                staged_runtime: Vec::new(),
             }),
             spawn: None,
             env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
