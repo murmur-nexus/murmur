@@ -746,8 +746,13 @@ pub(crate) fn resolve_interpreter_runtime_grants(
 /// Whole directories, deduplicated, and only the ones not already inside a fixed runtime path.
 /// This is the deliberate opposite of `resolve_landlock_grants`: no ELF parsing, no `DT_NEEDED`
 /// closure, no per-file grant — a bind mount carries a directory's whole contents, so the closure
-/// derivation `scoped` needs has nothing left to do here. A later slice
-/// (`staged-runtime-bind-mount`) replaces this with a staged interpreter tree.
+/// derivation `scoped` needs has nothing left to do here.
+///
+/// Every entry is **optional** by design — see `sealed::PlanBuilder::mirror`. A host missing one
+/// makes the composed root narrower rather than refusing the launch, which is why
+/// `capabilities.shell.staged_runtime` does *not* come through here: a declared runtime tree must
+/// fail closed, so it is resolved separately by [`resolve_staged_runtime_dirs`] and planned as a
+/// required bind. This function is additive to that, not replaced by it.
 ///
 /// Pure and syscall-free, so it is unit-testable on any platform.
 pub(crate) fn resolve_sealed_bind_dirs(
@@ -783,6 +788,69 @@ pub(crate) fn resolve_sealed_bind_dirs(
         dirs.push(candidate);
     }
     dirs
+}
+
+/// The `source_path` of each declared `capabilities.shell.staged_runtime` grant, as the composed
+/// root's *required* read-only binds.
+///
+/// Deliberately not folded into [`resolve_sealed_bind_dirs`], and deliberately not filtered the
+/// way that function filters. Both differences follow from the same fact — these fail closed:
+///
+///   * A path already inside [`crate::sealed::SEALED_RUNTIME_PATHS`] is **not** dropped here.
+///     Dropping it would be sound for an optional bind (the fixed list already covers it) but it
+///     would quietly convert a required grant into a dependency on an unrelated list staying the
+///     way it is today. `plan_composed_root` runs the required loop first and deduplicates by
+///     target, so naming an already-covered path costs one registration and stays required.
+///   * A non-existent path is **not** filtered out, here or anywhere. The whole point is that a
+///     grant naming a tree this host does not have refuses the launch — see
+///     `sealed::PlanBuilder::require_bind`.
+///
+/// Relative paths are still skipped: a relative `source_path` cannot be re-based under the
+/// composed root's base at all, so it names nothing to fail *about*. The manifest parser is the
+/// layer that rejects one.
+///
+/// Pure and syscall-free, so it is unit-testable on any platform.
+pub(crate) fn resolve_staged_runtime_dirs(policy: &CapabilityPolicy) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for grant in &policy.shell_staged_runtime {
+        let path = PathBuf::from(&grant.source_path);
+        if !path.is_absolute() || dirs.contains(&path) {
+            continue;
+        }
+        dirs.push(path);
+    }
+    dirs
+}
+
+/// One listable [`LandlockGrant`] per staged runtime directory.
+///
+/// The bind mount alone does not make a staged tree usable, and the reason is easy to miss: the
+/// composed root is not the only thing standing between the subprocess and a path. `sealed` still
+/// installs Landlock *inside* the root as defence in depth (see `applied_tier` and the
+/// `KernelSealed` arm of `prepare_enforcement`), and Landlock denies any path with no matching
+/// rule. A staged tree that is bind-mounted but ungranted is therefore present, read-only, and
+/// unreadable — `open()` returns `EACCES` — which is indistinguishable from the capability not
+/// working at all.
+///
+/// So a grant is emitted here for exactly the same directories [`resolve_staged_runtime_dirs`]
+/// binds, and the two are resolved from the same list so they cannot drift apart. `list_dir: true`
+/// is not configurable, unlike `interpreter_runtime`'s per-directory flag: a staged tree is a whole
+/// runtime a program walks (an interpreter enumerating its stdlib, a toolchain resolving its
+/// libexec), and the author already made the enumerability decision by naming the tree. Landlock
+/// rules attach to the opened inode, so a rule taken on the host path in the parent covers the
+/// same inode reached through the bind inside the root.
+///
+/// Read and execute only — never write. The bind is `MS_RDONLY` regardless, so this is the second
+/// of two independent reasons the tree cannot be mutated from inside a session.
+///
+/// Pure and syscall-free, so it is unit-testable on any platform.
+pub(crate) fn resolve_staged_runtime_landlock_grants(
+    policy: &CapabilityPolicy,
+) -> Vec<LandlockGrant> {
+    resolve_staged_runtime_dirs(policy)
+        .into_iter()
+        .map(|path| LandlockGrant { path, list_dir: true })
+        .collect()
 }
 
 // ---- fixed capsule device set (this slice) ----------------------------------------------
@@ -1531,6 +1599,18 @@ pub(crate) struct ShellEnforcement {
     /// every platform for parity, exactly like `landlock_grants` above.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) sealed_bind_dirs: Vec<PathBuf>,
+    /// The `source_path` of each declared `capabilities.shell.staged_runtime` grant, bind-mounted
+    /// read-only into the composed root at its own absolute path.
+    ///
+    /// Separate from `sealed_bind_dirs` above because the failure semantics are opposite, and that
+    /// is the capability: `sealed_bind_dirs` shrinks the root when the host is missing something,
+    /// while a staged tree that cannot be mounted aborts the composed-root construction before
+    /// `pivot_root`, which surfaces as `RuntimeError::SealedRootConstructionFailed` (`E-RUN-014`)
+    /// and is session-fatal. A capsule never gets a shell tool call inside a root missing a
+    /// runtime tree it declared. Consumed only on `KernelSealed`; resolved on every platform for
+    /// parity, exactly like the two fields above.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) staged_runtime_dirs: Vec<PathBuf>,
     /// Fully-resolved OS-level bounds for every subprocess this session spawns — `rlimit(2)`
     /// ceilings applied before `execve`, plus the values the cgroup scope below was built from.
     /// Unlike everything above it, this is enforced on **every** platform: `setrlimit` is POSIX,
@@ -1577,7 +1657,12 @@ impl ShellEnforcement {
             LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
         landlock_grants
             .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
+        // Plus one per staged runtime tree. Without this the tree is bind-mounted into the
+        // composed root and then denied by the Landlock ruleset installed inside it — see
+        // `resolve_staged_runtime_landlock_grants`.
+        landlock_grants.extend(resolve_staged_runtime_landlock_grants(policy));
         let sealed_bind_dirs = resolve_sealed_bind_dirs(&exec_allow_paths, policy);
+        let staged_runtime_dirs = resolve_staged_runtime_dirs(policy);
         Ok(Self {
             tier,
             network_allow_ips,
@@ -1585,6 +1670,7 @@ impl ShellEnforcement {
             exec_allow_paths,
             landlock_grants,
             sealed_bind_dirs,
+            staged_runtime_dirs,
             resource_limits: policy.resources,
             nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
             cgroup_scope: None,
@@ -1645,6 +1731,7 @@ impl ShellEnforcement {
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
             sealed_bind_dirs: Vec::new(),
+            staged_runtime_dirs: Vec::new(),
             // Defaults, not "no limits": the rlimit ceilings are the one part of this slice that
             // applies unchanged on this tier, so zeroing them out here would misrepresent what a
             // real macOS host does.
@@ -2150,7 +2237,11 @@ pub(crate) fn prepare_enforcement(
     // thread that no longer exists — happens now instead, synchronously, where a failure names
     // itself. See `crate::sealed` for the plan/execute split.
     let sealed_spec = if enforcement.tier == EnforcementTier::KernelSealed {
-        Some(build_sealed_root(workdir, &enforcement.sealed_bind_dirs)?)
+        Some(build_sealed_root(
+            workdir,
+            &enforcement.sealed_bind_dirs,
+            &enforcement.staged_runtime_dirs,
+        )?)
     } else {
         None
     };
@@ -2309,10 +2400,18 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// this point has already cleared `check_containment_floor`, so a failure here is a genuine
 /// host-state surprise (an unwritable workdir, a host with none of the base candidates), not a
 /// declared-vs-achieved mismatch.
+///
+/// `staged_runtime_read_only` is passed straight through to the planner rather than validated
+/// here. A missing `source_path` is *not* diagnosed in this function on purpose: a parent-side
+/// error would return `Err(String)`, which converts to the ordinary, retryable
+/// `ShellExecError::Failed`. Letting the required bind fail at `mount(2)` in the child instead
+/// routes it to the session-fatal `SealedRootConstructionFailed` (`E-RUN-014`) — the correct
+/// classification for a capsule that did not get a runtime tree it declared.
 #[cfg(target_os = "linux")]
 fn build_sealed_root(
     workdir: &Path,
     extra_read_only: &[PathBuf],
+    staged_runtime_read_only: &[PathBuf],
 ) -> Result<crate::sealed::SealedRootSpec, String> {
     use crate::sealed;
 
@@ -2353,6 +2452,7 @@ fn build_sealed_root(
         workdir,
         &base,
         extra_read_only,
+        staged_runtime_read_only,
         &sealed::RealHostLayout,
     );
     sealed::build_sealed_root_spec(&plan)
@@ -3909,6 +4009,69 @@ mod tests {
         assert_eq!(
             resolve_sealed_bind_dirs(&exec_allow, &policy),
             vec![PathBuf::from("/opt/toolchain/bin"), PathBuf::from("/opt/py/lib")]
+        );
+    }
+
+    /// Staged trees are resolved by a different rule than `sealed_bind_dirs` above, and the
+    /// differences are the point: a path inside a fixed runtime path is kept (dropping it would
+    /// silently make a required grant depend on an unrelated list), duplicates collapse, and a
+    /// relative path — which cannot be re-based under the composed root at all — is skipped.
+    #[test]
+    fn staged_runtime_dirs_keep_fixed_path_overlaps_and_drop_only_duplicates_and_relatives() {
+        use murmur_artifact::StagedRuntimeGrant;
+
+        let grant = |binary: &str, source: &str| StagedRuntimeGrant {
+            binary: binary.to_string(),
+            source_path: source.to_string(),
+            pin: "pin-1".to_string(),
+        };
+        let policy = CapabilityPolicy {
+            shell_staged_runtime: vec![
+                grant("python3", "/opt/py"),
+                // Inside /usr, which the fixed list already binds. Kept anyway — unlike
+                // `resolve_sealed_bind_dirs`, which drops exactly this case.
+                grant("perl", "/usr/lib/perl5"),
+                // A duplicate of the first, and a relative path naming nothing absolute.
+                grant("python3.12", "/opt/py"),
+                grant("ruby", "relative/ruby"),
+            ],
+            ..CapabilityPolicy::default()
+        };
+
+        assert_eq!(
+            resolve_staged_runtime_dirs(&policy),
+            vec![PathBuf::from("/opt/py"), PathBuf::from("/usr/lib/perl5")]
+        );
+    }
+
+    /// The bind is only half of it: `sealed` keeps Landlock installed inside the composed root, so
+    /// a staged tree with no Landlock rule is mounted-but-unreadable (`EACCES`). Both resolvers
+    /// must therefore cover the same directories.
+    #[test]
+    fn every_staged_runtime_dir_also_gets_a_listable_landlock_grant() {
+        use murmur_artifact::StagedRuntimeGrant;
+
+        let policy = CapabilityPolicy {
+            shell_staged_runtime: vec![StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/py".to_string(),
+                pin: "pin-1".to_string(),
+            }],
+            ..CapabilityPolicy::default()
+        };
+
+        let dirs = resolve_staged_runtime_dirs(&policy);
+        let grants = resolve_staged_runtime_landlock_grants(&policy);
+
+        assert_eq!(
+            grants,
+            vec![LandlockGrant { path: PathBuf::from("/opt/py"), list_dir: true }],
+            "a staged tree is walked by the runtime that uses it, so it must be listable",
+        );
+        assert_eq!(
+            grants.iter().map(|grant| grant.path.clone()).collect::<Vec<_>>(),
+            dirs,
+            "the bound set and the granted set must not drift apart",
         );
     }
 

@@ -22,18 +22,32 @@
 //! `murmur-artifact`). Staging is not an additional grant layered onto a widened scope; it is the
 //! thing that makes widening unnecessary.
 //!
-//! ## What this module contains, and what is deliberately not wired
+//! ## What this module contains, and how the mount reaches the launch path
 //!
 //! Two independent pieces, with very different reach:
 //!
 //!   * [`check_staged_runtime_floor`] — pure, every OS, and **live in the launch path**. It is the
 //!     gate that refuses to stage a capsule declaring `staged_runtime` below an effective `sealed`
 //!     floor, called from `runtime::stage_session` next to `check_containment_floor`.
-//!   * [`bind_mount_staged_runtimes`] — Linux-only, and **called from nowhere in the launch
-//!     path**. It performs the actual read-only bind mounts into a target root directory. It is
-//!     built and proven here in isolation, against a throwaway directory tree inside a mount
-//!     namespace its own test creates. See its doc comment for exactly where the composed-root
-//!     construction is expected to pick it up, and why that wiring was left as a separate step.
+//!   * [`bind_mount_staged_runtimes`] — Linux-only, and the executable statement of the mount
+//!     *contract*: the re-basing rule, the two-call read-only bind, and the failure taxonomy. It
+//!     is built and proven here in isolation, against a throwaway directory tree inside a mount
+//!     namespace its own test creates.
+//!
+//! The staging mounts **are** performed on every `sealed` launch that declares a grant — but not
+//! by calling that function. `sandbox::resolve_staged_runtime_dirs` collects each grant's
+//! `source_path` into `ShellEnforcement::staged_runtime_dirs`, `build_sealed_root` passes them to
+//! [`crate::sealed::plan_composed_root`]'s `staged_runtime_read_only` parameter, and they are
+//! planned as *required* `RootOp::Bind` steps ahead of every other step — and so ahead of
+//! `pivot_root`. A grant whose source is missing fails at the real `mount(2)` with `ENOENT`,
+//! aborting the construction; that reaches the operator as
+//! `RuntimeError::SealedRootConstructionFailed` (`E-RUN-014`) and is session-fatal.
+//!
+//! The function itself stays uncalled by production code because it allocates, and the composed
+//! root executes inside the forked child's `pre_exec` window, which must not — see
+//! [`bind_mount_staged_runtimes`]'s own doc comment. It remains valuable as an independently
+//! provable statement of what the planned step must do on a real kernel, without needing a sealed
+//! capsule, a `pivot_root` or the enforcement pipeline to demonstrate it.
 
 use std::path::{Path, PathBuf};
 
@@ -148,28 +162,31 @@ fn target_under_root(root: &Path, source_path: &Path) -> PathBuf {
 /// Bind-mounts every declared `staged_runtime` tree read-only into `root`, each at its own
 /// absolute host path re-based under `root`. Returns the target paths it established, in order.
 ///
-/// # Where this belongs, and why it is not called yet
+/// # Where the launch path performs this, and why it is not here
 ///
-/// **The composed-root construction is expected to call this once per declared grant, in the same
-/// step it bind-mounts the base runtime tree, before `pivot_root`** — that is, between steps 3 and
-/// 4 of the sequence [`crate::sealed`] documents.
+/// The staging mounts are live: every `sealed` launch that declares a grant establishes them
+/// before `pivot_root`. They are just not established by calling this function, and the reason is
+/// worth stating rather than leaving for someone to rediscover.
 ///
-/// It is deliberately not called from anywhere today, and the reason is worth stating rather than
-/// leaving for someone to rediscover. [`crate::sealed`] executes its mounts inside the forked
-/// child's `pre_exec` window, where allocation can deadlock on a malloc lock another thread of the
-/// parent held at `fork()`. It avoids that by splitting the decision (`plan_composed_root`, pure,
-/// parent-side) from the execution (`construct_composed_root`, raw syscalls over `CString`s built
-/// before the fork). This function allocates — it joins paths and creates directories — so calling
-/// it from that window as-is would break the invariant that split exists to protect.
+/// [`crate::sealed`] executes its mounts inside the forked child's `pre_exec` window, where
+/// allocation can deadlock on a malloc lock another thread of the parent held at `fork()`. It
+/// avoids that by splitting the decision (`plan_composed_root`, pure, parent-side) from the
+/// execution (`construct_composed_root`, raw syscalls over `CString`s built before the fork). This
+/// function allocates — it joins paths and creates directories — so calling it from that window
+/// as-is would break the invariant that split exists to protect.
 ///
-/// The correct wiring is therefore *not* to call this function from `construct_composed_root`, but
-/// to feed each grant's `source_path` into `plan_composed_root`'s existing `extra_read_only`
-/// parameter, which already carries exactly this shape (a host directory to bind read-only) and
-/// already lowers to an allocation-free `RootOp::Bind { read_only: true }`. This function is the
-/// executable, independently provable statement of what that plan entry must *do*: same re-basing
-/// rule, same two-call read-only bind, same failure taxonomy. Its test is what pins that behaviour
-/// down on a real kernel without requiring a sealed capsule, a `pivot_root`, or the enforcement
-/// pipeline.
+/// The wiring is therefore a *plan entry*, not a call: each grant's `source_path` is fed to
+/// [`crate::sealed::plan_composed_root`]'s `staged_runtime_read_only` parameter, which lowers to
+/// an allocation-free, **required** `RootOp::Bind { read_only: true }`, planned ahead of every
+/// other step. Note that this is a dedicated parameter and not the pre-existing `extra_read_only`:
+/// entries there are planned via `mirror`, which schedules *nothing at all* for a path the host
+/// does not have, so a missing source would have launched a capsule into a root silently lacking
+/// its runtime tree — the opposite of the guarantee below.
+///
+/// What remains here is the executable, independently provable statement of what that plan entry
+/// must *do*: same re-basing rule, same two-call read-only bind, same failure taxonomy. Its test
+/// is what pins that behaviour down on a real kernel without requiring a sealed capsule, a
+/// `pivot_root`, or the enforcement pipeline.
 ///
 /// # Preconditions
 ///
