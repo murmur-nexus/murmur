@@ -287,7 +287,14 @@ pub fn stage_session(
     // `achieved` comes from a live kernel probe only — the manifest never gets a vote in what
     // the host is reported to provide.
     let achieved_containment = detect_achieved_containment();
-    check_containment_floor(request.declared_containment_floor, achieved_containment)?;
+    check_containment_floor(
+        request.declared_containment_floor,
+        achieved_containment,
+        // Probed only so the refusal can name *which* part of the sealed mechanism is missing —
+        // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself. Reads
+        // the same cached host probe the tier decision above used, so the two cannot disagree.
+        crate::containment::detect_sealed_blocker(),
+    )?;
     // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
@@ -627,7 +634,14 @@ pub fn stage_session(
         artifact_grants,
         hook_components,
         allowlisted_tools: request.allowlisted_tools,
-        capability_policy: request.capability_policy,
+        // The combined floor (manifest + workspace config + `--containment`) replaces the
+        // manifest-only value the policy was built with, so every later reader — including
+        // `ShellEnforcement::resolve`, which decides whether this session installs a composed
+        // root — sees the class that was actually asked for.
+        capability_policy: CapabilityPolicy {
+            containment_floor: request.declared_containment_floor,
+            ..request.capability_policy
+        },
         otel_endpoint: request.otel_endpoint,
         eval_config_json: request.eval_config_json,
         case_id: request.case_id,
@@ -686,8 +700,11 @@ pub fn launch_session(
         staged.capability_policy.resources.workdir_max_bytes,
     ));
 
-    let shell_enforcement = sandbox::ShellEnforcement::resolve(&staged.capability_policy)
-        .map_err(RuntimeError::Runtime)?
+    let shell_enforcement = sandbox::ShellEnforcement::resolve(
+        &staged.capability_policy,
+        staged.declared_containment_floor,
+    )
+    .map_err(RuntimeError::Runtime)?
         .with_host_bounding(cgroup_scope, workdir_guard);
     let inference_env = staged
         .inference
@@ -3248,16 +3265,25 @@ fn dispatch_shell_tool(
                 result: shell_result_to_tool_result(&command, result),
                 shell: Some(shell),
                 is_skill: false,
+                fatal: None,
             }
         }
-        Err(error) => DispatchOutcome::tool(murmur::tool::run::ToolResult {
-            status: murmur::tool::run::Status::Error,
-            summary: Some("shell execution failed".to_string()),
-            data: Some(error),
-            data_path: None,
-            truncated: false,
-            metadata: Vec::new(),
-        }),
+        Err(error) => DispatchOutcome {
+            // The tool result is filled in either way, so the trace records the call that was
+            // attempted; `fatal` is what tells the agent turn loop that this particular failure
+            // is not one the capsule gets another turn to react to.
+            result: murmur::tool::run::ToolResult {
+                status: murmur::tool::run::Status::Error,
+                summary: Some("shell execution failed".to_string()),
+                data: Some(error.to_string()),
+                data_path: None,
+                truncated: false,
+                metadata: Vec::new(),
+            },
+            shell: None,
+            is_skill: false,
+            fatal: error.session_fatal(),
+        },
     }
 }
 
@@ -4485,6 +4511,82 @@ mod tests {
             "command must still carry only the argument list"
         );
         assert_eq!(shell.exit_code, 0);
+    }
+
+    /// The dispatch-layer half of the composed-root failure path: a sealed session whose root
+    /// could not be built does not come back as an ordinary failed tool call the capsule gets
+    /// another turn to react to. The tool result is still filled in (so the trace records the
+    /// attempt), but `fatal` carries the typed `RuntimeError` the agent turn loop returns and
+    /// the CLI renders as `E-RUN-014`.
+    ///
+    /// Linux-only because the forced-failure seam lives in the Linux `pre_exec` path; the
+    /// mechanism it stands in for is Linux-only too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let _guard = sandbox::ForceSealedRootFailureGuard::new();
+        let outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::sealed_test_enforcement(),
+        );
+
+        assert!(
+            matches!(outcome.result.status, murmur::tool::run::Status::Error),
+            "the failed call must still read as a failed call"
+        );
+        let data = outcome.result.data.as_deref().unwrap_or_default();
+        assert!(
+            data.contains("composed root"),
+            "the tool result must still say what happened: {data}"
+        );
+        let fatal = outcome
+            .fatal
+            .expect("a composed-root failure must be carried out as session-fatal");
+        assert!(
+            matches!(fatal, RuntimeError::SealedRootConstructionFailed { .. }),
+            "must be the variant murmur-cli maps to E-RUN-014: {fatal}"
+        );
+    }
+
+    /// The contrast: an ordinary shell failure leaves `fatal` unset, so the capsule keeps its
+    /// turn. Without this, "always fatal" would pass the test above.
+    #[test]
+    fn an_ordinary_shell_failure_leaves_the_session_running() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            &[],
+            // Empty allowlist: `execute_shell` refuses before spawning anything.
+            &CapabilityPolicy::default(),
+            &sandbox::ShellEnforcement::environment_only(),
+        );
+
+        assert!(matches!(
+            outcome.result.status,
+            murmur::tool::run::Status::Error
+        ));
+        assert!(
+            outcome.fatal.is_none(),
+            "a disallowed binary is the capsule's problem, not the session's"
+        );
     }
 
     /// The composed path, on real inputs and a real file: dispatch a real shell tool, then

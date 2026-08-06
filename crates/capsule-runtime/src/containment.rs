@@ -9,10 +9,16 @@
 //!   launch time. [`achieved_class_for_tier`] takes nothing else — not the manifest, not the
 //!   grant set — so no declaration can ever talk a host into reporting a class it cannot back.
 //!
-//! [`ContainmentClass::Sealed`] is structurally unreachable here: `achieved_class_for_tier` has
-//! no `Sealed` arm, because the mechanism (mount namespace + `pivot_root`) does not exist in this
-//! runtime. Declaring `sealed` therefore refuses to launch on every host, including a modern
-//! Linux one. That is the honest answer until a slice implements the mechanism, not a gap.
+//! [`ContainmentClass::Sealed`] is reachable exactly when [`EnforcementTier::KernelSealed`] is:
+//! a Linux host with a usable Landlock ABI, AppArmor out of the way of unprivileged user
+//! namespaces, and a namespace probe that really created one. See [`crate::sealed`] for the
+//! mechanism and for the [`SealedBlocker`] taxonomy that turns "not sealed here" into a specific
+//! command an operator can run.
+//!
+//! The shortfall reason for `sealed` is therefore *mechanism-specific*, not a fixed string: a
+//! host missing the AppArmor profile and a container missing `CAP_SYS_ADMIN` both fail to reach
+//! `sealed`, but they are fixed in completely different places, and a refusal that cannot tell
+//! them apart is a refusal an operator cannot act on.
 
 use murmur_artifact::ContainmentClass;
 use serde::Serialize;
@@ -20,8 +26,11 @@ use serde::Serialize;
 use crate::{
     errors::RuntimeError,
     sandbox::{detect_enforcement_tier, EnforcementTier},
+    sealed::SealedBlocker,
     types::CapabilityPolicy,
 };
+
+pub use crate::sandbox::detect_sealed_blocker;
 
 /// The class a host in `tier` can actually back, and nothing stronger.
 ///
@@ -30,6 +39,11 @@ use crate::{
 /// unit-testable on any OS.
 pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass {
     match tier {
+        // A private mount namespace pivoted onto a composed root: paths outside it are absent,
+        // not merely denied — exactly the mechanism `sealed` names. Landlock and seccomp still
+        // install inside it, so this arm is strictly stronger than `KernelFull`'s, never an
+        // alternative to it.
+        EnforcementTier::KernelSealed => ContainmentClass::Sealed,
         // Landlock mediates the filesystem and seccomp mediates exec/network: exactly the
         // mechanism `scoped` names.
         EnforcementTier::KernelFull => ContainmentClass::Scoped,
@@ -50,10 +64,14 @@ pub fn detect_achieved_containment() -> ContainmentClass {
 /// Why `achieved` falls short of `declared`, naming the missing *mechanism* rather than the
 /// missing class. `None` when the floor is met.
 ///
-/// Pure and host-independent: the caller supplies both classes.
+/// Pure and host-independent: the caller supplies both classes *and* — for the `sealed` arm — the
+/// already-probed [`SealedBlocker`], so this function still probes nothing and stays testable
+/// without a kernel. `sealed_blocker` is `None` when the caller has not probed (or cannot: a
+/// non-Linux host), in which case the arm falls back to naming the mechanism generically.
 pub fn containment_shortfall_reason(
     declared: ContainmentClass,
     achieved: ContainmentClass,
+    sealed_blocker: Option<SealedBlocker>,
 ) -> Option<String> {
     if achieved >= declared {
         return None;
@@ -72,11 +90,15 @@ pub fn containment_shortfall_reason(
              workdir are constrained by convention only"
                 .to_string()
         }
-        ContainmentClass::Sealed => {
-            "sealed requires mount-namespace + pivot_root isolation, which this runtime does not \
-             implement yet; no host can provide it today"
-                .to_string()
-        }
+        // The mechanism exists now, so the reason names *which part of it* this host is missing
+        // and how to fix that part — never the old blanket "no host can provide it today".
+        ContainmentClass::Sealed => match sealed_blocker {
+            Some(blocker) => blocker.reason(),
+            None => "sealed requires a private mount namespace pivoted onto a composed root \
+                     (unshare(CLONE_NEWUSER|CLONE_NEWNS) + pivot_root), which this host did not \
+                     provide"
+                .to_string(),
+        },
     };
 
     Some(reason)
@@ -90,8 +112,9 @@ pub fn containment_shortfall_reason(
 pub fn check_containment_floor(
     declared: ContainmentClass,
     achieved: ContainmentClass,
+    sealed_blocker: Option<SealedBlocker>,
 ) -> Result<(), RuntimeError> {
-    match containment_shortfall_reason(declared, achieved) {
+    match containment_shortfall_reason(declared, achieved, sealed_blocker) {
         None => Ok(()),
         Some(reason) => Err(RuntimeError::ContainmentFloorUnmet {
             declared,
@@ -193,18 +216,24 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
 /// combined floor. Probes the host tier once and reads nothing else.
 pub fn explain_scope(policy: &CapabilityPolicy, declared: ContainmentClass) -> ScopeReport {
-    scope_report_for_tier(policy, declared, detect_enforcement_tier())
+    scope_report_for_tier(
+        policy,
+        declared,
+        detect_enforcement_tier(),
+        detect_sealed_blocker(),
+    )
 }
 
-/// [`explain_scope`] with the tier injected — the seam every test uses so no test depends on
-/// the host it happens to run on.
+/// [`explain_scope`] with the tier and the sealed blocker injected — the seam every test uses so
+/// no test depends on the host it happens to run on.
 pub(crate) fn scope_report_for_tier(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
     tier: EnforcementTier,
+    sealed_blocker: Option<SealedBlocker>,
 ) -> ScopeReport {
     let achieved = achieved_class_for_tier(tier);
-    let shortfall_reason = containment_shortfall_reason(declared, achieved);
+    let shortfall_reason = containment_shortfall_reason(declared, achieved, sealed_blocker);
 
     ScopeReport {
         declared_containment: declared,
@@ -235,16 +264,26 @@ pub(crate) fn scope_report_for_tier(
 /// than a `Debug` rendering that is free to change.
 fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
     match tier {
+        EnforcementTier::KernelSealed => "mountns+pivot_root+landlock+seccomp",
         EnforcementTier::KernelFull => "landlock+seccomp",
         EnforcementTier::KernelSeccompOnly => "seccomp-only",
         EnforcementTier::EnvironmentOnly => "none",
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
+
+    /// Every tier, so a new variant cannot quietly escape a test that iterates "all of them".
+    const ALL_TIERS: &[EnforcementTier] = &[
+        EnforcementTier::KernelSealed,
+        EnforcementTier::KernelFull,
+        EnforcementTier::KernelSeccompOnly,
+        EnforcementTier::EnvironmentOnly,
+    ];
 
     #[test]
     fn kernel_full_achieves_scoped() {
@@ -252,6 +291,19 @@ mod tests {
             achieved_class_for_tier(EnforcementTier::KernelFull),
             ContainmentClass::Scoped
         );
+    }
+
+    /// The arm this slice exists to add: the sealed tier, and only the sealed tier, reports
+    /// `sealed`.
+    #[test]
+    fn only_the_sealed_tier_achieves_sealed() {
+        assert_eq!(
+            achieved_class_for_tier(EnforcementTier::KernelSealed),
+            ContainmentClass::Sealed
+        );
+        for tier in ALL_TIERS.iter().filter(|t| **t != EnforcementTier::KernelSealed) {
+            assert_ne!(achieved_class_for_tier(*tier), ContainmentClass::Sealed);
+        }
     }
 
     #[test]
@@ -266,42 +318,27 @@ mod tests {
         );
     }
 
-    /// The invariant this whole slice exists to hold: `sealed` cannot be reported as achieved
-    /// by any host, because no tier maps to it.
-    #[test]
-    fn no_tier_achieves_sealed() {
-        for tier in [
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            assert_ne!(achieved_class_for_tier(tier), ContainmentClass::Sealed);
-        }
-    }
-
     #[test]
     fn advisory_floor_is_met_on_every_tier() {
-        for tier in [
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            let achieved = achieved_class_for_tier(tier);
-            assert!(check_containment_floor(ContainmentClass::Advisory, achieved).is_ok());
+        for tier in ALL_TIERS {
+            let achieved = achieved_class_for_tier(*tier);
+            assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None).is_ok());
         }
     }
 
     #[test]
-    fn scoped_floor_is_met_only_on_a_landlock_host() {
-        let full = achieved_class_for_tier(EnforcementTier::KernelFull);
-        assert!(check_containment_floor(ContainmentClass::Scoped, full).is_ok());
+    fn scoped_floor_is_met_on_every_landlock_capable_tier() {
+        for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
+            let achieved = achieved_class_for_tier(tier);
+            assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None).is_ok());
+        }
 
         for tier in [
             EnforcementTier::KernelSeccompOnly,
             EnforcementTier::EnvironmentOnly,
         ] {
             let achieved = achieved_class_for_tier(tier);
-            let error = check_containment_floor(ContainmentClass::Scoped, achieved)
+            let error = check_containment_floor(ContainmentClass::Scoped, achieved, None)
                 .expect_err("scoped must refuse without Landlock");
             match error {
                 RuntimeError::ContainmentFloorUnmet {
@@ -321,24 +358,48 @@ mod tests {
         }
     }
 
+    /// The edge case the new tier makes possible: a capsule declaring the *weaker* class on a
+    /// sealed-capable host. The floor is met (a stronger host satisfies a weaker requirement),
+    /// and the applied mechanism is the declared one — asserted next door in
+    /// `sandbox::applied_tier`'s tests, since a careless `match` here could force sealed-only
+    /// behaviour onto a `scoped` declaration.
     #[test]
-    fn sealed_floor_is_refused_on_every_tier_including_landlock() {
-        for tier in [
-            EnforcementTier::KernelFull,
-            EnforcementTier::KernelSeccompOnly,
-            EnforcementTier::EnvironmentOnly,
-        ] {
-            let achieved = achieved_class_for_tier(tier);
-            let error = check_containment_floor(ContainmentClass::Sealed, achieved)
-                .expect_err("sealed must refuse everywhere until the mechanism exists");
+    fn a_weaker_declaration_is_satisfied_by_a_sealed_host_without_being_upgraded() {
+        let achieved = achieved_class_for_tier(EnforcementTier::KernelSealed);
+        assert_eq!(achieved, ContainmentClass::Sealed);
+        assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None).is_ok());
+        assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None).is_ok());
+        assert_eq!(
+            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None),
+            None
+        );
+    }
+
+    #[test]
+    fn sealed_floor_is_met_only_on_the_sealed_tier() {
+        assert!(check_containment_floor(
+            ContainmentClass::Sealed,
+            achieved_class_for_tier(EnforcementTier::KernelSealed),
+            None
+        )
+        .is_ok());
+
+        for tier in ALL_TIERS.iter().filter(|t| **t != EnforcementTier::KernelSealed) {
+            let achieved = achieved_class_for_tier(*tier);
+            let error = check_containment_floor(
+                ContainmentClass::Sealed,
+                achieved,
+                Some(SealedBlocker::NamespaceCreationDenied),
+            )
+            .expect_err("sealed must refuse on a host that cannot back it");
             match error {
                 RuntimeError::ContainmentFloorUnmet {
                     declared, reason, ..
                 } => {
                     assert_eq!(declared, ContainmentClass::Sealed);
                     assert!(
-                        reason.contains("pivot_root"),
-                        "reason must name the missing mechanism, got: {reason}"
+                        reason.contains("--cap-add SYS_ADMIN"),
+                        "reason must name the blocking mechanism's remediation, got: {reason}"
                     );
                 }
                 other => panic!("expected ContainmentFloorUnmet, got {other:?}"),
@@ -346,15 +407,84 @@ mod tests {
         }
     }
 
+    /// The refusal text is mechanism-specific, not one fixed sentence: the same
+    /// declared/achieved pair produces different, individually actionable reasons.
+    #[test]
+    fn the_sealed_refusal_names_the_specific_blocker() {
+        let achieved = ContainmentClass::Scoped;
+
+        let apparmor = containment_shortfall_reason(
+            ContainmentClass::Sealed,
+            achieved,
+            Some(SealedBlocker::AppArmorProfileMissing),
+        )
+        .expect("refusal");
+        assert!(apparmor.contains("mur-sealed"));
+        assert!(apparmor.contains("apparmor_parser -r"));
+        assert!(!apparmor.contains("--cap-add"));
+
+        let container = containment_shortfall_reason(
+            ContainmentClass::Sealed,
+            achieved,
+            Some(SealedBlocker::NamespaceCreationDenied),
+        )
+        .expect("refusal");
+        assert!(container.contains("--cap-add SYS_ADMIN"));
+        assert!(container.contains("outside the container"));
+        assert!(!container.contains("apparmor_parser"));
+
+        // Never the pre-mechanism blanket text again, under any blocker.
+        for blocker in [
+            SealedBlocker::NotLinux,
+            SealedBlocker::AppArmorProfileMissing,
+            SealedBlocker::NamespaceCreationDenied,
+            SealedBlocker::MountDenied,
+            SealedBlocker::KernelUnsupported,
+            SealedBlocker::LandlockUnavailable,
+        ] {
+            let reason =
+                containment_shortfall_reason(ContainmentClass::Sealed, achieved, Some(blocker))
+                    .expect("refusal");
+            assert!(!reason.contains("no host can provide it today"), "got: {reason}");
+        }
+    }
+
+    /// A caller with no probe result still gets a reason naming the mechanism rather than an
+    /// empty or misleading one.
+    #[test]
+    fn the_sealed_refusal_falls_back_to_naming_the_mechanism_without_a_probe() {
+        let reason = containment_shortfall_reason(
+            ContainmentClass::Sealed,
+            ContainmentClass::Advisory,
+            None,
+        )
+        .expect("refusal");
+        assert!(reason.contains("pivot_root"));
+        assert!(reason.contains("CLONE_NEWNS"));
+    }
+
     #[test]
     fn shortfall_reason_is_absent_when_the_floor_is_met() {
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Advisory, ContainmentClass::Scoped),
+            containment_shortfall_reason(
+                ContainmentClass::Advisory,
+                ContainmentClass::Scoped,
+                None
+            ),
             None
         );
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Scoped, ContainmentClass::Scoped),
+            containment_shortfall_reason(ContainmentClass::Scoped, ContainmentClass::Scoped, None),
             None
+        );
+        assert_eq!(
+            containment_shortfall_reason(
+                ContainmentClass::Sealed,
+                ContainmentClass::Sealed,
+                Some(SealedBlocker::NamespaceCreationDenied)
+            ),
+            None,
+            "a met floor must ignore a stale blocker rather than manufacture a refusal"
         );
     }
 
@@ -383,6 +513,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -411,6 +542,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
+            Some(SealedBlocker::NamespaceCreationDenied),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -422,13 +554,27 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
+            Some(SealedBlocker::NotLinux),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Sealed);
         assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
         assert!(!report.floor_met);
-        assert!(report.shortfall_reason.unwrap().contains("pivot_root"));
+        assert!(report.shortfall_reason.unwrap().contains("non-Linux"));
         assert_eq!(report.enforcement_tier, "none");
+    }
+
+    #[test]
+    fn scope_report_names_the_sealed_mechanism_on_a_sealed_host() {
+        let report = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Sealed,
+            EnforcementTier::KernelSealed,
+            None,
+        );
+        assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
+        assert!(report.floor_met);
+        assert_eq!(report.enforcement_tier, "mountns+pivot_root+landlock+seccomp");
     }
 
     #[test]
@@ -437,6 +583,7 @@ mod tests {
             &CapabilityPolicy::default(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSeccompOnly,
+            None,
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
 
@@ -454,13 +601,14 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
+            Some(SealedBlocker::AppArmorProfileMissing),
         )
         .render();
 
         assert!(rendered.contains("declared:  sealed"));
         assert!(rendered.contains("achieved:  scoped"));
         assert!(rendered.contains("floor met: no"));
-        assert!(rendered.contains("pivot_root"));
+        assert!(rendered.contains("mur-sealed"));
         assert!(rendered.contains("would refuse to launch"));
     }
 }

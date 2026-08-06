@@ -369,12 +369,24 @@ missing device, add a fourth entry to `CAPSULE_DEVICE_GRANTS` *and record the ob
 failure behind it is how a fixed three-device set turns into an unaudited `/dev` grant.
 
 **Future shape — this mechanism should be retired, not grown.** Enumerating devices path by path is
-the answer for the `scoped` containment class, which is what exists today. Once a `sealed`
-containment class exists, a capsule will get a private `/dev` **tmpfs** carrying the OCI default
-device set, and device access will stop being a Landlock rule list at all — the kernel-visible
-device namespace becomes the boundary instead of a per-path grant. A `sealed` implementation should
-delete `CAPSULE_DEVICE_GRANTS` outright rather than merge with it: two mechanisms describing the
-same device set is exactly the drift this note exists to prevent.
+the answer for the `scoped` containment class. The [`sealed` class](manifest-schema.md#field-containment)
+now exists and does the other thing: a capsule that declares it gets a private `/dev` **tmpfs**
+carrying the OCI default device set (`sealed::SEALED_DEVICE_NODES`), so the kernel-visible device
+namespace is the boundary rather than a per-path grant.
+
+The two sets are deliberately independent constants, not one derived from the other, and
+`CAPSULE_DEVICE_GRANTS` is untouched by that work: it still services every capsule that declares
+`scoped`, or that runs on a host which cannot back `sealed`. Deleting it belongs to whichever slice
+makes the composed root the only path — which is not this one, because a `scoped` declaration on a
+`sealed`-capable host deliberately keeps `scoped`'s mechanism. What must not happen is the two sets
+being merged or made to derive from each other: they answer different questions (a Landlock rule
+list over the host's `/dev` versus the entire contents of a private one), and conflating them is
+exactly the drift this note exists to prevent.
+
+One consequence worth naming, since it links the two: Landlock keeps running *inside* the composed
+root, so the sealed `/dev` needs Landlock rules of its own or its device nodes would be present and
+unopenable. `sandbox::landlock_device_grants` is the seam — it hands `CAPSULE_DEVICE_GRANTS` to
+`KernelFull` and the OCI set to `KernelSealed`.
 
 ### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 

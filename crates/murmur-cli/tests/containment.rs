@@ -1,12 +1,19 @@
 //! `mur run`'s containment surface: `--explain-scope`, `--containment`, and the refusal when a
 //! declared floor is stronger than the host.
 //!
-//! Every assertion here is host-independent on purpose. `sealed` is unreachable on *every* host
-//! (its mechanism does not exist in this runtime), and `advisory` is satisfied by every host, so
-//! these hold identically on macOS and on a Landlock-capable Linux box. Nothing here claims that
-//! `scoped` or `sealed` actually contains anything at the kernel level — that can only be checked
-//! by hand on a real Linux host, per
-//! `.nexus/workspace/builds/f19c4910-manual-verification-procedure.md`.
+//! Every assertion here is host-independent on purpose, and staying that way took real care once
+//! `sealed` became achievable. It is no longer true that no host can reach it: a Linux box with a
+//! usable Landlock ABI, unprivileged user namespaces and the shipped `mur-sealed` AppArmor profile
+//! does. A test that hardcodes "sealed always refuses" would therefore pass on CI (containers, no
+//! profile) and fail on exactly the machine the feature was built for — the worst possible place
+//! for a test to break.
+//!
+//! So the `sealed` cases below **ask the host first**, via `--explain-scope --json`, and assert the
+//! branch that host is actually in. Both branches are asserted; neither is skipped.
+//!
+//! Nothing here claims that `scoped` or `sealed` actually contains anything at the kernel level —
+//! that can only be checked by hand on a real Linux host, per
+//! `docs/content/reference/sealed-containment-manual-verification.md`.
 
 use std::fs;
 use std::path::Path;
@@ -41,17 +48,65 @@ fn mur_run(home: &TempDir, project_dir: &Path, args: &[&str]) -> assert_cmd::ass
         .assert()
 }
 
+/// What this host reports it can back, read from `--explain-scope --json` rather than assumed.
+///
+/// Uses a throwaway project so the caller's fixture is untouched, and a declared floor of
+/// `advisory` so the probe answer is the only thing that varies.
+fn host_achieved_containment() -> String {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(project.path(), "capabilities:\n  containment: advisory\n");
+
+    let output = mur_run(&home, project.path(), &["--explain-scope", "--json"])
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value =
+        serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap();
+    report["achieved_containment"].as_str().unwrap().to_string()
+}
+
+/// On a host that cannot back `sealed`, the refusal is `E-CAP-003` and it names the *specific*
+/// missing mechanism — the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel —
+/// rather than one fixed sentence. On a host that can, the same manifest launches and gets far
+/// enough to fail on the deliberately-invalid component instead.
 #[test]
-fn sealed_refuses_to_launch_on_every_host() {
+fn sealed_refuses_with_an_actionable_reason_unless_the_host_can_back_it() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  containment: sealed\n");
 
-    mur_run(&home, project.path(), &[])
+    if host_achieved_containment() == "sealed" {
+        // The gate let it through: it fails later, at the invalid component. Asserting the
+        // *absence* of E-CAP-003 is the point — a sealed-capable host must not refuse.
+        mur_run(&home, project.path(), &[])
+            .failure()
+            .stderr(predicate::str::contains("E-CAP-003").not());
+        return;
+    }
+
+    let assertion = mur_run(&home, project.path(), &[])
         .failure()
         .stderr(predicate::str::contains("E-CAP-003"))
-        .stderr(predicate::str::contains("'sealed'"))
-        .stderr(predicate::str::contains("pivot_root"));
+        .stderr(predicate::str::contains("'sealed'"));
+
+    // Exactly one of the mechanism-specific reasons, never a generic "not supported".
+    //
+    // Compared against `SealedBlocker::ALL` rather than a hand-written list of substrings. The
+    // hand-written version was wrong the moment a variant was added: the refusal was correct and
+    // specific, the list had not heard of it, and the failure read as "this host cannot do sealed"
+    // when the real defect was in the test. Deriving the expected set from the enum means a new
+    // blocker can never make this assert lie again.
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+    let matched = capsule_runtime::sealed::SealedBlocker::ALL
+        .iter()
+        .find(|blocker| stderr.contains(&blocker.reason()));
+    assert!(
+        matched.is_some(),
+        "the sealed refusal must be one of SealedBlocker's mechanism-specific reasons, got: \
+         {stderr}"
+    );
 
     // The refusal lands ahead of workdir creation, so nothing was left behind.
     assert!(
@@ -66,10 +121,15 @@ fn explain_scope_reports_an_unmet_floor_and_still_exits_zero() {
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  containment: sealed\n");
 
+    let met = if host_achieved_containment() == "sealed" {
+        "floor met: yes"
+    } else {
+        "floor met: no"
+    };
     mur_run(&home, project.path(), &["--explain-scope"])
         .success()
         .stdout(predicate::str::contains("declared:  sealed"))
-        .stdout(predicate::str::contains("floor met: no"));
+        .stdout(predicate::str::contains(met));
 
     assert!(
         !project.path().join("workdir").exists(),
@@ -101,13 +161,15 @@ fn explain_scope_json_emits_one_machine_readable_line() {
 
     let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(report["declared_containment"], "sealed");
-    assert_eq!(report["floor_met"], false);
     assert_eq!(
         report["network_allow"],
         serde_json::json!(["https://api.example.com"])
     );
-    // Never `sealed`, on any host this suite can run on.
-    assert_ne!(report["achieved_containment"], "sealed");
+    // `floor_met` follows the host, and the two fields must agree with each other — that
+    // consistency is the host-independent claim, not either field's value.
+    let achieved_is_sealed = report["achieved_containment"] == "sealed";
+    assert_eq!(report["floor_met"], achieved_is_sealed);
+    assert_eq!(report["shortfall_reason"].is_null(), achieved_is_sealed);
 }
 
 #[test]
@@ -130,9 +192,10 @@ fn the_cli_flag_can_raise_a_floor_the_manifest_never_declared() {
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");
 
-    mur_run(&home, project.path(), &["--containment", "sealed"])
-        .failure()
-        .stderr(predicate::str::contains("E-CAP-003"));
+    let assertion = mur_run(&home, project.path(), &["--containment", "sealed"]).failure();
+    if host_achieved_containment() != "sealed" {
+        assertion.stderr(predicate::str::contains("E-CAP-003"));
+    }
 }
 
 #[test]

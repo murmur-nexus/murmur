@@ -22,6 +22,7 @@ pub mod plan;
 pub mod resources;
 pub mod runtime;
 pub(crate) mod sandbox;
+pub mod sealed;
 pub mod security;
 pub(crate) mod shell;
 pub(crate) mod streaming;
@@ -30,8 +31,9 @@ pub mod types;
 
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    explain_scope, ScopeReport,
+    detect_sealed_blocker, explain_scope, ScopeReport,
 };
+pub use sealed::SealedBlocker;
 pub use errors::RuntimeError;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};

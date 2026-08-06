@@ -24,6 +24,17 @@ pub(crate) struct DispatchOutcome {
     /// a binary or WASM component. Used by the agent loop to write a `skill_call` trace
     /// event instead of a `tool_call` event.
     pub is_skill: bool,
+    /// Set when this dispatch failed in a way that ends the *session* rather than just this
+    /// tool call — today only a `sealed` composed-root construction failure
+    /// ([`crate::shell::ShellExecError::session_fatal`]). `result` still describes the failed
+    /// call so the trace records what was attempted; the agent turn loop then returns this
+    /// error instead of feeding the failure back to the model for another turn.
+    ///
+    /// A dispatch that merely failed leaves this `None`: a capsule reacting to a broken tool
+    /// call is ordinary, whereas a capsule continuing to run after its declared containment
+    /// boundary stopped being establishable is the silent-degradation failure mode the whole
+    /// containment-class mechanism exists to prevent.
+    pub fatal: Option<crate::errors::RuntimeError>,
 }
 
 impl DispatchOutcome {
@@ -32,6 +43,7 @@ impl DispatchOutcome {
             result,
             shell: None,
             is_skill: false,
+            fatal: None,
         }
     }
 
@@ -40,6 +52,7 @@ impl DispatchOutcome {
             result,
             shell: None,
             is_skill: true,
+            fatal: None,
         }
     }
 }
@@ -114,6 +127,19 @@ pub struct CapabilityPolicy {
     /// inside its wasmtime store, this bounds the processes the host forks. See
     /// [`crate::resources`].
     pub resources: crate::resources::HostResourceLimits,
+    /// The containment class this capsule asked for, from `capabilities.containment`.
+    ///
+    /// Unlike every other field here it is a *requirement*, not a grant — and unlike
+    /// `StageRequest::declared_containment_floor` it is only the manifest's own vote, before the
+    /// workspace config and `--containment` are folded in. `stage_session` overwrites it with the
+    /// combined floor as soon as that is known, so anything reading it off a `StagedSession` sees
+    /// the effective value; the manifest-only value exists so a `CapabilityPolicy` built straight
+    /// from a manifest is still self-consistent.
+    ///
+    /// Read by `sandbox::ShellEnforcement::resolve` to decide whether a sealed-capable host
+    /// actually installs a composed root for this session — a capsule that declared `scoped` must
+    /// keep getting `scoped`'s mechanism. See `sandbox::applied_tier`.
+    pub containment_floor: murmur_artifact::ContainmentClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +336,9 @@ pub fn capability_policy_from_runtime_manifest(
         env_allow,
         limits,
         resources,
+        containment_floor: caps
+            .and_then(|c| c.containment)
+            .unwrap_or_default(),
     }
 }
 

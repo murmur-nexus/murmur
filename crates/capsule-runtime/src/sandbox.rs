@@ -48,8 +48,14 @@
 //! primitive and permanently falls back to the existing, unmodified synthetic-HOME/env-
 //! stripping mechanism in `shell.rs` — see `EnforcementTier::EnvironmentOnly`.
 //!
-//! ## Three-tier model
+//! ## Four-tier model
 //!
+//! - `KernelSealed` (Linux, everything `KernelFull` has, plus a usable unprivileged user+mount
+//!   namespace — AppArmor out of the way, `unshare` + `mount` verified by a real probe): the
+//!   subprocess tree additionally runs inside a private mount namespace pivoted onto a composed
+//!   root, so paths outside it are *absent* rather than denied. Landlock and seccomp still install,
+//!   inside the new root, as defence in depth — see [`crate::sealed`]. Only capsules that declare
+//!   `capabilities.containment: sealed` get this; see `applied_tier`.
 //! - `KernelFull` (Linux, Landlock ABI available — kernel 5.13+): seccomp syscall allowlist +
 //!   exec/network allowlisting + socket-domain denial + Landlock filesystem scoping.
 //! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp syscall allowlist +
@@ -61,8 +67,10 @@
 //!   Permanent, not a placeholder for a future slice.
 //!
 //! Tier detection is always a runtime capability probe (attempt Landlock ruleset
-//! construction, inspect the resulting `RulesetStatus`) — never a hardcoded kernel-version
-//! string parse, which is fragile against distro backports.
+//! construction, inspect the resulting `RulesetStatus`; fork a child and really call
+//! `unshare(CLONE_NEWUSER | CLONE_NEWNS)` followed by a `mount(2)`) — never a hardcoded
+//! kernel-version string parse, which is fragile against distro backports, and never a config
+//! file. The probes run once per process and are cached; see `host_probe`.
 //!
 //! ## Fail-closed invariant
 //!
@@ -88,6 +96,15 @@ use crate::types::CapabilityPolicy;
 /// strength. Always host-probed at launch time — never sourced from the manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnforcementTier {
+    /// Linux, and everything `KernelFull` has *plus* a private mount namespace pivoted onto a
+    /// composed root (see [`crate::sealed`]): the shipped AppArmor profile is loaded (or AppArmor
+    /// imposes no unprivileged-userns restriction), a real `unshare` + `mount` probe succeeded,
+    /// and the Landlock ABI is usable. Paths outside the composed root are *absent*, not merely
+    /// denied — and Landlock and seccomp still install inside it, as defence in depth.
+    ///
+    /// Ranked first because it is the strongest tier; the enum is documented weakest-last and
+    /// carries no `Ord`, so this position is documentation, not a comparison.
+    KernelSealed,
     /// Linux, Landlock ABI available (kernel 5.13+): seccomp exec/network allowlisting
     /// + Landlock filesystem scoping.
     KernelFull,
@@ -99,34 +116,113 @@ pub(crate) enum EnforcementTier {
     EnvironmentOnly,
 }
 
-/// Pure decision: given whether the host is Linux and (if so) the outcome of a Landlock
-/// ruleset-restriction probe, decide the tier. No syscalls here — fully unit-testable on
-/// any OS.
+/// Pure decision: given whether the host is Linux, the outcome of a Landlock
+/// ruleset-restriction probe, and what [`crate::sealed::probe_sealed_support`] found, decide the
+/// tier. No syscalls here — fully unit-testable on any OS.
+///
+/// `KernelSealed` requires the whole conjunction — Linux, a usable Landlock ABI, AppArmor out of
+/// the way, and a namespace probe that really created one. Any missing element falls back to the
+/// tier that element still supports; nothing here ever reports a mechanism the host did not
+/// demonstrate.
 pub(crate) fn tier_from_probe(
     is_linux: bool,
     landlock_fully_enforced: Option<bool>,
+    sealed: crate::sealed::SealedProbe,
 ) -> EnforcementTier {
     if !is_linux {
         return EnforcementTier::EnvironmentOnly;
     }
     match landlock_fully_enforced {
+        Some(true)
+            if sealed.apparmor_permits_userns
+                && sealed.namespace == crate::sealed::NamespaceProbe::Ok =>
+        {
+            EnforcementTier::KernelSealed
+        }
         Some(true) => EnforcementTier::KernelFull,
         Some(false) | None => EnforcementTier::KernelSeccompOnly,
     }
 }
 
+/// The tier this *session* actually applies, which is never stronger than the host can back and
+/// never stronger than the capsule asked for.
+///
+/// A capsule declaring `scoped` on a sealed-capable host keeps running exactly as it does today:
+/// the composed root would otherwise silently delete host paths its `interpreter_runtime` grants
+/// legitimately point at, which is a regression to `scoped`'s behaviour dressed up as extra
+/// security. The declared floor is honoured, not merely met.
+///
+/// It is deliberately *not* symmetric with the achieved class recorded in the trace: `achieved`
+/// answers "what can this host back" (a host fact) and is probed independently, while this answers
+/// "what did this session install" (a session fact).
+pub(crate) fn applied_tier(
+    host_tier: EnforcementTier,
+    declared: murmur_artifact::ContainmentClass,
+) -> EnforcementTier {
+    match host_tier {
+        EnforcementTier::KernelSealed
+            if declared < murmur_artifact::ContainmentClass::Sealed =>
+        {
+            EnforcementTier::KernelFull
+        }
+        other => other,
+    }
+}
+
+/// The three host facts the tier decision is made from, probed once per process.
+///
+/// Cached because two of the three probes have a cost worth paying once and not per session: the
+/// Landlock probe places the runtime process into a (fully permissive) Landlock domain, and the
+/// namespace probe forks a child.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct HostProbe {
+    landlock_fully_enforced: Option<bool>,
+    sealed: crate::sealed::SealedProbe,
+}
+
+#[cfg(target_os = "linux")]
+fn host_probe() -> HostProbe {
+    static PROBE: std::sync::OnceLock<HostProbe> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| HostProbe {
+        landlock_fully_enforced: linux_enforce::probe_landlock_full_access(),
+        sealed: crate::sealed::probe_sealed_support(),
+    })
+}
+
 /// Real host probe. On Linux, attempts to build a Landlock ruleset and call
 /// `.restrict_self()`, mapping `RulesetStatus::FullyEnforced` to `Some(true)` and anything
 /// else (`PartiallyEnforced`/`NotEnforced`, or any construction error) to `Some(false)`,
-/// then delegates to `tier_from_probe`. Off Linux, never probes anything.
+/// probes the sealed mechanism, then delegates to `tier_from_probe`. Off Linux, never probes
+/// anything.
 #[cfg(target_os = "linux")]
 pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
-    tier_from_probe(true, linux_enforce::probe_landlock_full_access())
+    let probe = host_probe();
+    tier_from_probe(true, probe.landlock_fully_enforced, probe.sealed)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
-    tier_from_probe(false, None)
+    tier_from_probe(false, None, crate::sealed::probe_sealed_support())
+}
+
+/// Which single mechanism keeps this host below `sealed`, or `None` when nothing does.
+///
+/// Reads the same cached probe [`detect_enforcement_tier`] does, so the refusal an operator sees
+/// and the tier the runtime installs can never disagree about the host.
+#[cfg(target_os = "linux")]
+pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
+    let probe = host_probe();
+    crate::sealed::sealed_blocker(
+        true,
+        probe.landlock_fully_enforced == Some(true),
+        probe.sealed,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
+    crate::sealed::sealed_blocker(false, false, crate::sealed::probe_sealed_support())
 }
 
 /// Resolves every host in `network_allow` (via `crate::network_policy::parse_network_allow_rules`,
@@ -641,6 +737,52 @@ pub(crate) fn resolve_interpreter_runtime_grants(
             })
         })
         .collect()
+}
+
+/// The host directories a composed root must carry *beyond* [`crate::sealed::SEALED_RUNTIME_PATHS`]
+/// for this capsule's `shell.allow` to keep working: the containing directory of each resolved
+/// allowlisted binary, and each declared `interpreter_runtime` directory.
+///
+/// Whole directories, deduplicated, and only the ones not already inside a fixed runtime path.
+/// This is the deliberate opposite of `resolve_landlock_grants`: no ELF parsing, no `DT_NEEDED`
+/// closure, no per-file grant — a bind mount carries a directory's whole contents, so the closure
+/// derivation `scoped` needs has nothing left to do here. A later slice
+/// (`staged-runtime-bind-mount`) replaces this with a staged interpreter tree.
+///
+/// Pure and syscall-free, so it is unit-testable on any platform.
+pub(crate) fn resolve_sealed_bind_dirs(
+    exec_allow_paths: &[PathBuf],
+    policy: &CapabilityPolicy,
+) -> Vec<PathBuf> {
+    let fixed: Vec<&Path> = crate::sealed::SEALED_RUNTIME_PATHS
+        .iter()
+        .map(Path::new)
+        .collect();
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let candidates = exec_allow_paths
+        .iter()
+        .filter_map(|binary| binary.parent().map(Path::to_path_buf))
+        .chain(
+            policy
+                .shell_interpreter_runtime
+                .iter()
+                .flat_map(|grant| grant.dirs.iter().map(|dir| PathBuf::from(&dir.path))),
+        );
+
+    for candidate in candidates {
+        if !candidate.is_absolute() {
+            continue;
+        }
+        if fixed.iter().any(|root| candidate.starts_with(root)) {
+            continue;
+        }
+        if dirs.contains(&candidate) {
+            continue;
+        }
+        dirs.push(candidate);
+    }
+    dirs
 }
 
 // ---- fixed capsule device set (this slice) ----------------------------------------------
@@ -1380,6 +1522,15 @@ pub(crate) struct ShellEnforcement {
     /// for parity but never read off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) landlock_grants: Vec<LandlockGrant>,
+    /// Host directories this capsule needs bind-mounted read-only into its composed root *beyond*
+    /// the fixed [`crate::sealed::SEALED_RUNTIME_PATHS`]: the containing directory of each
+    /// resolved `shell.allow` binary, and each `capabilities.shell.interpreter_runtime` directory.
+    ///
+    /// Whole directories, never files — this slice must not extend the ELF-closure grant
+    /// derivation it exists to make unnecessary. Consumed only on `KernelSealed`; resolved on
+    /// every platform for parity, exactly like `landlock_grants` above.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) sealed_bind_dirs: Vec<PathBuf>,
     /// Fully-resolved OS-level bounds for every subprocess this session spawns — `rlimit(2)`
     /// ceilings applied before `execve`, plus the values the cgroup scope below was built from.
     /// Unlike everything above it, this is enforced on **every** platform: `setrlimit` is POSIX,
@@ -1409,8 +1560,14 @@ impl ShellEnforcement {
     /// The rlimit half of [`crate::resources`] is resolved here too (it needs nothing but the
     /// policy), while the cgroup scope and workdir guard are session-scoped live handles the
     /// caller creates and attaches with [`Self::with_host_bounding`].
-    pub(crate) fn resolve(policy: &CapabilityPolicy) -> Result<Self, String> {
-        let tier = detect_enforcement_tier();
+    ///
+    /// `declared` is the already-combined containment floor for the session. It is what decides
+    /// whether a sealed-capable host actually installs a composed root — see [`applied_tier`].
+    pub(crate) fn resolve(
+        policy: &CapabilityPolicy,
+        declared: murmur_artifact::ContainmentClass,
+    ) -> Result<Self, String> {
+        let tier = applied_tier(detect_enforcement_tier(), declared);
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
         // The b3220cb5 `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
@@ -1420,12 +1577,14 @@ impl ShellEnforcement {
             LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
         landlock_grants
             .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
+        let sealed_bind_dirs = resolve_sealed_bind_dirs(&exec_allow_paths, policy);
         Ok(Self {
             tier,
             network_allow_ips,
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
+            sealed_bind_dirs,
             resource_limits: policy.resources,
             nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
             cgroup_scope: None,
@@ -1485,6 +1644,7 @@ impl ShellEnforcement {
             unix_sockets_allowed: false,
             exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
+            sealed_bind_dirs: Vec::new(),
             // Defaults, not "no limits": the rlimit ceilings are the one part of this slice that
             // applies unchanged on this tier, so zeroing them out here would misrepresent what a
             // real macOS host does.
@@ -1532,6 +1692,23 @@ drops every Linux capability and sets no_new_privs before execve — but this me
 been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
 isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
 
+/// `KernelSealed`'s counterpart to [`KERNEL_UNVERIFIED_WARNING`], carrying the same `W_SEC_005`
+/// code for the same reason: the mechanism is real and installed, but the team has not yet run the
+/// manual acceptance procedure against it on real hardware, and a silent strongest tier would
+/// imply otherwise. It names what `sealed` adds over `scoped` so the warning is not merely a
+/// louder copy of the one below.
+const KERNEL_SEALED_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this \
+host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
+namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
+the only writable path, a private /dev tmpfs carrying the OCI default device set), with Landlock \
+and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
+rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
+private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
+so host process metadata stays visible there exactly as it is under scoped. This mechanism has \
+been checked by hand on one host and not yet by the team on hardware of their own — see \
+docs/content/reference/sealed-containment-manual-verification.md — so treat the containment \
+boundary as not-yet-confirmed until that procedure has been run again independently.";
+
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
 kernel-enforced at all, and the seccomp exec/network enforcement that would apply has not been \
@@ -1573,6 +1750,7 @@ pub(crate) fn tier_warning(
         return None;
     }
     match tier {
+        EnforcementTier::KernelSealed => Some((W_SEC_005, KERNEL_SEALED_UNVERIFIED_WARNING)),
         EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING)),
         EnforcementTier::KernelSeccompOnly => Some((W_SEC_002, SECCOMP_ONLY_WARNING)),
         EnforcementTier::EnvironmentOnly => Some((W_SEC_001, ENVIRONMENT_ONLY_WARNING)),
@@ -1752,6 +1930,47 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     pub(crate) static FORCE_LANDLOCK_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Fails the composed-root step of a `KernelSealed` launch. Exists because the real step can
+    /// only fail on a host that can attempt it at all, and the thing under test — that a
+    /// composed-root failure keeps its identity from the child's diagnostic pipe all the way to
+    /// the CLI's `E-RUN-014` — must be verifiable on any Linux host, including the CI containers
+    /// that can never reach `KernelSealed`. Short-circuits before any real namespace syscall.
+    pub(crate) static FORCE_SEALED_ROOT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII arm for [`FORCE_SEALED_ROOT_FAILURE`]. Lives beside the flag rather than in one test
+/// module because two of them need it: `sandbox`'s (which checks what `execute_shell` returns)
+/// and `runtime`'s (which checks what the dispatch layer does with it).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ForceSealedRootFailureGuard;
+
+#[cfg(all(test, target_os = "linux"))]
+impl ForceSealedRootFailureGuard {
+    pub(crate) fn new() -> Self {
+        FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for ForceSealedRootFailureGuard {
+    fn drop(&mut self) {
+        FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
+/// A `KernelSealed` enforcement with no grants, for the forced-failure tests. The parent-side
+/// half of the sealed mechanism still runs for real against it (the composed root is planned and
+/// its spec built); only the child's execution of that spec is short-circuited by the seam above,
+/// which is what makes these tests run identically on a sealed-capable host and on one that could
+/// never reach `KernelSealed` at all.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
+    ShellEnforcement {
+        tier: EnforcementTier::KernelSealed,
+        ..ShellEnforcement::environment_only()
+    }
 }
 
 /// Attach the OS-level *process* bounds — hard rlimits, and cgroup membership where a scope
@@ -1912,11 +2131,26 @@ pub(crate) fn prepare_enforcement(
     // EINVAL at the `.spawn()` call site. Grant paths that fail to open are silently dropped
     // (shrink-not-fail), exactly as before; only the *where* of the open moved. Landlock rules
     // only apply on `KernelFull`, so `KernelSeccompOnly` opens nothing.
-    let landlock_fds = if enforcement.tier == EnforcementTier::KernelFull {
+    let landlock_fds = if matches!(
+        enforcement.tier,
+        EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+    ) {
         Some(linux_enforce::open_landlock_fds(
             workdir,
             &enforcement.landlock_grants,
+            &landlock_device_grants(enforcement.tier),
         )?)
+    } else {
+        None
+    };
+
+    // Resolve the whole composed root in the PARENT for the same reason the Landlock fds are
+    // opened here: every path lookup, every `PathBuf::join` and every allocation the child would
+    // otherwise perform inside `pre_exec` — the window where the allocator lock may be held by a
+    // thread that no longer exists — happens now instead, synchronously, where a failure names
+    // itself. See `crate::sealed` for the plan/execute split.
+    let sealed_spec = if enforcement.tier == EnforcementTier::KernelSealed {
+        Some(build_sealed_root(workdir, &enforcement.sealed_bind_dirs)?)
     } else {
         None
     };
@@ -2016,6 +2250,7 @@ pub(crate) fn prepare_enforcement(
             let sock_fd = child_sock.as_raw_fd();
             match linux_enforce::child_install_enforcement(
                 tier,
+                sealed_spec.as_ref(),
                 landlock_fds.as_ref(),
                 sock_fd,
                 unix_sockets_allowed,
@@ -2039,6 +2274,90 @@ pub(crate) fn prepare_enforcement(
     ))
 }
 
+/// Which fixed device set Landlock grants, keyed on the tier.
+///
+/// Landlock keeps mediating inside a composed root, so the two device *lists* have to agree: a
+/// device present in the sealed `/dev` but absent from the Landlock rules would exist and be
+/// unopenable, which reads as a runtime bug rather than as policy. `KernelFull` keeps
+/// [`CAPSULE_DEVICE_GRANTS`] exactly as it is — that constant services `scoped` and this slice
+/// does not touch it — while `KernelSealed` derives its own from
+/// [`crate::sealed::SEALED_DEVICE_NODES`], the same list the private `/dev` tmpfs is built from.
+///
+/// The parent opens these paths on the *host*, before the namespace exists; because the composed
+/// root bind-mounts the host's own nodes rather than creating new ones, the inodes the rules name
+/// are the inodes the capsule reaches.
+#[cfg(target_os = "linux")]
+fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
+    match tier {
+        EnforcementTier::KernelSealed => crate::sealed::SEALED_DEVICE_NODES
+            .iter()
+            .map(|device| CapsuleDeviceGrant {
+                path: device.path,
+                writable: device.writable,
+            })
+            .collect(),
+        _ => CAPSULE_DEVICE_GRANTS.to_vec(),
+    }
+}
+
+/// Parent-side half of the sealed mechanism: pick a base, plan the composed root against the real
+/// host layout, create the workdir-backed `/tmp` store, and lower the plan into the C-string form
+/// the forked child executes.
+///
+/// Every failure here is synchronous and named, before `.spawn()` is called at all — the same
+/// reason `open_landlock_fds` moved its `open()` calls out of `pre_exec`. A capsule that reaches
+/// this point has already cleared `check_containment_floor`, so a failure here is a genuine
+/// host-state surprise (an unwritable workdir, a host with none of the base candidates), not a
+/// declared-vs-achieved mismatch.
+#[cfg(target_os = "linux")]
+fn build_sealed_root(
+    workdir: &Path,
+    extra_read_only: &[PathBuf],
+) -> Result<crate::sealed::SealedRootSpec, String> {
+    use crate::sealed;
+
+    // The workdir must be absolute for its path to mean the same thing inside the composed root,
+    // and `launch_session` always creates it as one — but the composed root's whole design rests
+    // on it, so it is checked rather than assumed.
+    if !workdir.is_absolute() {
+        return Err(format!(
+            "sealed: session workdir {} is not absolute; a composed root reproduces the workdir at \
+             its own absolute path",
+            workdir.display()
+        ));
+    }
+
+    let base = sealed::choose_root_base(workdir, sealed::SEALED_ROOT_BASE_CANDIDATES, |path| {
+        path.is_dir()
+    })
+    .ok_or_else(|| {
+        format!(
+            "sealed: no usable base directory for the composed root; none of {:?} exists outside \
+             the session workdir's own path",
+            sealed::SEALED_ROOT_BASE_CANDIDATES
+        )
+    })?;
+
+    // `/tmp` inside the composed root is backed by this directory, so it is created here rather
+    // than from inside `pre_exec`. See `sealed::SEALED_TMP_DIR_NAME` for why /tmp is workdir-backed
+    // rather than a second tmpfs.
+    let tmp_store = workdir.join(sealed::SEALED_TMP_DIR_NAME);
+    std::fs::create_dir_all(&tmp_store).map_err(|error| {
+        format!(
+            "sealed: failed to create the workdir-backed /tmp store at {}: {error}",
+            tmp_store.display()
+        )
+    })?;
+
+    let plan = sealed::plan_composed_root(
+        workdir,
+        &base,
+        extra_read_only,
+        &sealed::RealHostLayout,
+    );
+    sealed::build_sealed_root_spec(&plan)
+}
+
 /// Linux-only mechanics: fd-passing side channel, seccomp filter construction, Landlock
 /// application, and the background notify-request supervisor loop.
 ///
@@ -2058,7 +2377,7 @@ mod linux_enforce {
     use landlock::{make_bitflags, AccessFs, BitFlags};
 
     use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
-    use super::{EnforcementTier, LandlockGrant, SupervisorHandle, CAPSULE_DEVICE_GRANTS};
+    use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
 
     /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
     /// naming the failed step is far shorter than this; the bound just keeps the best-effort
@@ -2149,37 +2468,87 @@ mod linux_enforce {
         }
     }
 
-    /// Probes real Landlock support by actually building a ruleset and calling
-    /// `restrict_self()`, granting itself full access to `/` so the probe has no observable
-    /// effect on the calling (host) process beyond placing it into a Landlock domain that
-    /// permits everything — Landlock domains only ever get *stricter* on further nesting, and
-    /// the real per-shell-call restriction (scoped to `workdir`) is applied separately, inside
-    /// each spawned child's own `pre_exec`, not here. This is the "runtime capability probe"
-    /// the tier detection requires, without functionally sandboxing the whole host process
-    /// from a mere capability check.
+    /// Probes real Landlock support by building a ruleset granting full access to `/` and
+    /// calling `restrict_self()` **in a forked child**, so the host process is never placed
+    /// into a Landlock domain by a mere capability check.
+    ///
+    /// Forking is required, not defensive. An earlier version restricted the calling process
+    /// on the grounds that a domain permitting everything has "no observable effect" — that is
+    /// false, and the rights the ruleset grants are beside the point. Entering *any* Landlock
+    /// domain permanently forbids the mount family to the task and every descendant it will
+    /// ever have; Landlock is designed that way precisely to stop a sandbox being escaped
+    /// through a nested namespace. Since `host_probe` runs this before the sealed probe, and
+    /// both run inside `ShellEnforcement::resolve` before any fork that would build a composed
+    /// root, restricting in-process poisoned `sealed` on every host, on every invocation — the
+    /// namespace was created and then `mount` was refused, with nothing in the error to
+    /// suggest the runtime had done it to itself.
+    ///
+    /// The ruleset is built in the parent because creating one and adding rules restricts
+    /// nothing; only `restrict_self` applies it. That keeps everything the child does after
+    /// the fork down to a `prctl` and one syscall.
     pub(super) fn probe_landlock_full_access() -> Option<bool> {
         use landlock::{
             Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
             RulesetCreatedAttr, RulesetStatus, ABI,
         };
 
+        // The child reports which of the three outcomes it reached through its exit status;
+        // nothing else crosses the fork.
+        const PROBE_FULLY_ENFORCED: i32 = 0;
+        const PROBE_PARTIAL: i32 = 1;
+        const PROBE_FAILED: i32 = 2;
+
         let abi = ABI::V1;
         let access_all = AccessFs::from_all(abi);
 
         let root_fd = PathFd::new("/").ok()?;
 
-        let status = Ruleset::default()
+        let ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(access_all)
             .ok()?
             .create()
             .ok()?
             .add_rule(PathBeneath::new(root_fd, access_all))
-            .ok()?
-            .restrict_self()
             .ok()?;
 
-        Some(matches!(status.ruleset, RulesetStatus::FullyEnforced))
+        // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
+        // confines itself to async-signal-safe work. Everything this child does is the
+        // `restrict_self` syscall pair and `_exit`; the allocating part of building the
+        // ruleset already happened above, in the parent.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return None;
+        }
+        if pid == 0 {
+            let code = match ruleset.restrict_self() {
+                Ok(status) => {
+                    if matches!(status.ruleset, RulesetStatus::FullyEnforced) {
+                        PROBE_FULLY_ENFORCED
+                    } else {
+                        PROBE_PARTIAL
+                    }
+                }
+                Err(_) => PROBE_FAILED,
+            };
+            // SAFETY: forked-child context; `_exit` skips every destructor and atexit hook,
+            // which is what keeps the parent's state untouched.
+            unsafe { libc::_exit(code) }
+        }
+
+        let mut wait_status: libc::c_int = 0;
+        // SAFETY: `pid` is the child just forked; `wait_status` is a live local.
+        let waited = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
+        if waited < 0 || !libc::WIFEXITED(wait_status) {
+            return None;
+        }
+        match libc::WEXITSTATUS(wait_status) {
+            PROBE_FULLY_ENFORCED => Some(true),
+            PROBE_PARTIAL => Some(false),
+            // A `restrict_self` that errored tells us nothing either way, which is the same
+            // answer the pre-fork version gave by propagating `None` out of `.ok()?`.
+            _ => None,
+        }
     }
 
     /// Runs inside the forked child, pre-exec: strips the child's Linux capabilities, installs
@@ -2191,10 +2560,35 @@ mod linux_enforce {
     /// after fork.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
+        sealed_spec: Option<&crate::sealed::SealedRootSpec>,
         landlock_fds: Option<&LandlockChildFds>,
         child_sock_fd: RawFd,
         unix_sockets_allowed: bool,
     ) -> io::Result<()> {
+        // FIRST, and only on `KernelSealed`: build the private mount namespace and pivot onto the
+        // composed root. This has to precede every other step in this closure, for one reason that
+        // is not a matter of taste — `SECCOMP_MUST_STAY_DENIED` denies `unshare`, `mount` and
+        // `pivot_root` to every process the filter below covers, permanently and deliberately.
+        // The composed root is therefore built by this process while it still has its pre-filter
+        // credentials, never by a syscall the sandboxed subprocess is later permitted to make.
+        // The three steps that follow then run *inside* the new root: `drop_all_capabilities`
+        // strips the (namespace-local) capabilities `unshare` handed out, seccomp installs, and
+        // Landlock's rules — built from fds the parent opened, so unaffected by the pivot —
+        // re-scope the same inodes under their new pathnames. Defence in depth, in that order.
+        if tier == EnforcementTier::KernelSealed {
+            if let Some(spec) = sealed_spec {
+                #[cfg(test)]
+                if super::FORCE_SEALED_ROOT_FAILURE.with(|flag| flag.get()) {
+                    return Err(io::Error::other(format!(
+                        "{} unshare(CLONE_NEWUSER|CLONE_NEWNS) failed (forced by test seam)",
+                        crate::sealed::SEALED_ROOT_FAILURE_PREFIX
+                    )));
+                }
+                crate::sealed::construct_composed_root(spec)
+                    .map_err(|failure| io::Error::other(spec.describe(failure)))?;
+            }
+        }
+
         // Before anything else in this window, on every kernel tier: shut the fd-inheritance
         // door. Landlock (KernelFull only) mediates *new* filesystem operations against the
         // ruleset installed further down this function — it can do nothing about a descriptor
@@ -2240,7 +2634,10 @@ mod linux_enforce {
 
         install_seccomp_filter(child_sock_fd, unix_sockets_allowed)?;
 
-        if tier == EnforcementTier::KernelFull {
+        if matches!(
+            tier,
+            EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+        ) {
             if let Some(fds) = landlock_fds {
                 apply_landlock_scope(fds).map_err(io::Error::other)?;
             }
@@ -2891,15 +3288,17 @@ mod linux_enforce {
     /// spawned — instead of collapsing to a bare EINVAL inside `pre_exec`. A grant path that fails
     /// to open is dropped (shrink-not-fail), matching the previous per-grant `continue`.
     ///
-    /// The fixed [`CAPSULE_DEVICE_GRANTS`] paths are opened here too, by the same rules: they take
-    /// no argument (the list is a compile-time constant, not manifest-derived), and a host where
-    /// one of the three cannot be opened — unusual, but a broken or minimal `/dev` is possible —
-    /// loses that one device rather than failing the launch. Losing `/dev/null` here degrades to
-    /// exactly the behavior that existed before this mechanism, which is a strictly narrower scope,
-    /// never a wider one.
+    /// `device_grants` — the tier's fixed device set, [`super::CAPSULE_DEVICE_GRANTS`] on
+    /// `KernelFull` and the composed root's own OCI default set on `KernelSealed`, chosen by
+    /// `super::landlock_device_grants` — is opened here too, by the same rules: the list is a
+    /// compile-time constant rather than manifest-derived, and a host where one entry cannot be
+    /// opened — unusual, but a broken or minimal `/dev` is possible — loses that one device rather
+    /// than failing the launch. Losing `/dev/null` here degrades to exactly the behavior that
+    /// existed before this mechanism, which is a strictly narrower scope, never a wider one.
     pub(super) fn open_landlock_fds(
         workdir: &Path,
         landlock_grants: &[LandlockGrant],
+        device_grants: &[super::CapsuleDeviceGrant],
     ) -> Result<LandlockChildFds, String> {
         let workdir_fd = open_o_path(workdir).map_err(|error| {
             format!(
@@ -2919,8 +3318,8 @@ mod linux_enforce {
             }
         }
 
-        let mut devices = Vec::with_capacity(CAPSULE_DEVICE_GRANTS.len());
-        for device in CAPSULE_DEVICE_GRANTS {
+        let mut devices = Vec::with_capacity(device_grants.len());
+        for device in device_grants {
             match open_o_path(Path::new(device.path)) {
                 Ok(fd) => devices.push(OpenDeviceGrant {
                     fd,
@@ -3339,38 +3738,178 @@ mod tests {
         );
     }
 
+    /// A host that can back the sealed mechanism: AppArmor out of the way, and a namespace probe
+    /// that really created one.
+    fn sealed_capable() -> crate::sealed::SealedProbe {
+        crate::sealed::SealedProbe {
+            apparmor_permits_userns: true,
+            namespace: crate::sealed::NamespaceProbe::Ok,
+        }
+    }
+
+    /// A host that cannot: the default, which claims nothing.
+    fn sealed_incapable() -> crate::sealed::SealedProbe {
+        crate::sealed::SealedProbe::default()
+    }
+
     #[test]
     fn tier_from_probe_non_linux_is_always_environment_only() {
-        assert_eq!(
-            tier_from_probe(false, None),
-            EnforcementTier::EnvironmentOnly
-        );
-        assert_eq!(
-            tier_from_probe(false, Some(true)),
-            EnforcementTier::EnvironmentOnly
-        );
-        assert_eq!(
-            tier_from_probe(false, Some(false)),
-            EnforcementTier::EnvironmentOnly
-        );
+        for landlock in [None, Some(true), Some(false)] {
+            for sealed in [sealed_capable(), sealed_incapable()] {
+                assert_eq!(
+                    tier_from_probe(false, landlock, sealed),
+                    EnforcementTier::EnvironmentOnly
+                );
+            }
+        }
     }
 
     #[test]
     fn tier_from_probe_linux_fully_enforced_is_kernel_full() {
-        assert_eq!(tier_from_probe(true, Some(true)), EnforcementTier::KernelFull);
+        assert_eq!(
+            tier_from_probe(true, Some(true), sealed_incapable()),
+            EnforcementTier::KernelFull
+        );
     }
 
     #[test]
     fn tier_from_probe_linux_partially_enforced_is_seccomp_only() {
         assert_eq!(
-            tier_from_probe(true, Some(false)),
+            tier_from_probe(true, Some(false), sealed_incapable()),
             EnforcementTier::KernelSeccompOnly
         );
     }
 
     #[test]
     fn tier_from_probe_linux_no_probe_result_is_seccomp_only() {
-        assert_eq!(tier_from_probe(true, None), EnforcementTier::KernelSeccompOnly);
+        assert_eq!(
+            tier_from_probe(true, None, sealed_incapable()),
+            EnforcementTier::KernelSeccompOnly
+        );
+    }
+
+    /// The whole conjunction, one element removed at a time: `KernelSealed` needs Linux, a usable
+    /// Landlock ABI, AppArmor out of the way, and a namespace probe that succeeded — and drops to
+    /// exactly the tier the missing element still supports, never further.
+    #[test]
+    fn tier_from_probe_reaches_sealed_only_when_every_precondition_holds() {
+        use crate::sealed::{NamespaceProbe, SealedProbe};
+
+        assert_eq!(
+            tier_from_probe(true, Some(true), sealed_capable()),
+            EnforcementTier::KernelSealed
+        );
+
+        // No AppArmor profile (and the restriction is on) → the mechanism is unavailable, but
+        // Landlock still is: `scoped`, not `advisory`.
+        assert_eq!(
+            tier_from_probe(
+                true,
+                Some(true),
+                SealedProbe { apparmor_permits_userns: false, namespace: NamespaceProbe::Ok }
+            ),
+            EnforcementTier::KernelFull
+        );
+
+        // The container case, and its three other namespace failure modes.
+        for namespace in [
+            NamespaceProbe::Denied,
+            NamespaceProbe::MapDenied,
+            NamespaceProbe::MountDenied,
+            NamespaceProbe::Unsupported,
+        ] {
+            assert_eq!(
+                tier_from_probe(
+                    true,
+                    Some(true),
+                    SealedProbe { apparmor_permits_userns: true, namespace }
+                ),
+                EnforcementTier::KernelFull,
+                "namespace probe {namespace:?} must fall back to KernelFull, never below it"
+            );
+        }
+
+        // Landlock missing: sealed keeps Landlock inside as defence in depth, so a host without it
+        // cannot reach sealed no matter how good its namespaces are.
+        assert_eq!(
+            tier_from_probe(true, Some(false), sealed_capable()),
+            EnforcementTier::KernelSeccompOnly
+        );
+        assert_eq!(
+            tier_from_probe(true, None, sealed_capable()),
+            EnforcementTier::KernelSeccompOnly
+        );
+
+        // Not Linux at all.
+        assert_eq!(
+            tier_from_probe(false, Some(true), sealed_capable()),
+            EnforcementTier::EnvironmentOnly
+        );
+    }
+
+    /// A capsule that declared the weaker class keeps the weaker mechanism, even where the host
+    /// could give it more. Silently installing a composed root under a `scoped` declaration would
+    /// delete host paths its `interpreter_runtime` grants legitimately name.
+    #[test]
+    fn applied_tier_never_installs_a_composed_root_for_a_weaker_declaration() {
+        use murmur_artifact::ContainmentClass;
+
+        assert_eq!(
+            applied_tier(EnforcementTier::KernelSealed, ContainmentClass::Sealed),
+            EnforcementTier::KernelSealed
+        );
+        for declared in [ContainmentClass::Advisory, ContainmentClass::Scoped] {
+            assert_eq!(
+                applied_tier(EnforcementTier::KernelSealed, declared),
+                EnforcementTier::KernelFull,
+                "declaring {declared} must not opt a capsule into the composed root"
+            );
+        }
+
+        // Every other tier is passed through untouched, whatever was declared — the declared floor
+        // can only ever weaken the applied mechanism, never strengthen it past the host.
+        for host_tier in [
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            for declared in [
+                ContainmentClass::Advisory,
+                ContainmentClass::Scoped,
+                ContainmentClass::Sealed,
+            ] {
+                assert_eq!(applied_tier(host_tier, declared), host_tier);
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_bind_dirs_are_whole_directories_outside_the_fixed_runtime_paths() {
+        use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
+
+        let policy = CapabilityPolicy {
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![
+                    // Already inside /usr, which the fixed list binds wholesale.
+                    InterpreterRuntimeDir { path: "/usr/lib/python3.11".to_string(), list_dir: true },
+                    InterpreterRuntimeDir { path: "/opt/py/lib".to_string(), list_dir: true },
+                    // A duplicate, and a relative path that names nothing absolute.
+                    InterpreterRuntimeDir { path: "/opt/py/lib".to_string(), list_dir: false },
+                    InterpreterRuntimeDir { path: "relative/lib".to_string(), list_dir: false },
+                ],
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let exec_allow = vec![
+            PathBuf::from("/usr/bin/python3"),
+            PathBuf::from("/opt/toolchain/bin/cc"),
+        ];
+
+        assert_eq!(
+            resolve_sealed_bind_dirs(&exec_allow, &policy),
+            vec![PathBuf::from("/opt/toolchain/bin"), PathBuf::from("/opt/py/lib")]
+        );
     }
 
     #[test]
@@ -4515,7 +5054,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("sandbox"),
+                error.to_string().contains("sandbox"),
                 "the error must name what failed to initialize: {error}"
             );
             assert!(
@@ -4541,6 +5080,34 @@ mod tests {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
+mod landlock_probe_isolation {
+    /// The Landlock probe must leave the calling process exactly as it found it.
+    ///
+    /// Stated as "the sealed probe gives the same answer before and after" rather than by
+    /// inspecting the process's Landlock domain, because there is no API to ask whether a task
+    /// is landlocked — and because that framing is what actually broke: the probe restricted
+    /// itself, and every later attempt to build a composed root was refused, on every host, in
+    /// a way that looked like the host's fault.
+    ///
+    /// Host-independent by construction. On a machine that cannot do `sealed` at all, both
+    /// halves report the same failure and this passes trivially; on a capable one, an
+    /// in-process `restrict_self` turns the second answer into a mount denial and fails it.
+    #[test]
+    fn the_landlock_probe_does_not_restrict_the_calling_process() {
+        let before = crate::sealed::probe_sealed_support().namespace;
+        let _ = super::linux_enforce::probe_landlock_full_access();
+        let after = crate::sealed::probe_sealed_support().namespace;
+
+        assert_eq!(
+            before, after,
+            "the Landlock probe changed what the sealed probe reports ({before:?} -> {after:?}) — \
+             it has restricted the calling process instead of a forked child, which permanently \
+             forbids the mount family to this process and everything it spawns",
+        );
+    }
+}
+
 #[cfg(test)]
 mod linux_integration_tests {
     use std::path::Path;
@@ -5283,6 +5850,17 @@ mod linux_integration_tests {
     /// child-side failure active, asserts the target script never ran (marker absent), and returns
     /// the resulting error string. The RAII guard `arm` returns stays alive across `.spawn()`.
     fn child_setup_failure_error<G>(arm: impl FnOnce() -> G) -> String {
+        child_setup_failure_typed(&kernel_full_empty_grants(), arm).to_string()
+    }
+
+    /// [`child_setup_failure_error`] without the lossy `.to_string()`, and over a caller-chosen
+    /// enforcement. Tests that care which *kind* of failure happened — not merely what it reads
+    /// like — use this: the whole point of the sealed composed-root failure is that it keeps its
+    /// identity out to the CLI instead of arriving as one more error string.
+    fn child_setup_failure_typed<G>(
+        enforcement: &ShellEnforcement,
+        arm: impl FnOnce() -> G,
+    ) -> crate::shell::ShellExecError {
         let temp = tempfile::tempdir().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
@@ -5298,7 +5876,7 @@ mod linux_integration_tests {
             &[],
             temp.path(),
             &policy,
-            &kernel_full_empty_grants(),
+            enforcement,
         )
         .expect_err("a forced child-side setup failure must make execute_shell return Err");
         assert!(
@@ -5389,5 +5967,66 @@ mod linux_integration_tests {
                 "no failure may read as a bare EINVAL: {message}"
             );
         }
+    }
+
+    /// The first half of the composed-root failure path this slice promises: a `pre_exec`
+    /// composed-root failure comes back out of `execute_shell` as the *typed*
+    /// `SealedRootConstructionFailed`, carrying the child's diagnostic, and reports itself as
+    /// session-fatal. `runtime::tests` covers the second half (what the dispatch layer then
+    /// does with it) and `murmur-cli`'s error test covers the third (`E-RUN-014`).
+    #[test]
+    fn a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message() {
+        let error =
+            child_setup_failure_typed(&sealed_test_enforcement(), ForceSealedRootFailureGuard::new);
+
+        assert!(
+            matches!(
+                error,
+                crate::shell::ShellExecError::SealedRootConstructionFailed { .. }
+            ),
+            "a sealed-root diagnostic must survive as its own variant, not collapse into \
+             ShellExecError::Failed: {error}"
+        );
+        let fatal = error
+            .session_fatal()
+            .expect("a composed-root failure must end the session, not just the tool call");
+        assert!(
+            matches!(
+                fatal,
+                crate::errors::RuntimeError::SealedRootConstructionFailed { .. }
+            ),
+            "must map to the RuntimeError the CLI renders as E-RUN-014: {fatal}"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("composed root") && rendered.contains("unshare"),
+            "the message must name both the mechanism and the step that failed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("os error 22"),
+            "must not collapse to the bare EINVAL string: {rendered}"
+        );
+    }
+
+    /// The contrast that makes the assertion above mean something: an equally fatal-looking
+    /// `pre_exec` failure that is *not* the composed root stays an ordinary failure, so nothing
+    /// in this path ends a session for a Landlock or `no_new_privs` problem.
+    #[test]
+    fn an_ordinary_pre_exec_failure_is_not_session_fatal() {
+        let landlock =
+            child_setup_failure_typed(&kernel_full_empty_grants(), ForceLandlockFailureGuard::new);
+        assert!(
+            landlock.session_fatal().is_none(),
+            "a Landlock setup failure is the tool call's problem, not the session's: {landlock}"
+        );
+
+        let no_new_privs = child_setup_failure_typed(
+            &kernel_full_empty_grants(),
+            ForceNoNewPrivsFailureGuard::new,
+        );
+        assert!(
+            no_new_privs.session_fatal().is_none(),
+            "a no_new_privs failure is the tool call's problem, not the session's: {no_new_privs}"
+        );
     }
 }

@@ -108,6 +108,23 @@ pub enum RuntimeError {
         reason: String,
     },
 
+    /// A `sealed` session's composed root could not be built in the forked child, *after* the
+    /// pre-launch probe reported the mechanism available.
+    ///
+    /// Deliberately distinct from [`Self::ContainmentFloorUnmet`]: that one is a refusal decided
+    /// before anything is staged, on a host that never claimed to offer `sealed`. This one is a
+    /// host that claimed it and then failed to deliver — a race, a mount table that changed under
+    /// the runtime, or an edge case the cheap probe cannot catch. Conflating the two would tell an
+    /// operator to lower their declared floor when the real answer is that something moved.
+    ///
+    /// `detail` is the message the child wrote to the `pre_exec` diagnostic pipe, which names the
+    /// exact step (`unshare`, a specific bind mount, `pivot_root`) and its errno.
+    #[error(
+        "the sealed containment class was achievable at launch but its composed root could not be \
+         built for this subprocess: {detail}"
+    )]
+    SealedRootConstructionFailed { detail: String },
+
     #[error(
         "capsule component missing export murmur:capsule/run@0.1.0#run; rebuild the artifact against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )]

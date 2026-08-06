@@ -265,8 +265,10 @@ fn list_cases() {
         "\n`not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
          but the declared class provides no mechanism that could back a claim, so the result \
          cannot pass or fail.\n\
-         `sealed` is unreachable on every host — achieved_class_for_tier has no Sealed arm — so \
-         the class gate refuses before any case runs."
+         `not graded` is also not a skip: the `sealed` column records the class's intended \
+         verdict, and the case still runs and is still recorded, but nobody has validated those \
+         expectations against a real composed root yet, so they gate nothing. See \
+         docs/content/reference/sealed-containment-manual-verification.md."
     );
 }
 
@@ -274,7 +276,14 @@ fn list_cases() {
 /// never a skipped case.
 fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> Result<(), String> {
     let achieved = capsule_runtime::detect_achieved_containment();
-    if let Some(reason) = capsule_runtime::containment_shortfall_reason(class, achieved) {
+    // The third argument is what turns "sealed is unavailable here" into a specific, actionable
+    // sentence — the missing AppArmor profile, a container without CAP_SYS_ADMIN, a kernel
+    // without user namespaces. It probes the same cached host facts `detect_achieved_containment`
+    // above does.
+    let sealed_blocker = capsule_runtime::detect_sealed_blocker();
+    if let Some(reason) =
+        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker)
+    {
         return Err(format!(
             "REFUSED — this host cannot back the class under test.\n\
              \x20 declared: {class}\n\

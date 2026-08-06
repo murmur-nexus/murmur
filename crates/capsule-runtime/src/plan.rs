@@ -171,7 +171,10 @@ fn execute_inner(
 
     // Host-probed kernel enforcement tier + resolved network allowlist for this plan's shell
     // steps — resolved once, up front, same cadence as `runtime::launch_session`.
-    let shell_enforcement = match sandbox::ShellEnforcement::resolve(&ctx.capability_policy) {
+    let shell_enforcement = match sandbox::ShellEnforcement::resolve(
+        &ctx.capability_policy,
+        ctx.capability_policy.containment_floor,
+    ) {
         Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {
             return Ok(ExecutionReport {
@@ -566,7 +569,11 @@ fn dispatch_shell_step(
             ),
             None => failed(&step.id, result.stderr),
         },
-        Err(error) => failed(&step.id, error),
+        // Including a sealed composed-root failure, which fails the step carrying its full
+        // named text. Unlike the agent turn loop (which owns a session and ends it — see
+        // `agent::run_agent_loop`), this scheduler owns nothing above the step it is running,
+        // so naming the cause in the step's error is the whole of what it can do.
+        Err(error) => failed(&step.id, error.to_string()),
     }
 }
 

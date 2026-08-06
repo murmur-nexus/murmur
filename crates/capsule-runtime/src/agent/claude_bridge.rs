@@ -302,6 +302,10 @@ impl BridgeHandle {
         {
             Ok(outcome) => {
                 let is_error = !matches!(outcome.result.status, Status::Passed);
+                // `outcome.fatal` is deliberately not acted on here: this bridge is a tool server
+                // for an external Claude Code process and owns no murmur session to end. The
+                // failure still reaches the caller in full — `result.data` carries the same named
+                // text (`RuntimeError`'s Display) that the agent loop would end the session with.
                 let text = outcome
                     .result
                     .data

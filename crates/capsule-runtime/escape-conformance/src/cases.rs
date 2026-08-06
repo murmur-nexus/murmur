@@ -23,14 +23,17 @@
 //!   still run and are still recorded, but a class that provides no mechanism cannot be graded on
 //!   one. Cases that hold *without* any kernel mediation (metadata visibility, the per-process
 //!   `setrlimit` ceilings, the periodic workdir check) stay asserted at `advisory`.
-//! * **`sealed`** has no arm in `achieved_class_for_tier` at all, so the class gate refuses on
-//!   every host before a single case runs. Its column is [`Expectation::Unreachable`]: documented
-//!   so the intended semantics are on record, never exercised.
+//! * **`sealed`** is reachable now — a Linux host with a usable Landlock ABI, unprivileged user
+//!   namespaces and the shipped `mur-sealed` AppArmor profile resolves to
+//!   `EnforcementTier::KernelSealed` — but its column is still [`Expectation::Documented`]: the
+//!   verdicts run and are recorded in full, and gate nothing, because nobody has yet validated
+//!   them against a real composed root. See that variant's doc comment, and
+//!   `docs/content/reference/sealed-containment-manual-verification.md`.
 
 use crate::verdict::{Category, Expectation, Verdict};
 use murmur_artifact::ContainmentClass;
 
-use Expectation::{Must, NotAsserted, Unreachable};
+use Expectation::{Documented, Must, NotAsserted};
 use Verdict::{Contained, Refused, Succeeded};
 
 /// Work the harness performs on the host, before `mur run`, to set a case up.
@@ -173,7 +176,7 @@ pub const REGISTRY: &[Case] = &[
                       ordinary file permissions and proves nothing about containment.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -206,7 +209,7 @@ def main():
                       removed by hand.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -236,7 +239,7 @@ def main():
                       path outside the capsule's mount namespace entirely.",
         advisory: Must(Succeeded),
         scoped: Must(Succeeded),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -264,7 +267,7 @@ def main():
                       is never mistaken for a contained read.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -302,7 +305,7 @@ def main():
                       separate case.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -349,7 +352,7 @@ def main():
                       Landlock does mediate.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -389,7 +392,7 @@ def main():
                       exists to make.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -425,7 +428,7 @@ def main():
                       /proc carries no grant.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -457,7 +460,7 @@ def main():
                       all the case is INCONCLUSIVE rather than passed.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -499,7 +502,7 @@ def main():
                       hypothetical. Fds 0/1/2 are excluded by design and are not a leak.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::LeakFdIntoMur {
             fd: 7,
             path: "/etc/hostname",
@@ -546,7 +549,7 @@ def main():
                       MakeBlock to WORKDIR_ACCESS_RIGHTS, rebuild, and it must go ALLOWED.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -593,7 +596,7 @@ def main():
                       exec/connect race class is separately audited and lives in racecheck/.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::CopyBinaryAs {
             // First readable wins. All three are outside `shell.allow`, so each is a disallowed
             // identity wearing an allowlisted basename once copied.
@@ -643,7 +646,7 @@ def main():
                       is a different probe and is out of scope here.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -683,7 +686,7 @@ def main():
                       after the fact.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -719,7 +722,7 @@ def main():
                       EAI_* failures that are not refusals are reported verbatim in DETAIL.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -756,7 +759,7 @@ def main():
                       LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET scopes abstract sockets only.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -795,7 +798,7 @@ def main():
                       call refused and, if socket() succeeded, which of the two paths existed.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -836,7 +839,7 @@ def main():
                       create io_uring instances, so EPERM here is seccomp and nothing else.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -857,7 +860,7 @@ def main():
                       refusal from a host-policy one.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -886,7 +889,7 @@ def main():
                       DETAIL records the euid so this is never read as more than it is.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -909,7 +912,7 @@ def main():
                       Root run required for an attributable result.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -932,7 +935,7 @@ def main():
                       pointer, i.e. it was permitted.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -960,7 +963,7 @@ def main():
                       what is asserted.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Unreachable(Refused),
+        sealed: Documented(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -986,7 +989,7 @@ def main():
                       resource-limits-manual-verification.md scenario 2.",
         advisory: NotAsserted,
         scoped: Must(Contained),
-        sealed: Unreachable(Contained),
+        sealed: Documented(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1055,7 +1058,7 @@ def main():
                       Landlock or seccomp. Lifted from scenario 5.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Unreachable(Contained),
+        sealed: Documented(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1102,7 +1105,7 @@ def main():
                       the watcher is platform-independent. Lifted from scenario 6.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Unreachable(Contained),
+        sealed: Documented(Contained),
         prepare: Prepare::None,
         evidence: Evidence::SecondSpawnRefused("workdir_max_bytes"),
         profile: Profile::TightResources,
@@ -1157,7 +1160,7 @@ def main():
                       this path is the OOM kill. Lifted from scenario 3.",
         advisory: NotAsserted,
         scoped: Must(Contained),
-        sealed: Unreachable(Contained),
+        sealed: Documented(Contained),
         prepare: Prepare::None,
         // Graded on the exit code, not a probe file: a cgroup OOM kill is a SIGKILL, so a probe
         // that lived to write a verdict would be evidence the ceiling did *not* bite. 137 is
@@ -1200,7 +1203,7 @@ def main():
                       than bound anything.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Unreachable(Contained),
+        sealed: Documented(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1303,14 +1306,16 @@ mod tests {
         }
     }
 
-    /// `sealed` has no arm in `achieved_class_for_tier`, so no host can ever reach a case under
-    /// it. Every case must say so rather than claim an assertion that can never run.
+    /// The `sealed` column records an intended verdict but grades nothing, because no one has
+    /// validated these expectations against a real composed root yet. Every case must say so
+    /// rather than gate a release on an unchecked claim — promoting the column is a deliberate
+    /// edit, not something a new case should be able to do by accident.
     #[test]
-    fn sealed_expectations_are_all_marked_unreachable() {
+    fn sealed_expectations_are_recorded_but_not_graded() {
         for case in REGISTRY {
             assert!(
-                matches!(case.sealed, Unreachable(_)),
-                "{}: sealed is structurally unreachable and must be marked as such",
+                matches!(case.sealed, Documented(_)),
+                "{}: sealed expectations are recorded, not graded — see Expectation::Documented",
                 case.id
             );
         }
