@@ -1,5 +1,21 @@
 # mur-sealed — AppArmor profile permitting `mur` to create an unprivileged user
-# namespace, so `capabilities.containment: sealed` is achievable on this host.
+# namespace.
+#
+# It gates two runtime mechanisms, not one. The name is historical: the profile was
+# introduced for `capabilities.containment: sealed` (a user+mount namespace pivoted
+# onto a composed root), and it is still what makes that class achievable. Since the
+# capsule network namespace replaced the seccomp connect/sendto interception, the
+# same `userns,` rule is also what lets the runtime build the egress boundary that
+# enforces `capabilities.network.allow` for native subprocesses — and that applies at
+# *every* containment class, `advisory` included.
+#
+# Concretely, on a host with kernel.apparmor_restrict_unprivileged_userns=1 and this
+# profile absent:
+#
+#   - any capsule with a `capabilities.shell.allow` list refuses to launch,
+#     error[E-CAP-005]  (no network namespace, so no egress enforcement)
+#   - any capsule declaring `containment: sealed` refuses, error[E-CAP-003]
+#   - capsules that spawn no native subprocess are unaffected
 #
 # Install:
 #     sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed
@@ -11,6 +27,26 @@
 # Verify it is attached to the running binary:
 #     cat /proc/self/attr/current            # from a shell — expect "unconfined"
 #     mur run --explain-scope                # expect achieved: sealed
+#
+#
+# WHAT NEEDS IT
+#
+# Two mechanisms, not one, and the second applies to far more capsules than the
+# first:
+#
+#   * `capabilities.containment: sealed` — the composed root, which needs
+#     unshare(CLONE_NEWUSER | CLONE_NEWNS) plus mount(2) and pivot_root(2).
+#   * the capsule **network namespace**, which every capsule declaring
+#     `capabilities.shell.allow` or `capabilities.spawn.allow` gets at every
+#     containment class. It needs unshare(CLONE_NEWUSER | CLONE_NEWNET) and then
+#     CAP_NET_ADMIN *inside that new user namespace* to bring `lo` up and install
+#     the local route the egress proxy is reached through.
+#
+# Both are blocked by the same AppArmor transition, so one profile covers both —
+# but the consequence of the profile being absent is much larger than it used to
+# be. Without it, on a host with the restriction on, a capsule that can spawn a
+# native subprocess refuses to launch at all (E-CAP-005), rather than merely
+# failing to reach the `sealed` class.
 #
 #
 # WHY THIS FILE EXISTS
@@ -78,6 +114,7 @@ profile mur-sealed /{usr/local/,usr/,opt/mur/}bin/mur flags=(unconfined) {
   # file documents the full set of privileged operations the composed root needs and
   # so the profile keeps working if it is ever tightened into a confining one.
   capability sys_admin,
+  capability net_admin,
   mount,
   umount,
   pivot_root,
@@ -90,6 +127,7 @@ profile mur-sealed-home @{HOME}/{.local,.cargo}/bin/mur flags=(unconfined) {
   userns,
 
   capability sys_admin,
+  capability net_admin,
   mount,
   umount,
   pivot_root,

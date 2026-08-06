@@ -36,6 +36,7 @@ pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
 pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared scope
 pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared containment class
 pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a sealed containment floor
+pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree its own network namespace
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -266,6 +267,20 @@ impl From<RuntimeError> for CliError {
                  into, or remove the capabilities.shell.staged_runtime grant. Run `mur run \
                  --explain-scope` to see the declared grants and whether this host can back \
                  `sealed` — see docs/content/reference/manifest-schema.md",
+            ),
+            // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
+            // with another: this one is not about the containment ladder at all. A network
+            // namespace is what makes `capabilities.network.allow` mean anything for a native
+            // subprocess since the seccomp connect/sendto interception was retired, and every
+            // Linux capsule that can spawn one needs it at every containment class — so neither
+            // raising nor lowering a declared floor changes this answer. The hint therefore names
+            // the host mechanism, never the manifest.
+            error @ RuntimeError::EgressNamespaceUnavailable { .. } => CliError::with_hint(
+                E_CAP_005,
+                error.to_string(),
+                "the refusal above names the exact remediation for this host. Run `mur doctor` \
+                 to see what this machine can back — see \
+                 docs/content/reference/network-namespace-egress-proxy-manual-verification.md",
             ),
             // Delegate to the RuntimeError Display text so the versioned interface
             // name and rebuild hint can't drift from capsule-runtime's errors.rs.

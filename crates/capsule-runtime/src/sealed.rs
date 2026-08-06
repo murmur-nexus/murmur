@@ -13,6 +13,12 @@
 //!   1. `unshare(CLONE_NEWUSER | CLONE_NEWNS)`, then maps its own uid/gid one-to-one into the new
 //!      user namespace (`/proc/self/uid_map`), which is what gives it `CAP_SYS_ADMIN` *inside that
 //!      namespace* and nowhere else. Nothing here needs the host's root.
+//!
+//!      On every kernel tier this now runs *after* [`crate::network_namespace`] has already
+//!      created a user+network namespace, so the one built here is **nested** inside it. That is
+//!      load-bearing rather than incidental: a task in a descendant user namespace holds no
+//!      capability in the ancestor, so a `sealed` capsule cannot reconfigure the network namespace
+//!      it is confined to.
 //!   2. Makes mount propagation private (`MS_REC | MS_PRIVATE` on `/`), so nothing it does leaks
 //!      back into the host's mount table.
 //!   3. Mounts a fresh `tmpfs` over a base directory ([`choose_root_base`]) and composes the new
@@ -795,6 +801,23 @@ pub(crate) use linux::{
     build_sealed_root_spec, construct_composed_root, probe_sealed_support, SealedRootSpec,
 };
 
+/// The post-`fork()` namespace primitives [`crate::network_namespace`] reuses rather than
+/// reimplementing.
+///
+/// The `dumpable` pair is not a detail worth duplicating: a non-dumpable task's
+/// `/proc/self/uid_map` is root-owned and therefore unopenable by the task itself, and every
+/// namespace `mur` creates hits that trap identically — see [`linux::make_dumpable_for_map_writes`]
+/// for the full account of how misleading its symptom is.
+///
+/// `apparmor_permits_userns` is shared for a sharper reason still: it answers whether AppArmor
+/// stands between this binary and `unshare(CLONE_NEWUSER)`, which `sealed` and the capsule network
+/// namespace both need. Two implementations of one host question could return two answers, and the
+/// operator would be told to fix two different things.
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{
+    apparmor_permits_userns, make_dumpable_for_map_writes, restore_dumpable, write_decimal_map,
+};
+
 /// Non-Linux stub: nothing here can be probed, so nothing is claimed.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn probe_sealed_support() -> SealedProbe {
@@ -837,7 +860,7 @@ mod linux {
     /// Reading `/proc/self/attr/current` rather than the loaded-profile list is deliberate: a
     /// profile that is loaded but does not *attach* to the path `mur` was installed at helps
     /// nobody, and this asks the question that decides the outcome.
-    fn apparmor_permits_userns() -> bool {
+    pub(crate) fn apparmor_permits_userns() -> bool {
         let enabled = read_trimmed("/sys/module/apparmor/parameters/enabled");
         if !matches!(enabled.as_deref(), Some("Y") | Some("1")) {
             return true;
@@ -890,7 +913,7 @@ mod linux {
     /// Post-`fork()`, pre-exec child context only — `prctl(2)` is async-signal-safe, but the
     /// dumpable window this reopens is only sound while this process is the single-threaded child
     /// that is about to `execve` a sandboxed binary.
-    unsafe fn make_dumpable_for_map_writes() -> libc::c_int {
+    pub(crate) unsafe fn make_dumpable_for_map_writes() -> libc::c_int {
         // SAFETY: both `prctl` calls take four integer arguments; no pointers cross the boundary.
         // `PR_GET_DUMPABLE` returning `-1` means the query failed, in which case the restore below
         // is skipped rather than guessing.
@@ -906,7 +929,7 @@ mod linux {
     /// # Safety
     /// Same window and same constraints as [`make_dumpable_for_map_writes`]; `previous` must be
     /// the value that call returned.
-    unsafe fn restore_dumpable(previous: libc::c_int) {
+    pub(crate) unsafe fn restore_dumpable(previous: libc::c_int) {
         if previous < 0 {
             return;
         }
@@ -1020,7 +1043,7 @@ mod linux {
     /// Must only be called from the post-`fork()`, pre-exec window in the child, before any other
     /// thread could exist in this process — the same async-signal-safety constraint documented on
     /// [`construct_composed_root`]'s `unsafe` block, which this function's callers all sit inside.
-    unsafe fn write_decimal_map(
+    pub(crate) unsafe fn write_decimal_map(
         path: &std::ffi::CStr,
         id: Option<libc::uid_t>,
         value: libc::uid_t,
