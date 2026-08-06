@@ -1,6 +1,6 @@
 use capsule_runtime::{
     check_egress_namespace, check_staged_runtime_floor, detect_egress_namespace_blocker,
-    warn_on_interpreter_runtime_grants, ArtifactRequest,
+    warn_on_interpreter_runtime_grants, warn_on_workdir_exec, ArtifactRequest,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
@@ -85,6 +85,19 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     {
         warn_on_interpreter_runtime_grants(interpreter_runtime);
     }
+
+    // Same reasoning for `capabilities.filesystem.workdir_exec`: a posture warning an operator
+    // should see from `mur doctor` rather than only from a launched session, since it is the one
+    // declaration that trades away an enforcement property (`shell.allow` stops being kernel-
+    // enforced inside the workdir) and caps the capsule's achieved containment class at
+    // `advisory`. Same `W-SEC-011`, same wording, straight from the parsed manifest.
+    warn_on_workdir_exec(
+        runtime_manifest
+            .capabilities
+            .as_ref()
+            .and_then(|caps| caps.filesystem.as_ref())
+            .is_some_and(|filesystem| filesystem.workdir_exec),
+    );
 
     // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a
     // capsule declaring one without an effective `sealed` floor is rejected at staging with

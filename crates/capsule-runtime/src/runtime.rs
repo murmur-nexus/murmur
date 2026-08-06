@@ -15,7 +15,7 @@ use murmur_artifact::{
     InferenceConfig, LifecycleConfig, LockedArtifact,
     LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
     InterpreterRuntimeGrant, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
-    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009,
+    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -41,7 +41,7 @@ use crate::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
     cgroup,
-    containment::{check_containment_floor, detect_achieved_containment},
+    containment::{check_containment_floor, detect_achieved_containment_for},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
@@ -286,7 +286,12 @@ pub fn stage_session(
     // back the declared floor, refuse rather than launch something weaker than was asked for.
     // `achieved` comes from a live kernel probe only — the manifest never gets a vote in what
     // the host is reported to provide.
-    let achieved_containment = detect_achieved_containment();
+    // `achieved` is the host's live kernel probe, capped by the one manifest property that can
+    // lower it: `capabilities.filesystem.workdir_exec`. The manifest still gets no vote in what the
+    // host is *reported* to provide — the cap can only ever subtract (see
+    // `containment::achieved_containment_class`).
+    let workdir_exec = request.capability_policy.workdir_exec_allowed;
+    let achieved_containment = detect_achieved_containment_for(workdir_exec);
     check_containment_floor(
         request.declared_containment_floor,
         achieved_containment,
@@ -294,6 +299,7 @@ pub fn stage_session(
         // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself. Reads
         // the same cached host probe the tier decision above used, so the two cannot disagree.
         crate::containment::detect_sealed_blocker(),
+        workdir_exec,
     )?;
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
@@ -328,6 +334,10 @@ pub fn stage_session(
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
     warn_on_interpreter_runtime_grants(&request.capability_policy.shell_interpreter_runtime);
+    // Same seam, same reason: a capsule-wide declaration whose cost the operator should see stated
+    // once, before anything else happens. Ordered after the refusals above so a manifest that is
+    // going to be rejected outright is not first warned about.
+    warn_on_workdir_exec(workdir_exec);
 
     let engine = build_engine()?;
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
@@ -854,6 +864,9 @@ pub fn launch_session(
         let capabilities = capability_names(&staged.capability_policy);
         let containment_declared = staged.declared_containment_floor;
         let containment_achieved = staged.achieved_containment;
+        // Read off the session's own policy rather than re-derived: `session_start` records what
+        // this session ran with, and the policy is the single place that value already lives.
+        let trace_workdir_exec = staged.capability_policy.workdir_exec_allowed;
 
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
@@ -903,6 +916,7 @@ pub fn launch_session(
                 capabilities.clone(),
                 containment_declared,
                 containment_achieved,
+                trace_workdir_exec,
                 trace_include_tool_output,
             )
             .await
@@ -1449,6 +1463,10 @@ pub fn launch_session(
         limits: capsule_limits.limiter(),
     };
 
+    // Copied out before `state` above took ownership of the policy, so the trace writer further
+    // down still has it. One `bool`, not a clone of the whole policy.
+    let workdir_exec = state.capability_policy.workdir_exec_allowed;
+
     let mut store = Store::new(&staged.engine, state);
     // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
     // the store enforces, and instantiation itself allocates against them.
@@ -1510,6 +1528,7 @@ pub fn launch_session(
                 Vec::new(),
                 staged.declared_containment_floor,
                 staged.achieved_containment,
+                workdir_exec,
                 false,
             )
             .await
@@ -1679,6 +1698,31 @@ pub fn warn_on_interpreter_runtime_grants(grants: &[InterpreterRuntimeGrant]) {
             grant.binary
         );
     }
+}
+
+/// Warns (non-fatal, once per session) when a capsule declares
+/// `capabilities.filesystem.workdir_exec: true`.
+///
+/// This is the one grant that trades away an enforcement property rather than widening a scope:
+/// with the workdir's Landlock `Execute` right granted, `capabilities.shell.allow` stops being
+/// something the kernel can hold the capsule to — a binary it compiles, downloads or renames inside
+/// its own workdir runs regardless. The declaration is legitimate (compile-and-run workflows need
+/// it) and the class report already says `advisory`, but a class in a JSON field is easy to miss
+/// and the reason for it is not self-evident, so it is also stated in words, once, at staging.
+///
+/// Shared shape with [`warn_on_interpreter_runtime_grants`]: fires before any session workdir
+/// exists, so it goes to stderr only, not `logs/bootstrap.log`.
+pub fn warn_on_workdir_exec(workdir_exec: bool) {
+    if !workdir_exec {
+        return;
+    }
+    let link = security_warning_link(W_SEC_011);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_011}]: capabilities.filesystem.workdir_exec is true — \
+         the session workdir keeps its Landlock Execute right, so anything the capsule writes \
+         there can run regardless of capabilities.shell.allow; this capsule reports containment \
+         class 'advisory' on every host, including a Landlock-capable one ({link})"
+    );
 }
 
 /// A per-hook `capabilities:` block reuses the whole [`murmur_artifact::Capabilities`]
@@ -4657,6 +4701,7 @@ mod tests {
                 murmur_artifact::ContainmentClass::Advisory,
                 murmur_artifact::ContainmentClass::Advisory,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -4861,6 +4906,7 @@ mod tests {
             }),
             filesystem: scope.map(|scope| murmur_artifact::FilesystemCapabilities {
                 scope: Some(scope.to_string()),
+                workdir_exec: false,
             }),
             shell: None,
             spawn: None,
@@ -5153,6 +5199,7 @@ mod tests {
                 network: None,
                 filesystem: Some(murmur_artifact::FilesystemCapabilities {
                     scope: Some("../escape".to_string()),
+                    workdir_exec: false,
                 }),
                 shell: None,
                 spawn: None,
@@ -5178,7 +5225,10 @@ mod tests {
                 allow: Vec::new(),
                 unix_sockets: false,
             }),
-            filesystem: Some(murmur_artifact::FilesystemCapabilities { scope: None }),
+            filesystem: Some(murmur_artifact::FilesystemCapabilities {
+                scope: None,
+                workdir_exec: false,
+            }),
             shell: Some(murmur_artifact::ShellCapabilities {
                 allow: vec!["bash".to_string()],
                 strip_env: None,
@@ -5347,6 +5397,7 @@ mod tests {
             Vec::new(),
             murmur_artifact::ContainmentClass::Advisory,
             murmur_artifact::ContainmentClass::Advisory,
+            false,
             false,
         )
         .await

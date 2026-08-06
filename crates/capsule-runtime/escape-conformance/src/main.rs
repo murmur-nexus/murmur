@@ -281,8 +281,12 @@ fn gate(options: &Options, facts: &host::HostFacts, class: ContainmentClass) -> 
     // without user namespaces. It probes the same cached host facts `detect_achieved_containment`
     // above does.
     let sealed_blocker = capsule_runtime::detect_sealed_blocker();
+    // `workdir_exec: false` — the fourth argument is a *capsule* declaration
+    // (`capabilities.filesystem.workdir_exec`), and this gate asks a host question: can this
+    // machine back the class under test? The suite's own probe capsules never declare it, and one
+    // that did would be asserting a boundary it had opted out of.
     if let Some(reason) =
-        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker)
+        capsule_runtime::containment_shortfall_reason(class, achieved, sealed_blocker, false)
     {
         return Err(format!(
             "REFUSED — this host cannot back the class under test.\n\

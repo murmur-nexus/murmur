@@ -1,7 +1,10 @@
 //! Race probe: `execve(2)`'s `filename` argument, against the seccomp-notify supervisor's
 //! read-then-`notify_id_valid`-then-`CONTINUE` pattern.
 //!
-//! This is the race `decide_exec_allowed`'s own doc comment already names as open. The probe's job
+//! This is the race `decide_exec_allowed`'s own doc comment named as open while that function
+//! existed. It has since been deleted along with the rest of the exec supervisor — exec is a
+//! Landlock `Execute` right now, decided in-kernel on the resolved path — so this probe mirrors a
+//! retired design; see this crate's `lib.rs` header. The probe's job
 //! is to make it measurable rather than merely admitted.
 //!
 //! Layout of a run:

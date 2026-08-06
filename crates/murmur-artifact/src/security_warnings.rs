@@ -72,6 +72,16 @@ pub const W_SEC_009: &str = "W-SEC-009";
 /// distinct, short-lived processes evades it. Permanent on this platform, like [`W_SEC_001`].
 pub const W_SEC_010: &str = "W-SEC-010";
 
+/// `capabilities.filesystem.workdir_exec: true` keeps the Landlock `Execute` right on the session
+/// workdir, so anything the capsule writes there can run regardless of `capabilities.shell.allow`.
+/// The allowlist is still applied to what the *agent asks* to run, but it stops being an
+/// enforceable property of the capsule: a binary compiled, downloaded or renamed inside the workdir
+/// executes on its own. Because of that the capsule can never achieve
+/// `ContainmentClass::Scoped` — it reports `advisory` on every host, including a Landlock-capable
+/// one — and pairing it with `capabilities.containment: scoped` refuses the launch with `E-CAP-003`.
+/// Fires once, at staging, only for a capsule that declared it.
+pub const W_SEC_011: &str = "W-SEC-011";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 

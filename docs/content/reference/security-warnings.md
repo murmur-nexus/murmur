@@ -42,7 +42,11 @@ Warnings from `mur build` go to stderr only.
     The workdir's own grant withholds character-device, block-device and unix-socket creation, and
     both Linux tiers drop every capability from the shell child before `execve` — see
     [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node) for
-    the exact commands the team runs to confirm those two. Both Linux tiers also refuse
+    the exact commands the team runs to confirm those two. That same workdir grant withholds
+    `Execute` unless
+    [`capabilities.filesystem.workdir_exec: true`](manifest-schema.md#field-workdir-exec) is
+    declared, which is what makes `capabilities.shell.allow` kernel-enforced rather than
+    name-matched — see [`W-SEC-011`](#w-sec-011) and its own manual procedure. Both Linux tiers also refuse
     `socket(AF_UNIX, ...)` unless the manifest declares
     [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities), and always
     refuse `AF_NETLINK`/`AF_PACKET`, so a capsule cannot reach the host Docker daemon socket — see
@@ -67,7 +71,7 @@ subprocesses declared under `capabilities.shell.allow`.
 | Tier | Host | Filesystem | Exec | Network | Verified? |
 |---|---|---|---|---|---|
 | Full | Linux, kernel ≥5.13 (Landlock available) | kernel-enforced¹ | kernel-enforced¹ | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
-| Seccomp-only | Linux, kernel <5.13 (no Landlock) | **not** enforced | kernel-enforced¹ | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
+| Seccomp-only | Linux, kernel <5.13 (no Landlock) | **not** enforced | **not** enforced² | kernel-enforced¹ | **Not yet** — implemented, not team-verified on real hardware |
 | Environment-only | macOS, Windows, any non-Linux host | **not** enforced | **not** enforced | **not** enforced | Yes — enforcement is a documented no-op here |
 
 ¹ *Intended* behavior. On the Full tier the Landlock scope grants the capsule workdir a near-full
@@ -82,7 +86,12 @@ explicit per-directory `list_dir` flag, never a whole install prefix (see
 [`W-SEC-009`](#w-sec-009)). The workdir grant is *not* the full Landlock right-set: character-device
 (`MakeChar`), block-device (`MakeBlock`) and unix-socket (`MakeSock`) creation are withheld, so a
 capsule cannot create a raw disk device node inside its own workdir and read the host filesystem
-through it. Independently of Landlock — and therefore on **both** Linux tiers — seccomp refuses
+through it — and, unless the manifest declares
+[`capabilities.filesystem.workdir_exec: true`](manifest-schema.md#field-workdir-exec), the workdir
+grant also withholds `Execute`, so nothing the capsule writes into its own workdir can be run under
+any name. That withholding *is* the exec column above: `capabilities.shell.allow` is enforced by
+granting `Execute` on exactly the allowlisted binaries' own paths and nowhere the capsule can
+write. Independently of Landlock — and therefore on **both** Linux tiers — seccomp refuses
 `socket(AF_UNIX, ...)` outright unless the manifest declares
 [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities), and always
 refuses `AF_NETLINK`/`AF_PACKET`, so a capsule cannot reach a host daemon socket such as
@@ -95,10 +104,20 @@ on a real Landlock-capable Linux host, so do not treat any "kernel-enforced" cel
 confirmed boundary until that acceptance run lands — see
 [Manual acceptance procedure — workdir device-node escape](#manual-acceptance-device-node).
 
-Filesystem scoping uses Landlock; exec and network allowlisting use seccomp-bpf user-notify, and
-socket-family denial uses classic seccomp-bpf argument matching (no userspace supervisor — the
-`socket(2)` domain is an integer the kernel's own BPF can compare directly, unlike a `connect()`
-destination address behind a pointer). Underneath all three, the seccomp filter's default action is
+² Exec is a Landlock right, so a host without Landlock has no kernel-level exec mediation at all.
+This was not always so: until the exec supervisor was retired, `execve`/`execveat` were decided by
+a userspace seccomp-notify loop that ran on both Linux tiers. That loop read the invoked pathname
+out of the calling process's memory and answered `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which
+`seccomp_unotify(2)` documents as inherently racy, *and* it left the workdir executable so a binary
+renamed to an allowlisted basename could still run. Both defects are closed by the Landlock
+mechanism above; the price is that the Seccomp-only tier lost its (unsound) exec check rather than
+keeping it. Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
+
+Filesystem *and exec* scoping both use Landlock; network scoping uses the capsule's own network
+namespace plus an egress proxy; socket-family denial uses classic seccomp-bpf argument matching
+(no userspace supervisor — the `socket(2)` domain is an integer the kernel's own BPF can compare
+directly, unlike a `connect()` destination address behind a pointer). No mechanism here uses
+seccomp-notify any more. Underneath all of them, the seccomp filter's default action is
 itself a deny — see [Default-deny syscall allowlist](#default-deny-syscall-allowlist) — so a
 syscall named by none of the mechanisms above is refused outright rather than falling through to an
 implicit allow.
@@ -134,9 +153,12 @@ allowlists to contain a compromised subprocess.
 Seccomp-only tier (Linux, kernel <5.13).
 
 **Why it matters:** filesystem reads/writes outside the capsule workdir are not kernel-enforced at
-all on this tier — Landlock requires kernel ≥5.13. The seccomp exec/network enforcement that
-*would* apply here has never been verified on real Linux hardware (see
-[W-SEC-005](#w-sec-005)), so treat shell subprocess isolation as experimental on this host.
+all on this tier — Landlock requires kernel ≥5.13. **Nor is exec:** `capabilities.shell.allow` is
+enforced by granting the Landlock `Execute` right on exactly the allowlisted binaries, so without
+Landlock there is no exec mediation on this tier at all and a shell subprocess can run any binary
+its uid can reach. The network enforcement that *does* apply here (the capsule's own network
+namespace) has never been verified on real Linux hardware (see [W-SEC-005](#w-sec-005)), so treat
+shell subprocess isolation as experimental on this host.
 
 The [fixed capsule device set](#capsule-device-set) does **not** apply on this tier
 either, and the direction of that gap is worth being explicit about: it is a Landlock rule list, so
@@ -162,7 +184,9 @@ runnable on this tier.
 
 **What to do:** upgrade the host kernel to 5.13+ (moves you to the Full tier), but do not treat
 either Linux tier as a verified boundary until a real Linux run confirms the enforcement works.
-Treat filesystem scope, and for now exec/network scope too, as advisory on this host.
+Treat filesystem scope and exec scope as advisory on this host — that is not a caveat about
+verification, it is what the tier is: neither has a mechanism here. This is also why this tier
+cannot reach the `scoped` containment class.
 
 ---
 
@@ -215,11 +239,16 @@ exists to prevent.
 
 **Why it matters:** the Landlock + seccomp enforcement layer is implemented and unit-tested, but
 has **not yet been verified by the team on real Landlock-capable Linux hardware**. On this tier
-the Landlock scope grants the capsule workdir a near-full access set **and** a narrow, *derived*
+the Landlock scope grants the capsule workdir a near-full access set — near-full because it
+withholds `Execute` unless the manifest declares
+[`capabilities.filesystem.workdir_exec: true`](manifest-schema.md#field-workdir-exec) — **and** a
+narrow, *derived*
 read+execute grant for exactly the `shell.allow` binaries, their ELF interpreter (dynamic loader),
 and the transitive closure of their shared libraries — so an allowlisted program can exec and
 dynamically link outside the workdir, while no directory is granted wholesale and the only writable
 path outside the workdir is `/dev/null` (see [the fixed capsule device set](#capsule-device-set)).
+Those two facts together are the whole of exec enforcement on this tier: `Execute` where the
+operator named a binary, nowhere the capsule can write.
 (An earlier revision granted only the workdir, which would have denied every
 allowlisted binary its own `execve`; that has been fixed.) What remains unverified is whether this
 derived-grant mechanism behaves as intended end to end on a real Tier-1 host — the acceptance run
@@ -259,9 +288,13 @@ completely. Two independent mechanisms now close this, and **neither is team-ver
    independent of Landlock and applies on **both** Linux tiers, including
    [Seccomp-only](#w-sec-002).
 
-**The forked child is deliberately left `ptrace`-able by same-UID processes.** Any other process
-running as the same user can attach to a running shell-tool subprocess and read its memory and
-environment for as long as it runs. The runtime process itself stays non-dumpable throughout.
+**The forked child is no longer left `ptrace`-able by same-UID processes.** It used to be: the
+runtime explicitly restored `PR_SET_DUMPABLE` on each shell subprocess, because the seccomp-notify
+exec supervisor had to read `/proc/<child>/mem` to recover the pathname of every `execve` and the
+kernel's `ptrace_may_access` check refuses that read on a non-dumpable target — even for the
+target's own parent. With that supervisor retired (exec is a Landlock right now, decided in-kernel),
+nothing reads the child's memory, the restore is gone, and the child inherits the runtime process's
+non-dumpable state. Both processes stay non-dumpable for their whole lives.
 
 **Is `CAP_MKNOD` the only gate? Yes, for the device half.** `mknod(2)` for `S_IFBLK`/`S_IFCHR`
 always requires `CAP_MKNOD` in the caller's effective set, independently of Landlock. A genuinely
@@ -276,7 +309,7 @@ capsule handed an unexpected ambient `CAP_MKNOD` — for example a systemd unit 
 `AF_UNIX` socket file inside the workdir. Some build tooling and some language-toolchain daemons do
 exactly that, so this is the one withheld right that could plausibly break a real workload. The
 acceptance procedure below tests for it explicitly; if the team's real-hardware run finds a workload
-that needs it, `MakeSock` goes back into the workdir grant (`WORKDIR_ACCESS_RIGHTS` in
+that needs it, `MakeSock` goes back into the workdir grant (`WORKDIR_ACCESS_RIGHTS_NO_EXEC` in
 `crates/capsule-runtime/src/sandbox.rs`) and this section gets updated. `MakeChar`/`MakeBlock` are
 not up for reconsideration.
 
@@ -407,8 +440,12 @@ The filter's default action is now **deny** (`EPERM`) as well, modelled on the O
 seccomp profile: only a fixed, named allowlist of syscalls is permitted outright
 (`SECCOMP_SYSCALL_ALLOWLIST` in `crates/capsule-runtime/src/sandbox.rs`), and everything named in
 `SECCOMP_MUST_STAY_DENIED` — including the syscalls above — is refused before any argument is even
-read. `execve`/`execveat` are unaffected: they stay `Notify` rules decided by the exec supervisor
-exactly as before. `connect`/`sendto` are now ordinary allowed syscalls in this list — enforcement of
+read. `execve`/`execveat` are now ordinary allowed syscalls in this list: they used to be `Notify`
+rules decided by a userspace exec supervisor, and `capabilities.shell.allow` is enforced by the
+Landlock `Execute` right instead (see [`W-SEC-011`](#w-sec-011) and
+[the tier table](#subprocess-enforcement-tiers)). They have to be *permitted* here, because the
+default action is a deny and the child's own first act after the filter loads is the `execve` that
+turns it into the tool binary. `connect`/`sendto` are ordinary allowed syscalls too — enforcement of
 `capabilities.network.allow` for them moved out of the seccomp filter entirely, onto the capsule's own
 network namespace and egress proxy (see
 [`network-namespace-egress-proxy-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md)) —
@@ -609,6 +646,49 @@ Note the asymmetry with Linux, which is deliberate: there, the same condition (c
 subprocess, no cgroup scope available) is a **refused launch** with `E-RUN-012`, not a warning —
 on Linux a missing scope is a host misconfiguration an operator can fix, while here it is a
 property of the platform.
+
+---
+
+## W-SEC-011 — Executable workdir makes `shell.allow` advisory { #w-sec-011 }
+
+**Fires when:** the manifest declares
+[`capabilities.filesystem.workdir_exec: true`](manifest-schema.md#field-workdir-exec). Once, at
+staging, on stderr — before any session workdir exists.
+
+**Why it matters:** `capabilities.shell.allow` is enforced by granting the Landlock `Execute` right
+on exactly the allowlisted binaries' own paths and withholding it everywhere the capsule can write
+— above all its own session workdir. `workdir_exec: true` gives that right back to the workdir. From
+then on, a binary the agent compiles, downloads, unpacks or renames inside its workdir executes
+regardless of what the allowlist says. There is no name check to defeat, because there is no name
+check: the kernel is granting `Execute` on the path, and the path is inside the granted directory.
+
+This is a *stated trade*, not a defect. Compile-and-run workloads — a capsule that runs
+`gcc`/`cargo build` in its workdir and then executes the artefact, the SWE-bench-shaped case — need
+it, and there is no narrower form of the grant that distinguishes "a binary this capsule compiled"
+from "a binary this capsule downloaded". What the runtime refuses to do is let the trade be silent.
+
+**What the runtime does about it, beyond this warning:**
+
+* the capsule's achieved containment class is **`advisory`**, on every host — including a
+  Landlock-capable one that would otherwise report `scoped` or `sealed`;
+* `mur run --explain-scope` prints `workdir exec: true` next to that `advisory`;
+* `trace.jsonl`'s `session_start` event carries `workdir_exec: true`, so a completed session's
+  record shows which guarantee was in force;
+* declaring it alongside `capabilities.containment: scoped` (or `sealed`) refuses the launch with
+  `E-CAP-003`, before any registry pull, artifact compile or workdir creation. The refusal text
+  names the manifest key rather than a host mechanism, because no host can satisfy the pair.
+
+**What to do:** remove `workdir_exec` if the capsule does not genuinely need to run something it
+produced — that is the default, and it makes `capabilities.shell.allow` a boundary the kernel
+enforces rather than a convention. If the capsule does need it, keep the declared containment floor
+at `advisory` and treat `shell.allow` as documentation of intent, not as containment: use the
+[data/action phase-separation pattern](manifest-schema.md#threat-model) to bound what the capsule
+can be induced to build and run, and give it no network allowlist entry it does not need.
+
+**Verification.** That an executable-workdir capsule really can run its own binary, and that a
+default capsule really cannot, is checked by hand on Landlock-capable Linux hardware — see
+[workdir-exec Landlock manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md).
+Nothing in CI is evidence either way: this repo's CI never resolves to the Full tier.
 
 ---
 

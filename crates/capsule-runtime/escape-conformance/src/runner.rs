@@ -480,16 +480,20 @@ pub fn preflight(config: &RunnerConfig, class: murmur_artifact::ContainmentClass
          Every case would report INCONCLUSIVE and every asserted case would fail, which would \
          read as a boundary escape when in fact nothing was exercised. No record file was \
          written.\n\n\
-         Known cause worth checking first — `mur` calls `security::harden_process_dumpable()` at \
-         startup (`crates/murmur-cli/src/main.rs`), which is `prctl(PR_SET_DUMPABLE, 0)`. The \
-         forked shell child inherits `dumpable = 0`, which makes its `/proc/<pid>/*` entries \
-         root-owned and mode 0600. The seccomp-notify supervisor reads the `execve` pathname out \
-         of `/proc/<pid>/mem` (`sandbox::linux_enforce::read_cstr_from_child`); on a **non-root** \
-         `mur run` that open fails with EACCES, `classify_and_decide` fail-closes to \
-         `Decision::Deny`, and every allowlisted binary's `execve` is refused with EACCES before \
-         it runs. The tool result then reads exactly `Permission denied (os error 13)`.\n\
-         `cargo test` never shows this: the unit and integration tests do not call \
-         `harden_process_dumpable`, so their supervisor can read the child just fine.\n\n\
+         Known cause worth checking first — `capabilities.shell.allow` is enforced by Landlock \
+         `Execute` rights (`sandbox::linux_enforce::apply_landlock_scope`), so a binary reachable \
+         on this host but absent from the derived grant set gets EACCES on `execve` before it \
+         runs, and the tool result reads exactly `Permission denied (os error 13)`. The two shapes \
+         that produce it: an interpreter whose real path `resolve_exec_allowlist` did not resolve \
+         at launch (check `PATH` as `mur` sees it), and an interpreter whose stdlib or shared \
+         libraries live outside both the workdir and the derived `DT_NEEDED` closure — which is \
+         what `capabilities.shell.interpreter_runtime` and `.staged_runtime` exist to declare. \
+         Note also that nothing the capsule writes into its own workdir can be executed at all \
+         unless the manifest declares `capabilities.filesystem.workdir_exec: true`; a preflight \
+         that stages its interpreter into the workdir needs that key.\n\
+         (Before the exec supervisor was retired this hint named `prctl(PR_SET_DUMPABLE, 0)` and \
+         a `/proc/<pid>/mem` read instead. That mechanism is gone: nothing reads the child's \
+         memory any more, and the dumpable restore went with it.)\n\n\
          Artifacts for this preflight run: {}",
         outcome.detail,
         outcome.case_dir.display()
