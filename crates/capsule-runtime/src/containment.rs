@@ -158,6 +158,15 @@ pub struct ScopeReport {
     /// `<binary>: <dir>[ (list_dir)]`. These are the paths outside the workdir that stay
     /// reachable even at `scoped`.
     pub interpreter_runtime_grants: Vec<String>,
+    /// Every `capabilities.shell.staged_runtime` grant, rendered as
+    /// `<binary>: <source_path> (pin: <pin>)`. These are host runtime trees a `sealed` capsule
+    /// asks to have bind-mounted read-only into its composed root.
+    ///
+    /// Reported whatever the floor and whatever this host can back — a capsule that declares a
+    /// staged runtime and cannot run here is exactly the case an operator is inspecting when they
+    /// reach for `--explain-scope`, so hiding the grant behind a met floor would blank out the
+    /// diagnostic in the one case it is for.
+    pub staged_runtime_grants: Vec<String>,
 }
 
 impl ScopeReport {
@@ -191,6 +200,7 @@ impl ScopeReport {
             "interpreter runtime",
             &self.interpreter_runtime_grants,
         );
+        push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
 
         if !self.floor_met {
             out.push_str(
@@ -257,6 +267,16 @@ pub(crate) fn scope_report_for_tier(
                 })
             })
             .collect(),
+        staged_runtime_grants: policy
+            .shell_staged_runtime
+            .iter()
+            .map(|grant| {
+                format!(
+                    "{}: {} (pin: {})",
+                    grant.binary, grant.source_path, grant.pin
+                )
+            })
+            .collect(),
     }
 }
 
@@ -275,7 +295,7 @@ fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
+    use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant, StagedRuntimeGrant};
 
     /// Every tier, so a new variant cannot quietly escape a test that iterates "all of them".
     const ALL_TIERS: &[EnforcementTier] = &[
@@ -531,6 +551,57 @@ mod tests {
             report.interpreter_runtime_grants,
             vec!["python3: /usr/lib/python3.11 (list_dir)"]
         );
+    }
+
+    /// `--explain-scope` is a diagnostic, not a launch: a capsule declaring `staged_runtime` on a
+    /// host that cannot back `sealed` is exactly the case an operator inspects with it, so the
+    /// grant must be reported on every tier — including the ones where `mur run` would refuse.
+    #[test]
+    fn staged_runtime_grants_are_reported_on_every_tier() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["python3".to_string()],
+            shell_staged_runtime: vec![StagedRuntimeGrant {
+                binary: "python3".to_string(),
+                source_path: "/opt/testbed/conda/envs/django__django".to_string(),
+                pin: "conda-4.10.3/python-3.9.19".to_string(),
+            }],
+            ..CapabilityPolicy::default()
+        };
+
+        for tier in ALL_TIERS {
+            let report = scope_report_for_tier(
+                &policy,
+                ContainmentClass::Sealed,
+                *tier,
+                Some(SealedBlocker::NamespaceCreationDenied),
+            );
+            assert_eq!(
+                report.staged_runtime_grants,
+                vec![
+                    "python3: /opt/testbed/conda/envs/django__django \
+                     (pin: conda-4.10.3/python-3.9.19)"
+                ],
+                "tier {tier:?} must still report the declared staged runtime"
+            );
+            assert!(
+                report.render().contains("staged runtime"),
+                "the rendered report must carry a staged runtime section on tier {tier:?}"
+            );
+        }
+    }
+
+    /// The absent case: no `staged_runtime` in the manifest leaves the section empty rather than
+    /// inventing one, and `render` still names it as `<none>` like every other empty list.
+    #[test]
+    fn absent_staged_runtime_reports_nothing() {
+        let report = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+        );
+        assert!(report.staged_runtime_grants.is_empty());
+        assert!(report.render().contains("staged runtime: <none>"));
     }
 
     /// A capsule that declares `scoped` *and* opens host paths through `interpreter_runtime`

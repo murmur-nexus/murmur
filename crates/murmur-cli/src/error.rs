@@ -35,6 +35,7 @@ pub const E_RUN_014: &str = "E-RUN-014"; // a sealed session's composed root cou
 pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
 pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared scope
 pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared containment class
+pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a sealed containment floor
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -252,6 +253,20 @@ impl From<RuntimeError> for CliError {
                 );
                 CliError::with_hint(E_CAP_003, error.to_string(), hint)
             }
+            // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
+            // one means the host is too weak for the declared floor (lower it, or move hosts),
+            // this one means the capsule's own declaration is too weak for what it asked for
+            // (raise it, or drop the grant). Deciding it on the declared floor alone is why this
+            // fires identically on a host that could deliver `sealed`.
+            error @ RuntimeError::StagedRuntimeRequiresSealed { .. } => CliError::with_hint(
+                E_CAP_004,
+                error.to_string(),
+                "set `capabilities.containment: sealed` in murmur.yaml (or pass \
+                 `--containment sealed`) so the capsule gets a composed root to stage the runtime \
+                 into, or remove the capabilities.shell.staged_runtime grant. Run `mur run \
+                 --explain-scope` to see the declared grants and whether this host can back \
+                 `sealed` — see docs/content/reference/manifest-schema.md",
+            ),
             // Delegate to the RuntimeError Display text so the versioned interface
             // name and rebuild hint can't drift from capsule-runtime's errors.rs.
             error @ RuntimeError::CapsuleExportMissing => {
@@ -559,6 +574,34 @@ mod tests {
         assert!(
             hint.contains("--explain-scope"),
             "hint should point at the re-probe command: {hint}"
+        );
+    }
+
+    /// `staged_runtime` without a `sealed` floor must not land on `E-CAP-003`. The two refusals
+    /// read alike (both are pre-launch, both mention containment classes) and their remedies are
+    /// exact opposites — `E-CAP-003` says lower the declared floor, this one says raise it — so an
+    /// operator handed the wrong code would be told to make the problem worse.
+    #[test]
+    fn staged_runtime_without_sealed_has_its_own_code_and_opposite_remediation() {
+        let cli = CliError::from(RuntimeError::StagedRuntimeRequiresSealed {
+            binaries: vec!["python3".to_string()],
+            declared: murmur_artifact::ContainmentClass::Scoped,
+        });
+
+        assert_eq!(cli.code, E_CAP_004);
+        assert_ne!(
+            cli.code, E_CAP_003,
+            "an under-declared capsule is not a host that cannot deliver"
+        );
+        assert!(
+            cli.message.contains("python3") && cli.message.contains("staged_runtime"),
+            "message should name the grant and its binary: {}",
+            cli.message
+        );
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("sealed") && hint.contains("--explain-scope"),
+            "hint should name the floor to set and how to inspect it: {hint}"
         );
     }
 }

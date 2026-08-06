@@ -82,6 +82,10 @@ capabilities:
             list_dir: true          # Execute+ReadFile+ReadDir — the dir's entries are enumerable
           - path: /usr/lib/python3.11/lib-dynload
             list_dir: false         # Execute+ReadFile — files openable by exact name, dir not listable
+    staged_runtime:                 # optional: pinned host runtime trees to bind-mount into a sealed root
+      - binary: python3             # MUST already appear in allow above; MUST NOT also have an interpreter_runtime grant
+        source_path: /opt/testbed/conda/envs/django__django   # absolute host path to an already-pinned tree
+        pin: conda-4.10.3/python-3.9.19/testbed-2024-05-01    # required; never inferred
   env:
     allow:             # optional: host env vars a WASM guest (capsule/tool/driver) may observe
       - MY_APP_REGION
@@ -346,6 +350,10 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.shell.interpreter_runtime[].dirs` | list<dir> | yes | the host directories to grant; must name at least one |
 | `capabilities.shell.interpreter_runtime[].dirs[].path` | string | yes | an absolute host path (must start with `/`) outside the workdir |
 | `capabilities.shell.interpreter_runtime[].dirs[].list_dir` | bool | yes | `true` → `Execute+ReadFile+ReadDir` (directory entries enumerable); `false` → `Execute+ReadFile` (files openable by exact name, directory not listable). Never inferred — must be written explicitly. |
+| `capabilities.shell.staged_runtime` | list<grant> | no | names a pinned host runtime tree to bind-mount **read-only into a `sealed` capsule's composed root**, so the interpreter is present inside the root rather than reachable outside it. Requires an effective `sealed` containment floor, and is mutually exclusive per binary with `interpreter_runtime`. See [Staged runtime](#field-staged-runtime) below. |
+| `capabilities.shell.staged_runtime[].binary` | string | yes | a binary that MUST already appear in `capabilities.shell.allow`, and MUST NOT also have a `capabilities.shell.interpreter_runtime` grant — this says where an existing exec grant's runtime comes from, it never grants exec |
+| `capabilities.shell.staged_runtime[].source_path` | string | yes | absolute host path (must start with `/`) of an already-pinned runtime tree — a vendored toolchain directory, a baked-in conda env. Not resolved, discovered or version-sniffed by the runtime, and not required to exist on the machine that merely *parses* the manifest |
+| `capabilities.shell.staged_runtime[].pin` | string | yes | non-empty, opaque identifier of which build the tree is. Never inferred: it exists so a human can compare the declared pin across two hosts and confirm the same runtime shipped to both |
 | `capabilities.env.allow` | list<string> | no | host env var names a WASM guest (capsule/tool/driver component) may observe. Omitted or `[]` — a legitimate no-op, not an error — grants nothing beyond the runtime's own `MURMUR_*` injections. |
 | `capabilities.limits.memory_bytes` | integer | no | cap on a guest's linear-memory growth, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
 | `capabilities.limits.table_elements` | integer | no | cap on a guest's table growth, in elements. Default: 100000. Must be > 0. |
@@ -373,6 +381,73 @@ or to leave anything behind on the host.
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the kernel-level (Landlock/seccomp) enforcement set used for `capabilities.shell.allow` subprocesses. This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
 
 A WASM guest never inherits the host process's environment: `capabilities.env.allow` is the only way to expose a host variable, and even a name declared there is dropped if it is credential-shaped (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the exact pattern list — the same backstop applies here) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable is silently omitted, not an error.
+
+### Staged runtime { #field-staged-runtime }
+
+`capabilities.shell.staged_runtime` and `capabilities.shell.interpreter_runtime` solve the same
+problem — a path-based interpreter cannot run from its binary alone, because its stdlib lives
+outside the workdir at a path the `DT_NEEDED` closure cannot discover — and they solve it in
+opposite directions.
+
+| | `interpreter_runtime` | `staged_runtime` |
+|---|---|---|
+| Direction | widens the capsule's Landlock scope **outwards** to host paths | bind-mounts the runtime tree **inwards** into the capsule's own root |
+| Floor required | any (works at `scoped`) | `sealed` only |
+| Host paths reachable from inside | yes, the granted directories | no |
+| Coupled to one host's layout | yes — fires [`W-SEC-009`](security-warnings.md#w-sec-009) | no, and `pin` makes the coupling checkable |
+| Granularity | specific directories, each with an explicit `list_dir` | the whole named tree, read-only |
+
+Because the second makes the first unnecessary for any binary that uses it, **declaring both for
+the same binary is rejected at parse time.** It is a contradiction, not a layering: a composed root
+does not contain the host directories an `interpreter_runtime` grant names, so the grant would
+describe paths that do not exist inside the capsule.
+
+```yaml
+capabilities:
+  containment: sealed              # required — see below
+  shell:
+    allow:
+      - python3
+    staged_runtime:
+      - binary: python3
+        source_path: /opt/testbed/conda/envs/django__django
+        pin: conda-4.10.3/python-3.9.19/testbed-2024-05-01
+```
+
+**`sealed` is required, and it is checked against the declared floor.** A `staged_runtime` grant is
+staged into a composed root, and a composed root is built only for a capsule that asked for
+`sealed` (see [A weaker declaration is never silently upgraded](#field-containment)). So a capsule
+declaring `staged_runtime` below an effective `sealed` floor is refused before any registry pull,
+artifact compile or workdir creation:
+
+```text
+error[E-CAP-004]: capabilities.shell.staged_runtime is declared for python3 but the effective containment floor is 'scoped' — staging a runtime tree requires the 'sealed' floor, because there is no composed root to bind-mount it into below that
+  hint: set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment sealed`) so the capsule gets a composed root to stage the runtime into, or remove the capabilities.shell.staged_runtime grant.
+```
+
+This is deliberately **not** the same check as `E-CAP-003`, and the two remedies are opposites.
+`E-CAP-003` means the host is too weak for what the capsule declared — lower the floor or move
+hosts. `E-CAP-004` means the capsule declared too little for what it asked for — raise the floor or
+drop the grant. `E-CAP-004` therefore fires identically on a host that could deliver `sealed`,
+because the operator never asked for it. `mur doctor` surfaces the same condition as a warning
+ahead of a run.
+
+**`pin` is for humans, not for the runtime.** Nothing parses it, matches it, or verifies it against
+the tree at `source_path`. It exists so that "the same interpreter build ran on both hosts" is a
+claim someone can check by comparing two manifests, rather than one assumed from two directories
+having the same name. `mur run --explain-scope` prints every declared grant with its pin, on every
+host and whatever the floor:
+
+```text
+  staged runtime:
+    - python3: /opt/testbed/conda/envs/django__django (pin: conda-4.10.3/python-3.9.19/testbed-2024-05-01)
+```
+
+`--explain-scope` is a diagnostic, so it reports the grant even where `mur run` would refuse —
+which is exactly the case an operator is inspecting.
+
+For the hand-run verification procedure, including the bind-mount-vs-copy cost measurement, see
+[Staged runtime bind mount: manual verification](staged-runtime-bind-mount-manual-verification.md).
 
 ### Containment class { #field-containment }
 

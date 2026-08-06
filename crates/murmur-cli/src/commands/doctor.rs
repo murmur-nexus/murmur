@@ -1,13 +1,16 @@
-use capsule_runtime::{warn_on_interpreter_runtime_grants, ArtifactRequest};
+use capsule_runtime::{
+    check_staged_runtime_floor, warn_on_interpreter_runtime_grants, ArtifactRequest,
+};
 use murmur_artifact::{
-    current_platform, load_runtime_manifest, read_lockfile, resolve_manifest_path, sha256_hex,
-    LocalRegistry, LockfileError, MurmurLock,
+    current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
+    resolve_manifest_path, sha256_hex, LocalRegistry, LockfileError, MurmurLock,
 };
 
 use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
-use crate::error::CliError;
+use crate::config::load_effective_mur_config_if_any_exists;
+use crate::error::{CliError, E_CAP_004};
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
@@ -80,6 +83,40 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         .map(|shell| shell.interpreter_runtime.as_slice())
     {
         warn_on_interpreter_runtime_grants(interpreter_runtime);
+    }
+
+    // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a
+    // capsule declaring one without an effective `sealed` floor is rejected at staging with
+    // E-CAP-004, and finding that out from `mur doctor` beats finding it out from a failed run.
+    //
+    // Doctor sees two of the three floor sources — the manifest and the workspace config. It has
+    // no `--containment` flag of its own, and since the effective floor is the *strongest* of the
+    // three, a flag could only ever raise what is computed here. So this reports a warning rather
+    // than a failure, and says so: the run it is predicting may still be launched with
+    // `--containment sealed`.
+    let staged_runtime = runtime_manifest
+        .capabilities
+        .as_ref()
+        .and_then(|caps| caps.shell.as_ref())
+        .map(|shell| shell.staged_runtime.as_slice())
+        .unwrap_or_default();
+    if !staged_runtime.is_empty() {
+        let floor = effective_containment_floor(
+            load_effective_mur_config_if_any_exists()?.and_then(|config| config.containment),
+            runtime_manifest
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.containment),
+            None,
+        );
+        if let Err(error) = check_staged_runtime_floor(staged_runtime, floor) {
+            eprintln!(
+                "[mur doctor] warning[{E_CAP_004}]: {error}\n  \
+                 `mur run` will refuse this capsule unless the floor is raised — set \
+                 `capabilities.containment: sealed` in murmur.yaml, set `containment: sealed` in \
+                 .murmur/config.yaml, or pass `--containment sealed`."
+            );
+        }
     }
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
