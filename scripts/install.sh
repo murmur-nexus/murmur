@@ -340,7 +340,7 @@ ${manual}"
 
     if ! apparmor_parser -r "${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}" >/dev/null 2>&1; then
         warn "wrote ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME} but could not load it.
-mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Retry with: Retry with:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Retry with:
   sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
         return 0
     fi

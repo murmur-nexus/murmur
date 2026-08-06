@@ -962,15 +962,15 @@ pub(crate) const CAPSULE_DEVICE_GRANTS: &[CapsuleDeviceGrant] = &[
 /// symlink in that window can still race it.
 ///
 /// Neither exec nor symlinks are what bounds that race — it is the whole class of decision
-/// this supervisor makes by dereferencing a pointer into another task's memory. The
-/// `connect`/`sendto` path reads a `sockaddr` out of the notifying task via the same
-/// `/proc/<pid>/mem` read (`linux_enforce::read_cstr_from_child`) and answers with the
-/// same `CONTINUE`, so a second thread can overwrite that buffer between the supervisor's read
-/// and the kernel's post-continue re-use of it exactly as it can retarget a symlink here.
-/// Closing either fully requires fd-substitution (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather
-/// than continue semantics; the non-racing rename/copy bypass is what this closes. Audited,
-/// with citations and a hand-runnable race probe, in
-/// `docs/content/reference/seccomp-notify-toctou-audit.md`.
+/// this supervisor makes by dereferencing a pointer into another task's memory. A `connect`/
+/// `sendto` path used to read a `sockaddr` out of the notifying task the same way and answer
+/// with the same `CONTINUE`, exposed to the identical race; that path has been retired (the
+/// native subprocess tree now enforces `capabilities.network.allow` through its own network
+/// namespace and egress proxy instead), leaving this pathname read as the one remaining
+/// `/proc/<pid>/mem` dereference on the hot path. Closing it fully requires fd-substitution
+/// (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather than continue semantics; the non-racing
+/// rename/copy bypass is what this closes. Audited, with citations and a hand-runnable race
+/// probe, in `docs/content/reference/seccomp-notify-toctou-audit.md`.
 // Production callers live inside the Linux-only supervisor; unit tests exercise it on every
 // OS (which is the point of keeping it out of `linux_enforce`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
