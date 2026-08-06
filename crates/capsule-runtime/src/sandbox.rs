@@ -1617,7 +1617,10 @@ pub(crate) struct ShellEnforcement {
     /// so macOS gets the per-process half of this slice even though it can never get the
     /// aggregate half. See [`crate::resources`].
     pub(crate) resource_limits: crate::resources::HostResourceLimits,
-    /// The runtime's own uid process count, measured once here in the parent. `RLIMIT_NPROC` is a
+    /// The runtime's own uid task count, measured once here in the parent by
+    /// `crate::resources::uid_task_count` in whichever unit this platform's `RLIMIT_NPROC` is
+    /// enforced against: **threads** on Linux (`setrlimit(2)`: "the maximum number of processes
+    /// (or, more precisely on Linux, threads)"), **processes** on macOS. `RLIMIT_NPROC` is a
     /// per-uid limit, so `resource_limits.max_processes` is applied as headroom above this rather
     /// than as an absolute ceiling — see `crate::resources::apply_hard_rlimits`. `0` when the host
     /// cannot be asked, which makes the declared value apply literally (the tighter reading).
@@ -1672,7 +1675,7 @@ impl ShellEnforcement {
             sealed_bind_dirs,
             staged_runtime_dirs,
             resource_limits: policy.resources,
-            nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
+            nproc_baseline: crate::resources::uid_task_count().unwrap_or(0),
             cgroup_scope: None,
             workdir_guard: None,
         })
@@ -1736,7 +1739,7 @@ impl ShellEnforcement {
             // applies unchanged on this tier, so zeroing them out here would misrepresent what a
             // real macOS host does.
             resource_limits: crate::resources::HostResourceLimits::default(),
-            nproc_baseline: crate::resources::uid_process_count().unwrap_or(0),
+            nproc_baseline: crate::resources::uid_task_count().unwrap_or(0),
             cgroup_scope: None,
             workdir_guard: None,
         }

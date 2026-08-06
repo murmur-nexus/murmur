@@ -48,9 +48,11 @@ use std::{
     time::Duration,
 };
 
-/// Default `RLIMIT_NPROC` headroom — how many processes past the runtime's own uid baseline a
-/// subprocess tree may add. See [`apply_hard_rlimits`] for why this is headroom rather than an
-/// absolute ceiling.
+/// Default `RLIMIT_NPROC` headroom — how much past the runtime's own uid baseline a subprocess
+/// tree may add, in whichever unit this platform's `RLIMIT_NPROC` is checked against: threads on
+/// Linux (`setrlimit(2)`: "the maximum number of processes (or, more precisely on Linux,
+/// threads)"), processes on macOS. See [`apply_hard_rlimits`] for why this is headroom rather
+/// than an absolute ceiling, and [`uid_task_count`] for how the baseline is measured.
 pub const DEFAULT_MAX_PROCESSES: u64 = 128;
 
 /// Default `RLIMIT_NOFILE` hard ceiling — open descriptors per spawned subprocess.
@@ -95,9 +97,11 @@ pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostResourceLimits {
     /// `RLIMIT_NPROC` headroom above the runtime's own uid baseline. Per-**uid**, not
-    /// per-process-tree — see the module docs for why the cgroup `pids.max` below exists
-    /// alongside it rather than duplicating it, and [`apply_hard_rlimits`] for why it is applied
-    /// as headroom.
+    /// per-process-tree, and counted in the unit that uid's kernel enforces against — threads on
+    /// Linux (`setrlimit(2)`: "the maximum number of processes (or, more precisely on Linux,
+    /// threads)"), processes on macOS. See the module docs for why the cgroup `pids.max` below
+    /// exists alongside it rather than duplicating it, and [`apply_hard_rlimits`] for why it is
+    /// applied as headroom.
     pub max_processes: u64,
     /// `RLIMIT_NOFILE` hard ceiling.
     pub max_open_files: u64,
@@ -224,19 +228,23 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 ///
 /// ## Why `max_processes` is headroom, not an absolute ceiling
 ///
-/// `RLIMIT_NPROC` counts **every process owned by the uid**, not the ones in this tree. A desktop
-/// or workstation account routinely runs several hundred (measured: 389 on the machine this was
-/// developed on), so a hard `RLIMIT_NPROC` of 128 does not bound the capsule at 128 processes —
-/// it makes the very first `fork()` in the subprocess fail with `EAGAIN`, because the uid is
-/// already past the limit before the capsule does anything. That is a broken runtime, not a
-/// bound.
+/// `RLIMIT_NPROC` is checked against **everything the uid already owns**, not against the ones in
+/// this tree — and on Linux the unit it counts is *threads*, not processes: `setrlimit(2)` calls
+/// it "the maximum number of processes (or, more precisely on Linux, threads) that can be created
+/// for the real user ID". On macOS, whose BSD-derived limit is genuinely per-process, it counts
+/// processes. Either way a desktop or workstation account is already deep into that number before
+/// the capsule starts (measured on the machine this was developed on: 134 processes but 923
+/// threads), so a hard `RLIMIT_NPROC` of 128 does not bound the capsule at 128 — it makes the very
+/// first `fork()` in the subprocess fail with `EAGAIN`. That is a broken runtime, not a bound.
 ///
-/// So `nproc_baseline` — the uid's process count, measured once in the parent at launch by
-/// [`uid_process_count`] — is added to the declared `max_processes`, making the manifest field
-/// mean "how many processes past the host's existing usage this capsule's tree may add". That is
-/// the only reading of a per-uid limit that is both enforceable and non-breaking. When the count
-/// cannot be measured the caller passes `0` and the declared value applies literally, which
-/// errs toward the tighter bound.
+/// So `nproc_baseline` — the uid's live count *in that platform's own unit*, measured once in the
+/// parent at launch by [`uid_task_count`] — is added to the declared `max_processes`, making the
+/// manifest field mean "how much past the host's existing usage this capsule's tree may add".
+/// That is the only reading of a per-uid limit that is both enforceable and non-breaking, and it
+/// only holds if the baseline is measured in the unit the kernel checks: a *process* count fed to
+/// a Linux kernel counting threads yields a ceiling below the uid's live usage, i.e. the same
+/// `EAGAIN` the headroom design exists to prevent. When the count cannot be measured the caller
+/// passes `0` and the declared value applies literally, which errs toward the tighter bound.
 ///
 /// This is also, concretely, why the Linux cgroup `pids.max` is not redundant with this: it
 /// counts only the tasks in the capsule's own scope, so it needs no baseline and cannot be
@@ -309,26 +317,42 @@ fn set_hard_rlimit(resource: u32, value: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// How many processes the runtime's own uid currently owns, or `None` if the host cannot be
-/// asked.
+/// How many **tasks** — in the unit this platform's `RLIMIT_NPROC` is actually checked against —
+/// the runtime's own uid currently owns, or `None` if the host cannot be asked.
 ///
-/// Measured once per launch **in the parent** — it walks `/proc` (Linux) or issues a `sysctl`
+/// The unit differs per platform, and matching it is the entire point of this function:
+///
+///   - **Linux**: threads. `setrlimit(2)` states the limit is "the maximum number of processes
+///     (or, more precisely on Linux, threads) that can be created for the real user ID", and the
+///     kernel's `fork()` path compares against the uid's live task count. So this sums each owned
+///     process's `/proc/<pid>/task/` entries (one per thread, the leader included) rather than
+///     counting `/proc/<pid>` directories, which would count one per *process* and land an order
+///     of magnitude low on any account running threaded software.
+///   - **macOS**: processes. The BSD-derived `RLIMIT_NPROC` there genuinely counts one entry per
+///     process, so `proc_listpids` is already the matching unit.
+///
+/// Measured once per launch **in the parent** — it walks `/proc` (Linux) or calls into libproc
 /// (macOS), neither of which is async-signal-safe, so it must never be called from `pre_exec`.
 /// Its one consumer is the `RLIMIT_NPROC` baseline in [`apply_hard_rlimits`]; see there for why a
 /// per-uid limit is meaningless without it.
+///
+/// The Linux walk is inherently racy — a process can exit between the `read_dir("/proc")` and the
+/// read of its `task/` directory — and every such race is absorbed by skipping that process. A
+/// baseline slightly stale in either direction is harmless: it is added to `max_processes`
+/// headroom, not compared for equality against anything.
 #[cfg_attr(not(unix), allow(dead_code))]
 // Each `cfg` arm returns explicitly so that exactly one of them is live per target without the
 // arms having to be arranged so the live one happens to be last — on the target where an arm is
 // the final live statement, clippy sees its `return` as redundant, but removing it breaks every
 // other target.
 #[allow(clippy::needless_return)]
-pub(crate) fn uid_process_count() -> Option<u64> {
+pub(crate) fn uid_task_count() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
 
         // A `/proc/<pid>` directory is owned by the uid the process runs as, so a `stat` per
-        // entry answers this without opening or parsing a single `status` file.
+        // entry finds this uid's processes without opening or parsing a single `status` file.
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         let uid = {
             #[allow(unsafe_code)]
@@ -337,7 +361,7 @@ pub(crate) fn uid_process_count() -> Option<u64> {
             }
         };
         let entries = std::fs::read_dir("/proc").ok()?;
-        let count = entries
+        let count: u64 = entries
             .flatten()
             .filter(|entry| {
                 entry
@@ -346,8 +370,15 @@ pub(crate) fn uid_process_count() -> Option<u64> {
                     .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
                     && entry.metadata().is_ok_and(|metadata| metadata.uid() == uid)
             })
-            .count();
-        return Some(count as u64);
+            .map(|entry| {
+                // One `task/` entry per thread of that process, the group leader included. A
+                // process that exits mid-walk contributes 0 rather than aborting the count.
+                std::fs::read_dir(entry.path().join("task"))
+                    .map(|threads| threads.flatten().count() as u64)
+                    .unwrap_or(0)
+            })
+            .sum();
+        return Some(count);
     }
 
     #[cfg(target_os = "macos")]
@@ -614,23 +645,72 @@ mod tests {
         assert_eq!(guard.breach(), None);
     }
 
-    /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
-    /// can be raised back by the capsule itself. Asserted against the live process by lowering
-    /// a limit we can afford to lower (`RLIMIT_CORE`, which this runtime pins at zero anyway)
-    /// and reading it back.
     /// The baseline must be a real, plausible count — a `0` here would silently turn
     /// `max_processes` back into the absolute per-uid ceiling that makes every `fork()` in a
-    /// subprocess fail on any account already running more processes than the limit.
+    /// subprocess fail on any account already past the limit.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn uid_process_count_reports_a_plausible_baseline() {
-        let count = uid_process_count().expect("this platform can be asked for its process count");
+    fn uid_task_count_reports_a_plausible_baseline() {
+        let count = uid_task_count().expect("this platform can be asked for its task count");
         assert!(
             count > 0,
             "the test process itself is owned by this uid, so the count cannot be zero"
         );
     }
 
+    /// The regression guard for the unit itself: on Linux `RLIMIT_NPROC` is enforced against
+    /// *threads*, so threads spawned inside this very process must move the baseline. A
+    /// `/proc/<pid>`-directory count — one entry per process — would not move at all here, which
+    /// is exactly the bug this replaces.
+    ///
+    /// Asserted as strictly-greater rather than against an expected number: the host's other
+    /// threads come and go while the test runs, so any absolute expectation would be flaky on a
+    /// busy machine, while "spawning live threads cannot leave the count unchanged" holds
+    /// regardless of what else the uid is doing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uid_task_count_rises_when_this_process_gains_threads() {
+        use std::sync::Barrier;
+
+        const EXTRA_THREADS: usize = 8;
+
+        let before = uid_task_count().expect("linux can be asked for its task count");
+
+        // Two rendezvous points: the first proves every spawned thread is alive *before* the
+        // second measurement, the second holds them alive *across* it.
+        let started = Arc::new(Barrier::new(EXTRA_THREADS + 1));
+        let release = Arc::new(Barrier::new(EXTRA_THREADS + 1));
+        let handles: Vec<_> = (0..EXTRA_THREADS)
+            .map(|_| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                thread::spawn(move || {
+                    started.wait();
+                    release.wait();
+                })
+            })
+            .collect();
+        started.wait();
+
+        let during = uid_task_count().expect("linux can be asked for its task count");
+
+        release.wait();
+        for handle in handles {
+            handle.join().expect("spawned thread must not panic");
+        }
+
+        assert!(
+            during > before,
+            "{EXTRA_THREADS} live extra threads must raise the uid's task count \
+             (before: {before}, during: {during}) — an unchanged count means the baseline is \
+             counting processes, not the threads the kernel enforces `RLIMIT_NPROC` against"
+        );
+    }
+
+    /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
+    /// can be raised back by the capsule itself. Asserted against the live process by lowering
+    /// a limit we can afford to lower (`RLIMIT_CORE`, which this runtime pins at zero anyway)
+    /// and reading it back.
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]

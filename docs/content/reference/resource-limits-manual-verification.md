@@ -167,10 +167,21 @@ mur run murmur-defaults.yaml --task 'run this shell command and report its exact
 ```
 
 **Expected:** `1024` (`max_open_files`), `3600` (`cpu_seconds`), and for `ulimit -Hu` **the
-uid's current process count plus 128** — not a bare `128`. `RLIMIT_NPROC` is per-uid, so
-`max_processes` is applied as headroom above the runtime's own baseline; a literal `128` on an
-account already running more than that would make the subprocess's first `fork()` fail. Compare
-against `ps -u "$(id -un)" | wc -l` on the same host.
+uid's current thread count plus 128** — not a bare `128`. `RLIMIT_NPROC` is per-uid, and on Linux
+the unit it counts is threads, not processes (`setrlimit(2)`: "the maximum number of processes (or,
+more precisely on Linux, threads) that can be created for the real user ID"), so `max_processes` is
+applied as headroom above the runtime's own live *thread* baseline; a literal `128` on an account
+already past that would make the subprocess's first `fork()` fail. Compare against
+
+```bash
+ps -u "$(id -un)" -L --no-headers | wc -l
+```
+
+on the same host — `-L` lists one row per LWP (thread), which is the quantity the kernel checks.
+A plain `ps -u "$(id -un)" | wc -l` counts *processes* and will read far lower than the reported
+`ulimit -Hu`; that discrepancy is expected and is not a finding. On macOS the comparator is the
+process count (`ps -u "$(id -un)" | wc -l`), because that platform's `RLIMIT_NPROC` genuinely
+counts one entry per process.
 
 All three come from a manifest that declares no `resources:` block at all.
 
