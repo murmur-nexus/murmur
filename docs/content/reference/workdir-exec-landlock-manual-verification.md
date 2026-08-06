@@ -194,20 +194,20 @@ TIER: KernelSealed
 EXIT: 0
 OUT: REFUSED
 
-ERR: bash: /etc/bash.bashrc: Permission denied
-bash: line 1: ./bash: Permission denied
+ERR: bash: line 1: ./bash: Permission denied
 ```
 
-The two lines are separate facts and both matter:
-
-* `bash: line 1: ./bash: Permission denied` is Landlock refusing the `execve`. It is **not**
-  `No such file or directory` (the file is there, mode `0755`) and **not** an errno from a
-  userspace supervisor — nothing in userspace was consulted.
-* `/etc/bash.bashrc: Permission denied` is the same Landlock domain refusing a *read* outside the
-  workdir, which confirms the ruleset really installed rather than silently no-op'ing. A run where
-  that line is absent is a run where Landlock did not apply, and step 1's result is void.
+`bash: line 1: ./bash: Permission denied` is Landlock refusing the `execve`. It is **not**
+`No such file or directory` (the file is there, mode `0755`) and **not** an errno from a userspace
+supervisor — nothing in userspace was consulted.
 
 `EXIT: 0` is correct: the exit code is the `|| echo REFUSED` branch's, not the imposter's.
+
+Note: a plain `bash -c '...'` never opens `/etc/bash.bashrc` (verified with `strace -f -e trace=openat`
+on this same host) — an earlier draft of this procedure claimed that line as an additional control
+signal on stderr, but it is not something this harness reproducibly emits, so it has been dropped
+from the expected output. The `./bash: Permission denied` line is the property under test and is
+sufficient on its own.
 
 A `RAN_OK` here is a **failure of this procedure** and a live bypass. Record it and stop.
 
@@ -222,22 +222,22 @@ cargo test -p capsule-runtime --lib \
   -- --nocapture --exact sandbox::linux_integration_tests::scratch_workdir_exec
 ```
 
-Expected — the planted `/bin/echo` runs and prints its argument:
+Expected — the planted `/bin/echo` runs and prints its argument, and the script's `&&` continues
+into `echo RAN_OK`:
 
 ```
 TIER: KernelSealed
 EXIT: 0
 OUT: IMPOSTER_RAN
+RAN_OK
 
-ERR: bash: /etc/bash.bashrc: Permission denied
+ERR:
 ```
 
 `IMPOSTER_RAN` on stdout is the whole point: `capabilities.shell.allow` contained only `bash`, and a
 copy of `/bin/echo` just ran. That is the documented, accepted cost of the declaration, and it is
-what steps 4–6 make visible to an operator.
-
-The `/etc/bash.bashrc` denial must still be present — `workdir_exec` widens exactly one bit, and a
-run where the filesystem scope also disappeared would mean something else broke.
+what steps 4–6 make visible to an operator. `RAN_OK` on the next line simply confirms the `&&` branch
+was taken, i.e. the imposter genuinely exited zero rather than merely not crashing.
 
 A `REFUSED` here means compile-and-run workflows are broken; record it and stop.
 
@@ -498,11 +498,14 @@ the tier the property belongs to.
 in the session workdir as `./bash` (mode `0755`) while `capabilities.shell.allow` contained only
 `bash`. Observed:
 
-* `SCRATCH_WORKDIR_EXEC=0` → `OUT: REFUSED`, `ERR: bash: line 1: ./bash: Permission denied`,
-  preceded by `bash: /etc/bash.bashrc: Permission denied` (confirming the Landlock domain was live).
-* `SCRATCH_WORKDIR_EXEC=1` → `OUT: IMPOSTER_RAN`, with the `/etc/bash.bashrc` denial still present.
+* `SCRATCH_WORKDIR_EXEC=0` → `OUT: REFUSED`, `ERR: bash: line 1: ./bash: Permission denied`.
+* `SCRATCH_WORKDIR_EXEC=1` → `OUT: IMPOSTER_RAN` followed by `RAN_OK`, `ERR:` empty.
 
-Both outputs are reproduced verbatim in steps 1 and 2 above.
+Both outputs are reproduced verbatim in steps 1 and 2 above, and were re-confirmed independently
+during review on the same host (2026-08-06): the `/etc/bash.bashrc` line quoted in an earlier draft
+does not actually occur — `strace -f -e trace=openat bash -c 'true'` shows a plain `bash -c` never
+opens that file — so it was dropped as a claimed control signal; the `./bash: Permission denied`
+line is the property under test and stands on its own.
 
 **Step 3.** `kernel_tier_allows_nested_exec_of_second_allowlisted_binary` passes on this host, as do
 `kernel_tier_allows_exec_within_shell_allowlist`,
