@@ -588,7 +588,7 @@ not read this warning as an escape finding.
 
 **What to do:** run capsules that spawn subprocesses on a Linux host with systemd user cgroup
 delegation configured, where the aggregate bounds are real — see
-[Resource limits: manual verification](resource-limits-manual-verification.md). On this platform,
+[Verification](verification.md) for how those bounds are checked by hand. On this platform,
 treat `capabilities.resources`' `cgroup_*` fields as declared-but-inert and do not rely on them.
 This is **permanent** on this platform, exactly like [`W-SEC-001`](#w-sec-001): no future slice
 will add cgroups to a kernel that does not have them.
