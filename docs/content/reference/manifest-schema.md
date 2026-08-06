@@ -359,7 +359,7 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.limits.table_elements` | integer | no | cap on a guest's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | cap on the number of instances a single store may create. Default: 1000. Must be > 0. |
 | `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single guest invocation (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes). Must be > 0. |
-| `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how many processes past the runtime's own uid baseline its tree may add. Default: 128. Must be > 0. See the per-uid note below. |
+| `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how much past the runtime's own uid baseline its tree may add, in the unit the kernel enforces against (threads on Linux, processes on macOS). Default: 128. Must be > 0. See the per-uid note below. |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
 | `capabilities.resources.cpu_seconds` | integer | no | `RLIMIT_CPU` hard ceiling on each native subprocess, in CPU-seconds. Default: 3600 (1 hour). Must be > 0. |
@@ -980,14 +980,19 @@ Three mechanisms enforce these, in descending order of portability:
   `RLIMIT_CORE` is additionally pinned to `0` with no manifest surface at all.
 
     `max_processes` is the one field applied as **headroom rather than an absolute number**, and
-    the reason is `RLIMIT_NPROC`'s own semantics: it counts every process owned by the *uid*, not
-    the ones in the capsule's tree. A workstation account routinely runs several hundred, so a
-    literal hard ceiling of 128 would not bound the capsule at 128 processes — it would make the
-    subprocess's very first `fork()` fail with `EAGAIN` before the capsule did anything. The
-    runtime therefore measures the uid's process count once at launch and sets
-    `RLIMIT_NPROC = baseline + max_processes`. The Linux cgroup `pids.max` needs no such
-    adjustment, because it counts only the tasks in the capsule's own scope — which is exactly
-    why it, and not this field, is the bound that actually stops a fork bomb.
+    the reason is `RLIMIT_NPROC`'s own semantics: it counts everything already owned by the *uid*,
+    not the entries in the capsule's tree — and the unit it counts differs by platform. On Linux
+    it is **threads**: `setrlimit(2)` describes the limit as "the maximum number of processes (or,
+    more precisely on Linux, threads) that can be created for the real user ID". On macOS, whose
+    BSD-derived limit is genuinely per-process, it is **processes**. A workstation account is
+    routinely several hundred processes and several *thousand* threads deep before a capsule
+    starts, so a literal hard ceiling of 128 would not bound the capsule at 128 — it would make
+    the subprocess's very first `fork()` fail with `EAGAIN` before the capsule did anything. The
+    runtime therefore measures the uid's live count once at launch, in that platform's own unit
+    (threads on Linux, processes on macOS), and sets `RLIMIT_NPROC = baseline + max_processes`.
+    The Linux cgroup `pids.max` needs no such adjustment, because it counts only the tasks in the
+    capsule's own scope — which is exactly why it, and not this field, is the bound that actually
+    stops a fork bomb.
 - **A cgroup v2 scope** around the whole subprocess tree (`cgroup_*` fields), **Linux only**.
   This is what rlimits structurally cannot do: `RLIMIT_NPROC` is a per-**uid** ceiling, so a fork
   bomb of distinct, short-lived processes evades it; `pids.max` on a cgroup does not.
