@@ -274,10 +274,12 @@ pub(crate) fn sealed_blocker(
 ///
 /// Deliberately a whole-directory bind rather than a curated per-file set: the point of `sealed`
 /// is that it *deletes* the ELF-closure derivation `scoped` needs, along with its lock-time
-/// pinning problem. A later slice (`staged-runtime-bind-mount`) replaces this list with a staged
-/// interpreter tree; until then, anything a `shell.allow` binary needs at runtime must be under
-/// one of these or under a directory derived from the manifest — see `extra_read_only` in
-/// [`plan_composed_root`].
+/// pinning problem. `capabilities.shell.staged_runtime` is **additive** to this list, not a
+/// replacement for it: a declared runtime tree arrives through
+/// [`plan_composed_root`]'s own `staged_runtime_read_only` parameter, as a *required* bind, while
+/// this fixed list stays exactly as it is. Anything a `shell.allow` binary needs at runtime must
+/// therefore be under one of these, under a staged runtime tree, or under a directory derived
+/// from the manifest — see `extra_read_only` in [`plan_composed_root`].
 pub const SEALED_RUNTIME_PATHS: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
 ];
@@ -543,13 +545,35 @@ pub(crate) fn choose_root_base(
 /// each `capabilities.shell.interpreter_runtime` directory. They are whole-directory binds, not a
 /// per-file grant set: this slice must not extend the ELF-closure mechanism it exists to make
 /// unnecessary. Entries already covered by a fixed path are dropped.
+///
+/// `staged_runtime_read_only` carries the `source_path` of each declared
+/// `capabilities.shell.staged_runtime` grant. It is a *separate* parameter from `extra_read_only`
+/// rather than more entries in it, because the two have opposite failure semantics and the
+/// difference is the whole point of the capability. See [`PlanBuilder::require_bind`].
 pub(crate) fn plan_composed_root(
     workdir: &Path,
     base: &Path,
     extra_read_only: &[PathBuf],
+    staged_runtime_read_only: &[PathBuf],
     host: &dyn HostLayout,
 ) -> ComposedRootPlan {
     let mut builder = PlanBuilder::new(base);
+
+    // 0. Declared `staged_runtime` trees, read-only and REQUIRED — before everything else.
+    //
+    //    Ordering is load-bearing, not tidiness. `mirror` below deduplicates by target path via
+    //    the `made` set, so whichever loop registers a target first wins it and any later loop
+    //    silently no-ops on the same target. Running the required binds first means a staged path
+    //    that happens to collide with an optional one can only ever be *upgraded* to required,
+    //    never silently downgraded to optional.
+    //
+    //    These are also planned ahead of /dev, /proc, /tmp and the workdir bind — and therefore
+    //    ahead of `pivot_root`, which `construct_composed_root` performs only after every planned
+    //    step has run. A capsule never reaches a shell tool call inside a root that is missing a
+    //    runtime tree it declared.
+    for path in staged_runtime_read_only {
+        builder.require_bind(path);
+    }
 
     // 1. The host runtime tree, read-only. A usrmerge symlink is reproduced as a symlink so the
     //    composed root has the host's shape; a real directory is bind-mounted.
@@ -682,6 +706,39 @@ impl PlanBuilder {
                 self.steps.push(RootStep { op: RootOp::MkDir(current.clone()), required: true });
             }
         }
+    }
+
+    /// Schedules an unconditional, **required** read-only directory bind of `source`.
+    ///
+    /// The deliberate difference from [`Self::mirror`] is that this never consults [`HostLayout`].
+    /// `mirror` asks the host whether a path exists and, when it does not, returns having
+    /// scheduled *nothing at all* — not even a step that would fail. That is right for
+    /// `extra_read_only`, where a missing path should make the composed root narrower rather than
+    /// refuse the launch. It is exactly wrong for `staged_runtime`, where a missing source must
+    /// fail the launch: routed through `mirror`, a capsule declaring a runtime tree the host does
+    /// not have would launch successfully into a root silently lacking it.
+    ///
+    /// So no existence pre-check happens here, or anywhere else in this slice. The plan always
+    /// carries the step, `required: true`, and the real `mount(2)` in `execute_step`'s
+    /// [`CStepKind::Bind`] arm is the single source of truth for "does this exist" — a missing
+    /// source fails with `ENOENT` at construction time, in the child, which
+    /// `construct_composed_root`'s `step.required` check turns into a `SealedRootFailure`. That
+    /// path already reaches the operator as `RuntimeError::SealedRootConstructionFailed`
+    /// (`E-RUN-014`), already names the offending path via [`SealedRootSpec::describe`], and is
+    /// already session-fatal. No new error variant is needed, and none was added.
+    ///
+    /// Always a directory bind: a staged runtime tree is a tree. `mkdir_p` registers the target in
+    /// `made`, so a later `mirror` of the same path is the one that no-ops, never this.
+    fn require_bind(&mut self, source: &Path) {
+        let target = rebase(&self.base, source);
+        if self.made.contains(&target) {
+            return;
+        }
+        self.mkdir_p(&target);
+        self.push(
+            RootOp::Bind { source: source.to_path_buf(), target, read_only: true },
+            /* required */ true,
+        );
     }
 
     /// Reproduces one host path inside the composed root: a symlink as a symlink, a directory or
@@ -1537,6 +1594,7 @@ mod tests {
             Path::new(workdir),
             Path::new("/tmp"),
             &[],
+            &[],
             &FakeHost::usrmerge(),
         )
     }
@@ -1756,6 +1814,7 @@ mod tests {
             Path::new("/home/u/w"),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/python3.12"), PathBuf::from("/usr")],
+            &[],
             &host,
         );
         let operations = ops(&plan);
@@ -1773,6 +1832,132 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The property the whole capability rests on: `extra_read_only` shrinks when the host is
+    /// missing a path, `staged_runtime_read_only` fails. Both directions are asserted from the
+    /// same plan so the contrast cannot drift apart.
+    #[test]
+    fn a_staged_runtime_path_absent_from_the_host_still_plans_a_required_bind() {
+        // Neither path is in `FakeHost::usrmerge()` — the host has neither.
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            Path::new("/tmp"),
+            &[PathBuf::from("/opt/optional-tree")],
+            &[PathBuf::from("/opt/staged-tree")],
+            &FakeHost::usrmerge(),
+        );
+
+        // The optional entry contributes nothing at all — not even a step that would fail. This
+        // is `mirror`'s silent-skip-on-absence, and it is why `extra_read_only` could not be the
+        // destination for a staged grant.
+        assert!(
+            !plan.steps.iter().any(|step| matches!(
+                &step.op,
+                RootOp::Bind { source, .. } if source == Path::new("/opt/optional-tree")
+            )),
+            "an absent extra_read_only path must plan no step",
+        );
+
+        // The staged entry is planned regardless, and is required — so the real `mount(2)`
+        // returning ENOENT aborts the construction before `pivot_root`.
+        let staged = plan
+            .steps
+            .iter()
+            .find(|step| matches!(
+                &step.op,
+                RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree")
+            ))
+            .expect("an absent staged_runtime path must still plan a bind");
+        assert_eq!(
+            staged.op,
+            RootOp::Bind {
+                source: PathBuf::from("/opt/staged-tree"),
+                target: PathBuf::from("/tmp/opt/staged-tree"),
+                read_only: true,
+            },
+            "staged trees are re-based read-only binds at their own absolute path",
+        );
+        assert!(
+            staged.required,
+            "a staged_runtime bind must be required, so a missing source is session-fatal \
+             rather than a silently narrower root",
+        );
+    }
+
+    /// Staged binds land before `/etc`, `/dev`, `/proc`, `/tmp` and the workdir — and therefore
+    /// before the `pivot_root` that `construct_composed_root` performs after every planned step.
+    #[test]
+    fn staged_runtime_binds_are_planned_before_every_other_step() {
+        let mut host = FakeHost::usrmerge();
+        host.0.insert(PathBuf::from("/opt/staged-tree"), PathKind::Dir);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            Path::new("/tmp"),
+            &[],
+            &[PathBuf::from("/opt/staged-tree")],
+            &host,
+        );
+
+        let position = |predicate: &dyn Fn(&RootOp) -> bool| {
+            plan.steps
+                .iter()
+                .position(|step| predicate(&step.op))
+                .expect("step must be planned")
+        };
+
+        let staged = position(&|op| {
+            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree"))
+        });
+        let fixed_runtime_tree = position(&|op| {
+            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/usr"))
+        });
+        let etc = position(&|op| {
+            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/etc/ssl"))
+        });
+        let dev = position(&|op| matches!(op, RootOp::Tmpfs { target, .. } if target == Path::new("/tmp/dev")));
+        let proc = position(&|op| matches!(op, RootOp::Proc { .. }));
+        let tmp = position(&|op| {
+            matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp"))
+        });
+        let workdir = position(&|op| {
+            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/home/u/w"))
+        });
+
+        // Ahead of the fixed runtime tree / `extra_read_only` loop, so a coincidental target
+        // collision is won by the required registration rather than the optional one.
+        assert!(staged < fixed_runtime_tree, "staged binds precede the fixed runtime tree");
+        assert!(staged < etc, "staged binds precede /etc");
+        assert!(staged < dev, "staged binds precede /dev");
+        assert!(staged < proc, "staged binds precede /proc");
+        assert!(staged < tmp, "staged binds precede /tmp");
+        assert!(staged < workdir, "staged binds precede the workdir bind");
+    }
+
+    /// The collision case the ordering above exists to protect: a path named by *both* parameters
+    /// is registered once, by the required loop.
+    #[test]
+    fn a_path_named_both_staged_and_optional_stays_required() {
+        let mut host = FakeHost::usrmerge();
+        host.0.insert(PathBuf::from("/opt/shared"), PathKind::Dir);
+        let plan = plan_composed_root(
+            Path::new("/home/u/w"),
+            Path::new("/tmp"),
+            &[PathBuf::from("/opt/shared")],
+            &[PathBuf::from("/opt/shared")],
+            &host,
+        );
+
+        let binds: Vec<&RootStep> = plan
+            .steps
+            .iter()
+            .filter(|step| matches!(
+                &step.op,
+                RootOp::Bind { source, .. } if source == Path::new("/opt/shared")
+            ))
+            .collect();
+        assert_eq!(binds.len(), 1, "the shared target is registered exactly once");
+        assert!(binds[0].required, "and the required registration is the one that won");
     }
 
     #[test]

@@ -1,18 +1,27 @@
 # Verification — staged runtime bind mount
 
-!!! warning "Status: **Part A run during efc0d7db's review, see results below. Part B is blocked.**"
+!!! success "Status: **RUN — 2026-08-06, single host.** Part A run during efc0d7db's review; Part B run on one host during 309a3184's review."
 
     **Part A** (the bind-mount-vs-copy cost measurement) needs nothing this slice did not ship and
     was run against a substitute tree (see [Recording the result](#recording-the-result) for why,
     and which tree was used) — the reference SWE-bench conda tree was not available on the host
     that ran the review.
 
-    **Part B** (the end-to-end, two-host check) is **blocked** until the staged-runtime grant is
-    actually wired into the composed-root construction. The schema, the validation, the
-    `--explain-scope` reporting and the `E-CAP-004` refusal all ship and work; the bind mount into
-    a live capsule root does not happen yet. See [What is and is not wired
-    today](#what-is-and-is-not-wired-today) before running anything in Part B and concluding
-    something from it.
+    **Part B** is no longer blocked: `309a3184` wired the grant into
+    `sealed::plan_composed_root` as a *required* bind, and the mechanism was exercised end to end
+    on a real host through a live capsule's shell tool — the tree is present, read-only, and
+    outside-the-root paths are still `ENOENT`. A **missing** `source_path` refuses the session with
+    `error[E-RUN-014]` naming the path, with no shell command executed.
+
+    **The cross-host half of Part B was not run** and remains the one acceptance criterion on this
+    page with no observed result: only one Linux host was available. The single-host run is
+    evidence for the *mechanism*; it is not evidence for the "same pin, same interpreter, two
+    hosts" identity claim, which is what steps B1–B2 exist to check. See
+    [Recording the result](#recording-the-result) — the Host 2 column records this verbatim rather
+    than being quietly dropped.
+
+    A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the mount and
+    must not be reported as if it were.
 
 ## What this verifies
 
@@ -65,19 +74,31 @@ Read this before Part B.
 | `mur run --explain-scope` reporting the grant on any host and any floor | **shipped** |
 | `E-CAP-004` refusal when the declared floor is below `sealed` | **shipped** |
 | `mur doctor` warning ahead of a run | **shipped** |
-| `staged_runtime::bind_mount_staged_runtimes`, proven in its own mount namespace | **shipped, and called from nowhere** |
-| The composed root actually carrying the staged tree | **NOT wired** |
+| The composed root actually carrying the staged tree | **shipped** (`309a3184`) |
+| A missing `source_path` refusing the session with `E-RUN-014` | **shipped** (`309a3184`) |
+| `staged_runtime::bind_mount_staged_runtimes`, proven in its own mount namespace | **shipped, and deliberately not the production call site** |
 
-The composed-root mechanism itself (`capsule-runtime/src/sealed.rs`) does exist and is live — a
-`sealed` capsule really does run inside a private mount namespace pivoted onto a composed root. What
-is missing is only the step that feeds a declared `staged_runtime` grant into that root's plan. See
-the build summary for `efc0d7db` for the exact seam
-(`sealed::plan_composed_root`'s `extra_read_only` parameter) and why the wiring was left separate.
+`309a3184` added a fourth parameter to `sealed::plan_composed_root`
+(`staged_runtime_read_only: &[PathBuf]`) and a `PlanBuilder::require_bind` method that schedules a
+**required** `RootOp::Bind { read_only: true }` for every declared `source_path` — before the fixed
+runtime tree, `/etc`, `/dev`, `/proc`, `/tmp` and the workdir, and therefore before `pivot_root`.
+No existence check happens anywhere in Murmur: the real `mount(2)` is the source of truth, and its
+`ENOENT` aborts the construction through the pre-existing required-step path
+(`RuntimeError::SealedRootConstructionFailed` → `E-RUN-014`, session-fatal).
 
-**Consequence for Part B:** a `sealed` capsule declaring `staged_runtime` today launches
-successfully and simply does not have the tree mounted. Running Part B now would show a missing
-interpreter, which is the expected outcome of an unwired mechanism — not a bug to chase, and not a
-result to record on this page.
+`bind_mount_staged_runtimes` is still not the call site, and that is deliberate rather than
+leftover: it allocates, and the composed root executes inside the forked child's `pre_exec` window,
+which must not. It remains the independently-proven statement of the same two-call read-only bind
+contract the planned step executes.
+
+**One thing the bind alone does not buy.** `sealed` keeps Landlock installed *inside* the composed
+root as defence in depth, and Landlock denies any path with no matching rule. A staged tree that is
+bind-mounted but ungranted is present, read-only, and unreadable (`EACCES`) — which is
+indistinguishable from the capability not working. `309a3184` therefore also emits one listable
+`LandlockGrant` per staged directory (`sandbox::resolve_staged_runtime_landlock_grants`). This was
+found by the hand-run below, not by a test: the first end-to-end attempt returned
+`cat: ...: Permission denied` on a tree that was demonstrably mounted (the write probe already
+reported `Read-only file system`).
 
 ## Part A — bind mount vs. copy cost
 
@@ -176,11 +197,11 @@ right, because it would mean the mechanism's central premise does not hold on th
 
 ## Part B — end-to-end, two hosts
 
-!!! danger "Blocked — do not run for a result yet"
+!!! success "Unblocked as of `309a3184` — run on one host, see [Recording the result](#recording-the-result)"
 
-    Requires the staged-runtime grant to be wired into the composed-root plan. See [What is and is
-    not wired today](#what-is-and-is-not-wired-today). Written now so the wiring slice inherits a
-    ready procedure rather than an empty page.
+    The mechanism half of this procedure (B3, B4, B5, plus the missing-source refusal in B6 below)
+    was run on a single real host and passed. The identity half (B1, B2 compared *across* two
+    hosts) still has no observed result, because only one host was available.
 
 ### Prerequisites
 
@@ -275,6 +296,39 @@ Confirm from the session's `trace.jsonl` that `session_start` records
 and that no `W-SEC-009` warning was emitted on either host. `W-SEC-009` firing would mean an
 `interpreter_runtime` grant was still in play and the run does not demonstrate what it claims.
 
+### Step B6 — a `source_path` absent from the host refuses the session
+
+The inverse of everything above, and the reason the bind is planned `required: true`. Point the
+same declaration at a path this host does not have and run again:
+
+```yaml
+    staged_runtime:
+      - binary: python3
+        source_path: /opt/definitely-not-here
+        pin: whatever
+```
+
+`mur run --explain-scope` still reports the grant cleanly — existence is deliberately not checked at
+parse time, so a manifest stays parseable on a machine that will never run it. The refusal comes at
+the first shell tool call, when the composed root is constructed:
+
+```text
+error[E-RUN-014]: the sealed containment class was achievable at launch but its composed root could not be built for this subprocess: sealed-root: bind (ro) /opt/definitely-not-here -> /tmp/opt/definitely-not-here failed: No such file or directory (os error 2)
+```
+
+Confirm from `trace.jsonl` that `session_end` carries `"exit_status":"failed"` and
+`"total_shell_calls":0` — the session ended rather than the capsule retrying, and **no shell command
+ran inside a root missing what it declared**. That is the whole property.
+
+!!! note "`transport: process` does not end the session here, by design"
+
+    Under `inference.transport: process` the tool call is served by `agent::claude_bridge`, which
+    deliberately does not act on the session-fatal flag — it is a tool server for an external CLI
+    and owns no murmur session (see the comment at its dispatch site). The error text still reaches
+    the caller in full, but the process keeps going. Use `transport: http` for this step if you
+    want to observe the session actually terminating with `E-RUN-014`. This is pre-existing
+    behaviour, unrelated to staged runtimes.
+
 ## Recording the result
 
 Fill in on the run. Leave the "not run" markers in place until then — an unfilled table is a
@@ -303,31 +357,55 @@ final recorded number for the roadmap's acceptance criterion.
 
 ### Part B — end to end
 
+The tree used was **not** an interpreter, and deliberately so: the property under test on one host
+is "is this directory bind-mounted read-only into the composed root at its own absolute path", which
+a directory holding one readable file answers exactly as well as a conda env, without needing a
+285 MB fixture. Proving "the same *interpreter*" is the cross-host claim, and that is the column
+that went unfilled.
+
 | Field | Host 1 | Host 2 |
 |---|---|---|
-| Date | _blocked_ | _blocked_ |
-| Distro / kernel | _blocked_ | _blocked_ |
-| `achieved` class | _blocked_ | _blocked_ |
-| `python3 -VV` output | _blocked_ | _blocked_ |
-| `sys.executable` / `sys.prefix` | _blocked_ | _blocked_ |
-| B3 write refused? | _blocked_ | _blocked_ |
-| B4 `ENOENT` (not `EACCES`)? | _blocked_ | _blocked_ |
-| `W-SEC-009` absent? | _blocked_ | _blocked_ |
+| Date | 2026-08-06 | **not run — no second host.** This environment is a single sandboxed development machine and no second Linux host was provisioned or reachable. Not waived as unnecessary: the cross-host identity comparison (B1/B2) is genuinely unverified, and the Host 1 column is compensating evidence for the *mechanism* only. |
+| Distro / kernel | Linux 7.0.0-28-generic, x86_64, AppArmor `restrict_unprivileged_userns=0` | not run |
+| `achieved` class | `sealed` (`mur run --explain-scope`: `declared: sealed / achieved: sealed / floor met: yes / mechanism: mountns+pivot_root+landlock+seccomp`) | not run |
+| Staged tree used | `/space/mur-staged-check`, containing `marker.txt` (31 bytes). Substitute for the reference conda env — see the note above. | not run |
+| `pin` declared | `hand-verification-309a3184/marker-tree-2026-08-06` | not run |
+| `python3 -VV` output | **not applicable** on Host 1 — a marker tree was staged, not an interpreter. This row is the cross-host identity check and needs two hosts to mean anything. | not run |
+| `sys.executable` / `sys.prefix` | not applicable (as above) | not run |
+| B2 substitute — tree readable at its declared path? | **yes.** `cat /space/mur-staged-check/marker.txt` → `staged-runtime-marker-309a3184`. `ls -la` of the same path listed `marker.txt` from inside the session. | not run |
+| B3 write refused? | **yes.** `touch /space/mur-staged-check/probe` → `touch: cannot touch '/space/mur-staged-check/probe': Read-only file system` (`EROFS`) | not run |
+| B4 `ENOENT` (not `EACCES`)? | **yes.** `stat /etc/shadow` → `stat: cannot statx '/etc/shadow': No such file or directory` | not run |
+| `W-SEC-009` absent? | **yes.** No `interpreter_runtime` declared and no `W-SEC-009` in stderr or `logs/bootstrap.log`. `W-SEC-005` (the standard sealed-tier notice) did fire, as expected. | not run |
+| `trace.jsonl` `session_start` | `"containment_achieved":"sealed"` | not run |
+| B6 missing `source_path` refuses? | **yes.** With `source_path: /space/mur-staged-ABSENT`: `error[E-RUN-014]: ... sealed-root: bind (ro) /space/mur-staged-ABSENT -> /tmp/space/mur-staged-ABSENT failed: No such file or directory (os error 2)`; `session_end` carried `"exit_status":"failed"` and `"total_shell_calls":0`. | not run |
 
 ## Residuals recorded here rather than buried
 
-* **The helper is proven, the wiring is not.** `bind_mount_staged_runtimes` has a real
-  mount-namespace test that passes on a real Linux host. That test proves the *operation* is
-  correct; it proves nothing about a capsule, because nothing calls the function yet. Do not cite
-  it as evidence for Part B.
+* **Only one host, so only half of Part B.** The mechanism is confirmed on a real kernel; the
+  "same pin, same interpreter, two hosts" claim is not. Anyone with a second Linux host should run
+  B1/B2 against a real pinned tree and fill the Host 2 column — until then, treat the cross-host
+  guarantee as asserted rather than observed.
+
+* **The helper is proven and is still not the call site.** `bind_mount_staged_runtimes` has a real
+  mount-namespace test that passes on a real Linux host. That test proves the *operation*; the
+  production mount goes through `sealed::plan_composed_root`'s required-bind path instead, because
+  the helper allocates and `pre_exec` must not. Cite the hand-run above as evidence for Part B, not
+  that test.
+
+* **A substitute tree, not an interpreter.** Host 1 staged a directory holding one file. That is
+  sufficient for "is it mounted, read-only, at the right path" and insufficient for anything about
+  interpreter identity. Do not read the Host 1 column as a Python result.
 * **`pin` is unverified by construction.** Nothing compares `pin` against the tree at
   `source_path` — not a hash, not a version probe, not an existence check. Two hosts could declare
   the same pin over genuinely different trees and Murmur would not notice. Step B2 exists precisely
   because the pin is a human claim; it is the check, not the guarantee.
-* **`source_path` existence is not validated at parse time.** A manifest naming a tree absent from
-  the launch host parses cleanly, by design: manifests must stay parseable on machines that will
-  never run them (`mur build` on a laptop for a Linux fleet). The failure surfaces when the mount is
-  attempted — which, today, is never.
+* **`source_path` existence is not validated at parse time, and is not pre-checked at launch
+  either.** A manifest naming a tree absent from the launch host parses cleanly, by design:
+  manifests must stay parseable on machines that will never run them (`mur build` on a laptop for a
+  Linux fleet). The failure surfaces when the mount is attempted, at `mount(2)`, in the child — and
+  that placement is deliberate. A parent-side existence check would return `Err(String)` from
+  `build_sealed_root`, which converts to the ordinary retryable `ShellExecError::Failed`; letting
+  the required bind fail for real is what routes it to the session-fatal variant. Verified in B6.
 * **Part A measures the kernel, not Murmur.** Its numbers stay valid across refactors of this
   codebase and should not be re-run for a Murmur-side change unless the mount flags themselves
   change.
