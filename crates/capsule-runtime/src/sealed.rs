@@ -643,7 +643,10 @@ pub(crate) fn plan_composed_root(
 }
 
 /// `base` + `path`, where `path` is absolute: `/tmp` + `/usr/lib` → `/tmp/usr/lib`.
-fn rebase(base: &Path, path: &Path) -> PathBuf {
+///
+/// `pub(crate)` so [`crate::staged_runtime::target_under_root`] can reuse this instead of
+/// reimplementing the same re-basing rule.
+pub(crate) fn rebase(base: &Path, path: &Path) -> PathBuf {
     let relative = path.strip_prefix("/").unwrap_or(path);
     base.join(relative)
 }

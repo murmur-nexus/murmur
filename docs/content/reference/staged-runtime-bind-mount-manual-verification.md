@@ -1,10 +1,11 @@
 # Verification — staged runtime bind mount
 
-!!! warning "Status: **NOT RUN.** Part A is runnable today; Part B is blocked."
+!!! warning "Status: **Part A run during efc0d7db's review, see results below. Part B is blocked.**"
 
     **Part A** (the bind-mount-vs-copy cost measurement) needs nothing this slice did not ship and
-    can be run the day it merges. It has **not** been run — [Recording the
-    result](#recording-the-result) has empty slots waiting for two numbers.
+    was run against a substitute tree (see [Recording the result](#recording-the-result) for why,
+    and which tree was used) — the reference SWE-bench conda tree was not available on the host
+    that ran the review.
 
     **Part B** (the end-to-end, two-host check) is **blocked** until the staged-runtime grant is
     actually wired into the composed-root construction. The schema, the validation, the
@@ -283,17 +284,22 @@ correct record of an unperformed check.
 
 | Field | Value |
 |---|---|
-| Date | _not run_ |
-| Host / kernel | _not run_ |
-| Tree path | _not run_ |
-| Tree size (total / `lib/pythonX.Y`) | _not run_ |
-| File count | _not run_ |
-| Backing filesystem | _not run_ |
-| Cache state for the copy (cold/warm) | _not run_ |
-| **Bind mount `real`** | _not run_ |
-| **Recursive copy `real`** | _not run_ |
-| Ratio | _not run_ |
-| Both `OK` probes observed in A1? | _not run_ |
+| Date | 2026-08-06 |
+| Host / kernel | Linux 7.0.0-28-generic, x86_64 |
+| Tree path | `/usr/lib/python3` — **substitute**: no SWE-bench conda tree was available on the review host; this is a real, in-use CPython stdlib tree, not a synthetic fixture |
+| Tree size (total) | 83 MB |
+| File count | 5,448 |
+| Backing filesystem | btrfs |
+| Cache state for the copy | warm (no root available to drop caches in the review environment; a cold copy would only widen the gap below) |
+| **Bind mount `real`** | 0.004s |
+| **Recursive copy `real`** | 0.313s |
+| Ratio | ~78x |
+| Both `OK` probes observed in A1? | yes (`read: OK`, `write refused: OK`) |
+
+Smaller than the roadmap's 285 MB / 9,194-file reference tree, so the absolute copy time will be
+higher there — but the bind mount is O(1) in tree size, so the ratio only grows in staged_runtime's
+favor on the reference tree. Re-run against the actual reference tree before treating this as the
+final recorded number for the roadmap's acceptance criterion.
 
 ### Part B — end to end
 

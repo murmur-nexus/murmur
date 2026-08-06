@@ -138,15 +138,11 @@ impl std::error::Error for StagedRuntimeMountError {}
 /// Identity of the path inside and outside the root is the property the whole mechanism rests on —
 /// `sys.prefix`, shebang lines, `PYTHONHOME` and anything a previous turn wrote to disk all keep
 /// resolving, and the capsule never has to be told its interpreter moved. It is the same rule
-/// [`crate::sealed`] applies to the session workdir.
-///
-/// Pure, and separated out so the re-basing is testable without mounting anything.
+/// [`crate::sealed`] applies to the session workdir, via the same [`crate::sealed::rebase`]
+/// function — reused here rather than reimplemented, so there is exactly one re-basing rule.
 #[cfg(target_os = "linux")]
 fn target_under_root(root: &Path, source_path: &Path) -> PathBuf {
-    // `staged_runtime.source_path` is absolute (the manifest parser rejects anything else), so
-    // stripping the leading separator is all `join` needs to not discard `root`.
-    let relative = source_path.strip_prefix("/").unwrap_or(source_path);
-    root.join(relative)
+    crate::sealed::rebase(root, source_path)
 }
 
 /// Bind-mounts every declared `staged_runtime` tree read-only into `root`, each at its own
