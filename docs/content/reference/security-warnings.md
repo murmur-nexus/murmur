@@ -527,8 +527,11 @@ pure-Python stdlib files it discovers by listing each `sys.path` entry. That mak
 necessary to run such an interpreter, but it also **couples the capsule to a specific host
 distro/interpreter-version layout**: a grant naming `/usr/lib/python3.11` stops resolving the moment
 the host ships Python 3.12, and a capsule that runs on Debian may not run on Alpine. This is the
-honest cost, and the reason the durable fix is the still-unbuilt staged runtime bind-mount — this
-grant exists only to bridge until that lands.
+honest cost, and the reason the durable fix is
+[`capabilities.shell.staged_runtime`](manifest-schema.md#field-staged-runtime), which bind-mounts a
+pinned runtime tree into the capsule's own composed root instead of reaching out to the host's — this
+grant exists only to bridge for capsules that cannot use that (it requires an effective `sealed`
+floor; `interpreter_runtime` works at `scoped` too).
 
 **What it grants, exactly:** one Landlock rule per named directory, and nothing else. Each directory
 carries its own required `list_dir`:
@@ -548,8 +551,10 @@ requirement with `strace -f -e trace=openat,getdents64 <interpreter> -c "import 
 guessing, and set `list_dir: false` on any directory you only open known files inside (do not
 reflexively set `list_dir: true` "to be safe" — it only changes whether the directory can be
 *enumerated*, and files inside a `list_dir: false` directory are still openable by name). Accept
-that the capsule is now pinned to this host's interpreter layout, and plan to drop the grant once
-the staged runtime bind-mount ships.
+that the capsule is now pinned to this host's interpreter layout, or switch to
+`capabilities.shell.staged_runtime` if the capsule can run at an effective `sealed` floor — it
+bind-mounts a pinned tree into the composed root instead of reaching out to the host's, so it
+carries no host-layout coupling and fires no `W-SEC-009`.
 
 **Parse-time rejections.** A malformed `interpreter_runtime` fails `mur run`/`mur doctor` at
 manifest parse time (not a warning — a hard error naming the offending value): a `binary` not
