@@ -188,6 +188,23 @@ design built on *reading another process's memory* — the same design property 
 TOCTOU. An architecture that decided from kernel-held values, or substituted a resolved fd, would
 need neither the read nor the capability.
 
+!!! note "Correction, 2026-08-06: the capability is no longer required — the read still is"
+
+    This section's heading overstates what was measured. `restore_child_dumpable`
+    (`sandbox.rs`, in `pre_exec`) has the forked child re-enable its own dumpable flag before the
+    seccomp filter is installed, which is the *other* way `ptrace_may_access` can pass: same-uid
+    access to a dumpable target, no capability involved. A six-configuration matrix run for slice
+    `f163778e` — including controls that reproduce the historical `Permission denied (os error 13)`
+    failure by disabling that re-enable — measured an allowlisted `execve` succeeding with
+    `CAP_SYS_PTRACE` dropped from every capability set. See
+    step 6 ("does the container capability set still need `CAP_SYS_PTRACE`?") of
+    [`network-namespace-egress-proxy-manual-verification.md`](network-namespace-egress-proxy-manual-verification.md).
+
+    What stands unchanged is the paragraph above it: the supervisor still *reads another process's
+    memory*, and that is still the design property producing the TOCTOU this audit is about. The
+    capability was a symptom of that design, not the whole of it, and the symptom has a mitigation
+    while the design does not.
+
 ## The race probes
 
 The static verdict above is settled by reading code. The probes exist for a different question:

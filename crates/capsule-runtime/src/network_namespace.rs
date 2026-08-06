@@ -726,6 +726,24 @@ mod linux {
     /// Enough room for [`super::MAX_NAMESPACE_SOCKETS`] descriptors plus the `cmsghdr`.
     const CMSG_BUFFER_LEN: usize = 128;
 
+    // Not just a comment: `send_fds`/`receive_namespace_sockets` size `msg_controllen` from
+    // `libc::CMSG_SPACE(descriptor_bytes)`, independently of `CMSG_BUFFER_LEN`, so nothing before
+    // this diff stopped a future bump of `MAX_NAMESPACE_SOCKETS` (via
+    // `egress_proxy::MAX_EGRESS_TCP_PORTS`) from silently making that computed length exceed the
+    // fixed-size `CmsgBuffer` below — the CMSG macros would then write past its end. Pinned here
+    // at compile time instead of trusted to stay true.
+    const _: () = assert!(
+        // SAFETY: `CMSG_SPACE` is pure arithmetic on its argument (see libc's definition); it is
+        // marked `unsafe` only for macro-generation consistency with pointer-taking neighbours
+        // like `CMSG_DATA`, not because this call touches memory.
+        unsafe {
+            libc::CMSG_SPACE((super::MAX_NAMESPACE_SOCKETS * std::mem::size_of::<RawFd>()) as u32)
+                as usize
+        } <= CMSG_BUFFER_LEN,
+        "CMSG_BUFFER_LEN is too small to hold MAX_NAMESPACE_SOCKETS descriptors plus the cmsghdr; \
+         raise it to match"
+    );
+
     /// A `cmsghdr` buffer with the alignment the CMSG macros require.
     ///
     /// A bare `[u8; N]` is only 1-byte aligned and `CMSG_FIRSTHDR` casts it straight to

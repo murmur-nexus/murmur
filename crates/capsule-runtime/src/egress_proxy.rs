@@ -44,8 +44,12 @@
 //! ## Deliberate limits, stated rather than hidden
 //!
 //! * **IPv4 only.** The namespace installs no IPv6 route, so an IPv6 destination fails with
-//!   `ENETUNREACH` and this resolver answers `AAAA` with no records. A dual-stack client falls
-//!   back to IPv4, which is served end to end.
+//!   `ENETUNREACH` regardless of what DNS answered. This resolver does not withhold a name's real
+//!   `AAAA` records to prevent that — [`answer_dns_query`] answers `AAAA` with no records only when
+//!   the name has no IPv6 address upstream at all, so a genuinely dual-stack name's real IPv6
+//!   addresses are returned unchanged. A client that tries one of those first pays the cost of a
+//!   failed connection before falling back to IPv4, which is served end to end; it is not granted
+//!   anything, since the missing route — not the DNS answer — is what makes IPv6 unreachable.
 //! * **Only allowlisted ports are listened on.** A connection to a port no allow entry implies
 //!   gets `ECONNREFUSED`: the route delivers it locally and nothing is listening. That is a
 //!   refusal, not an escape.
@@ -89,26 +93,41 @@ const NAME_BINDING_LIFETIME: Duration = Duration::from_secs(300);
 /// modern resolver advertises; anything larger is malformed for our purposes.
 const MAX_DNS_MESSAGE_BYTES: usize = 4096;
 
+/// Ceiling on how long `resolve_upstream`'s real lookup may run before it is treated as having
+/// found nothing.
+///
+/// `to_socket_addrs` (`getaddrinfo(3)`) has no timeout of its own, and a session's DNS queries are
+/// served by one thread processing them one at a time — an unbounded lookup here would stall every
+/// other query behind it, and would make `EgressProxyHandle::shutdown`'s join of that same thread
+/// wait on however long a slow or unreachable upstream resolver takes. This is the DNS-side
+/// counterpart of `CONNECT_TIMEOUT`, the equivalent bound already in place on the TCP half.
+const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------- listen ports
 
 /// Every TCP port this capsule's allowlist implies a listener for, ascending and deduplicated.
 ///
-/// A rule with an explicit port contributes exactly that port. A rule without one contributes the
-/// default(s) for its scheme — 443 for `https://`, 80 for `http://`, and *both* for a bare host
-/// entry, which the manifest schema defines as spanning both schemes. Nothing else is opened, so a
-/// port no entry implies has no listener and a connection to it is refused by the kernel with
-/// nothing in userspace consulted.
+/// A rule with an explicit port contributes exactly that port. A rule without one contributes
+/// *both* scheme defaults, 80 and 443 — which the manifest schema defines as what a bare host
+/// entry spans. Nothing else is opened, so a port no entry implies has no listener and a
+/// connection to it is refused by the kernel with nothing in userspace consulted.
+///
+/// Only `rule.port` is consulted, deliberately: `network_policy::parse_url_allow_rule` already
+/// resolves a scheme-bearing entry's port via `default_port_for_scheme` at parse time (an
+/// `https://` or `http://` entry always carries `port: Some(_)` by the time it reaches here), so
+/// `rule.port == None` only ever happens for a bare host entry, which has no `scheme` either and
+/// is exactly the "both defaults" case below. There is no reachable state where `rule.scheme` is
+/// `Some(_)` and `rule.port` is `None` — matching on `scheme` here would just re-encode
+/// `default_port_for_scheme`'s mapping in a branch nothing can reach.
 pub(crate) fn egress_listen_ports(rules: &[NetworkAllowRule]) -> Vec<u16> {
     let mut ports: Vec<u16> = Vec::new();
     for rule in rules {
-        let implied: [Option<u16>; 2] = match (rule.port, rule.scheme.as_deref()) {
-            (Some(port), _) => [Some(port), None],
-            (None, Some("https")) => [Some(443), None],
-            (None, Some("http")) => [Some(80), None],
+        let implied: [Option<u16>; 2] = match rule.port {
+            Some(port) => [Some(port), None],
             // A bare `example.com` entry spans both schemes and every port. The two scheme
             // defaults are what a client actually dials; opening every port would be a listener
             // population no allowlist asked for.
-            (None, _) => [Some(80), Some(443)],
+            None => [Some(80), Some(443)],
         };
         for port in implied.into_iter().flatten() {
             if !ports.contains(&port) {
@@ -160,20 +179,19 @@ impl EgressPolicy {
     /// Whether a connection to `address:port` may be forwarded, given every name this session's
     /// resolver has bound to that address.
     ///
-    /// Name-keyed when a binding exists, address-keyed when none does. The scheme is derived from
-    /// the port (443 → `https`, anything else → `http`), which is what makes a manifest entry of
-    /// `https://api.example.com` refuse a plaintext connection to port 80 through the very same
-    /// rule set — and the very same [`NetworkAllowRule::matches`] — that gates the WASI-HTTP path.
-    /// One manifest entry cannot mean two things depending on which half of the runtime reads it.
+    /// Name-keyed when a binding exists, address-keyed when none does. The decision goes through
+    /// the very same [`NetworkAllowRule::matches`] — and the very same rule set — that gates the
+    /// WASI-HTTP path, so one manifest entry cannot mean two things depending on which half of the
+    /// runtime reads it. See [`rule_permits_connection`] for where the scheme it matches on comes
+    /// from, and why a connection cannot supply one.
     pub(crate) fn allows_connection(&self, names: &[String], address: IpAddr, port: u16) -> bool {
-        let scheme = if port == 443 { "https" } else { "http" };
         for name in names {
-            let target = RequestTarget {
-                scheme: scheme.to_string(),
-                host: normalize_host(name),
-                port: Some(port),
-            };
-            if self.rules.iter().any(|rule| rule.matches(&target)) {
+            let host = normalize_host(name);
+            if self
+                .rules
+                .iter()
+                .any(|rule| rule_permits_connection(rule, &host, port))
+            {
                 return true;
             }
         }
@@ -183,6 +201,33 @@ impl EgressPolicy {
         // launch-time resolution — reused rather than reimplemented.
         crate::sandbox::network_ip_allowed(address, &self.allow_ips)
     }
+}
+
+/// Whether `rule` permits a TCP connection to `host:port`.
+///
+/// The scheme handed to [`NetworkAllowRule::matches`] is taken from `rule` itself, which makes the
+/// matcher's scheme clause a deliberate no-op and leaves host and port — the only two things a TCP
+/// connection actually carries — as the whole decision. That is not a weakening, because the parser
+/// has already folded every rule's scheme into its port: `parse_url_allow_rule` gives an `https://`
+/// entry `port: Some(443)` and an `http://` entry `port: Some(80)` unless the entry pinned a port
+/// explicitly, and a bare host entry carries neither scheme nor port and spans both defaults. So
+/// `https://api.example.com` still refuses port 80 — its port is 443, and `egress_listen_ports`
+/// opens no listener on 80 for it at all — while `https://api.example.com:8443` is permitted on
+/// exactly the port its listener was opened for.
+///
+/// The alternative, deriving a scheme from the port number, is what this replaces: it silently
+/// refused every connection to a scheme-bearing entry with a non-default port, because `8443 != 443`
+/// guessed `http` and the rule said `https`. A listener was opened for a capability that then could
+/// not be used. The runtime never terminates TLS — that is the point of splicing bytes rather than
+/// proxying requests — so there is no honest way to observe a connection's scheme here, and
+/// guessing one is worse than declining to.
+fn rule_permits_connection(rule: &NetworkAllowRule, host: &str, port: u16) -> bool {
+    let target = RequestTarget {
+        scheme: rule.scheme.clone().unwrap_or_default(),
+        host: host.to_string(),
+        port: Some(port),
+    };
+    rule.matches(&target)
 }
 
 /// Lower-cases a host and drops the trailing dot a fully-qualified DNS name may carry, so
@@ -395,20 +440,37 @@ pub(crate) fn answer_dns_query(
 }
 
 /// The real upstream lookup, performed in the *host's* network namespace by the runtime process.
+///
+/// Run on a short-lived helper thread with a bounded wait rather than called inline: the
+/// `to_socket_addrs` call below has no timeout of its own, and the caller here is the single
+/// thread that serves every DNS query for this session and that `EgressProxyHandle::shutdown`
+/// joins — so an unbounded lookup would be both a head-of-line block on every other query and a
+/// stalled teardown. A lookup that does not answer within `DNS_UPSTREAM_TIMEOUT` is treated the
+/// same as one that resolved to nothing (`NXDOMAIN`, exactly as for a name that genuinely does not
+/// exist); the helper thread is simply left to finish on its own, since dropping an unjoined
+/// `JoinHandle` is not a leak.
 pub(crate) fn resolve_upstream(name: &str) -> Vec<IpAddr> {
     use std::net::ToSocketAddrs;
-    (name, 0u16)
-        .to_socket_addrs()
-        .map(|addresses| {
-            let mut ips: Vec<IpAddr> = Vec::new();
-            for address in addresses {
-                if !ips.contains(&address.ip()) {
-                    ips.push(address.ip());
+    let name = name.to_string();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let looked_up = (name.as_str(), 0u16)
+            .to_socket_addrs()
+            .map(|addresses| {
+                let mut ips: Vec<IpAddr> = Vec::new();
+                for address in addresses {
+                    if !ips.contains(&address.ip()) {
+                        ips.push(address.ip());
+                    }
                 }
-            }
-            ips
-        })
-        .unwrap_or_default()
+                ips
+            })
+            .unwrap_or_default();
+        // The receiver may already be gone (timed out and returned) — that is not an error here,
+        // just this thread finishing after nobody is left waiting.
+        let _ = result_tx.send(looked_up);
+    });
+    result_rx.recv_timeout(DNS_UPSTREAM_TIMEOUT).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- the running proxy
@@ -602,10 +664,20 @@ mod linux {
         else {
             return;
         };
-        let _ = client.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = client.set_write_timeout(Some(IO_TIMEOUT));
-        let _ = upstream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = upstream.set_write_timeout(Some(IO_TIMEOUT));
+        // Both sides get the same bound, and a failure to set one closes the connection rather
+        // than splicing it anyway. `IO_TIMEOUT` is what stops a relay thread from outliving the
+        // session that started it; a thread whose timeouts silently did not take would hold both
+        // sockets open indefinitely with nothing recording why, which is exactly the failure mode
+        // the bound exists to prevent. Refusing here costs one connection the capsule can retry.
+        let bounded = [
+            client.set_read_timeout(Some(IO_TIMEOUT)),
+            client.set_write_timeout(Some(IO_TIMEOUT)),
+            upstream.set_read_timeout(Some(IO_TIMEOUT)),
+            upstream.set_write_timeout(Some(IO_TIMEOUT)),
+        ];
+        if bounded.iter().any(|result| result.is_err()) {
+            return;
+        }
         splice(client, upstream);
     }
 
@@ -877,6 +949,30 @@ mod tests {
         let names = vec!["api.example.com".to_string()];
         assert!(policy.allows_connection(&names, ADDRESS, 8443));
         assert!(!policy.allows_connection(&names, ADDRESS, 443));
+    }
+
+    #[test]
+    fn a_scheme_bearing_entry_with_an_explicit_port_is_reachable_on_that_port() {
+        // The combination a port-derived scheme guess broke: `egress_listen_ports` opens 8443 for
+        // this entry, so every connection to it must be permitted — a declared capability whose
+        // listener exists but whose connections are all refused is a capability that does not work.
+        let policy = policy(&["https://api.example.com:8443"], &[]);
+        let names = vec!["api.example.com".to_string()];
+        assert_eq!(egress_listen_ports(&rules(&["https://api.example.com:8443"])), vec![8443]);
+        assert!(policy.allows_connection(&names, ADDRESS, 8443));
+        // The pinned port is still the only one permitted, scheme default included.
+        assert!(!policy.allows_connection(&names, ADDRESS, 443));
+        assert!(!policy.allows_connection(&names, ADDRESS, 80));
+    }
+
+    #[test]
+    fn an_http_entry_with_an_explicit_port_is_reachable_on_that_port() {
+        // The same case on the plaintext side, where the old guess happened to agree by accident:
+        // pinning it down so a future change to the matcher cannot regress one scheme silently.
+        let policy = policy(&["http://api.example.com:8080"], &[]);
+        let names = vec!["api.example.com".to_string()];
+        assert!(policy.allows_connection(&names, ADDRESS, 8080));
+        assert!(!policy.allows_connection(&names, ADDRESS, 80));
     }
 
     #[test]

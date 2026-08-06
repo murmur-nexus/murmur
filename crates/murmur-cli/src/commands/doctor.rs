@@ -126,6 +126,14 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // checks above this is a pure *host* question — no manifest floor is involved and no flag can
     // change the answer — so doctor asks it whenever the capsule declares a subprocess capability
     // at all, which is exactly what `mur run` does.
+    //
+    // Deliberately narrower than `stage_session`'s own refusal ought to be: it does not count a
+    // native-implementation artifact with no `shell.allow`/`spawn.allow` declared, because that
+    // would need each declared artifact's own bundled implementation metadata resolved from the
+    // registry — doctor's artifact loop below does that, but only per-artifact and after this
+    // point, and duplicating it earlier just for this warning is not worth the restructuring. A
+    // native-artifact-only capsule on a host that can't build the namespace will not get this
+    // warning from `mur doctor`; it will only surface as a run-time failure from `mur run`.
     let capabilities = runtime_manifest.capabilities.as_ref();
     let shell_allows = capabilities
         .and_then(|caps| caps.shell.as_ref())
