@@ -893,7 +893,8 @@ in a session), and `timestamp` (Unix milliseconds).
 | `capabilities` | string[] |
 | `tools_declared` | string[] |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the effective declared floor, always present even when no manifest/config/flag ever declared one (defaults to `"advisory"`) |
-| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — derived from the host's kernel capability alone, never from the manifest |
+| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the host's probed kernel capability, capped by `workdir_exec` below. Nothing in a manifest can raise it |
+| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its Landlock `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](security-warnings.md#w-sec-011) |
 
 **`inference`** — written after each driver response is parsed
 

@@ -14,8 +14,32 @@
     there** — it changes no enforcement code. See
     [What this audit deliberately does not do](#what-this-audit-deliberately-does-not-do).
 
+!!! success "Closed, 2026-08-06: **both** halves of the supervisor have since been deleted."
+
+    This audit's conclusion was acted on in full, in two slices, in the order it recommended.
+    `connect`/`sendto` went first, replaced by a network namespace plus an egress proxy
+    (`crates/capsule-runtime/src/network_namespace.rs`, `.../egress_proxy.rs`). `execve`/`execveat`
+    went second, replaced by Landlock `Execute` rights: each `shell.allow` binary gets a narrow
+    read+execute grant at its own path, and the session workdir gets no `Execute` right at all
+    unless the manifest declares `capabilities.filesystem.workdir_exec: true` (see
+    [workdir-exec Landlock manual verification](workdir-exec-landlock-manual-verification.md) and
+    [`W-SEC-011`](security-warnings.md#w-sec-011)).
+
+    `install_seccomp_filter` now installs **no `Notify` rule of any kind**, and `supervisor_loop`,
+    `classify_and_decide`, `decide_exec_allowed`, `read_cstr_from_child`, `read_child_cwd` and
+    `read_child_fd_path` are all deleted. There is no `/proc/<pid>/mem` read left anywhere on the
+    subprocess path — which also let `restore_child_dumpable` go, closing the same-uid `ptrace`
+    window that existed only to make that read possible.
+
+    Everything below is therefore a **historical record of a mechanism that no longer exists**,
+    kept because it is the evidence both replacements were built on. The race probes still build
+    and still win their races against the pattern they mirror; they are probes of a retired design.
+    Read this document to understand *why* the current mechanisms are shaped the way they are — not
+    as a description of live code.
+
 Line numbers below are as of the commit that added this document. Function and type names are the
-stable citation; if a line number has drifted, search for the name.
+stable citation; if a line number has drifted, search for the name. Names marked deleted above will
+not be found at all.
 
 ## Scope
 
@@ -453,3 +477,13 @@ Both are full replacements and both are separately gated. Until one lands, treat
 `shell.allow` and `network.allow` grants as defences against *non-racing* misuse — a renamed or
 copied binary, a plainly non-allowlisted destination — and not as boundaries that hold against a
 subprocess deliberately racing them.
+
+!!! success "Both landed"
+
+    The network replacement landed first, the exec replacement second; see the status box at the
+    top of this page. The caveat in the paragraph directly above no longer applies to either grant
+    — neither is decided by a pointer read any more, so there is nothing left for a subprocess to
+    race. What replaced them has its own, separate caveat: `capabilities.shell.allow` is enforced
+    by Landlock, so a host without a usable Landlock ABI now has *no* kernel-level exec mediation
+    at all rather than an unsound one. [`W-SEC-002`](security-warnings.md#w-sec-002) states that
+    plainly, and it is why such a host cannot reach the `scoped` containment class.

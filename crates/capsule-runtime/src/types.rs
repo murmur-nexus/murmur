@@ -100,6 +100,17 @@ pub struct CapabilityPolicy {
     /// `sandbox::denied_socket_domains`.
     pub unix_sockets_allowed: bool,
     pub filesystem_scope: Option<String>,
+    /// From `capabilities.filesystem.workdir_exec`. `false` by default, which withholds the
+    /// Landlock `Execute` right from the workdir's own `PathBeneath` rule — see
+    /// `sandbox::linux_enforce::workdir_access_rights`. With it withheld the kernel refuses to exec
+    /// anything under the workdir on the resolved path itself, so `shell_allow` is enforced
+    /// completely: a binary copied or compiled into the workdir cannot run under *any* name.
+    ///
+    /// `true` gives the right back for compile-and-run workflows and accepts, explicitly, that
+    /// `shell_allow` is then unenforceable for anything inside the workdir. That is why this field
+    /// is the one *grant* in this struct that also lowers the session's achieved containment class
+    /// (see `crate::containment::achieved_containment_class`) — nothing else here can.
+    pub workdir_exec_allowed: bool,
     pub shell_allow: Vec<String>,
     pub spawn_allow: Vec<String>,
     pub shell_strip_env: Vec<String>,
@@ -301,6 +312,11 @@ pub fn capability_policy_from_runtime_manifest(
     let filesystem_scope = caps
         .and_then(|c| c.filesystem.as_ref())
         .and_then(|filesystem| filesystem.scope.clone());
+    // Absent `capabilities.filesystem` block, or absent key within it, both mean denied — the same
+    // shape as `unix_sockets_allowed` above, for the same reason: the widening has to be declared.
+    let workdir_exec_allowed = caps
+        .and_then(|c| c.filesystem.as_ref())
+        .is_some_and(|filesystem| filesystem.workdir_exec);
 
     let shell_allow = caps
         .and_then(|c| c.shell.as_ref())
@@ -341,6 +357,7 @@ pub fn capability_policy_from_runtime_manifest(
         network_allow,
         unix_sockets_allowed,
         filesystem_scope,
+        workdir_exec_allowed,
         shell_allow,
         spawn_allow,
         shell_strip_env,
@@ -417,6 +434,80 @@ capabilities:
         );
 
         assert!(policy.shell_staged_runtime.is_empty());
+    }
+
+    /// The default every existing manifest gets. Three separate "nothing was declared" shapes —
+    /// no `capabilities:` at all, no `filesystem:` within it, and a `filesystem:` that only sets
+    /// `scope` — must all lower to denied, because each one is a real manifest in the wild and any
+    /// of them silently keeping workdir `Execute` would reopen the rename-to-an-allowed-basename
+    /// bypass this default exists to close.
+    #[test]
+    fn workdir_exec_denied_for_every_shape_of_undeclared() {
+        for manifest_yaml in [
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+"#,
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  network:
+    allow:
+      - https://api.anthropic.com
+"#,
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  filesystem:
+    scope: workdir
+"#,
+        ] {
+            let policy = policy_for(manifest_yaml);
+            assert!(
+                !policy.workdir_exec_allowed,
+                "an undeclared workdir_exec must lower to denied: {manifest_yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn workdir_exec_denied_when_declared_false() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  filesystem:
+    workdir_exec: false
+"#,
+        );
+
+        assert!(!policy.workdir_exec_allowed);
+    }
+
+    #[test]
+    fn workdir_exec_allowed_when_declared_true() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  filesystem:
+    scope: workdir
+    workdir_exec: true
+"#,
+        );
+
+        assert!(policy.workdir_exec_allowed);
+        // The two filesystem keys stay independent: lowering one must not disturb the other.
+        assert_eq!(policy.filesystem_scope.as_deref(), Some("workdir"));
     }
 
     /// A manifest with no `capabilities:` block at all denies unix sockets — the field must not

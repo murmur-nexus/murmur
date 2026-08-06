@@ -5,9 +5,15 @@
 //! * The **declared floor** ([`murmur_artifact::ContainmentClass`]) is a requirement, combined
 //!   from the manifest, the workspace config and `--containment` by taking the strongest (see
 //!   [`murmur_artifact::effective_containment_floor`]).
-//! * The **achieved class** is derived *only* from [`EnforcementTier`], which is host-probed at
-//!   launch time. [`achieved_class_for_tier`] takes nothing else — not the manifest, not the
-//!   grant set — so no declaration can ever talk a host into reporting a class it cannot back.
+//! * The **achieved class** starts from [`EnforcementTier`], which is host-probed at launch time.
+//!   [`achieved_class_for_tier`] takes nothing else — not the manifest, not the grant set — so no
+//!   declaration can ever talk a host into reporting a class it cannot back. Exactly one manifest
+//!   property may then talk a *capsule* down from that ceiling, and only downwards:
+//!   `capabilities.filesystem.workdir_exec: true` caps the result at
+//!   [`ContainmentClass::Advisory`] (see [`achieved_containment_class`]), because a capsule whose
+//!   own workdir is executable has given up the claim `scoped` makes. The cap is applied in a
+//!   separate wrapper rather than inside [`achieved_class_for_tier`] precisely so the "no
+//!   declaration raises a class" property stays a property of one small, pure function.
 //!
 //! [`ContainmentClass::Sealed`] is reachable exactly when [`EnforcementTier::KernelSealed`] is:
 //! a Linux host with a usable Landlock ABI, AppArmor out of the way of unprivileged user
@@ -56,9 +62,44 @@ pub(crate) fn achieved_class_for_tier(tier: EnforcementTier) -> ContainmentClass
     }
 }
 
+/// The class a session actually achieves: the host's ceiling from [`achieved_class_for_tier`],
+/// capped by what the capsule's own `capabilities.filesystem.workdir_exec` leaves standing.
+///
+/// This is the one place a *manifest* property lowers an achieved class, and it does so by capping
+/// rather than by deciding: [`achieved_class_for_tier`] above stays pure and tier-only, so no
+/// declaration can talk a host up, and this wrapper can only ever talk a capsule *down*.
+///
+/// Why `workdir_exec` caps at [`ContainmentClass::Advisory`]: `scoped` (and `sealed` above it) both
+/// claim that what runs inside the capsule is bounded by what the operator declared. With the
+/// workdir's `Execute` right granted, a binary the agent compiles, downloads or renames inside its
+/// own workdir runs whatever `capabilities.shell.allow` says — the allowlist stops being an
+/// enforceable property. A host that could back `scoped` still cannot back a claim the capsule
+/// itself has given up, so the honest report is `advisory`, on every tier.
+pub(crate) fn achieved_containment_class(
+    tier: EnforcementTier,
+    workdir_exec: bool,
+) -> ContainmentClass {
+    let host_ceiling = achieved_class_for_tier(tier);
+    if workdir_exec {
+        host_ceiling.min(ContainmentClass::Advisory)
+    } else {
+        host_ceiling
+    }
+}
+
 /// Probes this host and reports the strongest class it can actually provide.
+///
+/// Host-only, and deliberately still takes no capsule input: it answers "what can this machine
+/// back?", which is what `mur doctor` and the escape-conformance harness ask. A *session* asks the
+/// narrower question and must use [`detect_achieved_containment_for`] instead.
 pub fn detect_achieved_containment() -> ContainmentClass {
     achieved_class_for_tier(detect_enforcement_tier())
+}
+
+/// [`detect_achieved_containment`] narrowed by one capsule's `workdir_exec` declaration — the
+/// launch-path entry point, used by `runtime::stage_session`.
+pub fn detect_achieved_containment_for(workdir_exec: bool) -> ContainmentClass {
+    achieved_containment_class(detect_enforcement_tier(), workdir_exec)
 }
 
 /// Why `achieved` falls short of `declared`, naming the missing *mechanism* rather than the
@@ -68,13 +109,24 @@ pub fn detect_achieved_containment() -> ContainmentClass {
 /// already-probed [`SealedBlocker`], so this function still probes nothing and stays testable
 /// without a kernel. `sealed_blocker` is `None` when the caller has not probed (or cannot: a
 /// non-Linux host), in which case the arm falls back to naming the mechanism generically.
+///
+/// `workdir_exec` is the capsule's own `capabilities.filesystem.workdir_exec`. It is checked before
+/// every host arm below, because it is the one shortfall an operator cannot fix by changing hosts:
+/// no kernel backs `scoped` for a capsule that has declared its workdir executable. Naming a
+/// missing Landlock ABI to someone whose real problem is a line in their own manifest sends them to
+/// the wrong machine.
 pub fn containment_shortfall_reason(
     declared: ContainmentClass,
     achieved: ContainmentClass,
     sealed_blocker: Option<SealedBlocker>,
+    workdir_exec: bool,
 ) -> Option<String> {
     if achieved >= declared {
         return None;
+    }
+
+    if workdir_exec && declared > ContainmentClass::Advisory {
+        return Some(WORKDIR_EXEC_SHORTFALL.to_string());
     }
 
     let reason = match declared {
@@ -104,17 +156,30 @@ pub fn containment_shortfall_reason(
     Some(reason)
 }
 
+/// The reason a capsule that declared `capabilities.filesystem.workdir_exec: true` falls short of
+/// any floor above `advisory`. Fixed text rather than a `match` arm per declared class: the
+/// mechanism, the consequence and the remedy are identical for `scoped` and `sealed`, because both
+/// rest on the claim this declaration gives up.
+const WORKDIR_EXEC_SHORTFALL: &str =
+    "capabilities.filesystem.workdir_exec: true keeps the Landlock Execute right on the session \
+     workdir, so a binary the capsule compiles, downloads or renames inside it runs regardless of \
+     capabilities.shell.allow — the allowlist stops being an enforceable property of this capsule. \
+     No host can back a class above advisory for it. Either remove workdir_exec (the allowlist is \
+     then enforced by the kernel on the resolved path) or lower the declared containment floor to \
+     advisory";
+
 /// The refusal gate: `Ok(())` when the host's `achieved` class meets or exceeds the `declared`
 /// floor, [`RuntimeError::ContainmentFloorUnmet`] otherwise.
 ///
-/// Pure — takes both classes as arguments and probes nothing, so the whole decision is
+/// Pure — takes every input as an argument and probes nothing, so the whole decision is
 /// testable without a kernel.
 pub fn check_containment_floor(
     declared: ContainmentClass,
     achieved: ContainmentClass,
     sealed_blocker: Option<SealedBlocker>,
+    workdir_exec: bool,
 ) -> Result<(), RuntimeError> {
-    match containment_shortfall_reason(declared, achieved, sealed_blocker) {
+    match containment_shortfall_reason(declared, achieved, sealed_blocker, workdir_exec) {
         None => Ok(()),
         Some(reason) => Err(RuntimeError::ContainmentFloorUnmet {
             declared,
@@ -144,6 +209,14 @@ pub struct ScopeReport {
     pub enforcement_tier: &'static str,
     /// `capabilities.filesystem.scope`, verbatim.
     pub filesystem_scope: Option<String>,
+    /// `capabilities.filesystem.workdir_exec`. Always present (never skipped when `false`), so a
+    /// consumer can tell "declared false" from "this runtime predates the key" by the field's
+    /// presence rather than by its value.
+    ///
+    /// `true` is the only manifest declaration that lowers [`Self::achieved_containment`], which is
+    /// why it is reported next to the grants rather than buried: reading `achieved: advisory` on a
+    /// Landlock-capable host makes sense only alongside it.
+    pub workdir_exec: bool,
     /// `capabilities.network.allow`, verbatim — declared destinations, not resolved IPs.
     pub network_allow: Vec<String>,
     /// `capabilities.network.unix_sockets`.
@@ -190,6 +263,7 @@ impl ScopeReport {
             "  filesystem scope: {}\n",
             self.filesystem_scope.as_deref().unwrap_or("<none>")
         ));
+        out.push_str(&format!("  workdir exec:     {}\n", self.workdir_exec));
         push_list(&mut out, "network allow", &self.network_allow);
         out.push_str(&format!("  unix sockets:     {}\n", self.unix_sockets));
         push_list(&mut out, "shell allow", &self.shell_allow);
@@ -242,8 +316,13 @@ pub(crate) fn scope_report_for_tier(
     tier: EnforcementTier,
     sealed_blocker: Option<SealedBlocker>,
 ) -> ScopeReport {
-    let achieved = achieved_class_for_tier(tier);
-    let shortfall_reason = containment_shortfall_reason(declared, achieved, sealed_blocker);
+    let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
+    let shortfall_reason = containment_shortfall_reason(
+        declared,
+        achieved,
+        sealed_blocker,
+        policy.workdir_exec_allowed,
+    );
 
     ScopeReport {
         declared_containment: declared,
@@ -252,6 +331,7 @@ pub(crate) fn scope_report_for_tier(
         shortfall_reason,
         enforcement_tier: enforcement_tier_name(tier),
         filesystem_scope: policy.filesystem_scope.clone(),
+        workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
         unix_sockets: policy.unix_sockets_allowed,
         shell_allow: policy.shell_allow.clone(),
@@ -338,11 +418,119 @@ mod tests {
         );
     }
 
+    /// The whole tier × `workdir_exec` truth table, with both inputs supplied by the test and no
+    /// kernel consulted — the seam `achieved_class_for_tier`/`achieved_containment_class` exists
+    /// for. This is emphatically *not* a test of the security property (that a workdir binary
+    /// cannot execute); it tests only the class arithmetic, which is all that can honestly be
+    /// tested without a Landlock-capable host.
+    #[test]
+    fn workdir_exec_caps_the_achieved_class_at_advisory_on_every_tier() {
+        // Without the declaration: the host ceiling, unchanged.
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::KernelSealed, false),
+            ContainmentClass::Sealed
+        );
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::KernelFull, false),
+            ContainmentClass::Scoped
+        );
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::KernelSeccompOnly, false),
+            ContainmentClass::Advisory
+        );
+        assert_eq!(
+            achieved_containment_class(EnforcementTier::EnvironmentOnly, false),
+            ContainmentClass::Advisory
+        );
+
+        // With it: advisory, whatever the host could otherwise back.
+        for tier in ALL_TIERS {
+            assert_eq!(
+                achieved_containment_class(*tier, true),
+                ContainmentClass::Advisory,
+                "workdir_exec must cap tier {tier:?} at advisory"
+            );
+        }
+    }
+
+    /// The cap goes in the wrapper, never in the tier-only function — a regression here would mean
+    /// a manifest key had leaked into the one mapping that must stay host-only.
+    #[test]
+    fn the_tier_only_mapping_is_unaffected_by_the_cap() {
+        for tier in ALL_TIERS {
+            assert_eq!(
+                achieved_class_for_tier(*tier),
+                achieved_containment_class(*tier, false),
+                "the tier-only mapping and the uncapped wrapper must agree on tier {tier:?}"
+            );
+        }
+    }
+
+    /// The refusal an operator actually hits: `workdir_exec: true` plus
+    /// `capabilities.containment: scoped`, on a host that could otherwise back `scoped`. It must
+    /// refuse, and the reason must send them to their manifest rather than to another machine.
+    #[test]
+    fn workdir_exec_refuses_a_scoped_floor_even_on_a_landlock_capable_host() {
+        let achieved = achieved_containment_class(EnforcementTier::KernelFull, true);
+        assert_eq!(achieved, ContainmentClass::Advisory);
+
+        let error = check_containment_floor(ContainmentClass::Scoped, achieved, None, true)
+            .expect_err("workdir_exec + scoped must refuse");
+        match error {
+            RuntimeError::ContainmentFloorUnmet {
+                declared,
+                achieved,
+                reason,
+            } => {
+                assert_eq!(declared, ContainmentClass::Scoped);
+                assert_eq!(achieved, ContainmentClass::Advisory);
+                assert!(
+                    reason.contains("workdir_exec"),
+                    "the reason must name the manifest key, got: {reason}"
+                );
+                assert!(
+                    !reason.contains("this host provides no kernel filesystem mediation"),
+                    "the reason must not blame the host for a manifest declaration: {reason}"
+                );
+            }
+            other => panic!("expected ContainmentFloorUnmet, got {other:?}"),
+        }
+    }
+
+    /// `sealed` gets the same manifest-side reason rather than a `SealedBlocker` one: a probed
+    /// blocker is real but is not what is stopping *this* capsule, and reporting it would send the
+    /// operator to install an AppArmor profile that changes nothing.
+    #[test]
+    fn workdir_exec_outranks_a_probed_sealed_blocker_in_the_reason() {
+        let reason = containment_shortfall_reason(
+            ContainmentClass::Sealed,
+            ContainmentClass::Advisory,
+            Some(SealedBlocker::AppArmorProfileMissing),
+            true,
+        )
+        .expect("refusal");
+        assert!(reason.contains("workdir_exec"));
+        assert!(!reason.contains("apparmor_parser"));
+    }
+
+    /// The declaration is not itself a refusal: a capsule that declares `workdir_exec` and asks
+    /// for nothing above `advisory` launches normally on every host.
+    #[test]
+    fn workdir_exec_alone_refuses_nothing() {
+        for tier in ALL_TIERS {
+            let achieved = achieved_containment_class(*tier, true);
+            assert!(
+                check_containment_floor(ContainmentClass::Advisory, achieved, None, true).is_ok(),
+                "workdir_exec at an advisory floor must launch on tier {tier:?}"
+            );
+        }
+    }
+
     #[test]
     fn advisory_floor_is_met_on_every_tier() {
         for tier in ALL_TIERS {
             let achieved = achieved_class_for_tier(*tier);
-            assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None).is_ok());
+            assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok());
         }
     }
 
@@ -350,7 +538,7 @@ mod tests {
     fn scoped_floor_is_met_on_every_landlock_capable_tier() {
         for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
             let achieved = achieved_class_for_tier(tier);
-            assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None).is_ok());
+            assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok());
         }
 
         for tier in [
@@ -358,7 +546,7 @@ mod tests {
             EnforcementTier::EnvironmentOnly,
         ] {
             let achieved = achieved_class_for_tier(tier);
-            let error = check_containment_floor(ContainmentClass::Scoped, achieved, None)
+            let error = check_containment_floor(ContainmentClass::Scoped, achieved, None, false)
                 .expect_err("scoped must refuse without Landlock");
             match error {
                 RuntimeError::ContainmentFloorUnmet {
@@ -387,10 +575,10 @@ mod tests {
     fn a_weaker_declaration_is_satisfied_by_a_sealed_host_without_being_upgraded() {
         let achieved = achieved_class_for_tier(EnforcementTier::KernelSealed);
         assert_eq!(achieved, ContainmentClass::Sealed);
-        assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None).is_ok());
-        assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None).is_ok());
+        assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok());
+        assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok());
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None),
+            containment_shortfall_reason(ContainmentClass::Scoped, achieved, None, false),
             None
         );
     }
@@ -400,7 +588,8 @@ mod tests {
         assert!(check_containment_floor(
             ContainmentClass::Sealed,
             achieved_class_for_tier(EnforcementTier::KernelSealed),
-            None
+            None,
+            false
         )
         .is_ok());
 
@@ -410,6 +599,7 @@ mod tests {
                 ContainmentClass::Sealed,
                 achieved,
                 Some(SealedBlocker::NamespaceCreationDenied),
+                false,
             )
             .expect_err("sealed must refuse on a host that cannot back it");
             match error {
@@ -437,6 +627,7 @@ mod tests {
             ContainmentClass::Sealed,
             achieved,
             Some(SealedBlocker::AppArmorProfileMissing),
+            false,
         )
         .expect("refusal");
         assert!(apparmor.contains("mur-sealed"));
@@ -447,6 +638,7 @@ mod tests {
             ContainmentClass::Sealed,
             achieved,
             Some(SealedBlocker::NamespaceCreationDenied),
+            false,
         )
         .expect("refusal");
         assert!(container.contains("--cap-add SYS_ADMIN"));
@@ -463,8 +655,13 @@ mod tests {
             SealedBlocker::LandlockUnavailable,
         ] {
             let reason =
-                containment_shortfall_reason(ContainmentClass::Sealed, achieved, Some(blocker))
-                    .expect("refusal");
+                containment_shortfall_reason(
+                    ContainmentClass::Sealed,
+                    achieved,
+                    Some(blocker),
+                    false,
+                )
+                .expect("refusal");
             assert!(!reason.contains("no host can provide it today"), "got: {reason}");
         }
     }
@@ -477,6 +674,7 @@ mod tests {
             ContainmentClass::Sealed,
             ContainmentClass::Advisory,
             None,
+            false,
         )
         .expect("refusal");
         assert!(reason.contains("pivot_root"));
@@ -489,19 +687,26 @@ mod tests {
             containment_shortfall_reason(
                 ContainmentClass::Advisory,
                 ContainmentClass::Scoped,
-                None
+                None,
+                false
             ),
             None
         );
         assert_eq!(
-            containment_shortfall_reason(ContainmentClass::Scoped, ContainmentClass::Scoped, None),
+            containment_shortfall_reason(
+                ContainmentClass::Scoped,
+                ContainmentClass::Scoped,
+                None,
+                false
+            ),
             None
         );
         assert_eq!(
             containment_shortfall_reason(
                 ContainmentClass::Sealed,
                 ContainmentClass::Sealed,
-                Some(SealedBlocker::NamespaceCreationDenied)
+                Some(SealedBlocker::NamespaceCreationDenied),
+                false
             ),
             None,
             "a met floor must ignore a stale blocker rather than manufacture a refusal"
@@ -547,10 +752,63 @@ mod tests {
         assert_eq!(report.shell_allow, vec!["python3"]);
         assert_eq!(report.spawn_allow, vec!["helper"]);
         assert_eq!(report.env_allow, vec!["TZ"]);
+        assert!(!report.workdir_exec);
         assert_eq!(
             report.interpreter_runtime_grants,
             vec!["python3: /usr/lib/python3.11 (list_dir)"]
         );
+    }
+
+    /// `--explain-scope` is where an operator finds out *why* a Landlock-capable host is reporting
+    /// `advisory`, so the declaration and the class it produced have to appear together — in the
+    /// struct, in the JSON, and in the rendered text.
+    #[test]
+    fn scope_report_surfaces_workdir_exec_and_the_advisory_it_forces() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["gcc".to_string()],
+            workdir_exec_allowed: true,
+            ..CapabilityPolicy::default()
+        };
+
+        let report = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+        );
+
+        assert!(report.workdir_exec);
+        assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
+        assert!(!report.floor_met);
+        // The host is fully capable; the mechanism line must keep saying so, so the report does
+        // not read as a broken host.
+        assert_eq!(report.enforcement_tier, "landlock+seccomp");
+        assert!(report
+            .shortfall_reason
+            .as_deref()
+            .expect("refusal")
+            .contains("workdir_exec"));
+
+        let value: serde_json::Value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["workdir_exec"], true);
+
+        let rendered = report.render();
+        assert!(rendered.contains("workdir exec:     true"));
+        assert!(rendered.contains("achieved:  advisory"));
+    }
+
+    /// The field is always written, including `false`, so a consumer can distinguish "this capsule
+    /// declared nothing" from "this runtime does not know the key".
+    #[test]
+    fn scope_report_json_always_carries_workdir_exec() {
+        let value: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(value["workdir_exec"], false);
     }
 
     /// `--explain-scope` is a diagnostic, not a launch: a capsule declaring `staged_runtime` on a

@@ -7,22 +7,27 @@
 //! This module closes that gap for the shell subprocess tree specifically, using two Linux
 //! kernel primitives:
 //!
-//!   - **seccomp-bpf user-notify** (`SECCOMP_RET_USER_NOTIF`) to allowlist `execve`/`execveat`
-//!     (exec) and `connect`/`sendto` (network) by *argument content* (pathname / destination
-//!     IP), not just syscall number — classic BPF alone cannot dereference syscall argument
-//!     *contents*, only the notify facility (with a supervisor reading `/proc/<pid>/mem` at
-//!     the argument address) can. Exec decisions match *canonical binary identity* (the
-//!     exec'd path canonicalized against the launch-time-resolved real paths of the
-//!     `shell.allow` binaries — see `decide_exec_allowed`), never name/basename strings, so
-//!     renaming an arbitrary binary to an allowlisted name does not allowlist it.
+//!   - **Landlock `Execute` rights** to allowlist exec by *path*, decided by the kernel on the
+//!     path it resolved itself. Each `shell.allow` binary — plus its ELF interpreter and its
+//!     `DT_NEEDED` closure — gets a narrow read+execute grant (`resolve_landlock_grants`), and the
+//!     capsule's own workdir gets `Execute` **only** when the manifest declares
+//!     `capabilities.filesystem.workdir_exec: true` (`linux_enforce::workdir_access_rights`). With
+//!     the default, nothing the capsule writes into its workdir can run under any name, so the
+//!     rename-to-an-allowlisted-basename bypass has no path left. This replaced a seccomp-notify
+//!     exec supervisor that read the invoked pathname out of `/proc/<pid>/mem` and answered
+//!     `CONTINUE`, which `seccomp_unotify(2)` documents as inherently racy — see
+//!     `docs/content/reference/seccomp-notify-toctou-audit.md` for the audit that retired it.
+//!     There is no seccomp-notify mechanism left in this module at all: `execve`/`execveat` are
+//!     ordinary allowed syscalls, decided entirely by the Landlock domain they run in.
 //!   - **classic seccomp-bpf argument matching** (`SECCOMP_RET_ERRNO`) on `socket(2)`'s `domain`,
 //!     to refuse whole address families outright — see `denied_socket_domains`. Unlike a
 //!     destination `sockaddr`, `domain` is an integer in a register, so the kernel's own BPF can
 //!     compare it with no userspace round-trip and no notification at all. This is what stops a
-//!     capsule reaching `/var/run/docker.sock` (host root) over `AF_UNIX`, which the notify path
-//!     above never covered: its `sockaddr` parser returns `None` for non-IP families and the
-//!     supervisor treats that as allow. `AF_NETLINK`/`AF_PACKET` are denied unconditionally;
-//!     `AF_UNIX` is denied unless `capabilities.network.unix_sockets` says otherwise.
+//!     capsule reaching `/var/run/docker.sock` (host root) over `AF_UNIX`, which no other
+//!     mechanism here covers: a network namespace does not mediate `AF_UNIX` at all, and Landlock
+//!     ABI v1 does not mediate an abstract-namespace socket. `AF_NETLINK`/`AF_PACKET` are denied
+//!     unconditionally; `AF_UNIX` is denied unless `capabilities.network.unix_sockets` says
+//!     otherwise.
 //!   - **a default-deny syscall allowlist** modelled on the OCI/Docker default seccomp profile —
 //!     see `SECCOMP_SYSCALL_ALLOWLIST`. The filter's default action is `SECCOMP_RET_ERRNO(EPERM)`,
 //!     so a syscall named by neither that array nor one of the rules above is refused outright,
@@ -32,8 +37,10 @@
 //!     of a capsule's reach. The filter also sets `SCMP_FLTATR_CTL_LOG`, so each denial reaches
 //!     the kernel audit trail with a syscall number, pid and comm.
 //!   - **Landlock LSM** to scope filesystem access to the capsule's `workdir`. The workdir's own
-//!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock` — see
-//!     `linux_enforce::WORKDIR_ACCESS_RIGHTS`. Outside the workdir, alongside the derived
+//!     grant deliberately withholds `MakeChar`/`MakeBlock`/`MakeSock`, and withholds `Execute`
+//!     unless `capabilities.filesystem.workdir_exec` is declared — see
+//!     `linux_enforce::WORKDIR_ACCESS_RIGHTS_NO_EXEC` and `linux_enforce::workdir_access_rights`.
+//!     Outside the workdir, alongside the derived
 //!     read+execute grants, a fixed three-device set is granted unconditionally — see
 //!     `CAPSULE_DEVICE_GRANTS`: `/dev/null` read+write (the only writable path outside the
 //!     workdir), `/dev/zero` and `/dev/urandom` read-only, and no other device at all.
@@ -57,12 +64,14 @@
 //!   inside the new root, as defence in depth — see [`crate::sealed`]. Only capsules that declare
 //!   `capabilities.containment: sealed` get this; see `applied_tier`.
 //! - `KernelFull` (Linux, Landlock ABI available — kernel 5.13+): seccomp syscall allowlist +
-//!   exec/network allowlisting + socket-domain denial + Landlock filesystem scoping.
+//!   socket-domain denial + Landlock filesystem scoping, which is also what makes
+//!   `capabilities.shell.allow` enforceable (exec is a Landlock right, not a syscall filter).
 //! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp syscall allowlist +
-//!   exec/network allowlisting + socket-domain denial only. Filesystem scope stays convention-only
-//!   (`current_dir`) — a documented gap, not a bug. The syscall allowlist and the socket-domain
-//!   denial are identical on both tiers: they are seccomp rules, so they do not depend on Landlock
-//!   in any way.
+//!   socket-domain denial only. Filesystem scope stays convention-only (`current_dir`) — a
+//!   documented gap, not a bug — and, since this slice retired the exec supervisor, so does
+//!   `shell.allow`: with no Landlock domain there is no kernel-level exec mediation on this tier
+//!   at all. `W-SEC-002` says so. The syscall allowlist and the socket-domain denial are identical
+//!   on both tiers: they are seccomp rules, so they do not depend on Landlock in any way.
 //! - `EnvironmentOnly` (macOS / any non-Linux target): no kernel primitive attempted at all.
 //!   Permanent, not a placeholder for a future slice.
 //!
@@ -76,7 +85,7 @@
 //!
 //! If kernel enforcement setup fails unexpectedly on a Linux host (not the expected
 //! "Landlock unsupported, degrade to `KernelSeccompOnly`" signal, but something like seccomp
-//! filter install failing, or the notify-fd handshake failing before spawn) —
+//! filter install failing, or the namespace-socket handshake failing before spawn) —
 //! `prepare_enforcement` returns `Err` and `execute_shell` must not call `.spawn()` at all.
 //! There is no code path where a Linux host silently runs a shell subprocess with zero
 //! enforcement because setup failed.
@@ -272,9 +281,10 @@ pub(crate) fn resolve_network_allowlist_ips(network_allow: &[String]) -> Result<
 /// after launch* under an allowlisted name (the attack this exists to stop) must not become
 /// allowlisted by virtue of its name.
 ///
-/// This canonical set — not the raw name strings — is what the seccomp exec supervisor
-/// compares against, so `cp /usr/bin/nc ./bash && ./bash` is denied: the copy's canonical
-/// path is not the canonical path of the launch-time `bash`, no matter what it is named.
+/// This canonical set — not the raw name strings — is what `resolve_landlock_grants` derives the
+/// narrow read+execute Landlock grants from, so `cp /usr/bin/nc ./bash && ./bash` is denied: the
+/// copy lives under the workdir, which carries no `Execute` right by default, and the grant that
+/// does carry one names the launch-time `bash`'s own inode, not a basename.
 pub(crate) fn resolve_exec_allowlist(shell_allow: &[String]) -> Vec<PathBuf> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
@@ -314,12 +324,11 @@ fn resolve_exec_allowlist_in(shell_allow: &[String], path_dirs: &[PathBuf]) -> V
 /// binary that `execvp` would actually run, for reporting purposes: `shell-event.binary`
 /// on the hook side and the `binary` key of `trace.jsonl`'s `shell` record.
 ///
-/// Unlike [`resolve_exec_allowlist`] — which collects *every* `PATH` match because the
-/// kernel exec supervisor needs the full identity set — this returns the **first** match,
-/// which is the one `execvp` picks and therefore the one that ran. Resolution rules are
-/// otherwise identical (same `PATH` source, same [`is_executable_file`] test, same
-/// `canonicalize`), so a reported path is always a member of the allowlisted identity set
-/// the supervisor matches against.
+/// Unlike [`resolve_exec_allowlist`] — which collects *every* `PATH` match because each one needs
+/// its own Landlock grant — this returns the **first** match, which is the one `execvp` picks and
+/// therefore the one that ran. Resolution rules are otherwise identical (same `PATH` source, same
+/// [`is_executable_file`] test, same `canonicalize`), so a reported path is always a member of the
+/// set the Landlock grants were derived from.
 ///
 /// A name that resolves to nothing falls back to the bare invoked name, unchanged — never
 /// an error, never a panic, matching `resolve_exec_allowlist`'s "entries that resolve to
@@ -944,63 +953,6 @@ pub(crate) const CAPSULE_DEVICE_GRANTS: &[CapsuleDeviceGrant] = &[
     },
 ];
 
-/// Identity-based exec decision: canonicalizes the pathname a subprocess passed to
-/// `execve`/`execveat` (relative paths resolved against `base_dir` — the notifying task's
-/// cwd or `execveat` dirfd, read from `/proc` by the Linux supervisor) and allows the exec
-/// only if the *canonical* path is one of the launch-time-resolved allowlist binaries.
-///
-/// Matching canonical identity rather than the name/basename string is the point: a copy of
-/// an arbitrary binary renamed to an allowlisted name (e.g. `cp /usr/bin/nc ./bash`) has a
-/// different canonical path and is denied, while a symlink *to* the real allowlisted binary
-/// canonicalizes to it and is (correctly) allowed. Fail-closed: empty pathname, relative
-/// pathname with no resolvable base, nonexistent path, or any canonicalization error all
-/// deny.
-///
-/// Known residual limit, inherent to `SECCOMP_RET_USER_NOTIF` + continue (see
-/// `seccomp_unotify(2)`): after this check passes, the kernel re-resolves the pathname when
-/// it actually executes the syscall, so a hostile *multithreaded* child retargeting a
-/// symlink in that window can still race it.
-///
-/// Neither exec nor symlinks are what bounds that race — it is the whole class of decision
-/// this supervisor makes by dereferencing a pointer into another task's memory. A `connect`/
-/// `sendto` path used to read a `sockaddr` out of the notifying task the same way and answer
-/// with the same `CONTINUE`, exposed to the identical race; that path has been retired (the
-/// native subprocess tree now enforces `capabilities.network.allow` through its own network
-/// namespace and egress proxy instead), leaving this pathname read as the one remaining
-/// `/proc/<pid>/mem` dereference on the hot path. Closing it fully requires fd-substitution
-/// (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather than continue semantics; the non-racing
-/// rename/copy bypass is what this closes. Audited, with citations and a hand-runnable race
-/// probe, in `docs/content/reference/seccomp-notify-toctou-audit.md`.
-// Production callers live inside the Linux-only supervisor; unit tests exercise it on every
-// OS (which is the point of keeping it out of `linux_enforce`).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn decide_exec_allowed(
-    pathname: &str,
-    base_dir: Option<&Path>,
-    exec_allow: &[PathBuf],
-) -> bool {
-    if pathname.is_empty() || exec_allow.is_empty() {
-        return false;
-    }
-    let path = Path::new(pathname);
-    let joined;
-    let candidate: &Path = if path.is_absolute() {
-        path
-    } else {
-        match base_dir {
-            Some(base) => {
-                joined = base.join(path);
-                &joined
-            }
-            None => return false,
-        }
-    };
-    match std::fs::canonicalize(candidate) {
-        Ok(canonical) => exec_allow.iter().any(|allowed| allowed == &canonical),
-        Err(_) => false,
-    }
-}
-
 /// Network decision for one destination IP read out of a notifying task's `sockaddr`.
 /// Empty allowlist denies everything (a capsule that declared no `network.allow` hosts has
 /// no reason to open any subprocess socket).
@@ -1033,10 +985,11 @@ const LINUX_AF_PACKET: i32 = 17;
 /// Why a domain check is a classic BPF rule and not a notify:
 /// `socket()`'s `domain` is a plain integer in a register, so the kernel's own BPF can compare it
 /// directly. That is exactly what `connect()`'s destination address is *not* — it sits behind a
-/// pointer BPF cannot dereference, which is the entire reason `connect`/`sendto` need the
-/// notify+supervisor machinery (see this module's header). Denying the domain at *creation* time
-/// therefore needs no userspace round-trip, and is structurally immune to the TOCTOU class of
-/// problem that reading a pointed-to argument out of another task's memory invites.
+/// pointer BPF cannot dereference, which is why the retired notify supervisor had to read it out of
+/// the calling task's memory (see this module's header). Denying the domain at *creation* time
+/// needs no userspace round-trip, and is structurally immune to the TOCTOU class of problem that
+/// reading a pointed-to argument out of another task's memory invites — which is why this rule
+/// survived both retirements unchanged.
 ///
 /// The three families, and why they are not symmetric:
 ///   - `AF_UNIX` is gated, not banned. `/var/run/docker.sock` is host root, so it cannot be open
@@ -1049,8 +1002,8 @@ const LINUX_AF_PACKET: i32 = 17;
 ///     strictly more dangerous than one. Widening them would be a deliberate future decision with
 ///     its own justification, not an oversight to be fixed by adding a flag here.
 ///
-/// `AF_INET`/`AF_INET6` are never denied here: they stay governed exactly as before by the
-/// `connect`/`sendto` notify path against `capabilities.network.allow`. This function only ever
+/// `AF_INET`/`AF_INET6` are never denied here: they stay governed by the capsule's own network
+/// namespace and egress proxy against `capabilities.network.allow`. This function only ever
 /// *adds* denials, and is paired with [`allowed_socket_domains`], which names the families that
 /// get a positive rule — since the filter's default action is a deny, a family named by neither
 /// function is refused with the filter default (`EPERM`) rather than this rule's `EACCES`.
@@ -1107,12 +1060,19 @@ const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6;
 /// The filter's **default action is a deny** (`Errno(EPERM)`), so this array is the whole of what
 /// a shell subprocess may call, minus two carve-outs handled by rules rather than by name here:
 ///
-///   - `execve`/`execveat`/`connect`/`sendto` are `Notify` rules (argument-content decisions made
-///     by the supervisor). They are deliberately **absent** from this array — adding them would
-///     give them a second, plain `Allow` rule and take them away from the supervisor.
-///   - `socket` is absent for the same structural reason: it carries argument-conditional rules
-///     (see [`denied_socket_domains`] / [`allowed_socket_domains`]), and an unconditional `Allow`
-///     rule would discard them.
+///   - `socket` is absent: it carries argument-conditional rules (see [`denied_socket_domains`] /
+///     [`allowed_socket_domains`]), and an unconditional `Allow` rule would discard them.
+///
+/// `execve`/`execveat` are in this array as ordinary allowed syscalls, which is the visible half of
+/// the slice that retired the exec supervisor. They used to carry `Notify` rules so a userspace
+/// loop could read the invoked pathname out of the calling task's memory and match it against a
+/// canonical allowlist — a decision `seccomp_unotify(2)` documents as inherently racy under
+/// `CONTINUE` semantics. `capabilities.shell.allow` is now enforced by the Landlock domain instead
+/// (`Execute` on each allowlisted binary's own path, withheld from the workdir unless
+/// `capabilities.filesystem.workdir_exec` is declared), so what these rules permit is reaching the
+/// kernel — where the LSM decides, on the path it resolved itself. Permitting them here is not
+/// optional: the child's very first act after this filter loads is the `execve` that turns it into
+/// the tool binary, so a denial here refuses every capsule outright.
 ///
 /// Everything else is refused by the default action, which is the point of the card this list
 /// implements: before it, `io_uring_setup`, `bpf`, `userfaultfd`, `perf_event_open`,
@@ -1131,6 +1091,10 @@ const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
     // ---- process / thread lifecycle ----
+    // `execve`/`execveat` reach the kernel; the Landlock domain decides them. See this array's
+    // doc comment for the mechanism that replaced their former `Notify` rules.
+    "execve",
+    "execveat",
     // `clone`/`clone3` are allowed *unconditionally*, which is this filter's one significant
     // widening relative to Docker: Docker masks `clone`'s namespace-creation flags with an
     // argument comparison and forces `clone3` to `ENOSYS` so glibc falls back to the masked
@@ -1367,13 +1331,13 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
     // ---- sockets ----
     // `socket` is NOT here (argument-conditional rules — see this array's doc comment).
     //
-    // `connect`/`sendto` ARE here, and that is the visible half of this slice: they used to carry
-    // `Notify` rules so a userspace supervisor could read the destination `sockaddr` out of the
-    // calling task's memory and compare it against a resolved allowlist. That mechanism is gone
-    // (see `crate::network_namespace` for what replaced it), so these are ordinary allowed
-    // syscalls again — allowed to *reach the kernel*, where the capsule's own network namespace
-    // has no route to anything except the egress proxy. The decision moved from a racy pointer
-    // read into the routing table; it did not disappear.
+    // `connect`/`sendto` ARE here: they used to carry `Notify` rules so a userspace supervisor
+    // could read the destination `sockaddr` out of the calling task's memory and compare it against
+    // a resolved allowlist. That mechanism is gone (see `crate::network_namespace` for what
+    // replaced it), so these are ordinary allowed syscalls again — allowed to *reach the kernel*,
+    // where the capsule's own network namespace has no route to anything except the egress proxy.
+    // The decision moved from a racy pointer read into the routing table; it did not disappear.
+    // `execve`/`execveat` at the top of this array made the same move, into the Landlock domain.
     "connect",
     "sendto",
     "socketpair",
@@ -1462,7 +1426,7 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
 ///      clock setting, NUMA policy, `fanotify`.
 ///   3. **Denied instead of argument-conditioned.** Docker allows these only for specific
 ///      argument values, which a per-syscall-name allowlist cannot express and which would
-///      otherwise have to be routed through the notify supervisor (out of scope for this slice).
+///      otherwise have to be routed through a userspace decision this filter no longer makes.
 ///      Omitting them outright costs nothing, because nothing in bash, coreutils, git, or a
 ///      standard compiler/interpreter toolchain needs them: `personality`, `kcmp`, `seccomp`
 ///      itself (a nested filter cannot loosen this one, but it can slow it down for no benefit).
@@ -1536,7 +1500,7 @@ pub(crate) struct ShellEnforcement {
     /// Every `capabilities.network.allow` host resolved to concrete addresses once, at launch,
     /// by [`resolve_network_allowlist_ips`].
     ///
-    /// This used to be the *whole* network policy: the seccomp-notify supervisor read a
+    /// This used to be the *whole* network policy: a seccomp-notify supervisor read a
     /// destination `sockaddr` out of the stopped child and compared the IP against this list. It
     /// is now the narrower of the egress proxy's two checks — the one applied to a destination
     /// the capsule reached without ever resolving a name for it (a hardcoded literal). See
@@ -1567,11 +1531,17 @@ pub(crate) struct ShellEnforcement {
     /// platform for parity but never read off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) unix_sockets_allowed: bool,
-    /// Canonical filesystem paths of the `shell.allow` binaries, resolved once at launch by
-    /// `resolve_exec_allowlist` — the identity set the seccomp exec supervisor matches
-    /// against (never the raw name strings; see `decide_exec_allowed`).
+    /// `capabilities.filesystem.workdir_exec`, threaded through to the workdir's own Landlock
+    /// rule. `false` (the default) withholds the `Execute` right from it, which is what makes
+    /// `shell_allow` enforceable at all now that the exec supervisor is gone: nothing the capsule
+    /// writes into its workdir can run, under any name. Consumed only by
+    /// `linux_enforce::workdir_access_rights` on the Landlock tiers; resolved on every platform
+    /// for parity but never read off Linux.
+    ///
+    /// It has no seccomp counterpart on `KernelSeccompOnly` — without a Landlock domain there is
+    /// nothing to withhold — which is part of why that tier cannot reach `scoped`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) exec_allow_paths: Vec<PathBuf>,
+    pub(crate) workdir_exec: bool,
     /// Narrow read+execute (never write) Landlock grants *outside* the workdir so the allowlisted
     /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
     /// stdlib. Two origins, combined here:
@@ -1675,7 +1645,7 @@ impl ShellEnforcement {
             network_allow_rules,
             egress_tcp_ports,
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths,
+            workdir_exec: policy.workdir_exec_allowed,
             landlock_grants,
             sealed_bind_dirs,
             staged_runtime_dirs,
@@ -1738,7 +1708,9 @@ impl ShellEnforcement {
             // Denied, matching every other grant this constructor zeroes out. Inert on this tier
             // (no seccomp filter is installed at all), but it must not read as "allowed".
             unix_sockets_allowed: false,
-            exec_allow_paths: Vec::new(),
+            // Denied, like every other grant this constructor zeroes out. Inert on this tier (no
+            // Landlock domain exists to withhold anything from), but it must not read as "allowed".
+            workdir_exec: false,
             landlock_grants: Vec::new(),
             sealed_bind_dirs: Vec::new(),
             staged_runtime_dirs: Vec::new(),
@@ -1913,29 +1885,33 @@ pub(crate) fn warn_for_enforcement_tier(tier: EnforcementTier, workdir: &Path, p
     }
 }
 
-/// Handle to a (possibly no-op) supervisor. On Linux tiers, the background thread is already
-/// running by the time this is returned by `prepare_enforcement` — started BEFORE the caller
-/// calls `.spawn()`, not after.
+/// Handle to the (possibly no-op) side-channel machinery attached to one subprocess spawn. On
+/// Linux tiers, the background thread is already running by the time this is returned by
+/// `prepare_enforcement` — started BEFORE the caller calls `.spawn()`, not after.
 ///
-/// This ordering is required, not incidental: seccomp filters (installed inside `pre_exec`,
-/// i.e. after `fork()` but before the target binary's `execve`) are inherited across that very
-/// `execve` — so the FIRST notified syscall the forked child ever makes is the one that turns
-/// it into the target binary (e.g. `bash`) itself. `std::process::Command::spawn()`'s parent
-/// side blocks internally (via a close-on-exec error pipe) until that `execve` either succeeds
-/// or fails. If the supervisor only started listening for notifications after `.spawn()`
-/// returned, `.spawn()` could never return in the first place: the child would be stuck
-/// waiting for a notify response no one is listening for yet, and the parent would be stuck
-/// waiting for the child's exec to resolve. Starting the receiver+supervisor thread first
-/// (racing concurrently with the fork/exec inside `.spawn()`, not gated behind it) avoids that
-/// deadlock — by the time `.spawn()`'s internal blocking read is waiting on the exec-status
-/// pipe, the supervisor thread is already independently waiting to receive the notify fd and
-/// answer requests on it.
+/// This ordering is required, not incidental. The child builds its network namespace inside
+/// `pre_exec` and hands the namespace's listening sockets back over a `SOCK_DGRAM` socketpair;
+/// `std::process::Command::spawn()`'s parent side then blocks internally (via a close-on-exec
+/// error pipe) until the child's `execve` resolves. If the receiving thread only started after
+/// `.spawn()` returned, the capsule's very first outbound connection could beat the egress proxy
+/// to its own socket. Starting the thread first — racing concurrently with the fork/exec inside
+/// `.spawn()`, not gated behind it — closes that window.
+///
+/// The name is historical, and kept deliberately: this used to also run the seccomp-notify
+/// supervisor loop for `execve`/`execveat`, and before that for `connect`/`sendto`. Both mechanisms
+/// are retired (Landlock `Execute` rights and a network namespace respectively), so nothing is
+/// "supervised" here any more — what is left is the fd hand-off, the egress proxy's lifetime, and
+/// the child's diagnostic pipe.
 #[derive(Debug)]
 pub(crate) enum SupervisorHandle {
     Noop,
     #[cfg(target_os = "linux")]
     Linux {
-        done_rx: std::sync::mpsc::Receiver<()>,
+        /// Carries the started egress proxy back from the receiving thread, so the proxy's
+        /// lifetime ends with the subprocess tree it serves rather than outliving it. `None`
+        /// travels through here too — the hand-off can fail, and that is reported (and fatal to
+        /// the spawn) on its own path.
+        proxy_rx: std::sync::mpsc::Receiver<Option<crate::egress_proxy::EgressProxyHandle>>,
         /// Read end of the `CLOEXEC` diagnostic pipe whose write end was moved into the forked
         /// child's `pre_exec` closure. On a successful `execve` the write end closes
         /// automatically with nothing written (so a read yields immediate EOF); on a `pre_exec`
@@ -1947,21 +1923,25 @@ pub(crate) enum SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    /// Best-effort join with a short bound so `execute_shell` never hangs waiting for the
-    /// supervisor thread. In practice it returns immediately: the notify fd closes (which
-    /// makes the thread return) once every process holding the seccomp filter — the child and
-    /// all its descendants — has exited, which `wait_with_output` (called by `execute_shell`
-    /// right before this) has already waited for.
+    /// Shuts the session's egress proxy down, with a short bound so `execute_shell` never hangs.
+    /// In practice the receive returns immediately: the thread's only blocking step is the
+    /// namespace-socket hand-off, which completed before the child could `execve` at all — long
+    /// before `wait_with_output` (called by `execute_shell` right before this) returned.
+    ///
+    /// A proxy outliving its namespace would be serving sockets whose peers no longer exist, so
+    /// this is the teardown, not merely a join.
     pub(crate) fn join_best_effort(self) {
         match self {
             SupervisorHandle::Noop => {}
             #[cfg(target_os = "linux")]
-            SupervisorHandle::Linux { done_rx, .. } => {
-                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            SupervisorHandle::Linux { proxy_rx, .. } => {
+                if let Ok(Some(proxy)) = proxy_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    proxy.shutdown();
+                }
                 // Deliberately not joining the underlying `JoinHandle`: dropping it without
                 // joining leaves the thread detached (it keeps running to completion in the
-                // background, reclaimed by the OS on exit), which is fine here since the
-                // `done_rx` signal above already tells us the loop returned.
+                // background, reclaimed by the OS on exit), which is fine here since the value
+                // received above is the only thing it produces.
             }
         }
     }
@@ -2011,8 +1991,7 @@ fn forced_prepare_failure() -> Result<(), String> {
 }
 
 // Child-side (`pre_exec`) forced-failure seams, one per distinct setup step that can fail
-// independently: the explicit `no_new_privs` `prctl`, the `dumpable` restore `prctl`, and the
-// Landlock ruleset construction.
+// independently: the explicit `no_new_privs` `prctl` and the Landlock ruleset construction.
 // Unlike `FORCE_PREPARE_FAILURE` (which fails the *outer*, pre-fork `prepare_enforcement` path),
 // these are read from inside the forked child's `pre_exec` closure — `fork()` copy-on-write
 // duplicates the calling thread's TLS block, so a flag set `true` in the parent thread before
@@ -2022,8 +2001,6 @@ fn forced_prepare_failure() -> Result<(), String> {
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
     pub(crate) static FORCE_NO_NEW_PRIVS_FAILURE: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-    pub(crate) static FORCE_DUMPABLE_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     pub(crate) static FORCE_LANDLOCK_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
@@ -2201,7 +2178,7 @@ pub(crate) fn prepare_enforcement(
 
 /// Linux implementation of `prepare_enforcement`. See the module-level docs and the `linux_enforce`
 /// submodule for the mechanics (socketpair fd-passing side channel + `pre_exec` seccomp/Landlock
-/// installation + background notify-fd supervisor thread).
+/// installation + background namespace-socket receiving thread).
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 pub(crate) fn prepare_enforcement(
@@ -2236,6 +2213,7 @@ pub(crate) fn prepare_enforcement(
             workdir,
             &enforcement.landlock_grants,
             &landlock_device_grants(enforcement.tier),
+            enforcement.workdir_exec,
         )?)
     } else {
         None
@@ -2319,7 +2297,7 @@ pub(crate) fn prepare_enforcement(
 
     let tier = enforcement.tier;
     // Copied out before the `move` closure below takes ownership of everything it touches, the
-    // same clone-before-move shape `tier` and the Landlock fds already use. Note the notify-fd
+    // same clone-before-move shape `tier` and the Landlock fds already use. Note the fd-passing
     // socketpair above is created in the *parent*, before fork, so the child's own `sendmsg` over
     // it is unaffected by a filter that denies `socket(AF_UNIX, ...)`.
     let unix_sockets_allowed = enforcement.unix_sockets_allowed;
@@ -2335,7 +2313,8 @@ pub(crate) fn prepare_enforcement(
     // the capability-dropping `prctl`/`capset` sequence (bounding-set drop, capset clear, and the
     // explicit `no_new_privs` `prctl`) plus one allocation-free `open`/`read`/`close` of
     // `/proc/sys/kernel/cap_last_cap`, libseccomp filter construction/load (kernel syscalls), one
-    // `sendmsg` call to hand the notify fd to the parent over `child_sock`, and (KernelFull only)
+    // `sendmsg` batch handing the network namespace's sockets to the parent over `child_sock`, and
+    // (KernelFull only)
     // Landlock ruleset construction/`restrict_self` against already-open fds (also kernel
     // syscalls) — no `open()`/`canonicalize()` beyond that one `cap_last_cap` read, no locks
     // beyond what those syscalls need. On any failure it writes the real error message to the
@@ -2377,11 +2356,10 @@ pub(crate) fn prepare_enforcement(
         });
     }
 
-    // Start the receiver+supervisor thread now — BEFORE the caller calls `.spawn()`. See
+    // Start the namespace-socket receiving thread now — BEFORE the caller calls `.spawn()`. See
     // `SupervisorHandle`'s doc comment for why this ordering (not "after spawn") is required.
     Ok(linux_enforce::start_supervisor(
         parent_sock,
-        enforcement.exec_allow_paths.clone(),
         egress_policy,
         expected_namespace_sockets,
         diag_read,
@@ -2482,23 +2460,22 @@ fn build_sealed_root(
 }
 
 /// Linux-only mechanics: fd-passing side channel, seccomp filter construction, Landlock
-/// application, and the background notify-request supervisor loop.
+/// application, and the background thread that receives the capsule's network-namespace sockets.
 ///
-/// NOTE on `libseccomp` types used here: `ScmpFd` (the type `get_notify_fd`/`ScmpNotifReq::receive`/
-/// `notify_id_valid`/`ScmpNotifResp::respond` all use) is treated as an alias for `RawFd` (`i32`)
-/// per the libseccomp 0.4.0 docs — if a future version changes this, these call sites need an
-/// explicit `.into()`/`as` conversion.
+/// Nothing here uses `libseccomp`'s notify facility any more. It did, twice over: `connect`/
+/// `sendto` were `Notify` syscalls until the network namespace replaced them, and `execve`/
+/// `execveat` until Landlock `Execute` rights replaced them. Both retirements are recorded in
+/// `docs/content/reference/seccomp-notify-toctou-audit.md`; re-introducing a `Notify` rule here
+/// means re-introducing a `/proc/<pid>/mem` read on the hot path, which that audit found racy.
 #[cfg_attr(target_os = "linux", allow(unsafe_code))]
 #[cfg(target_os = "linux")]
 mod linux_enforce {
     use std::io;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-    use std::os::unix::fs::FileExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use landlock::{make_bitflags, AccessFs, BitFlags};
 
-    use super::decide_exec_allowed;
     use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
 
     /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
@@ -2526,22 +2503,35 @@ mod linux_enforce {
     }
 
     /// All Landlock file descriptors resolved in the parent for one shell subprocess: the
-    /// workdir's fd (scoped by [`WORKDIR_ACCESS_RIGHTS`]), each successfully-opened grant fd, and
+    /// workdir's fd (scoped by [`workdir_access_rights`]), each successfully-opened grant fd, and
     /// each successfully-opened fixed-device fd.
     /// Handed by reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules
     /// against these fds without performing a single `open()`.
     pub(super) struct LandlockChildFds {
         workdir_fd: OwnedFd,
+        /// The capsule's `capabilities.filesystem.workdir_exec`, carried alongside the fd it
+        /// applies to so `apply_landlock_scope` — which runs in `pre_exec` and must read nothing
+        /// but its argument — has the whole workdir rule decided for it before fork.
+        workdir_exec: bool,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
 
-    /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule.
+    /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule,
+    /// *excluding* `Execute` — see [`workdir_access_rights`], which adds it back for a capsule that
+    /// declared `capabilities.filesystem.workdir_exec: true`.
     ///
     /// Spelled out variant by variant rather than `AccessFs::from_all(ABI::V1)` for two reasons:
-    /// `from_all` hides what is actually handed to the capsule, and three of ABI v1's thirteen
-    /// rights are deliberately withheld.
+    /// `from_all` hides what is actually handed to the capsule, and four of ABI v1's thirteen
+    /// rights are withheld from this constant.
     ///
+    ///   - `Execute` — the one this constant withholds *conditionally*. Withholding it is what
+    ///     makes `capabilities.shell.allow` a complete, sound statement: Landlock refuses the exec
+    ///     on the path the kernel itself resolved, so a binary the capsule wrote into its workdir
+    ///     cannot run under any name — including an allowlisted basename, the exact bypass a prior
+    ///     release shipped. No userspace supervisor, no pointer read out of another task, and
+    ///     therefore no race. The cost is real and documented: a binary the capsule legitimately
+    ///     compiled in its workdir cannot run either, which is what `workdir_exec: true` buys back.
     ///   - `MakeChar` / `MakeBlock` — creating a device node inside the workdir escapes this
     ///     whole scope. A capsule running as root could `mknod` a node for the host's own disk
     ///     (e.g. major/minor `8:0` = `sda`) *inside* the granted directory — which Landlock
@@ -2561,12 +2551,16 @@ mod linux_enforce {
     /// and a FIFO carries none of the raw-device risk above.
     ///
     /// Because `apply_landlock_scope`'s `handle_access` still declares the *full*
-    /// `from_all(ABI::V1)` set, the three withheld rights are not merely "not extra-granted" —
-    /// they become **denied everywhere** in this domain, workdir included, once `restrict_self()`
-    /// takes effect.
-    pub(super) const WORKDIR_ACCESS_RIGHTS: BitFlags<AccessFs> = make_bitflags!(AccessFs::{
-        Execute
-            | WriteFile
+    /// `from_all(ABI::V1)` set, a right this rule withholds is not merely "not extra-granted" — it
+    /// is **denied on every path this rule covers**, workdir included, once `restrict_self()` takes
+    /// effect. That is precisely why withholding `Execute` here is enforcement and not a mere
+    /// omission. The three `Make*` rights are denied domain-wide because no other rule grants them
+    /// either; `Execute` is denied *on the workdir specifically*, while the narrow read+execute
+    /// grants below still carry it for the allowlisted binaries outside it — which is the whole
+    /// shape of the replacement: exec where the operator named a binary, nowhere the capsule
+    /// writes.
+    pub(super) const WORKDIR_ACCESS_RIGHTS_NO_EXEC: BitFlags<AccessFs> = make_bitflags!(AccessFs::{
+        WriteFile
             | ReadFile
             | ReadDir
             | RemoveDir
@@ -2577,16 +2571,18 @@ mod linux_enforce {
             | MakeSym
     });
 
-    enum Decision {
-        Allow,
-        Deny,
-    }
-
-    fn to_decision(allowed: bool) -> Decision {
-        if allowed {
-            Decision::Allow
+    /// The workdir's `PathBeneath` rights for one capsule: [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`], plus
+    /// `Execute` only when the manifest declared `capabilities.filesystem.workdir_exec: true`.
+    ///
+    /// A function rather than a second constant so the two cases cannot drift: adding a right to
+    /// the workdir grant is one edit, and the `workdir_exec` axis stays exactly one bit wide.
+    /// Note what this does *not* consult — `shell.allow`, the exec allowlist, any resolved path.
+    /// The whole point of the default is that the workdir grant is no longer name-based at all.
+    pub(super) fn workdir_access_rights(workdir_exec: bool) -> BitFlags<AccessFs> {
+        if workdir_exec {
+            WORKDIR_ACCESS_RIGHTS_NO_EXEC | AccessFs::Execute
         } else {
-            Decision::Deny
+            WORKDIR_ACCESS_RIGHTS_NO_EXEC
         }
     }
 
@@ -2674,15 +2670,17 @@ mod linux_enforce {
     }
 
     /// Runs inside the forked child, pre-exec: builds the capsule's network namespace and hands
-    /// its listening sockets to the parent, strips the child's Linux capabilities, installs the
-    /// seccomp filter (exec notify rules plus the `socket()` domain denials keyed on
-    /// `unix_sockets_allowed`), hands its notify fd to the parent over `child_sock_fd`, and (on
-    /// `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope. Returning `Err` here
-    /// aborts the exec (std's `Command` machinery propagates it back to the parent's `.spawn()`
-    /// call as an `io::Error`) — the fail-closed path for setup failures that happen after fork.
+    /// its listening sockets to the parent over `child_sock_fd`, strips the child's Linux
+    /// capabilities, installs the seccomp filter (the `socket()` domain denials keyed on
+    /// `unix_sockets_allowed`, over a default-deny syscall allowlist), and (on
+    /// `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope — which is also what
+    /// enforces `capabilities.shell.allow`, now that the exec notify supervisor is gone. Returning
+    /// `Err` here aborts the exec (std's `Command` machinery propagates it back to the parent's
+    /// `.spawn()` call as an `io::Error`) — the fail-closed path for setup failures that happen
+    /// after fork.
     ///
-    /// Both hand-offs go over the same `child_sock_fd` socketpair and the parent reads them in
-    /// this order: the namespace sockets first, the seccomp notify fd second.
+    /// `child_sock_fd` carries exactly one hand-off now: the namespace sockets. It used to carry a
+    /// second (the seccomp notify fd), which went with the supervisor.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         netns_plan: &crate::network_namespace::CapsuleNetnsPlan,
@@ -2749,7 +2747,7 @@ mod linux_enforce {
         // subsequent subprocess, on every platform and every tier, with no test to catch it.
         //
         // Running it first is also what makes it cover this function's *own* descriptors: the
-        // notify socketpair end, the diagnostic pipe and the Landlock grant fds are all used
+        // namespace-socket socketpair end, the diagnostic pipe and the Landlock grant fds are all used
         // below but must never survive the `execve`.
         mark_inherited_fds_cloexec()?;
 
@@ -2762,25 +2760,15 @@ mod linux_enforce {
         // failure is its own distinct, fail-closed error path before any filter is installed.
         drop_all_capabilities()?;
 
-        // Last thing before the filter goes in, on every kernel tier: undo — for this child only —
-        // the `dumpable = 0` it inherited from the runtime process. Without it the seccomp-notify
-        // supervisor cannot read `/proc/<child>/mem`, every notified `execve` fails closed, and no
-        // allowlisted binary runs at all for a non-root user. See
-        // [`restore_child_dumpable`] for the full reasoning and the security trade it makes.
-        //
-        // Ordered here rather than at the top of this function for two reasons, both load-bearing:
-        //
-        // * `drop_all_capabilities` must come first. `commit_creds` resets a task's `dumpable` to
-        //   `/proc/sys/fs/suid_dumpable` whenever its permitted capability set shrinks, so a
-        //   root-uid capsule whose caps are dropped *after* this call would have the flag silently
-        //   reset out from under it (to `0` or `2` on a hardened host) and the defect would return
-        //   for exactly the hosts least likely to be testing for it.
-        // * Everything above narrows what an attacker could reach through the window this opens:
-        //   once the child is dumpable, any same-uid process can `ptrace`-attach it, so the
-        //   inherited fds are already CLOEXEC and the capabilities already gone by then.
-        restore_child_dumpable()?;
-
-        install_seccomp_filter(child_sock_fd, unix_sockets_allowed)?;
+        // The child stays *non-dumpable*, inherited from the runtime process
+        // (`security::harden_process_dumpable`). Until this slice it did not: `restore_child_dumpable`
+        // set `PR_SET_DUMPABLE` back to 1 here, because the kernel's `ptrace_may_access` check gates
+        // every `/proc/<pid>/*` read and the seccomp-notify supervisor had to read
+        // `/proc/<child>/mem` to recover the pathname of each notified `execve`. With that
+        // supervisor deleted nothing reads the child's memory any more, so the flag — and the
+        // same-uid `ptrace`/`environ`/core-dump exposure it opened for the whole life of every
+        // shell subprocess — is simply gone. Do not reintroduce it without a reader that needs it.
+        install_seccomp_filter(unix_sockets_allowed)?;
 
         if matches!(
             tier,
@@ -2800,9 +2788,9 @@ mod linux_enforce {
     ///
     /// `CLOSE_RANGE_CLOEXEC` sets the flag rather than closing the descriptors outright. That is
     /// the required semantics here, not a softer variant of it: several fds in this range are
-    /// still needed *inside* this `pre_exec` window — the notify socketpair end that
-    /// `install_seccomp_filter` sends the seccomp notify fd over, the diagnostic pipe a failure
-    /// further down writes to, and the Landlock grant fds `apply_landlock_scope` builds rules
+    /// still needed *inside* this `pre_exec` window — the socketpair end `create_capsule_netns`
+    /// sends the namespace's listening sockets over, the diagnostic pipe a failure further down
+    /// writes to, and the Landlock grant fds `apply_landlock_scope` builds rules
     /// from. Closing them here would break the very enforcement setup that follows; flagging
     /// them means they keep working until `execve`, which then closes them for us.
     ///
@@ -3012,68 +3000,6 @@ mod linux_enforce {
         Ok(())
     }
 
-    /// Re-enables `dumpable` for the forked shell-tool child, so the seccomp-notify supervisor
-    /// running back in the runtime process can read the child's `/proc/<pid>/mem`.
-    ///
-    /// **Why this is needed.** `main()` marks the runtime process non-dumpable
-    /// (`security::harden_process_dumpable`) to close the `/proc/<pid>/environ` side channel on
-    /// *its own* environment, which may still hold raw, unfiltered secrets. `fork()` copies the
-    /// `mm` flags, so the child starts non-dumpable too — and the kernel's `ptrace_may_access`
-    /// check (which gates every `/proc/<pid>/*` read) then refuses a non-root, non-`CAP_SYS_PTRACE`
-    /// reader even when it shares the target's uid and is the target's own parent. The supervisor
-    /// is exactly such a reader: `read_cstr_from_child` opens `/proc/<pid>/mem` to recover the
-    /// pathname of every notified `execve`, `classify_and_decide` fails closed to `Decision::Deny`
-    /// when that read fails, and the loop answers `-EACCES`. The net effect for a non-root user was
-    /// that *every* allowlisted `execve` was denied with a bare `Permission denied (os error 13)`,
-    /// on both kernel tiers and at every containment class.
-    ///
-    /// **What it costs, stated plainly.** For as long as this child lives, any same-uid process on
-    /// the host can `ptrace`-attach it and read its `/proc/<pid>/mem` and `/proc/<pid>/environ`, or
-    /// obtain a core dump of it where core dumps are enabled. That is the same side channel
-    /// `harden_process_dumpable` closes for the runtime process — deliberately reopened here, for
-    /// the child only, because the two processes hold different things: by the time this runs, the
-    /// child's environment is the `shell::DEFAULT_ENV_BASELINE`-filtered subset plus explicit
-    /// overrides that `shell::build_shell_env` produced, never the runtime's own raw environment.
-    /// The runtime process itself stays non-dumpable for its entire life; nothing in this function
-    /// touches it. The resulting exposure is stated in
-    /// `docs/content/reference/security-warnings.md`.
-    ///
-    /// **Fail-closed.** `PR_SET_DUMPABLE` with arg2 `1` is never refused for a well-formed call, so
-    /// any error is unexpected: it aborts the spawn (via the diagnostic-pipe path in `pre_exec`)
-    /// rather than continuing with a child whose every `execve` would be denied anyway. Same call
-    /// convention and lifetime distinction as [`set_no_new_privs`]: per-shell-subprocess, inside
-    /// `pre_exec`, not the once-at-`main()` whole-process hardening. The success path is a single
-    /// syscall and allocates nothing; the named message on the failure path does allocate, which is
-    /// the same trade the surrounding `pre_exec` error path already makes when it calls
-    /// `error.to_string()` before writing to the diagnostic pipe.
-    #[allow(unsafe_code)]
-    fn restore_child_dumpable() -> io::Result<()> {
-        #[cfg(test)]
-        if super::FORCE_DUMPABLE_FAILURE.with(|flag| flag.get()) {
-            return Err(io::Error::other(
-                "sandbox: restore child dumpable (prctl PR_SET_DUMPABLE, 1) failed (forced by test seam)",
-            ));
-        }
-        // Typed as `c_ulong` for the same reason as in `set_no_new_privs`: the upper 32 bits of an
-        // untyped literal are unspecified in a variadic call on aarch64, and the kernel requires
-        // arg3/4/5 to be exactly 0.
-        let enable: libc::c_ulong = 1;
-        let zero: libc::c_ulong = 0;
-
-        // SAFETY: `prctl(PR_SET_DUMPABLE, ...)` takes four integer arguments — no pointers and no
-        // borrowed memory are involved, and it is a single syscall, so it is safe in the
-        // post-`fork()`/pre-`execve()` window.
-        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, enable, zero, zero, zero) };
-        if rc != 0 {
-            return Err(io::Error::other(format!(
-                "sandbox: restore child dumpable (prctl PR_SET_DUMPABLE, 1) failed: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        Ok(())
-    }
-
     /// Highest capability number this kernel defines, read from `/proc/sys/kernel/cap_last_cap`.
     /// Uses raw `open`/`read` into a stack buffer so it stays allocation-free in the post-`fork()`
     /// window. Any failure — file absent on a pre-2.6.25 kernel, unreadable, contents that do not
@@ -3130,37 +3056,36 @@ mod linux_enforce {
         ("landlock_restrict_self", 446),
     ];
 
-    /// Builds and loads the child's seccomp filter, then hands its notify fd to the parent.
+    /// Builds and loads the child's seccomp filter.
     ///
-    /// Two independent mechanisms live in this one filter, and they are deliberately not the
-    /// same mechanism:
+    /// **This filter raises no notifications and needs no supervisor.** It used to: `execve`/
+    /// `execveat` carried `SECCOMP_RET_USER_NOTIF` rules so a userspace loop could read the invoked
+    /// pathname out of `/proc/<pid>/mem` and answer `CONTINUE`, and `connect`/`sendto` did the same
+    /// for a destination `sockaddr`. Both mechanisms are gone, retired in that order: network
+    /// enforcement moved into [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec
+    /// enforcement moved into the Landlock domain `apply_landlock_scope` installs, where the kernel
+    /// evaluates the path it resolved itself. `seccomp_unotify(2)` calls continue-based argument
+    /// inspection inherently racy, and this filter no longer does any.
     ///
-    ///   - `execve`/`execveat` get `Notify` rules, because deciding them needs the *contents* of
-    ///     a pointed-to argument (a pathname) that in-kernel BPF cannot dereference — so the
-    ///     userspace supervisor (`classify_and_decide`) resolves each one. `connect`/`sendto` used
-    ///     to be here for the same reason and are not any more: their enforcement point moved out
-    ///     of this filter entirely, into the network namespace and egress proxy in
-    ///     [`crate::network_namespace`]. See [`super::SECCOMP_SYSCALL_ALLOWLIST`]'s socket section.
+    /// What is left is one mechanism plus a default:
+    ///
     ///   - `socket` gets classic, register-value `Errno` rules, one per denied domain. `domain` is
     ///     a plain integer argument, so the comparison compiles straight into the loaded BPF
-    ///     program and is evaluated in-kernel at syscall time: no notification is raised, no
-    ///     supervisor round-trip happens, and no memory of another task is read. That is what
-    ///     makes it structurally immune to the pointer-read TOCTOU concerns that apply to the
-    ///     notify rules above, and why it is a hard deny rather than a supervisor decision.
-    ///
-    /// Around both of those sits the filter's **default action**, which is a deny
-    /// (`Errno(EPERM)`): a syscall named by neither [`super::SECCOMP_SYSCALL_ALLOWLIST`] nor a
-    /// rule here is refused, without any argument being inspected. That is what makes
-    /// `io_uring_setup`, `bpf`, `userfaultfd`, `perf_event_open`, `ptrace` and the rest of
-    /// [`super::SECCOMP_MUST_STAY_DENIED`] unreachable — they are simply absent, not
-    /// argument-matched.
-    fn install_seccomp_filter(child_sock_fd: RawFd, unix_sockets_allowed: bool) -> io::Result<()> {
+    ///     program and is evaluated in-kernel at syscall time: no notification is raised and no
+    ///     memory of another task is read. That is what makes it structurally immune to the
+    ///     pointer-read TOCTOU class of problem in the first place.
+    ///   - the filter's **default action**, which is a deny (`Errno(EPERM)`): a syscall named by
+    ///     neither [`super::SECCOMP_SYSCALL_ALLOWLIST`] nor a rule here is refused, without any
+    ///     argument being inspected. That is what makes `io_uring_setup`, `bpf`, `userfaultfd`,
+    ///     `perf_event_open`, `ptrace` and the rest of [`super::SECCOMP_MUST_STAY_DENIED`]
+    ///     unreachable — they are simply absent, not argument-matched.
+    fn install_seccomp_filter(unix_sockets_allowed: bool) -> io::Result<()> {
         // Default-deny. `EPERM` matches what the OCI/Docker default profile returns for a syscall
-        // outside its allowlist, and is deliberately a *different* errno from the `EACCES` that
-        // `classify_and_decide` and the `socket()` domain rules return: `EACCES` means "the
-        // sandbox looked at this call's arguments and refused it", `EPERM` means "this syscall is
-        // not part of the capsule's syscall surface at all". Keeping them distinct is what lets
-        // an operator tell an unmediated-surface problem from a policy decision.
+        // outside its allowlist, and is deliberately a *different* errno from the `EACCES` that the
+        // `socket()` domain rules (and Landlock) return: `EACCES` means "the sandbox looked at this
+        // call's arguments and refused it", `EPERM` means "this syscall is not part of the
+        // capsule's syscall surface at all". Keeping them distinct is what lets an operator tell an
+        // unmediated-surface problem from a policy decision.
         let mut filter =
             libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Errno(libc::EPERM))
                 .map_err(to_io_err)?;
@@ -3185,17 +3110,11 @@ mod linux_enforce {
         // these denials are verified by.
         let _ = filter.set_ctl_log(true);
 
-        for name in ["execve", "execveat"] {
-            let syscall = libseccomp::ScmpSyscall::from_name(name).map_err(to_io_err)?;
-            filter
-                .add_rule(libseccomp::ScmpAction::Notify, syscall)
-                .map_err(to_io_err)?;
-        }
-
-        // Deny the dangerous `socket(2)` domains at creation time. `EACCES` (not `EPERM`) matches
-        // what `classify_and_decide`'s `Decision::Deny` returns for a blocked `execve`, so a
-        // capsule sees one consistent errno for "the sandbox looked at this call and refused it"
-        // whichever of the two mechanisms refused it.
+        // Deny the dangerous `socket(2)` domains at creation time. `EACCES` (not `EPERM`) is the
+        // errno this sandbox uses for "the sandbox looked at this call's arguments and refused it",
+        // as opposed to the default action's `EPERM` for "this syscall is not part of the capsule's
+        // surface at all". It also matches what Landlock returns for a denied exec, so a capsule
+        // sees one consistent errno across both argument-level mechanisms.
         //
         // Untouched by the network-namespace work, and deliberately so: a network namespace does
         // not mediate `AF_UNIX` at all — pathname or abstract — so this register-level rule is
@@ -3290,44 +3209,24 @@ mod linux_enforce {
                 .map_err(to_io_err)?;
         }
 
-        filter.load().map_err(to_io_err)?;
-
-        // NOTE: `get_notify_fd` only becomes valid after `load()`. Dropping `filter` afterward
-        // is safe — libseccomp's `seccomp_release()` (invoked on Drop) only frees the
-        // userspace filter-building context; the filter itself is already installed in the
-        // kernel and the notify fd is an independent, already-open fd that is unaffected by
-        // dropping this handle.
-        let notify_fd: RawFd = filter.get_notify_fd().map_err(to_io_err)?;
-        set_cloexec(notify_fd)?;
-
-        send_fd_over_socket(child_sock_fd, notify_fd)
+        // Dropping `filter` after `load()` is safe: libseccomp's `seccomp_release()` (invoked on
+        // Drop) only frees the userspace filter-building context, while the filter itself is
+        // already installed in the kernel and is inherited across the `execve` that follows.
+        filter.load().map_err(to_io_err)
     }
 
     fn to_io_err<E: std::fmt::Display>(error: E) -> io::Error {
         io::Error::other(error.to_string())
     }
 
-    #[allow(unsafe_code)]
-    fn set_cloexec(fd: RawFd) -> io::Result<()> {
-        // SAFETY: `fd` is the just-created, valid, open seccomp notify fd; F_GETFD/F_SETFD
-        // with FD_CLOEXEC only touch a per-fd integer flag, no pointer/lifetime hazards.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: same as above.
-        let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     /// Scopes the shell subprocess tree's filesystem access with Landlock. Three kinds of rule:
     ///
-    ///   - the workdir gets [`WORKDIR_ACCESS_RIGHTS`] — read/write/execute plus directory,
-    ///     regular-file, FIFO and symlink creation, but **not** `MakeChar`/`MakeBlock`/`MakeSock`
-    ///     (see that constant for why each of the three is withheld);
+    ///   - the workdir gets [`workdir_access_rights`] — read/write plus directory, regular-file,
+    ///     FIFO and symlink creation, but **not** `MakeChar`/`MakeBlock`/`MakeSock`, and **not**
+    ///     `Execute` unless the capsule declared `capabilities.filesystem.workdir_exec: true` (see
+    ///     [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`] for why each right is withheld). Withholding `Execute`
+    ///     is what enforces `capabilities.shell.allow` completely: the kernel refuses the exec on
+    ///     the path it resolved itself, so nothing the capsule writes into its workdir can run;
     ///   - each [`LandlockGrant`] (the `shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure, and any `interpreter_runtime` directory, all *outside* the
     ///     workdir) gets a **narrow read+execute** grant — never write. Whether that grant also
@@ -3354,8 +3253,8 @@ mod linux_enforce {
     ///
     /// `handle_access` must declare the union of every access bit any rule uses, and it stays the
     /// **full** ABI v1 set deliberately: a bit declared there but granted by no rule is denied for
-    /// the whole domain, which is exactly how the three rights missing from
-    /// [`WORKDIR_ACCESS_RIGHTS`] become denied rather than merely un-granted, and it is also what
+    /// the whole domain, which is exactly how the rights missing from
+    /// [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`] become denied rather than merely un-granted, and it is also what
     /// makes every device outside [`CAPSULE_DEVICE_GRANTS`] denied. A grant path — or a device
     /// path, on a host where one of the three is missing — that
     /// fails to *open* is skipped
@@ -3397,7 +3296,10 @@ mod linux_enforce {
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
-            .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), WORKDIR_ACCESS_RIGHTS))
+            .add_rule(PathBeneath::new(
+                fds.workdir_fd.as_fd(),
+                workdir_access_rights(fds.workdir_exec),
+            ))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
 
         for grant in &fds.grants {
@@ -3453,6 +3355,7 @@ mod linux_enforce {
         workdir: &Path,
         landlock_grants: &[LandlockGrant],
         device_grants: &[super::CapsuleDeviceGrant],
+        workdir_exec: bool,
     ) -> Result<LandlockChildFds, String> {
         let workdir_fd = open_o_path(workdir).map_err(|error| {
             format!(
@@ -3485,6 +3388,7 @@ mod linux_enforce {
 
         Ok(LandlockChildFds {
             workdir_fd,
+            workdir_exec,
             grants,
             devices,
         })
@@ -3572,138 +3476,53 @@ mod linux_enforce {
         }
     }
 
-    /// Sends one fd (`fd_to_send`) over an already-connected `SOCK_DGRAM` unix socket
-    /// (`sock_fd`) via `SCM_RIGHTS`. Runs inside `pre_exec` — only stack buffers are used (no
-    /// heap allocation) and the only syscall made is `sendmsg`, which is async-signal-safe.
-    #[allow(unsafe_code)]
-    fn send_fd_over_socket(sock_fd: RawFd, fd_to_send: RawFd) -> io::Result<()> {
-        // SAFETY: `sock_fd` and `fd_to_send` are both valid, open fds owned by this process.
-        // All buffers (`payload`, `cmsg_buf`, `iov`, `msg`) are stack-allocated locals that
-        // outlive the single `sendmsg` call using them.
-        unsafe {
-            let mut payload = [0u8; 1];
-            let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr() as *mut libc::c_void,
-                iov_len: payload.len(),
-            };
-
-            let mut cmsg_buf = [0u8; 128];
-            let cmsg_space = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
-
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg_space as _;
-
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            if cmsg.is_null() {
-                return Err(io::Error::other("CMSG_FIRSTHDR returned null"));
-            }
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut RawFd, fd_to_send);
-
-            let ret = libc::sendmsg(sock_fd, &msg, 0);
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    }
-
-    /// Parent-side counterpart of `send_fd_over_socket`. Not called from `pre_exec`, so
-    /// ordinary heap-allocating code would be fine here too, but it stays allocation-free to
-    /// match its sibling.
-    #[allow(unsafe_code)]
-    fn receive_fd_over_socket(sock_fd: RawFd) -> io::Result<RawFd> {
-        // SAFETY: `sock_fd` is a valid, open fd; buffers are stack-allocated and sized for
-        // exactly one fd's worth of ancillary data.
-        unsafe {
-            let mut payload = [0u8; 1];
-            let mut iov = libc::iovec {
-                iov_base: payload.as_mut_ptr() as *mut libc::c_void,
-                iov_len: payload.len(),
-            };
-
-            let mut cmsg_buf = [0u8; 128];
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = cmsg_buf.len() as _;
-
-            let ret = libc::recvmsg(sock_fd, &mut msg, libc::MSG_CMSG_CLOEXEC);
-            if ret < 0 {
-                return Err(io::Error::last_os_error());
-            }
-
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            if cmsg.is_null()
-                || (*cmsg).cmsg_level != libc::SOL_SOCKET
-                || (*cmsg).cmsg_type != libc::SCM_RIGHTS
-            {
-                return Err(io::Error::other(
-                    "recvmsg did not return an SCM_RIGHTS control message",
-                ));
-            }
-
-            let fd_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
-            Ok(std::ptr::read_unaligned(fd_ptr))
-        }
-    }
-
-    /// Spawns the background thread that will receive the notify fd from the child — blocking
-    /// on that receive, racing concurrently with the caller's (not-yet-issued) `.spawn()` call
-    /// rather than running after it, per `SupervisorHandle`'s doc comment — and then supervises
-    /// notify requests on it until it closes.
+    /// Spawns the background thread that receives the capsule network namespace's listening
+    /// sockets from the child and starts serving them through the egress proxy — blocking on that
+    /// receive, racing concurrently with the caller's (not-yet-issued) `.spawn()` call rather than
+    /// running after it, per [`SupervisorHandle`]'s doc comment.
     ///
-    /// If the fd is never received (e.g. `fork()` itself failed, or the child's `pre_exec`
-    /// closure errored before reaching the send), there is no live child left unsupervised:
-    /// `Command::spawn()` surfaces that same underlying failure as its own `Err`, via the same
-    /// close-on-exec error pipe, independently of this thread. This thread just logs and exits.
-    /// The child sends two `SCM_RIGHTS` messages, in this order: the network namespace's
-    /// listening sockets (from `create_capsule_netns`, the first thing the `pre_exec` window
-    /// does) and then the seccomp notify fd (from `install_seccomp_filter`). This thread receives
-    /// them in the same order, so the egress proxy is serving before the capsule's `execve`
-    /// completes and no first connection can race it.
+    /// The child sends exactly one `SCM_RIGHTS` batch over this socketpair, from
+    /// `create_capsule_netns` — the first thing its `pre_exec` window does. It used to send a
+    /// second message afterwards (the seccomp notify fd) and this thread used to stay alive
+    /// supervising it; both are gone with the exec supervisor, so the thread now finishes as soon
+    /// as the proxy is up and hands the live handle back over `proxy_rx` for
+    /// [`SupervisorHandle::join_best_effort`] to shut down. What that changes is *when* the proxy
+    /// stops: previously when the notify fd closed (i.e. when every process holding the filter had
+    /// exited), now when `execute_shell` has finished waiting on the subprocess tree. Those are the
+    /// same moment in every ordinary case, because `wait_with_output` reads stdout to EOF and so
+    /// waits for every descendant holding the pipe.
+    ///
+    /// If the sockets never arrive (e.g. `fork()` itself failed, or the child's `pre_exec` closure
+    /// errored before reaching the send), there is no live child left unserved:
+    /// `Command::spawn()` surfaces that same underlying failure as its own `Err`, via the
+    /// close-on-exec error pipe, independently of this thread.
     pub(super) fn start_supervisor(
         parent_sock: OwnedFd,
-        exec_allow: Vec<PathBuf>,
         egress_policy: crate::egress_proxy::EgressPolicy,
         expected_namespace_sockets: usize,
         diag_read: OwnedFd,
     ) -> SupervisorHandle {
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let (proxy_tx, proxy_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // The proxy is started and stopped on this thread so its lifetime is exactly the
-            // subprocess tree's: it begins before the child can exec, and it is torn down as soon
-            // as the notify fd closes — which happens once every process holding the filter has
-            // exited. A proxy outliving its namespace would be serving sockets whose peers no
-            // longer exist.
             let proxy = start_namespace_proxy(
                 parent_sock.as_raw_fd(),
                 expected_namespace_sockets,
                 egress_policy,
             );
-            match receive_fd_over_socket(parent_sock.as_raw_fd()) {
-                Ok(notify_fd) => supervisor_loop(notify_fd, &exec_allow),
-                Err(error) => {
-                    eprintln!(
-                        "[capsule-runtime] warning: failed to receive seccomp notify fd: \
-                         {error} (if a child process was actually forked, its own \
-                         Command::spawn() call reports that failure independently)"
-                    );
+            // A closed receiver means the caller gave up waiting (its bounded `recv_timeout`
+            // elapsed). Dropping the handle here then shuts the proxy down on this thread instead,
+            // which is the same outcome by a different route — never a proxy left running.
+            if let Err(returned) = proxy_tx.send(proxy) {
+                if let Some(proxy) = returned.0 {
+                    proxy.shutdown();
                 }
             }
-            if let Some(proxy) = proxy {
-                proxy.shutdown();
-            }
-            drop(done_tx);
         });
 
-        SupervisorHandle::Linux { done_rx, diag_read }
+        SupervisorHandle::Linux {
+            proxy_rx,
+            diag_read,
+        }
     }
 
     /// Receives the in-namespace listening sockets and starts serving them.
@@ -3743,149 +3562,6 @@ mod linux_enforce {
         }
     }
 
-    /// Reads and responds to notify requests until the notify fd errors/EOFs — which happens
-    /// once every process holding this seccomp filter (the child and all its descendants) has
-    /// exited. Ordinary (non-`pre_exec`) code: heap allocation, `/proc` reads, etc. are all
-    /// fine here.
-    fn supervisor_loop(notify_fd: RawFd, exec_allow: &[PathBuf]) {
-        loop {
-            let req = match libseccomp::ScmpNotifReq::receive(notify_fd) {
-                Ok(req) => req,
-                Err(_) => break,
-            };
-
-            let decision = classify_and_decide(&req, exec_allow);
-
-            // Read memory, THEN validate the notification id is still valid, THEN respond. If
-            // the id went stale (the target thread was resumed/killed via another path between
-            // our read and now), skip it rather than responding to a dead notification.
-            //
-            // This is a *liveness* check, and explicitly NOT a TOCTOU-safe pattern.
-            // `SECCOMP_IOCTL_NOTIF_ID_VALID` answers "does this notification still exist"; it
-            // does not re-validate that the bytes `classify_and_decide` just read out of the
-            // child are the bytes the kernel will act on when the syscall resumes. Because the
-            // `Decision::Allow` arm below answers with `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
-            // (`new_continue`), the kernel re-dereferences the pathname/`sockaddr` pointer
-            // itself after we respond — so a hostile *multithreaded* child that rewrites that
-            // buffer in the window between our read and the syscall's resumption gets the
-            // rewritten value enforced against a decision computed from the original one.
-            // `seccomp_unotify(2)` names this directly and calls continue-based argument
-            // inspection inherently racy. Audited in
-            // `docs/content/reference/seccomp-notify-toctou-audit.md`; a fix is a full
-            // replacement of this architecture (Landlock `Execute` for exec, a network
-            // namespace + egress proxy for network), not a patch here.
-            if libseccomp::notify_id_valid(notify_fd, req.id).is_err() {
-                continue;
-            }
-
-            let resp = match decision {
-                Decision::Allow => {
-                    libseccomp::ScmpNotifResp::new_continue(req.id, libseccomp::ScmpNotifRespFlags::empty())
-                }
-                Decision::Deny => libseccomp::ScmpNotifResp::new_error(
-                    req.id,
-                    -libc::EACCES,
-                    libseccomp::ScmpNotifRespFlags::empty(),
-                ),
-            };
-            let _ = resp.respond(notify_fd);
-        }
-    }
-
-    /// Classifies one notification and decides allow/deny. Uses `req.pid` — the pid the
-    /// *kernel* reports as the actual notifying task — rather than a pid threaded in from the
-    /// original `Child::id()`, since any descendant the original child forks/execs also
-    /// inherits this same seccomp filter and can itself be the notifying task (e.g. `bash -c
-    /// "sh -c 'nc ...'"` — the innermost `sh`'s own `execve` of `nc` notifies with `sh`'s pid,
-    /// not the original `bash`'s).
-    fn classify_and_decide(req: &libseccomp::ScmpNotifReq, exec_allow: &[PathBuf]) -> Decision {
-        let pid = req.pid;
-        let is_syscall = |name: &str| {
-            libseccomp::ScmpSyscall::from_name(name)
-                .map(|target| target == req.data.syscall)
-                .unwrap_or(false)
-        };
-
-        if is_syscall("execve") {
-            return match read_cstr_from_child(pid, req.data.args[0]) {
-                // A relative exec path is relative to the notifying task's own cwd — read it
-                // from /proc; if that read fails, `decide_exec_allowed` denies relative
-                // paths (absolute paths never consult it).
-                Ok(path) => {
-                    let cwd = read_child_cwd(pid);
-                    to_decision(decide_exec_allowed(&path, cwd.as_deref(), exec_allow))
-                }
-                Err(_) => Decision::Deny,
-            };
-        }
-        if is_syscall("execveat") {
-            // execveat(dirfd, pathname, argv, envp, flags): the pathname is resolved
-            // relative to `dirfd` (unless absolute), and with AT_EMPTY_PATH + empty
-            // pathname, `dirfd` IS the binary. All three bases are recoverable from
-            // /proc/<pid>/{cwd,fd/<n>}; any resolution failure denies.
-            let dirfd = req.data.args[0] as libc::c_int;
-            let flags = req.data.args[4] as libc::c_int;
-            let path = match read_cstr_from_child(pid, req.data.args[1]) {
-                Ok(path) => path,
-                Err(_) => return Decision::Deny,
-            };
-            if path.is_empty() && (flags & libc::AT_EMPTY_PATH) != 0 {
-                return match read_child_fd_path(pid, dirfd) {
-                    Some(target) => to_decision(decide_exec_allowed(
-                        &target.to_string_lossy(),
-                        None,
-                        exec_allow,
-                    )),
-                    None => Decision::Deny,
-                };
-            }
-            let base = if Path::new(&path).is_absolute() {
-                None
-            } else if dirfd == libc::AT_FDCWD {
-                read_child_cwd(pid)
-            } else {
-                read_child_fd_path(pid, dirfd)
-            };
-            return to_decision(decide_exec_allowed(&path, base.as_deref(), exec_allow));
-        }
-        // We only ever install NOTIFY rules for the two syscalls above; reaching here would
-        // mean an unexpected notification. Deny conservatively.
-        Decision::Deny
-    }
-
-    /// The notifying task's current working directory, via the /proc magic symlink.
-    fn read_child_cwd(pid: u32) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
-    }
-
-    /// The filesystem path behind one of the notifying task's open fds, via /proc.
-    fn read_child_fd_path(pid: u32, fd: libc::c_int) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()
-    }
-
-    /// Reads a NUL-terminated string out of the child's address space via `/proc/<pid>/mem`.
-    /// Falls back to a smaller read if the first (larger) attempt hits an unmapped page
-    /// boundary — pathnames are bounded by `PATH_MAX` (4096) but the NUL terminator is
-    /// typically well within the first page.
-    fn read_cstr_from_child(pid: u32, addr: u64) -> io::Result<String> {
-        let file = std::fs::File::open(format!("/proc/{pid}/mem"))?;
-
-        for len in [4096usize, 256] {
-            let mut buf = vec![0u8; len];
-            match file.read_at(&mut buf, addr) {
-                Ok(n) if n > 0 => {
-                    let nul_pos = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
-                    return Ok(String::from_utf8_lossy(&buf[..nul_pos]).into_owned());
-                }
-                Ok(_) => continue,
-                Err(_) => continue,
-            }
-        }
-
-        Err(io::Error::other(format!(
-            "failed to read pathname from /proc/{pid}/mem at {addr:#x}"
-        )))
-    }
 }
 
 #[cfg(test)]
@@ -4759,85 +4435,6 @@ mod tests {
         }
     }
 
-    // ---- exec decision (canonical identity match; finding #1's attack) ----
-
-    /// A tempdir "bin" with a real allowlisted `bash`, plus the canonical allow set for it.
-    fn exec_fixture() -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
-        let temp = tempfile::tempdir().unwrap();
-        let bin_dir = temp.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
-        make_executable(&bin_dir.join("bash"), "#!/bin/sh\nexit 0\n");
-        let allow =
-            resolve_exec_allowlist_in(&["bash".to_string()], std::slice::from_ref(&bin_dir));
-        assert_eq!(allow.len(), 1);
-        (temp, bin_dir, allow)
-    }
-
-    #[test]
-    fn decide_exec_denies_renamed_copy_with_allowlisted_basename() {
-        // The review's exact bypass: cp <anything> ./bash && ./bash — same basename as an
-        // allowlisted entry, different binary identity. Must be denied.
-        let (temp, bin_dir, allow) = exec_fixture();
-        let workdir = temp.path().join("work");
-        std::fs::create_dir(&workdir).unwrap();
-        let imposter = workdir.join("bash");
-        make_executable(&imposter, "#!/bin/sh\necho imposter\n");
-
-        assert!(
-            !decide_exec_allowed("./bash", Some(&workdir), &allow),
-            "relative exec of a renamed copy must be denied despite the allowlisted basename"
-        );
-        assert!(
-            !decide_exec_allowed(imposter.to_str().unwrap(), None, &allow),
-            "absolute exec of a renamed copy must be denied despite the allowlisted basename"
-        );
-        // Sanity: the real allowlisted binary itself is still allowed.
-        assert!(decide_exec_allowed(
-            bin_dir.join("bash").to_str().unwrap(),
-            None,
-            &allow
-        ));
-    }
-
-    #[test]
-    fn decide_exec_allows_symlink_and_relative_paths_to_the_real_allowlisted_binary() {
-        let (temp, bin_dir, allow) = exec_fixture();
-        let workdir = temp.path().join("work");
-        std::fs::create_dir(&workdir).unwrap();
-        // A symlink IS the allowlisted binary once canonicalized — allowing it is correct.
-        let link = workdir.join("bash");
-        std::os::unix::fs::symlink(bin_dir.join("bash"), &link).unwrap();
-
-        assert!(decide_exec_allowed("./bash", Some(&workdir), &allow));
-        assert!(decide_exec_allowed("bin/bash", Some(temp.path()), &allow));
-    }
-
-    #[test]
-    fn decide_exec_denies_relative_path_without_base_dir() {
-        let (_temp, _bin_dir, allow) = exec_fixture();
-        assert!(
-            !decide_exec_allowed("bash", None, &allow),
-            "a relative path whose base (child cwd / dirfd) could not be resolved must deny"
-        );
-    }
-
-    #[test]
-    fn decide_exec_denies_nonexistent_and_empty_paths() {
-        let (temp, _bin_dir, allow) = exec_fixture();
-        assert!(!decide_exec_allowed("/definitely/not/a/real/binary", None, &allow));
-        assert!(!decide_exec_allowed("", Some(temp.path()), &allow));
-    }
-
-    #[test]
-    fn decide_exec_denies_everything_on_empty_allowlist() {
-        let (_temp, bin_dir, _allow) = exec_fixture();
-        assert!(!decide_exec_allowed(
-            bin_dir.join("bash").to_str().unwrap(),
-            None,
-            &[]
-        ));
-    }
-
     // ---- `denied_socket_domains` ----------------------------------------------------------
     //
     // These are *content* checks on a hand-authored constant list, in the same category as the
@@ -4886,8 +4483,9 @@ mod tests {
         }
     }
 
-    /// The rule only ever subtracts: IP sockets stay governed by the `connect`/`sendto` notify
-    /// path against `capabilities.network.allow`, never by a domain-level deny.
+    /// The rule only ever subtracts: IP sockets stay governed by the capsule's own network
+    /// namespace and egress proxy against `capabilities.network.allow`, never by a domain-level
+    /// deny.
     #[test]
     fn denied_socket_domains_never_denies_ip_families() {
         for unix_sockets_allowed in [false, true] {
@@ -4984,15 +4582,19 @@ mod tests {
         }
     }
 
-    /// The four notify syscalls are decided by `classify_and_decide` on their argument *contents*.
-    /// A plain `Allow` rule for any of them would take that decision away from the supervisor
-    /// entirely — exec identity matching and the network allowlist would both stop applying.
+    /// `execve`/`execveat` must be *present*, which is the inversion this slice performed: they
+    /// used to be excluded because a `Notify` rule owned them, and a plain `Allow` would have taken
+    /// the decision away from the supervisor. With the supervisor deleted, the default-deny action
+    /// applies to anything unnamed — so omitting them now would refuse the child's own first
+    /// `execve` and no capsule could run a shell tool at all. Exec is decided by the Landlock
+    /// domain instead; see `linux_enforce::workdir_access_rights` and `resolve_landlock_grants`.
     #[test]
-    fn allowlist_excludes_the_notify_syscalls() {
+    fn allowlist_permits_exec_because_landlock_now_decides_it() {
         for name in ["execve", "execveat"] {
             assert!(
-                !SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
-                "{name} is decided by the notify supervisor; a plain Allow rule would bypass it"
+                SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
+                "{name} must reach the kernel — the default action is a deny, so omitting it \
+                 refuses the child's own exec and nothing runs"
             );
         }
     }
@@ -5345,7 +4947,10 @@ mod linux_integration_tests {
         use landlock::{Access, AccessFs, ABI};
 
         let all_v1 = AccessFs::from_all(ABI::V1);
-        let granted = linux_enforce::WORKDIR_ACCESS_RIGHTS;
+        // The `workdir_exec: true` set — the widest the workdir can ever be — so the three
+        // unconditionally-withheld rights below are checked against the permissive case rather
+        // than passing trivially because `Execute` happened to be absent too.
+        let granted = linux_enforce::workdir_access_rights(true);
 
         for withheld in [AccessFs::MakeChar, AccessFs::MakeBlock, AccessFs::MakeSock] {
             assert!(
@@ -5369,9 +4974,38 @@ mod linux_integration_tests {
         let expected = all_v1 & !(AccessFs::MakeChar | AccessFs::MakeBlock | AccessFs::MakeSock);
         assert_eq!(
             granted, expected,
-            "the workdir grant must be exactly Landlock ABI v1 minus MakeChar/MakeBlock/MakeSock \
-             — nothing else may be added or dropped without updating this test and the constant's \
-             comment together"
+            "the workdir_exec grant must be exactly Landlock ABI v1 minus \
+             MakeChar/MakeBlock/MakeSock — nothing else may be added or dropped without updating \
+             this test and the constant's comment together"
+        );
+    }
+
+    /// The bit this slice made conditional, pinned in both directions. A *content* check on the
+    /// right set only: it proves nothing about whether a kernel refuses an exec, which is the
+    /// manual procedure in
+    /// `docs/content/reference/workdir-exec-landlock-manual-verification.md`. What it does buy is
+    /// that flipping the default back — the exact regression that would silently reopen the
+    /// rename-to-an-allowlisted-basename bypass — cannot happen without this test failing.
+    #[test]
+    fn workdir_execute_right_is_granted_only_when_workdir_exec_is_declared() {
+        use landlock::AccessFs;
+
+        assert!(
+            !linux_enforce::workdir_access_rights(false).contains(AccessFs::Execute),
+            "the default must withhold Execute from the workdir — that withholding is the whole \
+             of what enforces capabilities.shell.allow now that the exec supervisor is gone"
+        );
+        assert!(
+            linux_enforce::workdir_access_rights(true).contains(AccessFs::Execute),
+            "capabilities.filesystem.workdir_exec: true must actually grant Execute, or the \
+             compile-and-run workflows it exists for silently stop working"
+        );
+
+        // Nothing else moves with the flag: the two sets differ by exactly `Execute`.
+        assert_eq!(
+            linux_enforce::workdir_access_rights(true) & !AccessFs::Execute,
+            linux_enforce::workdir_access_rights(false),
+            "workdir_exec must be a one-bit axis — no other right may ride along with it"
         );
     }
 
@@ -5384,50 +5018,16 @@ mod linux_integration_tests {
         supervisor.join_best_effort();
     }
 
-    #[test]
-    fn kernel_tier_denies_exec_outside_shell_allowlist() {
-        let tier = detect_enforcement_tier();
-        if tier == EnforcementTier::EnvironmentOnly {
-            eprintln!(
-                "skipping kernel_tier_denies_exec_outside_shell_allowlist: this Linux host \
-                 resolved to EnforcementTier::EnvironmentOnly, which should not happen — but \
-                 degrade gracefully rather than fail the suite"
-            );
-            return;
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        let policy = CapabilityPolicy {
-            shell_allow: vec!["bash".to_string()],
-            ..CapabilityPolicy::default()
-        };
-        let enforcement = ShellEnforcement {
-            tier,
-            network_allow_ips: Vec::new(),
-            unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
-            landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
-                &resolve_exec_allowlist(&policy.shell_allow),
-            )),
-            ..host_bounding_base()
-        };
-
-        let result = crate::shell::execute_shell(
-            "bash",
-            &["-c", "id"],
-            &[],
-            temp.path(),
-            &policy,
-            &enforcement,
-        )
-        .expect("execute_shell should return Ok with a nonzero exit code, not Err");
-
-        assert_ne!(
-            result.exit_code, 0,
-            "`id` is not in shell_allow, so the seccomp exec-notify supervisor must deny its \
-             execve, making bash report a nonzero exit code"
-        );
-    }
+    // There is deliberately no `kernel_tier_denies_exec_outside_shell_allowlist` here any more.
+    // It used to run `bash -c 'id'` with only `bash` allowlisted and assert a nonzero exit, which
+    // the exec-notify supervisor produced on *every* Linux tier. Exec is a Landlock right now, so
+    // the same claim only holds on `KernelFull`/`KernelSealed` — and this repo's CI has never
+    // resolved to either, so the test would have run the weaker path and passed while proving
+    // nothing. Per this card's roadmap the security property is not asserted in CI at all; it is
+    // verified by hand, on real Landlock-capable hardware, following
+    // `docs/content/reference/workdir-exec-landlock-manual-verification.md`. The two tests below
+    // remain because they assert the *opposite* direction — that allowlisted binaries still run —
+    // which a green run does legitimately evidence.
 
     #[test]
     fn kernel_tier_allows_exec_within_shell_allowlist() {
@@ -5449,7 +5049,6 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
@@ -5493,7 +5092,6 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
@@ -5551,7 +5149,6 @@ mod linux_integration_tests {
             network_allow_rules: Vec::new(),
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
@@ -5582,7 +5179,8 @@ mod linux_integration_tests {
     /// out-of-policy destinations without breaking permitted ones.
     ///
     /// Same claim as before this slice, reached through the mechanism that replaced the seccomp
-    /// supervisor. The allowlist now has to be declared rather than only pre-resolved, because it
+    /// connect/sendto supervisor. The allowlist now has to be declared rather than only
+    /// pre-resolved, because it
     /// decides two things instead of one: which addresses are permitted *and* which ports the
     /// namespace binds a listener on. A port no allow entry implies has nothing listening and is
     /// refused by the namespace itself.
@@ -5630,15 +5228,14 @@ mod linux_integration_tests {
             network_allow_rules: rules,
             network_allow_ips: resolve_network_allowlist_ips(&allow).unwrap(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
             ..host_bounding_base()
         };
 
-        // Builtins only — `/dev/tcp` and `read` are bash itself — so the exec supervisor never
-        // sees a second binary and this measures the network path alone.
+        // Builtins only — `/dev/tcp` and `read` are bash itself — so no second binary is exec'd
+        // and this measures the network path alone.
         let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && read -r reply <&3 && echo \"$reply\"");
         let result = crate::shell::execute_shell(
             "bash",
@@ -5688,7 +5285,6 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &resolve_exec_allowlist(&policy.shell_allow),
             )),
@@ -5751,7 +5347,6 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &exec_allow_paths,
             )),
-            exec_allow_paths,
             ..host_bounding_base()
         };
 
@@ -5814,7 +5409,6 @@ mod linux_integration_tests {
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
                 &exec_allow_paths,
             )),
-            exec_allow_paths,
             ..host_bounding_base()
         };
 
@@ -5855,7 +5449,6 @@ mod linux_integration_tests {
             tier,
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
-            exec_allow_paths,
             landlock_grants,
             ..host_bounding_base()
         }
@@ -6027,21 +5620,6 @@ mod linux_integration_tests {
         }
     }
 
-    struct ForceDumpableFailureGuard;
-
-    impl ForceDumpableFailureGuard {
-        fn new() -> Self {
-            FORCE_DUMPABLE_FAILURE.with(|flag| flag.set(true));
-            Self
-        }
-    }
-
-    impl Drop for ForceDumpableFailureGuard {
-        fn drop(&mut self) {
-            FORCE_DUMPABLE_FAILURE.with(|flag| flag.set(false));
-        }
-    }
-
     struct ForceLandlockFailureGuard;
 
     impl ForceLandlockFailureGuard {
@@ -6065,7 +5643,6 @@ mod linux_integration_tests {
             tier: EnforcementTier::KernelFull,
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: false,
-            exec_allow_paths: Vec::new(),
             landlock_grants: Vec::new(),
             ..host_bounding_base()
         }
@@ -6158,22 +5735,6 @@ mod linux_integration_tests {
         );
     }
 
-    /// The `dumpable` restore is what makes the notify supervisor able to read the child at all,
-    /// so a failure there must abort the spawn rather than leave a child whose every `execve`
-    /// would be denied — and it must say which step failed.
-    #[test]
-    fn pre_exec_dumpable_restore_failure_is_distinct_and_fails_closed() {
-        let error = child_setup_failure_error(ForceDumpableFailureGuard::new);
-        assert!(
-            error.contains("dumpable"),
-            "the error must name the dumpable-restore step specifically: {error}"
-        );
-        assert!(
-            !error.contains("os error 22"),
-            "must not collapse to the bare EINVAL string: {error}"
-        );
-    }
-
     #[test]
     fn pre_exec_landlock_failure_is_distinct_and_fails_closed() {
         let error = child_setup_failure_error(ForceLandlockFailureGuard::new);
@@ -6191,13 +5752,11 @@ mod linux_integration_tests {
     fn pre_exec_setup_failures_produce_pairwise_distinct_messages() {
         let workdir_msg = workdir_resolution_error();
         let no_new_privs_msg = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
-        let dumpable_msg = child_setup_failure_error(ForceDumpableFailureGuard::new);
         let landlock_msg = child_setup_failure_error(ForceLandlockFailureGuard::new);
 
         let messages = [
             ("workdir", &workdir_msg),
             ("no_new_privs", &no_new_privs_msg),
-            ("dumpable", &dumpable_msg),
             ("landlock", &landlock_msg),
         ];
         for (i, (left_name, left)) in messages.iter().enumerate() {
@@ -6206,7 +5765,7 @@ mod linux_integration_tests {
             }
         }
 
-        for message in [&workdir_msg, &no_new_privs_msg, &dumpable_msg, &landlock_msg] {
+        for message in [&workdir_msg, &no_new_privs_msg, &landlock_msg] {
             assert!(!message.is_empty(), "a distinct message must not be empty");
             assert!(
                 !message.contains("os error 22"),
@@ -6275,4 +5834,5 @@ mod linux_integration_tests {
             "a no_new_privs failure is the tool call's problem, not the session's: {no_new_privs}"
         );
     }
+
 }

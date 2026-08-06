@@ -521,6 +521,21 @@ pub struct NetworkCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilesystemCapabilities {
     pub scope: Option<String>,
+    /// Whether anything written *into* the session workdir may be executed. `false` unless the
+    /// manifest says otherwise, and that default is the whole point: with it, the workdir's own
+    /// Landlock `PathBeneath` rule withholds the `Execute` right, so the kernel — evaluating the
+    /// resolved path itself, with no userspace round trip — refuses to exec a binary the capsule
+    /// produced, whatever it is named. That is what makes `capabilities.shell.allow` a complete
+    /// and sound statement rather than a name-matching convention.
+    ///
+    /// `true` takes the `Execute` right back for compile-and-run workflows (a capsule that
+    /// `gcc`/`cargo build`s inside its workdir and then runs the result). The cost is not
+    /// negotiable and is not hidden: anything the capsule writes into the workdir can then run
+    /// regardless of `shell.allow`, so the allowlist stops being an enforceable property of that
+    /// capsule. A capsule declaring it can therefore never achieve
+    /// [`ContainmentClass::Scoped`] — see `capsule_runtime::containment` — and pairing it with
+    /// `capabilities.containment: scoped` is refused at launch.
+    pub workdir_exec: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1005,6 +1020,11 @@ struct RawNetworkCapabilities {
 struct RawFilesystemCapabilities {
     #[serde(default)]
     scope: Option<String>,
+    /// Same shape and defaulting convention as `RawNetworkCapabilities::unix_sockets`: a plain
+    /// `bool` that is always present after parsing and defaults to `false`, never an `Option`.
+    /// "The key is absent" and "the key says `false`" are the same declaration.
+    #[serde(default)]
+    workdir_exec: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1350,6 +1370,11 @@ fn parse_capabilities(
                 let trimmed = scope.trim();
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
             }),
+            // Copied straight across: a bool has no empty/whitespace case to normalise, and there
+            // is nothing to validate here — the *consequence* of declaring it (no `scoped`, and a
+            // refusal when `capabilities.containment: scoped` is also declared) belongs to the
+            // runtime's containment layer, not to manifest parsing.
+            workdir_exec: raw_filesystem.workdir_exec,
         });
 
     let shell = raw_caps
@@ -2530,6 +2555,101 @@ capabilities:
         assert!(network.unix_sockets);
         // The opt-in is orthogonal to the IP allowlist — declaring it does not imply any host.
         assert_eq!(network.allow, Vec::<String>::new());
+    }
+
+    /// The default every pre-existing manifest gets: a `filesystem:` block that has never heard of
+    /// `workdir_exec` must not silently keep the workdir's `Execute` right, because that right is
+    /// exactly what makes `capabilities.shell.allow` bypassable from inside the workdir.
+    #[test]
+    fn filesystem_workdir_exec_defaults_to_false_when_key_is_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  filesystem:
+    scope: workdir
+"#,
+        )
+        .unwrap();
+
+        let filesystem = manifest.capabilities.unwrap().filesystem.unwrap();
+        assert_eq!(filesystem.scope.as_deref(), Some("workdir"));
+        assert!(!filesystem.workdir_exec);
+    }
+
+    /// The other absent case: no `filesystem:` block at all. There is nothing to default here —
+    /// the whole sub-block stays `None` — but a capsule with no filesystem declaration must still
+    /// read as "workdir exec denied" downstream, which `capability_policy_from_runtime_manifest`
+    /// covers with its own test.
+    #[test]
+    fn filesystem_block_stays_absent_when_undeclared() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  network:
+    allow:
+      - https://api.anthropic.com
+"#,
+        )
+        .unwrap();
+
+        assert!(manifest.capabilities.unwrap().filesystem.is_none());
+    }
+
+    #[test]
+    fn filesystem_workdir_exec_parses_explicit_false() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  filesystem:
+    workdir_exec: false
+"#,
+        )
+        .unwrap();
+
+        assert!(!manifest
+            .capabilities
+            .unwrap()
+            .filesystem
+            .unwrap()
+            .workdir_exec);
+    }
+
+    #[test]
+    fn filesystem_workdir_exec_parses_explicit_true() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: echo
+    version: 1.2.3
+capabilities:
+  filesystem:
+    workdir_exec: true
+"#,
+        )
+        .unwrap();
+
+        let filesystem = manifest.capabilities.unwrap().filesystem.unwrap();
+        assert!(filesystem.workdir_exec);
+        // Orthogonal to `scope`, exactly as `unix_sockets` is orthogonal to `network.allow`:
+        // declaring one says nothing about the other.
+        assert_eq!(filesystem.scope, None);
     }
 
     #[test]

@@ -342,6 +342,7 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.network.allow` | list<string> | no | host/URL allow entries. Governs IP destinations only — it has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately |
 | `capabilities.network.unix_sockets` | bool | no | defaults to **`false`**. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`, enforced by seccomp on both Linux tiers. Set `true` only if a shell tool genuinely needs a local daemon socket — it is a coarse, capsule-wide grant, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. `AF_NETLINK` and `AF_PACKET` are always refused and have no equivalent key. No effect on non-Linux hosts, which have no kernel enforcement at all — see [`W-SEC-001`](security-warnings.md#w-sec-001) |
 | `capabilities.filesystem.scope` | string | no | relative scope under workdir |
+| `capabilities.filesystem.workdir_exec` | bool | no | defaults to **`false`**. When false, the session workdir's Landlock rule withholds the `Execute` right, so nothing the capsule writes there can be executed — under any name, including one that appears in `capabilities.shell.allow`. That withholding is what makes `shell.allow` a complete, kernel-enforced statement rather than a name-matching convention. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](security-warnings.md#w-sec-011) at staging. See [Executable workdirs](#field-workdir-exec) below. No effect on non-Linux hosts or on Linux without a usable Landlock ABI, neither of which mediates exec at all — see [`W-SEC-001`](security-warnings.md#w-sec-001) and [`W-SEC-002`](security-warnings.md#w-sec-002) |
 | `capabilities.shell.allow` | list<string> | no | shell binaries the agent may invoke (e.g. `bash`); each listed binary gets a synthetic tool manifest staged at launch |
 | `capabilities.shell.strip_env` | list<string> | no | glob patterns for env vars to strip from subprocess environment (e.g. `AWS_*`) |
 | `capabilities.shell.baseline_env` | list<string> | no | glob patterns for env vars to keep after stripping (e.g. `PATH`) |
@@ -381,6 +382,77 @@ or to leave anything behind on the host.
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the launch-time IP allowlist that `capabilities.shell.allow` subprocesses fall back to when they reach a destination by address rather than by name (see [network namespace and egress proxy](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md) for how a native subprocess's `network.allow` is enforced day to day — by name, through the capsule's own DNS responder, not by this launch-time set alone). This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
 
 A WASM guest never inherits the host process's environment: `capabilities.env.allow` is the only way to expose a host variable, and even a name declared there is dropped if it is credential-shaped (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the exact pattern list — the same backstop applies here) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable is silently omitted, not an error.
+
+### Executable workdirs { #field-workdir-exec }
+
+`capabilities.filesystem.workdir_exec` decides one Landlock bit: whether the session workdir's own
+rule carries the `Execute` right.
+
+**The default (`false`, and what every manifest that omits the key gets).** The workdir is
+readable and writable but not executable. Each binary named in `capabilities.shell.allow` gets its
+own narrow read+execute grant at its real host path — the binary, its ELF interpreter, and its
+`DT_NEEDED` shared-library closure — so allowlisted programs run normally from `/usr/bin` and
+friends. Nothing the capsule *produces* runs. The decision is made by the kernel, on the path it
+resolved itself, so there is no name to spoof and no window to race:
+
+```console
+$ # inside a capsule with `shell.allow: [bash]` and workdir_exec absent
+$ cp /usr/bin/nc ./bash && ./bash -l
+bash: ./bash: Permission denied
+```
+
+This closes a bypass a prior release shipped, where exec was decided by a userspace supervisor
+comparing a pathname it read out of the calling process. That comparison could be defeated by
+renaming a binary to an allowlisted basename, and — per `seccomp_unotify(2)` — raced even when it
+could not. Withholding one Landlock right replaces the whole mechanism.
+
+**The cost, stated plainly.** A binary the capsule legitimately compiled cannot run either:
+
+```console
+$ gcc -o ./hello hello.c && ./hello
+bash: ./hello: Permission denied
+```
+
+That is the accepted price of the default, not a bug to work around.
+
+**`workdir_exec: true`.** The workdir keeps `Execute`, and compile-and-run works. In exchange,
+`capabilities.shell.allow` stops being an enforceable property of the capsule: anything written
+into the workdir runs regardless of what the allowlist says. The runtime does not pretend
+otherwise —
+
+* the capsule's achieved containment class is `advisory`, on every host, including a
+  Landlock-capable one;
+* `mur run --explain-scope` prints `workdir exec: true` and the `advisory` it forced;
+* `trace.jsonl`'s `session_start` carries `workdir_exec: true`;
+* [`W-SEC-011`](security-warnings.md#w-sec-011) fires once at staging;
+* pairing it with `capabilities.containment: scoped` (or `sealed`) refuses the launch.
+
+```yaml
+capabilities:
+  filesystem:
+    workdir_exec: true           # compile-and-run; shell.allow is advisory inside the workdir
+  shell:
+    allow:
+      - bash
+      - gcc
+```
+
+The refusal, when a manifest asks for both, names the manifest rather than the host — because no
+host can satisfy it:
+
+```text
+error[E-CAP-003]: declared containment class 'scoped' is not achievable on this host (achieved: 'advisory'): capabilities.filesystem.workdir_exec: true keeps the Landlock Execute right on the session workdir, so a binary the capsule compiles, downloads or renames inside it runs regardless of capabilities.shell.allow — the allowlist stops being an enforceable property of this capsule. No host can back a class above advisory for it. Either remove workdir_exec (the allowlist is then enforced by the kernel on the resolved path) or lower the declared containment floor to advisory
+  hint: lower the declared floor to 'advisory' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'scoped'
+```
+
+**Where it has no effect.** The bit is a Landlock right, so a host with no usable Landlock ABI
+(Linux < 5.13) and every non-Linux host ignore it entirely — on those hosts nothing mediates exec
+either way, which is exactly why neither can reach `scoped`. `W-SEC-001` and `W-SEC-002` already
+say so.
+
+The claim that a workdir binary really cannot execute is verified by hand on real
+Landlock-capable hardware, not by the test suite — see
+[workdir-exec Landlock manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md).
 
 ### Staged runtime { #field-staged-runtime }
 
@@ -494,6 +566,14 @@ Linux without Landlock, or macOS) achieves `advisory`. Granting a `scoped` capsu
 paths outside the workdir via `capabilities.shell.interpreter_runtime` never changes the achieved
 class.
 
+**One manifest property does lower it, and only lower it.**
+`capabilities.filesystem.workdir_exec: true` caps the achieved class at `advisory` on every host,
+including a `sealed`-capable one. This is not the host probe changing its mind — the probe still
+reports what the machine can do, and `mechanism:` in `--explain-scope` still names the full tier.
+It is the capsule giving up the claim `scoped` makes: with an executable workdir, `shell.allow` is
+no longer something the kernel can hold the capsule to. Nothing in a manifest can ever *raise* an
+achieved class. See [Executable workdirs](#field-workdir-exec).
+
 **A weaker declaration is never silently upgraded.** On a `sealed`-capable host, a capsule
 declaring `scoped` still runs with `scoped`'s mechanism — Landlock and seccomp over the host
 filesystem, no composed root. Installing one anyway would delete the host paths its
@@ -554,6 +634,7 @@ Containment
 
 Effective grants
   filesystem scope: <none>
+  workdir exec:     false
   network allow:
     - https://api.anthropic.com
   unix sockets:     false
@@ -583,7 +664,9 @@ resolution and the shell allowlist's DT_NEEDED closure to stay fast and read-onl
 **`trace.jsonl`** records both classes on every session, in the `session_start` event's
 `containment_declared` and `containment_achieved` fields (see [session trace
 schema](cli.md#session-trace-tracejsonl)) — regardless of whether `capabilities.containment` was
-ever declared.
+ever declared. The same event carries `workdir_exec`, always, so a trace showing
+`containment_achieved: advisory` can be told apart from one written on a host with no Landlock:
+`workdir_exec: true` means the capsule chose it.
 
 #### `inference` { #field-inference }
 

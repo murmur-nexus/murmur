@@ -3,12 +3,12 @@
 Every containment claim murmur makes — Landlock scoping, seccomp filtering, `pivot_root` onto a
 composed root, cgroup v2 resource ceilings, file-descriptor hygiene across `exec` — is a claim about
 what a *kernel* does. Four of those claims are verified by a person, by hand, against a real Linux
-host, and the procedures are not published as part of this site.
+host, and those procedures are not published as part of this site.
 
 This page exists so that you can find them anyway, know what each one covers, and know what has
 actually been run.
 
-## Why these four are not automated
+## Why these are not automated
 
 A test suite that skips its way to green certifies nothing.
 
@@ -30,21 +30,22 @@ tier a probe resolves to, which containment class a tier achieves, that a limit 
 when it is zero. None of them touches a kernel boundary, and none of them is offered as evidence
 that one holds.
 
-!!! warning "These four pages are excluded from the docs build"
+!!! warning "These pages are excluded from the docs build"
 
-    Because they are listed under `exclude_docs:` in `mkdocs.yml`, links *inside* these four
+    Because they are listed under `exclude_docs:` in `mkdocs.yml`, links *inside* these
     documents are no longer validated by `mkdocs build --strict`. A broken cross-reference or a
     stale anchor within a procedure will not fail the build. If you edit one, check its links by
     hand — the safety net that covers the rest of this site does not cover them.
 
-## The four procedures
+## The procedures
 
 | Procedure | What it covers | When it is run |
 |---|---|---|
 | **Sealed containment — manual verification** | The `sealed` class end to end: the `E-CAP-003` refusal when the AppArmor profile is absent, the composed root observed from inside a live capsule's shell tool (paths outside it return `ENOENT`, not `EACCES`), `"containment_achieved":"sealed"` in `trace.jsonl`, and the refusal to run at a weaker class inside a plain container. | Release gate for the `sealed` class — see [below](#the-sealed-release-gate). Re-run whenever the composed-root construction, the host probe, or the tier→class mapping changes. |
 | **Resource limits — manual verification** | The three mechanisms bounding the native subprocess tree: `setrlimit(2)` per-process ceilings, the cgroup v2 scope (fork bomb, memory hog, CPU, I/O), and the periodic workdir-size check. Ten scenarios, including the `E-RUN-012` fail-closed launch refusal and the macOS gap behind `W-SEC-010`. | On a Linux host with systemd user cgroup delegation configured, whenever `capabilities.resources` enforcement or the cgroup delegation path changes. |
 | **Subprocess fd hygiene — verification** | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, across both spawn paths (shell tool and native tool), on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever either spawn path's `pre_exec` window changes. **Status: pending** — implemented and compiling, never executed on a real Linux host. |
-| **Seccomp-notify TOCTOU audit** | A recorded architectural verdict, not a pass/fail run: the seccomp-notify supervisor reads `execve`/`execveat`/`connect`/`sendto` pointer arguments out of the notifying task's memory and then answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, so the kernel dereferences the same pointer again after the decision. A hostile multithreaded subprocess can have one decision computed and a different one enforced. Ships with race probes and a manual acceptance procedure that reproduce it. | Once, as an audit; re-open it if the supervisor stops using `FLAG_CONTINUE` or starts copying arguments into kernel-stable storage. |
+| **Workdir `Execute` rights and declared `workdir_exec` — manual verification** | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
+| **Seccomp-notify TOCTOU audit** | A recorded architectural verdict, not a pass/fail run: a seccomp-notify supervisor read `execve`/`execveat`/`connect`/`sendto` pointer arguments out of the notifying task's memory and then answered `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, so the kernel dereferenced the same pointer again after the decision. A hostile multithreaded subprocess could have one decision computed and a different one enforced. Ships with race probes that reproduce it. **Both halves of that supervisor have since been deleted** — network enforcement moved to a namespace + egress proxy, exec enforcement to Landlock `Execute` rights — so this is now a historical record of why, not a description of live code. | Closed. Re-open it only if a `Notify` rule is ever added back to `install_seccomp_filter`. |
 
 ### The `sealed` release gate
 
@@ -71,6 +72,8 @@ The documents live in the repository, at the paths below, on the `main` branch:
   [`docs/content/reference/resource-limits-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/resource-limits-manual-verification.md)
 - **Subprocess fd hygiene — verification** —
   [`docs/content/reference/subprocess-fd-hygiene-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md)
+- **Workdir `Execute` rights and declared `workdir_exec` — manual verification** —
+  [`docs/content/reference/workdir-exec-landlock-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md)
 - **Seccomp-notify TOCTOU audit** —
   [`docs/content/reference/seccomp-notify-toctou-audit.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/seccomp-notify-toctou-audit.md)
 

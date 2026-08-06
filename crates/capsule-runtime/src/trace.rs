@@ -20,6 +20,7 @@ pub(crate) struct TraceWriter {
     capabilities: Vec<String>,
     containment_declared: ContainmentClass,
     containment_achieved: ContainmentClass,
+    workdir_exec: bool,
     include_tool_output: bool,
     session_start_time: Instant,
     session_started: bool,
@@ -67,10 +68,18 @@ struct SessionStartEvent {
     tools_declared: Vec<String>,
     /// Strongest containment class any source asked for. A *requirement*, not an observation.
     containment_declared: ContainmentClass,
-    /// What the host's kernel actually provided, derived from the probed enforcement tier
-    /// alone. Reading these two together is how a session's trace shows whether the capsule
-    /// ran under the containment its operator asked for.
+    /// What this session actually ran under: the probed enforcement tier's ceiling, capped by
+    /// `workdir_exec` below. Reading these two together is how a session's trace shows whether the
+    /// capsule ran under the containment its operator asked for.
     containment_achieved: ContainmentClass,
+    /// `capabilities.filesystem.workdir_exec`. Always written, including `false`, so its absence
+    /// identifies a trace from a runtime that predates the key rather than a capsule that declined
+    /// it.
+    ///
+    /// `true` is the reason a trace can show `containment_achieved: advisory` on a host whose
+    /// `session_start` would otherwise say `scoped` — and it is the record that this session's
+    /// `capabilities.shell.allow` was advisory too, since anything in the workdir could run.
+    workdir_exec: bool,
 }
 
 #[derive(Serialize)]
@@ -275,6 +284,7 @@ impl TraceWriter {
         capabilities: Vec<String>,
         containment_declared: ContainmentClass,
         containment_achieved: ContainmentClass,
+        workdir_exec: bool,
         include_tool_output: bool,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
@@ -291,6 +301,7 @@ impl TraceWriter {
             capabilities,
             containment_declared,
             containment_achieved,
+            workdir_exec,
             include_tool_output,
             session_start_time: Instant::now(),
             session_started: false,
@@ -327,6 +338,7 @@ impl TraceWriter {
             tools_declared,
             containment_declared: self.containment_declared,
             containment_achieved: self.containment_achieved,
+            workdir_exec: self.workdir_exec,
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -698,6 +710,7 @@ mod tests {
             vec!["shell".to_string()],
             ContainmentClass::Advisory,
             ContainmentClass::Advisory,
+            false,
             include_tool_output,
         )
         .await
@@ -735,7 +748,37 @@ mod tests {
         assert_eq!(e["tools_declared"], serde_json::json!(["bash"]));
         assert_eq!(e["containment_declared"], "advisory");
         assert_eq!(e["containment_achieved"], "advisory");
+        assert_eq!(e["workdir_exec"], false);
         assert!(e["timestamp"].as_u64().unwrap() > 0);
+    }
+
+    /// The pairing an operator reads a trace for: `workdir_exec: true` next to the `advisory` it
+    /// forces, on a session whose *declared* floor was higher. Without the flag on the record, a
+    /// trace showing `achieved: advisory` is indistinguishable from one written on a host with no
+    /// Landlock at all.
+    #[tokio::test]
+    async fn session_start_records_workdir_exec_next_to_the_class_it_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = TraceWriter::open(
+            dir.path(),
+            "test-session-id".to_string(),
+            "test-capsule".to_string(),
+            "1.0.0".to_string(),
+            "claude-test".to_string(),
+            Vec::new(),
+            ContainmentClass::Advisory,
+            ContainmentClass::Advisory,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events[0]["workdir_exec"], true);
+        assert_eq!(events[0]["containment_achieved"], "advisory");
     }
 
     /// A declared floor and an achieved class are recorded independently — the trace shows
@@ -752,6 +795,7 @@ mod tests {
             Vec::new(),
             ContainmentClass::Sealed,
             ContainmentClass::Scoped,
+            false,
             false,
         )
         .await

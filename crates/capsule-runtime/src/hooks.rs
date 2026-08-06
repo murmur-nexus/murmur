@@ -2896,6 +2896,7 @@ mod tests {
             }),
             filesystem: scope.map(|scope| FilesystemCapabilities {
                 scope: Some(scope.to_string()),
+                workdir_exec: false,
             }),
             shell: None,
             spawn: None,

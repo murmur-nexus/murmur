@@ -34,7 +34,7 @@ pub mod types;
 
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_sealed_blocker, explain_scope, ScopeReport,
+    detect_achieved_containment_for, detect_sealed_blocker, explain_scope, ScopeReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, EgressNamespaceBlocker,
@@ -44,7 +44,9 @@ pub use errors::RuntimeError;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 pub use resources::HostResourceLimits;
-pub use runtime::{launch_session, stage_session, warn_on_interpreter_runtime_grants};
+pub use runtime::{
+    launch_session, stage_session, warn_on_interpreter_runtime_grants, warn_on_workdir_exec,
+};
 pub use staged_runtime::check_staged_runtime_floor;
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
