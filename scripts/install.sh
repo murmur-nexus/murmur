@@ -19,8 +19,9 @@ REPO="${MUR_REPO:-$DEFAULT_REPO}"
 CHECKSUMS_FILE="checksums.txt"
 
 # AppArmor profile that lets `mur` create an unprivileged user namespace, which is
-# what `capabilities.containment: sealed` needs on Ubuntu 23.10+ and any other host
-# with kernel.apparmor_restrict_unprivileged_userns=1. See packaging/apparmor/mur-sealed.
+# what `capabilities.containment: sealed` and every capsule's own network namespace
+# both need on Ubuntu 23.10+ and any other host with
+# kernel.apparmor_restrict_unprivileged_userns=1. See packaging/apparmor/mur-sealed.
 APPARMOR_PROFILE_NAME="mur-sealed"
 APPARMOR_PROFILE_DIR="/etc/apparmor.d"
 
@@ -238,13 +239,23 @@ The download may be corrupt or tampered with. Nothing was installed."
 
 # ---------------------------------------------------------------- apparmor
 
-# Installs and loads the `mur-sealed` AppArmor profile, which is what makes
-# `capabilities.containment: sealed` achievable on an AppArmor host.
+# Installs and loads the `mur-sealed` AppArmor profile: this runtime's whole
+# capability-grant mechanism, and the only one it has. There is no `setcap` step and
+# no setuid binary — every namespace `mur` creates is an *unprivileged* one, made
+# inside a user namespace the calling process owns, so the only thing a host has to
+# grant is permission to call `unshare(CLONE_NEWUSER)` at all. On the AppArmor hosts
+# that restrict that (Ubuntu 23.10+), this profile is that permission.
 #
-# Warns and continues on every failure, never `die`s. `mur` must still install and
-# run at `scoped` or `advisory` on a host with no AppArmor (Fedora, Arch, macOS), on
-# a host where this script is not root, and on a host whose operator does not want
-# `sealed` at all. A missing profile costs one containment class, not the install.
+# It gates two mechanisms, not one. It has always been what makes
+# `capabilities.containment: sealed` achievable; since the network namespace replaced
+# the seccomp connect/sendto interception it is also what lets the runtime build the
+# egress boundary that enforces `capabilities.network.allow` for native subprocesses
+# — at every containment class, `advisory` included.
+#
+# Warns and continues on every failure, never `die`s. `mur` must still install on a
+# host with no AppArmor (Fedora, Arch, macOS), on a host where this script is not
+# root, and on a host whose operator does not want any of this. The install itself
+# never depends on the grant; only what a capsule can then do does.
 #
 # Like the rest of this script it never invokes sudo — it prints the two commands to
 # run instead. Prompting for a password inside `curl | sh` is both hostile and
@@ -261,7 +272,7 @@ install_apparmor_profile() {
 
     if ! command -v apparmor_parser >/dev/null 2>&1; then
         warn "AppArmor is enabled on this host but apparmor_parser was not found, so the ${APPARMOR_PROFILE_NAME} profile was not installed.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. Install the AppArmor userspace tools (Debian/Ubuntu: apparmor-utils) and then run:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Install the AppArmor userspace tools (Debian/Ubuntu: apparmor-utils) and then run:
 ${manual}"
         return 0
     fi
@@ -283,13 +294,13 @@ ${manual}"
                     "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}" soft; then
                     profile_src="${TMPDIR_INSTALL}/${asset_name}"
                 else
-                    warn "mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+                    warn "mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. From a murmur checkout, run:
 ${manual}"
                     return 0
                 fi
             else
                 warn "the ${APPARMOR_PROFILE_NAME} AppArmor profile is not listed in ${CHECKSUMS_FILE} for this release, so it was not installed — this script does not write unverified files into ${APPARMOR_PROFILE_DIR}.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. From a murmur checkout, run:
 ${manual}"
                 return 0
             fi
@@ -298,14 +309,14 @@ ${manual}"
 
     if [ -z "$profile_src" ]; then
         warn "could not obtain the ${APPARMOR_PROFILE_NAME} AppArmor profile, so it was not installed.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. From a murmur checkout, run:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. From a murmur checkout, run:
 ${manual}"
         return 0
     fi
 
     if [ "$(id -u)" != "0" ]; then
         warn "installing the ${APPARMOR_PROFILE_NAME} AppArmor profile needs root, and this script never invokes sudo.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded. Run:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Run:
   sudo install -m 644 ${profile_src} ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}
   sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
         return 0
@@ -316,24 +327,25 @@ mur is installed and works normally; capsules declaring \`capabilities.containme
     # binary install uses.
     if ! apparmor_parser -Q "$profile_src" >/dev/null 2>&1; then
         warn "the ${APPARMOR_PROFILE_NAME} AppArmor profile did not parse on this host's AppArmor version, so it was not installed. Nothing was written to ${APPARMOR_PROFILE_DIR}.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here."
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected."
         return 0
     fi
 
     if ! install -m 644 "$profile_src" "${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}" 2>/dev/null; then
         warn "could not write ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until the profile is loaded."
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Install it as root with:
+${manual}"
         return 0
     fi
 
     if ! apparmor_parser -r "${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}" >/dev/null 2>&1; then
         warn "wrote ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME} but could not load it.
-mur is installed and works normally; capsules declaring \`capabilities.containment: sealed\` will refuse to launch here until it loads. Retry with:
+mur is installed and works normally, but on a host with kernel.apparmor_restrict_unprivileged_userns=1 the runtime cannot create the network namespace that enforces capabilities.network.allow for native subprocesses: every capsule with a capabilities.shell.allow list refuses to launch with error[E-CAP-005], and capsules declaring \`capabilities.containment: sealed\` refuse with error[E-CAP-003]. Capsules that spawn no subprocess are unaffected. Retry with:
   sudo apparmor_parser -r ${APPARMOR_PROFILE_DIR}/${APPARMOR_PROFILE_NAME}"
         return 0
     fi
 
-    info "loaded AppArmor profile ${APPARMOR_PROFILE_NAME} (capabilities.containment: sealed is now available)"
+    info "loaded AppArmor profile ${APPARMOR_PROFILE_NAME} (native-subprocess network enforcement and capabilities.containment: sealed are now available)"
 }
 
 # ---------------------------------------------------------------- main

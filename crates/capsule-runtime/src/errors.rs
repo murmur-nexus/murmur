@@ -149,6 +149,31 @@ pub enum RuntimeError {
     )]
     SealedRootConstructionFailed { detail: String },
 
+    /// This host cannot give a capsule's native subprocess tree its own network namespace, so the
+    /// egress boundary that mediates `capabilities.network.allow` cannot be built.
+    ///
+    /// Raised before any registry pull, component compile or workdir creation, and raised for
+    /// **every** Linux capsule that can spawn a subprocess — including one whose
+    /// `capabilities.network.allow` is empty. That breadth is the point: with the namespace
+    /// missing, an empty allowlist would mean *unrestricted* egress rather than none, because the
+    /// seccomp `connect`/`sendto` interception that used to back it was deleted as unsound rather
+    /// than kept as a fallback. There is deliberately no path that continues at reduced
+    /// enforcement.
+    ///
+    /// Deliberately distinct from [`Self::ContainmentFloorUnmet`], which this would otherwise
+    /// look like: that one compares a *declared* containment class against what the host can
+    /// back, and its remedy is to lower the declared floor. A network namespace is not part of
+    /// the containment ladder — every class needs it equally — so lowering the floor fixes
+    /// nothing here, and offering that advice would be actively misleading.
+    #[error(
+        "this host cannot give the capsule's subprocess tree its own network namespace, so \
+         capabilities.network.allow cannot be enforced for it: {reason}"
+    )]
+    EgressNamespaceUnavailable {
+        blocker: crate::network_namespace::EgressNamespaceBlocker,
+        reason: String,
+    },
+
     #[error(
         "capsule component missing export murmur:capsule/run@0.1.0#run; rebuild the artifact against the versioned WIT (run `mur install` for a default artifact, or rebuild from source otherwise)"
     )]

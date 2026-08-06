@@ -962,15 +962,15 @@ pub(crate) const CAPSULE_DEVICE_GRANTS: &[CapsuleDeviceGrant] = &[
 /// symlink in that window can still race it.
 ///
 /// Neither exec nor symlinks are what bounds that race — it is the whole class of decision
-/// this supervisor makes by dereferencing a pointer into another task's memory. The
-/// `connect`/`sendto` path reads a `sockaddr` out of the notifying task via the same
-/// `/proc/<pid>/mem` read (`linux_enforce::read_sockaddr_ip_from_child`) and answers with the
-/// same `CONTINUE`, so a second thread can overwrite that buffer between the supervisor's read
-/// and the kernel's post-continue re-use of it exactly as it can retarget a symlink here.
-/// Closing either fully requires fd-substitution (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather
-/// than continue semantics; the non-racing rename/copy bypass is what this closes. Audited,
-/// with citations and a hand-runnable race probe, in
-/// `docs/content/reference/seccomp-notify-toctou-audit.md`.
+/// this supervisor makes by dereferencing a pointer into another task's memory. A `connect`/
+/// `sendto` path used to read a `sockaddr` out of the notifying task the same way and answer
+/// with the same `CONTINUE`, exposed to the identical race; that path has been retired (the
+/// native subprocess tree now enforces `capabilities.network.allow` through its own network
+/// namespace and egress proxy instead), leaving this pathname read as the one remaining
+/// `/proc/<pid>/mem` dereference on the hot path. Closing it fully requires fd-substitution
+/// (`SECCOMP_IOCTL_NOTIF_ADDFD`-style) rather than continue semantics; the non-racing
+/// rename/copy bypass is what this closes. Audited, with citations and a hand-runnable race
+/// probe, in `docs/content/reference/seccomp-notify-toctou-audit.md`.
 // Production callers live inside the Linux-only supervisor; unit tests exercise it on every
 // OS (which is the point of keeping it out of `linux_enforce`).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1010,7 +1010,7 @@ pub(crate) fn network_ip_allowed(ip: IpAddr, network_allow_ips: &[IpAddr]) -> bo
 }
 
 // `socket(2)`'s `domain` argument values, as Linux's ABI defines them. Spelled out as literals
-// rather than `libc::AF_*` for the same reason `LINUX_AF_INET` below is: the filter these feed is
+// rather than `libc::AF_*`: the filter these feed is
 // always compiled *for a Linux child*, so the numbers must be Linux's regardless of what host the
 // build runs on — and `denied_socket_domains` has to stay compilable and unit-testable on a macOS
 // dev machine, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
@@ -1018,6 +1018,8 @@ pub(crate) fn network_ip_allowed(ip: IpAddr, network_allow_ips: &[IpAddr]) -> bo
 // of the three from `libc` and two from literals would be worse than taking all three the same
 // way. Values are stable kernel ABI: `include/linux/socket.h`.
 const LINUX_AF_UNIX: i32 = 1;
+const LINUX_AF_INET: i32 = 2;
+const LINUX_AF_INET6: i32 = 10;
 const LINUX_AF_NETLINK: i32 = 16;
 const LINUX_AF_PACKET: i32 = 17;
 
@@ -1087,14 +1089,16 @@ pub(crate) fn allowed_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
     allowed
 }
 
-/// `socket(2)` `domain` values for the two IP families, as `i32` to match
-/// [`allowed_socket_domains`]'s rule-argument type. Derived from the `sockaddr`-parser constants
-/// below rather than re-typed as fresh literals: `AF_INET`'s number is one ABI value, whether it
-/// is being read out of a `sockaddr` or compared against `socket()`'s first argument.
+/// `socket(2)` `domain` values for the two IP families, named apart from the bare `LINUX_AF_*`
+/// numbers above so a rule's argument type reads as a domain rather than as a loose integer.
+///
+/// These used to be derived from a second pair of constants belonging to the `sockaddr` parser the
+/// retired `connect`/`sendto` supervisor used. That parser is gone with it, so they are literals
+/// from the same `include/linux/socket.h` list as their neighbours now.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LINUX_AF_INET_DOMAIN: i32 = LINUX_AF_INET as i32;
+const LINUX_AF_INET_DOMAIN: i32 = LINUX_AF_INET;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6 as i32;
+const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6;
 
 /// The syscalls the child's seccomp filter permits outright, modelled on the OCI/Docker default
 /// seccomp profile (reconciled against `containerd`'s `contrib/seccomp/seccomp_default.go`, which
@@ -1361,8 +1365,17 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
     "io_cancel",
     "io_getevents",
     // ---- sockets ----
-    // `socket` is NOT here (argument-conditional rules — see this array's doc comment), and
-    // neither are `connect`/`sendto` (notify rules).
+    // `socket` is NOT here (argument-conditional rules — see this array's doc comment).
+    //
+    // `connect`/`sendto` ARE here, and that is the visible half of this slice: they used to carry
+    // `Notify` rules so a userspace supervisor could read the destination `sockaddr` out of the
+    // calling task's memory and compare it against a resolved allowlist. That mechanism is gone
+    // (see `crate::network_namespace` for what replaced it), so these are ordinary allowed
+    // syscalls again — allowed to *reach the kernel*, where the capsule's own network namespace
+    // has no route to anything except the egress proxy. The decision moved from a racy pointer
+    // read into the routing table; it did not disappear.
+    "connect",
+    "sendto",
     "socketpair",
     "bind",
     "listen",
@@ -1516,50 +1529,36 @@ pub(crate) const SECCOMP_MUST_STAY_DENIED: &[&str] = &[
     "kcmp",
 ];
 
-// The bytes handed to `parse_sockaddr_ip` always come from a *Linux* child's memory (the
-// seccomp-notify supervisor is Linux-only), so the address-family constants and struct
-// layouts here are Linux's — spelled out as literals rather than `libc::AF_*` so the parser
-// is host-independent and unit-testable on non-Linux dev machines (macOS's `AF_INET6` is 30,
-// not 10, and its `sockaddr` puts the family in a different byte).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LINUX_AF_INET: u16 = 2;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const LINUX_AF_INET6: u16 = 10;
-
-/// Parses the destination IP out of a raw Linux `sockaddr` buffer (`sockaddr_in` /
-/// `sockaddr_in6` layouts). Returns `None` for any other address family (`AF_UNIX`,
-/// `AF_NETLINK`, ...) or a buffer too short to contain the address — the caller decides what
-/// non-IP means (the supervisor allows non-IP families; they are outside this layer's scope).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_sockaddr_ip(bytes: &[u8]) -> Option<IpAddr> {
-    if bytes.len() < 2 {
-        return None;
-    }
-    // `sa_family_t` is a native-endian u16 at offset 0 in Linux's sockaddr layouts; the
-    // supervisor runs on the same machine as the child, so native-endian is correct.
-    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
-    match family {
-        LINUX_AF_INET => {
-            let octets: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
-            Some(IpAddr::from(octets))
-        }
-        LINUX_AF_INET6 => {
-            let octets: [u8; 16] = bytes.get(8..24)?.try_into().ok()?;
-            Some(IpAddr::from(octets))
-        }
-        _ => None,
-    }
-}
-
 /// Bundles the resolved, host-independent enforcement inputs for one capsule session.
 #[derive(Debug, Clone)]
 pub(crate) struct ShellEnforcement {
     pub(crate) tier: EnforcementTier,
-    // Only read by the Linux-only supervisor (`linux_enforce::classify_and_decide`); on
-    // non-Linux builds this is resolved (for parity) but never consulted, since
-    // `prepare_enforcement` is a no-op there.
+    /// Every `capabilities.network.allow` host resolved to concrete addresses once, at launch,
+    /// by [`resolve_network_allowlist_ips`].
+    ///
+    /// This used to be the *whole* network policy: the seccomp-notify supervisor read a
+    /// destination `sockaddr` out of the stopped child and compared the IP against this list. It
+    /// is now the narrower of the egress proxy's two checks — the one applied to a destination
+    /// the capsule reached without ever resolving a name for it (a hardcoded literal). See
+    /// `egress_proxy::EgressPolicy::allows_connection`, which consults exactly this list through
+    /// the unchanged [`network_ip_allowed`].
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) network_allow_ips: Vec<IpAddr>,
+    /// The same allowlist in its *parsed*, name-keyed form — the ordinary path. The egress proxy
+    /// checks a name when it resolves it and again when the connection to the address that name
+    /// produced is accepted, which is what a resolved-IP set alone cannot express (one address,
+    /// many tenants) in either direction.
+    ///
+    /// The same `NetworkAllowRule` type and the same parser the WASI-HTTP path uses, so a manifest
+    /// entry cannot mean one thing to a WASM guest and another to a subprocess.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) network_allow_rules: Vec<crate::network_policy::NetworkAllowRule>,
+    /// The TCP ports the capsule's network namespace opens listeners on, derived from the
+    /// allowlist by `egress_proxy::egress_listen_ports`. A port no allow entry implies gets no
+    /// listener at all, so a connection to it is refused by the kernel with nothing in userspace
+    /// consulted — the strongest form the refusal can take.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) egress_tcp_ports: Vec<u16>,
     /// `capabilities.network.unix_sockets`, threaded through to the seccomp `socket()` rule.
     /// `false` (the default) means the forked child cannot create an `AF_UNIX` socket at all, so
     /// a local daemon socket — `/var/run/docker.sock` above all — is unreachable regardless of
@@ -1652,6 +1651,10 @@ impl ShellEnforcement {
     ) -> Result<Self, String> {
         let tier = applied_tier(detect_enforcement_tier(), declared);
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
+        let network_allow_rules =
+            crate::network_policy::parse_network_allow_rules(&policy.network_allow)
+                .map_err(|error| error.to_string())?;
+        let egress_tcp_ports = crate::egress_proxy::egress_listen_ports(&network_allow_rules);
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
         // The b3220cb5 `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
         // per author-declared `interpreter_runtime` directory (each with its own `list_dir`). A
@@ -1669,6 +1672,8 @@ impl ShellEnforcement {
         Ok(Self {
             tier,
             network_allow_ips,
+            network_allow_rules,
+            egress_tcp_ports,
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths,
             landlock_grants,
@@ -1728,6 +1733,8 @@ impl ShellEnforcement {
         Self {
             tier: EnforcementTier::EnvironmentOnly,
             network_allow_ips: Vec::new(),
+            network_allow_rules: Vec::new(),
+            egress_tcp_ports: Vec::new(),
             // Denied, matching every other grant this constructor zeroes out. Inert on this tier
             // (no seccomp filter is installed at all), but it must not read as "allowed".
             unix_sockets_allowed: false,
@@ -2299,6 +2306,17 @@ pub(crate) fn prepare_enforcement(
         )
     };
 
+    // Everything the child's namespace construction needs, resolved here in the parent: the
+    // `pre_exec` window permits no allocation, and `getuid()` in particular has to be read
+    // *before* the `unshare` — inside a fresh user namespace with no map written yet it reports
+    // the overflow id, and writing that back is refused on every host.
+    let netns_plan = crate::network_namespace::CapsuleNetnsPlan::resolve(enforcement.egress_tcp_ports.clone());
+    let expected_namespace_sockets = netns_plan.socket_count();
+    let egress_policy = crate::egress_proxy::EgressPolicy::new(
+        enforcement.network_allow_rules.clone(),
+        enforcement.network_allow_ips.clone(),
+    );
+
     let tier = enforcement.tier;
     // Copied out before the `move` closure below takes ownership of everything it touches, the
     // same clone-before-move shape `tier` and the Landlock fds already use. Note the notify-fd
@@ -2344,6 +2362,7 @@ pub(crate) fn prepare_enforcement(
             let sock_fd = child_sock.as_raw_fd();
             match linux_enforce::child_install_enforcement(
                 tier,
+                &netns_plan,
                 sealed_spec.as_ref(),
                 landlock_fds.as_ref(),
                 sock_fd,
@@ -2363,7 +2382,8 @@ pub(crate) fn prepare_enforcement(
     Ok(linux_enforce::start_supervisor(
         parent_sock,
         enforcement.exec_allow_paths.clone(),
-        enforcement.network_allow_ips.clone(),
+        egress_policy,
+        expected_namespace_sockets,
         diag_read,
     ))
 }
@@ -2472,14 +2492,13 @@ fn build_sealed_root(
 #[cfg(target_os = "linux")]
 mod linux_enforce {
     use std::io;
-    use std::net::IpAddr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
 
     use landlock::{make_bitflags, AccessFs, BitFlags};
 
-    use super::{decide_exec_allowed, network_ip_allowed, parse_sockaddr_ip};
+    use super::decide_exec_allowed;
     use super::{EnforcementTier, LandlockGrant, SupervisorHandle};
 
     /// Longest diagnostic message written to (or read from) the child-failure pipe. A message
@@ -2654,23 +2673,49 @@ mod linux_enforce {
         }
     }
 
-    /// Runs inside the forked child, pre-exec: strips the child's Linux capabilities, installs
-    /// the seccomp filter (exec/network notify rules plus the `socket()` domain denials keyed on
-    /// `unix_sockets_allowed`), hands its notify fd to the parent over
-    /// `child_sock_fd`, and (on `KernelFull`) applies the Landlock filesystem scope. Returning
-    /// `Err` here aborts the exec (std's `Command` machinery propagates it back to the parent's
-    /// `.spawn()` call as an `io::Error`) — the fail-closed path for setup failures that happen
-    /// after fork.
+    /// Runs inside the forked child, pre-exec: builds the capsule's network namespace and hands
+    /// its listening sockets to the parent, strips the child's Linux capabilities, installs the
+    /// seccomp filter (exec notify rules plus the `socket()` domain denials keyed on
+    /// `unix_sockets_allowed`), hands its notify fd to the parent over `child_sock_fd`, and (on
+    /// `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope. Returning `Err` here
+    /// aborts the exec (std's `Command` machinery propagates it back to the parent's `.spawn()`
+    /// call as an `io::Error`) — the fail-closed path for setup failures that happen after fork.
+    ///
+    /// Both hand-offs go over the same `child_sock_fd` socketpair and the parent reads them in
+    /// this order: the namespace sockets first, the seccomp notify fd second.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
+        netns_plan: &crate::network_namespace::CapsuleNetnsPlan,
         sealed_spec: Option<&crate::sealed::SealedRootSpec>,
         landlock_fds: Option<&LandlockChildFds>,
         child_sock_fd: RawFd,
         unix_sockets_allowed: bool,
     ) -> io::Result<()> {
-        // FIRST, and only on `KernelSealed`: build the private mount namespace and pivot onto the
-        // composed root. This has to precede every other step in this closure, for one reason that
-        // is not a matter of taste — `SECCOMP_MUST_STAY_DENIED` denies `unshare`, `mount` and
+        // FIRST, on every kernel tier: the capsule's own network namespace. It has to precede
+        // everything below it for three separate reasons, none of them stylistic:
+        //
+        //   * `SECCOMP_MUST_STAY_DENIED` denies `unshare` and the filter installed further down
+        //     denies `socket(AF_NETLINK)`, so this is the only window in which the namespace can
+        //     be built at all — the same argument the composed root makes.
+        //   * `drop_all_capabilities` (below) removes the `CAP_NET_ADMIN` that bringing `lo` up
+        //     and installing the local route require. The namespace is configured while the child
+        //     still holds them *inside its own new user namespace*, and never afterwards.
+        //   * on `KernelSealed`, the composed root's own `unshare(CLONE_NEWUSER)` nests a second
+        //     user namespace inside this one. A task in a descendant user namespace holds no
+        //     capability in the ancestor, so once that has happened the capsule cannot reconfigure
+        //     the network namespace it is confined to — which only holds if this runs first.
+        //
+        // This is what replaced the `connect`/`sendto` seccomp-notify interception. There is no
+        // path that skips it and falls back: a host that cannot do this refused the launch back in
+        // `stage_session` (`RuntimeError::EgressNamespaceUnavailable`, `E-CAP-005`).
+        //
+        // SAFETY: post-`fork()`, pre-exec child context — exactly the window this function
+        // documents itself as running in, and the one `create_capsule_netns` requires.
+        unsafe { crate::network_namespace::create_capsule_netns(netns_plan, child_sock_fd)? };
+
+        // NEXT, and only on `KernelSealed`: build the private mount namespace and pivot onto the
+        // composed root. This has to precede every *remaining* step in this closure, for one reason
+        // that is not a matter of taste — `SECCOMP_MUST_STAY_DENIED` denies `unshare`, `mount` and
         // `pivot_root` to every process the filter below covers, permanently and deliberately.
         // The composed root is therefore built by this process while it still has its pre-filter
         // credentials, never by a syscall the sandboxed subprocess is later permitted to make.
@@ -3090,10 +3135,12 @@ mod linux_enforce {
     /// Two independent mechanisms live in this one filter, and they are deliberately not the
     /// same mechanism:
     ///
-    ///   - `execve`/`execveat`/`connect`/`sendto` get `Notify` rules, because deciding them needs
-    ///     the *contents* of a pointed-to argument (a pathname, a `sockaddr`) that in-kernel BPF
-    ///     cannot dereference — so the userspace supervisor (`classify_and_decide`) resolves each
-    ///     one. Unchanged by the unix-socket work.
+    ///   - `execve`/`execveat` get `Notify` rules, because deciding them needs the *contents* of
+    ///     a pointed-to argument (a pathname) that in-kernel BPF cannot dereference — so the
+    ///     userspace supervisor (`classify_and_decide`) resolves each one. `connect`/`sendto` used
+    ///     to be here for the same reason and are not any more: their enforcement point moved out
+    ///     of this filter entirely, into the network namespace and egress proxy in
+    ///     [`crate::network_namespace`]. See [`super::SECCOMP_SYSCALL_ALLOWLIST`]'s socket section.
     ///   - `socket` gets classic, register-value `Errno` rules, one per denied domain. `domain` is
     ///     a plain integer argument, so the comparison compiles straight into the loaded BPF
     ///     program and is evaluated in-kernel at syscall time: no notification is raised, no
@@ -3138,7 +3185,7 @@ mod linux_enforce {
         // these denials are verified by.
         let _ = filter.set_ctl_log(true);
 
-        for name in ["execve", "execveat", "connect", "sendto"] {
+        for name in ["execve", "execveat"] {
             let syscall = libseccomp::ScmpSyscall::from_name(name).map_err(to_io_err)?;
             filter
                 .add_rule(libseccomp::ScmpAction::Notify, syscall)
@@ -3146,9 +3193,13 @@ mod linux_enforce {
         }
 
         // Deny the dangerous `socket(2)` domains at creation time. `EACCES` (not `EPERM`) matches
-        // what `classify_and_decide`'s `Decision::Deny` already returns for a blocked TCP/UDP
-        // destination, so a capsule sees one consistent errno for "the sandbox refused this
-        // socket" whichever of the two mechanisms refused it.
+        // what `classify_and_decide`'s `Decision::Deny` returns for a blocked `execve`, so a
+        // capsule sees one consistent errno for "the sandbox looked at this call and refused it"
+        // whichever of the two mechanisms refused it.
+        //
+        // Untouched by the network-namespace work, and deliberately so: a network namespace does
+        // not mediate `AF_UNIX` at all — pathname or abstract — so this register-level rule is
+        // still the only thing standing between a capsule and `/var/run/docker.sock`.
         //
         // `add_rule_conditional` (not `..._exact`) on purpose: the non-exact form lets libseccomp
         // adapt the rule to the architectures in the filter — on an arch where `socket` is
@@ -3612,16 +3663,32 @@ mod linux_enforce {
     /// closure errored before reaching the send), there is no live child left unsupervised:
     /// `Command::spawn()` surfaces that same underlying failure as its own `Err`, via the same
     /// close-on-exec error pipe, independently of this thread. This thread just logs and exits.
+    /// The child sends two `SCM_RIGHTS` messages, in this order: the network namespace's
+    /// listening sockets (from `create_capsule_netns`, the first thing the `pre_exec` window
+    /// does) and then the seccomp notify fd (from `install_seccomp_filter`). This thread receives
+    /// them in the same order, so the egress proxy is serving before the capsule's `execve`
+    /// completes and no first connection can race it.
     pub(super) fn start_supervisor(
         parent_sock: OwnedFd,
         exec_allow: Vec<PathBuf>,
-        network_allow_ips: Vec<IpAddr>,
+        egress_policy: crate::egress_proxy::EgressPolicy,
+        expected_namespace_sockets: usize,
         diag_read: OwnedFd,
     ) -> SupervisorHandle {
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
+            // The proxy is started and stopped on this thread so its lifetime is exactly the
+            // subprocess tree's: it begins before the child can exec, and it is torn down as soon
+            // as the notify fd closes — which happens once every process holding the filter has
+            // exited. A proxy outliving its namespace would be serving sockets whose peers no
+            // longer exist.
+            let proxy = start_namespace_proxy(
+                parent_sock.as_raw_fd(),
+                expected_namespace_sockets,
+                egress_policy,
+            );
             match receive_fd_over_socket(parent_sock.as_raw_fd()) {
-                Ok(notify_fd) => supervisor_loop(notify_fd, &exec_allow, &network_allow_ips),
+                Ok(notify_fd) => supervisor_loop(notify_fd, &exec_allow),
                 Err(error) => {
                     eprintln!(
                         "[capsule-runtime] warning: failed to receive seccomp notify fd: \
@@ -3630,24 +3697,64 @@ mod linux_enforce {
                     );
                 }
             }
+            if let Some(proxy) = proxy {
+                proxy.shutdown();
+            }
             drop(done_tx);
         });
 
         SupervisorHandle::Linux { done_rx, diag_read }
     }
 
+    /// Receives the in-namespace listening sockets and starts serving them.
+    ///
+    /// Returns `None` when the hand-off failed, which is not a silent degradation: the same
+    /// `pre_exec` failure that prevented the send also makes the child return `Err`, so
+    /// `Command::spawn()` reports it and no subprocess runs. There is no path where the capsule
+    /// starts with a namespace whose proxy never came up — that would be a capsule with no
+    /// network at all rather than an unbounded one, but it would present as an inexplicable
+    /// outage, so it is logged here too.
+    fn start_namespace_proxy(
+        sock_fd: RawFd,
+        expected: usize,
+        policy: crate::egress_proxy::EgressPolicy,
+    ) -> Option<crate::egress_proxy::EgressProxyHandle> {
+        let sockets = match crate::network_namespace::receive_namespace_sockets(sock_fd, expected) {
+            Ok(sockets) => sockets,
+            Err(error) => {
+                eprintln!(
+                    "[capsule-runtime] warning: failed to receive the capsule's network \
+                     namespace sockets: {error} (the subprocess spawn reports the underlying \
+                     pre_exec failure independently)"
+                );
+                return None;
+            }
+        };
+        match crate::egress_proxy::start_egress_proxy(sockets, policy) {
+            Ok(proxy) => Some(proxy),
+            Err(error) => {
+                eprintln!(
+                    "[capsule-runtime] warning: failed to serve the capsule's network namespace \
+                     sockets: {error} (the subprocess tree has no route off this host, so its \
+                     network calls fail closed)"
+                );
+                None
+            }
+        }
+    }
+
     /// Reads and responds to notify requests until the notify fd errors/EOFs — which happens
     /// once every process holding this seccomp filter (the child and all its descendants) has
     /// exited. Ordinary (non-`pre_exec`) code: heap allocation, `/proc` reads, etc. are all
     /// fine here.
-    fn supervisor_loop(notify_fd: RawFd, exec_allow: &[PathBuf], network_allow_ips: &[IpAddr]) {
+    fn supervisor_loop(notify_fd: RawFd, exec_allow: &[PathBuf]) {
         loop {
             let req = match libseccomp::ScmpNotifReq::receive(notify_fd) {
                 Ok(req) => req,
                 Err(_) => break,
             };
 
-            let decision = classify_and_decide(&req, exec_allow, network_allow_ips);
+            let decision = classify_and_decide(&req, exec_allow);
 
             // Read memory, THEN validate the notification id is still valid, THEN respond. If
             // the id went stale (the target thread was resumed/killed via another path between
@@ -3691,11 +3798,7 @@ mod linux_enforce {
     /// inherits this same seccomp filter and can itself be the notifying task (e.g. `bash -c
     /// "sh -c 'nc ...'"` — the innermost `sh`'s own `execve` of `nc` notifies with `sh`'s pid,
     /// not the original `bash`'s).
-    fn classify_and_decide(
-        req: &libseccomp::ScmpNotifReq,
-        exec_allow: &[PathBuf],
-        network_allow_ips: &[IpAddr],
-    ) -> Decision {
+    fn classify_and_decide(req: &libseccomp::ScmpNotifReq, exec_allow: &[PathBuf]) -> Decision {
         let pid = req.pid;
         let is_syscall = |name: &str| {
             libseccomp::ScmpSyscall::from_name(name)
@@ -3745,28 +3848,7 @@ mod linux_enforce {
             };
             return to_decision(decide_exec_allowed(&path, base.as_deref(), exec_allow));
         }
-        if is_syscall("connect") {
-            return match read_sockaddr_ip_from_child(pid, req.data.args[1]) {
-                Ok(Some(ip)) => to_decision(network_ip_allowed(ip, network_allow_ips)),
-                // Non-IP address family (e.g. AF_UNIX, AF_NETLINK) — outside this layer's scope.
-                Ok(None) => Decision::Allow,
-                Err(_) => Decision::Deny,
-            };
-        }
-        if is_syscall("sendto") {
-            // A null dest_addr means the socket is already connected (validated at connect()
-            // time); nothing new to check.
-            if req.data.args[4] == 0 {
-                return Decision::Allow;
-            }
-            return match read_sockaddr_ip_from_child(pid, req.data.args[4]) {
-                Ok(Some(ip)) => to_decision(network_ip_allowed(ip, network_allow_ips)),
-                Ok(None) => Decision::Allow,
-                Err(_) => Decision::Deny,
-            };
-        }
-
-        // We only ever install NOTIFY rules for the four syscalls above; reaching here would
+        // We only ever install NOTIFY rules for the two syscalls above; reaching here would
         // mean an unexpected notification. Deny conservatively.
         Decision::Deny
     }
@@ -3803,17 +3885,6 @@ mod linux_enforce {
         Err(io::Error::other(format!(
             "failed to read pathname from /proc/{pid}/mem at {addr:#x}"
         )))
-    }
-
-    /// Reads a raw `sockaddr` out of the child's address space and extracts the destination
-    /// IP, if the address family is `AF_INET`/`AF_INET6` (parsing lives in the OS-agnostic
-    /// `super::parse_sockaddr_ip` so it is unit-testable off-Linux).
-    fn read_sockaddr_ip_from_child(pid: u32, addr: u64) -> io::Result<Option<IpAddr>> {
-        let file = std::fs::File::open(format!("/proc/{pid}/mem"))?;
-        // sizeof(sockaddr_in6) is the largest layout we parse.
-        let mut buf = [0u8; 28];
-        let n = file.read_at(&mut buf, addr)?;
-        Ok(parse_sockaddr_ip(&buf[..n]))
     }
 }
 
@@ -4767,40 +4838,6 @@ mod tests {
         ));
     }
 
-    // ---- network decision (finding #2: C-7 decision path, unit level) ----
-
-    #[test]
-    fn parse_sockaddr_ip_parses_linux_sockaddr_in() {
-        let mut bytes = [0u8; 16];
-        bytes[0..2].copy_from_slice(&2u16.to_ne_bytes()); // Linux AF_INET
-        bytes[2..4].copy_from_slice(&443u16.to_be_bytes()); // port — irrelevant to the decision
-        bytes[4..8].copy_from_slice(&[93, 184, 216, 34]);
-        assert_eq!(
-            parse_sockaddr_ip(&bytes),
-            Some(IpAddr::from([93, 184, 216, 34]))
-        );
-    }
-
-    #[test]
-    fn parse_sockaddr_ip_parses_linux_sockaddr_in6() {
-        let ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
-        let mut bytes = [0u8; 28];
-        bytes[0..2].copy_from_slice(&10u16.to_ne_bytes()); // Linux AF_INET6 (10, not macOS's 30)
-        bytes[8..24].copy_from_slice(&ip.octets());
-        assert_eq!(parse_sockaddr_ip(&bytes), Some(IpAddr::V6(ip)));
-    }
-
-    #[test]
-    fn parse_sockaddr_ip_returns_none_for_non_ip_families_and_short_buffers() {
-        let mut af_unix = [0u8; 16];
-        af_unix[0..2].copy_from_slice(&1u16.to_ne_bytes()); // Linux AF_UNIX
-        assert_eq!(parse_sockaddr_ip(&af_unix), None);
-        assert_eq!(parse_sockaddr_ip(&[]), None);
-        assert_eq!(parse_sockaddr_ip(&[2]), None);
-        // Family claims AF_INET but the buffer is too short to hold an address.
-        assert_eq!(parse_sockaddr_ip(&2u16.to_ne_bytes()), None);
-    }
-
     // ---- `denied_socket_domains` ----------------------------------------------------------
     //
     // These are *content* checks on a hand-authored constant list, in the same category as the
@@ -4952,7 +4989,7 @@ mod tests {
     /// entirely — exec identity matching and the network allowlist would both stop applying.
     #[test]
     fn allowlist_excludes_the_notify_syscalls() {
-        for name in ["execve", "execveat", "connect", "sendto"] {
+        for name in ["execve", "execveat"] {
             assert!(
                 !SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
                 "{name} is decided by the notify supervisor; a plain Allow rule would bypass it"
@@ -5495,9 +5532,10 @@ mod linux_integration_tests {
             return;
         }
 
-        // A real listener, so the destination port is genuinely open — the failure below must
-        // come from the seccomp supervisor's deny (EACCES on connect), not from an
-        // incidental ECONNREFUSED against a closed port.
+        // A real listener on the *host*, so the destination port is genuinely open. The failure
+        // below is therefore about reachability, not about a closed port: the subprocess runs in
+        // its own network namespace, where `127.0.0.1` is that namespace's own loopback and this
+        // listener does not exist at all.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -5508,7 +5546,9 @@ mod linux_integration_tests {
         };
         let enforcement = ShellEnforcement {
             tier,
-            // Empty resolved allowlist: every destination must be denied.
+            // Empty allowlist: nothing is reachable, and the proxy would refuse it even if the
+            // capsule found its way to the endpoint.
+            network_allow_rules: Vec::new(),
             network_allow_ips: Vec::new(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
@@ -5532,33 +5572,63 @@ mod linux_integration_tests {
 
         assert_ne!(
             result.exit_code, 0,
-            "connect() to a destination outside the resolved network allowlist must be \
-             denied by the seccomp supervisor even though the port is really open"
+            "a direct connect() to a destination outside capabilities.network.allow must fail \
+             even though the port is really open on the host — the subprocess is in its own \
+             network namespace with no route to it"
         );
     }
 
+    /// The no-regression counterpart of the test above: enforcement must add denials for
+    /// out-of-policy destinations without breaking permitted ones.
+    ///
+    /// Same claim as before this slice, reached through the mechanism that replaced the seccomp
+    /// supervisor. The allowlist now has to be declared rather than only pre-resolved, because it
+    /// decides two things instead of one: which addresses are permitted *and* which ports the
+    /// namespace binds a listener on. A port no allow entry implies has nothing listening and is
+    /// refused by the namespace itself.
+    ///
+    /// Deliberately *not* a test of the security property — the card is explicit that a green
+    /// suite proves nothing about the kernel-level claim, and the real check is the hand-run
+    /// procedure in
+    /// `docs/content/reference/network-namespace-egress-proxy-manual-verification.md`. This
+    /// asserts only that the permitted path still functions.
     #[test]
-    fn kernel_tier_allows_network_connect_to_allowlisted_ip() {
+    fn kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy() {
         let tier = detect_enforcement_tier();
         if tier == EnforcementTier::EnvironmentOnly {
             eprintln!(
-                "skipping kernel_tier_allows_network_connect_to_allowlisted_ip: resolved to \
-                 EnvironmentOnly on a Linux host — degrading gracefully"
+                "skipping kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy: \
+                 resolved to EnvironmentOnly on a Linux host — degrading gracefully"
             );
             return;
         }
 
+        // A real listener on the host, answering one connection, so a success below means bytes
+        // really crossed the namespace boundary through the proxy rather than merely connecting.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Write;
+                let _ = stream.write_all(b"pong\n");
+            }
+        });
 
         let temp = tempfile::tempdir().unwrap();
+        // Naming the port is required, not incidental: it is what puts a listener on that port
+        // inside the namespace. See `egress_proxy::egress_listen_ports`.
+        let allow = vec![format!("http://127.0.0.1:{port}")];
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
+            network_allow: allow.clone(),
             ..CapabilityPolicy::default()
         };
+        let rules = crate::network_policy::parse_network_allow_rules(&allow).unwrap();
         let enforcement = ShellEnforcement {
             tier,
-            network_allow_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            egress_tcp_ports: crate::egress_proxy::egress_listen_ports(&rules),
+            network_allow_rules: rules,
+            network_allow_ips: resolve_network_allowlist_ips(&allow).unwrap(),
             unix_sockets_allowed: policy.unix_sockets_allowed,
             exec_allow_paths: resolve_exec_allowlist(&policy.shell_allow),
             landlock_grants: LandlockGrant::non_listable_files(resolve_landlock_grants(
@@ -5567,7 +5637,9 @@ mod linux_integration_tests {
             ..host_bounding_base()
         };
 
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+        // Builtins only — `/dev/tcp` and `read` are bash itself — so the exec supervisor never
+        // sees a second binary and this measures the network path alone.
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && read -r reply <&3 && echo \"$reply\"");
         let result = crate::shell::execute_shell(
             "bash",
             &["-c", &script],
@@ -5577,12 +5649,20 @@ mod linux_integration_tests {
             &enforcement,
         )
         .unwrap();
+        let _ = server.join();
 
         assert_eq!(
             result.exit_code, 0,
-            "connect() to an allowlisted destination must succeed — enforcement adds \
-             denials for out-of-policy actions, it does not degrade permitted ones \
+            "a destination inside capabilities.network.allow must stay reachable — enforcement \
+             adds denials for out-of-policy destinations, it does not degrade permitted ones \
              (stderr: {})",
+            result.stderr
+        );
+        assert!(
+            result.stdout.contains("pong"),
+            "the host listener's bytes must come back through the proxy unmodified \
+             (stdout: {:?}, stderr: {})",
+            result.stdout,
             result.stderr
         );
     }

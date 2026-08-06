@@ -8,6 +8,7 @@ pub(crate) mod agent;
 pub mod artifact;
 pub mod bindings;
 pub(crate) mod cgroup;
+pub(crate) mod egress_proxy;
 pub mod containment;
 pub mod errors;
 pub(crate) mod hooks;
@@ -15,6 +16,7 @@ pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub mod limits;
 pub(crate) mod murmur_md;
+pub mod network_namespace;
 pub(crate) mod network_policy;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
@@ -33,6 +35,9 @@ pub mod types;
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
     detect_sealed_blocker, explain_scope, ScopeReport,
+};
+pub use network_namespace::{
+    check_egress_namespace, detect_egress_namespace_blocker, EgressNamespaceBlocker,
 };
 pub use sealed::SealedBlocker;
 pub use errors::RuntimeError;

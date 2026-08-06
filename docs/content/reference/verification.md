@@ -61,8 +61,10 @@ and can say what a real sealed host actually does.
 
 ## Where to read them
 
-The four documents live in the repository, at the paths below, on the `main` branch:
+The documents live in the repository, at the paths below, on the `main` branch:
 
+- **Network namespace + egress proxy — manual verification** —
+  [`docs/content/reference/network-namespace-egress-proxy-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md)
 - **Sealed containment — manual verification** —
   [`docs/content/reference/sealed-containment-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/sealed-containment-manual-verification.md)
 - **Resource limits — manual verification** —

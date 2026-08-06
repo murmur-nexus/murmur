@@ -1,5 +1,6 @@
 use capsule_runtime::{
-    check_staged_runtime_floor, warn_on_interpreter_runtime_grants, ArtifactRequest,
+    check_egress_namespace, check_staged_runtime_floor, detect_egress_namespace_blocker,
+    warn_on_interpreter_runtime_grants, ArtifactRequest,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
@@ -10,7 +11,7 @@ use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
-use crate::error::{CliError, E_CAP_004};
+use crate::error::{CliError, E_CAP_004, E_CAP_005};
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
@@ -117,6 +118,39 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                  .murmur/config.yaml, or pass `--containment sealed`."
             );
         }
+    }
+
+    // Same reasoning again, for the mechanism that replaced the seccomp connect/sendto
+    // interception: a capsule that can spawn a native subprocess needs a network namespace to put
+    // it in, and a host that cannot create one refuses the run with E-CAP-005. Unlike the two
+    // checks above this is a pure *host* question — no manifest floor is involved and no flag can
+    // change the answer — so doctor asks it whenever the capsule declares a subprocess capability
+    // at all, which is exactly what `mur run` does.
+    //
+    // Deliberately narrower than `stage_session`'s own refusal ought to be: it does not count a
+    // native-implementation artifact with no `shell.allow`/`spawn.allow` declared, because that
+    // would need each declared artifact's own bundled implementation metadata resolved from the
+    // registry — doctor's artifact loop below does that, but only per-artifact and after this
+    // point, and duplicating it earlier just for this warning is not worth the restructuring. A
+    // native-artifact-only capsule on a host that can't build the namespace will not get this
+    // warning from `mur doctor`; it will only surface as a run-time failure from `mur run`.
+    let capabilities = runtime_manifest.capabilities.as_ref();
+    let shell_allows = capabilities
+        .and_then(|caps| caps.shell.as_ref())
+        .is_some_and(|shell| !shell.allow.is_empty());
+    let spawn_allows = capabilities
+        .and_then(|caps| caps.spawn.as_ref())
+        .is_some_and(|spawn| !spawn.allow.is_empty());
+    let can_spawn_subprocess = shell_allows || spawn_allows;
+    if let Err(error) = check_egress_namespace(
+        can_spawn_subprocess,
+        detect_egress_namespace_blocker(),
+    ) {
+        eprintln!(
+            "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
+             `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
+             murmur.yaml can change it — the refusal is about this machine, not the manifest."
+        );
     }
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so

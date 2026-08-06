@@ -282,14 +282,17 @@ not up for reconsideration.
 
 **Unix, netlink and packet sockets are refused at `socket()`, not at `connect()`.** Landlock and the
 `MakeSock` decision above only ever governed *creating a socket file inside the workdir*. They never
-governed *connecting to a socket file that already exists elsewhere on the host* — and the seccomp
-network path did not either: it inspects the destination `sockaddr` of `connect`/`sendto`, and its
-parser returns "not an IP address" for `AF_UNIX`, which the supervisor treated as **allow**. A
-capsule could therefore open `/var/run/docker.sock` (or `/run/docker.sock`) and drive the host
-Docker daemon, which is host root — a full sandbox escape, on both Linux tiers, with no manifest
-declaration of any kind. Landlock does not close this at any ABI: ABI v6's
-`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` scopes *abstract* unix sockets only, and `docker.sock` is a
-*pathname* socket, so no kernel upgrade fixes it.
+governed *connecting to a socket file that already exists elsewhere on the host* — and, historically,
+neither did the network enforcement of the day: an earlier seccomp-notify supervisor inspected the
+destination `sockaddr` of `connect`/`sendto`, and its parser returned "not an IP address" for
+`AF_UNIX`, which the supervisor treated as **allow**. A capsule could therefore open
+`/var/run/docker.sock` (or `/run/docker.sock`) and drive the host Docker daemon, which is host root —
+a full sandbox escape, on both Linux tiers, with no manifest declaration of any kind. Landlock does
+not close this at any ABI: ABI v6's `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` scopes *abstract* unix
+sockets only, and `docker.sock` is a *pathname* socket, so no kernel upgrade fixes it. (The
+`connect`/`sendto` notify supervisor described above no longer exists at all — see the note below —
+but this `socket()`-domain filter is what actually closes the hole, independently of whatever governs
+`AF_INET`/`AF_INET6`, so it keeps doing so regardless.)
 
 The fix is a separate, classic seccomp-bpf rule on `socket(2)` itself, keyed on its `domain`
 argument. `domain` is a plain integer in a register, so the comparison compiles directly into the
@@ -302,7 +305,7 @@ involve Landlock at all:
 | `AF_UNIX` | denied (`EACCES`) | yes — [`capabilities.network.unix_sockets: true`](manifest-schema.md#field-capabilities) |
 | `AF_NETLINK` | denied (`EACCES`) | **no** |
 | `AF_PACKET` | denied (`EACCES`) | **no** |
-| `AF_INET`, `AF_INET6`, everything else | unaffected | governed by `capabilities.network.allow` exactly as before |
+| `AF_INET`, `AF_INET6`, everything else | unaffected | governed by `capabilities.network.allow`, enforced by the capsule's own network namespace and egress proxy (see [`network-namespace-egress-proxy-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md)) |
 
 `AF_NETLINK` (routing tables, interface and firewall state) and `AF_PACKET` (raw frame capture and
 injection) get no opt-in key: neither has a shell-tool use case comparable to "talk to a local
@@ -404,9 +407,13 @@ The filter's default action is now **deny** (`EPERM`) as well, modelled on the O
 seccomp profile: only a fixed, named allowlist of syscalls is permitted outright
 (`SECCOMP_SYSCALL_ALLOWLIST` in `crates/capsule-runtime/src/sandbox.rs`), and everything named in
 `SECCOMP_MUST_STAY_DENIED` — including the syscalls above — is refused before any argument is even
-read. `execve`/`execveat`/`connect`/`sendto` are unaffected: they stay `Notify` rules decided by the
-supervisor exactly as before, and `socket` stays governed by the per-domain rules described above.
-Applies on **both** Linux tiers identically — it is a plain seccomp rule with no Landlock
+read. `execve`/`execveat` are unaffected: they stay `Notify` rules decided by the exec supervisor
+exactly as before. `connect`/`sendto` are now ordinary allowed syscalls in this list — enforcement of
+`capabilities.network.allow` for them moved out of the seccomp filter entirely, onto the capsule's own
+network namespace and egress proxy (see
+[`network-namespace-egress-proxy-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md)) —
+and `socket` stays governed by the per-domain rules described above. Applies on **both** Linux tiers
+identically — it is a plain seccomp rule with no Landlock
 involvement.
 
 **Diagnosability.** A syscall refused by the default action returns `EPERM` to the caller, same as
@@ -983,9 +990,10 @@ except OSError as e:
 " 2>&1 | tail -3'
 ```
 
-- **Expected (fixed):** `SOCKET_REFUSED 13 Permission denied`. Errno 13 is `EACCES` — the same errno
-  `classify_and_decide` returns for a blocked TCP destination, on purpose. The refusal happens at
-  `socket()`, so no `connect()` is ever attempted.
+- **Expected (fixed):** `SOCKET_REFUSED 13 Permission denied`. Errno 13 is `EACCES`, returned by the
+  `socket()`-domain filter described above, on purpose. The refusal happens at `socket()`, so no
+  `connect()` is ever attempted — independent of whatever mechanism governs a blocked `AF_INET`/
+  `AF_INET6` destination (today, the capsule's network namespace and egress proxy).
 - **Regression (unfixed):** `DOCKER_REACHED` followed by an HTTP response from the daemon. That
   response is host root.
 
@@ -1014,7 +1022,7 @@ try:
     s.connect((\"127.0.0.1\", 9))
     print(\"CONNECT_OK\")
 except OSError as e:
-    print(\"CONNECT_REFUSED\", e.errno, e.strerror)      # EACCES here is the pre-existing notify path
+    print(\"CONNECT_REFUSED\", e.errno, e.strerror)      # refusal here is the capsule's own network namespace + egress proxy, not this AF_UNIX-domain filter
 " 2>&1 | tail -2'
 ```
 

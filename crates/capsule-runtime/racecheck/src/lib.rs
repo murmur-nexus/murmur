@@ -12,12 +12,26 @@
 //! | [`linux::install_notify_filter`]  | `install_seccomp_filter`      |
 //! | [`linux::supervise`]              | `supervisor_loop`             |
 //! | [`linux::read_cstr_from_child`]   | `read_cstr_from_child`        |
-//! | [`linux::read_sockaddr_ip_from_child`] | `read_sockaddr_ip_from_child` |
+//! | [`linux::read_sockaddr_ip_from_child`] | *(retired — see below)*       |
 //! | [`linux::send_fd_over_socket`]    | `send_fd_over_socket`         |
 //! | [`linux::receive_fd_over_socket`] | `receive_fd_over_socket`      |
 //!
 //! See `docs/content/reference/seccomp-notify-toctou-audit.md` for the audit these probes belong
 //! to, including what a win and a loss each mean.
+//!
+//! ## The `connect` probe now mirrors a mechanism that no longer exists
+//!
+//! The audit's conclusion was acted on. `connect`/`sendto` are no longer `Notify` syscalls: the
+//! network half of the supervisor was deleted and replaced by a network namespace plus an egress
+//! proxy (`capsule-runtime`'s `network_namespace` and `egress_proxy` modules), where the
+//! destination is read from an already-established connection rather than out of the notifying
+//! task's memory, so there is no pointer left to race. `read_sockaddr_ip_from_child` and
+//! `network_ip_allowed`'s use by the supervisor went with it.
+//!
+//! `connect_race` is kept, still building and still winning its race, deliberately: it is the
+//! evidence the audit rests on and the reason the replacement was built. It is now a probe of a
+//! **historical** design. `exec_race` is the one that still mirrors live production code — the
+//! `execve`/`execveat` notify arms were out of scope for that replacement and are unchanged.
 
 #[cfg(target_os = "linux")]
 pub mod linux;
