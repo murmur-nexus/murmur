@@ -886,7 +886,11 @@ pub(crate) fn resolve_staged_runtime_landlock_grants(
 ) -> Vec<LandlockGrant> {
     resolve_staged_runtime_dirs(policy)
         .into_iter()
-        .map(|path| LandlockGrant { path, list_dir: true, executable: true })
+        .map(|path| LandlockGrant {
+            path,
+            list_dir: true,
+            executable: true,
+        })
         .collect()
 }
 
@@ -930,9 +934,7 @@ pub(crate) fn resolve_staged_runtime_landlock_grants(
 ///
 /// Pure and syscall-free — the paths need not exist on this host, since `apply_landlock_scope`
 /// skips any declared grant path that fails to open — so it is unit-testable on every platform.
-pub(crate) fn resolve_sealed_runtime_landlock_grants(
-    tier: EnforcementTier,
-) -> Vec<LandlockGrant> {
+pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> Vec<LandlockGrant> {
     if tier != EnforcementTier::KernelSealed {
         return Vec::new();
     }
@@ -3994,22 +3996,16 @@ mod tests {
         let policy = CapabilityPolicy::default();
         let usr = PathBuf::from("/usr");
 
-        let scoped = ShellEnforcement::resolve(
-            &policy,
-            murmur_artifact::ContainmentClass::Scoped,
-        )
-        .expect("an empty policy resolves");
+        let scoped = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Scoped)
+            .expect("an empty policy resolves");
         assert!(
             !scoped.landlock_grants.iter().any(|grant| grant.path == usr),
             "a scoped capsule runs Landlock over the real host filesystem — /usr must stay \
              unenumerable there",
         );
 
-        let sealed = ShellEnforcement::resolve(
-            &policy,
-            murmur_artifact::ContainmentClass::Sealed,
-        )
-        .expect("an empty policy resolves");
+        let sealed = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed)
+            .expect("an empty policy resolves");
         let granted: Vec<&LandlockGrant> = sealed
             .landlock_grants
             .iter()
@@ -4023,7 +4019,9 @@ mod tests {
                 crate::sealed::SEALED_RUNTIME_PATHS.len(),
                 "a sealed session must carry one listable grant per bound runtime path",
             );
-            assert!(granted.iter().all(|grant| grant.list_dir && !grant.executable));
+            assert!(granted
+                .iter()
+                .all(|grant| grant.list_dir && !grant.executable));
         } else {
             assert!(
                 granted.is_empty(),
@@ -5898,7 +5896,11 @@ mod linux_integration_tests {
             "the same tree granted Execute must run (stderr: {})",
             exec_allowed.stderr
         );
-        assert!(exec_allowed.stdout.contains("ran"), "stdout: {}", exec_allowed.stdout);
+        assert!(
+            exec_allowed.stdout.contains("ran"),
+            "stdout: {}",
+            exec_allowed.stdout
+        );
     }
 
     // ---- slice ebcc5f51: every distinct pre_exec setup failure is legible + fail-closed ----
