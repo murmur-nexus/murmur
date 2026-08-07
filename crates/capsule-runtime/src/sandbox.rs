@@ -707,26 +707,19 @@ fn resolve_landlock_grants_in(
 ///     never inferred from anything else, and never applied to an ancestor or sibling of a granted
 ///     directory.
 ///
-/// `executable` decides `Execute`, and it is a real access decision rather than a formality
-/// because **`Execute` is this runtime's exec allowlist**: the seccomp `execve` supervisor was
-/// retired in favour of Landlock `Execute` rights, so a path with no `Execute` rule cannot be
-/// `execve`d at all, and a path with one can. That makes the bit sharply asymmetric:
+/// `executable` decides `Execute`, which is this runtime's exec allowlist: the seccomp `execve`
+/// supervisor was retired in favour of Landlock `Execute` rights, so a path without an `Execute`
+/// rule cannot be `execve`d and a path with one can.
 ///
-///   - `true` → `Execute + ReadFile`, the right shape for a path the manifest asked to *run*: a
-///     `shell.allow` binary, its `DT_NEEDED` closure, and the interpreter/staged trees an author
-///     named explicitly (each of which is a runtime whose helper binaries are the point of
-///     declaring it).
-///   - `false` → `ReadFile` only. Readable and — with `list_dir` — enumerable, but not runnable.
-///     Reserved for a grant the *tier* issues rather than the manifest: see
+///   - `true` → `Execute + ReadFile`, for a path the manifest asked to *run*: a `shell.allow`
+///     binary, its `DT_NEEDED` closure, and the interpreter/staged trees an author named.
+///   - `false` → `ReadFile` only (readable, and with `list_dir` enumerable, but not runnable).
+///     For a grant the *tier* issues rather than the manifest: see
 ///     [`resolve_sealed_runtime_landlock_grants`], where granting `Execute` over `/usr`, `/bin`
-///     and `/sbin` wholesale would quietly turn `shell.allow` into a no-op on `sealed`, since
-///     every binary a host ships lives under one of them.
+///     and `/sbin` wholesale would turn `shell.allow` into a no-op on `sealed`.
 ///
-/// Note this bit affects `execve` only. A shared object opened `O_RDONLY` and mapped `PROT_EXEC`
-/// by `dlopen(3)` needs `ReadFile` and not `Execute` — Landlock checks `Execute` on the open that
-/// carries `FMODE_EXEC`, not on the mapping — so an interpreter can still load its own C
-/// extensions out of an `executable: false` tree. Verified by hand, not assumed; see
-/// `docs/content/reference/sealed-containment-manual-verification.md`.
+/// Affects `execve` only: a shared object mapped `PROT_EXEC` by `dlopen(3)` needs `ReadFile`, not
+/// `Execute`, so an interpreter still loads its C extensions out of an `executable: false` tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LandlockGrant {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -894,46 +887,30 @@ pub(crate) fn resolve_staged_runtime_landlock_grants(
         .collect()
 }
 
-/// One listable [`LandlockGrant`] per [`crate::sealed::SEALED_RUNTIME_PATHS`] entry — and only
-/// when this session actually installed a composed root.
+/// One listable [`LandlockGrant`] per [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, and only on
+/// `KernelSealed`.
 ///
-/// Same gap as [`resolve_staged_runtime_landlock_grants`] closes for a *declared* runtime tree,
-/// for the tree nobody declares: `plan_composed_root` bind-mounts `/usr`, `/bin`, `/sbin`, `/lib`…
-/// read-only into every composed root unconditionally, but Landlock still installs inside that
-/// root and denies any path with no matching rule. The `shell.allow` ELF closure grants those
-/// files one at a time and non-listably, so a binary can be opened by exact name while the
-/// directory holding it cannot be enumerated. That is precisely enough to start an interpreter and
-/// not enough to let it work: CPython dies in `init_fs_encoding` because it cannot `getdents64`
-/// `/usr/lib/python3.N` to find `encodings`, and a path-walking runtime of any kind fails the same
-/// way. Mounted but unenumerable is indistinguishable from not mounted at all.
+/// `plan_composed_root` bind-mounts `/usr`, `/bin`, `/sbin`, `/lib`… read-only into every composed
+/// root, but the Landlock ruleset installed inside that root denies any path with no matching rule.
+/// The `shell.allow` ELF closure grants those files one at a time and non-listably, so a binary
+/// opens by exact name while the directory holding it cannot be enumerated — enough to start an
+/// interpreter, not enough to run it: CPython dies in `init_fs_encoding` because it cannot
+/// `getdents64` `/usr/lib/python3.N` to find `encodings`. This grant makes the bound tree
+/// enumerable.
 ///
-/// `list_dir: true` is not configurable here, for the same reason it is not configurable for a
-/// staged tree: this is a whole runtime tree a program walks, not a case-by-case author choice.
-/// Never write; the binds are `MS_RDONLY` regardless, which is the second of two independent
-/// reasons the tree cannot be mutated.
+/// `list_dir: true` is not configurable: a whole runtime tree a program walks is not a
+/// case-by-case author choice. Writes are moot — the binds are `MS_RDONLY`.
 ///
-/// **`executable: false`, and that is not a detail.** This is the one grant in the runtime that
-/// withholds `Execute`, because it is also the only one covering a whole host tree that the
-/// manifest never named. Since the seccomp `execve` supervisor was retired in favour of Landlock
-/// `Execute` rights, an `Execute` rule *is* permission to run: granting it over `/usr`, `/bin` and
-/// `/sbin` would make every binary the host ships runnable inside a `sealed` session and reduce
-/// `capabilities.shell.allow` to documentation. Measured, not reasoned about — with `Execute` on
-/// these paths, `/bin/sh -c 'echo sh-ran'` runs inside a capsule whose allowlist never mentioned
-/// `sh`; without it, the same command is `Permission denied` while `import ast` still succeeds.
-/// The gap this function closes is enumeration, so enumeration is all it grants.
+/// `executable: false` (see [`LandlockGrant`]): this is the only grant covering whole host trees
+/// the manifest never named, so it must enumerate them without becoming permission to run them.
 ///
-/// **The tier gate is the whole safety argument, so it lives in the resolver rather than at the
-/// call site.** `apply_landlock_scope` runs on `KernelFull` as well as `KernelSealed`, and
-/// `KernelFull` is the tier a `scoped` capsule runs on — no composed root, Landlock applied
-/// straight over the *real host* filesystem. Granting `ReadDir` on `/usr` there would newly expose
-/// host directory shape to every `scoped` capsule. Under `KernelSealed` the same grant reveals
-/// nothing about the host: the tree being enumerated is a private read-only bind inside a pivoted
-/// root, holding only what was staged into it, and everything else is absent rather than denied.
-/// So the grants exist for exactly one tier, and returning an empty set everywhere else is the
-/// invariant, not an optimisation.
+/// Sealed-tier only: on `KernelFull` (where `scoped` runs) Landlock applies over the real host
+/// filesystem, so `ReadDir` on `/usr` would expose host directory shape; under `KernelSealed` the
+/// tree is a private read-only bind holding only what was staged, so enumerating it reveals
+/// nothing. Empty on every other tier.
 ///
-/// Pure and syscall-free — the paths need not exist on this host, since `apply_landlock_scope`
-/// skips any declared grant path that fails to open — so it is unit-testable on every platform.
+/// Pure and syscall-free (paths need not exist here — `apply_landlock_scope` skips any that fail
+/// to open), so unit-testable on every platform.
 pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> Vec<LandlockGrant> {
     if tier != EnforcementTier::KernelSealed {
         return Vec::new();
@@ -3388,11 +3365,8 @@ mod linux_enforce {
         let read_execute = AccessFs::Execute | AccessFs::ReadFile;
         // Adds enumerability (`getdents64`) — only for a grant carrying `list_dir: true`.
         let read_execute_list = read_execute | AccessFs::ReadDir;
-        // The same, minus `Execute`. `Execute` is this runtime's exec allowlist (the seccomp
-        // `execve` supervisor was retired in its favour), so withholding it is what keeps a
-        // whole-tree grant from also being permission to run everything in that tree — see
-        // `resolve_sealed_runtime_landlock_grants`, its only user. `dlopen(3)` still works under
-        // it: mapping `PROT_EXEC` needs `ReadFile`, not `Execute`.
+        // `ReadFile + ReadDir`, no `Execute` — readable and enumerable but not runnable. See
+        // `resolve_sealed_runtime_landlock_grants` (its only user) for why `Execute` is withheld.
         let read_list = AccessFs::ReadFile | AccessFs::ReadDir;
         // Device rights. No `Execute` (a character device is never exec'd) and no `ReadDir` (it is
         // not a directory) — only the two data bits, with `WriteFile` reserved for `/dev/null`.
