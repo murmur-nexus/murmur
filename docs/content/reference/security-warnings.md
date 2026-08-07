@@ -424,6 +424,61 @@ root, so the sealed `/dev` needs Landlock rules of its own or its device nodes w
 unopenable. `sandbox::landlock_device_grants` is the seam — it hands `CAPSULE_DEVICE_GRANTS` to
 `KernelFull` and the OCI set to `KernelSealed`.
 
+### The fixed sealed-tier runtime-tree grant { #sealed-runtime-tree-grant }
+
+Exactly the same shape of problem as the device set, one layer up, and it appears only on
+`sealed`. A composed root bind-mounts a fixed list of host directories read-only — `/usr`, `/bin`,
+`/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32` (`sealed::SEALED_RUNTIME_PATHS`) — and then Landlock
+installs *inside* that root as defence in depth. Landlock denies any path with no matching rule, so
+until this grant existed the runtime tree was mounted, present, and unreadable except through the
+per-file `shell.allow` closure. That is enough to start an interpreter and not enough to let it
+run: CPython aborts with `init_fs_encoding: failed to get the Python codec of the filesystem
+encoding` because it cannot `getdents64` `/usr/lib/python3.N` to discover `encodings`. Mounted but
+unenumerable is indistinguishable from not mounted at all.
+
+So every `sealed` session now gets one extra Landlock rule per entry of that list, fixed at compile
+time (`resolve_sealed_runtime_landlock_grants` in `crates/capsule-runtime/src/sandbox.rs`), with
+**no manifest key** that adds a path or removes one. Unlike
+[`W-SEC-009`](#w-sec-009)'s `interpreter_runtime` grants, nothing about this is author-declared —
+it fires no warning, appears in no `--explain-scope` section, and is a property of the tier.
+
+| Right | Granted | Why |
+|---|---|---|
+| `ReadFile` | yes | Open a file in the tree by name — already reachable one file at a time via the `shell.allow` closure; this generalises it to the tree the composed root actually mounted. |
+| `ReadDir` | yes | The gap being closed. A path-based runtime walks its search path; without `getdents64` it cannot find its own standard library. |
+| `Execute` | **no** | Withheld deliberately — see below. |
+| every write right | no | The bind is `MS_RDONLY` regardless, so the tree is immutable for two independent reasons. `touch /usr/testfile` reports `Read-only file system`. |
+
+**Why `Execute` is withheld, and why that is the interesting bit.** The seccomp `execve` supervisor
+was retired in favour of Landlock `Execute` rights, which makes an `Execute` rule *the* exec
+allowlist: a binary with one runs, a binary without one does not. Granting `Execute` across `/usr`,
+`/bin` and `/sbin` would therefore make every binary the host ships runnable inside a `sealed`
+session and reduce `capabilities.shell.allow` to documentation. Measured on a real host: with
+`Execute` on those paths, `/bin/sh -c 'echo sh-ran'` runs inside a capsule whose allowlist never
+mentioned `sh`; without it, the same command is `Permission denied` (exit 126) while
+`python3 -c "import ast"` still succeeds. Withholding it costs nothing an interpreter needs —
+`dlopen(3)` maps a shared object `PROT_EXEC` after an ordinary `O_RDONLY` open, which Landlock
+gates with `ReadFile`, not `Execute`, so C extension modules still load (`import ssl, zlib,
+_ctypes, sqlite3` succeeds under this grant). This is the only grant in the runtime that is
+readable and enumerable but not runnable.
+
+**Why enumerating this tree is safe, and what it does *not* widen.** The tree being enumerated is
+inside a private mount namespace pivoted onto a composed root: it holds the read-only runtime the
+root was built from and nothing else, and everything outside it is *absent* rather than denied. So
+a listing there reveals the staged runtime, not the host's shape. Two boundaries are unchanged and
+were re-confirmed by hand after this grant landed: `ls /` (the composed root's own top level, not
+itself one of these paths) is still `Permission denied`, and `/root` — never mounted into the root
+at all — is still `No such file or directory`.
+
+**`scoped` gets none of this, and the tier gate is the reason.** Landlock rules are built the same
+way on `KernelFull` (the tier a `scoped` capsule runs on) and `KernelSealed`, but `KernelFull` has
+no composed root: Landlock there applies straight over the *real host filesystem*, where `/usr` is
+the host's own `/usr`. Granting `ReadDir` on it would newly expose host directory shape to every
+`scoped` capsule, so the grant is emitted only when the resolved tier is `KernelSealed` and is
+empty on every other tier. Verified by hand: under `scoped`, `ls /`, `ls /usr` and
+`ls /usr/lib/python3.12` all still fail with `Permission denied`, byte-identically to the behaviour
+before this grant existed.
+
 ### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
 Every mechanism above governs a specific syscall (`socket`, `mknod`) or a specific resource

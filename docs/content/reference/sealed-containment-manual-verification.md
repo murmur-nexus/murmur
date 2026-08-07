@@ -1,6 +1,6 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addendum 2026-08-07: directory enumeration inside the composed root."
 
     Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
     live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
@@ -13,7 +13,9 @@
     container refusal) is still **not** run — no container runtime is installed on this host — and
     remains the one acceptance criterion on this page with no observed result. Recorded verbatim,
     with exact evidence, in [Recording the result](#recording-the-result). Read that section before
-    treating this page as a clean pass.
+    treating this page as a clean pass. A later, targeted run on 2026-08-07 added the one behaviour
+    no earlier run recorded — `ls` on a path that *is* one of the composed root's bind-mounted
+    runtime directories — and is recorded in the same section.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
@@ -600,6 +602,133 @@ If step 3a's output is identical under both classes, the probes are not measurin
 claims and the result must not be recorded as a pass.
 
 ## Recording the result
+
+### Run of 2026-08-07 — directory enumeration inside the composed root (`SEALED_RUNTIME_PATHS`)
+
+A targeted run, not a re-run of steps 1–6: it records what happens for `ls` on a path that *is* one
+of the composed root's bind-mounted runtime directories, which no earlier run on this page covered.
+The 2026-08-05 entry recorded `ls /` and `ls /etc` as `Permission denied` and cited that as evidence
+Landlock still mediates *inside* the root. Both remain true. What was not recorded is that
+`ls /usr/lib/python3.12` failed the same way — and that this made a `sealed` capsule with `python3`
+in `shell.allow` unable to start Python at all.
+
+**Host.** Same machine as the 2026-08-05 run: `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP
+PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04, `systemd-detect-virt` → `none`,
+non-root (`uid=1000`), `kernel.apparmor_restrict_unprivileged_userns=0` (so no profile was needed),
+CPython 3.12.3 under `/usr/lib/python3.12`. Both binaries built from the same worktree; sessions
+launched under `systemd-run --user --scope -p Delegate=yes` with
+`capabilities.resources.max_processes: 4096` (the `bfb08018` `RLIMIT_NPROC` baseline defect —
+unrelated to this page). Capsule: `containment: sealed`, `shell.allow: [bash, python3, ls, touch]`,
+**no** `interpreter_runtime` and **no** `staged_runtime`, so the fixed bind list is the only thing
+under test. `mur run --explain-scope` → `achieved: sealed`; `trace.jsonl` `session_start` →
+`"containment_achieved":"sealed"`.
+
+**Before (control, `mur` built without the grant)** — one real `bash` tool call, verbatim:
+
+```text
+--1-PY--
+Python path configuration:
+  ...
+  stdlib dir = '/usr/lib/python3.12'
+  sys.path = [
+    '/usr/lib/python312.zip',
+    '/usr/lib/python3.12',
+    '/usr/lib/python3.12/lib-dynload',
+  ]
+Fatal Python error: init_fs_encoding: failed to get the Python codec of the filesystem encoding
+Python runtime state: core initialized
+ModuleNotFoundError: No module named 'encodings'
+rc=1
+--5-WRITE--
+touch: cannot touch '/usr/testfile': Read-only file system
+```
+
+Every `ls` in that same run produced no output at all, which is itself informative: the pipeline's
+`head` could not `execve` either, because `/usr/bin/head` is not in `shell.allow`. Probed directly,
+verbatim:
+
+```text
+bash: line 1: /usr/bin/whoami: Permission denied     rc=126
+bash: line 1: /usr/bin/basename: Permission denied   rc=126
+bash: line 1: /bin/sh: Permission denied             rc=126
+```
+
+**After (the grant in place)** — same capsule, same command:
+
+```text
+--1-PY--
+ok
+rc=0
+--2-DLOPEN--
+dlopen-ok            (python3 -c "import ssl, zlib, _ctypes, json, sqlite3")
+rc=0
+--4-LSROOTDIR--
+ls: cannot open directory '/': Permission denied
+--5-LSROOT--
+ls: cannot access '/root': No such file or directory
+--6-WRITE--
+touch: cannot touch '/usr/testfile': Read-only file system
+--7-LSUSR--
+bin games include lib lib64 libexec local sbin share src
+--8-EXEC--
+bash: line 1: /bin/sh: Permission denied             rc=126
+bash: line 1: /usr/bin/basename: Permission denied   rc=126
+```
+
+and, in a second call (using bash builtins to count, since `wc`/`head` are correctly still
+un-runnable):
+
+```text
+--A-LSDIR--
+total 56
+drwxr-xr-x 1 65534 65534   118 Jul 26 17:20 .
+drwxr-xr-x 1 65534 65534  4080 Jul 26 17:20 ..
+-rw-r--r-- 1 65534 65534 12473 Jun 19 07:46 decoder.py
+-rw-r--r-- 1 65534 65534 16070 Jun 19 07:46 encoder.py
+-rw-r--r-- 1 65534 65534 14020 Jun 19 07:46 __init__.py
+drwxr-xr-x 1 65534 65534   226 Jul 26 17:20 __pycache__
+-rw-r--r-- 1 65534 65534  2425 Jun 19 07:46 scanner.py
+-rw-r--r-- 1 65534 65534  3339 Jun 19 07:46 tool.py
+--B-COUNT--
+entries=200
+```
+
+Read against the four boundaries this page cares about:
+
+| probe | before | after | verdict |
+|---|---|---|---|
+| `python3 -c "import ast; print('ok')"` | `init_fs_encoding` fatal, rc=1 | `ok`, rc=0 | fixed |
+| `ls -la` inside `/usr/lib/python3.12` | denied | real entries (200 in the stdlib dir) | fixed |
+| `ls /` (composed root's own top level) | `Permission denied` | `Permission denied` | unchanged ✅ |
+| `ls /root` (never mounted) | absent | `No such file or directory` | unchanged ✅ |
+| `touch /usr/testfile` | `Read-only file system` | `Read-only file system` | unchanged ✅ |
+| `/bin/sh`, `/usr/bin/basename` (not in `shell.allow`) | `Permission denied`, rc=126 | `Permission denied`, rc=126 | unchanged ✅ |
+
+**The last row is the one worth reading twice.** Granting these paths `Execute` alongside `ReadDir`
+— the obvious implementation, and the one every other grant in the runtime uses — makes `/bin/sh`
+and every other host binary runnable inside a `sealed` capsule, because Landlock `Execute` *is* this
+runtime's exec allowlist since the seccomp `execve` supervisor was retired. That was observed on
+this host during this run, not theorised, and is why the grant withholds `Execute`. `dlopen(3)` is
+unaffected (row 2 above: `ssl`, `zlib`, `_ctypes` and `sqlite3` all import), because mapping a
+shared object `PROT_EXEC` needs `ReadFile`, not `Execute`.
+
+**Negative control — `scoped` is untouched.** The identical capsule with `containment: scoped`,
+run through the same live shell-tool path, before and after:
+
+```text
+--1-LSROOTDIR--  ls: cannot open directory '/': Permission denied                   rc=2
+--2-LSUSR--      ls: cannot open directory '/usr': Permission denied                rc=2
+--3-LSPY--       ls: cannot open directory '/usr/lib/python3.12': Permission denied rc=2
+--4-PY--         Fatal Python error: init_fs_encoding: ...                          rc=1
+--5-EXEC--       bash: line 1: /bin/sh: Permission denied                           rc=126
+```
+
+`diff` of the two transcripts is empty (modulo CPython's thread-id line): **byte-identical before
+and after.** This is the property the tier gate exists for — under `scoped` there is no composed
+root, `/usr` is literally the host's, and no new host directory became enumerable.
+
+**Not run.** Step 5 (the container refusal) remains unrun on this host for the same reason as
+before — no container runtime installed. This entry adds nothing to it.
 
 ### Run of 2026-08-05 — steps 1–4 and 6 pass through a live capsule, step 5 not run
 

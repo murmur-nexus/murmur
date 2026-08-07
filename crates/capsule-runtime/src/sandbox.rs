@@ -689,39 +689,57 @@ fn resolve_landlock_grants_in(
     grants.into_iter().collect()
 }
 
-/// One resolved Landlock filesystem grant outside the workdir: a canonical path plus whether the
-/// directory's own entries may be enumerated (`ReadDir`).
+/// One resolved Landlock filesystem grant outside the workdir: a canonical path plus the two
+/// independent bits that decide the rule's access set.
 ///
-/// `list_dir` carries the whole difference between the two grant kinds this runtime issues:
+/// `list_dir` decides enumerability (`ReadDir`):
 ///
-///   - `false` → `Execute + ReadFile`. Enough for the dynamic loader to open, read, and
-///     map-execute a file; and (Landlock's read rights apply to the whole subtree beneath a
-///     granted directory) enough to open a file *inside* a granted directory by its exact name.
-///     But the directory's own listing (`getdents64`) is denied. This is what every derived
+///   - `false` → no `getdents64` on the granted directory itself. Landlock's read rights apply to
+///     the whole subtree beneath a granted directory, so a file *inside* it can still be opened by
+///     its exact name — the listing is what is denied. This is what every derived
 ///     `DT_NEEDED`-closure grant gets — they are individual files, where `ReadDir` was always a
 ///     no-op anyway (Landlock's `ReadDir` only has meaning on a directory inode).
-///   - `true` → `Execute + ReadFile + ReadDir`. Adds enumerability, which a path-based
-///     interpreter's import machinery needs on each `sys.path` entry (CPython's `FileFinder`
-///     `listdir`-caches each one). Only ever set by an author writing `list_dir: true` next to a
-///     specific `interpreter_runtime` directory — never inferred, and never applied to an
-///     ancestor or sibling of a granted directory.
+///   - `true` → adds enumerability, which a path-based interpreter's import machinery needs on
+///     each `sys.path` entry (CPython's `FileFinder` `listdir`-caches each one). Set by an author
+///     writing `list_dir: true` next to a specific `interpreter_runtime` directory, and by the two
+///     whole-tree resolvers ([`resolve_staged_runtime_landlock_grants`] and
+///     [`resolve_sealed_runtime_landlock_grants`]) where a runtime tree is walked by definition —
+///     never inferred from anything else, and never applied to an ancestor or sibling of a granted
+///     directory.
+///
+/// `executable` decides `Execute`, which is this runtime's exec allowlist: the seccomp `execve`
+/// supervisor was retired in favour of Landlock `Execute` rights, so a path without an `Execute`
+/// rule cannot be `execve`d and a path with one can.
+///
+///   - `true` → `Execute + ReadFile`, for a path the manifest asked to *run*: a `shell.allow`
+///     binary, its `DT_NEEDED` closure, and the interpreter/staged trees an author named.
+///   - `false` → `ReadFile` only (readable, and with `list_dir` enumerable, but not runnable).
+///     For a grant the *tier* issues rather than the manifest: see
+///     [`resolve_sealed_runtime_landlock_grants`], where granting `Execute` over `/usr`, `/bin`
+///     and `/sbin` wholesale would turn `shell.allow` into a no-op on `sealed`.
+///
+/// Affects `execve` only: a shared object mapped `PROT_EXEC` by `dlopen(3)` needs `ReadFile`, not
+/// `Execute`, so an interpreter still loads its C extensions out of an `executable: false` tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LandlockGrant {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) path: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) list_dir: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) executable: bool,
 }
 
 impl LandlockGrant {
     /// Wraps each derived `DT_NEEDED`-closure file path as a non-listable grant. A regular file
     /// has no meaningful `ReadDir`, so `list_dir: false` is both correct and a pure simplification
     /// of b3220cb5's old uniform `Execute|ReadFile|ReadDir` — it never changes *which* files are
-    /// granted.
+    /// granted. `executable: true`: this closure is exactly the set of paths `shell.allow` asked
+    /// to run, so it is the allowlist the `Execute` right exists to express.
     fn non_listable_files(paths: Vec<PathBuf>) -> Vec<LandlockGrant> {
         paths
             .into_iter()
-            .map(|path| LandlockGrant { path, list_dir: false })
+            .map(|path| LandlockGrant { path, list_dir: false, executable: true })
             .collect()
     }
 }
@@ -743,6 +761,9 @@ pub(crate) fn resolve_interpreter_runtime_grants(
             grant.dirs.iter().map(|dir| LandlockGrant {
                 path: PathBuf::from(&dir.path),
                 list_dir: dir.list_dir,
+                // Executable: an `interpreter_runtime` directory is named by an author precisely so
+                // the interpreter it belongs to can run out of it, helper binaries included.
+                executable: true,
             })
         })
         .collect()
@@ -858,7 +879,49 @@ pub(crate) fn resolve_staged_runtime_landlock_grants(
 ) -> Vec<LandlockGrant> {
     resolve_staged_runtime_dirs(policy)
         .into_iter()
-        .map(|path| LandlockGrant { path, list_dir: true })
+        .map(|path| LandlockGrant {
+            path,
+            list_dir: true,
+            executable: true,
+        })
+        .collect()
+}
+
+/// One listable [`LandlockGrant`] per [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, and only on
+/// `KernelSealed`.
+///
+/// `plan_composed_root` bind-mounts `/usr`, `/bin`, `/sbin`, `/lib`… read-only into every composed
+/// root, but the Landlock ruleset installed inside that root denies any path with no matching rule.
+/// The `shell.allow` ELF closure grants those files one at a time and non-listably, so a binary
+/// opens by exact name while the directory holding it cannot be enumerated — enough to start an
+/// interpreter, not enough to run it: CPython dies in `init_fs_encoding` because it cannot
+/// `getdents64` `/usr/lib/python3.N` to find `encodings`. This grant makes the bound tree
+/// enumerable.
+///
+/// `list_dir: true` is not configurable: a whole runtime tree a program walks is not a
+/// case-by-case author choice. Writes are moot — the binds are `MS_RDONLY`.
+///
+/// `executable: false` (see [`LandlockGrant`]): this is the only grant covering whole host trees
+/// the manifest never named, so it must enumerate them without becoming permission to run them.
+///
+/// Sealed-tier only: on `KernelFull` (where `scoped` runs) Landlock applies over the real host
+/// filesystem, so `ReadDir` on `/usr` would expose host directory shape; under `KernelSealed` the
+/// tree is a private read-only bind holding only what was staged, so enumerating it reveals
+/// nothing. Empty on every other tier.
+///
+/// Pure and syscall-free (paths need not exist here — `apply_landlock_scope` skips any that fail
+/// to open), so unit-testable on every platform.
+pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> Vec<LandlockGrant> {
+    if tier != EnforcementTier::KernelSealed {
+        return Vec::new();
+    }
+    crate::sealed::SEALED_RUNTIME_PATHS
+        .iter()
+        .map(|path| LandlockGrant {
+            path: PathBuf::from(path),
+            list_dir: true,
+            executable: false,
+        })
         .collect()
 }
 
@@ -1542,21 +1605,30 @@ pub(crate) struct ShellEnforcement {
     /// nothing to withhold — which is part of why that tier cannot reach `scoped`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) workdir_exec: bool,
-    /// Narrow read+execute (never write) Landlock grants *outside* the workdir so the allowlisted
+    /// Narrow read (never write) Landlock grants *outside* the workdir so the allowlisted
     /// binaries can actually exec, dynamically link, and (for a path-based interpreter) reach their
-    /// stdlib. Two origins, combined here:
+    /// stdlib. Four origins, combined here:
     ///
     ///   - the `DT_NEEDED`-closure files (`shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure), from `resolve_landlock_grants` — each wrapped `list_dir: false`
     ///     (they are individual files, where `ReadDir` was always a no-op);
     ///   - one grant per `capabilities.shell.interpreter_runtime` directory, from
     ///     `resolve_interpreter_runtime_grants` — each carrying exactly the `list_dir` its author
-    ///     declared.
+    ///     declared;
+    ///   - one listable grant per `capabilities.shell.staged_runtime` tree, from
+    ///     `resolve_staged_runtime_landlock_grants`;
+    ///   - on `KernelSealed` **only**, one listable but *non-executable* grant per fixed
+    ///     [`crate::sealed::SEALED_RUNTIME_PATHS`] entry, from
+    ///     `resolve_sealed_runtime_landlock_grants` — the composed root's own bind-mounted runtime
+    ///     tree, which nothing else grants.
+    ///
+    /// The first three carry `executable: true`; the last does not, and that asymmetry is load-
+    /// bearing — see [`LandlockGrant`].
     ///
     /// Resolved once at launch (in the parent) and threaded into the forked child's `pre_exec`,
     /// where `apply_landlock_scope` turns each into a per-path `PathBeneath` rule with an access
-    /// set that depends on `list_dir`. Only consulted on `KernelFull`; resolved on every platform
-    /// for parity but never read off Linux.
+    /// set that depends on `list_dir` and `executable`. Only consulted on `KernelFull` and
+    /// `KernelSealed`; resolved on every platform for parity but never read off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) landlock_grants: Vec<LandlockGrant>,
     /// Host directories this capsule needs bind-mounted read-only into its composed root *beyond*
@@ -1637,6 +1709,12 @@ impl ShellEnforcement {
         // composed root and then denied by the Landlock ruleset installed inside it — see
         // `resolve_staged_runtime_landlock_grants`.
         landlock_grants.extend(resolve_staged_runtime_landlock_grants(policy));
+        // Plus, on `KernelSealed` only, one listable grant per fixed `SEALED_RUNTIME_PATHS`
+        // directory — the composed root binds them but Landlock inside the root still denies
+        // enumerating them. Gated on `tier`, not on the manifest: on `KernelFull` (the tier a
+        // `scoped` capsule runs on) the same grant would expose real host directory shape. The
+        // resolver applies that gate itself and returns nothing on every other tier.
+        landlock_grants.extend(resolve_sealed_runtime_landlock_grants(tier));
         let sealed_bind_dirs = resolve_sealed_bind_dirs(&exec_allow_paths, policy);
         let staged_runtime_dirs = resolve_staged_runtime_dirs(policy);
         Ok(Self {
@@ -2484,11 +2562,13 @@ mod linux_enforce {
     const MAX_DIAG_LEN: usize = 1024;
 
     /// One Landlock grant path, opened (`O_PATH | O_CLOEXEC`) in the PARENT before fork(), paired
-    /// with the `list_dir` bit that decides whether its rule also carries `ReadDir`. Only the
-    /// already-open fd crosses into the child's `pre_exec` — never a path to re-open there.
+    /// with the two bits that decide its rule's access set: `list_dir` (`ReadDir`) and
+    /// `executable` (`Execute`). Only the already-open fd crosses into the child's `pre_exec` —
+    /// never a path to re-open there.
     pub(super) struct OpenLandlockGrant {
         fd: OwnedFd,
         list_dir: bool,
+        executable: bool,
     }
 
     /// One entry of [`CAPSULE_DEVICE_GRANTS`], opened (`O_PATH | O_CLOEXEC`) in the PARENT before
@@ -3228,14 +3308,17 @@ mod linux_enforce {
     ///     is what enforces `capabilities.shell.allow` completely: the kernel refuses the exec on
     ///     the path it resolved itself, so nothing the capsule writes into its workdir can run;
     ///   - each [`LandlockGrant`] (the `shell.allow` binaries, their ELF interpreter, their
-    ///     shared-library closure, and any `interpreter_runtime` directory, all *outside* the
-    ///     workdir) gets a **narrow read+execute** grant — never write. Whether that grant also
-    ///     carries `ReadDir` (i.e. the directory's own entries are enumerable) is exactly the
-    ///     grant's `list_dir`: the derived closure files are all `false` (a regular file has no
-    ///     meaningful `ReadDir`), while an `interpreter_runtime` directory carries whatever its
-    ///     author wrote. `ReadDir` is granted only on the specific inode a rule names — never on
-    ///     an ancestor or sibling — so naming one subdirectory never makes `/usr/lib` (or any
-    ///     parent) enumerable;
+    ///     shared-library closure, any `interpreter_runtime` or `staged_runtime` directory, and on
+    ///     `KernelSealed` the fixed [`crate::sealed::SEALED_RUNTIME_PATHS`], all *outside* the
+    ///     workdir) gets a **narrow read** grant — never write — with two bits added on top.
+    ///     Whether it carries `ReadDir` (i.e. the directory's own entries are enumerable) is
+    ///     exactly the grant's `list_dir`: the derived closure files are all `false` (a regular
+    ///     file has no meaningful `ReadDir`), while an `interpreter_runtime` directory carries
+    ///     whatever its author wrote. `ReadDir` is granted only on the specific inode a rule names
+    ///     — never on an ancestor or sibling — so naming one subdirectory never makes `/usr/lib`
+    ///     (or any parent) enumerable. Whether it carries `Execute` is the grant's `executable`,
+    ///     `true` everywhere except the tier-issued sealed-runtime grant, which is deliberately
+    ///     readable and enumerable but not runnable;
     ///   - each entry of the fixed [`CAPSULE_DEVICE_GRANTS`] set gets `ReadFile`, plus `WriteFile`
     ///     if its `writable` bit is set. That bit is set for exactly one path — `/dev/null` — which
     ///     is therefore the *only* writable path outside the workdir in the whole sandbox. This
@@ -3280,8 +3363,11 @@ mod linux_enforce {
         // open a file inside a granted directory by exact name — but no write access, and (without
         // `ReadDir`) no enumeration of the directory's own entries.
         let read_execute = AccessFs::Execute | AccessFs::ReadFile;
-        // Adds enumerability (`getdents64`) — only for a grant whose author set `list_dir: true`.
+        // Adds enumerability (`getdents64`) — only for a grant carrying `list_dir: true`.
         let read_execute_list = read_execute | AccessFs::ReadDir;
+        // `ReadFile + ReadDir`, no `Execute` — readable and enumerable but not runnable. See
+        // `resolve_sealed_runtime_landlock_grants` (its only user) for why `Execute` is withheld.
+        let read_list = AccessFs::ReadFile | AccessFs::ReadDir;
         // Device rights. No `Execute` (a character device is never exec'd) and no `ReadDir` (it is
         // not a directory) — only the two data bits, with `WriteFile` reserved for `/dev/null`.
         let device_read: BitFlags<AccessFs> = AccessFs::ReadFile.into();
@@ -3306,10 +3392,12 @@ mod linux_enforce {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
             // so every fd reaching here is valid. A rule that still fails to add is a genuine
             // ruleset-construction failure and propagates as `Err` (fail-closed).
-            let access = if grant.list_dir {
-                read_execute_list
-            } else {
-                read_execute
+            let access = match (grant.executable, grant.list_dir) {
+                (true, true) => read_execute_list,
+                (true, false) => read_execute,
+                // Not executable implies listable today — the only non-executable grant is the
+                // whole-tree sealed-runtime one, which exists precisely to enumerate.
+                (false, _) => read_list,
             };
             ruleset = ruleset
                 .add_rule(PathBeneath::new(grant.fd.as_fd(), access))
@@ -3370,6 +3458,7 @@ mod linux_enforce {
                 Ok(fd) => grants.push(OpenLandlockGrant {
                     fd,
                     list_dir: grant.list_dir,
+                    executable: grant.executable,
                 }),
                 Err(_) => continue,
             }
@@ -3815,7 +3904,11 @@ mod tests {
 
         assert_eq!(
             grants,
-            vec![LandlockGrant { path: PathBuf::from("/opt/py"), list_dir: true }],
+            vec![LandlockGrant {
+                path: PathBuf::from("/opt/py"),
+                list_dir: true,
+                executable: true,
+            }],
             "a staged tree is walked by the runtime that uses it, so it must be listable",
         );
         assert_eq!(
@@ -3823,6 +3916,93 @@ mod tests {
             dirs,
             "the bound set and the granted set must not drift apart",
         );
+    }
+
+    #[test]
+    fn every_sealed_runtime_path_gets_a_listable_non_executable_landlock_grant() {
+        let grants = resolve_sealed_runtime_landlock_grants(EnforcementTier::KernelSealed);
+
+        assert_eq!(
+            grants,
+            crate::sealed::SEALED_RUNTIME_PATHS
+                .iter()
+                .map(|path| LandlockGrant {
+                    path: PathBuf::from(path),
+                    list_dir: true,
+                    executable: false,
+                })
+                .collect::<Vec<_>>(),
+            "the composed root binds exactly these, so exactly these must be enumerable — \
+             the bound set and the granted set must not drift apart",
+        );
+        assert!(
+            grants.iter().all(|grant| grant.list_dir),
+            "a runtime tree an interpreter walks is useless without getdents64",
+        );
+        assert!(
+            grants.iter().all(|grant| !grant.executable),
+            "Execute is the exec allowlist: granting it over /usr, /bin and /sbin would let a \
+             sealed capsule run every binary the host ships, whatever shell.allow says",
+        );
+    }
+
+    #[test]
+    fn sealed_runtime_landlock_grants_are_sealed_tier_only() {
+        for tier in [
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            assert!(
+                resolve_sealed_runtime_landlock_grants(tier).is_empty(),
+                "{tier:?} has no composed root, so granting ReadDir on SEALED_RUNTIME_PATHS \
+                 would enumerate the real host filesystem",
+            );
+        }
+    }
+
+    /// The gate as `ShellEnforcement::resolve` actually applies it. `applied_tier` never returns
+    /// `KernelSealed` for a capsule declaring `scoped`, on any host, so this half is host-
+    /// independent; the `sealed` half asserts against whatever tier this host resolved to, which
+    /// is the only honest thing a test can do about a kernel capability it may not have.
+    #[test]
+    fn shell_enforcement_grants_sealed_runtime_paths_only_when_sealed_applies() {
+        let policy = CapabilityPolicy::default();
+        let usr = PathBuf::from("/usr");
+
+        let scoped = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Scoped)
+            .expect("an empty policy resolves");
+        assert!(
+            !scoped.landlock_grants.iter().any(|grant| grant.path == usr),
+            "a scoped capsule runs Landlock over the real host filesystem — /usr must stay \
+             unenumerable there",
+        );
+
+        let sealed = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed)
+            .expect("an empty policy resolves");
+        let granted: Vec<&LandlockGrant> = sealed
+            .landlock_grants
+            .iter()
+            .filter(|grant| {
+                crate::sealed::SEALED_RUNTIME_PATHS.contains(&grant.path.to_str().unwrap_or(""))
+            })
+            .collect();
+        if sealed.tier == EnforcementTier::KernelSealed {
+            assert_eq!(
+                granted.len(),
+                crate::sealed::SEALED_RUNTIME_PATHS.len(),
+                "a sealed session must carry one listable grant per bound runtime path",
+            );
+            assert!(granted
+                .iter()
+                .all(|grant| grant.list_dir && !grant.executable));
+        } else {
+            assert!(
+                granted.is_empty(),
+                "this host fell back to {:?}, where there is no composed root to enumerate",
+                sealed.tier,
+            );
+        }
     }
 
     #[test]
@@ -4311,10 +4491,12 @@ mod tests {
                 LandlockGrant {
                     path: PathBuf::from("/usr/lib/python3.11"),
                     list_dir: true,
+                    executable: true,
                 },
                 LandlockGrant {
                     path: PathBuf::from("/usr/lib/python3.11/lib-dynload"),
                     list_dir: false,
+                    executable: true,
                 },
             ]
         );
@@ -4335,10 +4517,12 @@ mod tests {
                 LandlockGrant {
                     path: PathBuf::from("/opt/py/nonexistent"),
                     list_dir: false,
+                    executable: true,
                 },
                 LandlockGrant {
                     path: PathBuf::from("/opt/rb/also-nonexistent"),
                     list_dir: true,
+                    executable: true,
                 },
             ]
         );
@@ -5593,6 +5777,103 @@ mod linux_integration_tests {
         assert_ne!(
             list_parent.exit_code, 0,
             "a grant on stdlib/ must not make its (ungranted) parent enumerable"
+        );
+    }
+
+    /// The `executable` axis, measured against the real kernel rather than reasoned about.
+    ///
+    /// This is the property the `sealed` runtime-tree grant depends on: a whole tree can be made
+    /// readable and enumerable without becoming a place to run programs from. It is asserted here
+    /// on the plain Landlock path (`KernelFull`) because the access shape is tier-independent —
+    /// `apply_landlock_scope` builds the same rule either way — and because a `KernelSealed` host
+    /// would have to be driven through a composed root, which no unit test can reach.
+    ///
+    /// Runs on any host with a usable Landlock ABI, `KernelSealed` ones included: the tier is
+    /// pinned in the enforcement literal, so only the ABI has to be real. Skips loudly elsewhere.
+    #[test]
+    fn kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it() {
+        let host_tier = detect_enforcement_tier();
+        if !matches!(
+            host_tier,
+            EnforcementTier::KernelFull | EnforcementTier::KernelSealed
+        ) {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE LANDLOCK FIX ON THIS HOST: \
+                 kernel_full_non_executable_grant_... needs a usable Landlock ABI (kernel 5.13+); \
+                 detected {host_tier:?}. This run does NOT install a Landlock domain, so a green \
+                 result is not evidence that withholding Execute denies execve."
+            );
+            return;
+        }
+
+        let workdir = tempfile::tempdir().unwrap();
+        // A runtime-tree stand-in: one readable file plus one runnable binary, outside the workdir.
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(tree.path().join("entry.txt"), "x\n").unwrap();
+        let runme = tree.path().join("runme");
+        std::fs::copy("/bin/echo", &runme).unwrap();
+
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "ls".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let with_tree_grant = |executable: bool| {
+            let mut enforcement = kernel_full_enforcement(EnforcementTier::KernelFull, &policy);
+            enforcement.landlock_grants.push(LandlockGrant {
+                path: tree.path().to_path_buf(),
+                list_dir: true,
+                executable,
+            });
+            enforcement
+        };
+        let run = |enforcement: &ShellEnforcement, command: String| {
+            crate::shell::execute_shell(
+                "bash",
+                &["-c", &command],
+                &[],
+                workdir.path(),
+                &policy,
+                enforcement,
+            )
+            .expect("execute_shell should return Ok even when the command itself fails")
+        };
+
+        let denied = with_tree_grant(false);
+        let list = run(&denied, format!("ls '{}'", tree.path().display()));
+        assert_eq!(
+            list.exit_code, 0,
+            "a non-executable grant must still be enumerable — that is its entire purpose \
+             (stderr: {})",
+            list.stderr
+        );
+        assert!(list.stdout.contains("entry.txt"), "stdout: {}", list.stdout);
+
+        let exec_denied = run(&denied, format!("'{}' ran", runme.display()));
+        assert_ne!(
+            exec_denied.exit_code, 0,
+            "withholding Execute must deny execve inside the granted tree; a program ran instead \
+             (stdout: {})",
+            exec_denied.stdout
+        );
+        assert!(
+            !exec_denied.stdout.contains("ran"),
+            "the binary produced output, so it executed: {}",
+            exec_denied.stdout
+        );
+
+        // The control: the identical grant with `executable: true` does run it. Without this the
+        // assertion above could be passing for an unrelated reason (a bad path, a missing library).
+        let allowed = with_tree_grant(true);
+        let exec_allowed = run(&allowed, format!("'{}' ran", runme.display()));
+        assert_eq!(
+            exec_allowed.exit_code, 0,
+            "the same tree granted Execute must run (stderr: {})",
+            exec_allowed.stderr
+        );
+        assert!(
+            exec_allowed.stdout.contains("ran"),
+            "stdout: {}",
+            exec_allowed.stdout
         );
     }
 
