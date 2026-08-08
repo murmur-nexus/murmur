@@ -479,6 +479,72 @@ empty on every other tier. Verified by hand: under `scoped`, `ls /`, `ls /usr` a
 `ls /usr/lib/python3.12` all still fail with `Permission denied`, byte-identically to the behaviour
 before this grant existed.
 
+### The fixed sealed-tier `/etc` grant { #sealed-etc-grant }
+
+The same mounted-but-denied bug as the runtime tree, one directory over, and the one users hit
+first — because what it breaks is TLS.
+
+A composed root does not carry the host's `/etc`. It carries a fixed, curated allowlist of sixteen
+entries (`sealed::SEALED_ETC_PATHS`), bind-mounted read-only, each silently skipped when the host
+does not have it: the loader's cache and config (`/etc/ld.so.cache`, `/etc/ld.so.conf`,
+`/etc/ld.so.conf.d`), the alternatives database (`/etc/alternatives`), the TLS trust store
+(`/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/etc/ca-certificates.conf`), name resolution
+(`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`), the timezone (`/etc/localtime`,
+`/etc/timezone`), the terminal database (`/etc/terminfo`) and the account databases
+(`/etc/passwd`, `/etc/group`). Everything else under `/etc` — `/etc/shadow`, `/etc/sudoers`,
+`/etc/ssh`, cloud-init credentials, and every future addition — is **absent by construction**,
+never by enumeration in a denylist.
+
+Until this grant existed, all sixteen were mounted and unopenable. The visible symptom was
+certificate verification:
+
+```text
+PermissionError: [Errno 13] Permission denied   # /etc/ssl/certs/ca-certificates.crt
+curl: (77) error setting certificate file: /etc/ssl/certs/ca-certificates.crt
+pip: SSLError(PermissionError(13, 'Permission denied')) — Could not fetch URL https://pypi.org/simple/…
+```
+
+The TCP connection succeeded; the trust store could not be read, so `pip`, `curl`, `wget` and
+`git` all failed over HTTPS against hosts the manifest had explicitly allowed. `getpwuid(3)` failed
+the same way, so `whoami` and every tool that resolves its own username misreported.
+
+Every `sealed` session now gets one Landlock rule per entry, fixed at compile time
+(`resolve_sealed_etc_landlock_grants` in `crates/capsule-runtime/src/sandbox.rs`), with **no
+manifest key** that adds a path or removes one. Like the runtime-tree grant it is a property of the
+tier: it fires no warning and appears in no `--explain-scope` section.
+
+| Right | Granted | Why |
+|---|---|---|
+| `ReadFile` | yes, on all sixteen | The gap being closed. Reading the file the composed root already mounted. |
+| `ReadDir` | on the six directory entries only — `/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/etc/ld.so.conf.d`, `/etc/alternatives`, `/etc/terminfo` | OpenSSL's `SSL_CERT_DIR` hash lookup, `c_rehash`, and `os.listdir('/etc/ssl/certs')` all enumerate. The other ten are files or symlinks, where `ReadDir` has no meaning — and the kernel rejects a `ReadDir` rule on a non-directory outright. |
+| `Execute` | **no** | `/etc/alternatives` is a directory of symlinks into `/usr/bin`. Granting `Execute` here would be a second, undeclared route around `capabilities.shell.allow` — the same hole the [runtime-tree grant](#sealed-runtime-tree-grant) withholds `Execute` to close. Confirmed by hand: `/etc/alternatives/awk --version` is `Permission denied` (exit 126) in a capsule that can read and list that directory. |
+| every write right | no | The binds are `MS_RDONLY`, so `touch /etc/hosts` reports `Permission denied` and `open('/etc/hosts', 'w')` reports `Read-only file system`. A writable `/etc/resolv.conf` inside a capsule would be a name-resolution hijack of the capsule's own egress. |
+
+**What this widens, stated plainly.** Two of the sixteen entries carry a real, accepted cost, and
+it is the one already recorded on `SEALED_ETC_PATHS` itself: `/etc/passwd` and `/etc/group` are
+world-readable on every distribution, so a `sealed` capsule can now read the host's account names.
+They are bound rather than synthesised because synthesising them means writing files from inside
+the `pre_exec` window, which this module's discipline forbids; a two-line synthetic passwd/group
+built in the parent is the obvious follow-up. Nothing else here is sensitive: a CA bundle, a
+timezone, a loader cache and a terminfo database are public data on any host. And the containment
+boundary is unchanged — `ls /etc` itself is still `Permission denied` (no rule covers the composed
+root's `/etc` directory, only the specific entries mounted beneath it), while `/etc/shadow` and
+`/etc/ssh/sshd_config` are still `No such file or directory`, because they were never mounted.
+
+**`scoped` gets none of this**, for exactly the reason [the runtime-tree grant](#sealed-runtime-tree-grant)
+gives: on `KernelFull` there is no composed root, so these rules would apply to the *host's* `/etc`
+— its real trust store, its real `resolv.conf`, its real account databases. The grant is emitted
+only when the resolved tier is `KernelSealed`. Verified by hand: a `scoped` capsule's transcript
+across all sixteen paths is byte-identical before and after this change.
+
+**One operational consequence.** Sixteen more Landlock grants means sixteen more file descriptors
+held open across the child's `pre_exec` window, under whatever `capabilities.resources.max_open_files`
+the manifest declared. Measured on the verification host, a `sealed` capsule allowing
+`[bash, python3]` spawns at `max_open_files: 72` and is refused at `64` with
+`sandbox: shell enforcement setup failed before exec: egress-netns: writing uid_map/gid_map
+failed`. That is fail-closed and legible, not a silent weakening, but a manifest with a very tight
+`max_open_files` may need to raise it.
+
 ### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
 Every mechanism above governs a specific syscall (`socket`, `mknod`) or a specific resource

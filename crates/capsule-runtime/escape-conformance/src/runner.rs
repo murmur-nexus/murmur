@@ -145,15 +145,21 @@ fn tight_resources_yaml() -> &'static str {
     \x20   # attributable: RLIMIT_NPROC headroom well above cgroup_pids_max means a tree that\n\
     \x20   # stops in the low tens stopped because of pids.max and nothing else.\n\
     \x20   max_processes: 512\n\
-    \x20   # 64 rather than the document's 16, and the difference is a finding rather than a\n\
+    \x20   # 128 rather than the document's 16, and the difference is a finding rather than a\n\
     \x20   # preference. `apply_hard_rlimits` runs first in the child's pre_exec window, so every\n\
-    \x20   # later step in that window lives under this ceiling — and installing the seccomp\n\
-    \x20   # filter needs descriptors. Observed on Linux 7.0.0/libseccomp 2.5.5: at 16 and at 32\n\
-    \x20   # every spawn dies with `shell enforcement setup failed before exec: There was a system\n\
-    \x20   # failure beyond the control of libseccomp`; at 64 the spawn succeeds and the ceiling\n\
-    \x20   # still bites, with EMFILE at descriptor 61 rather than in the 1000s. 16 would make the\n\
-    \x20   # fd-exhauster case unrunnable, which is not the same as contained.\n\
-    \x20   max_open_files: 64\n\
+    \x20   # later step in that window lives under this ceiling — and the Landlock grant fds, the\n\
+    \x20   # netns/uid_map setup and the seccomp filter all need descriptors while it holds.\n\
+    \x20   # Observed on Linux 7.0.0/libseccomp 2.5.5: at 16 and at 32 every spawn dies with\n\
+    \x20   # `shell enforcement setup failed before exec: There was a system failure beyond the\n\
+    \x20   # control of libseccomp`. 64 worked until slice fb1eea97 added one Landlock grant per\n\
+    \x20   # `SEALED_ETC_PATHS` entry: sixteen more fds held open across that window put a `sealed`\n\
+    \x20   # capsule back over the line, and every resource case reported\n\
+    \x20   # `egress-netns: writing uid_map/gid_map failed` instead of its ceiling. Measured on\n\
+    \x20   # that host, a [bash, python3] sealed capsule spawns at 72 and refuses at 64; 128 is\n\
+    \x20   # that floor with room for a grant set that grows again. The ceiling still bites, and\n\
+    \x20   # still far below the host default, so the fd-exhauster case stays runnable — which is\n\
+    \x20   # the constraint that rules out simply raising it to the sky.\n\
+    \x20   max_open_files: 128\n\
     \x20   max_file_size_bytes: 10485760      # 10 MiB\n\
     \x20   # 60 rather than the document's 5: pids.max is hit in milliseconds, so a generous CPU\n\
     \x20   # ceiling keeps the fork-bomb attribution unambiguously cgroup_pids_max.\n\
@@ -724,10 +730,13 @@ mod tests {
         let yaml = manifest_yaml(case, &config(), murmur_artifact::ContainmentClass::Scoped);
         assert!(yaml.contains("cgroup_pids_max: 32"));
         assert!(yaml.contains("workdir_max_bytes: 52428800"));
-        // 64, not the manual-verification document's 16: below roughly 64 the seccomp filter
-        // cannot be installed in the child's pre_exec window and every spawn fails outright.
-        // Pinned here so the value cannot drift back without the reason being re-read.
-        assert!(yaml.contains("max_open_files: 64"));
+        // 128, not the manual-verification document's 16: the child's pre_exec window has to
+        // install a seccomp filter, write uid_map/gid_map for the egress netns, and hold one
+        // Landlock grant fd per granted path, all under this ceiling. Below roughly 64 the
+        // seccomp install fails; at 64 a `sealed` capsule fails on uid_map once the
+        // `SEALED_ETC_PATHS` grants are counted (slice fb1eea97). Pinned here so the value
+        // cannot drift back down without the reason being re-read.
+        assert!(yaml.contains("max_open_files: 128"));
         assert!(yaml.contains("max_processes: 512"));
     }
 
