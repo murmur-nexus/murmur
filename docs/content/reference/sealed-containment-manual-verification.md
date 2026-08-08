@@ -449,12 +449,16 @@ touch: cannot touch '/writable-there': Read-only file system
 
 ```sh
 echo probe > /tmp/sealed-probe && cat /tmp/sealed-probe
+ls -a /tmp
 ```
 
 Expected:
 
 ```text
 probe
+.
+..
+sealed-probe
 ```
 
 Confirm from the **host** side, after the session ends, that the bytes landed in the workdir:
@@ -467,6 +471,58 @@ Expected:
 
 ```text
 probe
+```
+
+The mount alone is not enough, and this is worth checking with the tools that actually broke.
+`plan_composed_root` has bind-mounted `.mur-tmp` at `/tmp` read-write since the composed root
+existed, but Landlock inside the root matches an access to `/tmp/x` against the **bind's own root
+inode**, never the workdir's — so until `apply_landlock_scope` grew a rule for it, every one of
+these failed `EACCES` on a genuinely writable mount:
+
+```sh
+python3 -c "open('/tmp/probe','w').write('y')"; echo "rc=$?"; cat /tmp/probe; echo
+mktemp; echo "rc=$?"
+printf '#include <stdio.h>\nint main(void){puts("hi");return 0;}\n' > t.c; cc t.c -o t; echo "rc=$?"
+```
+
+Expected — the Python write succeeds and reads back `y`, `mktemp` prints a path under `/tmp` and
+exits 0, and `cc` exits 0 with no `Cannot create temporary file in /tmp/` line:
+
+```text
+rc=0
+y
+/tmp/tmp.IOF7QFO79k
+rc=0
+rc=0
+```
+
+!!! note "`cc t.c -o t` compiles under `sealed`; `./t` does not, and that is a different rule"
+
+    `/tmp` carries the *same* Landlock right-set as the workdir — including the `Execute` bit,
+    which is granted only when `capabilities.filesystem.workdir_exec: true`. And a capsule
+    declaring `workdir_exec: true` cannot reach `sealed` at all: it is capped at `advisory` by
+    `containment::achieved_containment_class`, so `mur run --explain-scope` reports
+    `achieved: advisory / floor met: no` for a `sealed` manifest that declares it. A real `sealed`
+    session therefore always has `workdir_exec: false`, and running the binary it just compiled —
+    from the workdir *or* from `/tmp` — is refused with `Permission denied` (rc 126). Compiling is
+    the part this page's `/tmp` grant restores; running the output is `workdir_exec`'s separate,
+    unchanged decision, verified on
+    [its own page](workdir-exec-landlock-manual-verification.md).
+
+The size guard needs no `/tmp`-specific check and must not grow one: `.mur-tmp` is an ordinary
+subdirectory of the workdir, so `resources::directory_size_bytes` already walks it. With a small
+`capabilities.resources.workdir_max_bytes` declared, filling `/tmp` past the ceiling must latch the
+same breach an oversized write straight into the workdir would:
+
+```sh
+python3 -c "open('/tmp/big','w').write('x'*4000000)"
+```
+
+Expected, on the *next* shell tool call (the guard checks on an interval, then refuses at the spawn
+boundary rather than mid-write):
+
+```text
+workdir grew to 4000000 bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
 ```
 
 ### 3e — `/proc`
@@ -811,6 +867,146 @@ changes all five resource cases report `CONTAINED` on both binaries.
 **Not run.** Step 5 (the container refusal) remains unrun on this host for the same reason as every
 earlier entry — no container runtime installed.
 
+### Run of 2026-08-08 — `/tmp` is writable inside the composed root (step 3d)
+
+A targeted run, not a re-run of steps 1–6: it records step 3d's `/tmp` claim, which **no earlier run
+on this page had ever exercised**. The 2026-08-05 entry tested step 3's writability through
+`echo hi > "$PWD/canary.txt"` only, and the 2026-08-03 run's harness stopped before Landlock
+installed. The `Expected: probe` block above was therefore aspirational, and it was wrong: it
+described a mount that was bind-mounted read-write and then denied by the Landlock ruleset installed
+inside the root, because that ruleset had a rule for the workdir and none for the `/tmp` bind.
+
+**Host.** Same machine as the 2026-08-05 and 2026-08-07 runs: `Linux 7.0.0-28-generic
+#28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04,
+`systemd-detect-virt` → `none` (bare metal, not a container), non-root (`uid=1000`),
+`kernel.apparmor_restrict_unprivileged_userns=0` so no profile was needed, `/proc/self/attr/current`
+→ `unconfined`. CPython 3.12.3, gcc 13 with `cc1` under `/usr/libexec/gcc/x86_64-linux-gnu/13`.
+Sessions launched under `systemd-run --user --scope -p Delegate=yes` (without it the launch is
+correctly refused with `E-RUN-012`) with `capabilities.resources.max_processes: 4096`. Capsule:
+`containment: sealed`, `shell.allow: [bash, python3, mktemp, cc, gcc, as, ld, cat, ls, touch,
+stat]`, one `interpreter_runtime` grant for `cc` on `/usr/libexec/gcc` (`list_dir: true`), no
+`staged_runtime`. `mur run --explain-scope` → `achieved: sealed`, `floor met: yes`; `trace.jsonl`
+`session_start` → `"containment_achieved":"sealed"`, `"workdir_exec":false`.
+
+**Before (control, `mur` built without the `/tmp` rule)** — driven through `shell::execute_shell`
+at the resolved `KernelSealed` tier, verbatim:
+
+```text
+--1-PY-WRITE--
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+PermissionError: [Errno 13] Permission denied: '/tmp/probe'
+rc=1
+--3-MKTEMP--
+mktemp: failed to create file via template ‘/tmp/tmp.XXXXXXXXXX’: Permission denied
+rc=1
+--4-CC--
+Cannot create temporary file in /tmp/: Permission denied
+rc=134
+--9-TMP-LS--
+ls: cannot open directory '/tmp': Permission denied
+rc=2
+--7-USR-WRITE--
+touch: cannot touch '/usr/testfile': Read-only file system
+--8-SHADOW--
+stat: cannot statx '/etc/shadow': No such file or directory
+```
+
+**After (the rule in place), through a real, live capsule session.** One real `bash` tool call, the
+agent's verbatim report of stdout:
+
+```text
+1 rc=0
+y
+/tmp/tmp.IOF7QFO79k
+3 rc=0
+4 rc=0
+touch: cannot touch '/usr/testfile': Read-only file system
+```
+
+(`1` is `python3 -c "open('/tmp/probe','w').write('y')"`, then `cat /tmp/probe` → `y`; `3` is
+`mktemp`; `4` is `cc t.c -o t`. The call's stderr carried one expected line —
+`bash: line 1: /usr/bin/head: Permission denied` — because the probe piped `stat` into `head`, which
+is not in `shell.allow`.)
+
+A second live call, covering the rest of 3d:
+
+```text
+--A--
+probe
+--B--
+.
+..
+sealed-probe
+--C--
+stat: cannot statx '/etc/shadow': No such file or directory
+--D--
+touch: cannot touch '/usr/testfile': Read-only file system
+--E--
+heredoc-ok
+```
+
+Host side, after both sessions ended: `<workdir>/.mur-tmp/` contained `probe` (1 byte, `y`),
+`sealed-probe` (`probe`), the `mktemp` file `tmp.IOF7QFO79k`, and — from the `cc` run — nothing left
+behind, gcc having cleaned up its own intermediates. The compiled `t` sits in the workdir proper.
+This is the bind-mount identity holding, the same way `canary.txt` demonstrated it for the workdir
+in the 2026-08-05 run.
+
+| probe | before | after | verdict |
+|---|---|---|---|
+| `python3 -c "open('/tmp/probe','w')…"` | `PermissionError: [Errno 13]` | rc 0, reads back `y` | fixed |
+| `mktemp` | `failed to create file … Permission denied` | prints `/tmp/tmp.…`, rc 0 | fixed |
+| `cc t.c -o t` | `Cannot create temporary file in /tmp/`, rc 134 | rc 0 | fixed |
+| `ls -a /tmp` | `Permission denied` | `.  ..  sealed-probe` | fixed |
+| `cat <<EOF` heredoc | (bash uses a pipe, so it never failed) | `heredoc-ok` | unchanged ✅ |
+| `touch /usr/testfile` | `Read-only file system` | `Read-only file system` | unchanged ✅ |
+| `stat /etc/shadow` | `No such file or directory` | `No such file or directory` | unchanged ✅ |
+
+**The `Execute` axis, checked in both directions.** `/tmp` gets the workdir's right-set from a
+single binding in `apply_landlock_scope`, so `Execute` on `/tmp` tracks
+`capabilities.filesystem.workdir_exec` exactly. Driven at the `KernelSealed` tier with the flag
+forced both ways (a state `mur run` itself will not produce — see the note in 3d — so it was
+resolved directly through `ShellEnforcement::resolve`):
+
+```text
+workdir_exec=false   ./t → Permission denied (rc 126)   /tmp/t2 → Permission denied (rc 126)
+workdir_exec=true    ./t → hello from cc (rc 0)         /tmp/t2 → hello from cc (rc 0)
+```
+
+Neither more nor less runnable than the workdir it is stored in, which is the whole claim: `/tmp` is
+the *same storage*, so a rule that let a binary run from `/tmp` while the workdir refused it would
+be a hole straight through `shell.allow`.
+
+**The size guard still counts `/tmp`, and needed no change.** With
+`workdir_max_bytes: 1000000` and a 4 MB write to `/tmp/big`, the existing `resources::WorkdirGuard`
+latched on its own interval and the next shell spawn was refused:
+
+```text
+[capsule-runtime] workdir grew to 4000000 bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
+latched breach: Some(WorkdirBreach { max_bytes: 1000000, observed_bytes: 4000000 })
+refused: workdir grew to 4000000 bytes, past the 1000000 byte ceiling (capabilities.resources.workdir_max_bytes)
+```
+
+**Negative control — `scoped` is untouched.** The identical capsule with `containment: scoped`, run
+through the same live shell-tool path:
+
+```text
+--A--  echo probe > /tmp/sealed-probe          rc=1   (stderr: /tmp/sealed-probe: Permission denied)
+--B--  ls -a /tmp                              ls: cannot open directory '/tmp': Permission denied
+--C--  stat /etc/shadow                        real metadata: Size 1357, Inode 894783, mode 0640
+--D--  touch /usr/testfile                     touch: cannot touch '/usr/testfile': Permission denied
+--E--  python3 -c "open('/tmp/probe','w')…"    init_fs_encoding fatal (rc=1), unrelated and pre-existing
+```
+
+and **no `.mur-tmp` directory exists in the scoped session's workdir at all** — the tier gate is on
+the fd, so `scoped` neither creates the store nor grants it. The same probe run before and after the
+change under `scoped` diffs empty modulo a CPython thread id, a pid and the elapsed time. Note the
+contrast with the sealed column and with step 6: under `scoped`, `/usr` is the host's and reports
+`Permission denied`; under `sealed` it is a read-only bind and reports `Read-only file system`.
+
+**Not run.** Step 5 (the container refusal) remains unrun on this host — still no container runtime
+installed. This entry adds nothing to it.
+
 ### Run of 2026-08-07 — directory enumeration inside the composed root (`SEALED_RUNTIME_PATHS`)
 
 A targeted run, not a re-run of steps 1–6: it records what happens for `ls` on a path that *is* one
@@ -1059,7 +1255,14 @@ root while the same paths exist and `stat` cleanly outside it.
 ### What still needs a hand-run
 
 - Step 5, on a host with a container runtime. This is the only remaining gap; every other step has
-  now been run end to end through a live capsule's shell tool (see the 2026-08-05 run above).
+  now been run end to end through a live capsule's shell tool (see the 2026-08-05 run above, and the
+  2026-08-08 run for step 3d's `/tmp` claim, which that entry had left untested).
+
+A caution this page earned the hard way: an "Expected:" block here is a claim about a mechanism, not
+evidence about one. Step 3d's `/tmp` block sat on this page for three runs, describing behaviour no
+run had produced, while the mount it described was denied by Landlock on every real host. When a
+step's expectation has not appeared verbatim in a *Recording the result* entry, treat it as
+unverified, and say so in the next entry rather than assuming an earlier run must have covered it.
 
 ## Residuals recorded here rather than buried
 
