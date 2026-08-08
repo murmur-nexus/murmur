@@ -668,6 +668,13 @@ ever declared. The same event carries `workdir_exec`, always, so a trace showing
 `containment_achieved: advisory` can be told apart from one written on a host with no Landlock:
 `workdir_exec: true` means the capsule chose it.
 
+The same `session_start` event also carries `effective_grants`: the complete report above —
+network allow, shell allow, spawn allow, env allow, interpreter runtime grants, and all — recorded
+verbatim, field for field identical to what `--explain-scope --json` prints for the same manifest
+on the same host. `containment_declared`/`containment_achieved`/`workdir_exec` stay as their own
+top-level fields for convenience; `effective_grants` is the one place a finished trace answers
+"network access to *where*, shell access to *what*" without the manifest in hand.
+
 #### `inference` { #field-inference }
 
 | Field | Type | Required | Notes |

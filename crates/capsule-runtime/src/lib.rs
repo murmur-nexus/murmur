@@ -34,7 +34,7 @@ pub mod types;
 
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_achieved_containment_for, detect_sealed_blocker, explain_scope, ScopeReport,
+    detect_sealed_blocker, explain_scope, ScopeReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, EgressNamespaceBlocker,
