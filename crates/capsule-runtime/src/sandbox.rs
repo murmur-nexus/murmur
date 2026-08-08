@@ -3604,13 +3604,14 @@ mod linux_enforce {
         // calls the same one) so there is something here to open.
         let sealed_tmp_fd = if tier == EnforcementTier::KernelSealed {
             let tmp_store = super::ensure_sealed_tmp_store(workdir)?;
-            Some(open_o_path(&tmp_store).map_err(|error| {
+            let tmp_store_file = open_o_path(&tmp_store).map_err(|error| {
                 format!(
                     "sandbox: failed to open the workdir-backed /tmp store {} for Landlock \
                      scoping: {error}",
                     tmp_store.display()
                 )
-            })?)
+            })?;
+            Some(OwnedFd::from(tmp_store_file))
         } else {
             None
         };
