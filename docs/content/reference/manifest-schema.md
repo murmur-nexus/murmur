@@ -521,6 +521,52 @@ which is exactly the case an operator is inspecting.
 For the hand-run verification procedure, including the bind-mount-vs-copy cost measurement, see
 [Staged runtime bind mount: manual verification](staged-runtime-bind-mount-manual-verification.md).
 
+#### Under `sealed`, a missing grant is caught at launch { #sealed-reachability-checks }
+
+Staging a `shell.allow` binary's own ELF dependency closure into the composed root is necessary for
+that binary to run, and for two kinds of program it is not sufficient. Both used to launch cleanly
+and then fail many turns into a run; under a declared `sealed` floor both are now decided at
+staging, before any registry pull, artifact compile or workdir creation.
+
+**An interpreted entrypoint refuses with `E-CAP-006`.** A console script such as `pip` at
+`~/.local/bin/pip` is a `#!` script, not an ELF image, so its dependency closure is *empty* — the
+staging that makes `/usr/bin/bash` work stages nothing at all of what the script imports, and the
+package it needs (`~/.local/lib/python3.12/site-packages/pip`) is a different directory nothing
+derives. Under `sealed`, `mur run` now refuses unless one of the following holds: the script
+already resolves under a fixed sealed runtime path (`/usr`, `/bin`, …), or it lives inside a
+directory a `staged_runtime`/`interpreter_runtime` grant already names, or some such grant names
+the script or its shebang interpreter:
+
+```text
+error[E-CAP-006]: capabilities.shell.allow grants 'pip' (/home/dev/.local/bin/pip, a script run by 'python3') under the 'sealed' containment floor, but nothing declared makes the interpreted entrypoint's own package tree reachable inside the composed root — ...
+  hint: declare `capabilities.shell.interpreter_runtime` (or `staged_runtime`) for the interpreter named above, listing the directories its import machinery actually reads — measure them on this host with `strace -f -e trace=openat,getdents64 <the command>` rather than guessing ...
+```
+
+The name match is deliberately loose, and the guarantee is correspondingly narrow: declaring
+`interpreter_runtime` for `python3` satisfies every `python3` script, whatever directories the
+grant names. murmur does not try to derive an interpreted program's import closure — `sys.path`,
+`.pth` files and whatever the script does at runtime make that undecidable in general — so this
+check verifies you declared *something*, never that the directory you declared is the right one.
+Measuring it is still yours to do, which is why the hint names the `strace` invocation.
+
+Distinguish this from `E-CAP-004` above: that one fires when a grant exists at too low a floor
+(*raise the floor*), this one when the floor is already `sealed` and no grant exists (*add a
+grant*).
+
+**A compiler driver warns with `W-SEC-012`.** `cc`/`gcc`/`g++`/`c++` fork and exec `cc1`,
+`cc1plus`, `as`, `ld` and `collect2` — separate binaries, outside the driver's own dependency
+closure, living under `/usr`, which a composed root binds read-only and grants `ReadFile +
+ReadDir` but deliberately **not** `Execute`. The driver therefore starts and the first real compile
+fails partway through. This one warns rather than refuses, because the probe behind it is a
+heuristic over a fixed driver/helper table; see
+[`W-SEC-012`](security-warnings.md#w-sec-012) for the full comparison and the fix.
+
+Both checks read only the *declared* floor, never a host probe, and are completely inert at
+`scoped` and `advisory` — below `sealed` there is no composed root, and the host filesystem is
+simply the host filesystem. `mur doctor` surfaces both ahead of a run, as warnings, without
+launching anything. For the hand-run verification of both, see
+[Shell-binary reachability under sealed: manual verification](shell-binary-reachability-manual-verification.md).
+
 ### Containment class { #field-containment }
 
 A containment class is a floor requirement — "don't launch me unless the host can actually enforce

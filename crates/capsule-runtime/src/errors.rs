@@ -2,6 +2,37 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// One `capabilities.shell.allow` entry that resolved to a script whose interpreter's package
+/// tree nothing declared could reach inside a `sealed` composed root.
+///
+/// Defined here rather than in [`crate::reachability`] — which is a `pub(crate)` module — because
+/// it is a field of a public [`RuntimeError`] variant and so has to be nameable by anything that
+/// matches on one (`murmur-cli`'s `CliError` conversion, above all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableEntrypoint {
+    /// The `capabilities.shell.allow` entry, verbatim as the manifest wrote it.
+    pub binary: String,
+    /// Where that entry resolves on this host — the first `PATH` match, i.e. the one `execvp`
+    /// would run.
+    pub resolved_path: PathBuf,
+    /// The bare interpreter name read out of the file's `#!` line, with one level of
+    /// `env NAME` indirection resolved. This is the name a covering
+    /// `interpreter_runtime`/`staged_runtime` grant would have to declare.
+    pub interpreter: String,
+}
+
+impl std::fmt::Display for UnreachableEntrypoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' ({}, a script run by '{}')",
+            self.binary,
+            self.resolved_path.display(),
+            self.interpreter
+        )
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     #[error("artifact {name}@{version} not found in registry")]
@@ -131,6 +162,34 @@ pub enum RuntimeError {
         binaries: Vec<String>,
         declared: murmur_artifact::ContainmentClass,
     },
+
+    /// A `sealed` capsule allowlists a script whose interpreter's package tree nothing declared
+    /// could make reachable inside the composed root.
+    ///
+    /// Deliberately distinct from [`Self::StagedRuntimeRequiresSealed`], which it sits next to in
+    /// `stage_session`: that one fires when a grant *was* declared at too low a floor, this one
+    /// fires when no grant was declared at all and the floor is already `sealed`. Their remedies
+    /// point in opposite directions — raise the floor there, add a grant here.
+    ///
+    /// `entries` names every offending allowlist entry so an operator fixing this does not have to
+    /// re-run to discover the second script, following the same precedent.
+    #[error(
+        "capabilities.shell.allow grants {} under the 'sealed' containment floor, but nothing \
+         declared makes the interpreted entrypoint's own package tree reachable inside the \
+         composed root — the script's ELF/DT_NEEDED closure is empty, so staging it stages \
+         nothing its interpreter imports, and the capsule would fail with a module-not-found \
+         error partway into a run rather than here. Declare \
+         capabilities.shell.interpreter_runtime or capabilities.shell.staged_runtime naming the \
+         interpreter (measure the real directories with \
+         `strace -f -e trace=openat,getdents64 <the command>`), or use a copy of the interpreter \
+         and its packages that already lives under a fixed sealed runtime path",
+        .entries
+            .iter()
+            .map(UnreachableEntrypoint::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    )]
+    ShellBinaryPackageUnreachable { entries: Vec<UnreachableEntrypoint> },
 
     /// A `sealed` session's composed root could not be built in the forked child, *after* the
     /// pre-launch probe reported the mechanism available.

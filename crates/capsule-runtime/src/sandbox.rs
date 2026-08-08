@@ -342,8 +342,10 @@ pub(crate) fn resolve_invoked_binary_path(binary: &str) -> String {
 }
 
 /// Testable core of [`resolve_invoked_binary_path`], with the `PATH` directory list
-/// injected.
-fn resolve_invoked_binary_path_in(binary: &str, path_dirs: &[PathBuf]) -> String {
+/// injected. `pub(crate)` because [`crate::reachability`] needs the same first-match resolution
+/// against an *injected* directory list — its own unit tests point `PATH` at a temp directory of
+/// synthetic script fixtures rather than at whatever the machine running the suite has installed.
+pub(crate) fn resolve_invoked_binary_path_in(binary: &str, path_dirs: &[PathBuf]) -> String {
     let fallback = || binary.to_string();
     if binary.is_empty() {
         return fallback();

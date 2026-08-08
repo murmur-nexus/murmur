@@ -82,6 +82,20 @@ pub const W_SEC_010: &str = "W-SEC-010";
 /// Fires once, at staging, only for a capsule that declared it.
 pub const W_SEC_011: &str = "W-SEC-011";
 
+/// A `sealed` capsule's `capabilities.shell.allow` names a known compiler driver (`cc`, `gcc`,
+/// `g++`, `c++`) whose helper subprocess — `cc1`, `cc1plus`, `as`, `ld`, `collect2` — has no grant
+/// carrying the Landlock `Execute` right. The driver forks and execs those helpers itself; they
+/// are separate binaries outside its own `DT_NEEDED` closure, so nothing derives them, and they
+/// live under the fixed sealed runtime tree (`/usr`, `/bin`, …), which is bind-mounted read-only
+/// and granted `list_dir: true, executable: false` — present and readable, but not runnable. The
+/// driver therefore starts, answers `--version`, and then fails partway through the first real
+/// compile. The fix is an `interpreter_runtime` or `staged_runtime` grant naming the helper's
+/// containing directory, both of which carry `Execute`. A warning rather than a refusal because
+/// the `<driver> -print-prog-name=<helper>` probe behind it is a heuristic about one driver
+/// family: a hard refusal built on it could block a capsule that would in fact have worked. Fires
+/// once per uncovered helper, at staging, only under a declared `sealed` floor.
+pub const W_SEC_012: &str = "W-SEC-012";
+
 const SECURITY_WARNINGS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
 
