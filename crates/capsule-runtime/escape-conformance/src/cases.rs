@@ -203,13 +203,16 @@ def main():
         category: Category::Boundary,
         summary: "creates a file in /tmp, outside the capsule workdir",
         attribution: "Unambiguous. /tmp is world-writable, so ordinary file permissions permit \
-                      this for any uid; only kernel filesystem mediation can refuse it. A \
-                      REFUSED verdict here is attributable to Landlock and nothing else. If the \
-                      verdict is ALLOWED the created path is named in DETAIL so it can be \
-                      removed by hand.",
+                      this for any uid; only kernel filesystem mediation can refuse it. Under \
+                      `scoped`, a REFUSED verdict here is attributable to Landlock and nothing \
+                      else. Under `sealed`, ALLOWED is the correct, intended verdict: /tmp is a \
+                      bind mount of a directory inside the session workdir \
+                      (`sealed::SEALED_TMP_DIR_NAME`), carrying the workdir's own Landlock \
+                      rights (see 646b64ee) — the write lands at the path named in DETAIL, under \
+                      the workdir, not actually outside it.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Documented(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,

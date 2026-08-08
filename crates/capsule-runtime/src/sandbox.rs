@@ -5518,9 +5518,8 @@ mod linux_integration_tests {
             EnforcementTier::EnvironmentOnly,
         ] {
             let workdir = tempfile::tempdir().unwrap();
-            let fds =
-                linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
-                    .expect("a real, writable workdir must yield Landlock fds on any tier");
+            let fds = linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
+                .expect("a real, writable workdir must yield Landlock fds on any tier");
 
             assert!(
                 fds.sealed_tmp_fd().is_none(),
