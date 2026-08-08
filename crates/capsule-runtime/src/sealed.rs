@@ -290,6 +290,34 @@ pub const SEALED_RUNTIME_PATHS: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
 ];
 
+/// One entry of the fixed `/etc` allowlist: the host path to bind, plus whether it is a directory.
+///
+/// The `directory` bit exists because the same list drives two mechanisms with different needs.
+/// [`plan_composed_root`] does not need it — it asks the host what each path is via
+/// [`HostLayout::kind`] and mirrors accordingly. `sandbox::resolve_sealed_etc_landlock_grants` does:
+/// it must decide `ReadDir` per entry, and it is required to be pure and syscall-free (it runs on
+/// any platform, for paths that need not exist). Carrying the classification *in the list* rather
+/// than in a second parallel constant is what makes the bound set and the granted set structurally
+/// incapable of drifting apart — the same reason [`SealedDevice`] carries its own `writable` bit
+/// rather than deriving it from a separate table.
+///
+/// It is a static claim about mainstream Linux, not a fact read off this host: `/etc/ssl` and
+/// friends are directories on Debian, Ubuntu, Fedora, RHEL, Arch and Alpine alike. A host that
+/// disagrees costs the entry its enumerability and nothing else — `open_landlock_fds` narrows
+/// `list_dir` back to `false` for anything that does not `fstat` as a directory, because the kernel
+/// rejects (`EINVAL`) a `ReadDir` rule on a non-directory and that would otherwise refuse the whole
+/// launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedEtcPath {
+    /// Absolute host path, bind-mounted read-only at the same path inside the composed root.
+    pub path: &'static str,
+    /// Whether this path is a directory on a mainstream Linux host, and therefore whether its
+    /// Landlock rule carries `ReadDir`. `false` for regular files and for symlinks (the symlink is
+    /// followed when the rule's fd is opened, so `/etc/localtime`'s rule lands on the zoneinfo file
+    /// it points at).
+    pub directory: bool,
+}
+
 /// The only `/etc` entries that exist inside a composed root, each bind-mounted read-only and each
 /// silently skipped when the host does not have it.
 ///
@@ -306,23 +334,29 @@ pub const SEALED_RUNTIME_PATHS: &[&str] = &[
 /// `pre_exec` window, and this module's discipline is that that window performs no work the parent
 /// could have done for it. Synthesising a two-line passwd/group in the parent is the obvious
 /// follow-up.
-pub const SEALED_ETC_PATHS: &[&str] = &[
-    "/etc/ld.so.cache",
-    "/etc/ld.so.conf",
-    "/etc/ld.so.conf.d",
-    "/etc/alternatives",
-    "/etc/ssl",
-    "/etc/pki",
-    "/etc/ca-certificates",
-    "/etc/ca-certificates.conf",
-    "/etc/resolv.conf",
-    "/etc/hosts",
-    "/etc/nsswitch.conf",
-    "/etc/localtime",
-    "/etc/timezone",
-    "/etc/terminfo",
-    "/etc/passwd",
-    "/etc/group",
+///
+/// Binding these is only half the job: Landlock still mediates *inside* the composed root, so an
+/// entry bound here but absent from the ruleset exists and is unopenable — which is how TLS
+/// verification used to fail with `EACCES` on `/etc/ssl/certs/ca-certificates.crt` despite the
+/// trust store being right there. `sandbox::resolve_sealed_etc_landlock_grants` turns this list
+/// into the matching read grants.
+pub const SEALED_ETC_PATHS: &[SealedEtcPath] = &[
+    SealedEtcPath { path: "/etc/ld.so.cache", directory: false },
+    SealedEtcPath { path: "/etc/ld.so.conf", directory: false },
+    SealedEtcPath { path: "/etc/ld.so.conf.d", directory: true },
+    SealedEtcPath { path: "/etc/alternatives", directory: true },
+    SealedEtcPath { path: "/etc/ssl", directory: true },
+    SealedEtcPath { path: "/etc/pki", directory: true },
+    SealedEtcPath { path: "/etc/ca-certificates", directory: true },
+    SealedEtcPath { path: "/etc/ca-certificates.conf", directory: false },
+    SealedEtcPath { path: "/etc/resolv.conf", directory: false },
+    SealedEtcPath { path: "/etc/hosts", directory: false },
+    SealedEtcPath { path: "/etc/nsswitch.conf", directory: false },
+    SealedEtcPath { path: "/etc/localtime", directory: false },
+    SealedEtcPath { path: "/etc/timezone", directory: false },
+    SealedEtcPath { path: "/etc/terminfo", directory: true },
+    SealedEtcPath { path: "/etc/passwd", directory: false },
+    SealedEtcPath { path: "/etc/group", directory: false },
 ];
 
 /// One entry of the private `/dev` tmpfs.
@@ -592,7 +626,7 @@ pub(crate) fn plan_composed_root(
     }
 
     // 2. The narrow /etc allowlist, read-only. Everything else under /etc simply does not exist.
-    for path in SEALED_ETC_PATHS.iter().map(Path::new) {
+    for path in SEALED_ETC_PATHS.iter().map(|entry| Path::new(entry.path)) {
         builder.mirror(path, host, /* required */ false);
     }
 

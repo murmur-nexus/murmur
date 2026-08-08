@@ -1,6 +1,6 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addendum 2026-08-07: directory enumeration inside the composed root."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake."
 
     Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
     live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
@@ -15,7 +15,10 @@
     with exact evidence, in [Recording the result](#recording-the-result). Read that section before
     treating this page as a clean pass. A later, targeted run on 2026-08-07 added the one behaviour
     no earlier run recorded — `ls` on a path that *is* one of the composed root's bind-mounted
-    runtime directories — and is recorded in the same section.
+    runtime directories — and is recorded in the same section. A second targeted run on 2026-08-08
+    did the same for the composed root's `/etc` allowlist, where the same mounted-but-denied defect
+    was breaking TLS certificate verification; it is the first entry under Recording the result and
+    carries a completed `pip install` over a verified HTTPS connection.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
@@ -602,6 +605,211 @@ If step 3a's output is identical under both classes, the probes are not measurin
 claims and the result must not be recorded as a pass.
 
 ## Recording the result
+
+### Run of 2026-08-08 — reading the composed root's `/etc` allowlist (`SEALED_ETC_PATHS`), and TLS
+
+A targeted run in the same shape as the 2026-08-07 entry below, one directory over. The composed
+root bind-mounts sixteen curated `/etc` entries read-only and the Landlock ruleset installed inside
+that root then denied every one of them. What that broke, visibly, was **TLS certificate
+verification**: the trust store was mounted and unreadable, so `pip`, `curl` and anything else that
+opens `/etc/ssl/certs/ca-certificates.crt` by name failed against hosts the manifest had explicitly
+allowed. Earlier entries on this page recorded `ls /etc` as `Permission denied` and read it as
+containment holding; it was, but it was also hiding this.
+
+**Host.** Same machine as the 2026-08-05 and 2026-08-07 runs: `Linux 7.0.0-28-generic
+#28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04,
+`systemd-detect-virt` → `none` (bare metal), non-root `uid=1000`, `/proc/self/attr/current` →
+`unconfined`, `kernel.apparmor_restrict_unprivileged_userns=0` so no profile was needed. CPython
+3.12.3, curl 8.5.0, OpenSSL 3.0.13.
+
+**Harness.** Real, live capsule sessions through the built `mur` binary, with
+`inference.transport: process` pointed at the escape-conformance package's `probe-driver` — the
+same route that package documents, so the tool call runs through
+`CapsuleStoreState::dispatch_agent_tool_async`, the real Landlock ruleset and the real seccomp
+filter, with only the *choice* of command scripted. Each session under `systemd-run --user --scope
+--property=Delegate=yes`. Two binaries built from the same worktree and kept side by side:
+`mur-before` (branch point) and `mur-after` (the grant in place).
+
+**Capsule.** `containment: sealed`; `shell.allow: [bash, python3, ls, cat, touch, curl]`;
+`network.allow: [https://pypi.org, https://files.pythonhosted.org]`; `interpreter_runtime` for
+`python3` only. `mur run --explain-scope` → `declared: sealed`, `achieved: sealed`, `floor met:
+yes`, `mechanism: mountns+pivot_root+landlock+seccomp`. `trace.jsonl` `session_start` →
+`"containment_declared":"sealed","containment_achieved":"sealed"`.
+
+#### Before — the reported bug, reproduced verbatim
+
+```text
+--1-CA-BUNDLE-READ--
+PermissionError: [Errno 13] Permission denied                    rc=1
+--2-TLS-PYTHON-EXPLICIT-BUNDLE--
+PermissionError: [Errno 13] Permission denied                    rc=1
+--3-TLS-CURL--
+curl: (77) error setting certificate file: /etc/ssl/certs/ca-certificates.crt
+http_code=000                                                    rc=77
+--4-LS-SSL-CERTS--
+ls: cannot open directory '/etc/ssl/certs': Permission denied
+--5-LISTDIR-COUNTS--
+LIST FAIL /etc/ssl                 [Errno 13] Permission denied: '/etc/ssl'
+LIST FAIL /etc/ssl/certs           [Errno 13] Permission denied: '/etc/ssl/certs'
+LIST FAIL /etc/alternatives        [Errno 13] Permission denied: '/etc/alternatives'
+LIST FAIL /etc/ca-certificates     [Errno 13] Permission denied: '/etc/ca-certificates'
+LIST FAIL /etc/pki                 [Errno 13] Permission denied: '/etc/pki'
+LIST FAIL /etc/ld.so.conf.d        [Errno 13] Permission denied: '/etc/ld.so.conf.d'
+LIST FAIL /etc/terminfo            [Errno 13] Permission denied: '/etc/terminfo'
+--6-FILE-ENTRIES--
+OPEN FAIL /etc/ld.so.cache         [Errno 13] Permission denied
+OPEN FAIL /etc/ld.so.conf          [Errno 13] Permission denied
+OPEN FAIL /etc/ca-certificates.conf [Errno 13] Permission denied
+OPEN FAIL /etc/hosts               [Errno 13] Permission denied
+OPEN FAIL /etc/nsswitch.conf       [Errno 13] Permission denied
+OPEN ok   /etc/localtime           bytes=246
+OPEN FAIL /etc/timezone            [Errno 13] Permission denied
+OPEN FAIL /etc/passwd              [Errno 13] Permission denied
+OPEN FAIL /etc/group               [Errno 13] Permission denied
+OPEN FAIL /etc/resolv.conf         [Errno 2] No such file or directory
+--7-GETPWUID--
+KeyError: 'getpwuid(): uid not found: 1000'                      rc=1
+```
+
+and `pip`, which is the card's own acceptance criterion:
+
+```text
+WARNING: Retrying (Retry(total=4, …)) after connection broken by
+  'SSLError(PermissionError(13, 'Permission denied'))': /simple/six/
+Could not fetch URL https://pypi.org/simple/six/: There was a problem confirming the ssl
+  certificate: … (Caused by SSLError(PermissionError(13, 'Permission denied'))) - skipping
+ERROR: No matching distribution found for six==1.17.0                rc=1
+```
+
+#### After — same capsule, same commands
+
+```text
+--1-CA-BUNDLE-READ--   loaded, x509=121                          rc=0
+--2-TLS-PYTHON-EXPLICIT-BUNDLE--
+  handshake-ok cipher=TLS_AES_128_GCM_SHA256 peer-CN=pypi.org     rc=0
+--3-TLS-CURL--         http_code=200                             rc=0
+--4-LS-SSL-CERTS--
+total 1156
+drwxr-xr-x 1 nobody nogroup   9960 Jul 26 17:23 .
+drwxr-xr-x 1 nobody nogroup     46 Aug  2 06:43 ..
+lrwxrwxrwx 1 nobody nogroup     23 Feb  9 19:20 002c0b4f.0 -> GlobalSign_Root_R46.pem
+lrwxrwxrwx 1 nobody nogroup     24 Feb  9 19:20 0179095f.0 -> BJCA_Global_Root_CA1.pem
+(total lines=248)
+--5-LISTDIR-COUNTS--
+LIST ok   /etc/ssl                 entries=3
+LIST ok   /etc/ssl/certs           entries=245
+LIST ok   /etc/alternatives        entries=117
+LIST ok   /etc/ca-certificates     entries=1
+LIST ok   /etc/pki                 entries=2
+LIST ok   /etc/ld.so.conf.d        entries=3
+LIST ok   /etc/terminfo            entries=1
+--6-FILE-ENTRIES--
+OPEN ok   /etc/ld.so.cache         bytes=68131
+OPEN ok   /etc/ld.so.conf          bytes=34
+OPEN ok   /etc/ca-certificates.conf bytes=6862
+OPEN ok   /etc/hosts               bytes=220
+OPEN ok   /etc/nsswitch.conf       bytes=594
+OPEN ok   /etc/localtime           bytes=246
+OPEN ok   /etc/timezone            bytes=15
+OPEN ok   /etc/passwd              bytes=2910
+OPEN ok   /etc/group               bytes=1102
+OPEN FAIL /etc/resolv.conf         [Errno 2] No such file or directory
+--7-GETPWUID--        getpwuid=agape                             rc=0
+```
+
+```text
+Collecting six==1.17.0
+  Downloading six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Downloading six-1.17.0-py2.py3-none-any.whl (11 kB)
+Installing collected packages: six
+Successfully installed six-1.17.0                                    rc=0
+six 1.17.0 from <workdir>/site/six.py                                rc=0
+```
+
+**A real `pip install` from a real index over a verified TLS connection.** That is the card's
+manual-acceptance criterion, met.
+
+#### The boundary, re-checked in the same session
+
+| probe | before | after | verdict |
+|---|---|---|---|
+| `ls /etc` (the root's own `/etc`, not a mounted entry) | `Permission denied` | `Permission denied` | unchanged ✅ |
+| `cat /etc/shadow` | `No such file or directory` | `No such file or directory` | unchanged ✅ |
+| `cat /etc/ssh/sshd_config` | `No such file or directory` | `No such file or directory` | unchanged ✅ |
+| `touch /etc/hosts` | `Permission denied` | `Permission denied` | unchanged ✅ |
+| `open('/etc/hosts','w')` | `[Errno 30] Read-only file system` | `[Errno 30] Read-only file system` | unchanged ✅ |
+| `touch /etc/ssl/certs/evil.crt` | `Read-only file system` | `Read-only file system` | unchanged ✅ |
+| `/etc/alternatives/awk --version` | `Permission denied` (126) | `Permission denied` (126) | unchanged ✅ |
+| `ls /` | `Permission denied` | `Permission denied` | unchanged ✅ |
+| `ls /root` | `No such file or directory` | `No such file or directory` | unchanged ✅ |
+| `cat /dev/sda`, `cat /var/run/docker.sock` | absent | absent | unchanged ✅ |
+
+**The `/etc/alternatives/awk` row is the one worth reading twice**, and it is the same finding the
+2026-08-07 entry recorded for `/usr`: `/etc/alternatives` is 117 symlinks into `/usr/bin`, so a
+grant that carried `Execute` would hand a `sealed` capsule a second, undeclared route to every host
+binary. It is granted `ReadFile`+`ReadDir` and no `Execute`, and `awk` — readable, listable, and
+not in `shell.allow` — still refuses to run.
+
+#### Two host-specific observations, recorded rather than generalised
+
+**`/etc/localtime` opened *before* the fix.** It is a symlink to `/usr/share/zoneinfo/…` on this
+host, and `/usr` was already granted by the 2026-08-07 runtime-tree grant, so its own rule is
+largely redundant here. On a host where `/etc/localtime` is a regular file it would not have been.
+
+**`/etc/resolv.conf` is `No such file or directory` in a composed root on this host, before and
+after.** It is a symlink to `../run/systemd/resolve/stub-resolv.conf`; `plan_composed_root`
+reproduces symlinks as symlinks, and `/run` is not mounted into the root, so the link dangles. That
+is a pre-existing property of the composed root, unrelated to this grant and unchanged by it —
+worth a follow-up, since DNS configuration is one of the things this allowlist exists to provide.
+
+**Why the trust store failed the way it did, exactly.** On Debian/Ubuntu, `/etc/ssl/certs/<hash>.0`
+are symlinks to `<Name>.pem`, which are themselves symlinks to `/usr/share/ca-certificates/…`. So
+OpenSSL's *hash-directory* lookup already resolved into `/usr` and worked before this fix — a
+`ssl.create_default_context()` handshake succeeded on this host even with `/etc/ssl` denied. What
+did not work was the *concatenated bundle*, `/etc/ssl/certs/ca-certificates.crt`, which is a real
+regular file in `/etc/ssl/certs`: `curl`'s default `CAINFO`, `pip`'s, and any explicit
+`load_verify_locations()` all name it, and all got `EACCES`. Enumerating `/etc/ssl/certs` failed
+too. So the symptom's severity is host-layout-dependent; the defect is not.
+
+#### Negative control — `scoped` is untouched
+
+The identical capsule with `containment: scoped`, run through the same path against both binaries.
+`diff` of the two full transcripts is **empty** — byte-identical, all sixteen paths still
+`Permission denied`, `getpwuid` still failing, curl still `(77)`. Under `scoped` there is no
+composed root and `/etc` is literally the host's, which is exactly what the tier gate exists to
+protect.
+
+#### Escape-conformance harness (card `4875bc97`)
+
+Run at `--class sealed` against both binaries, 28 cases each. Both exit `0` with
+`boundary: no boundary was crossed` and `resource exhaustion: every declared ceiling held`. Three
+cases change verdict, all three for the same reason and all three by design:
+
+| case | before | after |
+|---|---|---|
+| `symlink-escape` | REFUSED | ALLOWED |
+| `proc-self-cwd-reopen` | REFUSED | ALLOWED |
+| `proc-pid-root-reopen` | REFUSED | ALLOWED |
+
+All three read **`/etc/passwd`**, which is on `SEALED_ETC_PATHS` and is therefore now readable by
+declaration. `read-etc-shadow` stays REFUSED in both runs — the file that actually holds secrets is
+still absent from the root. Their `sealed` expectation was updated from `Documented(Refused)` to
+`Documented(Allowed)` so the record stays truthful; they are `Documented`, i.e. recorded and not
+graded, so nothing about pass/fail changed.
+
+The harness also needed one calibration change, which is a genuine consequence of this slice and is
+recorded here rather than buried: its `TightResources` profile declared
+`max_open_files: 64`, and sixteen more Landlock grant fds held open across the child's `pre_exec`
+window put a `sealed` capsule back over that ceiling. Every resource case failed with
+`sandbox: shell enforcement setup failed before exec: egress-netns: writing uid_map/gid_map failed`
+instead of reporting its ceiling. Bisected by hand on this host with a `[bash, python3]` sealed
+capsule: **refused at 64, spawns at 72**. The profile is now `128`, and the `resource-fd-exhauster`
+case grades against the ceiling the child reads back from its own `RLIMIT_NOFILE` rather than
+against a constant, so the next move of that number cannot silently mis-grade it. With those two
+changes all five resource cases report `CONTAINED` on both binaries.
+
+**Not run.** Step 5 (the container refusal) remains unrun on this host for the same reason as every
+earlier entry — no container runtime installed.
 
 ### Run of 2026-08-07 — directory enumeration inside the composed root (`SEALED_RUNTIME_PATHS`)
 

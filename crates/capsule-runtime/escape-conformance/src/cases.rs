@@ -34,7 +34,7 @@ use crate::verdict::{Category, Expectation, Verdict};
 use murmur_artifact::ContainmentClass;
 
 use Expectation::{Documented, Must, NotAsserted};
-use Verdict::{Contained, Refused, Succeeded};
+use Verdict::{Allowed, Contained, Refused, Succeeded};
 
 /// Work the harness performs on the host, before `mur run`, to set a case up.
 ///
@@ -264,10 +264,11 @@ def main():
                       checked against the *target* path. Creating the link is expected to \
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
-                      is never mistaken for a contained read.",
+                      is never mistaken for a contained read.\
+                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Documented(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -389,10 +390,11 @@ def main():
                       control (ordinary /proc files carry no grant and are expected to be EACCES) \
                       are both reported in DETAIL as context — the same distinction \
                       subprocess-fd-hygiene-verification.md's 'Why not /proc/self/fd' section \
-                      exists to make.",
+                      exists to make.\
+                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Documented(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -425,10 +427,11 @@ def main():
         attribution: "Same /proc-reachability control as the other two /proc cases. /proc/<pid>/root \
                       is the alias that would defeat a chroot-shaped boundary; against a Landlock \
                       ruleset it is only another path, and it is expected to be refused because \
-                      /proc carries no grant.",
+                      /proc carries no grant.\
+                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Documented(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -1195,12 +1198,15 @@ def main():
                       from the probe file rather than the trace: RLIMIT_NOFILE fails an open() \
                       inside the child with EMFILE and kills nothing, so there is no \
                       parent-visible signal to attribute and the runtime does not invent one. \
-                      The evidence is the count — it must be far below the 1024 default, never in \
-                      the 1000s. Asserted at `advisory` too, since setrlimit applies on every \
+                      The evidence is the count, graded against the ceiling the child reads back \
+                      from its own RLIMIT_NOFILE rather than against a constant — it must land at \
+                      or under that ceiling, and the ceiling itself must be far below the 1024 \
+                      default. Asserted at `advisory` too, since setrlimit applies on every \
                       Unix platform. Lifted from scenario 1, but with the declared ceiling raised \
-                      from that document's 16 to 64: see the comment on the tight resources block \
+                      from that document's 16 to 128: see the comment on the tight resources block \
                       in runner.rs, where 16 is shown to make every spawn fail outright rather \
-                      than bound anything.",
+                      than bound anything, and where 64 is shown to have stopped being enough \
+                      once slice fb1eea97 added the `SEALED_ETC_PATHS` grant fds.",
         advisory: Must(Contained),
         scoped: Must(Contained),
         sealed: Documented(Contained),
@@ -1209,6 +1215,8 @@ def main():
         profile: Profile::TightResources,
         body: r#"
 def main():
+    import resource
+    ceiling = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
     opened = []
     try:
         for i in range(4096):
@@ -1220,13 +1228,20 @@ def main():
                 os.close(fd)
             except OSError:
                 pass
-        if count < 100:
-            verdict("CONTAINED", "open() failed with %s after %d descriptors -- the declared "
-                                 "max_open_files ceiling bit, not the 1024 default"
-                                 % (en(exc), count))
+        # Graded against the ceiling the capsule actually declared, read back from the child's
+        # own RLIMIT_NOFILE, rather than against a magic number calibrated for one manifest:
+        # `max_open_files` has had to move twice already (16 -> 64 -> 128, see the tight
+        # resources block in runner.rs), and each move silently invalidated a fixed threshold.
+        # Two conditions, and both matter: EMFILE arrived at or under the declared ceiling, and
+        # that ceiling is itself well below the 1024 default this case exists to rule out.
+        if count <= ceiling and ceiling < 512:
+            verdict("CONTAINED", "open() failed with %s after %d descriptors, at or under the "
+                                 "declared max_open_files ceiling of %d -- not the 1024 default"
+                                 % (en(exc), count, ceiling))
         else:
-            verdict("UNCONTAINED", "open() failed with %s only after %d descriptors -- far past "
-                                   "the declared max_open_files ceiling" % (en(exc), count))
+            verdict("UNCONTAINED", "open() failed with %s after %d descriptors, against a "
+                                   "declared max_open_files ceiling of %d -- the ceiling did "
+                                   "not bound it" % (en(exc), count, ceiling))
         return
     for fd in opened:
         os.close(fd)
