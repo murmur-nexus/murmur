@@ -2,7 +2,7 @@
 
 Every containment claim murmur makes — Landlock scoping, seccomp filtering, `pivot_root` onto a
 composed root, cgroup v2 resource ceilings, file-descriptor hygiene across `exec` — is a claim about
-what a *kernel* does. Four of those claims are verified by a person, by hand, against a real Linux
+what a *kernel* does. Five of those claims are verified by a person, by hand, against a real Linux
 host, and those procedures are not published as part of this site.
 
 This page exists so that you can find them anyway, know what each one covers, and know what has
@@ -45,6 +45,7 @@ that one holds.
 | **Resource limits — manual verification** | The three mechanisms bounding the native subprocess tree: `setrlimit(2)` per-process ceilings, the cgroup v2 scope (fork bomb, memory hog, CPU, I/O), and the periodic workdir-size check. Ten scenarios, including the `E-RUN-012` fail-closed launch refusal and the macOS gap behind `W-SEC-010`. | On a Linux host with systemd user cgroup delegation configured, whenever `capabilities.resources` enforcement or the cgroup delegation path changes. |
 | **Subprocess fd hygiene — verification** | The negative property that a descriptor open in the runtime process at spawn time is not visible inside the spawned child, across both spawn paths (shell tool and native tool), on both kernel tiers. Landlock cannot substitute for this: an inherited fd was opened before the ruleset existed. | Whenever either spawn path's `pre_exec` window changes. **Status: pending** — implemented and compiling, never executed on a real Linux host. |
 | **Workdir `Execute` rights and declared `workdir_exec` — manual verification** | That `capabilities.shell.allow` is *complete*: with the default `capabilities.filesystem.workdir_exec: false`, a binary planted in the session workdir under an allowlisted basename does not execute, because the workdir's Landlock rule carries no `Execute` right. Also the declared opt-in's whole visible surface — the binary runs, the achieved class drops to `advisory`, `--explain-scope` and `trace.jsonl` say so, and `containment: scoped` alongside it refuses with `E-CAP-003`. | Whenever the workdir grant's right set, the exec-grant derivation, or the tier→class mapping changes. |
+| **Shell-binary reachability under `sealed` — manual verification** | That a `capabilities.shell.allow` grant which cannot actually *function* inside a composed root fails at launch rather than deep in a run: the `E-CAP-006` refusal for an interpreted entrypoint whose package tree nothing declared reaches, the `W-SEC-012` warning for a compiler driver whose `cc1`/`as`/`ld` helpers have no `Execute` grant, and the two negative controls — a system `/usr` interpreter that needs no grant, and a declared `interpreter_runtime` that makes a real compile succeed. | Whenever the reachability checks, the fixed sealed runtime tree's right set, or the known-driver registry changes. |
 | **Seccomp-notify TOCTOU audit** | A recorded architectural verdict, not a pass/fail run: a seccomp-notify supervisor read `execve`/`execveat`/`connect`/`sendto` pointer arguments out of the notifying task's memory and then answered `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, so the kernel dereferenced the same pointer again after the decision. A hostile multithreaded subprocess could have one decision computed and a different one enforced. Ships with race probes that reproduce it. **Both halves of that supervisor have since been deleted** — network enforcement moved to a namespace + egress proxy, exec enforcement to Landlock `Execute` rights — so this is now a historical record of why, not a description of live code. | Closed. Re-open it only if a `Notify` rule is ever added back to `install_seccomp_filter`. |
 
 ### The `sealed` release gate
@@ -74,6 +75,8 @@ The documents live in the repository, at the paths below, on the `main` branch:
   [`docs/content/reference/subprocess-fd-hygiene-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/subprocess-fd-hygiene-verification.md)
 - **Workdir `Execute` rights and declared `workdir_exec` — manual verification** —
   [`docs/content/reference/workdir-exec-landlock-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md)
+- **Shell-binary reachability under `sealed` — manual verification** —
+  [`docs/content/reference/shell-binary-reachability-manual-verification.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md)
 - **Seccomp-notify TOCTOU audit** —
   [`docs/content/reference/seccomp-notify-toctou-audit.md`](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/seccomp-notify-toctou-audit.md)
 

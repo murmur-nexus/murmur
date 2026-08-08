@@ -37,6 +37,7 @@ pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared s
 pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared containment class
 pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a sealed containment floor
 pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree its own network namespace
+pub const E_CAP_006: &str = "E-CAP-006"; // sealed capsule allowlists a script whose interpreter's package tree nothing declared reaches
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -267,6 +268,24 @@ impl From<RuntimeError> for CliError {
                  into, or remove the capabilities.shell.staged_runtime grant. Run `mur run \
                  --explain-scope` to see the declared grants and whether this host can back \
                  `sealed` — see docs/content/reference/manifest-schema.md",
+            ),
+            // Sits next to E-CAP-004 and is deliberately not it: that one means a grant was
+            // declared at too low a floor (raise the floor, or drop the grant), this one means the
+            // floor is already `sealed` and no grant was declared at all for a script that needs
+            // one (add a grant). Handing an operator E-CAP-004's "raise the floor" advice here
+            // would send them to change the one thing that is already correct.
+            error @ RuntimeError::ShellBinaryPackageUnreachable { .. } => CliError::with_hint(
+                E_CAP_006,
+                error.to_string(),
+                "declare `capabilities.shell.interpreter_runtime` (or `staged_runtime`) for the \
+                 interpreter named above, listing the directories its import machinery actually \
+                 reads — measure them on this host with \
+                 `strace -f -e trace=openat,getdents64 <the command>` rather than guessing, since \
+                 murmur deliberately does not try to derive an interpreted program's import \
+                 closure. Alternatively point `capabilities.shell.allow` at a copy that already \
+                 lives under a fixed sealed runtime path (a distro `/usr/bin` interpreter and its \
+                 system packages need no grant at all). See \
+                 docs/content/reference/manifest-schema.md",
             ),
             // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
             // with another: this one is not about the containment ladder at all. A network
@@ -617,6 +636,41 @@ mod tests {
         assert!(
             hint.contains("sealed") && hint.contains("--explain-scope"),
             "hint should name the floor to set and how to inspect it: {hint}"
+        );
+    }
+
+    /// The third member of the same family, and the one most easily confused with `E-CAP-004`:
+    /// both are pre-launch refusals about a `sealed` capsule's runtime staging. `E-CAP-004` fires
+    /// when a grant exists at too low a floor and says *raise the floor*; this one fires when the
+    /// floor is already `sealed` and no grant exists at all, and says *add a grant*. An operator
+    /// handed `E-CAP-004`'s advice here would go and change the one thing already correct, so the
+    /// codes and the hints are asserted to be distinct.
+    #[test]
+    fn an_unreachable_interpreted_entrypoint_has_its_own_code_and_names_the_measurement() {
+        let cli = CliError::from(RuntimeError::ShellBinaryPackageUnreachable {
+            entries: vec![capsule_runtime::UnreachableEntrypoint {
+                binary: "pip".to_string(),
+                resolved_path: std::path::PathBuf::from("/home/dev/.local/bin/pip"),
+                interpreter: "python3".to_string(),
+            }],
+        });
+
+        assert_eq!(cli.code, E_CAP_006);
+        assert_ne!(
+            cli.code, E_CAP_004,
+            "a missing grant at sealed is not a grant declared below sealed"
+        );
+        for expected in ["pip", "/home/dev/.local/bin/pip", "python3"] {
+            assert!(
+                cli.message.contains(expected),
+                "message should name {expected}: {}",
+                cli.message
+            );
+        }
+        let hint = cli.hint.as_deref().unwrap_or_default();
+        assert!(
+            hint.contains("interpreter_runtime") && hint.contains("strace"),
+            "hint should name the grant to declare and how to measure its directories: {hint}"
         );
     }
 }

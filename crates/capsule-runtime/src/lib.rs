@@ -21,6 +21,7 @@ pub(crate) mod network_policy;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod plan;
+pub(crate) mod reachability;
 pub mod resources;
 pub mod runtime;
 pub(crate) mod sandbox;
@@ -40,7 +41,15 @@ pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, EgressNamespaceBlocker,
 };
 pub use sealed::SealedBlocker;
-pub use errors::RuntimeError;
+// `reachability` is a private module, but both of its entry points are consumed from
+// `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the
+// same facade shape `check_staged_runtime_floor` has, without making the module's internals
+// (`shebang_interpreter_name`, the probe, the prefix helpers) part of any crate's API.
+pub use reachability::{
+    check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
+    ToolchainHelperWarning,
+};
+pub use errors::{RuntimeError, UnreachableEntrypoint};
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 pub use resources::HostResourceLimits;

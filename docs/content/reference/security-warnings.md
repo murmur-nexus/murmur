@@ -747,6 +747,78 @@ Nothing in CI is evidence either way: this repo's CI never resolves to the Full 
 
 ---
 
+## W-SEC-012 — A compiler driver's toolchain has no `Execute` grant { #w-sec-012 }
+
+**Fires when:** the capsule's declared containment floor is
+[`sealed`](manifest-schema.md#field-containment) **and** `capabilities.shell.allow` names a known
+compiler driver — `cc`, `gcc`, `g++`, `c++` — whose helper binaries have no grant carrying the
+Landlock `Execute` right. Once per uncovered helper, at staging, on stderr, before any registry
+pull or workdir creation. Also printed by `mur doctor`, which never launches anything.
+
+**Why it matters:** `cc` compiles nothing. It forks and execs a front end (`cc1` for C, `cc1plus`
+for C++), an assembler (`as`), a linker (`ld`) and a linker wrapper (`collect2`). Those are
+separate binaries, and none of them appears in `cc`'s own `DT_NEEDED` closure — so the derivation
+that stages an allowlisted binary's shared libraries into the composed root stages none of them.
+
+They are still *present* inside the root, because they live under `/usr`, which
+[`sealed`](manifest-schema.md#field-containment) bind-mounts read-only into every composed root.
+What they do not have is permission to run: that fixed tree is granted `ReadFile + ReadDir` and
+deliberately **not** `Execute`, because it is the one grant covering whole host trees the manifest
+never named — it has to make them readable without making them runnable. The result is a capsule
+where `cc --version` prints a version and the first real compile dies partway through, with an
+exec failure on a path that is demonstrably right there.
+
+**Example.** A capsule declaring `containment: sealed` and `shell.allow: [cc]` on a Debian-family
+host gets, at staging:
+
+```text
+[capsule-runtime] warning[W-SEC-012]: capabilities.shell.allow grants the compiler driver 'cc',
+but its helper 'cc1' at /usr/libexec/gcc/x86_64-linux-gnu/13/cc1 has no grant carrying the
+Landlock Execute right under the 'sealed' composed root — ...
+```
+
+**What to do:** declare an
+[`interpreter_runtime`](manifest-schema.md#field-capabilities) (or
+[`staged_runtime`](manifest-schema.md#field-staged-runtime)) grant for the driver, naming the
+directories its helpers live in. Both grant shapes carry `Execute`, which is exactly what is
+missing. Measure the directories on the host rather than guessing them:
+
+```bash
+cc -print-prog-name=cc1        # /usr/libexec/gcc/x86_64-linux-gnu/13/cc1
+cc -print-prog-name=as         # `as` — deferred to PATH, i.e. /usr/bin/as
+```
+
+The warning itself names the helper's containing directory, so the common case is a copy-paste.
+
+**Why this is a warning and not a refusal.** The check is a probe, not a measurement of what the
+driver will actually do: it asks a fixed list of helper names via `-print-prog-name=`, which is a
+GCC-driver convention, and reasons about a fixed list of four driver names. A capsule may compile
+successfully without every probed helper — a link-only workload never reaches `cc1` — and a driver
+family outside the list is not probed at all. Refusing a launch on that basis would block capsules
+that would have worked, to prevent a failure the operator can now see coming. Compare
+[`E-CAP-006`](#w-sec-012-vs-e-cap-006) below, which *is* a refusal, because there the evidence is
+categorical rather than heuristic.
+
+### Not to be confused with `E-CAP-006` { #w-sec-012-vs-e-cap-006 }
+
+Both fire only under a declared `sealed` floor, and both are about a `shell.allow` binary that
+starts and then cannot finish. They differ in what is known:
+
+| | `E-CAP-006` (refusal) | `W-SEC-012` (warning) |
+|---|---|---|
+| Trigger | an allowlisted `#!` script with no covering grant | an allowlisted compiler driver with an uncovered helper |
+| Evidence | categorical — a script's ELF closure is *empty*, so staging it stages nothing it imports | heuristic — a `-print-prog-name=` probe over a fixed driver/helper table |
+| Failure it predicts | `ModuleNotFoundError` inside the root (ENOENT-class, not a denial) | an exec failure partway through a compile |
+| Outcome | launch refused before any registry pull | launch proceeds, operator warned |
+
+**Verification.** That an uncovered `cc` really does fail a compile inside a composed root, and
+that declaring the grant really does fix it, is checked by hand on bare-metal `sealed`-capable
+Linux hardware — see
+[shell-binary reachability manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md).
+Nothing in CI is evidence either way: this repo's CI never resolves to the sealed tier.
+
+---
+
 ## Manual acceptance procedure — workdir device-node escape { #manual-acceptance-device-node }
 
 This procedure confirms the two mechanisms described under [W-SEC-005](#w-sec-005) — the narrowed

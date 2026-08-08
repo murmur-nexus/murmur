@@ -1,6 +1,8 @@
 use capsule_runtime::{
-    check_egress_namespace, check_staged_runtime_floor, detect_egress_namespace_blocker,
-    warn_on_interpreter_runtime_grants, warn_on_workdir_exec, ArtifactRequest,
+    capability_policy_from_runtime_manifest, check_egress_namespace,
+    check_interpreted_entrypoints_reachable, check_staged_runtime_floor,
+    detect_egress_namespace_blocker, warn_on_interpreter_runtime_grants,
+    warn_on_unreachable_toolchain_helpers, warn_on_workdir_exec, ArtifactRequest,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
@@ -11,7 +13,7 @@ use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
-use crate::error::{CliError, E_CAP_004, E_CAP_005};
+use crate::error::{CliError, E_CAP_004, E_CAP_005, E_CAP_006};
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
@@ -108,6 +110,18 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // three, a flag could only ever raise what is computed here. So this reports a warning rather
     // than a failure, and says so: the run it is predicting may still be launched with
     // `--containment sealed`.
+    //
+    // Computed once here rather than inside the `staged_runtime` branch it used to live in,
+    // because the two reachability checks below need it for *every* capsule, not only one
+    // declaring a grant.
+    let declared_floor = effective_containment_floor(
+        load_effective_mur_config_if_any_exists()?.and_then(|config| config.containment),
+        runtime_manifest
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.containment),
+        None,
+    );
     let staged_runtime = runtime_manifest
         .capabilities
         .as_ref()
@@ -115,15 +129,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         .map(|shell| shell.staged_runtime.as_slice())
         .unwrap_or_default();
     if !staged_runtime.is_empty() {
-        let floor = effective_containment_floor(
-            load_effective_mur_config_if_any_exists()?.and_then(|config| config.containment),
-            runtime_manifest
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.containment),
-            None,
-        );
-        if let Err(error) = check_staged_runtime_floor(staged_runtime, floor) {
+        if let Err(error) = check_staged_runtime_floor(staged_runtime, declared_floor) {
             eprintln!(
                 "[mur doctor] warning[{E_CAP_004}]: {error}\n  \
                  `mur run` will refuse this capsule unless the floor is raised — set \
@@ -132,6 +138,30 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             );
         }
     }
+
+    // The two stage-time reachability checks, surfaced here for the same reason as everything
+    // above: finding out from `mur doctor` that a `sealed` capsule's `pip` can never import its
+    // own package beats finding it out from a `ModuleNotFoundError` several agent turns into a
+    // run. Both resolve `shell.allow` against this host's real `PATH` and read real files, but
+    // neither creates a session workdir nor contacts a registry, so they belong in doctor's
+    // manifest-only prologue rather than in its artifact loop below.
+    //
+    // The first is an `Err` at `mur run` and a warning here, following the `E-CAP-004` precedent
+    // three lines up: doctor never launches, so it has nothing to refuse, and aborting the rest of
+    // the checklist over it would hide every artifact problem behind one capability problem.
+    let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
+    if let Err(error) = check_interpreted_entrypoints_reachable(&capability_policy, declared_floor)
+    {
+        eprintln!(
+            "[mur doctor] warning[{E_CAP_006}]: {error}\n  \
+             `mur run` will refuse this capsule at the declared floor — declare the grant above, \
+             or lower `capabilities.containment` if this capsule does not need a composed root."
+        );
+    }
+    // The second already prints its own `W-SEC-012` line, in the same words `mur run` uses, so
+    // there is nothing to reformat here — the return value is only for callers that want to
+    // inspect what was warned about.
+    let _ = warn_on_unreachable_toolchain_helpers(&capability_policy, declared_floor);
 
     // Same reasoning again, for the mechanism that replaced the seccomp connect/sendto
     // interception: a capsule that can spawn a native subprocess needs a network namespace to put

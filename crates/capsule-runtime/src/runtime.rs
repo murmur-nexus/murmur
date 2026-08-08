@@ -326,6 +326,16 @@ pub fn stage_session(
         &request.capability_policy.shell_staged_runtime,
         request.declared_containment_floor,
     )?;
+    // The same question as the line above, asked of the other half of the same gap. That one
+    // catches a grant declared at too low a floor; this one catches a `sealed` capsule that
+    // declared no grant at all for a `shell.allow` entry that provably needs one — a `#!` script,
+    // whose ELF/DT_NEEDED closure is empty, so the staging that makes an ELF binary work stages
+    // nothing at all of what the script imports. Same declared-floor-only gating, same
+    // pre-registry-pull position, same "name every offender once" refusal shape.
+    crate::reachability::check_interpreted_entrypoints_reachable(
+        &request.capability_policy,
+        request.declared_containment_floor,
+    )?;
     // A third refusal, in the same pre-staging seam and for the same fail-closed reason, but
     // about a mechanism that sits outside the containment ladder entirely: a capsule that can
     // spawn a native subprocess needs a network namespace to put it in, because that namespace —
@@ -354,6 +364,17 @@ pub fn stage_session(
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
     warn_on_workdir_exec(workdir_exec);
+    // The non-fatal half of the reachability check above. A compiler driver's helper binaries
+    // (`cc1`, `as`, `ld`, `collect2`) are exec'd by the driver itself and sit outside its own
+    // DT_NEEDED closure, inside the fixed sealed tree that is deliberately bound without the
+    // Landlock Execute right — so `cc` starts and the first real compile does not finish. This
+    // warns rather than refuses because the probe behind it is a heuristic about one driver
+    // family; see `reachability::warn_on_unreachable_toolchain_helpers`, which prints each
+    // `W-SEC-012` line itself so `mur doctor` and this call site cannot state it differently.
+    crate::reachability::warn_on_unreachable_toolchain_helpers(
+        &request.capability_policy,
+        request.declared_containment_floor,
+    );
 
     let engine = build_engine()?;
     // Start ticking before the first guest runs: `dispatch_stage` below invokes on-stage
