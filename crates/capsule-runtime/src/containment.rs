@@ -91,15 +91,11 @@ pub(crate) fn achieved_containment_class(
 ///
 /// Host-only, and deliberately still takes no capsule input: it answers "what can this machine
 /// back?", which is what `mur doctor` and the escape-conformance harness ask. A *session* asks the
-/// narrower question and must use [`detect_achieved_containment_for`] instead.
+/// narrower question and must use [`achieved_containment_class`] with its own probed tier instead
+/// — see `runtime::stage_session`, which probes the tier once and passes it to both that call and
+/// [`scope_report_for_tier`].
 pub fn detect_achieved_containment() -> ContainmentClass {
     achieved_class_for_tier(detect_enforcement_tier())
-}
-
-/// [`detect_achieved_containment`] narrowed by one capsule's `workdir_exec` declaration — the
-/// launch-path entry point, used by `runtime::stage_session`.
-pub fn detect_achieved_containment_for(workdir_exec: bool) -> ContainmentClass {
-    achieved_containment_class(detect_enforcement_tier(), workdir_exec)
 }
 
 /// Why `achieved` falls short of `declared`, naming the missing *mechanism* rather than the
