@@ -11,6 +11,8 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
 };
 
+use crate::containment::ScopeReport;
+
 pub(crate) struct TraceWriter {
     writer: BufWriter<File>,
     session_id: String,
@@ -18,9 +20,12 @@ pub(crate) struct TraceWriter {
     capsule_version: String,
     model: String,
     capabilities: Vec<String>,
-    containment_declared: ContainmentClass,
-    containment_achieved: ContainmentClass,
-    workdir_exec: bool,
+    /// The session's complete effective grant set, computed once at stage time. Written whole to
+    /// `session_start` as `effective_grants`, and also the source of that event's
+    /// `containment_declared`/`containment_achieved`/`workdir_exec` summary fields — they are read
+    /// off this report rather than passed in beside it, so a trace cannot claim one containment
+    /// class at the top level and another inside the report.
+    effective_grants: ScopeReport,
     include_tool_output: bool,
     session_start_time: Instant,
     session_started: bool,
@@ -80,6 +85,15 @@ struct SessionStartEvent {
     /// `session_start` would otherwise say `scoped` — and it is the record that this session's
     /// `capabilities.shell.allow` was advisory too, since anything in the workdir could run.
     workdir_exec: bool,
+    /// The complete grant set this session ran under — every destination, binary, path and
+    /// environment variable the policy actually opened, plus the probed enforcement tier — in the
+    /// exact shape `mur run --explain-scope --json` prints for the same policy on the same host.
+    ///
+    /// `capabilities` above stays what it always was: a list of category *names*. It answers "did
+    /// this session have network access?" but not "to where?", which is the question an auditor
+    /// reading a finished trace actually has. This field answers it without re-parsing the
+    /// manifest, which by then may have changed or moved.
+    effective_grants: ScopeReport,
 }
 
 #[derive(Serialize)]
@@ -282,9 +296,7 @@ impl TraceWriter {
         capsule_version: String,
         model: String,
         capabilities: Vec<String>,
-        containment_declared: ContainmentClass,
-        containment_achieved: ContainmentClass,
-        workdir_exec: bool,
+        effective_grants: ScopeReport,
         include_tool_output: bool,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
@@ -299,9 +311,7 @@ impl TraceWriter {
             capsule_version,
             model,
             capabilities,
-            containment_declared,
-            containment_achieved,
-            workdir_exec,
+            effective_grants,
             include_tool_output,
             session_start_time: Instant::now(),
             session_started: false,
@@ -336,9 +346,10 @@ impl TraceWriter {
             max_turns,
             capabilities: self.capabilities.clone(),
             tools_declared,
-            containment_declared: self.containment_declared,
-            containment_achieved: self.containment_achieved,
-            workdir_exec: self.workdir_exec,
+            containment_declared: self.effective_grants.declared_containment,
+            containment_achieved: self.effective_grants.achieved_containment,
+            workdir_exec: self.effective_grants.workdir_exec,
+            effective_grants: self.effective_grants.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -694,7 +705,30 @@ fn timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        containment::scope_report_for_tier, sandbox::EnforcementTier, types::CapabilityPolicy,
+    };
+    use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
+
+    /// A [`ScopeReport`] built the way production builds one — through
+    /// `containment::scope_report_for_tier` with an *explicit* tier, never a live probe, so these
+    /// tests assert the same values on a Landlock-capable host and a laptop that has none.
+    fn report_for(
+        declared: ContainmentClass,
+        tier: EnforcementTier,
+        workdir_exec: bool,
+    ) -> ScopeReport {
+        scope_report_for_tier(
+            &CapabilityPolicy {
+                workdir_exec_allowed: workdir_exec,
+                ..CapabilityPolicy::default()
+            },
+            declared,
+            tier,
+            None,
+        )
+    }
 
     async fn make_writer(dir: &std::path::Path) -> TraceWriter {
         make_writer_with_opts(dir, false).await
@@ -708,9 +742,11 @@ mod tests {
             "1.0.0".to_string(),
             "claude-test".to_string(),
             vec!["shell".to_string()],
-            ContainmentClass::Advisory,
-            ContainmentClass::Advisory,
-            false,
+            report_for(
+                ContainmentClass::Advisory,
+                EnforcementTier::EnvironmentOnly,
+                false,
+            ),
             include_tool_output,
         )
         .await
@@ -766,9 +802,12 @@ mod tests {
             "1.0.0".to_string(),
             "claude-test".to_string(),
             Vec::new(),
-            ContainmentClass::Advisory,
-            ContainmentClass::Advisory,
-            true,
+            // A host that could back `scoped`, capped to `advisory` by the declaration alone.
+            report_for(
+                ContainmentClass::Advisory,
+                EnforcementTier::KernelFull,
+                true,
+            ),
             false,
         )
         .await
@@ -793,9 +832,7 @@ mod tests {
             "1.0.0".to_string(),
             "claude-test".to_string(),
             Vec::new(),
-            ContainmentClass::Sealed,
-            ContainmentClass::Scoped,
-            false,
+            report_for(ContainmentClass::Sealed, EnforcementTier::KernelFull, false),
             false,
         )
         .await
@@ -806,6 +843,79 @@ mod tests {
         let events = read_events(dir.path());
         assert_eq!(events[0]["containment_declared"], "sealed");
         assert_eq!(events[0]["containment_achieved"], "scoped");
+    }
+
+    /// The card's central property: `session_start.effective_grants` is the *whole* `ScopeReport`,
+    /// serialized byte-for-byte as `mur run --explain-scope --json` prints it — not a re-derived
+    /// summary of it. Asserted by comparing against `serde_json::to_value` of the very report
+    /// handed to the writer, so any field added to `ScopeReport` later is covered without this
+    /// test being touched.
+    ///
+    /// The tier is a literal, never a probe: this asserts the recording, not the host.
+    #[tokio::test]
+    async fn session_start_records_the_whole_scope_report_as_effective_grants() {
+        let policy = CapabilityPolicy {
+            network_allow: vec!["https://api.example.com".to_string()],
+            unix_sockets_allowed: false,
+            filesystem_scope: Some("workdir".to_string()),
+            shell_allow: vec!["python3".to_string()],
+            spawn_allow: vec!["helper".to_string()],
+            env_allow: vec!["TZ".to_string()],
+            shell_interpreter_runtime: vec![InterpreterRuntimeGrant {
+                binary: "python3".to_string(),
+                dirs: vec![InterpreterRuntimeDir {
+                    path: "/usr/lib/python3.11".to_string(),
+                    list_dir: true,
+                }],
+            }],
+            ..CapabilityPolicy::default()
+        };
+        let expected = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = TraceWriter::open(
+            dir.path(),
+            "test-session-id".to_string(),
+            "test-capsule".to_string(),
+            "1.0.0".to_string(),
+            "claude-test".to_string(),
+            vec!["network".to_string(), "shell".to_string()],
+            expected.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(
+            events[0]["effective_grants"],
+            serde_json::to_value(&expected).unwrap()
+        );
+
+        // The category-name summary that predates this field is unchanged, and the three
+        // top-level containment fields agree with the report they are now read from.
+        assert_eq!(
+            events[0]["capabilities"],
+            serde_json::json!(["network", "shell"])
+        );
+        assert_eq!(events[0]["containment_declared"], "scoped");
+        assert_eq!(events[0]["containment_achieved"], "scoped");
+        assert_eq!(events[0]["workdir_exec"], false);
+        assert_eq!(
+            events[0]["effective_grants"]["network_allow"],
+            serde_json::json!(["https://api.example.com"])
+        );
+        assert_eq!(
+            events[0]["effective_grants"]["interpreter_runtime_grants"],
+            serde_json::json!(["python3: /usr/lib/python3.11 (list_dir)"])
+        );
     }
 
     #[tokio::test]

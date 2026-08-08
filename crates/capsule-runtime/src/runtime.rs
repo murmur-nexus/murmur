@@ -41,7 +41,7 @@ use crate::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
     cgroup,
-    containment::{check_containment_floor, detect_achieved_containment_for},
+    containment::{achieved_containment_class, check_containment_floor},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
@@ -291,16 +291,32 @@ pub fn stage_session(
     // host is *reported* to provide — the cap can only ever subtract (see
     // `containment::achieved_containment_class`).
     let workdir_exec = request.capability_policy.workdir_exec_allowed;
-    let achieved_containment = detect_achieved_containment_for(workdir_exec);
+    // Both host probes happen exactly once per session, right here, and every later consumer —
+    // the refusal below and the `ScopeReport` recorded in the trace — reads these two bindings.
+    // A second probe could read differently from the first (an AppArmor profile loaded, a
+    // container's capabilities changed), and the trace would then describe a session that never
+    // ran under what it claims.
+    let enforcement_tier = sandbox::detect_enforcement_tier();
+    // Probed only so the refusal can name *which* part of the sealed mechanism is missing —
+    // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself.
+    let sealed_blocker = crate::containment::detect_sealed_blocker();
+    let achieved_containment = achieved_containment_class(enforcement_tier, workdir_exec);
     check_containment_floor(
         request.declared_containment_floor,
         achieved_containment,
-        // Probed only so the refusal can name *which* part of the sealed mechanism is missing —
-        // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself. Reads
-        // the same cached host probe the tier decision above used, so the two cannot disagree.
-        crate::containment::detect_sealed_blocker(),
+        sealed_blocker,
         workdir_exec,
     )?;
+    // The complete grant set this session is about to run under, in exactly the shape
+    // `mur run --explain-scope --json` prints — same builder, same policy, same declared floor,
+    // and the same two probes taken above. Computed once here rather than at trace-open time so
+    // the record cannot drift from the decision that let the session start.
+    let scope_report = crate::containment::scope_report_for_tier(
+        &request.capability_policy,
+        request.declared_containment_floor,
+        enforcement_tier,
+        sealed_blocker,
+    );
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
     // asks for?". A `staged_runtime` grant needs a composed root to be staged into, and one is
@@ -695,7 +711,7 @@ pub fn stage_session(
         internal_port: request.internal_port,
         job_id: request.job_id,
         declared_containment_floor: request.declared_containment_floor,
-        achieved_containment,
+        scope_report,
         registry,
         _epoch_ticker: epoch_ticker,
     })
@@ -862,11 +878,11 @@ pub fn launch_session(
 
         let capsule_name = staged.capsule_name.clone();
         let capabilities = capability_names(&staged.capability_policy);
-        let containment_declared = staged.declared_containment_floor;
-        let containment_achieved = staged.achieved_containment;
-        // Read off the session's own policy rather than re-derived: `session_start` records what
-        // this session ran with, and the policy is the single place that value already lives.
-        let trace_workdir_exec = staged.capability_policy.workdir_exec_allowed;
+        // Computed once at stage time, not re-derived here: `session_start` records what this
+        // session ran with, and the staged report is the single place that value already lives.
+        // It also carries the declared/achieved classes and `workdir_exec` the event's own
+        // top-level fields are written from.
+        let effective_grants = staged.scope_report.clone();
 
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
@@ -914,9 +930,7 @@ pub fn launch_session(
                 capsule_version.clone(),
                 inference_model.clone(),
                 capabilities.clone(),
-                containment_declared,
-                containment_achieved,
-                trace_workdir_exec,
+                effective_grants,
                 trace_include_tool_output,
             )
             .await
@@ -1463,10 +1477,6 @@ pub fn launch_session(
         limits: capsule_limits.limiter(),
     };
 
-    // Copied out before `state` above took ownership of the policy, so the trace writer further
-    // down still has it. One `bool`, not a clone of the whole policy.
-    let workdir_exec = state.capability_policy.workdir_exec_allowed;
-
     let mut store = Store::new(&staged.engine, state);
     // Must precede instantiation: `Store::limiter` latches the instance/table/memory counts
     // the store enforces, and instantiation itself allocates against them.
@@ -1526,9 +1536,7 @@ pub fn launch_session(
                 staged.capsule_version.clone(),
                 String::new(),
                 Vec::new(),
-                staged.declared_containment_floor,
-                staged.achieved_containment,
-                workdir_exec,
+                staged.scope_report.clone(),
                 false,
             )
             .await
@@ -4698,9 +4706,12 @@ mod tests {
                 "0.1.0".to_string(),
                 "test-model".to_string(),
                 Vec::new(),
-                murmur_artifact::ContainmentClass::Advisory,
-                murmur_artifact::ContainmentClass::Advisory,
-                false,
+                crate::containment::scope_report_for_tier(
+                    &policy,
+                    murmur_artifact::ContainmentClass::Advisory,
+                    sandbox::EnforcementTier::EnvironmentOnly,
+                    None,
+                ),
                 false,
             )
             .await
@@ -5395,9 +5406,12 @@ mod tests {
             "0.1.0".to_string(),
             "test-model".to_string(),
             Vec::new(),
-            murmur_artifact::ContainmentClass::Advisory,
-            murmur_artifact::ContainmentClass::Advisory,
-            false,
+            crate::containment::scope_report_for_tier(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+            ),
             false,
         )
         .await

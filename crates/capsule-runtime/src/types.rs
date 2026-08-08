@@ -276,10 +276,17 @@ pub struct StagedSession {
     /// Floor this session was staged against (copied from
     /// StageRequest::declared_containment_floor).
     pub(crate) declared_containment_floor: murmur_artifact::ContainmentClass,
-    /// What the host actually provided, derived at staging time from the probed
-    /// `EnforcementTier` alone. Recorded in `trace.jsonl`'s `session_start`. Never sourced from
-    /// the manifest — see `containment::achieved_class_for_tier`.
-    pub(crate) achieved_containment: murmur_artifact::ContainmentClass,
+    /// The complete effective grant set this session was staged with — the same report
+    /// `mur run --explain-scope --json` prints, built by `containment::scope_report_for_tier`
+    /// from this session's own policy, declared floor and single host probe. Written verbatim to
+    /// `trace.jsonl`'s `session_start` as `effective_grants`, and the source of the
+    /// `containment_declared`/`containment_achieved`/`workdir_exec` fields alongside it, so the
+    /// summary and the full report cannot disagree.
+    ///
+    /// Replaces a former separate `achieved_containment` field: what the host actually provided
+    /// is `scope_report.achieved_containment`, and keeping a second copy beside it only created a
+    /// way for the two to drift.
+    pub(crate) scope_report: crate::containment::ScopeReport,
     /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,

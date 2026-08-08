@@ -446,3 +446,209 @@ fn trace_session_id_matches_staged_session() {
         );
     }
 }
+
+// ── Effective grant set on session_start ─────────────────────────────────────
+
+/// A manifest whose grants are all *non-process* ones — network destinations, a filesystem scope
+/// and an env allowlist — so the session launches on any host.
+///
+/// Deliberately no `shell.allow`/`spawn.allow`: either would make this capsule require a bounded
+/// process tree, and a host whose systemd unit has not delegated the cgroup controllers refuses
+/// the launch outright (`E-RUN-…`/`CgroupDelegationUnavailable`) before a trace is ever written.
+/// Those two categories, and `interpreter_runtime` alongside them, are covered against the same
+/// whole-object equality assertion by `trace::tests::
+/// session_start_records_the_whole_scope_report_as_effective_grants` in `capsule-runtime`, which
+/// needs no kernel at all.
+fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> PathBuf {
+    let manifest = format!(
+        concat!(
+            "name: trace-grants-test\n",
+            "version: 0.3.0\n",
+            "artifacts:\n",
+            "  - name: {driver_name}\n",
+            "    version: {driver_version}\n",
+            "    runtime: driver\n",
+            "capabilities:\n",
+            "  containment: advisory\n",
+            "  filesystem:\n",
+            "    scope: ./workdir\n",
+            "  network:\n",
+            "    allow:\n",
+            "      - {endpoint}\n",
+            "      - https://api.example.com\n",
+            "  env:\n",
+            "    allow:\n",
+            "      - MURMUR_TEST_REGION\n",
+            "inference:\n",
+            "  transport: http\n",
+            "  endpoint: {endpoint}\n",
+            "  model: test-model\n",
+            "  api_key: test-key\n",
+            "  driver:\n",
+            "    artifact: {driver_name}\n",
+        ),
+        driver_name = DRIVER_NAME,
+        driver_version = DRIVER_VERSION,
+        endpoint = endpoint,
+    );
+    fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
+    project_dir.join("murmur.yaml")
+}
+
+/// The card's headline property, end to end: `session_start.effective_grants` in a real
+/// `trace.jsonl` equals, field for field, the object `mur run --explain-scope --json` prints for
+/// the same manifest on the same host.
+///
+/// Both sides go through `containment::scope_report_for_tier` from the same manifest-derived
+/// `CapabilityPolicy` and the same declared floor, so the only thing that could make them differ
+/// is live host state changing between the two invocations — which does not happen inside one
+/// test. Comparing the whole object, rather than a hand-listed set of keys, is what makes a field
+/// later added to `ScopeReport` on only one of the two paths fail here.
+#[test]
+fn session_start_effective_grants_match_explain_scope_json() {
+    let server = common::ScriptedServer::start(vec![end_turn_response()]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    setup_driver(&home, &artifact_dir);
+
+    let manifest_path = create_grants_manifest(project.path(), &server.endpoint);
+
+    // The read-only diagnostic first: it stages nothing, so it cannot disturb the run below.
+    let explain_stdout = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .current_dir(project.path())
+        .args([
+            "run",
+            "--manifest",
+            "murmur.yaml",
+            "--explain-scope",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let explain_report: Value =
+        serde_json::from_str(String::from_utf8(explain_stdout).unwrap().trim()).unwrap();
+
+    let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+    let workdir = staged.workdir.clone();
+    fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
+
+    launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let events = parse_events(&workdir);
+    let session_start = events
+        .iter()
+        .find(|e| e["event_type"] == "session_start")
+        .expect("a completed session must have written session_start");
+
+    assert_eq!(
+        session_start["effective_grants"], explain_report,
+        "session_start.effective_grants must be the ScopeReport --explain-scope --json prints"
+    );
+
+    // Spot-checks that the manifest's own declarations survived verbatim into the trace, so a
+    // failure above reads as "these two disagree" rather than "both are empty and equal".
+    let grants = &session_start["effective_grants"];
+    assert_eq!(
+        grants["network_allow"],
+        json!([server.endpoint, "https://api.example.com"])
+    );
+    assert_eq!(grants["env_allow"], json!(["MURMUR_TEST_REGION"]));
+    assert_eq!(grants["filesystem_scope"], json!("./workdir"));
+    assert_eq!(grants["declared_containment"], json!("advisory"));
+    assert!(
+        grants["enforcement_tier"].is_string(),
+        "the probed tier must be recorded as a wire name"
+    );
+
+    // The pre-existing summary fields are untouched by the new object sitting next to them, and
+    // agree with it — they are now read off the same report.
+    //
+    // Note what `capabilities` does *not* say: this manifest's `env.allow` has no category name at
+    // all, and `network` names no destination. That gap is the reason `effective_grants` exists.
+    assert_eq!(
+        session_start["capabilities"],
+        json!(["network", "filesystem"])
+    );
+    assert_eq!(
+        session_start["containment_declared"],
+        grants["declared_containment"]
+    );
+    assert_eq!(
+        session_start["containment_achieved"],
+        grants["achieved_containment"]
+    );
+    assert_eq!(session_start["workdir_exec"], grants["workdir_exec"]);
+}
+
+/// Two manifests differing only in `capabilities.network.allow` produce `effective_grants` entries
+/// that differ exactly as the manifests do. The whole point of recording the grant set is that
+/// this is legible from the trace alone, with neither manifest in hand.
+#[test]
+fn effective_grants_network_allow_tracks_the_manifest_across_two_runs() {
+    fn network_allow_for(capabilities_yaml: &str, endpoint: &str) -> Value {
+        let home = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        setup_driver(&home, &artifact_dir);
+
+        let manifest = format!(
+            concat!(
+                "name: trace-grants-diff\n",
+                "version: 0.1.0\n",
+                "artifacts:\n",
+                "  - name: {driver_name}\n",
+                "    version: {driver_version}\n",
+                "    runtime: driver\n",
+                "{capabilities}",
+                "inference:\n",
+                "  transport: http\n",
+                "  endpoint: {endpoint}\n",
+                "  model: test-model\n",
+                "  api_key: test-key\n",
+                "  driver:\n",
+                "    artifact: {driver_name}\n",
+            ),
+            driver_name = DRIVER_NAME,
+            driver_version = DRIVER_VERSION,
+            capabilities = capabilities_yaml,
+            endpoint = endpoint,
+        );
+        let manifest_path = project.path().join("murmur.yaml");
+        fs::write(&manifest_path, manifest).unwrap();
+
+        let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
+        let workdir = staged.workdir.clone();
+        fs::write(workdir.join("task.md"), "Report and stop.").unwrap();
+        launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+        parse_events(&workdir)
+            .into_iter()
+            .find(|e| e["event_type"] == "session_start")
+            .expect("session_start must be present")["effective_grants"]["network_allow"]
+            .clone()
+    }
+
+    let server = common::ScriptedServer::start(vec![end_turn_response(), end_turn_response()]);
+
+    let with_destinations = network_allow_for(
+        &format!(
+            "capabilities:\n  network:\n    allow:\n      - {}\n",
+            server.endpoint
+        ),
+        &server.endpoint,
+    );
+    let without_destinations = network_allow_for("", &server.endpoint);
+
+    assert_eq!(with_destinations, json!([server.endpoint]));
+    assert_eq!(without_destinations, json!([]));
+    assert_ne!(with_destinations, without_destinations);
+}
