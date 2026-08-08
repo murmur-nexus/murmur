@@ -2360,6 +2360,7 @@ pub(crate) fn prepare_enforcement(
             &enforcement.landlock_grants,
             &landlock_device_grants(enforcement.tier),
             enforcement.workdir_exec,
+            enforcement.tier,
         )?)
     } else {
         None
@@ -2538,6 +2539,27 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
     }
 }
 
+/// Creates (idempotently) the directory inside the session workdir that backs `/tmp` in the
+/// composed root, returning its host path.
+///
+/// Two callers need it and neither may assume the other ran first: `build_sealed_root` binds it at
+/// `/tmp`, and `open_landlock_fds` opens it to give that bind a Landlock rule. They are called in
+/// that reverse order by `prepare_enforcement` today, so the creation lives here rather than in
+/// either of them — one `create_dir_all`, one message, no ordering dependency between the two.
+/// See [`crate::sealed::SEALED_TMP_DIR_NAME`] for why `/tmp` is workdir-backed rather than a second
+/// tmpfs.
+#[cfg(target_os = "linux")]
+fn ensure_sealed_tmp_store(workdir: &Path) -> Result<PathBuf, String> {
+    let tmp_store = workdir.join(crate::sealed::SEALED_TMP_DIR_NAME);
+    std::fs::create_dir_all(&tmp_store).map_err(|error| {
+        format!(
+            "sealed: failed to create the workdir-backed /tmp store at {}: {error}",
+            tmp_store.display()
+        )
+    })?;
+    Ok(tmp_store)
+}
+
 /// Parent-side half of the sealed mechanism: pick a base, plan the composed root against the real
 /// host layout, create the workdir-backed `/tmp` store, and lower the plan into the C-string form
 /// the forked child executes.
@@ -2585,15 +2607,9 @@ fn build_sealed_root(
     })?;
 
     // `/tmp` inside the composed root is backed by this directory, so it is created here rather
-    // than from inside `pre_exec`. See `sealed::SEALED_TMP_DIR_NAME` for why /tmp is workdir-backed
-    // rather than a second tmpfs.
-    let tmp_store = workdir.join(sealed::SEALED_TMP_DIR_NAME);
-    std::fs::create_dir_all(&tmp_store).map_err(|error| {
-        format!(
-            "sealed: failed to create the workdir-backed /tmp store at {}: {error}",
-            tmp_store.display()
-        )
-    })?;
+    // than from inside `pre_exec`. `open_landlock_fds` — which runs earlier and must open the same
+    // directory to grant it — creates it through the same idempotent helper.
+    ensure_sealed_tmp_store(workdir)?;
 
     let plan = sealed::plan_composed_root(
         workdir,
@@ -2651,8 +2667,9 @@ mod linux_enforce {
     }
 
     /// All Landlock file descriptors resolved in the parent for one shell subprocess: the
-    /// workdir's fd (scoped by [`workdir_access_rights`]), each successfully-opened grant fd, and
-    /// each successfully-opened fixed-device fd.
+    /// workdir's fd (scoped by [`workdir_access_rights`]), the workdir-backed `/tmp` store's fd on
+    /// `KernelSealed`, each successfully-opened grant fd, and each successfully-opened fixed-device
+    /// fd.
     /// Handed by reference into the child's `pre_exec`, where `apply_landlock_scope` builds rules
     /// against these fds without performing a single `open()`.
     pub(super) struct LandlockChildFds {
@@ -2661,8 +2678,28 @@ mod linux_enforce {
         /// applies to so `apply_landlock_scope` — which runs in `pre_exec` and must read nothing
         /// but its argument — has the whole workdir rule decided for it before fork.
         workdir_exec: bool,
+        /// `<workdir>/.mur-tmp` — the directory `plan_composed_root` bind-mounts at `/tmp` inside
+        /// the composed root — opened on `KernelSealed` and `None` on every other tier, which has
+        /// no composed root and therefore no such bind.
+        ///
+        /// It needs an fd of its own even though it lives *inside* the workdir: Landlock resolves a
+        /// path by walking dentries up to each mount root, so an access to `/tmp/x` inside the root
+        /// is matched against the `.mur-tmp` inode (the bind's root) and then against the composed
+        /// root's own `/tmp` mountpoint — never against the workdir inode. The workdir's rule
+        /// therefore does not reach the bind, and without this fd every `/tmp` access is `EACCES`
+        /// on a mount that is genuinely writable.
+        sealed_tmp_fd: Option<OwnedFd>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
+    }
+
+    impl LandlockChildFds {
+        /// The workdir-backed `/tmp` fd, for the tier-gate test. Keeps the struct's fields private
+        /// like every other one: nothing outside `apply_landlock_scope` needs the fd itself.
+        #[cfg(test)]
+        pub(super) fn sealed_tmp_fd(&self) -> Option<&OwnedFd> {
+            self.sealed_tmp_fd.as_ref()
+        }
     }
 
     /// The Landlock ABI v1 rights granted on the capsule **workdir's own** `PathBeneath` rule,
@@ -3367,7 +3404,7 @@ mod linux_enforce {
         io::Error::other(error.to_string())
     }
 
-    /// Scopes the shell subprocess tree's filesystem access with Landlock. Three kinds of rule:
+    /// Scopes the shell subprocess tree's filesystem access with Landlock. Four kinds of rule:
     ///
     ///   - the workdir gets [`workdir_access_rights`] — read/write plus directory, regular-file,
     ///     FIFO and symlink creation, but **not** `MakeChar`/`MakeBlock`/`MakeSock`, and **not**
@@ -3375,6 +3412,14 @@ mod linux_enforce {
     ///     [`WORKDIR_ACCESS_RIGHTS_NO_EXEC`] for why each right is withheld). Withholding `Execute`
     ///     is what enforces `capabilities.shell.allow` completely: the kernel refuses the exec on
     ///     the path it resolved itself, so nothing the capsule writes into its workdir can run;
+    ///   - on `KernelSealed` only, the workdir-backed `/tmp` store gets that **same** right-set
+    ///     from the same local binding. `plan_composed_root` binds `<workdir>/.mur-tmp` at `/tmp`
+    ///     read-write, but Landlock matches an access to `/tmp/x` against the bind's own root inode
+    ///     rather than the workdir's, so without this rule the mount is writable and every access
+    ///     to it is nevertheless `EACCES` — bash heredocs, `mktemp`, a compiler's intermediate
+    ///     objects and a package manager's build scratch all fail. Identical rights are the honest
+    ///     ones: it is the same storage, counted by the same `workdir_max_bytes` guard, so it must
+    ///     be neither more nor less runnable than the workdir itself;
     ///   - each [`LandlockGrant`] (the `shell.allow` binaries, their ELF interpreter, their
     ///     shared-library closure, any `interpreter_runtime` or `staged_runtime` directory, and on
     ///     `KernelSealed` the fixed [`crate::sealed::SEALED_RUNTIME_PATHS`] and
@@ -3447,6 +3492,14 @@ mod linux_enforce {
         let device_read: BitFlags<AccessFs> = AccessFs::ReadFile.into();
         let device_read_write = device_read | AccessFs::WriteFile;
 
+        // The one writable right-set in this function, resolved once and used by both rules that
+        // carry it. The composed root's `/tmp` is a bind of a directory inside the workdir — the
+        // same storage, under the same size guard — so it gets the same rights, `Execute` axis
+        // included: `workdir_exec: false` must no more permit running a binary from `/tmp` than
+        // from the workdir it is stored in. Sharing the binding is what keeps that true; two
+        // separate calls could drift apart.
+        let writable_rights = workdir_access_rights(fds.workdir_exec);
+
         // Every fd here was already opened in the parent (before fork). This function performs no
         // `open()`/`canonicalize()` — only the Landlock ruleset syscalls against already-open fds,
         // so a failure here can only be the kernel call itself, not an unrelated path resolution.
@@ -3456,11 +3509,19 @@ mod linux_enforce {
             .map_err(|error| format!("landlock: handle_access failed: {error}"))?
             .create()
             .map_err(|error| format!("landlock: ruleset create failed: {error}"))?
-            .add_rule(PathBeneath::new(
-                fds.workdir_fd.as_fd(),
-                workdir_access_rights(fds.workdir_exec),
-            ))
+            .add_rule(PathBeneath::new(fds.workdir_fd.as_fd(), writable_rights))
             .map_err(|error| format!("landlock: add_rule failed: {error}"))?;
+
+        // `KernelSealed` only — on every other tier there is no composed root and this is `None`.
+        // A rule on the workdir alone does not reach the bind mounted over `/tmp`; see
+        // [`LandlockChildFds::sealed_tmp_fd`].
+        if let Some(sealed_tmp_fd) = &fds.sealed_tmp_fd {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(sealed_tmp_fd.as_fd(), writable_rights))
+                .map_err(|error| {
+                    format!("landlock: add_rule for the workdir-backed /tmp failed: {error}")
+                })?;
+        }
 
         for grant in &fds.grants {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
@@ -3516,11 +3577,20 @@ mod linux_enforce {
     /// opened — unusual, but a broken or minimal `/dev` is possible — loses that one device rather
     /// than failing the launch. Losing `/dev/null` here degrades to exactly the behavior that
     /// existed before this mechanism, which is a strictly narrower scope, never a wider one.
+    ///
+    /// `tier` decides one thing only: whether the workdir-backed `/tmp` store
+    /// ([`crate::sealed::SEALED_TMP_DIR_NAME`]) is created and opened. It is on `KernelSealed`,
+    /// where `plan_composed_root` unconditionally binds it at `/tmp`, and on no other tier — none
+    /// of which composes a root at all. Both the creation and the open are fail-closed — an `Err`
+    /// naming the path, exactly like the workdir's own open above, never the grant loops'
+    /// shrink-not-fail `continue`. That bind is not manifest-optional, and silently dropping its fd
+    /// would leave `/tmp` mounted-but-denied, which is precisely the defect the rule exists to fix.
     pub(super) fn open_landlock_fds(
         workdir: &Path,
         landlock_grants: &[LandlockGrant],
         device_grants: &[super::CapsuleDeviceGrant],
         workdir_exec: bool,
+        tier: EnforcementTier,
     ) -> Result<LandlockChildFds, String> {
         let workdir_fd = open_o_path(workdir).map(OwnedFd::from).map_err(|error| {
             format!(
@@ -3528,6 +3598,23 @@ mod linux_enforce {
                 workdir.display()
             )
         })?;
+
+        // `prepare_enforcement` calls this function *before* `build_sealed_root`, so `.mur-tmp`
+        // need not exist yet; the shared helper creates it (idempotently — `build_sealed_root`
+        // calls the same one) so there is something here to open.
+        let sealed_tmp_fd = if tier == EnforcementTier::KernelSealed {
+            let tmp_store = super::ensure_sealed_tmp_store(workdir)?;
+            let tmp_store_file = open_o_path(&tmp_store).map_err(|error| {
+                format!(
+                    "sandbox: failed to open the workdir-backed /tmp store {} for Landlock \
+                     scoping: {error}",
+                    tmp_store.display()
+                )
+            })?;
+            Some(OwnedFd::from(tmp_store_file))
+        } else {
+            None
+        };
 
         let mut grants = Vec::with_capacity(landlock_grants.len());
         for grant in landlock_grants {
@@ -3565,6 +3652,7 @@ mod linux_enforce {
         Ok(LandlockChildFds {
             workdir_fd,
             workdir_exec,
+            sealed_tmp_fd,
             grants,
             devices,
         })
@@ -5386,6 +5474,119 @@ mod linux_integration_tests {
             linux_enforce::workdir_access_rights(true) & !AccessFs::Execute,
             linux_enforce::workdir_access_rights(false),
             "workdir_exec must be a one-bit axis — no other right may ride along with it"
+        );
+    }
+
+    /// The tier gate on the workdir-backed `/tmp` fd, in both directions, against a real
+    /// `tempfile::tempdir()` workdir. Opening an fd is an ordinary `open()` — no Landlock call, no
+    /// namespace, no privilege — so this runs on any Linux host, unlike the enforcement it feeds.
+    ///
+    /// It proves **nothing** about whether the kernel then honors the rule built from that fd; that
+    /// is the hand-run procedure in
+    /// `docs/content/reference/sealed-containment-manual-verification.md` (step "3d — writability").
+    /// What it does buy is that the fd is there to build a rule from at all, and that the directory
+    /// backing it exists before `build_sealed_root` — which runs *after* this function — binds it.
+    #[test]
+    fn the_workdir_backed_tmp_store_is_opened_for_landlock_on_the_sealed_tier_only() {
+        let sealed_workdir = tempfile::tempdir().unwrap();
+        let fds = linux_enforce::open_landlock_fds(
+            sealed_workdir.path(),
+            &[],
+            &[],
+            false,
+            EnforcementTier::KernelSealed,
+        )
+        .expect("a real, writable workdir must yield sealed Landlock fds");
+
+        assert!(
+            fds.sealed_tmp_fd().is_some(),
+            "the composed root binds {} at /tmp read-write on every sealed capsule, so its fd must \
+             always be opened — a missing rule leaves /tmp mounted but EACCES",
+            crate::sealed::SEALED_TMP_DIR_NAME,
+        );
+        assert!(
+            sealed_workdir
+                .path()
+                .join(crate::sealed::SEALED_TMP_DIR_NAME)
+                .is_dir(),
+            "the /tmp store must be created here: open_landlock_fds runs before build_sealed_root, \
+             so nothing else has made this directory yet",
+        );
+
+        for tier in [
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            let workdir = tempfile::tempdir().unwrap();
+            let fds = linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
+                .expect("a real, writable workdir must yield Landlock fds on any tier");
+
+            assert!(
+                fds.sealed_tmp_fd().is_none(),
+                "{tier:?} composes no root and binds nothing at /tmp, so granting a workdir-backed \
+                 /tmp would grant a path this tier's capsule never sees",
+            );
+            assert!(
+                !workdir
+                    .path()
+                    .join(crate::sealed::SEALED_TMP_DIR_NAME)
+                    .exists(),
+                "{tier:?} must not even create the store — an unbound directory in the session \
+                 workdir is litter the capsule can see",
+            );
+        }
+    }
+
+    /// Pure content check on the right-set the composed root's `/tmp` rule carries: no kernel call,
+    /// no fork, no spawn.
+    ///
+    /// `apply_landlock_scope` resolves `workdir_access_rights(fds.workdir_exec)` into a single
+    /// local and adds it to *both* the workdir rule and the `/tmp` rule, so the two sets are equal
+    /// by construction; what this test pins is the content of that shared set as `/tmp`'s users
+    /// need it — a compiler writing intermediates, `mktemp` creating and removing files, a package
+    /// manager creating build directories — and the `Execute` axis, which must track
+    /// `workdir_exec` on `/tmp` exactly as it does on the workdir, because both paths resolve to
+    /// the same storage and a binary staged in one is the same bytes as a binary staged in the
+    /// other.
+    #[test]
+    fn the_composed_root_tmp_rule_carries_exactly_the_workdir_right_set() {
+        use landlock::AccessFs;
+
+        for workdir_exec in [false, true] {
+            let rights = linux_enforce::workdir_access_rights(workdir_exec);
+
+            for needed in [
+                AccessFs::WriteFile,
+                AccessFs::ReadFile,
+                AccessFs::ReadDir,
+                AccessFs::MakeReg,
+                AccessFs::MakeDir,
+                AccessFs::RemoveFile,
+                AccessFs::RemoveDir,
+            ] {
+                assert!(
+                    rights.contains(needed),
+                    "/tmp carries the workdir's rights, so it must carry {needed:?}: without it \
+                     `cc`, `mktemp` and `pip` fail on a mount that is genuinely writable",
+                );
+            }
+
+            assert_eq!(
+                rights.contains(AccessFs::Execute),
+                workdir_exec,
+                "/tmp is backed by a directory inside the workdir, so Execute there must follow \
+                 capabilities.filesystem.workdir_exec exactly — granting it unconditionally would \
+                 make /tmp a hole through which capsule-written bytes run",
+            );
+        }
+
+        assert_eq!(
+            linux_enforce::workdir_access_rights(true) & !AccessFs::Execute,
+            linux_enforce::workdir_access_rights(false),
+            "the /tmp rule and the workdir rule share one right-set binding in \
+             apply_landlock_scope; if that set ever grows a second conditional axis, this test and \
+             that binding must be revisited together",
         );
     }
 

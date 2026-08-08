@@ -381,6 +381,21 @@ Granting write on `/dev/null` gives up no confidentiality and no integrity: the 
 character device is defined to discard, so there is no state behind it to reach, corrupt, or read
 back. It is the narrowest possible exception — one inode, not `/dev`, not a directory.
 
+**One apparent second exception, on `sealed` only, that is not one.** Inside a composed root `/tmp`
+is writable. It is not a path outside the workdir: `plan_composed_root` binds `<workdir>/.mur-tmp`
+there, so `/tmp` and the workdir are the same storage under two names, counted by the same
+`capabilities.resources.workdir_max_bytes` guard and discarded with the session. `apply_landlock_scope`
+grants that bind its own `PathBeneath` rule — Landlock matches an access to `/tmp/x` against the
+bind's own root inode, never the workdir's, so the workdir's rule does not reach it and without a
+second rule the mount is writable and every access to it returns `EACCES`. The rule carries exactly
+`workdir_access_rights(workdir_exec)`, the workdir's own set from the same binding, so `/tmp` is
+neither more nor less runnable than the workdir: with `workdir_exec: false` (which every `sealed`
+session has, since declaring it caps the achieved class at `advisory`) a binary written to `/tmp`
+cannot be exec'd, exactly as one written to the workdir cannot. `scoped` composes no root, binds
+nothing at `/tmp`, and is unaffected — there, `/tmp` stays denied. Verified by hand on real
+hardware: see the run of 2026-08-08 in
+[sealed containment verification](sealed-containment-manual-verification.md).
+
 **Every other device path is denied, and that needs no new code.** `handle_access` declares the
 full Landlock ABI v1 right-set for the whole domain, so a path with no matching rule is *refused*,
 not merely un-granted. This mechanism only ever *adds* rules, and it adds exactly three. So
@@ -1587,7 +1602,8 @@ with open(\"/dev/urandom\", \"rb\") as f:
 ### Scenario 3 — `/dev/zero` and `/dev/urandom` are **not** writable
 
 The read-only grants must be exactly that. This is what keeps `/dev/null` the *sole* writable path
-outside the workdir.
+outside the workdir (on `sealed`, `/tmp` is writable too — but it *is* the workdir, bound there from
+`<workdir>/.mur-tmp`; see [the note above](#capsule-device-set)).
 
 ```bash
 SCRATCH_SCRIPT='
