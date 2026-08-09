@@ -2568,7 +2568,7 @@ fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> 
     // The same string `build_shell_env` puts in `$HOME`, from the same constant.
     let home = workdir.join(crate::shell::SYNTHETIC_HOME_DIR_NAME);
     let home = home.to_string_lossy().into_owned();
-    let identity = crate::sealed::CapsuleIdentity {
+    let identity = crate::sealed::SealedAccountIdentity {
         uid: owner.uid(),
         gid: owner.gid(),
         home: &home,
@@ -3578,7 +3578,6 @@ mod linux_enforce {
                     format!("landlock: add_rule for a synthetic /etc file failed: {error}")
                 })?;
         }
-
 
         for grant in &fds.grants {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),

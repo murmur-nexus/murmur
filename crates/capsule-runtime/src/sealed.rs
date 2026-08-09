@@ -350,7 +350,7 @@ pub enum SyntheticEtcFile {
 /// `std::fs::metadata(workdir).uid()` answers the question in safe std — the same pattern
 /// `crate::resources` already uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CapsuleIdentity<'a> {
+pub(crate) struct SealedAccountIdentity<'a> {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     /// The synthetic `HOME`, exactly as `crate::shell::build_shell_env` sets it in the subprocess
@@ -388,8 +388,8 @@ impl SyntheticEtcFile {
     /// Fails rather than emits a corrupt database when the home path contains a field separator or
     /// a newline: `passwd(5)` has no escaping, so a workdir named with a `:` would silently shift
     /// every field after it. Parent-side and synchronous, so it surfaces as a named launch failure.
-    pub(crate) fn render(self, identity: &CapsuleIdentity) -> Result<String, String> {
-        let CapsuleIdentity { uid, gid, home } = *identity;
+    pub(crate) fn render(self, identity: &SealedAccountIdentity) -> Result<String, String> {
+        let SealedAccountIdentity { uid, gid, home } = *identity;
         match self {
             Self::Passwd => {
                 if home.contains(':') || home.contains('\n') {
@@ -1954,7 +1954,7 @@ mod tests {
     /// observes as `pwd.getpwuid(os.getuid()).pw_dir == os.environ["HOME"]`.
     #[test]
     fn the_synthetic_databases_name_root_and_the_capsules_own_id_and_nothing_else() {
-        let identity = CapsuleIdentity { uid: 1000, gid: 1000, home: "/w/.capsule-home" };
+        let identity = SealedAccountIdentity { uid: 1000, gid: 1000, home: "/w/.capsule-home" };
 
         let passwd = SyntheticEtcFile::Passwd.render(&identity).unwrap();
         assert_eq!(
@@ -1977,7 +1977,7 @@ mod tests {
     /// for uid 0 would leave `getpwuid(0)` resolving to whichever the parser saw first.
     #[test]
     fn a_root_capsule_gets_a_single_passwd_line_carrying_its_own_home() {
-        let identity = CapsuleIdentity { uid: 0, gid: 0, home: "/w/.capsule-home" };
+        let identity = SealedAccountIdentity { uid: 0, gid: 0, home: "/w/.capsule-home" };
 
         assert_eq!(
             SyntheticEtcFile::Passwd.render(&identity).unwrap(),
@@ -1991,7 +1991,7 @@ mod tests {
     #[test]
     fn a_home_path_that_cannot_be_spelled_in_a_passwd_field_is_refused() {
         for home in ["/w/od:d", "/w/two\nlines"] {
-            let identity = CapsuleIdentity { uid: 1000, gid: 1000, home };
+            let identity = SealedAccountIdentity { uid: 1000, gid: 1000, home };
             let error = SyntheticEtcFile::Passwd.render(&identity).unwrap_err();
             assert!(error.contains(home), "the message must name the offending path: {error}");
         }
