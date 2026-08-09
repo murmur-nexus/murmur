@@ -36,9 +36,9 @@
 //! `scoped` has to enumerate and refuse (pathname unix sockets, device nodes, metadata visibility,
 //! stdlib directory enumeration) stop being reachable rather than being individually denied.
 //!
-//! `/proc` is the one documented exception to that sentence, and it is stated here rather than in a
-//! footnote: mounting a private `procfs` unprivileged needs a PID namespace this slice deliberately
-//! does not create, so on a bare host the composed root carries a bind of the host's `/proc` and
+//! `/proc` is the one exception to that sentence: mounting a private `procfs` unprivileged needs a
+//! PID namespace this module deliberately does not create, so on a bare host the composed root
+//! carries a bind of the host's `/proc` and
 //! host process metadata stays *visible* there (opens through it are still Landlock's to refuse).
 //! See [`PROC_HIDEPID_OPTIONS`].
 //!
@@ -272,8 +272,8 @@ pub(crate) fn sealed_blocker(
 
 /// Host directories bind-mounted read-only into every composed root, in order.
 ///
-/// Fixed, not derived: this is the roadmap's validated recipe (`bind-mount /usr`) plus the
-/// non-usrmerge spellings of the same tree. On a usrmerge distro `/bin`, `/sbin`, `/lib`,
+/// Fixed, not derived: a whole-tree bind of `/usr` plus the non-usrmerge spellings of the same
+/// tree. On a usrmerge distro `/bin`, `/sbin`, `/lib`,
 /// `/lib64`… are *symlinks* into `/usr`; [`plan_composed_root`] recreates them as symlinks rather
 /// than bind-mounting through them, so the composed root has the same shape as the host and a
 /// hashbang like `#!/bin/sh` resolves.
@@ -328,7 +328,7 @@ pub struct SealedEtcPath {
 /// trust store, DNS configuration, the timezone, and the passwd/group databases `getpwuid(3)`
 /// needs.
 ///
-/// Residual, recorded rather than buried: `/etc/passwd` and `/etc/group` are world-readable on
+/// Residual exposure: `/etc/passwd` and `/etc/group` are world-readable on
 /// every distribution, so binding them leaks the host's account names into the capsule. They are
 /// bound rather than synthesised because synthesising them means writing files from inside the
 /// `pre_exec` window, and this module's discipline is that that window performs no work the parent
@@ -445,7 +445,7 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// `mount -t proc`. The numeric form is the legacy parser's; `invisible` is the Linux 5.8+
 /// spelling; the empty string is a plain private `procfs` with no masking.
 ///
-/// **On a bare host none of the three succeeds, and that is a kernel rule, not a bug here.**
+/// **On a bare host none of the three succeeds, and that is a kernel rule.**
 /// `proc_fill_super` requires `CAP_SYS_ADMIN` over the user namespace *owning the PID namespace*.
 /// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` leaves the process in the host's initial PID namespace,
 /// whose owner is the initial user namespace — where an unprivileged process has no capabilities
@@ -460,8 +460,8 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// that privilege — as root, and inside a container run with `--cap-add SYS_ADMIN` — and because
 /// a later PID-namespace slice makes them succeed everywhere without touching this list.
 ///
-/// When they all fail the executor binds the host's `/proc` instead. What that costs is recorded
-/// rather than buried: the capsule can enumerate host PIDs and read the `/proc/<pid>/root` and
+/// When they all fail the executor binds the host's `/proc` instead. What that costs: the capsule
+/// can enumerate host PIDs and read the `/proc/<pid>/root` and
 /// `/proc/<pid>/cwd` symlinks, so `/proc` is the one part of the composed root where "outside does
 /// not exist" degrades to `scoped`'s "outside is denied" — Landlock's ruleset covers no path under
 /// `/proc`, so opens through it are refused, and `ptrace_may_access` gates the rest. Every other
@@ -519,9 +519,8 @@ pub(crate) enum RootOp {
     /// symlinks.
     Symlink { target: PathBuf, link: PathBuf },
     /// `mount(source, target, MS_BIND | MS_REC)`, followed by a second
-    /// `MS_REMOUNT | MS_BIND | MS_RDONLY` call when `read_only` — a single `MS_BIND | MS_RDONLY`
-    /// mount does *not* produce a read-only bind, which is a kernel behaviour worth stating
-    /// rather than rediscovering.
+    /// `MS_REMOUNT | MS_BIND | MS_RDONLY` call when `read_only`. The second call is required: a
+    /// single `MS_BIND | MS_RDONLY` mount does *not* produce a read-only bind.
     Bind { source: PathBuf, target: PathBuf, read_only: bool },
     /// A fresh `tmpfs`.
     Tmpfs { target: PathBuf, options: &'static str },
@@ -583,8 +582,8 @@ pub(crate) fn choose_root_base(
 /// `extra_read_only` carries the host directories this *particular* capsule needs beyond
 /// [`SEALED_RUNTIME_PATHS`] — the containing directory of each resolved `shell.allow` binary and
 /// each `capabilities.shell.interpreter_runtime` directory. They are whole-directory binds, not a
-/// per-file grant set: this slice must not extend the ELF-closure mechanism it exists to make
-/// unnecessary. Entries already covered by a fixed path are dropped.
+/// per-file grant set: a bind carries a directory's whole contents, so this must not grow into a
+/// second ELF-closure derivation. Entries already covered by a fixed path are dropped.
 ///
 /// `staged_runtime_read_only` carries the `source_path` of each declared
 /// `capabilities.shell.staged_runtime` grant. It is a *separate* parameter from `extra_read_only`
@@ -758,14 +757,14 @@ impl PlanBuilder {
     /// fail the launch: routed through `mirror`, a capsule declaring a runtime tree the host does
     /// not have would launch successfully into a root silently lacking it.
     ///
-    /// So no existence pre-check happens here, or anywhere else in this slice. The plan always
+    /// So no existence pre-check happens here, or anywhere else in this module. The plan always
     /// carries the step, `required: true`, and the real `mount(2)` in `execute_step`'s
     /// [`CStepKind::Bind`] arm is the single source of truth for "does this exist" — a missing
     /// source fails with `ENOENT` at construction time, in the child, which
     /// `construct_composed_root`'s `step.required` check turns into a `SealedRootFailure`. That
     /// path already reaches the operator as `RuntimeError::SealedRootConstructionFailed`
     /// (`E-RUN-014`), already names the offending path via [`SealedRootSpec::describe`], and is
-    /// already session-fatal. No new error variant is needed, and none was added.
+    /// already session-fatal, so no error variant of its own is needed.
     ///
     /// Always a directory bind: a staged runtime tree is a tree. `mkdir_p` registers the target in
     /// `made`, so a later `mirror` of the same path is the one that no-ops, never this.
@@ -838,15 +837,14 @@ pub(crate) use linux::{
 /// The post-`fork()` namespace primitives [`crate::network_namespace`] reuses rather than
 /// reimplementing.
 ///
-/// The `dumpable` pair is not a detail worth duplicating: a non-dumpable task's
-/// `/proc/self/uid_map` is root-owned and therefore unopenable by the task itself, and every
-/// namespace `mur` creates hits that trap identically — see [`linux::make_dumpable_for_map_writes`]
-/// for the full account of how misleading its symptom is.
+/// The `dumpable` pair is shared because a non-dumpable task's `/proc/self/uid_map` is root-owned
+/// and therefore unopenable by the task itself, and every namespace `mur` creates hits that trap
+/// identically — see [`linux::make_dumpable_for_map_writes`].
 ///
-/// `apparmor_permits_userns` is shared for a sharper reason still: it answers whether AppArmor
-/// stands between this binary and `unshare(CLONE_NEWUSER)`, which `sealed` and the capsule network
-/// namespace both need. Two implementations of one host question could return two answers, and the
-/// operator would be told to fix two different things.
+/// `apparmor_permits_userns` is shared because it answers whether AppArmor stands between this
+/// binary and `unshare(CLONE_NEWUSER)`, which `sealed` and the capsule network namespace both
+/// need. Two implementations of one host question could return two answers, and the operator would
+/// be told to fix two different things.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
     apparmor_permits_userns, make_dumpable_for_map_writes, restore_dumpable, write_decimal_map,
@@ -919,7 +917,7 @@ mod linux {
 
     /// Flips `PR_SET_DUMPABLE` for the duration of the identity-map writes, and back again.
     ///
-    /// Not optional, and the single hardest-won line in this module. `mur` marks itself
+    /// Not optional. `mur` marks itself
     /// non-dumpable at startup (`security::harden_process_dumpable`, `prctl(PR_SET_DUMPABLE, 0)`)
     /// so that no same-uid process can read its `/proc/<pid>/environ`. That flag is inherited
     /// across `fork()`, and the kernel's `task_dump_owner()` reassigns *every* `/proc/<pid>/*`
@@ -927,10 +925,10 @@ mod linux {
     /// unprivileged process therefore cannot open its own `uid_map` for writing, and the namespace
     /// it just created is one it can never own.
     ///
-    /// The symptom this produced was maximally misleading: `unshare` succeeded, the map write
-    /// failed with `EACCES`, and the refusal blamed the host's id-mapping policy — on a host whose
-    /// id-mapping policy was fine, and where the identical syscall sequence run from any other
-    /// program succeeded. `sealed` was unreachable on every host for this reason alone.
+    /// The symptom is misleading: `unshare` succeeds, the map write fails with `EACCES`, and the
+    /// refusal blames the host's id-mapping policy — on a host whose id-mapping policy is fine,
+    /// and where the identical syscall sequence run from any other program succeeds. Without this
+    /// flip, `sealed` is unreachable on every host for that reason alone.
     ///
     /// The window is reopened for exactly the three `open`/`write`/`close` pairs that need it and
     /// closed again before the first mount, so the child spends no longer readable than the map
@@ -940,8 +938,8 @@ mod linux {
     /// assuming `0`. Hardcoding `0` looked equivalent — `mur` always runs non-dumpable — and was
     /// not: it also cleared the flag for every process that had *not* hardened itself, which
     /// includes this crate's own integration tests, and a non-dumpable child is one whose
-    /// `/proc/<pid>/mem` the seccomp-notify supervisor cannot read. Every allowlisted `execve`
-    /// then fail-closed to `EACCES`.
+    /// `/proc/<pid>/mem` the seccomp-notify supervisor could not read — every allowlisted `execve`
+    /// then failed closed to `EACCES`.
     ///
     /// # Safety
     /// Post-`fork()`, pre-exec child context only — `prctl(2)` is async-signal-safe, but the

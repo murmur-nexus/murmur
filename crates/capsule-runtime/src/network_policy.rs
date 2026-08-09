@@ -295,12 +295,11 @@ impl HookCapabilityGrant {
 /// manifest entry for that artifact (`murmur_artifact::RuntimeArtifact::capabilities`) at
 /// staging time and applied on the shared `invoke_tool_component` dispatch path.
 ///
-/// The baseline is the opposite of [`HookCapabilityGrant`]'s, and that is the whole point of
-/// having two types: a hook derives its grant *from nothing* (absent block = deny), whereas a
-/// tool or driver derives it *from the capsule ceiling* (absent block = the capsule-wide
-/// policy, unchanged). Both fields are therefore `Option`-of-narrowing rather than plain
-/// values, and [`Default`] — what an entry with no `capabilities:` block yields — means
-/// "inherit everything", i.e. byte-for-byte today's behavior.
+/// The baseline is the opposite of [`HookCapabilityGrant`]'s, which is why they are two types: a
+/// hook derives its grant *from nothing* (absent block = deny), whereas a tool or driver derives
+/// it *from the capsule ceiling* (absent block = the capsule-wide policy, unchanged). Both fields
+/// are therefore `Option`-of-narrowing rather than plain values, and [`Default`] — what an entry
+/// with no `capabilities:` block yields — means "inherit everything".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolCapabilityGrant {
     /// Effective allow-rules for this artifact, already clamped to the ceiling. `None` =
@@ -530,7 +529,7 @@ mod tests {
     }
 
     /// The no-op invariant: a tool/driver entry with no `capabilities:` block keeps the whole
-    /// ceiling and the whole workdir — byte-for-byte the pre-slice behavior.
+    /// ceiling and the whole workdir, unchanged.
     #[test]
     fn tool_grant_without_entry_inherits_the_ceiling_unchanged() {
         let ceiling = ceiling();
