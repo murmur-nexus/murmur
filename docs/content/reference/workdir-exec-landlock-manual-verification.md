@@ -27,9 +27,9 @@ ABI v1 right *except* `Execute`, unless the manifest declares
 
 This replaced a seccomp-notify exec supervisor that intercepted `execve(2)`/`execveat(2)` and
 compared a pathname read out of the stopped child's `/proc/<pid>/mem` against a canonical allowlist.
-That mechanism is **deleted**, not demoted to a fallback: see
-[the TOCTOU audit](seccomp-notify-toctou-audit.md) for why continue-based argument inspection could
-not be made sound, and [`W-SEC-002`](security-warnings.md#w-sec-002) for what a host without
+That mechanism is **deleted**, not demoted to a fallback: continue-based
+argument inspection cannot be made sound, because the kernel dereferences the same pointer again
+after the decision. See [`W-SEC-002`](security-warnings.md#w-sec-002) for what a host without
 Landlock now gets instead (no exec mediation at all, and no path to the `scoped` class).
 
 Two properties are under test, and they are opposites of each other:
@@ -535,6 +535,4 @@ serialization test and not a substitute for reading a real session's trace.
 
 * [`W-SEC-011`](security-warnings.md#w-sec-011) — the warning this mechanism fires.
 * [`capabilities.filesystem.workdir_exec`](manifest-schema.md#field-workdir-exec) — the field.
-* [Seccomp-notify TOCTOU audit](seccomp-notify-toctou-audit.md) — why the supervisor this replaced
-  could not be made sound.
 * [Verification](verification.md) — the index of hand-run procedures.

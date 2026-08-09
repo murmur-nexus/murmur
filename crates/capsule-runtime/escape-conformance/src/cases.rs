@@ -656,7 +656,8 @@ def main():
                       (WORKDIR_ACCESS_RIGHTS). EPERM is the missing CAP_MKNOD — which an \
                       ordinary uid never had, so on a non-root run this case cannot distinguish \
                       the fix from the pre-fix state. Re-run as root to exercise the deployment \
-                      shape that was actually exposed; security-warnings.md scenario 4 records \
+                      shape that was actually exposed; scenario 4 of \
+                      workdir-device-node-manual-verification.md records \
                       the same caveat. This is the case the negative control flips: restore \
                       MakeBlock to WORKDIR_ACCESS_RIGHTS, rebuild, and it must go ALLOWED.\
                       At `sealed` the measured errno is EACCES, so on this class the non-root \
@@ -710,8 +711,8 @@ def main():
                       pins the pure function; this case pins the same shape against the real \
                       kernel enforcement. A PermissionError from execve is the refusal; an ENOENT \
                       means the harness's own staging failed and is INCONCLUSIVE, never a pass. \
-                      This is not a TOCTOU probe — it is single-threaded and does not race; the \
-                      exec/connect race class is separately audited and lives in racecheck/.\
+                      This probe is single-threaded and does not race; an argument-race probe is \
+                      a different shape and out of scope here.\
                       At `sealed` the measured refusal is EACCES from execve, and two independent \
                       things hold it: the exec allowlist resolves the copy to its real path before \
                       comparing, and the workdir bind carries no execute right at all \
@@ -762,13 +763,11 @@ def main():
         category: Category::Boundary,
         summary: "connects to 1.1.1.1:443, a host named nowhere in capabilities.network.allow",
         attribution: "The capsule declares an empty network.allow, so every destination is \
-                      unlisted. EPERM/EACCES from connect(2) is the seccomp-notify supervisor's \
-                      denial. A timeout or ENETUNREACH means the host itself has no route and \
-                      the case proved nothing — INCONCLUSIVE, not a pass. Single-threaded and \
-                      non-racing: the TOCTOU class documented in seccomp-notify-toctou-audit.md \
-                      is a different probe and is out of scope here.\
-                      The seccomp-notify supervisor named above was retired by slice f163778e, and \
-                      on both kernel classes the mechanism is now structural rather than a filter \
+                      unlisted. A timeout or ENETUNREACH means the host itself has no route and \
+                      the case proved nothing — INCONCLUSIVE, not a pass. This probe is \
+                      single-threaded and non-racing; the argument-race class is a different probe \
+                      and is out of scope here.\
+                      On both kernel classes the mechanism is structural rather than a filter \
                       that has to be consulted: the capsule runs in its own network namespace whose \
                       only route is `local default dev lo`, and the runtime binds a TCP listener \
                       only on the ports `capabilities.network.allow` implies. An unlisted port is \

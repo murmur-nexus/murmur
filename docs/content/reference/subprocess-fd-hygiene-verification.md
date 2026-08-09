@@ -45,9 +45,7 @@ no `#[ignore]` marker intended for an automated runner, no workflow step. CI run
 `ubuntu-latest` GitHub runners, which never resolve to a kernel-enforcement tier, and on macOS,
 where `close_range(2)` does not exist. A test asserting this property would either pass
 vacuously or skip — and either outcome would turn a green run into false evidence about a
-security property it never touched. This is the same reasoning that keeps the
-[seccomp-notify race probes](seccomp-notify-toctou-audit.md#where-they-live-and-why-they-are-invisible-to-every-automated-run)
-out of the workspace.
+security property it never touched.
 
 The one automated test this work added is a content check —
 `sandbox::tests::fd_hygiene_range_starts_above_stdio`, asserting `FD_HYGIENE_FIRST_FD == 3`. It

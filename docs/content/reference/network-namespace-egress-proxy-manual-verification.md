@@ -34,9 +34,9 @@ a connection-level proxy running in the runtime process that applies
 
 This replaced a seccomp-notify supervisor that intercepted `connect(2)`/`sendto(2)` and compared a
 destination IP read out of the stopped child's `/proc/<pid>/mem`. That mechanism is **deleted**,
-not demoted to a fallback: see
-[the TOCTOU audit](seccomp-notify-toctou-audit.md) for why it could not be made sound, and
-[`E-CAP-005`](cli.md) for what a host that cannot provide a namespace now does instead
+not demoted to a fallback: a decision computed from a pointer argument can be enforced against a
+different value once the kernel dereferences it again. See
+[`E-CAP-005`](cli.md) for what a host that cannot provide a namespace does instead
 (refuse to launch).
 
 The property under test is negative and structural:

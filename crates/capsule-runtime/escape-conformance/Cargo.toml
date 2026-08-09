@@ -13,10 +13,6 @@
 # workspace root, so cargo does not object to a package living under a workspace directory without
 # being a member of it. Removing it makes `cargo build` here fail outright, which is the intended
 # tripwire if someone tries to fold this into the workspace.
-#
-# This mirrors `crates/capsule-runtime/racecheck/` exactly. That package is a *different* suite
-# (seccomp-notify TOCTOU races) and the two must not be merged — see
-# `docs/content/reference/seccomp-notify-toctou-audit.md`.
 [workspace]
 
 [package]
