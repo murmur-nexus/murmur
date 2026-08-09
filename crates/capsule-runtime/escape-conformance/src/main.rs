@@ -263,11 +263,16 @@ fn list_cases() {
     }
     println!(
         "\n`not-asserted` is not a skip: the case still runs and its verdict is still recorded, \
-         but the declared class provides no mechanism that could back a claim, so the result \
-         cannot pass or fail.\n\
-         `not graded` is also not a skip: the `sealed` column records the class's intended \
-         verdict, and the case still runs and is still recorded, but nobody has validated those \
-         expectations against a real composed root yet, so they gate nothing. See \
+         but nothing can pass or fail, because there is no claim to compare the result against. \
+         It appears for two different reasons and they must not be conflated.\n\
+         In the `advisory` column it means the *class* has no mechanism that could back a claim.\n\
+         In the `sealed` column it appears for exactly two cases — `hardlink-escape` and \
+         `rename-across-boundary` — and there it means the *case's own shape* cannot reach its \
+         premise at that class: `sealed` composes its root out of independent bind mounts, so \
+         link(2)/rename(2) hit EXDEV at a mount boundary before Landlock is consulted, for every \
+         destination reachable from the workdir. Every other `sealed` expectation is graded, \
+         against the verdict a real composed root produced on 2026-08-09. See each case's \
+         attribution note in a record, and \
          docs/content/reference/sealed-containment-manual-verification.md."
     );
 }

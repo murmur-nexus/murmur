@@ -267,9 +267,14 @@ impl Record<'_> {
         let _ = writeln!(out, "## Boundary cases\n");
         let _ = writeln!(
             out,
-            "A failure in this table is a containment escape. `not-asserted` means the declared \
-             class provides no mechanism that could back a claim here — the case still ran and \
-             its verdict is recorded, but it cannot pass or fail. That is not a skip.\n"
+            "A failure in this table is a containment escape. `not-asserted` means there is no \
+             claim for the result to be compared against — the case still ran and its verdict is \
+             recorded, but it cannot pass or fail. That is not a skip, and it happens for two \
+             different reasons: either the declared class provides no mechanism that could back a \
+             claim (every kernel-mediated case at `advisory`), or the case's own shape cannot reach \
+             its premise at this class (`hardlink-escape` and `rename-across-boundary` at `sealed`, \
+             where independent bind mounts make link(2)/rename(2) fail with EXDEV before Landlock \
+             is consulted). The per-case `attribution` below says which applies.\n"
         );
         self.render_table(&mut out, Category::Boundary);
 
@@ -317,9 +322,16 @@ impl Record<'_> {
         let _ = writeln!(
             out,
             "Recorded here so this file is self-contained: a reader can see what the suite would \
-             have asserted at a different class without the repository in hand. `sealed` is \
-             marked unreachable throughout because `achieved_class_for_tier` has no `Sealed` arm \
-             — no host provides it today, so the class gate refuses before any case runs.\n"
+             have asserted at a different class without the repository in hand. All three columns \
+             are reachable: `achieved_class_for_tier` maps `EnforcementTier::KernelSealed` to \
+             `sealed`, and a host with a usable Landlock ABI, unprivileged user namespaces and \
+             (where the host restricts them) the shipped `mur-sealed` AppArmor profile reaches it. \
+             The `sealed` column is graded rather than merely recorded: every entry is the verdict \
+             a real composed root produced on 2026-08-09, except `hardlink-escape` and \
+             `rename-across-boundary`, which assert nothing there because `sealed`'s independent \
+             bind mounts make link(2)/rename(2) fail with EXDEV before Landlock is consulted. \
+             `not-asserted` in the `advisory` column means something different — a class with no \
+             mechanism — and the two must not be read as one.\n"
         );
         let _ = writeln!(out, "| case | category | advisory | scoped | sealed |");
         let _ = writeln!(out, "|---|---|---|---|---|");
