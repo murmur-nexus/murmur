@@ -58,7 +58,7 @@
 //! `AF_UNIX` is untouched. `CLONE_NEWNET` does not mediate unix sockets in any way that matters
 //! here — a pathname socket is reached through the filesystem, not the network stack. That is
 //! exactly why the register-level `socket(2)` domain filter (`denied_socket_domains` in
-//! [`crate::sandbox`]) is left alone by this slice and remains the thing that refuses
+//! [`crate::sandbox`]) is untouched here and remains the thing that refuses
 //! `/var/run/docker.sock`.
 
 /// One TCP listener per allowlisted port, plus the single wildcard UDP :53 resolver socket.
@@ -79,7 +79,7 @@ pub(crate) const MAX_NAMESPACE_SOCKETS: usize = crate::egress_proxy::MAX_EGRESS_
 /// Deliberately **not** an `EnforcementTier` variant and deliberately not tied to
 /// `ContainmentClass`: a network namespace is required for every Linux capsule that can spawn a
 /// subprocess, at every containment class, so hanging it off the class ladder would make
-/// `advisory` capsules silently exempt from the boundary this slice exists to install.
+/// `advisory` capsules silently exempt from this boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressNamespaceBlocker {
@@ -183,8 +183,7 @@ pub(crate) fn egress_namespace_blocker(
     // Not Linux: there is no network namespace here, and there was no seccomp interception
     // either. A non-Linux host resolves to `EnforcementTier::EnvironmentOnly`, installs no kernel
     // subprocess sandbox at all, and says so loudly (`W_SEC_001`). Refusing here would turn every
-    // macOS developer run into an error about a mechanism macOS has never had — which is not what
-    // this slice changed, and not a regression it is entitled to introduce.
+    // macOS run into an error about a mechanism macOS has never had.
     if !is_linux {
         return None;
     }

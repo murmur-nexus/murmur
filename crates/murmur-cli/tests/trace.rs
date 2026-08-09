@@ -495,7 +495,7 @@ fn create_grants_manifest(project_dir: &std::path::Path, endpoint: &str) -> Path
     project_dir.join("murmur.yaml")
 }
 
-/// The card's headline property, end to end: `session_start.effective_grants` in a real
+/// Headline property, end to end: `session_start.effective_grants` in a real
 /// `trace.jsonl` equals, field for field, the object `mur run --explain-scope --json` prints for
 /// the same manifest on the same host.
 ///

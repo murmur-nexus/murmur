@@ -389,8 +389,7 @@ mod tests {
         );
     }
 
-    /// The arm this slice exists to add: the sealed tier, and only the sealed tier, reports
-    /// `sealed`.
+    /// The sealed tier, and only the sealed tier, reports `sealed`.
     #[test]
     fn only_the_sealed_tier_achieves_sealed() {
         assert_eq!(

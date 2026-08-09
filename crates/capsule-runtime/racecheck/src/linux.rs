@@ -1,10 +1,7 @@
 //! The Linux-only half of the probe scaffolding.
 //!
-//! **Never compiled on this repo's macOS dev machines** — `libseccomp` needs a Linux `cc`/sysroot
-//! and cross-compiling is blocked by a transitive `ring` dependency in the workspace. Everything
-//! here was written by reading `crates/capsule-runtime/src/sandbox.rs` and the `libseccomp` 0.4.0
-//! crate source side by side; it is verified by review, not by a build on the machine that wrote
-//! it. Build and run it on a real Linux host.
+//! Linux-only: `libseccomp` needs a Linux `cc`/sysroot, and cross-compiling is blocked by a
+//! transitive `ring` dependency in the workspace. Build and run on a real Linux host.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

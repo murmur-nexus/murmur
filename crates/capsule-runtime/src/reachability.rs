@@ -28,7 +28,7 @@
 //!      not.
 //!
 //! Neither gap is derivable the way the ELF closure is. An interpreted program's import closure
-//! depends on `sys.path`, on `.pth` files, on whatever the script does at runtime — the roadmap
+//! depends on `sys.path`, on `.pth` files, on whatever the script does at runtime — the design
 //! card behind this module states it plainly: *an arbitrary interpreted closure is not generally
 //! derivable*. So this module does not try to derive it. It asks the weaker question that is
 //! actually answerable at staging time, and answers it honestly:
@@ -83,7 +83,7 @@ const SHEBANG_PROBE_BYTES: u64 = 512;
 /// Deliberately a fixed, short, hand-maintained table rather than anything derived. There is no
 /// general way to ask an arbitrary program "what else will you exec?", and the one family that
 /// *can* be asked — the GCC driver, whose `-print-prog-name=` exists precisely to answer it — is
-/// the family whose absence from the exec grant set was observed to break real compiles. Anything
+/// the family whose absence from the exec grant set breaks real compiles. Anything
 /// outside this table is simply not probed; that is a known, deliberate hole, not an oversight.
 ///
 /// The helper lists are per-driver because the driver picks its own front end: `gcc` reaches
@@ -736,7 +736,7 @@ mod tests {
         .is_ok());
     }
 
-    /// Scenario 3: the roadmap's acceptance criterion 3 — a system script under the fixed,
+    /// Scenario 3: a system script under the fixed,
     /// fully-bound sealed tree needs no declaration at all.
     #[test]
     fn a_script_under_a_fixed_sealed_runtime_path_needs_no_grant() {
@@ -844,7 +844,7 @@ mod tests {
     /// A stand-in compiler driver that answers `-print-prog-name=<helper>` the way GCC does,
     /// letting Scenarios 6 and 7 run on any host with a shell — including one with no real GCC.
     /// Absolute answers for the front ends, `PATH`-deferred answers for the assembler/linker,
-    /// exactly as this repo's own bare-metal `gcc 13.3` was observed to behave.
+    /// matching GCC's own behaviour.
     #[cfg(unix)]
     fn fake_driver(dir: &Path, name: &str, libexec: &Path) -> PathBuf {
         let script = format!(
@@ -953,7 +953,7 @@ mod tests {
         );
     }
 
-    /// The load-bearing distinction from `fa4c62a5`: the fixed sealed tree is bound and listable
+    /// The load-bearing distinction: the fixed sealed tree is bound and listable
     /// but **not** executable, so a helper resolving under it is still uncovered. Written as a
     /// direct assertion on the coverage rule so that granting `SEALED_RUNTIME_PATHS` the
     /// `Execute` right one day cannot silently pass this test.

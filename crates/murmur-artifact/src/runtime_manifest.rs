@@ -1053,8 +1053,8 @@ struct RawInterpreterRuntimeGrant {
 struct RawInterpreterRuntimeDir {
     #[serde(default)]
     path: Option<String>,
-    // `Option` so an omitted `list_dir` is distinguishable from an explicit `false`: this slice
-    // rejects the omission outright rather than defaulting, because enumerability is never
+    // `Option` so an omitted `list_dir` is distinguishable from an explicit `false`: the
+    // omission is rejected outright rather than defaulted, because enumerability is never
     // inferred.
     #[serde(default)]
     list_dir: Option<bool>,

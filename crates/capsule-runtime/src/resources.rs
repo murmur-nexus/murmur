@@ -35,8 +35,7 @@
 //! unprivileged process may raise its own soft limit up to the hard one at any time. Against a
 //! hostile agent a soft-only cap is therefore advisory: one `setrlimit` call from inside the
 //! capsule undoes it. Every limit this module sets writes `rlim_cur == rlim_max`, leaving no
-//! ceiling to raise into. Lowering `rlim_max` is irreversible for an unprivileged process,
-//! which is precisely the property being bought.
+//! ceiling to raise into, and lowering `rlim_max` is irreversible for an unprivileged process.
 
 use std::{
     path::{Path, PathBuf},
@@ -49,10 +48,9 @@ use std::{
 };
 
 /// Default `RLIMIT_NPROC` headroom — how much past the runtime's own uid baseline a subprocess
-/// tree may add, in whichever unit this platform's `RLIMIT_NPROC` is checked against: threads on
-/// Linux (`setrlimit(2)`: "the maximum number of processes (or, more precisely on Linux,
-/// threads)"), processes on macOS. See [`apply_hard_rlimits`] for why this is headroom rather
-/// than an absolute ceiling, and [`uid_task_count`] for how the baseline is measured.
+/// tree may add, in whichever unit this platform's `RLIMIT_NPROC` is checked against. See
+/// [`apply_hard_rlimits`] for why this is headroom rather than an absolute ceiling, and
+/// [`uid_task_count`] for the per-platform unit and how the baseline is measured.
 pub const DEFAULT_MAX_PROCESSES: u64 = 128;
 
 /// Default `RLIMIT_NOFILE` hard ceiling — open descriptors per spawned subprocess.
@@ -88,8 +86,8 @@ pub const DEFAULT_WORKDIR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 ///
 /// An internal constant rather than a manifest key, matching [`crate::limits::EPOCH_TICK_INTERVAL`]:
 /// the cadence changes *when* a breach is noticed, never *whether* it is, so exposing it would
-/// add a knob with no security meaning. The consequence is stated rather than hidden — a disk
-/// filler is caught within one interval of crossing the ceiling, not at the instant it crosses.
+/// add a knob with no security meaning. The consequence: a disk filler is caught within one
+/// interval of crossing the ceiling, not at the instant it crosses.
 pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Fully-resolved host-process limits for one session: the manifest's `capabilities.resources`
@@ -97,11 +95,10 @@ pub(crate) const WORKDIR_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostResourceLimits {
     /// `RLIMIT_NPROC` headroom above the runtime's own uid baseline. Per-**uid**, not
-    /// per-process-tree, and counted in the unit that uid's kernel enforces against — threads on
-    /// Linux (`setrlimit(2)`: "the maximum number of processes (or, more precisely on Linux,
-    /// threads)"), processes on macOS. See the module docs for why the cgroup `pids.max` below
-    /// exists alongside it rather than duplicating it, and [`apply_hard_rlimits`] for why it is
-    /// applied as headroom.
+    /// per-process-tree, and counted in the unit that uid's kernel enforces against
+    /// ([`uid_task_count`]). See the module docs for why the cgroup `pids.max` below exists
+    /// alongside it rather than duplicating it, and [`apply_hard_rlimits`] for why it is applied
+    /// as headroom.
     pub max_processes: u64,
     /// `RLIMIT_NOFILE` hard ceiling.
     pub max_open_files: u64,
@@ -223,8 +220,8 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 ///
 /// A requested value above the inherited hard limit is **clamped down to it** rather than
 /// treated as an error: an unprivileged process cannot raise `rlim_max`, so the inherited value
-/// is the real ceiling either way, and failing the spawn would only replace a bound we cannot
-/// widen with no subprocess at all.
+/// is the real ceiling either way, and failing the spawn would replace an unwidenable bound with
+/// no subprocess at all.
 ///
 /// ## Why `max_processes` is headroom, not an absolute ceiling
 ///
@@ -232,23 +229,23 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 /// this tree — and on Linux the unit it counts is *threads*, not processes: `setrlimit(2)` calls
 /// it "the maximum number of processes (or, more precisely on Linux, threads) that can be created
 /// for the real user ID". On macOS, whose BSD-derived limit is genuinely per-process, it counts
-/// processes. Either way a desktop or workstation account is already deep into that number before
-/// the capsule starts (measured on the machine this was developed on: 134 processes but 923
-/// threads), so a hard `RLIMIT_NPROC` of 128 does not bound the capsule at 128 — it makes the very
-/// first `fork()` in the subprocess fail with `EAGAIN`. That is a broken runtime, not a bound.
+/// processes. Either way an interactive account is already deep into that number before the
+/// capsule starts — and far deeper in threads than in processes — so a hard `RLIMIT_NPROC` of 128
+/// does not bound the capsule at 128; it makes the first `fork()` in the subprocess fail with
+/// `EAGAIN`. That is a broken runtime, not a bound.
 ///
 /// So `nproc_baseline` — the uid's live count *in that platform's own unit*, measured once in the
 /// parent at launch by [`uid_task_count`] — is added to the declared `max_processes`, making the
 /// manifest field mean "how much past the host's existing usage this capsule's tree may add".
-/// That is the only reading of a per-uid limit that is both enforceable and non-breaking, and it
-/// only holds if the baseline is measured in the unit the kernel checks: a *process* count fed to
-/// a Linux kernel counting threads yields a ceiling below the uid's live usage, i.e. the same
-/// `EAGAIN` the headroom design exists to prevent. When the count cannot be measured the caller
-/// passes `0` and the declared value applies literally, which errs toward the tighter bound.
+/// This only holds if the baseline is measured in the unit the kernel checks: a *process* count
+/// fed to a Linux kernel counting threads yields a ceiling below the uid's live usage, i.e. the
+/// same `EAGAIN` the headroom design exists to prevent. When the count cannot be measured the
+/// caller passes `0` and the declared value applies literally, which errs toward the tighter
+/// bound.
 ///
-/// This is also, concretely, why the Linux cgroup `pids.max` is not redundant with this: it
-/// counts only the tasks in the capsule's own scope, so it needs no baseline and cannot be
-/// evaded by the uid's other processes.
+/// This is why the Linux cgroup `pids.max` is not redundant with this: it counts only the tasks
+/// in the capsule's own scope, so it needs no baseline and cannot be evaded by the uid's other
+/// processes.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn apply_hard_rlimits(
@@ -436,8 +433,8 @@ pub(crate) struct WorkdirBreach {
 /// **Why a periodic check and not a tmpfs-backed workdir with a size mount option.** The
 /// structural version needs a mount namespace the runtime does not have: nothing in this
 /// codebase's process model ever runs as root, and the `sealed-containment-runtime` work that
-/// would create one is a separate, unbuilt roadmap card. A poll is what is available without
-/// it, and its one-interval detection lag is stated rather than hidden.
+/// would create one is separate and unbuilt. A poll is what is available without it, at the cost
+/// of a one-interval detection lag.
 #[derive(Debug)]
 pub(crate) struct WorkdirGuard {
     max_bytes: u64,
@@ -557,8 +554,8 @@ mod tests {
         );
     }
 
-    /// The rule this slice inherits from `capabilities.limits`: a manifest that declares the
-    /// section but omits a field gets that field's default, never "unlimited".
+    /// The rule inherited from `capabilities.limits`: a manifest that declares the section but
+    /// omits a field gets that field's default, never "unlimited".
     #[test]
     fn resolve_fills_each_omitted_field_independently() {
         let declared = murmur_artifact::ResourceCapabilities {
@@ -596,8 +593,8 @@ mod tests {
     }
 
     /// Attribution must name a limit only where the kernel's own signal identifies exactly one.
-    /// The negative half of this test is the point: over-attributing a `SIGKILL` to
-    /// `memory_bytes` would put a guess into the trace as if it were evidence.
+    /// The negative half matters too: over-attributing a `SIGKILL` to `memory_bytes` would put a
+    /// guess into the trace as if it were evidence.
     #[test]
     fn only_the_two_unambiguous_signals_name_a_limit() {
         assert_eq!(limit_from_signal(libc::SIGXCPU), Some("cpu_seconds"));
@@ -709,7 +706,7 @@ mod tests {
 
     /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
     /// can be raised back by the capsule itself. Asserted against the live process by lowering
-    /// a limit we can afford to lower (`RLIMIT_CORE`, which this runtime pins at zero anyway)
+    /// a safely lowerable limit (`RLIMIT_CORE`, which this runtime pins at zero anyway)
     /// and reading it back.
     #[cfg(unix)]
     #[test]

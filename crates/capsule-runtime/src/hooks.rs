@@ -2821,8 +2821,7 @@ mod tests {
     /// A hook that never returns from `on-session-start` is cut off at its epoch deadline
     /// and flows through the *existing* per-hook isolation: the failure is logged to
     /// `logs/hook-<name>.log` by `log_hook_error` and `dispatch` carries on to the next
-    /// hook rather than aborting the session. This is the hook half of the slice's
-    /// "before: unkillable, after: bounded" proof.
+    /// hook rather than aborting the session. A spinning hook is bounded, not unkillable.
     #[test]
     fn blocking_hook_that_spins_is_interrupted_and_does_not_abort_dispatch() {
         let session = TempDir::new().unwrap();
@@ -2854,7 +2853,7 @@ mod tests {
                     .await
                     .expect("both doubles export every required fn, so both instantiate");
 
-            // Returns at all == the spinning guest was interrupted. Before this slice the
+            // Returns at all == the spinning guest was interrupted; without the deadline the
             // await below would never complete.
             hooks.emit(session.path(), HookEvent::SessionStart).await;
         });

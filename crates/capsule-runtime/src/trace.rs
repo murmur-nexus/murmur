@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(events[0]["containment_achieved"], "scoped");
     }
 
-    /// The card's central property: `session_start.effective_grants` is the *whole* `ScopeReport`,
+    /// Central property: `session_start.effective_grants` is the *whole* `ScopeReport`,
     /// serialized byte-for-byte as `mur run --explain-scope --json` prints it — not a re-derived
     /// summary of it. Asserted by comparing against `serde_json::to_value` of the very report
     /// handed to the writer, so any field added to `ScopeReport` later is covered without this

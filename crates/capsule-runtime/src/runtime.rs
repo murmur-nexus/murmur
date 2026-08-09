@@ -2775,8 +2775,7 @@ pub(crate) async fn invoke_tool_component(
         .map_err(|err| format!("failed to type-check tool '{name}' run export: {err}"))?;
 
     // Fresh budget for `run` itself, so instantiation cost cannot eat into it. This is
-    // also the driver path (`agent.rs` dispatches the inference driver through here),
-    // which before this slice had no deadline of any kind.
+    // also the driver path (`agent.rs` dispatches the inference driver through here).
     store.set_epoch_deadline(tool_limits.deadline_ticks());
     let called = run.call_async(&mut store, (input,)).await;
     let (result,) = match called {
@@ -3216,11 +3215,9 @@ fn dispatch_native_tool(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Before this slice this path had no `pre_exec` hook of any kind, so a native-implementation
-    // artifact ran completely unbounded while `execute_shell` did not. It now carries the same
-    // hard rlimits and the same cgroup membership. It still installs no seccomp filter and no
-    // Landlock scope — that asymmetry is a pre-existing, separately-tracked gap this slice
-    // deliberately does not close.
+    // This path carries the same hard rlimits and the same cgroup membership as `execute_shell`,
+    // but installs no seccomp filter and no Landlock scope. That asymmetry is deliberate and
+    // open: a native-implementation artifact is bounded but not confined.
     sandbox::attach_process_limits(&mut command, enforcement);
     // Mark every fd >= 3 close-on-exec in the forked child, so this subprocess inherits only the
     // stdio pipes configured just above and nothing that merely happened to be open in the

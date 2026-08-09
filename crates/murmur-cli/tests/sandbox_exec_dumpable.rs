@@ -377,8 +377,8 @@ fn host_provides_scoped(home: &TempDir, project: &Path) -> bool {
 }
 
 /// Scenario 1: non-root, containment `advisory` (nothing declared — the default class every host
-/// satisfies). Broken before this slice on both kernel tiers, because the tier is host-probed and
-/// the seccomp-notify filter is installed independently of the declared containment class.
+/// satisfies). The tier is host-probed and the seccomp-notify filter is installed independently
+/// of the declared containment class.
 #[test]
 fn advisory_containment_executes_an_allowlisted_shell_binary() {
     if running_as_root() {

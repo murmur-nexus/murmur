@@ -68,7 +68,7 @@
 //!   `capabilities.shell.allow` enforceable (exec is a Landlock right, not a syscall filter).
 //! - `KernelSeccompOnly` (Linux, Landlock unavailable — kernel <5.13): seccomp syscall allowlist +
 //!   socket-domain denial only. Filesystem scope stays convention-only (`current_dir`) — a
-//!   documented gap, not a bug — and, since this slice retired the exec supervisor, so does
+//!   documented gap, not a bug — and, since the exec supervisor was retired, so does
 //!   `shell.allow`: with no Landlock domain there is no kernel-level exec mediation on this tier
 //!   at all. `W-SEC-002` says so. The syscall allowlist and the socket-domain denial are identical
 //!   on both tiers: they are seccomp rules, so they do not depend on Landlock in any way.
@@ -158,8 +158,8 @@ pub(crate) fn tier_from_probe(
 ///
 /// A capsule declaring `scoped` on a sealed-capable host keeps running exactly as it does today:
 /// the composed root would otherwise silently delete host paths its `interpreter_runtime` grants
-/// legitimately point at, which is a regression to `scoped`'s behaviour dressed up as extra
-/// security. The declared floor is honoured, not merely met.
+/// legitimately point at — a narrowing of `scoped`'s behaviour, not added security. The
+/// declared floor is honoured, not merely met.
 ///
 /// It is deliberately *not* symmetric with the achieved class recorded in the trace: `achieved`
 /// answers "what can this host back" (a host fact) and is probed independently, while this answers
@@ -374,7 +374,7 @@ fn is_executable_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// ---- derived Landlock read+execute grant set (this slice) ----
+// ---- derived Landlock read+execute grant set ----
 //
 // On `KernelFull`, Landlock scopes the shell subprocess tree to the workdir. The workdir rule
 // grants `linux_enforce::WORKDIR_ACCESS_RIGHTS` (everything in ABI v1 except device-node and
@@ -398,9 +398,9 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// Standard Linux shared-library search directories used as the fallback resolution set for a
 /// `DT_NEEDED` soname when the binary declares no `DT_RPATH`/`DT_RUNPATH` (or it doesn't match).
-/// Covers both of this repo's platform targets (`linux/x86_64` and `linux/aarch64`), including the
-/// Debian/Ubuntu multiarch-triplet subdirectories. A later slice or a reviewer targeting a
-/// platform this list didn't anticipate can extend it here — it is the single source of truth.
+/// Covers both supported platform targets (`linux/x86_64` and `linux/aarch64`), including the
+/// Debian/Ubuntu multiarch-triplet subdirectories. Extend here for a platform this list does not
+/// cover — it is the single source of truth.
 const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
@@ -462,7 +462,7 @@ fn vaddr_to_file_offset(vaddr: u64, loads: &[(u64, u64, u64)]) -> Option<u64> {
 /// grant set (shrink-not-fail). Deliberately hand-rolled (no crate dependency) and byte-slice-in /
 /// struct-out so it is fully unit-testable off-Linux with synthetic fixtures; it makes no syscalls.
 ///
-/// Only ELF64 is parsed: both of this repo's Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
+/// Only ELF64 is parsed: both supported Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
 /// 32-bit image is not a binary this runtime would exec and is treated as unparseable.
 pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     // e_ident (16) + fixed ELF64 header fields extend to offset 64.
@@ -482,7 +482,7 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     let e_phoff = read_u64(bytes, 32, le)? as usize;
     let e_phentsize = read_u16(bytes, 54, le)? as usize;
     let e_phnum = read_u16(bytes, 56, le)? as usize;
-    // Each Elf64_Phdr is 56 bytes; a smaller entsize means this is not the layout we parse.
+    // Each Elf64_Phdr is 56 bytes; a smaller entsize is not this layout.
     if e_phentsize < 56 {
         return None;
     }
@@ -715,9 +715,9 @@ fn resolve_landlock_grants_in(
 /// narrows `list_dir` to `false` for any grant whose fd does not `fstat` as a directory, so this
 /// field is a request rather than a promise.
 ///
-/// `executable` decides `Execute`, which is this runtime's exec allowlist: the seccomp `execve`
-/// supervisor was retired in favour of Landlock `Execute` rights, so a path without an `Execute`
-/// rule cannot be `execve`d and a path with one can.
+/// `executable` decides `Execute`, which is this runtime's exec allowlist: a path without an
+/// `Execute` rule cannot be `execve`d, and a path with one can. This is the canonical statement of
+/// that rule; the grant resolvers below cross-reference it rather than restating it.
 ///
 ///   - `true` → `Execute + ReadFile`, for a path the manifest asked to *run*: a `shell.allow`
 ///     binary, its `DT_NEEDED` closure, and the interpreter/staged trees an author named.
@@ -742,10 +742,8 @@ pub(crate) struct LandlockGrant {
 
 impl LandlockGrant {
     /// Wraps each derived `DT_NEEDED`-closure file path as a non-listable grant. A regular file
-    /// has no meaningful `ReadDir`, so `list_dir: false` is both correct and a pure simplification
-    /// of b3220cb5's old uniform `Execute|ReadFile|ReadDir` — it never changes *which* files are
-    /// granted. `executable: true`: this closure is exactly the set of paths `shell.allow` asked
-    /// to run, so it is the allowlist the `Execute` right exists to express.
+    /// has no meaningful `ReadDir`, so `list_dir: false` costs nothing. `executable: true`: this
+    /// closure is exactly the set of paths `shell.allow` asked to run — see [`LandlockGrant`].
     fn non_listable_files(paths: Vec<PathBuf>) -> Vec<LandlockGrant> {
         paths
             .into_iter()
@@ -757,7 +755,7 @@ impl LandlockGrant {
 /// Turns each `capabilities.shell.interpreter_runtime` directory into a [`LandlockGrant`] carrying
 /// exactly the `list_dir` its author wrote. Pure and syscall-free (the declared paths need not
 /// exist here — `apply_landlock_scope` skips any that fail to open), so it is unit-testable on
-/// every platform including a non-Linux dev machine.
+/// every platform, including non-Linux targets.
 ///
 /// There is deliberately no path here that could widen a grant to a whole install prefix: it emits
 /// one grant per explicitly declared directory and copies the author's `list_dir` verbatim,
@@ -953,11 +951,11 @@ pub(crate) fn resolve_sealed_runtime_landlock_grants(tier: EnforcementTier) -> V
 /// (`c_rehash` symlink lookup, `os.listdir('/etc/ssl/certs')`, `SSL_CERT_DIR`); files and symlinks
 /// get `ReadFile` only, the same convention as [`LandlockGrant::non_listable_files`].
 ///
-/// `executable: false` throughout (see [`LandlockGrant`]): `Execute` is this runtime's exec
-/// allowlist, and nothing in `/etc` is a program a manifest asked to run. `/etc/alternatives` in
-/// particular is a directory of symlinks *into* `/usr/bin`, so granting `Execute` here would be a
-/// second, undeclared route to the exec bypass `resolve_sealed_runtime_landlock_grants` withholds
-/// it to prevent.
+/// `executable: false` throughout (see [`LandlockGrant`] for what `Execute` decides). Nothing in
+/// `/etc` is a program a manifest asked to run, and `/etc/alternatives` in particular is a
+/// directory of symlinks *into* `/usr/bin`, so granting `Execute` here would be a second,
+/// undeclared route to the exec bypass `resolve_sealed_runtime_landlock_grants` withholds it to
+/// prevent.
 ///
 /// No write right, ever: the binds are `MS_RDONLY`, and `/etc/resolv.conf` or `/etc/hosts` becoming
 /// writable inside a capsule would be a name-resolution hijack of the capsule's own egress.
@@ -984,7 +982,7 @@ pub(crate) fn resolve_sealed_etc_landlock_grants(tier: EnforcementTier) -> Vec<L
         .collect()
 }
 
-// ---- fixed capsule device set (this slice) ----------------------------------------------
+// ---- fixed capsule device set ------------------------------------------------------------
 //
 // Everything above derives its grants from the manifest: `shell.allow` binaries and their
 // `DT_NEEDED` closure, `interpreter_runtime` directories. The device set below derives from
@@ -1075,7 +1073,7 @@ pub(crate) const CAPSULE_DEVICE_GRANTS: &[CapsuleDeviceGrant] = &[
     },
 ];
 
-/// Network decision for one destination IP read out of a notifying task's `sockaddr`.
+/// Network decision for one destination IP.
 /// Empty allowlist denies everything (a capsule that declared no `network.allow` hosts has
 /// no reason to open any subprocess socket).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1087,7 +1085,7 @@ pub(crate) fn network_ip_allowed(ip: IpAddr, network_allow_ips: &[IpAddr]) -> bo
 // rather than `libc::AF_*`: the filter these feed is
 // always compiled *for a Linux child*, so the numbers must be Linux's regardless of what host the
 // build runs on — and `denied_socket_domains` has to stay compilable and unit-testable on a macOS
-// dev machine, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
+// non-Linux targets, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
 // crate defines them only under `linux_like`). `libc::AF_UNIX` does exist on macOS, but taking one
 // of the three from `libc` and two from literals would be worse than taking all three the same
 // way. Values are stable kernel ABI: `include/linux/socket.h`.
@@ -1107,11 +1105,10 @@ const LINUX_AF_PACKET: i32 = 17;
 /// Why a domain check is a classic BPF rule and not a notify:
 /// `socket()`'s `domain` is a plain integer in a register, so the kernel's own BPF can compare it
 /// directly. That is exactly what `connect()`'s destination address is *not* — it sits behind a
-/// pointer BPF cannot dereference, which is why the retired notify supervisor had to read it out of
-/// the calling task's memory (see this module's header). Denying the domain at *creation* time
-/// needs no userspace round-trip, and is structurally immune to the TOCTOU class of problem that
-/// reading a pointed-to argument out of another task's memory invites — which is why this rule
-/// survived both retirements unchanged.
+/// pointer BPF cannot dereference, so deciding on it needs a userspace round-trip that reads the
+/// calling task's memory (see this module's header). Denying the domain at *creation* time needs
+/// no round-trip, and is structurally immune to the TOCTOU class of problem that reading a
+/// pointed-to argument out of another task's memory invites.
 ///
 /// The three families, and why they are not symmetric:
 ///   - `AF_UNIX` is gated, not banned. `/var/run/docker.sock` is host root, so it cannot be open
@@ -1167,9 +1164,8 @@ pub(crate) fn allowed_socket_domains(unix_sockets_allowed: bool) -> Vec<i32> {
 /// `socket(2)` `domain` values for the two IP families, named apart from the bare `LINUX_AF_*`
 /// numbers above so a rule's argument type reads as a domain rather than as a loose integer.
 ///
-/// These used to be derived from a second pair of constants belonging to the `sockaddr` parser the
-/// retired `connect`/`sendto` supervisor used. That parser is gone with it, so they are literals
-/// from the same `include/linux/socket.h` list as their neighbours now.
+/// Literals from the same `include/linux/socket.h` list as their neighbours above, for the same
+/// reason: the filter is always compiled for a Linux child.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const LINUX_AF_INET_DOMAIN: i32 = LINUX_AF_INET;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -1185,21 +1181,16 @@ const LINUX_AF_INET6_DOMAIN: i32 = LINUX_AF_INET6;
 ///   - `socket` is absent: it carries argument-conditional rules (see [`denied_socket_domains`] /
 ///     [`allowed_socket_domains`]), and an unconditional `Allow` rule would discard them.
 ///
-/// `execve`/`execveat` are in this array as ordinary allowed syscalls, which is the visible half of
-/// the slice that retired the exec supervisor. They used to carry `Notify` rules so a userspace
-/// loop could read the invoked pathname out of the calling task's memory and match it against a
-/// canonical allowlist — a decision `seccomp_unotify(2)` documents as inherently racy under
-/// `CONTINUE` semantics. `capabilities.shell.allow` is now enforced by the Landlock domain instead
-/// (`Execute` on each allowlisted binary's own path, withheld from the workdir unless
-/// `capabilities.filesystem.workdir_exec` is declared), so what these rules permit is reaching the
-/// kernel — where the LSM decides, on the path it resolved itself. Permitting them here is not
-/// optional: the child's very first act after this filter loads is the `execve` that turns it into
-/// the tool binary, so a denial here refuses every capsule outright.
+/// `execve`/`execveat` are ordinary allowed syscalls here: they permit only *reaching the kernel*,
+/// where the Landlock domain decides the exec on the path it resolved itself (see this module's
+/// header for why they no longer carry `Notify` rules). Permitting them is not optional — the
+/// child's very first act after this filter loads is the `execve` that turns it into the tool
+/// binary, so a denial here refuses every capsule outright.
 ///
-/// Everything else is refused by the default action, which is the point of the card this list
-/// implements: before it, `io_uring_setup`, `bpf`, `userfaultfd`, `perf_event_open`,
-/// `open_by_handle_at`, `keyctl` and `ptrace` were all reachable from a capsule shell on bare
-/// metal, while the same probe under Docker got `EPERM` for each. `io_uring` is the one that
+/// Everything else is refused by the default action. Without this list `io_uring_setup`, `bpf`,
+/// `userfaultfd`, `perf_event_open`, `open_by_handle_at`, `keyctl` and `ptrace` are all reachable
+/// from a capsule shell on bare metal, while the same probe under Docker gets `EPERM` for each.
+/// `io_uring` is the one that
 /// matters most: it has historically bypassed LSM path hooks, so leaving it reachable undermines
 /// the Landlock filesystem boundary rather than merely widening the syscall surface. See
 /// [`SECCOMP_MUST_STAY_DENIED`] for the full set that must never be added back.
@@ -1220,9 +1211,9 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
     // `clone`/`clone3` are allowed *unconditionally*, which is this filter's one significant
     // widening relative to Docker: Docker masks `clone`'s namespace-creation flags with an
     // argument comparison and forces `clone3` to `ENOSYS` so glibc falls back to the masked
-    // `clone`. Reproducing that faithfully is possible for `clone` but pointless in isolation,
-    // and the card scopes this slice to a syscall-name allowlist. `unshare`/`setns`/`mount`/
-    // `pivot_root`/`chroot` all stay denied, so a new namespace stays largely inert.
+    // `clone`. Reproducing that faithfully is possible for `clone` but pointless in isolation:
+    // `unshare`/`setns`/`mount`/`pivot_root`/`chroot` all stay denied, so a new namespace stays
+    // largely inert.
     "clone",
     "clone3",
     "fork",
@@ -1453,13 +1444,9 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
     // ---- sockets ----
     // `socket` is NOT here (argument-conditional rules — see this array's doc comment).
     //
-    // `connect`/`sendto` ARE here: they used to carry `Notify` rules so a userspace supervisor
-    // could read the destination `sockaddr` out of the calling task's memory and compare it against
-    // a resolved allowlist. That mechanism is gone (see `crate::network_namespace` for what
-    // replaced it), so these are ordinary allowed syscalls again — allowed to *reach the kernel*,
-    // where the capsule's own network namespace has no route to anything except the egress proxy.
-    // The decision moved from a racy pointer read into the routing table; it did not disappear.
-    // `execve`/`execveat` at the top of this array made the same move, into the Landlock domain.
+    // `connect`/`sendto` ARE here: allowing them permits only *reaching the kernel*, where the
+    // capsule's own network namespace has no route to anything except the egress proxy. The
+    // destination check lives there, not in this filter — see `crate::network_namespace`.
     "connect",
     "sendto",
     "socketpair",
@@ -1534,8 +1521,8 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
 ///
 /// Three groups, and they are not equally negotiable:
 ///
-///   1. **Named in the card's evidence table** — the ones a probe demonstrated were reachable on
-///      bare metal while Docker refused them: `io_uring_setup`/`io_uring_enter`/
+///   1. **Demonstrated reachable** — a probe reached these on bare metal while Docker refused
+///      them: `io_uring_setup`/`io_uring_enter`/
 ///      `io_uring_register` (historically bypasses LSM path hooks, so it is a candidate route
 ///      around Landlock itself), `bpf`, `userfaultfd`, `perf_event_open`, `open_by_handle_at`,
 ///      `keyctl`/`add_key`/`request_key`, `process_vm_readv`/`process_vm_writev`, and `ptrace`
@@ -1554,7 +1541,7 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
 ///      itself (a nested filter cannot loosen this one, but it can slow it down for no benefit).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const SECCOMP_MUST_STAY_DENIED: &[&str] = &[
-    // 1. the card's evidence table
+    // 1. demonstrated reachable on bare metal
     "io_uring_setup",
     "io_uring_enter",
     "io_uring_register",
@@ -1622,12 +1609,10 @@ pub(crate) struct ShellEnforcement {
     /// Every `capabilities.network.allow` host resolved to concrete addresses once, at launch,
     /// by [`resolve_network_allowlist_ips`].
     ///
-    /// This used to be the *whole* network policy: a seccomp-notify supervisor read a
-    /// destination `sockaddr` out of the stopped child and compared the IP against this list. It
-    /// is now the narrower of the egress proxy's two checks — the one applied to a destination
-    /// the capsule reached without ever resolving a name for it (a hardcoded literal). See
+    /// The narrower of the egress proxy's two checks — the one applied to a destination the
+    /// capsule reached without ever resolving a name for it (a hardcoded literal). See
     /// `egress_proxy::EgressPolicy::allows_connection`, which consults exactly this list through
-    /// the unchanged [`network_ip_allowed`].
+    /// [`network_ip_allowed`].
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) network_allow_ips: Vec<IpAddr>,
     /// The same allowlist in its *parsed*, name-keyed form — the ordinary path. The egress proxy
@@ -1698,8 +1683,8 @@ pub(crate) struct ShellEnforcement {
     /// the fixed [`crate::sealed::SEALED_RUNTIME_PATHS`]: the containing directory of each
     /// resolved `shell.allow` binary, and each `capabilities.shell.interpreter_runtime` directory.
     ///
-    /// Whole directories, never files — this slice must not extend the ELF-closure grant
-    /// derivation it exists to make unnecessary. Consumed only on `KernelSealed`; resolved on
+    /// Whole directories, never files: a bind carries a directory's whole contents, so this must
+    /// not grow into a second ELF-closure derivation. Consumed only on `KernelSealed`; resolved on
     /// every platform for parity, exactly like `landlock_grants` above.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) sealed_bind_dirs: Vec<PathBuf>,
@@ -1718,16 +1703,15 @@ pub(crate) struct ShellEnforcement {
     /// Fully-resolved OS-level bounds for every subprocess this session spawns — `rlimit(2)`
     /// ceilings applied before `execve`, plus the values the cgroup scope below was built from.
     /// Unlike everything above it, this is enforced on **every** platform: `setrlimit` is POSIX,
-    /// so macOS gets the per-process half of this slice even though it can never get the
-    /// aggregate half. See [`crate::resources`].
+    /// so macOS gets the per-process bounds even though it can never get the aggregate (cgroup)
+    /// half. See [`crate::resources`].
     pub(crate) resource_limits: crate::resources::HostResourceLimits,
     /// The runtime's own uid task count, measured once here in the parent by
-    /// `crate::resources::uid_task_count` in whichever unit this platform's `RLIMIT_NPROC` is
-    /// enforced against: **threads** on Linux (`setrlimit(2)`: "the maximum number of processes
-    /// (or, more precisely on Linux, threads)"), **processes** on macOS. `RLIMIT_NPROC` is a
-    /// per-uid limit, so `resource_limits.max_processes` is applied as headroom above this rather
-    /// than as an absolute ceiling — see `crate::resources::apply_hard_rlimits`. `0` when the host
-    /// cannot be asked, which makes the declared value apply literally (the tighter reading).
+    /// `crate::resources::uid_task_count`, in whichever unit this platform's `RLIMIT_NPROC` is
+    /// enforced against. `RLIMIT_NPROC` is a per-uid limit, so `resource_limits.max_processes` is
+    /// applied as headroom above this rather than as an absolute ceiling — see
+    /// `crate::resources::apply_hard_rlimits`. `0` when the host cannot be asked, which makes the
+    /// declared value apply literally (the tighter reading).
     pub(crate) nproc_baseline: u64,
     /// The session's cgroup v2 scope, when the host could delegate one (Linux only, and only
     /// for capsules that can actually spawn a native subprocess). `None` on macOS always, and on
@@ -1761,7 +1745,7 @@ impl ShellEnforcement {
                 .map_err(|error| error.to_string())?;
         let egress_tcp_ports = crate::egress_proxy::egress_listen_ports(&network_allow_rules);
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
-        // The b3220cb5 `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
+        // The `DT_NEEDED`-closure files (individual files → non-listable) plus one grant
         // per author-declared `interpreter_runtime` directory (each with its own `list_dir`). A
         // directory not named in the manifest never receives a rule, regardless of what it holds.
         let mut landlock_grants =
@@ -1860,9 +1844,8 @@ impl ShellEnforcement {
             landlock_grants: Vec::new(),
             sealed_bind_dirs: Vec::new(),
             staged_runtime_dirs: Vec::new(),
-            // Defaults, not "no limits": the rlimit ceilings are the one part of this slice that
-            // applies unchanged on this tier, so zeroing them out here would misrepresent what a
-            // real macOS host does.
+            // Defaults, not "no limits": the rlimit ceilings apply unchanged on this tier, so
+            // zeroing them out here would misrepresent what a real macOS host does.
             resource_limits: crate::resources::HostResourceLimits::default(),
             nproc_baseline: crate::resources::uid_task_count().unwrap_or(0),
             cgroup_scope: None,
@@ -1885,11 +1868,9 @@ impl ShellEnforcement {
 /// `socket(2)` domains in `denied_socket_domains` — closing the `/var/run/docker.sock` path, which
 /// no Landlock ABI mediates for pathname sockets. The forked shell child also
 /// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
-/// None of this has yet been verified by the team on real Landlock-capable Linux hardware (the
-/// manual acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a
-/// silent "full" tier would imply everything is confirmed-enforced, which is the false assurance
-/// to avoid until a real Linux run lands.
-const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this host \
+/// `KernelFull` warns (`W_SEC_005`) rather than staying silent: the tier is a filesystem and
+/// syscall scope, not a namespace, so what it does and does not cover has to reach the operator.
+const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
@@ -1903,26 +1884,20 @@ capsule cannot reach a host daemon socket such as /var/run/docker.sock; the secc
 defaults to deny and permits only a fixed syscall allowlist modelled on the OCI/Docker default \
 profile, so io_uring, bpf, userfaultfd, perf_event_open, ptrace and similar are refused outright; \
 and the forked shell child \
-drops every Linux capability and sets no_new_privs before execve — but this mechanism has not yet \
-been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
-isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
+drops every Linux capability and sets no_new_privs before execve. Paths outside the workdir are \
+denied, not absent: stat, access and readlink on an ungranted path still succeed.";
 
-/// `KernelSealed`'s counterpart to [`KERNEL_UNVERIFIED_WARNING`], carrying the same `W_SEC_005`
-/// code for the same reason: the mechanism is real and installed, but the team has not yet run the
-/// manual acceptance procedure against it on real hardware, and a silent strongest tier would
-/// imply otherwise. It names what `sealed` adds over `scoped` so the warning is not merely a
-/// louder copy of the one below.
-const KERNEL_SEALED_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this \
+/// `KernelSealed`'s counterpart to [`KERNEL_ENFORCEMENT_NOTICE`], carrying the same `W_SEC_005`
+/// code: a silent strongest tier would imply the boundary has no documented exceptions, and it
+/// has one. Names what `sealed` adds over `scoped` so the warning is not a louder copy of it.
+const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
 namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
 the only writable path, a private /dev tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
 private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
-so host process metadata stays visible there exactly as it is under scoped. This mechanism has \
-been checked by hand on one host and not yet by the team on hardware of their own — see \
-docs/content/reference/sealed-containment-manual-verification.md — so treat the containment \
-boundary as not-yet-confirmed until that procedure has been run again independently.";
+so host process metadata stays visible there exactly as it is under scoped.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -1965,8 +1940,8 @@ pub(crate) fn tier_warning(
         return None;
     }
     match tier {
-        EnforcementTier::KernelSealed => Some((W_SEC_005, KERNEL_SEALED_UNVERIFIED_WARNING)),
-        EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING)),
+        EnforcementTier::KernelSealed => Some((W_SEC_005, KERNEL_SEALED_ENFORCEMENT_NOTICE)),
+        EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE)),
         EnforcementTier::KernelSeccompOnly => Some((W_SEC_002, SECCOMP_ONLY_WARNING)),
         EnforcementTier::EnvironmentOnly => Some((W_SEC_001, ENVIRONMENT_ONLY_WARNING)),
     }
@@ -2043,11 +2018,9 @@ pub(crate) fn warn_for_enforcement_tier(tier: EnforcementTier, workdir: &Path, p
 /// to its own socket. Starting the thread first — racing concurrently with the fork/exec inside
 /// `.spawn()`, not gated behind it — closes that window.
 ///
-/// The name is historical, and kept deliberately: this used to also run the seccomp-notify
-/// supervisor loop for `execve`/`execveat`, and before that for `connect`/`sendto`. Both mechanisms
-/// are retired (Landlock `Execute` rights and a network namespace respectively), so nothing is
-/// "supervised" here any more — what is left is the fd hand-off, the egress proxy's lifetime, and
-/// the child's diagnostic pipe.
+/// The name is historical: nothing is "supervised" here any more (the seccomp-notify loops it once
+/// ran are retired — see this module's header). What is left is the fd hand-off, the egress
+/// proxy's lifetime, and the child's diagnostic pipe.
 #[derive(Debug)]
 pub(crate) enum SupervisorHandle {
     Noop,
@@ -2075,7 +2048,7 @@ impl SupervisorHandle {
     /// before `wait_with_output` (called by `execute_shell` right before this) returned.
     ///
     /// A proxy outliving its namespace would be serving sockets whose peers no longer exist, so
-    /// this is the teardown, not merely a join.
+    /// this is the teardown, not merely a thread join.
     pub(crate) fn join_best_effort(self) {
         match self {
             SupervisorHandle::Noop => {}
@@ -2116,10 +2089,9 @@ impl SupervisorHandle {
     }
 }
 
-// Forced-failure seam for the fail-closed contract, per the slice design's own wording
-// ("simulated via a forced error path in a unit/integration test, since inducing a real
-// kernel-level failure requires already-hostile conditions"). Only compiled into test
-// builds; production `prepare_enforcement` has no bypass or injection point.
+// Forced-failure seam for the fail-closed contract: inducing a real kernel-level setup failure
+// requires already-hostile conditions, so tests simulate one here instead. Only compiled into
+// test builds; production `prepare_enforcement` has no bypass or injection point.
 #[cfg(test)]
 thread_local! {
     pub(crate) static FORCE_PREPARE_FAILURE: std::cell::Cell<bool> =
@@ -2201,7 +2173,7 @@ pub(crate) fn sealed_test_enforcement() -> ShellEnforcement {
 /// cgroup self-move is a single `write(2)` to a descriptor the parent already opened. Splitting
 /// this out is what lets the two subprocess spawn paths converge: `execute_shell` gets it as
 /// part of `prepare_enforcement`, and `dispatch_native_tool` — which installs no seccomp or
-/// Landlock at all, a pre-existing gap this slice does not close — gets it on its own.
+/// Landlock at all, a standing gap — gets it on its own.
 ///
 /// Everything the returned closure does runs in the forked child between `fork` and `execve`,
 /// so it is restricted to syscalls: `getrlimit`/`setrlimit` pairs and one `write`. No
@@ -2236,18 +2208,16 @@ pub(crate) fn attach_process_limits(
 /// Lowest file descriptor the fd-hygiene step touches. Everything from here upward is marked
 /// close-on-exec in the forked child; fds 0, 1 and 2 are deliberately left alone.
 ///
-/// **The stdio decision, recorded here so no future reader has to re-derive it: stdio is NOT
-/// marked close-on-exec, and is NOT reopened.** The whole point of the `Stdio::piped()` handles
-/// both spawn paths install *before* `pre_exec` runs is that the exec'd program inherits them
-/// across its own `execve` and talks to the parent over them — `execute_shell` reads the
-/// subprocess's stdout/stderr, and `dispatch_native_tool` additionally writes its `ToolInput`
-/// JSON to the subprocess's stdin and parses its `ToolResult` JSON back off stdout. Marking
-/// 0/1/2 close-on-exec would leave the exec'd program with those descriptors closed, breaking
-/// every invocation on both paths; and there is no meaningful thing to "reopen" them onto,
-/// because the pipes themselves are the intended destination, not an accident of inheritance.
-/// Stdio inheritance is the correct outcome. The gap this constant closes is everything
-/// *above* stdio, where inheritance was never intended and was only ever prevented by the
-/// empirical accident of nothing else happening to be open at spawn time.
+/// **Stdio is NOT marked close-on-exec, and is NOT reopened.** The `Stdio::piped()` handles both
+/// spawn paths install *before* `pre_exec` runs exist so the exec'd program inherits them across
+/// its own `execve` and talks to the parent over them — `execute_shell` reads the subprocess's
+/// stdout/stderr, and `dispatch_native_tool` additionally writes its `ToolInput` JSON to the
+/// subprocess's stdin and parses its `ToolResult` JSON back off stdout. Marking 0/1/2
+/// close-on-exec would leave the exec'd program with those descriptors closed, breaking every
+/// invocation on both paths, and there is nothing meaningful to reopen them onto: the pipes
+/// themselves are the intended destination. The gap this constant closes is everything *above*
+/// stdio, where inheritance was never intended and was only ever prevented by the empirical
+/// accident of nothing else happening to be open at spawn time.
 ///
 /// Its only non-test reader is Linux-only (`linux_enforce::mark_inherited_fds_cloexec`), so this
 /// carries the same cross-platform `dead_code` exception the other Linux-consumed items in this
@@ -2518,8 +2488,7 @@ pub(crate) fn prepare_enforcement(
 /// Landlock keeps mediating inside a composed root, so the two device *lists* have to agree: a
 /// device present in the sealed `/dev` but absent from the Landlock rules would exist and be
 /// unopenable, which reads as a runtime bug rather than as policy. `KernelFull` keeps
-/// [`CAPSULE_DEVICE_GRANTS`] exactly as it is — that constant services `scoped` and this slice
-/// does not touch it — while `KernelSealed` derives its own from
+/// [`CAPSULE_DEVICE_GRANTS`], which services `scoped`, while `KernelSealed` derives its own from
 /// [`crate::sealed::SEALED_DEVICE_NODES`], the same list the private `/dev` tmpfs is built from.
 ///
 /// The parent opens these paths on the *host*, before the namespace exists; because the composed
@@ -2714,9 +2683,8 @@ mod linux_enforce {
     ///     makes `capabilities.shell.allow` a complete, sound statement: Landlock refuses the exec
     ///     on the path the kernel itself resolved, so a binary the capsule wrote into its workdir
     ///     cannot run under any name — including an allowlisted basename, the exact bypass a prior
-    ///     release shipped. No userspace supervisor, no pointer read out of another task, and
-    ///     therefore no race. The cost is real and documented: a binary the capsule legitimately
-    ///     compiled in its workdir cannot run either, which is what `workdir_exec: true` buys back.
+    ///     release shipped. The cost: a binary the capsule legitimately compiled in its workdir
+    ///     cannot run either, which is what `workdir_exec: true` buys back.
     ///   - `MakeChar` / `MakeBlock` — creating a device node inside the workdir escapes this
     ///     whole scope. A capsule running as root could `mknod` a node for the host's own disk
     ///     (e.g. major/minor `8:0` = `sda`) *inside* the granted directory — which Landlock
@@ -2738,12 +2706,11 @@ mod linux_enforce {
     /// Because `apply_landlock_scope`'s `handle_access` still declares the *full*
     /// `from_all(ABI::V1)` set, a right this rule withholds is not merely "not extra-granted" — it
     /// is **denied on every path this rule covers**, workdir included, once `restrict_self()` takes
-    /// effect. That is precisely why withholding `Execute` here is enforcement and not a mere
-    /// omission. The three `Make*` rights are denied domain-wide because no other rule grants them
-    /// either; `Execute` is denied *on the workdir specifically*, while the narrow read+execute
-    /// grants below still carry it for the allowlisted binaries outside it — which is the whole
-    /// shape of the replacement: exec where the operator named a binary, nowhere the capsule
-    /// writes.
+    /// effect — so withholding `Execute` here is enforcement, not a mere omission. The three
+    /// `Make*` rights are denied domain-wide because no other rule grants them either; `Execute`
+    /// is denied *on the workdir specifically*, while the narrow read+execute grants below still
+    /// carry it for the allowlisted binaries outside it: exec where the operator named a binary,
+    /// nowhere the capsule writes.
     pub(super) const WORKDIR_ACCESS_RIGHTS_NO_EXEC: BitFlags<AccessFs> = make_bitflags!(AccessFs::{
         WriteFile
             | ReadFile
@@ -2775,16 +2742,14 @@ mod linux_enforce {
     /// calling `restrict_self()` **in a forked child**, so the host process is never placed
     /// into a Landlock domain by a mere capability check.
     ///
-    /// Forking is required, not defensive. An earlier version restricted the calling process
-    /// on the grounds that a domain permitting everything has "no observable effect" — that is
-    /// false, and the rights the ruleset grants are beside the point. Entering *any* Landlock
-    /// domain permanently forbids the mount family to the task and every descendant it will
-    /// ever have; Landlock is designed that way precisely to stop a sandbox being escaped
-    /// through a nested namespace. Since `host_probe` runs this before the sealed probe, and
-    /// both run inside `ShellEnforcement::resolve` before any fork that would build a composed
-    /// root, restricting in-process poisoned `sealed` on every host, on every invocation — the
-    /// namespace was created and then `mount` was refused, with nothing in the error to
-    /// suggest the runtime had done it to itself.
+    /// Forking is required, not defensive. The rights the ruleset grants are beside the point:
+    /// entering *any* Landlock domain — even one permitting everything — permanently forbids the
+    /// mount family to the task and every descendant it will ever have, which is how Landlock
+    /// stops a sandbox being escaped through a nested namespace. `host_probe` runs this before the
+    /// sealed probe, and both run inside `ShellEnforcement::resolve` before any fork that would
+    /// build a composed root, so restricting in-process poisons `sealed` on every host and every
+    /// invocation: the namespace is created and then `mount` is refused, with nothing in the error
+    /// to suggest the runtime did it to itself.
     ///
     /// The ruleset is built in the parent because creating one and adding rules restricts
     /// nothing; only `restrict_self` applies it. That keeps everything the child does after
@@ -2859,13 +2824,11 @@ mod linux_enforce {
     /// capabilities, installs the seccomp filter (the `socket()` domain denials keyed on
     /// `unix_sockets_allowed`, over a default-deny syscall allowlist), and (on
     /// `KernelFull`/`KernelSealed`) applies the Landlock filesystem scope — which is also what
-    /// enforces `capabilities.shell.allow`, now that the exec notify supervisor is gone. Returning
-    /// `Err` here aborts the exec (std's `Command` machinery propagates it back to the parent's
-    /// `.spawn()` call as an `io::Error`) — the fail-closed path for setup failures that happen
-    /// after fork.
+    /// enforces `capabilities.shell.allow`. Returning `Err` here aborts the exec (std's `Command`
+    /// machinery propagates it back to the parent's `.spawn()` call as an `io::Error`) — the
+    /// fail-closed path for setup failures that happen after fork.
     ///
-    /// `child_sock_fd` carries exactly one hand-off now: the namespace sockets. It used to carry a
-    /// second (the seccomp notify fd), which went with the supervisor.
+    /// `child_sock_fd` carries exactly one hand-off: the namespace sockets.
     pub(super) fn child_install_enforcement(
         tier: EnforcementTier,
         netns_plan: &crate::network_namespace::CapsuleNetnsPlan,
@@ -2875,7 +2838,7 @@ mod linux_enforce {
         unix_sockets_allowed: bool,
     ) -> io::Result<()> {
         // FIRST, on every kernel tier: the capsule's own network namespace. It has to precede
-        // everything below it for three separate reasons, none of them stylistic:
+        // everything below it for three separate reasons:
         //
         //   * `SECCOMP_MUST_STAY_DENIED` denies `unshare` and the filter installed further down
         //     denies `socket(AF_NETLINK)`, so this is the only window in which the namespace can
@@ -2897,9 +2860,9 @@ mod linux_enforce {
         unsafe { crate::network_namespace::create_capsule_netns(netns_plan, child_sock_fd)? };
 
         // NEXT, and only on `KernelSealed`: build the private mount namespace and pivot onto the
-        // composed root. This has to precede every *remaining* step in this closure, for one reason
-        // that is not a matter of taste — `SECCOMP_MUST_STAY_DENIED` denies `unshare`, `mount` and
-        // `pivot_root` to every process the filter below covers, permanently and deliberately.
+        // composed root. This has to precede every *remaining* step in this closure, because
+        // `SECCOMP_MUST_STAY_DENIED` denies `unshare`, `mount` and `pivot_root` to every process
+        // the filter below covers, permanently and deliberately.
         // The composed root is therefore built by this process while it still has its pre-filter
         // credentials, never by a syscall the sandboxed subprocess is later permitted to make.
         // The three steps that follow then run *inside* the new root: `drop_all_capabilities`
@@ -2946,13 +2909,10 @@ mod linux_enforce {
         drop_all_capabilities()?;
 
         // The child stays *non-dumpable*, inherited from the runtime process
-        // (`security::harden_process_dumpable`). Until this slice it did not: `restore_child_dumpable`
-        // set `PR_SET_DUMPABLE` back to 1 here, because the kernel's `ptrace_may_access` check gates
-        // every `/proc/<pid>/*` read and the seccomp-notify supervisor had to read
-        // `/proc/<child>/mem` to recover the pathname of each notified `execve`. With that
-        // supervisor deleted nothing reads the child's memory any more, so the flag — and the
-        // same-uid `ptrace`/`environ`/core-dump exposure it opened for the whole life of every
-        // shell subprocess — is simply gone. Do not reintroduce it without a reader that needs it.
+        // (`security::harden_process_dumpable`). Nothing reads the child's memory, so nothing
+        // needs it dumpable. Marking it dumpable opens same-uid `ptrace`, `environ` and core-dump
+        // access for the whole life of every shell subprocess: do not do so without a reader that
+        // requires it.
         install_seccomp_filter(unix_sockets_allowed)?;
 
         if matches!(
@@ -2982,7 +2942,7 @@ mod linux_enforce {
     /// The range starts at 3, never 0 — see [`super::FD_HYGIENE_FIRST_FD`] for the recorded
     /// stdio decision and its reasoning.
     ///
-    /// **Kernel range narrowing, stated plainly:** `close_range(2)` landed in Linux 5.9 and
+    /// **Kernel range narrowing:** `close_range(2)` landed in Linux 5.9 and
     /// `CLOSE_RANGE_CLOEXEC` in Linux 5.11. On an older kernel this call fails (`ENOSYS`, or
     /// `EINVAL` for the flag on 5.9/5.10), the error propagates, and `Command::spawn()` fails —
     /// so every shell spawn on a `KernelSeccompOnly` *or* `KernelFull` host with such a kernel
@@ -2990,7 +2950,7 @@ mod linux_enforce {
     /// this module's established fail-closed discipline (`drop_all_capabilities`,
     /// `install_seccomp_filter` and `apply_landlock_scope` all abort the spawn on an unexpected
     /// error rather than degrade), but it is a real, user-visible narrowing of the supported
-    /// kernel range for kernel-enforcement tiers, not a side effect worth burying.
+    /// kernel range for kernel-enforcement tiers.
     pub(super) fn mark_inherited_fds_cloexec() -> io::Result<()> {
         // SAFETY: `close_range` takes three scalar arguments and dereferences nothing. It is a
         // single syscall, so it is safe to call in the post-fork/pre-exec window. `c_uint::MAX`
@@ -3243,16 +3203,12 @@ mod linux_enforce {
 
     /// Builds and loads the child's seccomp filter.
     ///
-    /// **This filter raises no notifications and needs no supervisor.** It used to: `execve`/
-    /// `execveat` carried `SECCOMP_RET_USER_NOTIF` rules so a userspace loop could read the invoked
-    /// pathname out of `/proc/<pid>/mem` and answer `CONTINUE`, and `connect`/`sendto` did the same
-    /// for a destination `sockaddr`. Both mechanisms are gone, retired in that order: network
-    /// enforcement moved into [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec
-    /// enforcement moved into the Landlock domain `apply_landlock_scope` installs, where the kernel
-    /// evaluates the path it resolved itself. `seccomp_unotify(2)` calls continue-based argument
-    /// inspection inherently racy, and this filter no longer does any.
+    /// **This filter raises no notifications and needs no supervisor.** Network enforcement lives
+    /// in [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec enforcement in the
+    /// Landlock domain `apply_landlock_scope` installs — see this module's own header for why no
+    /// `Notify` rule may come back.
     ///
-    /// What is left is one mechanism plus a default:
+    /// One mechanism plus a default:
     ///
     ///   - `socket` gets classic, register-value `Errno` rules, one per denied domain. `domain` is
     ///     a plain integer argument, so the comparison compiles straight into the loaded BPF
@@ -3335,7 +3291,7 @@ mod linux_enforce {
         // Equality rules per allowed domain, and NOT one unconditional `Allow` rule for `socket`:
         // libseccomp resolves an unconditional rule for a syscall by *discarding* every
         // argument-conditional chain already recorded for it (`db.c`: "syscall exists with chains
-        // but the new filter has no chains so we need to clear the existing chains"), so a broad
+        // but the new filter has no chains so the existing chains must be cleared"), so a broad
         // `Allow` here would silently delete the AF_UNIX/AF_NETLINK/AF_PACKET denials directly
         // above and reopen the `/var/run/docker.sock` path they exist to close. containerd's
         // default profile carries the same warning against combining a broad `socket` allow with
@@ -3523,6 +3479,7 @@ mod linux_enforce {
                 })?;
         }
 
+
         for grant in &fds.grants {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
             // so every fd reaching here is valid. A rule that still fails to add is a genuine
@@ -3615,6 +3572,7 @@ mod linux_enforce {
         } else {
             None
         };
+
 
         let mut grants = Vec::with_capacity(landlock_grants.len());
         for grant in landlock_grants {
@@ -3749,15 +3707,11 @@ mod linux_enforce {
     /// running after it, per [`SupervisorHandle`]'s doc comment.
     ///
     /// The child sends exactly one `SCM_RIGHTS` batch over this socketpair, from
-    /// `create_capsule_netns` — the first thing its `pre_exec` window does. It used to send a
-    /// second message afterwards (the seccomp notify fd) and this thread used to stay alive
-    /// supervising it; both are gone with the exec supervisor, so the thread now finishes as soon
-    /// as the proxy is up and hands the live handle back over `proxy_rx` for
-    /// [`SupervisorHandle::join_best_effort`] to shut down. What that changes is *when* the proxy
-    /// stops: previously when the notify fd closed (i.e. when every process holding the filter had
-    /// exited), now when `execute_shell` has finished waiting on the subprocess tree. Those are the
-    /// same moment in every ordinary case, because `wait_with_output` reads stdout to EOF and so
-    /// waits for every descendant holding the pipe.
+    /// `create_capsule_netns` — the first thing its `pre_exec` window does. The thread finishes as
+    /// soon as the proxy is up and hands the live handle back over `proxy_rx` for
+    /// [`SupervisorHandle::join_best_effort`] to shut down, so the proxy stops when
+    /// `execute_shell` has finished waiting on the subprocess tree. `wait_with_output` reads
+    /// stdout to EOF and so waits for every descendant holding the pipe.
     ///
     /// If the sockets never arrive (e.g. `fork()` itself failed, or the child's `pre_exec` closure
     /// errored before reaching the send), there is no live child left unserved:
@@ -3836,16 +3790,12 @@ mod tests {
     use super::*;
     use murmur_artifact::security_warnings::W_SEC_003;
 
-    /// Content check only, deliberately: this asserts the *constant* the fd-hygiene call is
-    /// built from, not the security property itself. A test that opened an extra fd, spawned a
-    /// real subprocess and asserted the child could not see it would pass vacuously on every
-    /// runner this repo's CI uses (macOS has no `close_range`; Linux CI never resolves to a
-    /// kernel-enforcement tier), which would read as evidence while proving nothing. The
-    /// property is verified by hand — see
-    /// `docs/content/reference/subprocess-fd-hygiene-verification.md`.
+    /// Content check only: this asserts the *constant*, not the security property. Spawning a
+    /// subprocess and asserting it cannot see an inherited fd passes vacuously without kernel
+    /// enforcement, so it would read as evidence while proving nothing.
     ///
-    /// What this does catch is the one silent, catastrophic edit: a `0` here would mark stdio
-    /// close-on-exec and break every subprocess invocation on both spawn paths.
+    /// It does catch the one silent, catastrophic edit: a `0` here marks stdio close-on-exec and
+    /// breaks every subprocess invocation on both spawn paths.
     #[test]
     fn fd_hygiene_range_starts_above_stdio() {
         assert_eq!(
@@ -4816,7 +4766,7 @@ mod tests {
     #[test]
     fn non_listable_files_marks_every_closure_file_non_enumerable() {
         // The DT_NEEDED closure yields individual files; wrapping them must never set `list_dir`
-        // (ReadDir on a regular file was always a no-op — this is the slice's pure correction).
+        // (ReadDir on a regular file is a no-op anyway).
         let wrapped = LandlockGrant::non_listable_files(vec![
             PathBuf::from("/lib/x86_64-linux-gnu/libc.so.6"),
             PathBuf::from("/usr/bin/bash"),
@@ -4833,15 +4783,16 @@ mod tests {
 
     // ---- `CAPSULE_DEVICE_GRANTS` (fixed device set) ----------------------------------------
     //
-    // *Content* checks on a hand-authored constant, in the same category as the
-    // `WORKDIR_ACCESS_RIGHTS` bit-membership test and the `denied_socket_domains` tests: they
-    // assert what a Rust constant holds, NOT that any kernel grants or refuses anything. Nothing
-    // here — and no green CI run — is evidence that `/dev/null` is actually writable inside a
-    // capsule, or that `/dev/random` is actually refused. Those are enforcement claims about a
-    // real kernel, verified only by the manual procedure in
+    // The canonical statement of what the *content* checks in this file are worth, referenced by
+    // the `denied_socket_domains` and `SECCOMP_SYSCALL_ALLOWLIST` sections below: they assert what
+    // a Rust constant holds, NOT that any kernel grants or refuses anything. A green run is not
+    // evidence that `/dev/null` is writable inside a capsule or that `/dev/random` is refused —
+    // on a host below `KernelFull`, `apply_landlock_scope` never runs at all. A content check
+    // buys one thing: changing a constant cannot happen by accident.
+    //
+    // The enforcement claim for this constant is verified only by the manual procedure in
     // `docs/content/reference/security-warnings.md` ("Manual acceptance procedure — the fixed
-    // capsule device set"), on real, uncontainerized Linux hardware. This repo's CI has never
-    // resolved to a tier where `apply_landlock_scope` even runs.
+    // capsule device set"), on real, uncontainerized Linux hardware.
 
     #[test]
     fn capsule_device_grants_are_exactly_three_devices_with_only_dev_null_writable() {
@@ -4905,12 +4856,10 @@ mod tests {
 
     // ---- `denied_socket_domains` ----------------------------------------------------------
     //
-    // These are *content* checks on a hand-authored constant list, in the same category as the
-    // `WORKDIR_ACCESS_RIGHTS` bit-membership test below: they assert what the function returns,
-    // NOT that any kernel refuses anything. Nothing here — and no green CI run — is evidence
-    // that `socket(AF_UNIX, ...)` is actually denied on a real host. That claim is verified only
-    // by the manual procedure in `docs/content/reference/security-warnings.md`
-    // ("Manual acceptance procedure — unmediated AF_UNIX sockets"), on real Linux hardware.
+    // Content checks — see the `CAPSULE_DEVICE_GRANTS` section above for what that is and is not
+    // worth. That `socket(AF_UNIX, ...)` is actually denied on a real host is verified only by the
+    // manual procedure in `docs/content/reference/security-warnings.md` ("Manual acceptance
+    // procedure — unmediated AF_UNIX sockets"), on real Linux hardware.
 
     #[test]
     fn denied_socket_domains_denies_unix_by_default() {
@@ -5028,15 +4977,10 @@ mod tests {
 
     // ---- `SECCOMP_SYSCALL_ALLOWLIST` -------------------------------------------------------
     //
-    // Same category as the `denied_socket_domains` tests above: *content* checks on a
-    // hand-authored constant list. Nothing here — and no green CI run — is evidence that any
-    // kernel refuses `io_uring_setup` on a real host; CI never resolves to a kernel enforcement
-    // tier, so a green suite has repeatedly meant nothing for this module. The claim that these
-    // syscalls are actually denied is verified only by the hand-run escape-conformance harness
-    // (`crates/capsule-runtime/escape-conformance/`, cases `syscall-*`), on real bare-metal Linux
-    // hardware. What these tests
-    // *do* buy is that re-permitting one of the dangerous syscalls cannot happen by accident
-    // while reconciling the allowlist against a newer upstream profile.
+    // Content checks — see the `CAPSULE_DEVICE_GRANTS` section above for what that is and is not
+    // worth. These assert the allowlist's contents, not that the kernel denies anything. They buy
+    // one thing: re-permitting a dangerous syscall cannot happen by accident while reconciling
+    // the allowlist against a newer upstream profile.
 
     #[test]
     fn allowlist_contains_no_syscall_that_must_stay_denied() {
@@ -5050,12 +4994,10 @@ mod tests {
         }
     }
 
-    /// `execve`/`execveat` must be *present*, which is the inversion this slice performed: they
-    /// used to be excluded because a `Notify` rule owned them, and a plain `Allow` would have taken
-    /// the decision away from the supervisor. With the supervisor deleted, the default-deny action
-    /// applies to anything unnamed — so omitting them now would refuse the child's own first
-    /// `execve` and no capsule could run a shell tool at all. Exec is decided by the Landlock
-    /// domain instead; see `linux_enforce::workdir_access_rights` and `resolve_landlock_grants`.
+    /// `execve`/`execveat` must be *present*: the default-deny action applies to anything unnamed,
+    /// so omitting them would refuse the child's own first `execve` and no capsule could run a
+    /// shell tool at all. Exec is decided by the Landlock domain instead; see
+    /// `linux_enforce::workdir_access_rights` and `resolve_landlock_grants`.
     #[test]
     fn allowlist_permits_exec_because_landlock_now_decides_it() {
         for name in ["execve", "execveat"] {
@@ -5118,13 +5060,13 @@ mod tests {
     // ---- tier warnings (finding #3: assert behavior, not just "doesn't panic") ----
 
     #[test]
-    fn tier_warning_kernel_full_warns_enforcement_is_unverified() {
-        // The Linux "full" tier must NOT be silent — a silent tier implies enforcement is
-        // trustworthy, but the enforcement has never run on real Linux hardware. It warns when a shell
-        // is declared, and stays silent only when there is no subprocess to enforce anything on.
+    fn tier_warning_kernel_full_warns_when_a_shell_is_declared() {
+        // The Linux "full" tier must NOT be silent: it is a filesystem and syscall scope, not a
+        // namespace, and a silent tier would imply it has no documented limits. It warns when a
+        // shell is declared, and stays silent only when there is no subprocess to enforce on.
         assert_eq!(
             tier_warning(EnforcementTier::KernelFull, false),
-            Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING))
+            Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE))
         );
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
     }
@@ -5208,17 +5150,18 @@ mod tests {
     }
 
     #[test]
-    fn warn_for_enforcement_tier_kernel_full_logs_unverified_when_shell_declared() {
+    fn warn_for_enforcement_tier_kernel_full_logs_scope_when_shell_declared() {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(EnforcementTier::KernelFull, temp.path(), &warning_test_policy());
         let log = bootstrap_log_contents(temp.path());
         assert!(
             log.contains(W_SEC_005),
-            "KernelFull must not be silent — it must warn its enforcement is not yet confirmed: {log}"
+            "KernelFull must not be silent — it must state what the tier does and does not cover: {log}"
         );
         assert!(
-            log.contains("not yet been verified"),
-            "must state the derived-grant mechanism is not yet team-verified on real hardware: {log}"
+            log.contains("denied, not absent"),
+            "must state the scope's documented limit: paths outside the workdir are denied, not \
+             absent: {log}"
         );
         assert!(
             log.contains("read+execute") && log.contains("outside the workdir"),
@@ -5448,9 +5391,9 @@ mod linux_integration_tests {
         );
     }
 
-    /// The bit this slice made conditional, pinned in both directions. A *content* check on the
-    /// right set only: it proves nothing about whether a kernel refuses an exec, which is the
-    /// manual procedure in
+    /// The `workdir_exec` bit, pinned in both directions. A *content* check on the right set
+    /// only: it proves nothing about whether a kernel refuses an exec, which is the manual
+    /// procedure in
     /// `docs/content/reference/workdir-exec-landlock-manual-verification.md`. What it does buy is
     /// that flipping the default back — the exact regression that would silently reopen the
     /// rename-to-an-allowlisted-basename bypass — cannot happen without this test failing.
@@ -5599,16 +5542,10 @@ mod linux_integration_tests {
         supervisor.join_best_effort();
     }
 
-    // There is deliberately no `kernel_tier_denies_exec_outside_shell_allowlist` here any more.
-    // It used to run `bash -c 'id'` with only `bash` allowlisted and assert a nonzero exit, which
-    // the exec-notify supervisor produced on *every* Linux tier. Exec is a Landlock right now, so
-    // the same claim only holds on `KernelFull`/`KernelSealed` — and this repo's CI has never
-    // resolved to either, so the test would have run the weaker path and passed while proving
-    // nothing. Per this card's roadmap the security property is not asserted in CI at all; it is
-    // verified by hand, on real Landlock-capable hardware, following
-    // `docs/content/reference/workdir-exec-landlock-manual-verification.md`. The two tests below
-    // remain because they assert the *opposite* direction — that allowlisted binaries still run —
-    // which a green run does legitimately evidence.
+    // Exec denial outside the allowlist is deliberately not asserted here. Exec is a Landlock
+    // right, so the claim holds only on `KernelFull`/`KernelSealed`; on any weaker tier such a
+    // test passes while exercising a path that enforces nothing. The two tests below assert the
+    // opposite direction — that allowlisted binaries still run — which any tier does evidence.
 
     #[test]
     fn kernel_tier_allows_exec_within_shell_allowlist() {
@@ -5759,16 +5696,12 @@ mod linux_integration_tests {
     /// The no-regression counterpart of the test above: enforcement must add denials for
     /// out-of-policy destinations without breaking permitted ones.
     ///
-    /// Same claim as before this slice, reached through the mechanism that replaced the seccomp
-    /// connect/sendto supervisor. The allowlist now has to be declared rather than only
-    /// pre-resolved, because it
-    /// decides two things instead of one: which addresses are permitted *and* which ports the
-    /// namespace binds a listener on. A port no allow entry implies has nothing listening and is
-    /// refused by the namespace itself.
+    /// The allowlist has to be declared rather than only pre-resolved, because it decides two
+    /// things: which addresses are permitted *and* which ports the namespace binds a listener on.
+    /// A port no allow entry implies has nothing listening and is refused by the namespace itself.
     ///
-    /// Deliberately *not* a test of the security property — the card is explicit that a green
-    /// suite proves nothing about the kernel-level claim, and the real check is the hand-run
-    /// procedure in
+    /// Deliberately *not* a test of the security property — a green suite proves nothing about
+    /// the kernel-level claim, and the real check is the hand-run procedure in
     /// `docs/content/reference/network-namespace-egress-proxy-manual-verification.md`. This
     /// asserts only that the permitted path still functions.
     #[test]
@@ -5888,12 +5821,10 @@ mod linux_integration_tests {
         );
     }
 
-    // NOTE: the two tests below exercise the derived-Landlock-grant fix for this slice. A green
-    // run on THIS repo's CI/dev machine is NOT evidence the fix works: per this card's roadmap,
-    // CI has never actually resolved to `KernelFull` (it silently runs the `KernelSeccompOnly`
-    // path instead), and the dev machine is macOS. Both tests print an unmistakable skip line and
-    // return when the host is not `KernelFull`. Real acceptance is a manual run on a real
-    // Landlock-capable Linux host, done by the team after this card lands.
+    // The two tests below exercise the derived Landlock grants. A green run is not evidence they
+    // work: below `KernelFull` the weaker `KernelSeccompOnly` path runs instead, and on non-Linux
+    // no Landlock domain is installed at all. Both tests print a skip line and return when the
+    // host is not `KernelFull`.
 
     #[test]
     fn kernel_full_runs_nontrivial_shell_allowlist_but_a_pass_here_does_not_prove_the_landlock_fix()
@@ -6035,10 +5966,8 @@ mod linux_integration_tests {
         }
     }
 
-    // NOTE (as above): a green run on THIS repo's CI/dev machine proves nothing — CI has never
-    // resolved to `KernelFull` and the dev machine is macOS. Both tests print an unmistakable skip
-    // line and return when the host is not `KernelFull`. Real acceptance is a manual run on a real
-    // Landlock-capable Linux host.
+    // As above: a green run proves nothing below `KernelFull`. Both tests print a skip line and
+    // return when the host is not `KernelFull`.
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing() {
@@ -6177,7 +6106,7 @@ mod linux_integration_tests {
         );
     }
 
-    /// The `executable` axis, measured against the real kernel rather than reasoned about.
+    /// The `executable` axis, asserted against a real Landlock kernel.
     ///
     /// This is the property the `sealed` runtime-tree grant depends on: a whole tree can be made
     /// readable and enumerable without becoming a place to run programs from. It is asserted here
@@ -6277,7 +6206,7 @@ mod linux_integration_tests {
     /// The access shape most of `SEALED_ETC_PATHS` needs: a non-executable grant on a *regular
     /// file* (`/etc/ssl/certs/ca-certificates.crt`'s stand-in) must install and be readable.
     ///
-    /// Two kernel facts are pinned here rather than reasoned about. First, `ReadFile` alone —
+    /// Two kernel facts are pinned here. First, `ReadFile` alone —
     /// `apply_landlock_scope`'s `(false, false)` arm — is enough to `open()` the file. Second,
     /// `landlock_append_fs_rule` rejects `ReadDir` on a non-directory with `EINVAL`, and the rule
     /// loop is fail-closed, so a `list_dir: true` *claim* on a file would refuse the whole launch
@@ -6361,7 +6290,7 @@ mod linux_integration_tests {
         );
     }
 
-    // ---- slice ebcc5f51: every distinct pre_exec setup failure is legible + fail-closed ----
+    // ---- every distinct pre_exec setup failure is legible + fail-closed ----
     //
     // These force each of the three distinct sandbox setup failures and assert each produces its
     // OWN legible message (not the undifferentiated bare EINVAL), and that the target binary never
@@ -6414,7 +6343,7 @@ mod linux_integration_tests {
     }
 
     /// Scenario 1 (real): `prepare_enforcement` with a `KernelFull` tier and a workdir that does
-    /// not exist. Because this slice opens the workdir's Landlock fd in the PARENT, this fails
+    /// not exist. Because the workdir's Landlock fd is opened in the PARENT, this fails
     /// synchronously before fork() — `.spawn()` is never called. Returns the error string.
     fn workdir_resolution_error() -> String {
         let temp = tempfile::tempdir().unwrap();
@@ -6539,7 +6468,7 @@ mod linux_integration_tests {
         }
     }
 
-    /// The first half of the composed-root failure path this slice promises: a `pre_exec`
+    /// The first half of the composed-root failure path: a `pre_exec`
     /// composed-root failure comes back out of `execute_shell` as the *typed*
     /// `SealedRootConstructionFailed`, carrying the child's diagnostic, and reports itself as
     /// session-fatal. `runtime::tests` covers the second half (what the dispatch layer then
