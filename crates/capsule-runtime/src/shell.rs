@@ -28,7 +28,12 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
 /// Directory name for the per-session synthetic home, created under the capsule's
 /// session workdir. Planned /proc and subprocess key isolation work
 /// depend on this exact name/location convention.
-const SYNTHETIC_HOME_DIR_NAME: &str = ".capsule-home";
+///
+/// `pub(crate)` for one reader outside this file: `sandbox::ensure_sealed_identity_files`, which
+/// writes the `pw_dir` field of a sealed capsule's synthetic `/etc/passwd` entry. That field and
+/// `$HOME` must be the same string — a second hand-copied `".capsule-home"` there is exactly how
+/// they would stop being one.
+pub(crate) const SYNTHETIC_HOME_DIR_NAME: &str = ".capsule-home";
 
 /// Credential-shaped env var patterns stripped from every subprocess, regardless of
 /// whether they came from the host process env, `env_overrides`, or

@@ -528,6 +528,12 @@ Every `sealed` session now gets one Landlock rule per entry, fixed at compile ti
 manifest key** that adds a path or removes one. Like the runtime-tree grant it is a property of the
 tier: it fires no warning and appears in no `--explain-scope` section.
 
+Two of those rules are joined by a rule each on the synthetic account databases described below.
+A Landlock rule names the inode an fd resolved to, not the path string it was opened by, so the
+rule taken on the host's `/etc/passwd` does not cover a *different* file bind-mounted at that path
+— without its own rule the synthetic database is mounted and `EACCES`, which is this section's bug
+all over again.
+
 | Right | Granted | Why |
 |---|---|---|
 | `ReadFile` | yes, on all sixteen | The gap being closed. Reading the file the composed root already mounted. |
@@ -535,13 +541,24 @@ tier: it fires no warning and appears in no `--explain-scope` section.
 | `Execute` | **no** | `/etc/alternatives` is a directory of symlinks into `/usr/bin`. Granting `Execute` here would be a second, undeclared route around `capabilities.shell.allow` — the same hole the [runtime-tree grant](#sealed-runtime-tree-grant) withholds `Execute` to close. Confirmed by hand: `/etc/alternatives/awk --version` is `Permission denied` (exit 126) in a capsule that can read and list that directory. |
 | every write right | no | The binds are `MS_RDONLY`, so `touch /etc/hosts` reports `Permission denied` and `open('/etc/hosts', 'w')` reports `Read-only file system`. A writable `/etc/resolv.conf` inside a capsule would be a name-resolution hijack of the capsule's own egress. |
 
-**What this widens, stated plainly.** Two of the sixteen entries carry a real, accepted cost, and
-it is the one already recorded on `SEALED_ETC_PATHS` itself: `/etc/passwd` and `/etc/group` are
-world-readable on every distribution, so a `sealed` capsule can now read the host's account names.
-They are bound rather than synthesised because synthesising them means writing files from inside
-the `pre_exec` window, which this module's discipline forbids; a two-line synthetic passwd/group
-built in the parent is the obvious follow-up. Nothing else here is sensitive: a CA bundle, a
-timezone, a loader cache and a terminfo database are public data on any host. And the containment
+**What this widens, stated plainly.** Fourteen of the sixteen entries are the host's own file,
+bind-mounted read-only, and none of them is sensitive: a CA bundle, a timezone, a loader cache and
+a terminfo database are public data on any host. The remaining two — `/etc/passwd` and `/etc/group`
+— are **not** the host's. They were, and that cost was recorded here: both are world-readable on
+every distribution, so binding them handed a `sealed` capsule the machine's full account list.
+The parent now writes a two-line database instead, and the composed root binds *that* at the same
+two paths, read-only:
+
+```text
+root:x:0:0:root:/root:/bin/sh
+capsule:x:1000:1000:Murmur capsule:<workdir>/.capsule-home:/bin/sh
+```
+
+`root`, and one entry for the uid the capsule's subprocesses actually run as, whose home directory
+is the synthetic `$HOME` the subprocess environment already sets — so `getpwuid(3)`, `getgrgid(3)`,
+`~` expansion and `os.path.expanduser` all still resolve, and agree with `$HOME`. A capsule already
+running as uid 0 gets the single `root` line rather than a duplicate entry. No host account name
+appears in either file. See `sealed::SyntheticEtcFile`. And the containment
 boundary is unchanged — `ls /etc` itself is still `Permission denied` (no rule covers the composed
 root's `/etc` directory, only the specific entries mounted beneath it), while `/etc/shadow` and
 `/etc/ssh/sshd_config` are still `No such file or directory`, because they were never mounted.
@@ -552,7 +569,8 @@ gives: on `KernelFull` there is no composed root, so these rules would apply to 
 only when the resolved tier is `KernelSealed`. Verified by hand: a `scoped` capsule's transcript
 across all sixteen paths is byte-identical before and after this change.
 
-**One operational consequence.** Sixteen more Landlock grants means sixteen more file descriptors
+**One operational consequence.** Eighteen more Landlock grants (the sixteen entries plus the two
+synthetic files' own rules) means that many more file descriptors
 held open across the child's `pre_exec` window, under whatever `capabilities.resources.max_open_files`
 the manifest declared. Measured on the verification host, a `sealed` capsule allowing
 `[bash, python3]` spawns at `max_open_files: 72` and is refused at `64` with

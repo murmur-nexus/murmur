@@ -664,6 +664,178 @@ claims and the result must not be recorded as a pass.
 
 ## Recording the result
 
+### Run of 2026-08-09 — synthetic `/etc/passwd` and `/etc/group` (card `60e1c285`)
+
+The narrowing the 2026-08-08 `/etc`-allowlist entry below flagged as its own residual: that entry
+made the host's account databases *readable* inside a composed root (`OPEN ok /etc/passwd
+bytes=2910` — 50 accounts, every login name on this machine). The parent now writes a two-line
+passwd/group instead, and the composed root binds those at the same two paths.
+
+**Host.** Same machine as every run below: `Linux 7.0.0-28-generic #28~24.04.1-Ubuntu SMP
+PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04, `systemd-detect-virt` → `none`
+(bare metal), non-root `uid=1000 gid=1000`, `kernel.apparmor_restrict_unprivileged_userns=0` so no
+profile was needed. CPython 3.12.3. The host's own databases for comparison: `/etc/passwd` 50
+lines, `/etc/group` 77 lines.
+
+**Harness.** The same route as the 2026-08-08 entry — a real, live capsule session per run through
+a built `mur`, `inference.transport: process` pointed at the escape-conformance package's
+`probe-driver`, each session under `systemd-run --user --scope --property=Delegate=yes`, so the
+tool call goes through `dispatch_agent_tool_async`, the real composed root, the real Landlock
+ruleset and the real seccomp filter. Two debug binaries from the same worktree, side by side:
+`mur-before` (branch point) and `mur-after`. One capsule: `containment: sealed`,
+`shell.allow: [bash, python3]`, `interpreter_runtime` for `python3`. `mur run --explain-scope` →
+`declared: sealed`, `achieved: sealed`, `floor met: yes`,
+`mechanism: mountns+pivot_root+landlock+seccomp`.
+
+#### Before — the host's account list, read from inside the capsule
+
+```text
+--0-IDENTITY--
+uid=1000 gid=1000 cwd=/tmp/mur-verify/sealed/wd
+--1-GETPWUID-HOME--
+pw_name=agape
+pw_dir=/home/agape
+HOME=/tmp/mur-verify/sealed/wd/.capsule-home
+MATCH=False
+expanduser=/tmp/mur-verify/sealed/wd/.capsule-home
+gr_name=agape gr_gid=1000
+--2-CONTENT--
+/etc/passwd bytes=2910 lines=50
+  | root:x:0:0:root:/root:/bin/bash
+  | daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+  | bin:x:2:2:bin:/bin:/usr/sbin/nologin
+  | sys:x:3:3:sys:/dev:/usr/sbin/nologin
+  | sync:x:4:65534:sync:/bin:/bin/sync
+  | games:x:5:60:games:/usr/games:/usr/sbin/nologin
+  | man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+  | lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+  | ... (42 more lines)
+/etc/passwd names=_apt,agape,avahi,backup,bin,colord,cups-browsed,cups-pk-helper,daemon,dhcpcd,
+dnsmasq,fwupd-refresh,games,gdm,geoclue,gnome-initial-setup,gnome-remote-desktop,hplip,irc,
+kernoops,list,lp,mail,man,messagebus,news,nm-openvpn,nobody,polkitd,proxy,root,rtkit,saned,
+speech-dispatcher,sshd,sssd,sync,sys,syslog,systemd-network,systemd-oom,systemd-resolve,
+systemd-timesync,tcpdump,tss,usbmux,uucp,uuidd,whoopsie,www-data
+/etc/group bytes=1107 lines=77
+  | root:x:0:
+  | daemon:x:1:
+  | bin:x:2:
+  | sys:x:3:
+  | adm:x:4:syslog,agape
+  | tty:x:5:
+  | disk:x:6:
+  | lp:x:7:
+  | ... (69 more lines)
+--3-WRITE-REFUSAL--
+/etc/passwd utime(touch) -> [Errno 30] Read-only file system
+/etc/passwd append -> [Errno 13] Permission denied: '/etc/passwd'
+/etc/group utime(touch) -> [Errno 30] Read-only file system
+/etc/group append -> [Errno 13] Permission denied: '/etc/group'
+--4-BOUNDARY--
+/etc/shadow -> [Errno 2] No such file or directory: '/etc/shadow'
+/etc/hosts bytes=220
+/etc/ssl/certs/ca-certificates.crt bytes=182140
+--END--
+```
+
+Note `pw_name=agape` and `pw_dir=/home/agape`: not only the host's whole account list, but the
+launching user's login name and real home path, contradicting the `$HOME` the same subprocess was
+given (`MATCH=False`).
+
+#### After — same capsule, same probe
+
+```text
+--0-IDENTITY--
+uid=1000 gid=1000 cwd=/tmp/mur-verify/sealed/wd
+--1-GETPWUID-HOME--
+pw_name=capsule
+pw_dir=/tmp/mur-verify/sealed/wd/.capsule-home
+HOME=/tmp/mur-verify/sealed/wd/.capsule-home
+MATCH=True
+expanduser=/tmp/mur-verify/sealed/wd/.capsule-home
+gr_name=capsule gr_gid=1000
+--2-CONTENT--
+/etc/passwd bytes=113 lines=2
+  | root:x:0:0:root:/root:/bin/sh
+  | capsule:x:1000:1000:Murmur capsule:/tmp/mur-verify/sealed/wd/.capsule-home:/bin/sh
+/etc/passwd names=capsule,root
+/etc/group bytes=26 lines=2
+  | root:x:0:
+  | capsule:x:1000:
+/etc/group names=capsule,root
+--3-WRITE-REFUSAL--
+/etc/passwd utime(touch) -> [Errno 30] Read-only file system
+/etc/passwd append -> [Errno 30] Read-only file system: '/etc/passwd'
+/etc/group utime(touch) -> [Errno 30] Read-only file system
+/etc/group append -> [Errno 30] Read-only file system: '/etc/group'
+--4-BOUNDARY--
+/etc/shadow -> [Errno 2] No such file or directory: '/etc/shadow'
+/etc/hosts bytes=220
+/etc/ssl/certs/ca-certificates.crt bytes=182140
+--END--
+```
+
+Both files still readable (`getpwuid(3)`/`getgrgid(3)` resolve, `~` expands), `pw_dir` and `$HOME`
+byte-identical, two lines each, and **none of the 50 host account names or 77 host group names
+appears** beyond `root`. Writes are still refused; the append now reports `Read-only file system`
+where it reported `Permission denied` before — same refusal, different layer reaching it first
+(the `MS_RDONLY` bind rather than Landlock, because the synthetic file's own rule carries
+`ReadFile` and the host file's carried nothing that applied). `/etc/shadow`, `/etc/hosts` and the
+trust store are unchanged.
+
+#### The Landlock rule these files need, demonstrated by removing it
+
+A Landlock rule names the **inode** an fd resolved to, not the path string it was opened by. The
+`SEALED_ETC_PATHS` grant for `/etc/passwd` is taken on the *host's* `/etc/passwd`, which the
+composed root no longer binds — so the synthetic file needs a rule of its own, taken on the file in
+`<workdir>/.mur-etc/`. A third binary, identical to `mur-after` except that
+`apply_landlock_scope` skips those two rules:
+
+```text
+--1-GETPWUID-HOME--
+getpwuid FAIL KeyError('getpwuid(): uid not found: 1000')
+getgrgid FAIL KeyError('getgrgid(): gid not found: 1000')
+--2-CONTENT--
+/etc/passwd OPEN FAIL PermissionError(13, 'Permission denied')
+/etc/group OPEN FAIL PermissionError(13, 'Permission denied')
+```
+
+Mounted and unopenable — precisely the bug the 2026-08-08 entry below exists to record, one file
+over. This is why this slice touched `open_landlock_fds`/`apply_landlock_scope` at all;
+`resolve_sealed_etc_landlock_grants` itself is unchanged.
+
+#### Negative control — `scoped` is untouched
+
+The identical capsule with `containment: scoped`, run through the same path against both binaries.
+`diff` of the two full transcripts is **empty** — byte-identical:
+
+```text
+--1-GETPWUID-HOME--
+getpwuid FAIL KeyError('getpwuid(): uid not found: 1000')
+--2-CONTENT--
+/etc/passwd OPEN FAIL PermissionError(13, 'Permission denied')
+/etc/group OPEN FAIL PermissionError(13, 'Permission denied')
+--4-BOUNDARY--
+/etc/shadow -> [Errno 13] Permission denied: '/etc/shadow'
+/etc/hosts -> [Errno 13] Permission denied: '/etc/hosts'
+/etc/ssl/certs/ca-certificates.crt -> [Errno 13] Permission denied
+```
+
+`Permission denied` rather than `No such file or directory` on `/etc/shadow` is the tell that this
+session is looking at the **host's** real `/etc` through Landlock, with no composed root anywhere —
+`applied_tier` returns `KernelFull` for a `scoped` declaration even on a host that can back
+`sealed`, which is why `mur run --explain-scope` reporting the host's `achieved: sealed` is not a
+contradiction. Same behaviour as the 2026-08-08 entry recorded for `scoped`.
+
+#### Escape-conformance harness (card `4875bc97`)
+
+Run at `--class sealed` against both binaries, 28 cases each, same host, same session. Both exit
+`0` with `boundary: no boundary was crossed` and `resource exhaustion: every declared ceiling
+held`; **21 boundary cases asserted and passed, 5 resource cases asserted and passed, 2 recorded
+but not asserted**. `diff` of the two verdict columns is empty — every case identical before and
+after, including the three cases that read `/etc/passwd` and are expected `ALLOWED`
+(`symlink-escape`, `proc-self-cwd-reopen`, `proc-pid-root-reopen`: the file is still readable, only
+its contents changed) and `read-etc-shadow`, still `REFUSED`.
+
 ### Run of 2026-08-09 — the first full-registry bare-metal `sealed` run against a *gated* escape-conformance suite (card `a495eacb`)
 
 Every earlier escape-conformance run on this page — including the `4875bc97` entry below — graded
@@ -1432,10 +1604,13 @@ file; each is a scoping decision this slice made explicitly.
   This is the one place the composed root's "outside does not exist" promise degrades to `scoped`'s
   "outside is denied". See the warning under step 3e for the kernel rule that forces it and for what
   it costs.
-- **`/etc/passwd` and `/etc/group` are bind-mounted from the host**, so the host's account names are
-  visible inside the root. They are world-readable on every distribution and `getpwuid(3)` needs
-  them; synthesising a two-line pair in the parent is the obvious follow-up. See the doc comment on
-  `sealed::SEALED_ETC_PATHS`.
+- **`/etc/passwd` and `/etc/group` are synthetic, and a capsule can rewrite its own copy.** They are
+  no longer the host's (card `60e1c285`; the residual this bullet used to record is closed — see the
+  2026-08-09 entry). What remains: the two files are staged in `<workdir>/.mur-etc/`, and the
+  workdir is the capsule's one writable path, so a capsule that edits them there changes what its
+  own `getpwuid(3)` reports. It reaches nothing outside itself by doing so — nothing on the host
+  reads those files, and they name no id the capsule is not already running as. The bind itself
+  stays read-only, so `touch /etc/passwd` is still `EROFS`.
 - **Read-only binds are not recursively read-only.** A submount underneath a bound directory (a
   separate `/usr/local` partition, say) keeps its own mount flags. `MS_REMOUNT | MS_BIND | MS_RDONLY`
   applies to one mount; walking the subtree is a follow-up.

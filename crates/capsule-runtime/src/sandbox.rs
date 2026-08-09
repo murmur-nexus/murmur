@@ -2529,6 +2529,69 @@ fn ensure_sealed_tmp_store(workdir: &Path) -> Result<PathBuf, String> {
     Ok(tmp_store)
 }
 
+/// Writes (idempotently) the synthetic `/etc/passwd`/`/etc/group` the composed root binds in place
+/// of the host's, returning their host paths in [`crate::sealed::SEALED_ETC_PATHS`] order.
+///
+/// Sibling of [`ensure_sealed_tmp_store`] in every respect that matters: plain `std::fs`, no
+/// privilege, and two callers in different phases that must not depend on each other's ordering —
+/// `build_sealed_root` binds these files, `open_landlock_fds` opens them to grant them. Content is
+/// a pure function of the workdir, so both calls write the same bytes.
+///
+/// Runs in the parent, never in `pre_exec`: composing a root is the child's job, but *producing
+/// content* is work the parent can do, and this module's rule is that the `pre_exec` window does
+/// nothing the parent could have done for it.
+///
+/// The rewrite is deliberately in place (`fs::write` truncates; it does not replace). The Landlock
+/// rule the earlier caller took is bound to the file's inode, so writing a fresh file over the path
+/// would leave that rule pointing at an inode the composed root no longer binds — `/etc/passwd`
+/// mounted and `EACCES`.
+#[cfg(target_os = "linux")]
+fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let staging = workdir.join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME);
+    std::fs::create_dir_all(&staging).map_err(|error| {
+        format!(
+            "sealed: failed to create the synthetic /etc staging directory at {}: {error}",
+            staging.display()
+        )
+    })?;
+
+    // The workdir was created by this process, so its owner is the identity the capsule's
+    // subprocesses run as — no `getuid(2)` FFI needed under `#![deny(unsafe_code)]`.
+    let owner = std::fs::metadata(workdir).map_err(|error| {
+        format!(
+            "sealed: failed to stat the session workdir {} for the capsule's uid/gid: {error}",
+            workdir.display()
+        )
+    })?;
+    // The same string `build_shell_env` puts in `$HOME`, from the same constant.
+    let home = workdir.join(crate::shell::SYNTHETIC_HOME_DIR_NAME);
+    let home = home.to_string_lossy().into_owned();
+    let identity = crate::sealed::SealedAccountIdentity {
+        uid: owner.uid(),
+        gid: owner.gid(),
+        home: &home,
+    };
+
+    let mut written = Vec::new();
+    for entry in crate::sealed::SEALED_ETC_PATHS {
+        let Some(file) = entry.synthetic else {
+            continue;
+        };
+        let path = crate::sealed::synthetic_etc_source(workdir, file);
+        std::fs::write(&path, file.render(&identity)?).map_err(|error| {
+            format!(
+                "sealed: failed to write the synthetic {} at {}: {error}",
+                entry.path,
+                path.display()
+            )
+        })?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
 /// Parent-side half of the sealed mechanism: pick a base, plan the composed root against the real
 /// host layout, create the workdir-backed `/tmp` store, and lower the plan into the C-string form
 /// the forked child executes.
@@ -2579,6 +2642,11 @@ fn build_sealed_root(
     // than from inside `pre_exec`. `open_landlock_fds` — which runs earlier and must open the same
     // directory to grant it — creates it through the same idempotent helper.
     ensure_sealed_tmp_store(workdir)?;
+
+    // `/etc/passwd` and `/etc/group` inside the composed root are binds of these files, so they
+    // exist on disk before the plan that names them is built — and long before the child executes
+    // it. Same idempotent helper `open_landlock_fds` called earlier to grant them.
+    ensure_sealed_identity_files(workdir)?;
 
     let plan = sealed::plan_composed_root(
         workdir,
@@ -2658,6 +2726,20 @@ mod linux_enforce {
         /// therefore does not reach the bind, and without this fd every `/tmp` access is `EACCES`
         /// on a mount that is genuinely writable.
         sealed_tmp_fd: Option<OwnedFd>,
+        /// The parent-written synthetic `/etc/passwd`/`/etc/group`
+        /// ([`crate::sealed::SEALED_ETC_STAGING_DIR_NAME`]), opened on `KernelSealed` and empty on
+        /// every other tier.
+        ///
+        /// Exactly the [`Self::sealed_tmp_fd`] problem, one directory over. The grant list already
+        /// carries `/etc/passwd`, but that rule is taken on the fd opened at the *host's*
+        /// `/etc/passwd` — a different inode from the file the composed root actually binds there.
+        /// Landlock matches inodes, not path strings, and the walk from a bind-mounted file starts
+        /// at the bound file's own inode, so without these fds both account databases would be
+        /// mounted and `EACCES`: `getpwuid(3)` fails, and a shell cannot expand `~`.
+        ///
+        /// Read-only, like every other `SEALED_ETC_PATHS` rule — the mount is `MS_RDONLY` too, and
+        /// nothing inside a capsule has any business editing an account database.
+        sealed_identity_fds: Vec<OwnedFd>,
         grants: Vec<OpenLandlockGrant>,
         devices: Vec<OpenDeviceGrant>,
     }
@@ -2668,6 +2750,13 @@ mod linux_enforce {
         #[cfg(test)]
         pub(super) fn sealed_tmp_fd(&self) -> Option<&OwnedFd> {
             self.sealed_tmp_fd.as_ref()
+        }
+
+        /// How many synthetic-`/etc` fds were opened, for the tier-gate test. A count, not the fds:
+        /// the same "nothing outside `apply_landlock_scope` needs the fd itself" rule as above.
+        #[cfg(test)]
+        pub(super) fn sealed_identity_fd_count(&self) -> usize {
+            self.sealed_identity_fds.len()
         }
     }
 
@@ -3479,6 +3568,16 @@ mod linux_enforce {
                 })?;
         }
 
+        // `KernelSealed` only — empty on every other tier. `ReadFile` alone: these are the two
+        // synthetic account databases the root binds read-only at `/etc/passwd`/`/etc/group`, and
+        // the grant loop's rules for those two paths are taken on the host's files, not on these.
+        for identity_fd in &fds.sealed_identity_fds {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(identity_fd.as_fd(), read_only))
+                .map_err(|error| {
+                    format!("landlock: add_rule for a synthetic /etc file failed: {error}")
+                })?;
+        }
 
         for grant in &fds.grants {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
@@ -3573,6 +3672,25 @@ mod linux_enforce {
             None
         };
 
+        // Same story, same tier gate, same fail-closed handling: the composed root binds these two
+        // files at `/etc/passwd`/`/etc/group`, and the grant loop below opens the *host's* files of
+        // those names, whose inodes the capsule never sees. See `LandlockChildFds`.
+        let sealed_identity_fds = if tier == EnforcementTier::KernelSealed {
+            let mut fds = Vec::new();
+            for path in super::ensure_sealed_identity_files(workdir)? {
+                let file = open_o_path(&path).map_err(|error| {
+                    format!(
+                        "sandbox: failed to open the synthetic /etc file {} for Landlock scoping: \
+                         {error}",
+                        path.display()
+                    )
+                })?;
+                fds.push(OwnedFd::from(file));
+            }
+            fds
+        } else {
+            Vec::new()
+        };
 
         let mut grants = Vec::with_capacity(landlock_grants.len());
         for grant in landlock_grants {
@@ -3611,6 +3729,7 @@ mod linux_enforce {
             workdir_fd,
             workdir_exec,
             sealed_tmp_fd,
+            sealed_identity_fds,
             grants,
             devices,
         })
@@ -5479,6 +5598,119 @@ mod linux_integration_tests {
                  workdir is litter the capsule can see",
             );
         }
+    }
+
+    /// The synthetic account databases, written and opened by the same parent-side call, against a
+    /// real `tempfile::tempdir()` workdir.
+    ///
+    /// Like the `/tmp` test above it proves nothing about kernel enforcement — that is the hand-run
+    /// in `docs/content/reference/sealed-containment-manual-verification.md`. What it does buy is
+    /// that the files exist before `build_sealed_root` binds them, that there is an fd to build
+    /// each rule from (without one, Landlock matches the *host's* `/etc/passwd` inode and the
+    /// bound synthetic file is mounted-but-`EACCES`), and that neither is created on a tier that
+    /// composes no root.
+    #[test]
+    fn the_synthetic_etc_files_are_written_and_opened_on_the_sealed_tier_only() {
+        let sealed_workdir = tempfile::tempdir().unwrap();
+        let fds = linux_enforce::open_landlock_fds(
+            sealed_workdir.path(),
+            &[],
+            &[],
+            false,
+            EnforcementTier::KernelSealed,
+        )
+        .expect("a real, writable workdir must yield sealed Landlock fds");
+
+        let synthetic: Vec<&crate::sealed::SealedEtcPath> = crate::sealed::SEALED_ETC_PATHS
+            .iter()
+            .filter(|entry| entry.synthetic.is_some())
+            .collect();
+        assert_eq!(
+            fds.sealed_identity_fd_count(),
+            synthetic.len(),
+            "every synthetic /etc entry the composed root binds needs a rule of its own: {synthetic:?}",
+        );
+        for entry in &synthetic {
+            let path = crate::sealed::synthetic_etc_source(
+                sealed_workdir.path(),
+                entry.synthetic.unwrap(),
+            );
+            assert!(
+                path.is_file(),
+                "{} must be written here: open_landlock_fds runs before build_sealed_root, so \
+                 nothing else has written it yet",
+                entry.path,
+            );
+        }
+
+        for tier in [
+            EnforcementTier::KernelFull,
+            EnforcementTier::KernelSeccompOnly,
+            EnforcementTier::EnvironmentOnly,
+        ] {
+            let workdir = tempfile::tempdir().unwrap();
+            let fds = linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
+                .expect("a real, writable workdir must yield Landlock fds on any tier");
+
+            assert_eq!(
+                fds.sealed_identity_fd_count(),
+                0,
+                "{tier:?} composes no root, so its capsule reads the host's real /etc/passwd and \
+                 these files stand in for nothing",
+            );
+            assert!(
+                !workdir
+                    .path()
+                    .join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME)
+                    .exists(),
+                "{tier:?} must not even create the staging directory — same reason as .mur-tmp",
+            );
+        }
+    }
+
+    /// The one field that has to agree across two files: the synthetic `pw_dir` and `$HOME`.
+    ///
+    /// Both are derived from `shell::SYNTHETIC_HOME_DIR_NAME`, and this asserts the end result
+    /// rather than the constant — a capsule sees `pwd.getpwuid(os.getuid()).pw_dir` and
+    /// `os.environ["HOME"]`, and a disagreement between them is silent until a tool picks the
+    /// wrong one. The uid/gid are checked against the workdir's own owner, which is where
+    /// `ensure_sealed_identity_files` reads the capsule's identity from.
+    #[test]
+    fn the_synthetic_passwd_entry_carries_exactly_the_home_the_subprocess_env_gets() {
+        use std::os::unix::fs::MetadataExt;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let written = ensure_sealed_identity_files(workdir.path()).unwrap();
+        let env = crate::shell::build_shell_env(
+            &crate::types::CapabilityPolicy::default(),
+            &[],
+            workdir.path(),
+        )
+        .unwrap();
+
+        let passwd = std::fs::read_to_string(&written[0]).unwrap();
+        let owner = std::fs::metadata(workdir.path()).unwrap();
+        let entry: Vec<&str> = passwd
+            .lines()
+            .last()
+            .expect("the capsule's own entry is the last line")
+            .split(':')
+            .collect();
+
+        assert_eq!(entry[2], owner.uid().to_string(), "uid field");
+        assert_eq!(entry[3], owner.gid().to_string(), "gid field");
+        assert_eq!(
+            Some(&entry[5].to_string()),
+            env.get("HOME"),
+            "pw_dir and $HOME are the same string or the entry is worse than useless",
+        );
+
+        let group = std::fs::read_to_string(&written[1]).unwrap();
+        assert_eq!(
+            group.lines().last().unwrap().split(':').nth(2),
+            Some(owner.gid().to_string().as_str()),
+            "gid field of the capsule's own group",
+        );
     }
 
     /// Pure content check on the right-set the composed root's `/tmp` rule carries: no kernel call,
