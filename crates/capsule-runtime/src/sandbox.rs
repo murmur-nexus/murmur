@@ -13,11 +13,7 @@
 //!     capsule's own workdir gets `Execute` **only** when the manifest declares
 //!     `capabilities.filesystem.workdir_exec: true` (`linux_enforce::workdir_access_rights`). With
 //!     the default, nothing the capsule writes into its workdir can run under any name, so the
-//!     rename-to-an-allowlisted-basename bypass has no path left. This replaced a seccomp-notify
-//!     exec supervisor that read the invoked pathname out of `/proc/<pid>/mem` and answered
-//!     `CONTINUE`, which `seccomp_unotify(2)` documents as inherently racy — see
-//!     `docs/content/reference/seccomp-notify-toctou-audit.md` for the audit that retired it.
-//!     There is no seccomp-notify mechanism left in this module at all: `execve`/`execveat` are
+//!     rename-to-an-allowlisted-basename bypass has no path left. `execve`/`execveat` are
 //!     ordinary allowed syscalls, decided entirely by the Landlock domain they run in.
 //!   - **classic seccomp-bpf argument matching** (`SECCOMP_RET_ERRNO`) on `socket(2)`'s `domain`,
 //!     to refuse whole address families outright — see `denied_socket_domains`. Unlike a
@@ -2660,11 +2656,10 @@ fn build_sealed_root(
 /// Linux-only mechanics: fd-passing side channel, seccomp filter construction, Landlock
 /// application, and the background thread that receives the capsule's network-namespace sockets.
 ///
-/// Nothing here uses `libseccomp`'s notify facility any more. It did, twice over: `connect`/
-/// `sendto` were `Notify` syscalls until the network namespace replaced them, and `execve`/
-/// `execveat` until Landlock `Execute` rights replaced them. Both retirements are recorded in
-/// `docs/content/reference/seccomp-notify-toctou-audit.md`; re-introducing a `Notify` rule here
-/// means re-introducing a `/proc/<pid>/mem` read on the hot path, which that audit found racy.
+/// Nothing here uses `libseccomp`'s notify facility. `connect`/`sendto` are enforced by the
+/// network namespace and `execve`/`execveat` by Landlock `Execute` rights, both of which decide
+/// from kernel-held state. A `Notify` rule would reintroduce a `/proc/<pid>/mem` read on the hot
+/// path, where the value read can change between the decision and the kernel's own dereference.
 #[cfg_attr(target_os = "linux", allow(unsafe_code))]
 #[cfg(target_os = "linux")]
 mod linux_enforce {

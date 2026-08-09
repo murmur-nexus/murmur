@@ -104,9 +104,8 @@ impl Default for Options {
     }
 }
 
-/// Hand-rolled rather than `clap`, mirroring `racecheck/`: this package's dependency set is one
-/// crate, and a reviewer should be able to convince themselves the gate has no behaviour beyond
-/// what is in these files.
+/// Hand-rolled rather than `clap`: this package's dependency set is one crate, and a reviewer
+/// should be able to convince themselves the gate has no behaviour beyond what is in these files.
 fn parse_args(argv: &[String]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut args = argv.iter().skip(1);

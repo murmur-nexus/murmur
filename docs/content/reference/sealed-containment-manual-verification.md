@@ -57,8 +57,8 @@ that have neither `CAP_SYS_ADMIN` nor an AppArmor profile, so they resolve to `K
 and never execute a single line of the composed-root construction. A test asserting this property
 there would pass vacuously or skip, and either outcome turns a green run into false evidence about
 a security property it never touched. This is the same reasoning that keeps the
-[fd-hygiene procedure](subprocess-fd-hygiene-verification.md#what-this-deliberately-is-not) and the
-[seccomp-notify race probes](seccomp-notify-toctou-audit.md) out of the automated suite.
+[fd-hygiene procedure](subprocess-fd-hygiene-verification.md#what-this-deliberately-is-not) out of
+the automated suite.
 
 The automated tests this work added assert only the *decision* logic — that
 `sandbox::tier_from_probe` reaches `KernelSealed` exactly when all four preconditions hold, that

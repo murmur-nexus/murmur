@@ -89,21 +89,13 @@ sets, and sets `no_new_privs` before `execve`, so a root-operated `mur run` does
 subprocess `CAP_MKNOD` (or `CAP_DAC_OVERRIDE`, or anything else) in the first place.
 
 ¹ Exec is a Landlock right, so a host without Landlock has no kernel-level exec mediation at all.
-This was not always so: until the exec supervisor was retired, `execve`/`execveat` were decided by
-a userspace seccomp-notify loop that ran on both Linux tiers. That loop read the invoked pathname
-out of the calling process's memory and answered `SECCOMP_USER_NOTIF_FLAG_CONTINUE`, which
-`seccomp_unotify(2)` documents as inherently racy, *and* it left the workdir executable so a binary
-renamed to an allowlisted basename could still run. Both defects are closed by the Landlock
-mechanism above; the price is that the Seccomp-only tier lost its (unsound) exec check rather than
-keeping it. Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
+Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 
 Filesystem *and exec* scoping both use Landlock; network scoping uses the capsule's own network
-namespace plus an egress proxy; socket-family denial uses classic seccomp-bpf argument matching
-(no userspace supervisor — the `socket(2)` domain is an integer the kernel's own BPF can compare
-directly, unlike a `connect()` destination address behind a pointer). No mechanism here uses
-seccomp-notify any more. Underneath all of them, the seccomp filter's default action is itself a
-deny — see [Default-deny syscall allowlist](#default-deny-syscall-allowlist) — so a syscall named by
-none of the mechanisms above is refused outright rather than falling through to an implicit allow.
+namespace plus an egress proxy; socket-family denial uses seccomp argument matching. Underneath all
+of them, the seccomp filter's default action is itself a deny — see
+[Default-deny syscall allowlist](#default-deny-syscall-allowlist) — so a syscall named by none of
+the mechanisms above is refused outright rather than falling through to an implicit allow.
 
 Environment-only enforcement still gives you a synthetic `HOME` and strips credential-shaped
 environment variables before the subprocess spawns (see
@@ -111,9 +103,8 @@ environment variables before the subprocess spawns (see
 but nothing prevents the subprocess from reading files outside the workdir, executing an
 unlisted binary, or connecting to a host outside `capabilities.network.allow`.
 
-**Checking any of this by hand.** These are kernel behaviours, so the only honest check is a run on
-a real host. The hand-run procedures that do that live in the repository and are listed on the
-[Verification](verification.md) page.
+These are kernel behaviours, so the only check that means anything is a run on a real host. The
+hand-run procedures that do that are listed on the [Verification](verification.md) page.
 
 ---
 
@@ -265,25 +256,16 @@ whose shell steps relied on root's usual "can read anything" posture.
 
 **What to do:** keep `shell.allow`, `network.allow` and `filesystem.scope` as narrow as the task
 genuinely needs, and don't run `mur run` as root if you can avoid it — a non-root capsule never had
-the `CAP_MKNOD` the workdir device-node restriction exists to backstop. To check these mechanisms by
-hand on a real host, see
-[workdir device-node escape](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-device-node-manual-verification.md),
-[unmediated AF_UNIX sockets](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/af-unix-sockets-manual-verification.md)
-and
-[the fixed capsule device set](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/capsule-device-set-manual-verification.md).
+the `CAP_MKNOD` the workdir device-node restriction exists to backstop.
 
 ### The fixed capsule device set { #capsule-device-set }
 
-**Why `/dev/null` has to be writable.** Before this mechanism, *nothing* outside the workdir was
-writable and only the derived read+execute grants were readable — which meant `/dev/null` was not
-openable at all. That is not a strict-but-workable posture, it is a broken one: programs treat
-`/dev/null` as infallible, so the failure surfaces as an unexplained crash in an ordinary tool
-rather than as a policy denial. Every capsule on this tier now gets exactly three extra Landlock
-rules, fixed at compile time, with **no manifest key** that adds a device or removes one:
+A capsule on this tier gets exactly three device rules, fixed at compile time, with **no manifest
+key** that adds a device or removes one:
 
 | Device | Access | Why |
 |---|---|---|
-| `/dev/null` | read **and** write | The one deliberate exception to "nothing outside the workdir is writable". Bare-host `strace` shows Python's `subprocess.DEVNULL` opening it `O_RDWR\|O_CLOEXEC` and a shell `2>/dev/null` redirect opening it `O_WRONLY\|O_CREAT` — a read-only grant fails **both**, and `subprocess.DEVNULL` is reachable from any Python tool a capsule might run. |
+| `/dev/null` | read **and** write | The one deliberate exception to "nothing outside the workdir is writable". Ordinary tooling opens it for both reading and writing — a shell `2>/dev/null` redirect, a language runtime's null-device constant — and a read-only grant fails those, as an unexplained crash rather than as a policy denial. |
 | `/dev/zero` | read only | Zero-fill reads and older allocators' mapping fallbacks. Nothing needs to write it. |
 | `/dev/urandom` | read only | Not for `getrandom(2)` — that is a syscall and needs no filesystem grant — but because OpenSSL and older glibc paths still `open()` the device outright. |
 
@@ -291,16 +273,12 @@ Granting write on `/dev/null` gives up no confidentiality and no integrity: the 
 character device is defined to discard, so there is no state behind it to reach, corrupt, or read
 back. It is the narrowest possible exception — one inode, not `/dev`, not a directory.
 
-**One apparent second exception, on `sealed` only, that is not one.** Inside a composed root `/tmp`
-is writable. It is not a path outside the workdir: the runtime binds `<workdir>/.mur-tmp` there, so
-`/tmp` and the workdir are the same storage under two names, counted by the same
-`capabilities.resources.workdir_max_bytes` guard and discarded with the session. That bind carries
-its own Landlock rule — Landlock matches an access to `/tmp/x` against the bind's own root inode,
-never the workdir's — and that rule carries exactly the workdir's own right set. So `/tmp` is
-neither more nor less runnable than the workdir: with `workdir_exec: false`, which every `sealed`
-session has since declaring it caps the achieved class at `advisory`, a binary written to `/tmp`
-cannot be exec'd, exactly as one written to the workdir cannot. `scoped` composes no root, binds
-nothing at `/tmp`, and is unaffected — there, `/tmp` stays denied.
+**`/tmp` under `sealed` is not a second exception.** Inside a composed root `/tmp` is writable, but
+it is the workdir under another name: the runtime binds a directory inside the session workdir
+there, counted by the same `capabilities.resources.workdir_max_bytes` guard and discarded with the
+session. It carries exactly the workdir's rights, so a binary written to `/tmp` is no more runnable
+than one written to the workdir. `scoped` composes no root and binds nothing at `/tmp`, where it
+stays denied.
 
 **Every other device path is denied, and that needs no extra rule.** The capsule's Landlock domain
 declares the full ABI v1 right-set for itself, so a path with no matching rule is *refused*, not
@@ -309,22 +287,12 @@ merely un-granted. This mechanism only ever *adds* rules, and it adds exactly th
 denied by the same mechanism that already denied them — there is no separate deny list to keep in
 sync, and no way for a fourth device to appear except by editing the fixed set.
 
-**Why `/dev/random` is excluded — and the reasoning that is *not* the reason.** A plausible-sounding
-argument for excluding it is "writing to `/dev/random` contributes entropy to the kernel pool, so a
-capsule could poison it." That argument is **wrong**, and it should not be repeated: a plain
-`write()` to `/dev/random` mixes bytes into the input pool but credits **zero** entropy. Crediting
-entropy requires the `RNDADDENTROPY` ioctl, which requires `CAP_SYS_ADMIN` — which the shell child
-has already dropped along with every other capability (see the capability drop above), on both Linux
-tiers. The real reason is duller and holds up: since Linux 5.6 `/dev/random` blocks until the CRNG
-is initialized while `/dev/urandom` does not, and no workload needs the blocking variant when the
+**Why `/dev/random` is excluded.** Since Linux 5.6 `/dev/random` blocks until the kernel RNG is
+initialized while `/dev/urandom` does not, and no workload needs the blocking variant when the
 non-blocking one is granted. It is excluded because nothing has demonstrated a need for it, which is
-the same standard every other device is held to.
-
-**Widening the set is allowed — evidence-first.** If a real workload is observed failing on a
-missing device, a fourth entry may be added — *with* the observed failure recorded in
-[the fixed capsule device set procedure](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/capsule-device-set-manual-verification.md)
-alongside it. A widening with no recorded failure behind it is how a fixed three-device set turns
-into an unaudited `/dev` grant.
+the standard every device on this list is held to. A capsule cannot poison the kernel entropy pool
+through it either way: crediting entropy needs a privileged ioctl, and the shell child has dropped
+every capability before it runs.
 
 **On `sealed`, a different mechanism answers the same question.** A capsule that declares the
 [`sealed` class](manifest-schema.md#field-containment) gets a private `/dev` **tmpfs** carrying the
@@ -337,179 +305,120 @@ without them its device nodes would be present and unopenable.
 
 ### The fixed sealed-tier runtime-tree grant { #sealed-runtime-tree-grant }
 
-Exactly the same shape of problem as the device set, one layer up, and it appears only on
-`sealed`. A composed root bind-mounts a fixed list of host directories read-only — `/usr`, `/bin`,
-`/sbin`, `/lib`, `/lib32`, `/lib64` and `/libx32` — and then Landlock
-installs *inside* that root as defence in depth. Landlock denies any path with no matching rule, so
-until this grant existed the runtime tree was mounted, present, and unreadable except through the
-per-file `shell.allow` closure. That is enough to start an interpreter and not enough to let it
-run: CPython aborts with `init_fs_encoding: failed to get the Python codec of the filesystem
-encoding` because it cannot `getdents64` `/usr/lib/python3.N` to discover `encodings`. Mounted but
-unenumerable is indistinguishable from not mounted at all.
-
-So every `sealed` session now gets one extra Landlock rule per entry of that list, fixed at compile
-time, with **no manifest key** that adds a path or removes one. Unlike
-[`W-SEC-009`](#w-sec-009)'s `interpreter_runtime` grants, nothing about this is author-declared —
-it fires no warning, appears in no `--explain-scope` section, and is a property of the tier.
+On `sealed` only. A composed root bind-mounts a fixed list of host runtime directories read-only —
+`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64` and `/libx32` — and Landlock installs *inside*
+that root as defence in depth. Each of those entries gets one Landlock rule, fixed at compile time,
+with **no manifest key** that adds a path or removes one. Unlike [`W-SEC-009`](#w-sec-009)'s
+`interpreter_runtime` grants, nothing here is author-declared: it fires no warning, appears in no
+`--explain-scope` section, and is a property of the tier.
 
 | Right | Granted | Why |
 |---|---|---|
-| `ReadFile` | yes | Open a file in the tree by name — already reachable one file at a time via the `shell.allow` closure; this generalises it to the tree the composed root actually mounted. |
-| `ReadDir` | yes | The gap being closed. A path-based runtime walks its search path; without `getdents64` it cannot find its own standard library. |
+| `ReadFile` | yes | Open a file in the tree by name. |
+| `ReadDir` | yes | A path-based runtime walks its search path; without the ability to list it, it cannot find its own standard library. |
 | `Execute` | **no** | Withheld deliberately — see below. |
-| every write right | no | The bind is `MS_RDONLY` regardless, so the tree is immutable for two independent reasons. `touch /usr/testfile` reports `Read-only file system`. |
+| every write right | no | The bind is read-only regardless, so the tree is immutable for two independent reasons. |
 
-**Why `Execute` is withheld, and why that is the interesting bit.** The seccomp `execve` supervisor
-was retired in favour of Landlock `Execute` rights, which makes an `Execute` rule *the* exec
-allowlist: a binary with one runs, a binary without one does not. Granting `Execute` across `/usr`,
-`/bin` and `/sbin` would therefore make every binary the host ships runnable inside a `sealed`
-session and reduce `capabilities.shell.allow` to documentation. With `Execute` on those paths,
-`/bin/sh` runs inside a capsule whose allowlist never mentioned `sh`; without it, invoking `sh` is
-`Permission denied` (exit 126) while an allowlisted interpreter still runs. Withholding it costs
-nothing an interpreter needs —
-`dlopen(3)` maps a shared object `PROT_EXEC` after an ordinary `O_RDONLY` open, which Landlock
-gates with `ReadFile`, not `Execute`, so C extension modules still load (`import ssl, zlib,
-_ctypes, sqlite3` succeeds under this grant). This is the only grant in the runtime that is
-readable and enumerable but not runnable.
+**Why `Execute` is withheld.** An `Execute` rule *is* the exec allowlist: a binary with one runs, a
+binary without one does not. Granting `Execute` across `/usr`, `/bin` and `/sbin` would make every
+binary the host ships runnable inside a `sealed` session and reduce `capabilities.shell.allow` to
+documentation. Withholding it costs an interpreter nothing — loading a shared library is gated by
+`ReadFile`, not `Execute`, so extension modules still load. This is the only grant in the runtime
+that is readable and enumerable but not runnable.
 
-**Why enumerating this tree is safe, and what it does *not* widen.** The tree being enumerated is
-inside a private mount namespace pivoted onto a composed root: it holds the read-only runtime the
-root was built from and nothing else, and everything outside it is *absent* rather than denied. So
-a listing there reveals the staged runtime, not the host's shape. Two boundaries are unchanged:
-`ls /` (the composed root's own top level, not itself one of these paths) is still
-`Permission denied`, and `/root` — never mounted into the root at all — is still
-`No such file or directory`.
+**What enumerating this tree does not widen.** The tree is inside the composed root: it holds the
+read-only runtime the root was built from and nothing else, and everything outside it is *absent*
+rather than denied. A listing there reveals the staged runtime, not the host's shape. The composed
+root's own top level stays unreadable, and paths never mounted into it — home directories among
+them — do not exist inside the capsule at all.
 
-**`scoped` gets none of this, and the tier gate is the reason.** Landlock rules are built the same
-way whether or not a composed root exists, but a `scoped` capsule has no composed root: Landlock
-there applies straight over the *real host filesystem*, where `/usr` is the host's own `/usr`.
-Granting `ReadDir` on it would newly expose host directory shape to every `scoped` capsule, so the
-grant is emitted only on the sealed tier and is empty everywhere else. Under `scoped`, `ls /`,
-`ls /usr` and `ls /usr/lib/python3.N` all still fail with `Permission denied`.
+**`scoped` gets none of this.** A `scoped` capsule has no composed root, so Landlock there applies
+straight over the real host filesystem, where `/usr` is the host's own. Granting `ReadDir` on it
+would newly expose host directory shape to every `scoped` capsule, so the grant is emitted only on
+the sealed tier and is empty everywhere else.
 
 ### The fixed sealed-tier `/etc` grant { #sealed-etc-grant }
 
-The same mounted-but-denied bug as the runtime tree, one directory over, and the one users hit
-first — because what it breaks is TLS.
+A composed root does not carry the host's `/etc`. It carries a fixed allowlist of sixteen entries,
+bind-mounted read-only and each silently skipped when the host does not have it: the loader's cache
+and config (`/etc/ld.so.cache`, `/etc/ld.so.conf`, `/etc/ld.so.conf.d`), the alternatives database
+(`/etc/alternatives`), the TLS trust store (`/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`,
+`/etc/ca-certificates.conf`), name resolution (`/etc/resolv.conf`, `/etc/hosts`,
+`/etc/nsswitch.conf`), the timezone (`/etc/localtime`, `/etc/timezone`), the terminal database
+(`/etc/terminfo`) and the account databases (`/etc/passwd`, `/etc/group`). Everything else under
+`/etc` — `/etc/shadow`, `/etc/sudoers`, `/etc/ssh`, cloud-init credentials, and every future
+addition — is **absent by construction**, never by enumeration in a denylist.
 
-A composed root does not carry the host's `/etc`. It carries a fixed, curated allowlist of sixteen
-entries, bind-mounted read-only, each silently skipped when the host
-does not have it: the loader's cache and config (`/etc/ld.so.cache`, `/etc/ld.so.conf`,
-`/etc/ld.so.conf.d`), the alternatives database (`/etc/alternatives`), the TLS trust store
-(`/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/etc/ca-certificates.conf`), name resolution
-(`/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`), the timezone (`/etc/localtime`,
-`/etc/timezone`), the terminal database (`/etc/terminfo`) and the account databases
-(`/etc/passwd`, `/etc/group`). Everything else under `/etc` — `/etc/shadow`, `/etc/sudoers`,
-`/etc/ssh`, cloud-init credentials, and every future addition — is **absent by construction**,
-never by enumeration in a denylist.
-
-Until this grant existed, all sixteen were mounted and unopenable. The visible symptom was
-certificate verification:
-
-```text
-PermissionError: [Errno 13] Permission denied   # /etc/ssl/certs/ca-certificates.crt
-curl: (77) error setting certificate file: /etc/ssl/certs/ca-certificates.crt
-pip: SSLError(PermissionError(13, 'Permission denied')) — Could not fetch URL https://pypi.org/simple/…
-```
-
-The TCP connection succeeded; the trust store could not be read, so `pip`, `curl`, `wget` and
-`git` all failed over HTTPS against hosts the manifest had explicitly allowed. `getpwuid(3)` failed
-the same way, so `whoami` and every tool that resolves its own username misreported.
-
-Every `sealed` session now gets one Landlock rule per entry, fixed at compile time, with **no
-manifest key** that adds a path or removes one. Like the runtime-tree grant it is a property of the
-tier: it fires no warning and appears in no `--explain-scope` section.
-
-Two of those rules are joined by a rule each on the synthetic account databases described below.
-A Landlock rule names the inode an fd resolved to, not the path string it was opened by, so the
-rule taken on the host's `/etc/passwd` does not cover a *different* file bind-mounted at that path
-— without its own rule the synthetic database is mounted and `EACCES`, which is this section's bug
-all over again.
+Each entry gets one Landlock rule, fixed at compile time, with **no manifest key** that adds a path
+or removes one. Like the runtime-tree grant it is a property of the tier: it fires no warning and
+appears in no `--explain-scope` section.
 
 | Right | Granted | Why |
 |---|---|---|
-| `ReadFile` | yes, on all sixteen | The gap being closed. Reading the file the composed root already mounted. |
-| `ReadDir` | on the six directory entries only — `/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/etc/ld.so.conf.d`, `/etc/alternatives`, `/etc/terminfo` | OpenSSL's `SSL_CERT_DIR` hash lookup, `c_rehash`, and `os.listdir('/etc/ssl/certs')` all enumerate. The other ten are files or symlinks, where `ReadDir` has no meaning — and the kernel rejects a `ReadDir` rule on a non-directory outright. |
-| `Execute` | **no** | `/etc/alternatives` is a directory of symlinks into `/usr/bin`. Granting `Execute` here would be a second, undeclared route around `capabilities.shell.allow` — the same hole the [runtime-tree grant](#sealed-runtime-tree-grant) withholds `Execute` to close. `/etc/alternatives/awk --version` is `Permission denied` (exit 126) in a capsule that can read and list that directory. |
-| every write right | no | The binds are `MS_RDONLY`, so `touch /etc/hosts` reports `Permission denied` and `open('/etc/hosts', 'w')` reports `Read-only file system`. A writable `/etc/resolv.conf` inside a capsule would be a name-resolution hijack of the capsule's own egress. |
+| `ReadFile` | yes, on all sixteen | Reading the file the composed root already mounted. |
+| `ReadDir` | on the six directory entries only — `/etc/ssl`, `/etc/pki`, `/etc/ca-certificates`, `/etc/ld.so.conf.d`, `/etc/alternatives`, `/etc/terminfo` | TLS trust-store lookup and terminal-database lookup enumerate their directories. The other ten are files or symlinks, where listing has no meaning. |
+| `Execute` | **no** | `/etc/alternatives` is a directory of symlinks into `/usr/bin`. Granting `Execute` here would be a second, undeclared route around `capabilities.shell.allow` — the same hole the [runtime-tree grant](#sealed-runtime-tree-grant) withholds `Execute` to close. |
+| every write right | no | The binds are read-only. A writable `/etc/resolv.conf` inside a capsule would be a name-resolution hijack of the capsule's own egress. |
 
-**What this widens, stated plainly.** Fourteen of the sixteen entries are the host's own file,
-bind-mounted read-only, and none of them is sensitive: a CA bundle, a timezone, a loader cache and
-a terminfo database are public data on any host. The remaining two — `/etc/passwd` and `/etc/group`
-— are **not** the host's. They were, and that cost was recorded here: both are world-readable on
-every distribution, so binding them handed a `sealed` capsule the machine's full account list.
-The parent now writes a two-line database instead, and the composed root binds *that* at the same
-two paths, read-only:
+**What this widens.** Fourteen of the sixteen entries are the host's own file, bind-mounted
+read-only, and none is sensitive: a CA bundle, a timezone, a loader cache and a terminal database
+are public data on any host.
 
-```text
-root:x:0:0:root:/root:/bin/sh
-capsule:x:1000:1000:Murmur capsule:<workdir>/.capsule-home:/bin/sh
-```
+The remaining two — `/etc/passwd` and `/etc/group` — are **not** the host's. Both are world-readable
+on every distribution, so binding the host's would hand a `sealed` capsule the machine's full
+account list. The composed root carries a synthetic pair instead: an entry for `root`, and one for
+the uid the capsule's subprocesses run as, whose home directory is the synthetic `$HOME` the
+subprocess environment already sets. Username, group and `~` lookups all resolve and agree with
+`$HOME`; **no host account name appears inside the capsule.**
 
-`root`, and one entry for the uid the capsule's subprocesses actually run as, whose home directory
-is the synthetic `$HOME` the subprocess environment already sets — so `getpwuid(3)`, `getgrgid(3)`,
-`~` expansion and `os.path.expanduser` all still resolve, and agree with `$HOME`. A capsule already
-running as uid 0 gets the single `root` line rather than a duplicate entry. No host account name
-appears in either file. And the containment boundary is unchanged — `ls /etc` itself is still `Permission denied` (no rule covers the composed
-root's `/etc` directory, only the specific entries mounted beneath it), while `/etc/shadow` and
-`/etc/ssh/sshd_config` are still `No such file or directory`, because they were never mounted.
+The boundary around them is unchanged: `/etc` itself cannot be listed — only the specific entries
+mounted beneath it are readable — and paths that were never mounted, `/etc/shadow` among them, do
+not exist inside the capsule.
 
-**`scoped` gets none of this**, for exactly the reason [the runtime-tree grant](#sealed-runtime-tree-grant)
-gives: without a composed root these rules would apply to the *host's* `/etc` — its real trust
-store, its real `resolv.conf`, its real account databases. The grant is emitted only on the sealed
-tier, so a `scoped` capsule's behaviour across all sixteen paths is unchanged by it.
+**`scoped` gets none of this**, for the reason [the runtime-tree grant](#sealed-runtime-tree-grant)
+gives: without a composed root these rules would apply to the host's own `/etc` — its real trust
+store, its real `resolv.conf`, its real account databases.
 
-**One operational consequence.** Eighteen more Landlock grants (the sixteen entries plus the two
-synthetic files' own rules) means that many more file descriptors
-held open across the child's pre-exec window, under whatever `capabilities.resources.max_open_files`
-the manifest declared. A `sealed` capsule allowing `[bash, python3]` needs roughly seventy
-descriptors to launch; below that it is refused at startup with
-`sandbox: shell enforcement setup failed before exec: egress-netns: writing uid_map/gid_map
-failed`. That is fail-closed and legible, not a silent weakening, but a manifest with a very tight
+**One operational consequence.** Each of these entries holds a file descriptor open while the
+capsule starts, under whatever `capabilities.resources.max_open_files` the manifest declared. A
+`sealed` capsule allowing an interpreter and a shell needs roughly seventy descriptors to launch,
+and below that it is refused at startup rather than silently weakened. A manifest with a very tight
 `max_open_files` may need to raise it.
 
 ### Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
 Every mechanism above governs a specific syscall (`socket`, `mknod`) or a specific resource (the
-workdir). The seccomp filter itself used to default to **allow**: any syscall not named by one of
-those specific rules fell through and was permitted, unmediated. The filter's default action is now
-**deny** (`EPERM`) instead, modelled on the OCI/Docker default seccomp profile — only a fixed, named
-allowlist of syscalls is permitted outright, and a syscall outside it is refused before any argument
-is even read. Applies on **both** Linux tiers identically: it is a plain seccomp rule with no
-Landlock involvement.
+workdir). Underneath them, the seccomp filter's default action is **deny** (`EPERM`), modelled on
+the OCI/Docker default seccomp profile: only a fixed, named allowlist of syscalls is permitted, and
+a syscall outside it is refused before any argument is read. Applies on **both** Linux tiers
+identically.
 
-`execve`/`execveat` are ordinary allowed syscalls in that list. They used to be decided by a
-userspace exec supervisor; `capabilities.shell.allow` is enforced by the Landlock `Execute` right
-instead (see [`W-SEC-011`](#w-sec-011) and [the tier table](#subprocess-enforcement-tiers)), and
-they have to be *permitted* here because the child's own first act after the filter loads is the
-`execve` that turns it into the tool binary. `connect`/`sendto` are ordinary allowed syscalls too —
-enforcement of `capabilities.network.allow` for them lives in the capsule's own network namespace
-and egress proxy — and `socket` stays governed by the per-domain rules described above.
+`execve`/`execveat` are ordinary allowed syscalls in that list — `capabilities.shell.allow` is
+enforced by the Landlock `Execute` right instead (see [`W-SEC-011`](#w-sec-011) and
+[the tier table](#subprocess-enforcement-tiers)) — as are `connect`/`sendto`, whose
+`capabilities.network.allow` enforcement lives in the capsule's own network namespace and egress
+proxy. `socket` stays governed by the per-domain rules described above.
 
-**A container in front of `mur run` can hide what this layer does and does not do.** This is the
-caveat worth internalising: running a capsule inside a container means two independent things are
-restricting it, and only one of them is the capsule runtime. A container supplies containment the
-runtime does not — a masked or minimal `/dev`, its own default syscall filter, dropped capabilities,
-its own mount and network namespaces. So a capsule that looks well contained inside one may be
-relying on the container for part of that, and the same capsule on bare metal is contained only by
-what this page describes. Test the posture you actually intend to ship, on the kind of host you
-intend to ship it on; a result observed under a container is not a result about the runtime.
+**A container in front of `mur run` can hide what this layer does and does not do.** Running a
+capsule inside a container means two independent things are restricting it, and only one of them is
+the capsule runtime. A container supplies containment the runtime does not — a masked or minimal
+`/dev`, its own default syscall filter, dropped capabilities, its own mount and network namespaces.
+A capsule that looks well contained inside one may be relying on the container for part of that,
+and the same capsule on bare metal is contained only by what this page describes. Test the posture
+you intend to ship, on the kind of host you intend to ship it on.
 
-**Diagnosability.** A syscall refused by the default action returns `EPERM` to the caller, same as
-always — the seccomp return-errno action has no channel for anything richer. To make a denial
-attributable after the fact, the filter also turns on kernel audit logging for every non-allow
-action, so a denial reaches `dmesg`/`journalctl -k`/`ausearch` with the syscall number, pid and
-process name — provided the host's `/proc/sys/kernel/seccomp/actions_logged` includes `errno`, which
-is host configuration `mur` does not control. On a host whose libseccomp predates 2.4.0 the
-attribute cannot be set at all; enforcement is unaffected, only its legibility is.
+**Diagnosability.** A syscall refused by the default action returns `EPERM` to the caller. To make
+a denial attributable after the fact, the filter also turns on kernel audit logging for every
+non-allow action, so a denial reaches the kernel log with the syscall number, pid and process name
+— provided the host is configured to log seccomp errno actions, which `mur` does not control.
+Enforcement does not depend on that; only its legibility does.
 
 **Compatibility is the load-bearing risk here, not security.** The allowlist is reconciled against
-containerd's own default profile precisely so that a workload already proven to run under a
-container's seccomp profile keeps working under `mur run`'s equivalent. Do not assume the syscall
-surface a shell workload needs is exactly the one that profile permits, though: if a workload dies
-on an unexpected `EPERM`, the audit trail names the syscall, and whether it belongs in the allowlist
-or stays denied is a deliberate, reviewed change to the runtime, not a default anyone can widen from
-a manifest.
+containerd's default profile so that a workload already proven to run under a container's seccomp
+profile keeps working under `mur run`'s equivalent. Do not assume the syscall surface a shell
+workload needs is exactly the one that profile permits: if a workload dies on an unexpected
+`EPERM`, the audit trail names the syscall. Widening the allowlist is a change to the runtime, not
+something a manifest can do.
 
 **What to do:** prefer specific binary declarations over `bash`, keep `network.allow` and
 `filesystem.scope` minimal, and use the
@@ -716,11 +625,6 @@ at `advisory` and treat `shell.allow` as documentation of intent, not as contain
 [data/action phase-separation pattern](manifest-schema.md#threat-model) to bound what the capsule
 can be induced to build and run, and give it no network allowlist entry it does not need.
 
-**Verification.** That an executable-workdir capsule really can run its own binary, and that a
-default capsule really cannot, is checked by hand on Landlock-capable Linux hardware — see
-[workdir-exec Landlock manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md).
-Nothing in CI is evidence either way: this repo's CI never resolves to the Full tier.
-
 ---
 
 ## W-SEC-012 — A compiler driver's toolchain has no `Execute` grant { #w-sec-012 }
@@ -784,11 +688,5 @@ starts and then cannot finish. They differ in what is known:
 |---|---|---|
 | Trigger | an allowlisted `#!` script with no covering grant | an allowlisted compiler driver with an uncovered helper |
 | Evidence | categorical — a script's ELF closure is *empty*, so staging it stages nothing it imports | heuristic — a `-print-prog-name=` probe over a fixed driver/helper table |
-| Failure it predicts | `ModuleNotFoundError` inside the root (ENOENT-class, not a denial) | an exec failure partway through a compile |
+| Failure it predicts | a missing-module error inside the root, not a denial | an exec failure partway through a compile |
 | Outcome | launch refused before any registry pull | launch proceeds, operator warned |
-
-**Verification.** That an uncovered `cc` really does fail a compile inside a composed root, and
-that declaring the grant really does fix it, is checked by hand on bare-metal `sealed`-capable
-Linux hardware — see
-[shell-binary reachability manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/shell-binary-reachability-manual-verification.md).
-Nothing in CI is evidence either way: this repo's CI never resolves to the sealed tier.

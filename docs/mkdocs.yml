@@ -16,7 +16,6 @@ exclude_docs: |
   # Note: links *inside* these are no longer checked by `mkdocs build --strict`.
   reference/sealed-containment-manual-verification.md
   reference/resource-limits-manual-verification.md
-  reference/seccomp-notify-toctou-audit.md
   reference/subprocess-fd-hygiene-verification.md
   reference/staged-runtime-bind-mount-manual-verification.md
   reference/network-namespace-egress-proxy-manual-verification.md

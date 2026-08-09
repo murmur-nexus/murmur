@@ -379,7 +379,7 @@ count against `capabilities.resources.workdir_max_bytes` like any other workdir 
 discarded when the session ends — a `sealed` capsule cannot use `/tmp` to escape its workdir ceiling
 or to leave anything behind on the host.
 
-A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the launch-time IP allowlist that `capabilities.shell.allow` subprocesses fall back to when they reach a destination by address rather than by name (see [network namespace and egress proxy](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/network-namespace-egress-proxy-manual-verification.md) for how a native subprocess's `network.allow` is enforced day to day — by name, through the capsule's own DNS responder, not by this launch-time set alone). This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
+A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the launch-time IP allowlist that `capabilities.shell.allow` subprocesses fall back to when they reach a destination by address rather than by name (a native subprocess's `network.allow` is enforced day to day by name, through the capsule's own DNS responder, not by this launch-time set alone). This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
 
 A WASM guest never inherits the host process's environment: `capabilities.env.allow` is the only way to expose a host variable, and even a name declared there is dropped if it is credential-shaped (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the exact pattern list — the same backstop applies here) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable is silently omitted, not an error.
 
@@ -450,10 +450,6 @@ error[E-CAP-003]: declared containment class 'scoped' is not achievable on this 
 either way, which is exactly why neither can reach `scoped`. `W-SEC-001` and `W-SEC-002` already
 say so.
 
-The claim that a workdir binary really cannot execute is verified by hand on real
-Landlock-capable hardware, not by the test suite — see
-[workdir-exec Landlock manual verification](https://github.com/murmur-nexus/murmur/blob/main/docs/content/reference/workdir-exec-landlock-manual-verification.md).
-
 ### Staged runtime { #field-staged-runtime }
 
 `capabilities.shell.staged_runtime` and `capabilities.shell.interpreter_runtime` solve the same
@@ -518,21 +514,18 @@ host and whatever the floor:
 `--explain-scope` is a diagnostic, so it reports the grant even where `mur run` would refuse —
 which is exactly the case an operator is inspecting.
 
-For the hand-run verification procedure, including the bind-mount-vs-copy cost measurement, see
-[Staged runtime bind mount: manual verification](staged-runtime-bind-mount-manual-verification.md).
-
 #### Under `sealed`, a missing grant is caught at launch { #sealed-reachability-checks }
 
 Staging a `shell.allow` binary's own ELF dependency closure into the composed root is necessary for
-that binary to run, and for two kinds of program it is not sufficient. Both used to launch cleanly
-and then fail many turns into a run; under a declared `sealed` floor both are now decided at
-staging, before any registry pull, artifact compile or workdir creation.
+that binary to run, and for two kinds of program it is not sufficient. Either would otherwise launch
+cleanly and fail deep into a run, so under a declared `sealed` floor both are decided at staging,
+before any registry pull, artifact compile or workdir creation.
 
 **An interpreted entrypoint refuses with `E-CAP-006`.** A console script such as `pip` at
 `~/.local/bin/pip` is a `#!` script, not an ELF image, so its dependency closure is *empty* — the
 staging that makes `/usr/bin/bash` work stages nothing at all of what the script imports, and the
 package it needs (`~/.local/lib/python3.12/site-packages/pip`) is a different directory nothing
-derives. Under `sealed`, `mur run` now refuses unless one of the following holds: the script
+derives. Under `sealed`, `mur run` refuses unless one of the following holds: the script
 already resolves under a fixed sealed runtime path (`/usr`, `/bin`, …), or it lives inside a
 directory a `staged_runtime`/`interpreter_runtime` grant already names, or some such grant names
 the script or its shebang interpreter:
@@ -564,8 +557,7 @@ heuristic over a fixed driver/helper table; see
 Both checks read only the *declared* floor, never a host probe, and are completely inert at
 `scoped` and `advisory` — below `sealed` there is no composed root, and the host filesystem is
 simply the host filesystem. `mur doctor` surfaces both ahead of a run, as warnings, without
-launching anything. For the hand-run verification of both, see
-[Shell-binary reachability under sealed: manual verification](shell-binary-reachability-manual-verification.md).
+launching anything.
 
 ### Containment class { #field-containment }
 
@@ -577,20 +569,16 @@ describe *what* is allowed once a session is running. Three classes exist, weake
 |---|---|
 | `advisory` | No kernel-level enforcement required. Every host satisfies this, including macOS and older Linux. |
 | `scoped` | Landlock filesystem mediation + seccomp syscall filtering over the host filesystem. Requires Linux 5.13+ with a usable Landlock ABI. |
-| `sealed` | Mount-namespace + `pivot_root` isolation onto a composed root: the host runtime bind-mounted read-only, the session workdir the only writable path, a private `/dev` tmpfs carrying the OCI default device set, and a `/proc` (masked with `hidepid` where the kernel allows it; see the note below). Everything outside that root is *absent*, not merely denied. Landlock and seccomp still install inside it as defence in depth. Requires an uncontainerised Linux host with a usable Landlock ABI, unprivileged user namespaces, and — on an AppArmor host with `kernel.apparmor_restrict_unprivileged_userns=1` — the shipped `mur-sealed` profile loaded (`packaging/apparmor/mur-sealed`). See [Verification](verification.md) for how this class is checked by hand against a real host. |
+| `sealed` | Mount-namespace isolation onto a composed root, with Landlock and seccomp still applied inside it. Everything outside that root is *absent*, not merely denied. Requires an uncontainerised Linux host with a usable Landlock ABI and unprivileged user namespaces; on an AppArmor host, the profile shipped with `mur` must be loaded. |
 
 !!! note "`sealed`'s one documented exception: `/proc`"
 
-    Mounting a private `procfs` unprivileged requires `CAP_SYS_ADMIN` over the user namespace that
-    owns the *PID* namespace, which an unprivileged user namespace never has. `sealed` does not
-    create a PID namespace (that changes reaping and signal semantics for the whole subprocess
-    tree and is out of scope), so on a bare host the composed root carries a **bind of the host's
-    `/proc`** — `nosuid,nodev,noexec`, but not `hidepid`-masked. Host process metadata is therefore
-    *visible* under `/proc` inside a `sealed` root, exactly as it is under `scoped`; opens through
-    it are still refused by Landlock. Every other axis of the root — `/etc`, `/dev`, block devices,
-    sockets, other users' homes — is absent, not merely denied. `mount -t proc` with `hidepid` is
-    still attempted first and succeeds where the process does hold that privilege (as root, or in a
-    container run with `--cap-add SYS_ADMIN`).
+    A private `procfs` needs a privilege an unprivileged user namespace does not have, so on most
+    hosts a `sealed` root carries the host's `/proc` instead. **Host process metadata is visible
+    under `/proc` inside a `sealed` capsule**, as it is under `scoped`; opens through it are still
+    refused. Every other axis of the root — `/etc`, `/dev`, block devices, sockets, other users'
+    homes — is absent, not merely denied. Where the runtime does hold that privilege, a private
+    masked `/proc` is used and this exception does not apply.
 
 **Declaring a floor.** Three independent sources can each declare a minimum class, and they combine
 by taking the **strongest** requested — never the weakest:
@@ -623,7 +611,7 @@ achieved class. See [Executable workdirs](#field-workdir-exec).
 **A weaker declaration is never silently upgraded.** On a `sealed`-capable host, a capsule
 declaring `scoped` still runs with `scoped`'s mechanism — Landlock and seccomp over the host
 filesystem, no composed root. Installing one anyway would delete the host paths its
-`interpreter_runtime` grants legitimately name, which is a regression dressed up as extra security.
+`interpreter_runtime` grants legitimately name, weakening the capsule rather than strengthening it.
 The achieved class reported in the trace still says what the *host* can back; the mechanism
 installed follows what the capsule *asked for*.
 
@@ -655,9 +643,9 @@ error[E-CAP-003]: declared containment class 'sealed' is not achievable on this 
 ```
 
 A `sealed` host that clears the probe at launch and *then* fails to build the composed root for a
-particular subprocess is a different event and gets its own code, `E-RUN-014` — see
-`RuntimeError::SealedRootConstructionFailed`. It means something moved underneath the runtime
-mid-session (a profile reloaded, a container policy changed), not that the floor was mis-declared.
+particular subprocess is a different event and gets its own code, `E-RUN-014`. It means something
+moved underneath the runtime mid-session (a profile reloaded, a container policy changed), not that
+the floor was mis-declared.
 
 A manifest that never declares `capabilities.containment` is never gated by this check — the
 effective floor resolves to `advisory`, which every host satisfies.
