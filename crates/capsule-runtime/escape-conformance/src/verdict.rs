@@ -3,7 +3,7 @@
 //! The two are deliberately separate types. A [`Verdict`] is what the kernel actually did; an
 //! [`Expectation`] is what the containment class under test *claims* it will do. Collapsing them
 //! into one enum is how a harness ends up asserting something false about a weak class — the
-//! failure mode the roadmap card calls out by name for `stat-outside-workdir`.
+//! failure mode `stat-outside-workdir` exists to prevent.
 
 use std::fmt;
 

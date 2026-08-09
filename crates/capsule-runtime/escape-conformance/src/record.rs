@@ -1,7 +1,7 @@
 //! The dated record file — the artifact this whole harness exists to produce.
 //!
-//! `W-SEC-005` currently rests on one live run on one host, which the roadmap card calls a smoke
-//! test rather than verification. The intended replacement is not "the harness exits 0" but *this
+//! One live run on one host is a smoke test, not verification. What `W-SEC-005` rests on is not
+//! "the harness exits 0" but *this
 //! file*: a dated, self-contained document a reviewer can read without the harness, the
 //! repository, or the person who ran it.
 //!

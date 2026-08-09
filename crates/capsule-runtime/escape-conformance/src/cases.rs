@@ -1,4 +1,4 @@
-//! The case registry — every case the roadmap's minimum case set names, with its expected
+//! The case registry — the minimum case set, with each case's expected
 //! verdict per containment class.
 //!
 //! # There is no disable mechanism, deliberately
@@ -6,7 +6,7 @@
 //! [`REGISTRY`] is a flat `const` slice. There is no `enabled` flag, no filter file, no
 //! environment variable that drops a case, and [`ALL_CASES`]/[`BOUNDARY_CASE_COUNT`]/
 //! [`RESOURCE_CASE_COUNT`] are asserted against it by the tests at the bottom of this file. The
-//! roadmap card requires `exec-renamed-disallowed-binary` to be permanent; the way that is held
+//! `exec-renamed-disallowed-binary` is permanent; the way that is held
 //! is that removing it changes a count assertion, so the deletion cannot land without appearing
 //! in a diff review. [`PERMANENT_CASE_IDS`] pins the same property by name.
 //!
@@ -143,7 +143,7 @@ impl Case {
 /// A trivial capsule run, used only to answer "can a probe start at all on this host?".
 ///
 /// Deliberately **not** in [`REGISTRY`]: it asserts nothing about containment, and counting it
-/// would corrupt the roadmap's minimum-case-set arithmetic. It exists because the alternative is
+/// would corrupt the minimum-case-set arithmetic. It exists because the alternative is
 /// far worse than a missing case. If the shell-tool path cannot execute anything — a cgroup that
 /// cannot be joined, an interpreter the exec allowlist will not resolve, a supervisor that cannot
 /// read the child's memory — then every case reports `INCONCLUSIVE`, every asserted case fails,
@@ -174,9 +174,9 @@ def main():
 /// fails this package's own `cargo test` rather than quietly shrinking the suite.
 pub const PERMANENT_CASE_IDS: &[&str] = &["exec-renamed-disallowed-binary"];
 
-/// The roadmap's minimum case set: 23 boundary cases.
+/// Minimum case set: 23 boundary cases.
 pub const BOUNDARY_CASE_COUNT: usize = 23;
-/// The roadmap's minimum case set: 5 resource-exhaustion cases.
+/// Minimum case set: 5 resource-exhaustion cases.
 pub const RESOURCE_CASE_COUNT: usize = 5;
 
 /// Every case, boundary first. Order is the order they run and the order they are reported.
@@ -1548,7 +1548,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The completeness check the card asks for: the registry must carry exactly the roadmap's
+    /// Completeness check: the registry must carry exactly the
     /// minimum case set, and a case cannot disappear without this failing.
     #[test]
     fn registry_matches_the_roadmap_minimum_case_set() {
@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(REGISTRY.len(), BOUNDARY_CASE_COUNT + RESOURCE_CASE_COUNT);
     }
 
-    /// The v0.5.7 regression case is named "kept permanently" by the roadmap. Deleting it fails
+    /// The v0.5.7 regression case is kept permanently. Deleting it fails
     /// here, so the deletion has to appear in a diff review rather than land silently.
     #[test]
     fn registry_keeps_permanent_cases() {

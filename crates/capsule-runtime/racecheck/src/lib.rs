@@ -23,7 +23,7 @@
 //!
 //! ## Both probes now mirror a mechanism that no longer exists
 //!
-//! The audit's conclusion was acted on in full, in two slices. `connect`/`sendto` went first:
+//! The audit's conclusion was acted on in full, in two stages. `connect`/`sendto` went first:
 //! replaced by a network namespace plus an egress proxy (`capsule-runtime`'s `network_namespace`
 //! and `egress_proxy` modules), where the destination is read from an already-established
 //! connection rather than out of the notifying task's memory. `execve`/`execveat` went second:
@@ -47,10 +47,9 @@ pub mod linux;
 
 /// The message every binary in this package prints when built for a non-Linux host.
 ///
-/// The probes exist to exercise a Linux kernel mechanism, so there is nothing honest for them to
-/// do anywhere else — but they must still *build* and *run* on a macOS dev machine, because that
-/// is where they are written and reviewed. Exit status is 0: "not applicable here" is not a
-/// failure, and a non-zero exit would read as a broken build.
+/// The probes exercise a Linux kernel mechanism, so there is nothing honest for them to do
+/// elsewhere — but they must still build and run on non-Linux hosts. Exit status is 0:
+/// "not applicable here" is not a failure, and a non-zero exit would read as a broken build.
 pub fn non_linux_stub(bin: &str) {
     println!(
         "{bin}: this probe only runs its race on Linux; \

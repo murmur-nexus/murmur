@@ -287,7 +287,7 @@ pub(crate) async fn run_process_inference_loop(
 
     // on-session-start / on-session-end hook dispatch fires once per launch from
     // runtime.rs (around the task loop), not per task here. The trace's own
-    // session_start/session_end markers remain per task (out of scope for this slice).
+    // session_start/session_end markers remain per task.
     // Declare the bridge-exposed tools so `mur trace show` reflects them (process transport
     // used to always record an empty tool set); empty when no tools are declared.
     let tools_declared: Vec<String> = inventory

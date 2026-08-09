@@ -506,7 +506,7 @@ mod tests {
     /// declared `capabilities.resources.max_open_files` must reach the child as its **hard**
     /// ceiling, which is what `ulimit -Hn` reports. This asserts the mechanism (the value was
     /// applied to `rlim_max`, not only `rlim_cur`), not a security outcome — the hostile-capsule
-    /// scenarios are hand-run on real Linux hardware, per this slice's manual-verification doc.
+    /// scenarios require real Linux hardware.
     #[test]
     fn execute_shell_applies_the_declared_limit_as_a_hard_ceiling() {
         let temp = tempdir().unwrap();

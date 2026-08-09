@@ -156,7 +156,7 @@ pub(crate) async fn run_agent_loop(
     let max_turns = inference.max_turns;
     // on-session-start / on-session-end hook dispatch now fires once per launch from
     // runtime.rs (around the task loop), not per task here. The trace's own
-    // session_start/session_end markers remain per task (out of scope for this slice).
+    // session_start/session_end markers remain per task.
     trace
         .write_session_start(max_turns, tools_declared)
         .await
@@ -1664,7 +1664,7 @@ mod tests {
         assert_eq!(payload["model"], json!("m"));
         assert_eq!(payload["max_tokens"], json!(8192));
 
-        // Exactly the shape run_agent_loop built before this slice.
+        // Exactly the shape run_agent_loop builds.
         let mut expected = json!({
             "model": "m",
             "max_tokens": 8192,
@@ -1903,10 +1903,9 @@ mod tests {
         None
     }
 
-    /// A long run whose live context stays far below the threshold must never compact, no
-    /// matter how large the cumulative token throughput gets. This is the observed symptom
-    /// from the astropy exp-0101 run: peak per-turn context ~81k against a 1M window, yet
-    /// compaction fired mid-run on a cumulative figure of ~972k.
+    /// A long run whose live context stays far below the threshold must never compact, however
+    /// large the cumulative token throughput grows. Compacting on the cumulative figure fires
+    /// mid-run while each turn's context is a fraction of the window.
     #[test]
     fn stable_per_turn_context_never_triggers_compaction() {
         let context_window = 1_000_000;

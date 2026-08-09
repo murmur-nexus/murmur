@@ -247,9 +247,9 @@ pub(crate) fn sealed_blocker(
     if !is_linux {
         return Some(SealedBlocker::NotLinux);
     }
-    // Blame AppArmor before the namespace outcome: when the restriction is on and our profile is
-    // not loaded, the namespace failure is a *consequence*, and pointing at `--cap-add SYS_ADMIN`
-    // on a bare Ubuntu desktop would send the operator somewhere useless.
+    // Attribute to AppArmor before the namespace outcome: when the restriction is on and the
+    // shipped profile is not loaded, the namespace failure is a *consequence*, and naming
+    // `--cap-add SYS_ADMIN` on a bare host sends the operator somewhere useless.
     if !probe.apparmor_permits_userns {
         return Some(SealedBlocker::AppArmorProfileMissing);
     }
@@ -336,10 +336,10 @@ pub struct SealedEtcPath {
 /// follow-up.
 ///
 /// Binding these is only half the job: Landlock still mediates *inside* the composed root, so an
-/// entry bound here but absent from the ruleset exists and is unopenable — which is how TLS
-/// verification used to fail with `EACCES` on `/etc/ssl/certs/ca-certificates.crt` despite the
-/// trust store being right there. `sandbox::resolve_sealed_etc_landlock_grants` turns this list
-/// into the matching read grants.
+/// entry bound here but absent from the ruleset exists and is unopenable — a trust store present
+/// at `/etc/ssl/certs/ca-certificates.crt` but `EACCES` on open fails TLS verification.
+/// `sandbox::resolve_sealed_etc_landlock_grants` turns this list into the matching read grants.
+/// Keep the two sets aligned.
 pub const SEALED_ETC_PATHS: &[SealedEtcPath] = &[
     SealedEtcPath { path: "/etc/ld.so.cache", directory: false },
     SealedEtcPath { path: "/etc/ld.so.conf", directory: false },
@@ -460,12 +460,11 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// that privilege — as root, and inside a container run with `--cap-add SYS_ADMIN` — and because
 /// a later PID-namespace slice makes them succeed everywhere without touching this list.
 ///
-/// When they all fail the executor binds the host's `/proc` instead. What that costs: the capsule
-/// can enumerate host PIDs and read the `/proc/<pid>/root` and
-/// `/proc/<pid>/cwd` symlinks, so `/proc` is the one part of the composed root where "outside does
-/// not exist" degrades to `scoped`'s "outside is denied" — Landlock's ruleset covers no path under
-/// `/proc`, so opens through it are refused, and `ptrace_may_access` gates the rest. Every other
-/// axis of the root stays absolute. The alternative is a capsule with no `/proc` at all, which
+/// When they all fail the executor binds the host's `/proc` instead. The capsule can then
+/// enumerate host PIDs and read the `/proc/<pid>/root` and `/proc/<pid>/cwd` symlinks, so `/proc`
+/// is the one part of the composed root where "outside does not exist" degrades to `scoped`'s
+/// "outside is denied" — Landlock's ruleset covers no path under `/proc`, so opens through it are
+/// refused, and `ptrace_may_access` gates the rest. Every other axis of the root stays absolute. The alternative is a capsule with no `/proc` at all, which
 /// breaks `/dev/fd`, process substitution and every runtime that reads `/proc/self/*`.
 const PROC_HIDEPID_OPTIONS: &[&str] = &["hidepid=2", "hidepid=invisible", ""];
 
@@ -1487,7 +1486,7 @@ mod linux {
             }
             CStepKind::Proc { target } => {
                 // Try each `hidepid` spelling in turn, then a recursive bind of the host's
-                // `/proc` — see `PROC_HIDEPID_OPTIONS` for why the bind exists and what it costs.
+                // `/proc` — see `PROC_HIDEPID_OPTIONS` for the bind's rationale and exposure.
                 for option in PROC_HIDEPID_OPTIONS {
                     let mut buffer = [0u8; 32];
                     let bytes = option.as_bytes();
@@ -2047,9 +2046,9 @@ mod tests {
 
     #[test]
     fn a_map_failure_is_not_reported_as_the_container_case() {
-        // These two used to collapse into `Denied`, so a host that created the
-        // namespace perfectly well and then refused the id mapping was told to go
-        // add `--cap-add SYS_ADMIN` to a container it wasn't running in.
+        // `MapDenied` must stay distinct from `Denied`: a host that creates the namespace and
+        // then refuses the id mapping is not the container case, and must not be told to add
+        // `--cap-add SYS_ADMIN` to a container it is not running in.
         let probe = SealedProbe {
             apparmor_permits_userns: true,
             namespace: NamespaceProbe::MapDenied,

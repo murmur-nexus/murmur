@@ -1,6 +1,6 @@
 //! What this host is, recorded so a run can never be cited out of context.
 //!
-//! The roadmap card's "Critical execution requirement" is that the suite runs on bare metal: a
+//! Critical execution requirement: the suite runs on bare metal. A
 //! container previously masked three separate findings — the raw-disk escape, the `docker.sock`
 //! escape, and the entire syscall surface all looked closed inside Docker and were wide open
 //! outside it. A suite that only ran in a container would have certified a broken boundary. So
@@ -81,7 +81,7 @@ fn capture(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-/// The container heuristics named in the roadmap card, plus podman's equivalent of `/.dockerenv`.
+/// The container heuristics, plus podman's equivalent of `/.dockerenv`.
 ///
 /// Deliberately a fixed, short list rather than an exhaustive one: the point is that a record
 /// states plainly which checks ran and what each said, so a reader can judge the evidence. A long

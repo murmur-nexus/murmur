@@ -734,7 +734,7 @@ mod tests {
         // install a seccomp filter, write uid_map/gid_map for the egress netns, and hold one
         // Landlock grant fd per granted path, all under this ceiling. Below roughly 64 the
         // seccomp install fails; at 64 a `sealed` capsule fails on uid_map once the
-        // `SEALED_ETC_PATHS` grants are counted (slice fb1eea97). Pinned here so the value
+        // `SEALED_ETC_PATHS` grants are counted. Pinned here so the value
         // cannot drift back down without the reason being re-read.
         assert!(yaml.contains("max_open_files: 128"));
         assert!(yaml.contains("max_processes: 512"));

@@ -158,8 +158,8 @@ pub(crate) fn tier_from_probe(
 ///
 /// A capsule declaring `scoped` on a sealed-capable host keeps running exactly as it does today:
 /// the composed root would otherwise silently delete host paths its `interpreter_runtime` grants
-/// legitimately point at, which is a regression to `scoped`'s behaviour dressed up as extra
-/// security. The declared floor is honoured, not merely met.
+/// legitimately point at — a narrowing of `scoped`'s behaviour, not added security. The
+/// declared floor is honoured, not merely met.
 ///
 /// It is deliberately *not* symmetric with the achieved class recorded in the trace: `achieved`
 /// answers "what can this host back" (a host fact) and is probed independently, while this answers
@@ -398,9 +398,9 @@ fn is_executable_file(path: &Path) -> bool {
 
 /// Standard Linux shared-library search directories used as the fallback resolution set for a
 /// `DT_NEEDED` soname when the binary declares no `DT_RPATH`/`DT_RUNPATH` (or it doesn't match).
-/// Covers both of this repo's platform targets (`linux/x86_64` and `linux/aarch64`), including the
-/// Debian/Ubuntu multiarch-triplet subdirectories. A later slice or a reviewer targeting a
-/// platform this list didn't anticipate can extend it here — it is the single source of truth.
+/// Covers both supported platform targets (`linux/x86_64` and `linux/aarch64`), including the
+/// Debian/Ubuntu multiarch-triplet subdirectories. Extend here for a platform this list does not
+/// cover — it is the single source of truth.
 const DEFAULT_LIBRARY_SEARCH_DIRS: &[&str] = &[
     "/lib",
     "/lib64",
@@ -462,7 +462,7 @@ fn vaddr_to_file_offset(vaddr: u64, loads: &[(u64, u64, u64)]) -> Option<u64> {
 /// grant set (shrink-not-fail). Deliberately hand-rolled (no crate dependency) and byte-slice-in /
 /// struct-out so it is fully unit-testable off-Linux with synthetic fixtures; it makes no syscalls.
 ///
-/// Only ELF64 is parsed: both of this repo's Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
+/// Only ELF64 is parsed: both supported Linux targets (`x86_64`, `aarch64`) are 64-bit, so a
 /// 32-bit image is not a binary this runtime would exec and is treated as unparseable.
 pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     // e_ident (16) + fixed ELF64 header fields extend to offset 64.
@@ -482,7 +482,7 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
     let e_phoff = read_u64(bytes, 32, le)? as usize;
     let e_phentsize = read_u16(bytes, 54, le)? as usize;
     let e_phnum = read_u16(bytes, 56, le)? as usize;
-    // Each Elf64_Phdr is 56 bytes; a smaller entsize means this is not the layout we parse.
+    // Each Elf64_Phdr is 56 bytes; a smaller entsize is not this layout.
     if e_phentsize < 56 {
         return None;
     }
@@ -755,7 +755,7 @@ impl LandlockGrant {
 /// Turns each `capabilities.shell.interpreter_runtime` directory into a [`LandlockGrant`] carrying
 /// exactly the `list_dir` its author wrote. Pure and syscall-free (the declared paths need not
 /// exist here — `apply_landlock_scope` skips any that fail to open), so it is unit-testable on
-/// every platform including a non-Linux dev machine.
+/// every platform, including non-Linux targets.
 ///
 /// There is deliberately no path here that could widen a grant to a whole install prefix: it emits
 /// one grant per explicitly declared directory and copies the author's `list_dir` verbatim,
@@ -1085,7 +1085,7 @@ pub(crate) fn network_ip_allowed(ip: IpAddr, network_allow_ips: &[IpAddr]) -> bo
 // rather than `libc::AF_*`: the filter these feed is
 // always compiled *for a Linux child*, so the numbers must be Linux's regardless of what host the
 // build runs on — and `denied_socket_domains` has to stay compilable and unit-testable on a macOS
-// dev machine, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
+// non-Linux targets, where `libc::AF_NETLINK` and `libc::AF_PACKET` do not exist at all (the `libc`
 // crate defines them only under `linux_like`). `libc::AF_UNIX` does exist on macOS, but taking one
 // of the three from `libc` and two from literals would be worse than taking all three the same
 // way. Values are stable kernel ABI: `include/linux/socket.h`.
@@ -2917,12 +2917,10 @@ mod linux_enforce {
         drop_all_capabilities()?;
 
         // The child stays *non-dumpable*, inherited from the runtime process
-        // (`security::harden_process_dumpable`). It used to be set back to dumpable here, because
-        // the kernel's `ptrace_may_access` check gates every `/proc/<pid>/*` read and the
-        // seccomp-notify supervisor had to read `/proc/<child>/mem` to recover the pathname of
-        // each notified `execve`. Nothing reads the child's memory any more, so the flag — and the
-        // same-uid `ptrace`/`environ`/core-dump exposure it opened for the whole life of every
-        // shell subprocess — is gone. Do not reintroduce it without a reader that needs it.
+        // (`security::harden_process_dumpable`). Nothing reads the child's memory, so nothing
+        // needs it dumpable. Marking it dumpable opens same-uid `ptrace`, `environ` and core-dump
+        // access for the whole life of every shell subprocess: do not do so without a reader that
+        // requires it.
         install_seccomp_filter(unix_sockets_allowed)?;
 
         if matches!(
@@ -3301,7 +3299,7 @@ mod linux_enforce {
         // Equality rules per allowed domain, and NOT one unconditional `Allow` rule for `socket`:
         // libseccomp resolves an unconditional rule for a syscall by *discarding* every
         // argument-conditional chain already recorded for it (`db.c`: "syscall exists with chains
-        // but the new filter has no chains so we need to clear the existing chains"), so a broad
+        // but the new filter has no chains so the existing chains must be cleared"), so a broad
         // `Allow` here would silently delete the AF_UNIX/AF_NETLINK/AF_PACKET denials directly
         // above and reopen the `/var/run/docker.sock` path they exist to close. containerd's
         // default profile carries the same warning against combining a broad `socket` allow with
@@ -3798,16 +3796,12 @@ mod tests {
     use super::*;
     use murmur_artifact::security_warnings::W_SEC_003;
 
-    /// Content check only, deliberately: this asserts the *constant* the fd-hygiene call is
-    /// built from, not the security property itself. A test that opened an extra fd, spawned a
-    /// real subprocess and asserted the child could not see it would pass vacuously on every
-    /// runner this repo's CI uses (macOS has no `close_range`; Linux CI never resolves to a
-    /// kernel-enforcement tier), which would read as evidence while proving nothing. The
-    /// property is verified by hand — see
-    /// `docs/content/reference/subprocess-fd-hygiene-verification.md`.
+    /// Content check only: this asserts the *constant*, not the security property. Spawning a
+    /// subprocess and asserting it cannot see an inherited fd passes vacuously without kernel
+    /// enforcement, so it would read as evidence while proving nothing.
     ///
-    /// What this does catch is the one silent, catastrophic edit: a `0` here would mark stdio
-    /// close-on-exec and break every subprocess invocation on both spawn paths.
+    /// It does catch the one silent, catastrophic edit: a `0` here marks stdio close-on-exec and
+    /// breaks every subprocess invocation on both spawn paths.
     #[test]
     fn fd_hygiene_range_starts_above_stdio() {
         assert_eq!(
@@ -4797,12 +4791,10 @@ mod tests {
     //
     // The canonical statement of what the *content* checks in this file are worth, referenced by
     // the `denied_socket_domains` and `SECCOMP_SYSCALL_ALLOWLIST` sections below: they assert what
-    // a Rust constant holds, NOT that any kernel grants or refuses anything. Nothing here — and no
-    // green CI run — is evidence that `/dev/null` is actually writable inside a capsule, or that
-    // `/dev/random` is actually refused. This repo's CI has never resolved to a tier where
-    // `apply_landlock_scope` even runs, so a green suite means nothing for the enforcement claim.
-    // What a content check does buy is that changing one of these constants cannot happen by
-    // accident.
+    // a Rust constant holds, NOT that any kernel grants or refuses anything. A green run is not
+    // evidence that `/dev/null` is writable inside a capsule or that `/dev/random` is refused —
+    // on a host below `KernelFull`, `apply_landlock_scope` never runs at all. A content check
+    // buys one thing: changing a constant cannot happen by accident.
     //
     // The enforcement claim for this constant is verified only by the manual procedure in
     // `docs/content/reference/security-warnings.md` ("Manual acceptance procedure — the fixed
@@ -4992,11 +4984,9 @@ mod tests {
     // ---- `SECCOMP_SYSCALL_ALLOWLIST` -------------------------------------------------------
     //
     // Content checks — see the `CAPSULE_DEVICE_GRANTS` section above for what that is and is not
-    // worth. That these syscalls are actually denied is verified only by the hand-run
-    // escape-conformance harness (`crates/capsule-runtime/escape-conformance/`, cases
-    // `syscall-*`), on real bare-metal Linux hardware. What these tests do buy is that
-    // re-permitting one of the dangerous syscalls cannot happen by accident while reconciling the
-    // allowlist against a newer upstream profile.
+    // worth. These assert the allowlist's contents, not that the kernel denies anything. They buy
+    // one thing: re-permitting a dangerous syscall cannot happen by accident while reconciling
+    // the allowlist against a newer upstream profile.
 
     #[test]
     fn allowlist_contains_no_syscall_that_must_stay_denied() {
@@ -5557,16 +5547,10 @@ mod linux_integration_tests {
         supervisor.join_best_effort();
     }
 
-    // There is deliberately no `kernel_tier_denies_exec_outside_shell_allowlist` here any more.
-    // It used to run `bash -c 'id'` with only `bash` allowlisted and assert a nonzero exit, which
-    // the exec-notify supervisor produced on *every* Linux tier. Exec is a Landlock right now, so
-    // the same claim only holds on `KernelFull`/`KernelSealed` — and this repo's CI has never
-    // resolved to either, so the test would have run the weaker path and passed while proving
-    // nothing. The security property is deliberately not asserted in CI at all; it is
-    // verified by hand, on real Landlock-capable hardware, following
-    // `docs/content/reference/workdir-exec-landlock-manual-verification.md`. The two tests below
-    // remain because they assert the *opposite* direction — that allowlisted binaries still run —
-    // which a green run does legitimately evidence.
+    // Exec denial outside the allowlist is deliberately not asserted here. Exec is a Landlock
+    // right, so the claim holds only on `KernelFull`/`KernelSealed`; on any weaker tier such a
+    // test passes while exercising a path that enforces nothing. The two tests below assert the
+    // opposite direction — that allowlisted binaries still run — which any tier does evidence.
 
     #[test]
     fn kernel_tier_allows_exec_within_shell_allowlist() {
@@ -5842,11 +5826,10 @@ mod linux_integration_tests {
         );
     }
 
-    // NOTE: the two tests below exercise the derived Landlock grants. A green run on THIS repo's
-    // CI/dev machine is NOT evidence they work: CI has never actually resolved to `KernelFull`
-    // (it silently runs the `KernelSeccompOnly` path instead), and the dev machine is macOS. Both
-    // tests print an unmistakable skip line and return when the host is not `KernelFull`. Real
-    // acceptance is a manual run on a real Landlock-capable Linux host.
+    // The two tests below exercise the derived Landlock grants. A green run is not evidence they
+    // work: below `KernelFull` the weaker `KernelSeccompOnly` path runs instead, and on non-Linux
+    // no Landlock domain is installed at all. Both tests print a skip line and return when the
+    // host is not `KernelFull`.
 
     #[test]
     fn kernel_full_runs_nontrivial_shell_allowlist_but_a_pass_here_does_not_prove_the_landlock_fix()
@@ -5988,10 +5971,8 @@ mod linux_integration_tests {
         }
     }
 
-    // NOTE (as above): a green run on THIS repo's CI/dev machine proves nothing — CI has never
-    // resolved to `KernelFull` and the dev machine is macOS. Both tests print an unmistakable skip
-    // line and return when the host is not `KernelFull`. Real acceptance is a manual run on a real
-    // Landlock-capable Linux host.
+    // As above: a green run proves nothing below `KernelFull`. Both tests print a skip line and
+    // return when the host is not `KernelFull`.
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing() {

@@ -4,7 +4,7 @@
 //! Every `mur run` here is wrapped in an `assert_cmd` timeout well above the limit under
 //! test. That timeout is the regression guard: if the deadline or the limiter stops firing,
 //! these tests fail on the timeout instead of hanging the suite forever — which is exactly
-//! the failure mode this slice exists to remove.
+//! the failure mode epoch interruption exists to remove.
 
 use std::{fs, path::Path, path::PathBuf, time::Duration};
 
@@ -60,8 +60,8 @@ fn run_capsule(home: &Path, manifest_path: &Path) -> assert_cmd::assert::Assert 
 }
 
 /// The headline proof: a capsule spinning in a loop that never returns and never calls the
-/// host is interrupted at its deadline and `mur run` exits. Before this slice the engine
-/// had no epoch interruption and this command could not be made to terminate.
+/// host is interrupted at its deadline and `mur run` exits. Without epoch interruption this
+/// command could not be made to terminate.
 #[test]
 fn spin_loop_capsule_is_interrupted_at_its_configured_deadline() {
     let home = tempfile::tempdir().unwrap();

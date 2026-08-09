@@ -220,8 +220,8 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 ///
 /// A requested value above the inherited hard limit is **clamped down to it** rather than
 /// treated as an error: an unprivileged process cannot raise `rlim_max`, so the inherited value
-/// is the real ceiling either way, and failing the spawn would only replace a bound we cannot
-/// widen with no subprocess at all.
+/// is the real ceiling either way, and failing the spawn would replace an unwidenable bound with
+/// no subprocess at all.
 ///
 /// ## Why `max_processes` is headroom, not an absolute ceiling
 ///
@@ -229,10 +229,10 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 /// this tree — and on Linux the unit it counts is *threads*, not processes: `setrlimit(2)` calls
 /// it "the maximum number of processes (or, more precisely on Linux, threads) that can be created
 /// for the real user ID". On macOS, whose BSD-derived limit is genuinely per-process, it counts
-/// processes. Either way a desktop or workstation account is already deep into that number before
-/// the capsule starts (a developer workstation measured 134 processes but 923 threads), so a hard
-/// `RLIMIT_NPROC` of 128 does not bound the capsule at 128 — it makes the very first `fork()` in
-/// the subprocess fail with `EAGAIN`. That is a broken runtime, not a bound.
+/// processes. Either way an interactive account is already deep into that number before the
+/// capsule starts — and far deeper in threads than in processes — so a hard `RLIMIT_NPROC` of 128
+/// does not bound the capsule at 128; it makes the first `fork()` in the subprocess fail with
+/// `EAGAIN`. That is a broken runtime, not a bound.
 ///
 /// So `nproc_baseline` — the uid's live count *in that platform's own unit*, measured once in the
 /// parent at launch by [`uid_task_count`] — is added to the declared `max_processes`, making the
@@ -706,7 +706,7 @@ mod tests {
 
     /// `rlim_cur == rlim_max` is the whole point of this module's rlimit path: a soft-only cap
     /// can be raised back by the capsule itself. Asserted against the live process by lowering
-    /// a limit we can afford to lower (`RLIMIT_CORE`, which this runtime pins at zero anyway)
+    /// a safely lowerable limit (`RLIMIT_CORE`, which this runtime pins at zero anyway)
     /// and reading it back.
     #[cfg(unix)]
     #[test]
