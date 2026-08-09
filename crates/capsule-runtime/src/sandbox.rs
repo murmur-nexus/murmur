@@ -1868,11 +1868,9 @@ impl ShellEnforcement {
 /// `socket(2)` domains in `denied_socket_domains` — closing the `/var/run/docker.sock` path, which
 /// no Landlock ABI mediates for pathname sockets. The forked shell child also
 /// drops every Linux capability before `execve` (see `linux_enforce::drop_all_capabilities`).
-/// None of this has yet been verified by the team on real Landlock-capable Linux hardware (the
-/// manual acceptance check happens after this ships), so `KernelFull` still warns (`W_SEC_005`): a
-/// silent "full" tier would imply everything is confirmed-enforced, which is the false assurance
-/// to avoid until a real Linux run lands.
-const KERNEL_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this host \
+/// `KernelFull` warns (`W_SEC_005`) rather than staying silent: the tier is a filesystem and
+/// syscall scope, not a namespace, so what it does and does not cover has to reach the operator.
+const KERNEL_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this host \
 resolved to a Linux kernel-enforcement tier (Landlock/seccomp). Landlock now grants a narrow, \
 derived read+execute scope outside the workdir (the allowlisted binaries, their loader, and their \
 shared libraries — nothing writable, no directory granted wholesale), plus a fixed device set \
@@ -1886,26 +1884,20 @@ capsule cannot reach a host daemon socket such as /var/run/docker.sock; the secc
 defaults to deny and permits only a fixed syscall allowlist modelled on the OCI/Docker default \
 profile, so io_uring, bpf, userfaultfd, perf_event_open, ptrace and similar are refused outright; \
 and the forked shell child \
-drops every Linux capability and sets no_new_privs before execve — but this mechanism has not yet \
-been verified by the team on real Landlock-capable Linux hardware — treat shell-subprocess \
-isolation as not-yet-confirmed and do not rely on it as a hardened boundary until it is.";
+drops every Linux capability and sets no_new_privs before execve. Paths outside the workdir are \
+denied, not absent: stat, access and readlink on an ungranted path still succeed.";
 
-/// `KernelSealed`'s counterpart to [`KERNEL_UNVERIFIED_WARNING`], carrying the same `W_SEC_005`
-/// code for the same reason: the mechanism is real and installed, but the team has not yet run the
-/// manual acceptance procedure against it on real hardware, and a silent strongest tier would
-/// imply otherwise. It names what `sealed` adds over `scoped` so the warning is not merely a
-/// louder copy of the one below.
-const KERNEL_SEALED_UNVERIFIED_WARNING: &str = "capabilities.shell.allow is non-empty and this \
+/// `KernelSealed`'s counterpart to [`KERNEL_ENFORCEMENT_NOTICE`], carrying the same `W_SEC_005`
+/// code: a silent strongest tier would imply the boundary has no documented exceptions, and it
+/// has one. Names what `sealed` adds over `scoped` so the warning is not a louder copy of it.
+const KERNEL_SEALED_ENFORCEMENT_NOTICE: &str = "capabilities.shell.allow is non-empty and this \
 host resolved to the sealed kernel-enforcement tier: the subprocess tree runs in a private mount \
 namespace pivoted onto a composed root (host runtime bind-mounted read-only, the session workdir \
 the only writable path, a private /dev tmpfs carrying the OCI default device set), with Landlock \
 and seccomp still installed inside it as defence in depth. Paths outside that root are absent \
 rather than denied — with one documented exception: /proc is a bind of the host's, not a masked \
 private procfs, because mounting one unprivileged needs a PID namespace this tier does not create, \
-so host process metadata stays visible there exactly as it is under scoped. This mechanism has \
-been checked by hand on one host and not yet by the team on hardware of their own — see \
-docs/content/reference/sealed-containment-manual-verification.md — so treat the containment \
-boundary as not-yet-confirmed until that procedure has been run again independently.";
+so host process metadata stays visible there exactly as it is under scoped.";
 
 const SECCOMP_ONLY_WARNING: &str = "capabilities.shell.allow is non-empty and this Linux kernel \
 lacks Landlock (kernel <5.13) — filesystem access outside the capsule workdir is not \
@@ -1948,8 +1940,8 @@ pub(crate) fn tier_warning(
         return None;
     }
     match tier {
-        EnforcementTier::KernelSealed => Some((W_SEC_005, KERNEL_SEALED_UNVERIFIED_WARNING)),
-        EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING)),
+        EnforcementTier::KernelSealed => Some((W_SEC_005, KERNEL_SEALED_ENFORCEMENT_NOTICE)),
+        EnforcementTier::KernelFull => Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE)),
         EnforcementTier::KernelSeccompOnly => Some((W_SEC_002, SECCOMP_ONLY_WARNING)),
         EnforcementTier::EnvironmentOnly => Some((W_SEC_001, ENVIRONMENT_ONLY_WARNING)),
     }
@@ -3487,6 +3479,7 @@ mod linux_enforce {
                 })?;
         }
 
+
         for grant in &fds.grants {
             // Grant paths that failed to open in the parent were already dropped (shrink-not-fail),
             // so every fd reaching here is valid. A rule that still fails to add is a genuine
@@ -3579,6 +3572,7 @@ mod linux_enforce {
         } else {
             None
         };
+
 
         let mut grants = Vec::with_capacity(landlock_grants.len());
         for grant in landlock_grants {
@@ -5066,13 +5060,13 @@ mod tests {
     // ---- tier warnings (finding #3: assert behavior, not just "doesn't panic") ----
 
     #[test]
-    fn tier_warning_kernel_full_warns_enforcement_is_unverified() {
-        // The Linux "full" tier must NOT be silent — a silent tier implies enforcement is
-        // trustworthy, but the enforcement has never run on real Linux hardware. It warns when a shell
-        // is declared, and stays silent only when there is no subprocess to enforce anything on.
+    fn tier_warning_kernel_full_warns_when_a_shell_is_declared() {
+        // The Linux "full" tier must NOT be silent: it is a filesystem and syscall scope, not a
+        // namespace, and a silent tier would imply it has no documented limits. It warns when a
+        // shell is declared, and stays silent only when there is no subprocess to enforce on.
         assert_eq!(
             tier_warning(EnforcementTier::KernelFull, false),
-            Some((W_SEC_005, KERNEL_UNVERIFIED_WARNING))
+            Some((W_SEC_005, KERNEL_ENFORCEMENT_NOTICE))
         );
         assert_eq!(tier_warning(EnforcementTier::KernelFull, true), None);
     }
@@ -5156,17 +5150,18 @@ mod tests {
     }
 
     #[test]
-    fn warn_for_enforcement_tier_kernel_full_logs_unverified_when_shell_declared() {
+    fn warn_for_enforcement_tier_kernel_full_logs_scope_when_shell_declared() {
         let temp = tempfile::tempdir().unwrap();
         warn_for_enforcement_tier(EnforcementTier::KernelFull, temp.path(), &warning_test_policy());
         let log = bootstrap_log_contents(temp.path());
         assert!(
             log.contains(W_SEC_005),
-            "KernelFull must not be silent — it must warn its enforcement is not yet confirmed: {log}"
+            "KernelFull must not be silent — it must state what the tier does and does not cover: {log}"
         );
         assert!(
-            log.contains("not yet been verified"),
-            "must state the derived-grant mechanism is not yet team-verified on real hardware: {log}"
+            log.contains("denied, not absent"),
+            "must state the scope's documented limit: paths outside the workdir are denied, not \
+             absent: {log}"
         );
         assert!(
             log.contains("read+execute") && log.contains("outside the workdir"),
