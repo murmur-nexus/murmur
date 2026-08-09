@@ -1,6 +1,6 @@
 # Verification — sealed containment (mount namespace + `pivot_root`)
 
-!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake."
+!!! success "Status: **RUN — 2026-08-05, partial.** Steps 1–4 and 6 pass on a real host through a live capsule's shell tool; step 5 (container) was not run. Addenda: 2026-08-07, directory enumeration inside the composed root; 2026-08-08, reading its `/etc` allowlist and completing a verified TLS handshake; 2026-08-09, the first full-registry escape-conformance run at `--class sealed` against a *gated* suite (exit 0, 26 of 28 cases asserted and passing)."
 
     Steps 0–4 and 6 were executed on a bare Ubuntu host on 2026-08-05, driven through a real,
     live capsule session (`claude` as the inference driver, a real `bash` tool call), and every
@@ -17,8 +17,10 @@
     no earlier run recorded — `ls` on a path that *is* one of the composed root's bind-mounted
     runtime directories — and is recorded in the same section. A second targeted run on 2026-08-08
     did the same for the composed root's `/etc` allowlist, where the same mounted-but-denied defect
-    was breaking TLS certificate verification; it is the first entry under Recording the result and
-    carries a completed `pip install` over a verified HTTPS connection.
+    was breaking TLS certificate verification, and carries a completed `pip install` over a verified
+    HTTPS connection. The **first entry** under Recording the result is now the 2026-08-09 run: the
+    first time the escape-conformance suite's `sealed` column *graded* anything rather than recording
+    an intention, and therefore the first `sealed`-class result whose exit code is citable.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
@@ -661,6 +663,163 @@ If step 3a's output is identical under both classes, the probes are not measurin
 claims and the result must not be recorded as a pass.
 
 ## Recording the result
+
+### Run of 2026-08-09 — the first full-registry bare-metal `sealed` run against a *gated* escape-conformance suite (card `a495eacb`)
+
+Every earlier escape-conformance run on this page — including the `4875bc97` entry below — graded
+**nothing** at `sealed`. All 28 cases carried `Expectation::Documented(_)`, which
+`Expectation::gates()` returns `false` for, so the column was an intention that ran, was recorded in
+full, and could not fail. That is why the entry below could report "both exit `0`" while also
+reporting three cases changing verdict: no expectation was being compared against anything. This run
+is the one that turns the column into a gate. Its expectations are set from what this host actually
+did, so the exit code now means something for `sealed`.
+
+**Host.** Same machine as the 2026-08-05, 2026-08-07 and 2026-08-08 runs: `Linux 7.0.0-28-generic
+#28~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Jul 1 15:50:57 UTC 2 x86_64`, Ubuntu 24.04, bare metal
+(`/.dockerenv` absent, `/run/.containerenv` absent, `/proc/1/cgroup` → `0::/init.scope`), non-root
+`uid=1000`, `/proc/sys/user/max_user_namespaces` → `55249`,
+`kernel.apparmor_restrict_unprivileged_userns=0` so **no AppArmor profile was needed** and a
+`./target/release/mur` binary is covered (the profile attaches by executable path; with the
+restriction off there is nothing to attach). Delegated cgroup v2 through `systemd-run --user --scope
+--property=Delegate=yes`, which the harness applies per case by default. CPython 3.12.3.
+
+`mur run --explain-scope` against a `containment: sealed` capsule on this host:
+
+```text
+Containment
+  declared:  sealed
+  achieved:  sealed
+  floor met: yes
+  mechanism: mountns+pivot_root+landlock+seccomp
+```
+
+**Invocation and result.** `cd crates/capsule-runtime/escape-conformance && cargo build --release`,
+then `./target/release/escape-conformance --class sealed --record-dir <dir>`. **Exit code `0`.** The
+dated record's `## Summary`, verbatim:
+
+| category | asserted | passed | failed | recorded but not asserted |
+|---|---|---|---|---|
+| **boundary** (a failure here is an escape) | 21 | 21 | 0 | 2 |
+| **resource_exhaustion** (a failure here is denial of service, never an escape) | 5 | 5 | 0 | 0 |
+
+Twenty-six of the 28 cases print `PASS` rather than `recorded (not asserted at this class)`; the two
+that do not are `hardlink-escape` and `rename-across-boundary`, for a structural reason given below.
+
+**The promoted expectation table.** This is the `sealed` column as it now stands in
+`crates/capsule-runtime/escape-conformance/src/cases.rs`. Nothing in it is `Documented(_)` any more.
+
+| case | `sealed` expectation | actual on this run |
+|---|---|---|
+| `read-etc-shadow` | `Must(Refused)` | REFUSED (ENOENT — absent from the root) |
+| `write-outside-workdir` | `Must(Allowed)` | ALLOWED (`/tmp` is workdir-backed) |
+| `stat-outside-workdir` | `Must(Refused)` | REFUSED (ENOENT — no inode to stat) |
+| `symlink-escape` | `Must(Allowed)` | ALLOWED (`/etc/passwd` is allowlisted) |
+| `hardlink-escape` | `NotAsserted` | INCONCLUSIVE (EXDEV) |
+| `rename-across-boundary` | `NotAsserted` | INCONCLUSIVE (EXDEV) |
+| `proc-self-cwd-reopen` | `Must(Allowed)` | ALLOWED (reaches the *composed root's* `/etc/passwd`) |
+| `proc-pid-root-reopen` | `Must(Allowed)` | ALLOWED (the alias is the composed root, not the host `/`) |
+| `proc-self-fd-reopen` | `Must(Refused)` | REFUSED (EACCES on the O_RDWR upgrade) |
+| `inherited-fd-after-exec` | `Must(Refused)` | REFUSED (no fd above stdio) |
+| `mknod-block-device-in-workdir` | `Must(Refused)` | REFUSED (EACCES — Landlock, not CAP_MKNOD) |
+| `exec-renamed-disallowed-binary` | `Must(Refused)` | REFUSED (EACCES from execve) |
+| `connect-unlisted-tcp-host` | `Must(Refused)` | REFUSED (ECONNREFUSED — nothing listening) |
+| `udp-exfiltration` | `Must(Refused)` | REFUSED (delivery-confirmed local capture) |
+| `dns-exfiltration` | `Must(Refused)` | REFUSED (EAI_AGAIN from the in-namespace resolver) |
+| `abstract-unix-socket-connect` | `Must(Refused)` | REFUSED (EACCES at `socket(2)`) |
+| `pathname-unix-socket-connect` | `Must(Refused)` | REFUSED (EACCES at `socket(2)`) |
+| `syscall-io-uring-setup` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `syscall-userfaultfd` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `syscall-bpf` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `syscall-open-by-handle-at` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `syscall-perf-event-open` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `syscall-keyctl` | `Must(Refused)` | REFUSED (EPERM, seccomp) |
+| `resource-fork-bomb` | `Must(Contained)` | CONTAINED (EAGAIN at 31 children, `pids.max` 32) |
+| `resource-disk-filler-per-file` | `Must(Contained)` | CONTAINED (EFBIG at exactly 10 MiB) |
+| `resource-disk-filler-aggregate` | `Must(Contained)` | CONTAINED (second spawn refused, naming `workdir_max_bytes`) |
+| `resource-memory-hog` | `Must(Contained)` | CONTAINED (shell tool exit 137) |
+| `resource-fd-exhauster` | `Must(Contained)` | CONTAINED (EMFILE at 125 of 128) |
+
+Two of these — `syscall-userfaultfd` and `syscall-perf-event-open` — read their attribution sysctl
+as `unknown` at this class, because `/proc/sys` is not part of the composed root's `/proc`. They are
+asserted because the seccomp filter is identical on both kernel classes and `scoped` is where the
+sysctl is readable; the record's per-case attribution says so rather than implying an attribution
+this class cannot make.
+
+#### The four documented-versus-actual mismatches, and how each was resolved
+
+Each case's `attribution` field in `cases.rs` carries the full reasoning; this is the summary, not a
+second copy of it.
+
+- **`udp-exfiltration` — documented REFUSED, measured ALLOWED, resolved as REFUSED after a
+  receive-side check.** This was the one mismatch that read as a genuine weakening, and it was a
+  measurement artifact. Since `f163778e` the capsule runs in its own network namespace whose only
+  route is `local default dev lo`, which makes *every* destination address locally deliverable — so
+  `sendto` returning success proves the write succeeded, not that anything left the host. Worse, the
+  probe aimed at port 53, the one UDP port the runtime itself binds inside that namespace
+  (`network_namespace::bind_dns_socket`), so its datagram terminated in the runtime's own DNS
+  resolver: the most contained outcome available, scored as an escape. The probe now binds a UDP
+  receiver on `0.0.0.0:46053` **before** sending, in the same process and therefore the same
+  namespace, and grades on what that receiver observes. It observed the identical 35-byte payload,
+  with a source address of `1.1.1.1` — the destination itself, because the `local` route makes that
+  address local. `REFUSED` is the delivery-confirmed verdict, and the refusal is structural (no path
+  off the host) rather than an errno, which is what `DETAIL` now says. The port-53 send is still made
+  and reported as context, so the old ALLOWED reading and its cause appear on the same line.
+- **`proc-self-cwd-reopen` — documented ALLOWED (per the `4875bc97` entry below), measured REFUSED by
+  a later run, resolved as ALLOWED.** Neither written record was wrong about what it saw; the probe
+  was wrong. Its walk out of the workdir used a fixed six `..` components, so whether it reached the
+  filesystem root depended on how deep the harness's own `--work-root` happened to be. That was
+  reproduced deliberately on this host, same binary and same class: from `/tmp/ec1/w` the case
+  measured **ALLOWED**, and from a work root eleven components deep it measured **REFUSED** with
+  `ENOENT` on `<work-root-ancestor>/etc/passwd`. Path-depth arithmetic wearing a containment
+  verdict's clothes — and it had been passing at `scoped` for the same wrong reason. The `..` count is
+  now derived from the probe's own cwd depth (`..` at `/` resolves to `/`, so overshooting is free)
+  and `DETAIL` names the count and the resolved target. The mechanism behind the honest ALLOWED is
+  the one the entry below identified: the walk reaches the **composed root's** `/etc/passwd`, on
+  `SEALED_ETC_PATHS` and granted read since `fb1eea97`. Everything such a walk can arrive at is
+  bounded by what the composed root exposes, which is the property worth asserting. At `scoped` the
+  fixed probe now refuses with `EACCES` from Landlock instead of `ENOENT` from a truncated walk — a
+  strictly better assertion at that class too, verified on this host.
+- **`hardlink-escape` and `rename-across-boundary` — documented REFUSED, measured INCONCLUSIVE,
+  resolved as `NotAsserted`.** Both hit `EXDEV`, and `EXDEV` here is the mount layout speaking, not
+  containment. `sealed` composes its root out of six independent bind/mount operations
+  (`sealed::plan_composed_root`): staged runtime trees, the `/etc` allowlist, `/dev`, `/proc`, `/tmp`,
+  and last the workdir at its own absolute path. `link(2)`/`rename(2)` return `EXDEV` whenever source
+  and destination are on different mounts, whatever their sources' filesystems — which is why
+  `rename-across-boundary` fails even though `/tmp`'s bind source is
+  `workdir.join(SEALED_TMP_DIR_NAME)`, a subdirectory of the very same workdir. No destination
+  avoids it: every path reachable from the workdir is either another independent bind or the base
+  root the workdir bind sits on, because giving the workdir its own mount is the mechanism that makes
+  everything else read-only-or-absent, and a path with no bind at all answers `ENOENT` without
+  exercising a rename boundary either.
+
+    A control run isolates the cause, because "different filesystems" could otherwise be read as an
+    accident of where the harness's work root sat. `/space` on this host is `/dev/nvme0n1p7` while
+    `/`, `/etc` and `/tmp` are `/dev/nvme0n1p5`, so both cases were re-run with
+    `--work-root /tmp/…` — the *same block device* as their destinations. At `scoped` they then
+    refuse for real: `link(/etc/passwd)` → `EPERM(1)`, `rename(… -> /tmp/…)` → `EACCES(13)`. At
+    `sealed`, same work root, same device, they still report `EXDEV`. The device layout is therefore
+    not what causes it at `sealed`; the composed root's independent mounts are.
+
+    So these two are `Expectation::NotAsserted` at `sealed` — **not** for `advisory`'s reason (a
+    class with no mechanism) but because the *cases' own shape* cannot reach their premise at this
+    class. Both remain `Must(Refused)` at `scoped`, where there is one filesystem and Landlock is
+    genuinely consulted. A related consequence, recorded because it weakens an attribution rather
+    than a boundary: `protected_hardlinks` reads back as `unknown` at `sealed`, since `/proc/sys` is
+    not in the composed root.
+
+#### What this run did not change
+
+No enforcement mechanism. Nothing under `crates/capsule-runtime/src/` was touched — the diff is the
+harness's own data (`cases.rs`), two probe bodies, two stale explanatory paragraphs
+(`main.rs`'s `--list-cases` trailer and `record.rs`'s cross-class preamble, which still claimed
+`achieved_class_for_tier` had no `Sealed` arm) and this page. No case was added, removed or renamed:
+23 boundary + 5 resource-exhaustion, as before.
+
+**Not run.** Step 5 (the container refusal) remains unrun on this host for the same reason as every
+earlier entry — no container runtime installed. A root run remains unrun too, so
+`mknod-block-device-in-workdir`, `syscall-bpf` and `syscall-open-by-handle-at` keep the non-root
+caveats their attributions state; `mknod` did at least answer `EACCES` here, which is Landlock and
+not the missing capability.
 
 ### Run of 2026-08-08 — reading the composed root's `/etc` allowlist (`SEALED_ETC_PATHS`), and TLS
 

@@ -79,21 +79,26 @@ pub enum Expectation {
     NotAsserted,
     /// The class's intended verdict, recorded but **not graded**.
     ///
-    /// Only `sealed` uses this. The column was written while `achieved_class_for_tier` had no
-    /// `Sealed` arm at all — it was documentation for a mechanism that did not exist, and the
-    /// variant was called `Unreachable` because the class gate refused on every host before a
-    /// single case could run.
+    /// **No case in [`crate::cases::REGISTRY`] constructs this today, and that is the point of it.**
+    /// It is the state a containment class's column lives in between "the mechanism exists" and
+    /// "someone has run the suite against the real thing" — a claim written down, run on every
+    /// host, and trusted by nothing.
     ///
-    /// That is no longer true: the mount-namespace + `pivot_root` mechanism exists, and a host
-    /// with the shipped AppArmor profile and unprivileged user namespaces reaches
-    /// `EnforcementTier::KernelSealed`. What has *not* happened is anyone validating these
-    /// expectations against a real composed root — see
-    /// `docs/content/reference/sealed-containment-manual-verification.md`, still marked PENDING.
-    /// Grading a release on a column nobody has checked would be exactly the false assurance this
-    /// suite exists to prevent, so the verdicts run and are recorded in full and gate nothing.
+    /// `sealed` is the class that went through it. The column was written while
+    /// `achieved_class_for_tier` had no `Sealed` arm at all, so the variant was originally called
+    /// `Unreachable`: the class gate refused on every host before a single case could run. The
+    /// mechanism then landed, the gate started passing, and the expectations still had no
+    /// measurement behind them — which is the interesting state, because grading a release on a
+    /// column nobody has checked is exactly the false assurance this suite exists to prevent. On
+    /// 2026-08-09 a bare-metal `KernelSealed` run measured all 28 cases and the column was
+    /// promoted to [`Expectation::Must`] (with two [`Expectation::NotAsserted`] cases whose own
+    /// shape cannot reach their premise at that class); see
+    /// `docs/content/reference/sealed-containment-manual-verification.md` under "Recording the
+    /// result".
     ///
-    /// Promoting these to [`Expectation::Must`] is the follow-up, and it belongs to whoever runs
-    /// that manual procedure and can say what a real sealed host actually does.
+    /// Kept, not deleted, for the next class in that position — see `cases.rs`'s "Adding a fourth
+    /// containment class". Starting a new column at `Must` from reasoning about what the mechanism
+    /// ought to do would skip the step that found four of `sealed`'s own documented verdicts wrong.
     Documented(Verdict),
 }
 

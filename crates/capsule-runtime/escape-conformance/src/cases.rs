@@ -23,17 +23,35 @@
 //!   still run and are still recorded, but a class that provides no mechanism cannot be graded on
 //!   one. Cases that hold *without* any kernel mediation (metadata visibility, the per-process
 //!   `setrlimit` ceilings, the periodic workdir check) stay asserted at `advisory`.
-//! * **`sealed`** is reachable now — a Linux host with a usable Landlock ABI, unprivileged user
-//!   namespaces and the shipped `mur-sealed` AppArmor profile resolves to
-//!   `EnforcementTier::KernelSealed` — but its column is still [`Expectation::Documented`]: the
-//!   verdicts run and are recorded in full, and gate nothing, because nobody has yet validated
-//!   them against a real composed root. See that variant's doc comment, and
+//! * **`sealed`** is asserted. Its column was validated against a real composed root on
+//!   2026-08-09 — an uncontainerised `KernelSealed` host, kernel `7.0.0-28-generic`, uid 1000 —
+//!   and every value in it is now [`Expectation::Must`] of the verdict that run actually
+//!   produced, with two exceptions named below. Nothing in the column is
+//!   [`Expectation::Documented`] any more: that variant survives for the *next* containment class
+//!   that exists but has not been measured, not for this one. The run, the four
+//!   documented-versus-actual mismatches it resolved and the two probe fixes it needed are
+//!   recorded under "Recording the result" in
 //!   `docs/content/reference/sealed-containment-manual-verification.md`.
+//!
+//!   The two exceptions are `hardlink-escape` and `rename-across-boundary`, which are
+//!   [`Expectation::NotAsserted`] at `sealed` for a reason unlike `advisory`'s. `advisory` is
+//!   not-asserted because the *class* has no mechanism; these two are not-asserted because the
+//!   *cases' own shape* cannot reach their premise at this class — `sealed` composes its root out
+//!   of independent bind mounts, so `link(2)`/`rename(2)` hit `EXDEV` at the mount boundary before
+//!   Landlock is ever consulted, for every destination reachable from the workdir. See each case's
+//!   `attribution`.
+//!
+//! # Adding a fourth containment class
+//!
+//! Give it its own field and its own column, and start it at [`Expectation::Documented`] — record
+//! what the mechanism is meant to do, grade nothing, and promote the column only once someone has
+//! run the suite against the real thing and can say what it does. That is exactly the sequence
+//! `sealed` went through.
 
 use crate::verdict::{Category, Expectation, Verdict};
 use murmur_artifact::ContainmentClass;
 
-use Expectation::{Documented, Must, NotAsserted};
+use Expectation::{Must, NotAsserted};
 use Verdict::{Allowed, Contained, Refused, Succeeded};
 
 /// Work the harness performs on the host, before `mur run`, to set a case up.
@@ -173,10 +191,16 @@ pub const REGISTRY: &[Case] = &[
                       probe therefore also reads /etc/passwd — world-readable, outside the \
                       workdir, covered by no grant. /etc/passwd refused too ⇒ Landlock is \
                       genuinely mediating. /etc/passwd readable ⇒ the /etc/shadow refusal is \
-                      ordinary file permissions and proves nothing about containment.",
+                      ordinary file permissions and proves nothing about containment.\
+                      At `sealed` that control inverts and the ambiguity above stops applying: \
+                      /etc/passwd IS on `sealed::SEALED_ETC_PATHS` and is readable *by design*, \
+                      while the measured refusal for /etc/shadow is ENOENT and not EACCES — the \
+                      path is not on the allowlist, so it does not exist in the composed root at \
+                      all. Absence is the stronger property: there is no inode left for any grant \
+                      to be widened onto.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -209,10 +233,12 @@ def main():
                       bind mount of a directory inside the session workdir \
                       (`sealed::SEALED_TMP_DIR_NAME`), carrying the workdir's own Landlock \
                       rights (see 646b64ee) — the write lands at the path named in DETAIL, under \
-                      the workdir, not actually outside it.",
+                      the workdir, not actually outside it. Measured ALLOWED against a real \
+                      composed root, which is why it is asserted that way here rather than \
+                      merely predicted.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Allowed),
+        sealed: Must(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -239,10 +265,15 @@ def main():
                       that reported it as a failure would be asserting something false about the \
                       class it is certifying. It is asserted at `advisory` too, where nothing is \
                       mediated at all. Only `sealed` would change the answer, by putting the \
-                      path outside the capsule's mount namespace entirely.",
+                      path outside the capsule's mount namespace entirely. That is exactly what a \
+                      real composed root does, and the measured errno says so: `sealed` refuses \
+                      with ENOENT, not EACCES — /etc/shadow is not on `SEALED_ETC_PATHS`, so \
+                      there is no inode in the namespace for stat(2) to describe. A REFUSED at \
+                      `sealed` and a SUCCESS at `scoped` are therefore both correct, and the \
+                      difference is the mount namespace rather than a stronger Landlock ruleset.",
         advisory: Must(Succeeded),
         scoped: Must(Succeeded),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -268,10 +299,10 @@ def main():
                       succeed (MakeSym is granted on the workdir); only the read through it is \
                       the boundary. DETAIL reports the two steps separately so a create failure \
                       is never mistaken for a contained read.\
-                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED. The symlink resolves *inside* the composed root, so what it can reach is bounded by what the root exposes; that is the property being asserted, not the read succeeding.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Allowed),
+        sealed: Must(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -306,10 +337,32 @@ def main():
                       pass); EPERM may be the kernel's protected_hardlinks sysctl rather than \
                       Landlock; EACCES is Landlock. A hard link, unlike a symlink, would alias \
                       the inode itself and survive any later path check, which is why it is a \
-                      separate case.",
+                      separate case.\
+                      NOT ASSERTED AT `sealed`, and for a different reason than `advisory`'s. \
+                      `advisory` asserts nothing here because the *class* has no mechanism; this \
+                      case asserts nothing at `sealed` because the *case's own shape* cannot reach \
+                      its premise at that class. `sealed` composes its root out of independent \
+                      bind mounts — the workdir at its own absolute path, each \
+                      `SEALED_ETC_PATHS` entry, /dev, /proc and /tmp each its own mount (see the \
+                      six-step plan in `sealed::plan_composed_root`) — and link(2) returns EXDEV \
+                      whenever source and destination are on different mounts, whatever their \
+                      hosts' filesystems. The real run measured exactly that: EXDEV, which the \
+                      probe correctly reports as INCONCLUSIVE, before Landlock was consulted at \
+                      all. No destination avoids it: every path reachable from the workdir is \
+                      either another independent bind or the base root the workdir bind sits on, \
+                      because giving the workdir its own mount is the mechanism that makes \
+                      everything else read-only-or-absent. A control run rules out the obvious \
+                      alternative reading — that the harness's work root merely sat on a different \
+                      block device: re-run with the work root on the *same* device as /etc, this \
+                      case refuses for real at `scoped` (EPERM) and still reports EXDEV at \
+                      `sealed`. Asserting a verdict here would be asserting the mount layout, not \
+                      containment. A second consequence of the \
+                      same layout: /proc/sys is unreachable in the composed root, so \
+                      `protected_hardlinks` reads back as `unknown` and even the EPERM/EACCES \
+                      attribution above is unavailable at this class.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: NotAsserted,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -353,10 +406,27 @@ def main():
                       never have worked here regardless of containment — recorded as \
                       INCONCLUSIVE rather than credited as a refusal. Anything else is \
                       attributable: rename is a create-class action on the destination, which \
-                      Landlock does mediate.",
+                      Landlock does mediate.\
+                      NOT ASSERTED AT `sealed`, and for a different reason than `advisory`'s. \
+                      `advisory` asserts nothing because the *class* has no mechanism; this case \
+                      asserts nothing at `sealed` because the *case's own shape* cannot reach its \
+                      premise there. /tmp in the composed root is a bind whose source is \
+                      `workdir.join(SEALED_TMP_DIR_NAME)` — a subdirectory of this very workdir on \
+                      the host — yet the workdir bind and the /tmp bind are two different mounts \
+                      in the namespace, so rename(2) returns EXDEV even though both sides share \
+                      one host filesystem. The real run measured exactly that, and the probe \
+                      correctly reports INCONCLUSIVE. Landlock is never reached, and no other \
+                      destination changes that: /etc/*, /dev and the base root are each their own \
+                      mount too, and a path with no bind at all answers ENOENT rather than \
+                      exercising a rename boundary. A control run rules out the obvious \
+                      alternative reading — that the harness's work root merely sat on a different \
+                      block device: re-run with the work root on the *same* device as /tmp, this \
+                      case refuses for real at `scoped` (EACCES) and still reports EXDEV at \
+                      `sealed`. Encoding a `Must` here would grade the mount layout instead of \
+                      containment.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: NotAsserted,
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -394,10 +464,22 @@ def main():
                       are both reported in DETAIL as context — the same distinction \
                       subprocess-fd-hygiene-verification.md's 'Why not /proc/self/fd' section \
                       exists to make.\
-                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
+                      At `sealed` the measured verdict is ALLOWED, and that is the class working as declared rather than a crossing: the walk reaches the *composed root's* `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` — the curated allowlist the root bind-mounts read-only and (since slice fb1eea97) grants read on. Everything a walk out of the workdir can arrive at is bounded by what the composed root exposes, and `/etc/shadow` is not on that list and is absent from the root entirely (see `read-etc-shadow`, which stays REFUSED). \
+                      This case is one of the four documented/actual mismatches the 2026-08-09 \
+                      bare-metal run had to resolve, and the resolution is that the earlier \
+                      REFUSED reading was a defect in *this probe*, not a containment finding. The \
+                      walk used a fixed six `..` components, so whether it reached the filesystem \
+                      root at all depended on how deep the harness's own `--work-root` happened to \
+                      be: from a shallow work root the same case on the same host measured \
+                      ALLOWED, and from a deep one it measured REFUSED with ENOENT on a path like \
+                      `<work-root-ancestor>/etc/passwd` — path-depth arithmetic wearing a \
+                      containment verdict's clothes. The `..` count is now derived from the \
+                      probe's own cwd depth so the walk always lands on `/`, and DETAIL names the \
+                      count and the resolved target. ALLOWED is therefore the measured verdict of \
+                      the property this case actually claims to test.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Allowed),
+        sealed: Must(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -410,17 +492,29 @@ def main():
         reopen += " (re-opening the workdir through the magic symlink is expected: Landlock "
         reopen += "resolves it to the granted workdir, which is not a crossing)"
 
+    # The `..` count is derived, never fixed. A constant count is a silent dependency on how deep
+    # the harness's own work root happens to be: with too few components the walk stops inside an
+    # ancestor of the workdir, `etc/passwd` under it does not exist, and the ENOENT reads as a
+    # containment refusal when nothing was contained. `..` at `/` resolves to `/`, so overshooting
+    # is free -- one extra component past the cwd's own depth guarantees the walk lands on the root
+    # of this mount namespace no matter where the workdir sits.
+    hops = os.getcwd().count("/") + 1
+    target = "/proc/self/cwd/" + "../" * hops + "etc/passwd"
+
     # The boundary is here, not above: can the magic symlink be used as a base to reach a path
     # the ruleset does not grant?
-    escaped, esc_note = probe_open("/proc/self/cwd/../../../../../../etc/passwd")
+    escaped, esc_note = probe_open(target)
+    walk = "walked up %d components from %s, so the walk reached the root of this mount " \
+           "namespace rather than stopping inside an ancestor of the workdir" % (hops, os.getcwd())
     if escaped is not None:
         data = os.read(escaped, 32)
         os.close(escaped)
         verdict("ALLOWED", "walked out of the workdir through /proc/self/cwd and read %d bytes of "
-                           "/etc/passwd ; %s ; %s" % (len(data), reopen, control))
+                           "/etc/passwd via %s ; %s ; %s ; %s"
+                           % (len(data), target, walk, reopen, control))
         return
-    verdict("REFUSED", "the walk out of the workdir was refused: %s ; %s ; %s"
-                       % (esc_note, reopen, control))
+    verdict("REFUSED", "the walk out of the workdir was refused: %s ; %s ; %s ; %s"
+                       % (esc_note, walk, reopen, control))
 "#,
     },
     Case {
@@ -431,10 +525,10 @@ def main():
                       is the alias that would defeat a chroot-shaped boundary; against a Landlock \
                       ruleset it is only another path, and it is expected to be refused because \
                       /proc carries no grant.\
-                      At `sealed` the verdict is ALLOWED, and that is the class working as declared rather than a crossing: `/etc/passwd` is on `sealed::SEALED_ETC_PATHS`, the curated allowlist the composed root bind-mounts read-only and (since slice fb1eea97) grants read on, so `getpwuid(3)` resolves. `/etc/shadow` is not on that list and is absent from the root entirely — see `read-etc-shadow`, which stays REFUSED.",
+                      At `sealed` the measured verdict is ALLOWED, and the reason is worth stating precisely because it is easy to misread as the chroot-shaped escape this route is famous for. `/proc` in the composed root is a *fresh* proc mount made inside the capsule's own mount namespace (step 4 of `sealed::plan_composed_root`), so `/proc/<pid>/root` is an alias for the composed root — not for the host's `/`. What the read reaches is therefore the composed root's `/etc/passwd`, which is on `sealed::SEALED_ETC_PATHS` and is granted read since slice fb1eea97. The alias works and lands nowhere the class did not already expose; `/etc/shadow` is absent from the root entirely, so the same route cannot reach it (see `read-etc-shadow`). Note the /proc control still reports `proc_itself=denied`: ordinary /proc files carry no Landlock grant even here, which is why the reachable path is the magic alias and not /proc at large.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Allowed),
+        sealed: Must(Allowed),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -463,10 +557,17 @@ def main():
                       bases on /dev/urandom, which CAPSULE_DEVICE_GRANTS grants **read-only**: a \
                       successful O_RDWR re-open would convert a read-only device grant into a \
                       writable one, which is a real crossing. If /dev/urandom cannot be opened at \
-                      all the case is INCONCLUSIVE rather than passed.",
+                      all the case is INCONCLUSIVE rather than passed.\
+                      At `sealed` the base descriptor is still openable — /dev/urandom is one of \
+                      the OCI default device nodes the composed root bind-mounts into its private \
+                      /dev tmpfs — and the measured result is the same EACCES on the O_RDWR \
+                      re-open while the same-mode re-open succeeds. That pairing is the \
+                      attribution: the refusal is the mode *upgrade* being denied, not the path \
+                      having become unreachable, which is the only reading that makes this case \
+                      evidence about anything.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -505,10 +606,15 @@ def main():
                       nothing and is indistinguishable from a clean result. The harness runs \
                       `mur` from a shell that has already done `exec 7</etc/hostname`, exactly as \
                       that document's step 4 does, so a leak would be real rather than \
-                      hypothetical. Fds 0/1/2 are excluded by design and are not a leak.",
+                      hypothetical. Fds 0/1/2 are excluded by design and are not a leak.\
+                      At `sealed` the measured result is identical — no fd above stdio is open in \
+                      the sandboxed child — and the composed root contributes nothing to it: the \
+                      descriptor is closed before either the Landlock ruleset or the pivot exists. \
+                      The same verdict is asserted at both kernel classes precisely because the \
+                      mechanism is the same one.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::LeakFdIntoMur {
             fd: 7,
             path: "/etc/hostname",
@@ -552,10 +658,16 @@ def main():
                       the fix from the pre-fix state. Re-run as root to exercise the deployment \
                       shape that was actually exposed; security-warnings.md scenario 4 records \
                       the same caveat. This is the case the negative control flips: restore \
-                      MakeBlock to WORKDIR_ACCESS_RIGHTS, rebuild, and it must go ALLOWED.",
+                      MakeBlock to WORKDIR_ACCESS_RIGHTS, rebuild, and it must go ALLOWED.\
+                      At `sealed` the measured errno is EACCES, so on this class the non-root \
+                      caveat above did not decide the result: the refusal is attributable to the \
+                      Landlock workdir grant withholding MakeBlock, not to the missing CAP_MKNOD. \
+                      The caveat still stands as a caveat — a host whose kernel answers EPERM \
+                      first would leave the same verdict unattributable — which is why it is not \
+                      deleted here.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -599,10 +711,15 @@ def main():
                       kernel enforcement. A PermissionError from execve is the refusal; an ENOENT \
                       means the harness's own staging failed and is INCONCLUSIVE, never a pass. \
                       This is not a TOCTOU probe — it is single-threaded and does not race; the \
-                      exec/connect race class is separately audited and lives in racecheck/.",
+                      exec/connect race class is separately audited and lives in racecheck/.\
+                      At `sealed` the measured refusal is EACCES from execve, and two independent \
+                      things hold it: the exec allowlist resolves the copy to its real path before \
+                      comparing, and the workdir bind carries no execute right at all \
+                      (`capabilities.filesystem.workdir_exec` is false), so nothing staged into the \
+                      workdir is executable whatever it is called.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::CopyBinaryAs {
             // First readable wins. All three are outside `shell.allow`, so each is a disallowed
             // identity wearing an allowlisted basename once copied.
@@ -649,10 +766,19 @@ def main():
                       denial. A timeout or ENETUNREACH means the host itself has no route and \
                       the case proved nothing — INCONCLUSIVE, not a pass. Single-threaded and \
                       non-racing: the TOCTOU class documented in seccomp-notify-toctou-audit.md \
-                      is a different probe and is out of scope here.",
+                      is a different probe and is out of scope here.\
+                      The seccomp-notify supervisor named above was retired by slice f163778e, and \
+                      on both kernel classes the mechanism is now structural rather than a filter \
+                      that has to be consulted: the capsule runs in its own network namespace whose \
+                      only route is `local default dev lo`, and the runtime binds a TCP listener \
+                      only on the ports `capabilities.network.allow` implies. An unlisted port is \
+                      delivered locally to nothing. The errno measured at `sealed` is therefore \
+                      ECONNREFUSED — which is that refusal, not a host routing failure; a genuine \
+                      absence of route would present as the timeout or ENETUNREACH the probe \
+                      reports as INCONCLUSIVE.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -686,35 +812,112 @@ def main():
         category: Category::Boundary,
         summary: "sendto()s a UDP datagram to an unlisted host",
         attribution: "UDP is a separate case from TCP because it never calls connect(2): the \
-                      destination rides on sendto(2), which the supervisor mediates through a \
-                      different rule. sendto succeeding is exfiltration even though no \
-                      connection was ever established, and a datagram send cannot be refused \
-                      after the fact.",
+                      destination rides on sendto(2), and a datagram send cannot be refused after \
+                      the fact.\
+                      GRADED ON DELIVERY, NOT ON sendto's RETURN VALUE — and that distinction is \
+                      the whole of this case's resolution. Slice f163778e replaced the \
+                      seccomp-notify sendto rule with a network namespace whose single route is \
+                      `local default dev lo`, which makes *every* destination address locally \
+                      deliverable (`network_namespace`'s module doc, point 3). A sendto to any \
+                      address therefore returns success because the write succeeded, not because \
+                      anything left the host, and the previous version of this probe reported \
+                      ALLOWED on that return value alone. It also aimed at port 53, the one UDP \
+                      port the runtime *does* bind inside the namespace \
+                      (`network_namespace::bind_dns_socket`), so its datagram terminated in the \
+                      runtime's own DNS resolver — the most contained outcome available, scored as \
+                      an escape. \
+                      The probe now binds a receiver in the same network namespace, on the same \
+                      port, *before* sending, and grades on what that receiver sees. On the \
+                      2026-08-09 bare-metal run the payload arrived at it byte-for-byte, with a \
+                      source address of 1.1.1.1 — the destination itself, because the `local` route \
+                      makes that address local: the datagram was captured inside the capsule's own \
+                      namespace and never reached a wire. REFUSED is the measured verdict, matching the original \
+                      documented intent — but the refusal is structural (there is no path off the \
+                      host) rather than an errno, which is what DETAIL says. Had the receiver seen \
+                      nothing, that would have ruled out namespace-local capture and the case would \
+                      report ALLOWED with the ruling-out stated; a receiver that cannot be bound is \
+                      INCONCLUSIVE, never a pass, because then the two readings cannot be told \
+                      apart at all.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
         body: r#"
 def main():
+    # Deliberately not port 53. The runtime binds a wildcard UDP :53 resolver inside the capsule's
+    # network namespace, so a datagram sent there is swallowed by the runtime's own DNS half and
+    # this probe could never observe it -- and DNS as an exfiltration channel is `dns-exfiltration`,
+    # a separate case. This port is in no allowlist and nothing else binds it.
+    port = 46053
+    payload = b"murmur-escape-conformance-udp-%d" % os.getpid()
+
+    # Bound BEFORE the send, in this process, and therefore in the same network namespace the
+    # sendto will be issued from. This is the whole mechanism: it is what tells "captured locally,
+    # nothing left the host" apart from "genuinely reached the internet", which the return value of
+    # sendto(2) cannot distinguish under a namespace whose only route makes every address local.
+    rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        rx.bind(("0.0.0.0", port))
+    except OSError as exc:
+        rx.close()
+        verdict("INCONCLUSIVE", "could not bind the same-namespace receiver on 0.0.0.0:%d (%s), so "
+                                "a successful sendto could not be told apart from a real egress -- "
+                                "nothing was concluded about the boundary" % (port, en(exc)))
+        return
+    rx.settimeout(5)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(8)
     try:
-        sent = sock.sendto(b"murmur-escape-conformance", ("1.1.1.1", 53))
-    except OSError as exc:
-        if getattr(exc, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH):
-            verdict("INCONCLUSIVE", "sendto got %s -- the host has no route, nothing exercised"
-                                    % en(exc))
-        else:
-            verdict("REFUSED", "sendto(1.1.1.1:53) refused with %s" % en(exc))
-        return
-    finally:
         try:
-            sock.close()
-        except OSError:
-            pass
-    verdict("ALLOWED", "sent %d bytes by UDP to an unlisted host without any connect(2)" % sent)
+            sent = sock.sendto(payload, ("1.1.1.1", port))
+        except OSError as exc:
+            if getattr(exc, "errno", None) in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+                verdict("INCONCLUSIVE", "sendto(1.1.1.1:%d) got %s -- no route at all, so nothing "
+                                        "about the boundary was exercised" % (port, en(exc)))
+            else:
+                verdict("REFUSED", "sendto(1.1.1.1:%d) refused with %s before any datagram was "
+                                   "written" % (port, en(exc)))
+            return
+        # Context only, never the verdict: what the retired probe measured, reported alongside so a
+        # reader can see the old ALLOWED reading and its cause in the same line.
+        try:
+            dns = "sendto(1.1.1.1:53) also accepted %d bytes, which is the reading the previous " \
+                  "version of this probe scored as an escape: 53 is bound inside this namespace " \
+                  "by the runtime's own DNS resolver, so that datagram terminates there" \
+                  % sock.sendto(payload, ("1.1.1.1", 53))
+        except OSError as exc:
+            dns = "sendto(1.1.1.1:53)=%s" % en(exc)
+
+        try:
+            seen, src = rx.recvfrom(len(payload) + 64)
+        except (socket.timeout, OSError) as exc:
+            verdict("ALLOWED", "sendto accepted %d bytes to 1.1.1.1:%d and the receiver bound on "
+                               "0.0.0.0:%d in this same network namespace saw nothing within 5s "
+                               "(%s) -- namespace-local capture is ruled out, so the datagram went "
+                               "somewhere this probe cannot account for ; %s"
+                               % (sent, port, port, exc.__class__.__name__, dns))
+            return
+        if seen == payload:
+            verdict("REFUSED", "the datagram never left the host: sendto accepted %d bytes to "
+                               "1.1.1.1:%d and the identical payload arrived at a receiver bound "
+                               "on 0.0.0.0:%d in this same network namespace, from %s. The "
+                               "namespace's `local default dev lo` route delivered it locally, so "
+                               "sendto succeeding is a write that succeeded and not an egress -- "
+                               "the refusal is structural, not an errno ; %s"
+                               % (sent, port, port, src, dns))
+            return
+        verdict("INCONCLUSIVE", "the receiver on 0.0.0.0:%d saw %r from %s, which is not the "
+                                "payload that was sent -- that establishes neither local capture "
+                                "nor egress ; %s" % (port, seen[:32], src, dns))
+    finally:
+        for handle in (sock, rx):
+            try:
+                handle.close()
+            except OSError:
+                pass
 "#,
     },
     Case {
@@ -725,10 +928,19 @@ def main():
                       so a resolver reachable at all is an exfiltration route regardless of \
                       whether any answer comes back. NXDOMAIN therefore counts as ALLOWED — the \
                       query left the host. Only a refusal before the query leaves is containment. \
-                      EAI_* failures that are not refusals are reported verbatim in DETAIL.",
+                      EAI_* failures that are not refusals are reported verbatim in DETAIL.\
+                      At `sealed` the measured failure is EAI_AGAIN (`[Errno -3] Temporary failure \
+                      in name resolution`) and *not* EAI_NONAME, and the difference is the finding. \
+                      The lookup did reach a resolver — the wildcard UDP :53 socket \
+                      `network_namespace::bind_dns_socket` binds inside the capsule's own network \
+                      namespace — and that resolver is the runtime's, which answers a name outside \
+                      `capabilities.network.allow` with an rcode of REFUSED rather than forwarding \
+                      it. The query and any payload in its label terminated in the runtime \
+                      process. An NXDOMAIN would have meant the opposite (the label travelled), \
+                      which is why the probe scores that as ALLOWED.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -762,10 +974,14 @@ def main():
                       whose DETAIL says the refusal came from connect() rather than socket() \
                       would mean the mechanism is not the one W-SEC-005 describes, so the probe \
                       reports which call raised. Landlock cannot substitute: ABI v6's \
-                      LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET scopes abstract sockets only.",
+                      LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET scopes abstract sockets only.\
+                      At `sealed` the measured refusal is EACCES raised by socket(2) itself, which \
+                      is the mechanism W-SEC-005 describes and not a connect-time accident. The \
+                      composed root changes nothing here: a register-level domain filter runs \
+                      before any path exists to be mounted or not mounted.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -801,10 +1017,16 @@ def main():
                       reaching it needs no manifest declaration of any kind. Expected refusal is \
                       at socket() creation, before either path is tried, because \
                       capabilities.network.unix_sockets defaults to false. DETAIL names which \
-                      call refused and, if socket() succeeded, which of the two paths existed.",
+                      call refused and, if socket() succeeded, which of the two paths existed.\
+                      At `sealed` the measured refusal is EACCES at socket(2), before either path \
+                      is tried — the expected shape. Worth stating that the composed root would \
+                      also make both paths absent, since neither `/run` nor `/var/run` is on \
+                      `SEALED_ETC_PATHS` or in the runtime path set: at this class two independent \
+                      mechanisms close the same route, and the one that answered first is the \
+                      domain filter.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -842,10 +1064,15 @@ def main():
                       historically bypassed LSM path hooks, so leaving it reachable is a route \
                       around the Landlock filesystem boundary itself, not merely a wider syscall \
                       surface. Unambiguous on a non-root host — an ordinary uid may normally \
-                      create io_uring instances, so EPERM here is seccomp and nothing else.",
+                      create io_uring instances, so EPERM here is seccomp and nothing else.\
+                      Measured REFUSED with EPERM at `sealed`, and it is asserted there for the \
+                      same reason as at `scoped`: the seccomp filter is loaded on both kernel \
+                      classes, so this case's mechanism does not vary between them. That it is \
+                      *also* the entry that would route around the composed root's filesystem \
+                      boundary is why it is asserted at the stronger class rather than assumed.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -863,10 +1090,16 @@ def main():
         attribution: "Ambiguous if the host sets vm.unprivileged_userfaultfd=0, which also \
                       returns EPERM to a non-root caller. The probe reads that sysctl when it \
                       can and folds the value into DETAIL, so a reader can tell a seccomp \
-                      refusal from a host-policy one.",
+                      refusal from a host-policy one.\
+                      Measured REFUSED with EPERM at `sealed` — but note the attribution control \
+                      is *weaker* at this class, not stronger: /proc/sys is not part of the \
+                      composed root's /proc, so the sysctl reads back as `unknown` and the \
+                      host-policy reading cannot be excluded from inside the capsule. The verdict \
+                      is asserted because the seccomp filter is identical on both kernel classes \
+                      and `scoped`, where the sysctl is readable, is the run that attributes it.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -892,10 +1125,13 @@ def main():
         attribution: "Ambiguous on a non-root run: bpf(2) requires CAP_BPF or CAP_SYS_ADMIN for \
                       most commands and returns EPERM to an ordinary uid with no seccomp filter \
                       loaded at all. Re-run as root to attribute the refusal to the allowlist. \
-                      DETAIL records the euid so this is never read as more than it is.",
+                      DETAIL records the euid so this is never read as more than it is.\
+                      Measured REFUSED with EPERM at `sealed`, on a euid-1000 run, so the same \
+                      non-root caveat applies unchanged: the value is asserted because the filter \
+                      is the same on both kernel classes, not because this run attributed it.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -915,10 +1151,15 @@ def main():
                       CAP_DAC_READ_SEARCH and returns EPERM to an ordinary uid regardless of \
                       seccomp. It is in the table because with that capability it opens any \
                       inode by handle, ignoring every path-based check including Landlock's. \
-                      Root run required for an attributable result.",
+                      Root run required for an attributable result.\
+                      Measured REFUSED with EPERM at `sealed`, on a euid-1000 run, so the caveat \
+                      stands and the assertion rests on the filter being identical on both kernel \
+                      classes. Its place in the table matters more at this class than at `scoped`: \
+                      with CAP_DAC_READ_SEARCH it opens an inode by handle, ignoring the path — \
+                      and a composed root is a path-shaped boundary.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -938,10 +1179,14 @@ def main():
         attribution: "Partly ambiguous: kernel.perf_event_paranoid can make this EACCES or EPERM \
                       for an ordinary uid on its own. The probe reads that sysctl when it can. \
                       EFAULT would mean the call reached its implementation with the NULL attr \
-                      pointer, i.e. it was permitted.",
+                      pointer, i.e. it was permitted.\
+                      Measured REFUSED with EPERM at `sealed`, with the sysctl reading back as \
+                      `unknown` — /proc/sys is not in the composed root's /proc, so as with \
+                      `syscall-userfaultfd` the attribution control is unavailable at this class \
+                      and `scoped` is the run that supplies it.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -966,10 +1211,14 @@ def main():
                       against its own session keyring, so EPERM here is the seccomp default \
                       action. add_key(2) sits beside it in SECCOMP_MUST_STAY_DENIED and shares \
                       this case's mechanism; the roadmap's minimum set names keyctl, so keyctl is \
-                      what is asserted.",
+                      what is asserted.\
+                      Measured REFUSED with EPERM at `sealed`, and unambiguous there for the same \
+                      reason it is at `scoped`: nothing about the composed root would refuse a \
+                      call against the caller's own session keyring, so the seccomp default action \
+                      is the only remaining explanation.",
         advisory: NotAsserted,
         scoped: Must(Refused),
-        sealed: Documented(Refused),
+        sealed: Must(Refused),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::Boundary,
@@ -992,10 +1241,15 @@ def main():
                       must say cgroup_pids_max, not max_processes — RLIMIT_NPROC is a per-uid \
                       ceiling that a tree of short-lived processes evades in practice and that \
                       kills nothing, so it must never be reported as a kill cause. Lifted from \
-                      resource-limits-manual-verification.md scenario 2.",
+                      resource-limits-manual-verification.md scenario 2.\
+                      Measured CONTAINED at `sealed`: fork was refused with EAGAIN after 31 live \
+                      children against a declared cgroup_pids_max of 32, with RLIMIT_NPROC at 1334 \
+                      — ample headroom, so the per-uid ceiling cannot be what refused it and the \
+                      cgroup is. The composed root neither helps nor hinders here; the ceiling is \
+                      the delegated cgroup v2 subtree, which is the same on both kernel classes.",
         advisory: NotAsserted,
         scoped: Must(Contained),
-        sealed: Documented(Contained),
+        sealed: Must(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1061,10 +1315,14 @@ def main():
                       rlimit-triggered signals that map to exactly one cause, which is why this \
                       attribution is safe to assert. Asserted at `advisory` as well as `scoped`: \
                       setrlimit(2) is applied on every Unix platform and owes nothing to \
-                      Landlock or seccomp. Lifted from scenario 5.",
+                      Landlock or seccomp. Lifted from scenario 5.\
+                      Measured CONTAINED at `sealed`: EFBIG at exactly 10485760 bytes, the \
+                      declared 10 MiB max_file_size_bytes, so the ceiling bit on the byte rather \
+                      than approximately. Asserted at all three classes for the same reason — \
+                      setrlimit owes nothing to any of them.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Documented(Contained),
+        sealed: Must(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1108,10 +1366,17 @@ def main():
                       mechanism is narrower than that wording — `WorkdirGuard` latches a breach \
                       and `ShellEnforcement::check_workdir_budget` refuses the next spawn, so a \
                       single-tool-call case observes nothing at all. Asserted at `advisory` too: \
-                      the watcher is platform-independent. Lifted from scenario 6.",
+                      the watcher is platform-independent. Lifted from scenario 6.\
+                      Measured CONTAINED at `sealed`: the probe itself reported UNCONTAINED after \
+                      writing about 1080 MiB, and the *second* spawn was then refused naming \
+                      `workdir_max_bytes` (471864427 bytes past the 52428800 ceiling) — which is \
+                      precisely why this case is graded on that second call and not on the probe's \
+                      own line. Note the overshoot is large because the composed root's /tmp is \
+                      backed by the same workdir tree, so a 10s poll interval covers a lot of \
+                      writing; a breach caught late is still contained.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Documented(Contained),
+        sealed: Must(Contained),
         prepare: Prepare::None,
         evidence: Evidence::SecondSpawnRefused("workdir_max_bytes"),
         profile: Profile::TightResources,
@@ -1163,10 +1428,14 @@ def main():
                       trace.jsonl, but the process-transport bridge this harness drives writes no \
                       shell event, so that field is absent here no matter what the kernel did \
                       (see `trace_resource_limit` in runner.rs). 137 is 128 + SIGKILL, which on \
-                      this path is the OOM kill. Lifted from scenario 3.",
+                      this path is the OOM kill. Lifted from scenario 3.\
+                      Measured CONTAINED at `sealed`: the shell tool exited 137 with no probe file \
+                      written at all, which is the shape a real SIGKILL leaves and the reason this \
+                      case is graded on the exit code. A probe that had lived to report would have \
+                      been evidence the ceiling did not bite.",
         advisory: NotAsserted,
         scoped: Must(Contained),
-        sealed: Documented(Contained),
+        sealed: Must(Contained),
         prepare: Prepare::None,
         // Graded on the exit code, not a probe file: a cgroup OOM kill is a SIGKILL, so a probe
         // that lived to write a verdict would be evidence the ceiling did *not* bite. 137 is
@@ -1209,10 +1478,16 @@ def main():
                       from that document's 16 to 128: see the comment on the tight resources block \
                       in runner.rs, where 16 is shown to make every spawn fail outright rather \
                       than bound anything, and where 64 is shown to have stopped being enough \
-                      once slice fb1eea97 added the `SEALED_ETC_PATHS` grant fds.",
+                      once slice fb1eea97 added the `SEALED_ETC_PATHS` grant fds.\
+                      Measured CONTAINED at `sealed`: EMFILE after 125 descriptors against a \
+                      declared max_open_files of 128, read back from the child's own \
+                      RLIMIT_NOFILE. Both halves of the grading held — at or under the declared \
+                      ceiling, and that ceiling far below the 1024 default — and the small gap \
+                      between 125 and 128 is the composed root's own grant fds, which is exactly \
+                      the effect that forced the ceiling from 64 to 128.",
         advisory: Must(Contained),
         scoped: Must(Contained),
-        sealed: Documented(Contained),
+        sealed: Must(Contained),
         prepare: Prepare::None,
         evidence: Evidence::ProbeFile,
         profile: Profile::TightResources,
@@ -1324,17 +1599,54 @@ mod tests {
         }
     }
 
-    /// The `sealed` column records an intended verdict but grades nothing, because no one has
-    /// validated these expectations against a real composed root yet. Every case must say so
-    /// rather than gate a release on an unchecked claim — promoting the column is a deliberate
-    /// edit, not something a new case should be able to do by accident.
+    /// Case ids whose `sealed` expectation is [`Expectation::NotAsserted`] because the *case's own
+    /// shape* cannot reach its premise at that class — not because the class lacks a mechanism.
+    ///
+    /// Both are `EXDEV`: `sealed` composes its root out of independent bind mounts, so `link(2)`
+    /// and `rename(2)` fail at the mount boundary before Landlock is consulted, for every
+    /// destination reachable from the workdir. See each case's `attribution`.
+    const SEALED_NOT_ASSERTED: &[&str] = &["hardlink-escape", "rename-across-boundary"];
+
+    /// Replaces `sealed_expectations_are_recorded_but_not_graded`, which asserted the pre-promotion
+    /// invariant (every `sealed` expectation is [`Expectation::Documented`], i.e. recorded and
+    /// gating nothing). The column was validated against a real composed root on 2026-08-09 and is
+    /// now graded, so the invariant worth pinning is the inverse: nothing may slip *back* to
+    /// `Documented`, and the only cases allowed to assert nothing at `sealed` are the two named
+    /// above. A new case that quietly arrived as `Documented` — or a quiet demotion of an existing
+    /// one — would put an unchecked claim, or a hole, into a column a release now gates on, which
+    /// is the failure this file's "There is no disable mechanism" module doc exists to prevent.
     #[test]
-    fn sealed_expectations_are_recorded_but_not_graded() {
+    fn sealed_expectations_are_graded_except_for_the_two_structural_exdev_cases() {
         for case in REGISTRY {
+            match case.sealed {
+                Expectation::Documented(_) => panic!(
+                    "{}: the sealed column is graded now — an expectation must be Must(_) for the \
+                     verdict a real composed root produced, or NotAsserted with an attribution \
+                     saying why the case cannot reach its premise at this class",
+                    case.id
+                ),
+                NotAsserted => assert!(
+                    SEALED_NOT_ASSERTED.contains(&case.id),
+                    "{}: only {SEALED_NOT_ASSERTED:?} may assert nothing at sealed. Add this case \
+                     to SEALED_NOT_ASSERTED, with the structural reason in its attribution, or \
+                     promote it to Must(_) from a real measurement",
+                    case.id
+                ),
+                Must(_) => {}
+            }
+        }
+        // The other direction, so the exemption list cannot outlive the cases it names.
+        for id in SEALED_NOT_ASSERTED {
+            let case = find(id).unwrap_or_else(|| panic!("{id} is not in the registry"));
+            assert_eq!(
+                case.sealed,
+                NotAsserted,
+                "{id} is listed as structurally not-assertable at sealed but now asserts \
+                 something — remove it from SEALED_NOT_ASSERTED if a real run can reach its premise"
+            );
             assert!(
-                matches!(case.sealed, Documented(_)),
-                "{}: sealed expectations are recorded, not graded — see Expectation::Documented",
-                case.id
+                case.attribution.contains("EXDEV"),
+                "{id}: a case that asserts nothing at sealed must say why in its attribution"
             );
         }
     }
