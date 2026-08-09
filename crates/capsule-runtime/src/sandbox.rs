@@ -5513,8 +5513,8 @@ mod linux_integration_tests {
     /// The `workdir_exec` bit, pinned in both directions. A *content* check on the right set
     /// only: it proves nothing about whether a kernel refuses an exec, which is the manual
     /// procedure in
-    /// `docs/content/reference/workdir-exec-landlock-manual-verification.md`. What it does buy is
-    /// that flipping the default back — the exact regression that would silently reopen the
+    /// `docs/content/reference/workdir-exec-landlock-manual-verification.md`. It catches the one
+    /// regression that matters here: flipping the default back — which would silently reopen the
     /// rename-to-an-allowlisted-basename bypass — cannot happen without this test failing.
     #[test]
     fn workdir_execute_right_is_granted_only_when_workdir_exec_is_declared() {
@@ -5546,8 +5546,9 @@ mod linux_integration_tests {
     /// It proves **nothing** about whether the kernel then honors the rule built from that fd; that
     /// is the hand-run procedure in
     /// `docs/content/reference/sealed-containment-manual-verification.md` (step "3d — writability").
-    /// What it does buy is that the fd is there to build a rule from at all, and that the directory
-    /// backing it exists before `build_sealed_root` — which runs *after* this function — binds it.
+    /// It catches two things: that the fd is there to build a rule from at all, and that the
+    /// directory backing it exists before `build_sealed_root` — which runs *after* this function —
+    /// binds it.
     #[test]
     fn the_workdir_backed_tmp_store_is_opened_for_landlock_on_the_sealed_tier_only() {
         let sealed_workdir = tempfile::tempdir().unwrap();
@@ -5604,9 +5605,9 @@ mod linux_integration_tests {
     /// real `tempfile::tempdir()` workdir.
     ///
     /// Like the `/tmp` test above it proves nothing about kernel enforcement — that is the hand-run
-    /// in `docs/content/reference/sealed-containment-manual-verification.md`. What it does buy is
-    /// that the files exist before `build_sealed_root` binds them, that there is an fd to build
-    /// each rule from (without one, Landlock matches the *host's* `/etc/passwd` inode and the
+    /// in `docs/content/reference/sealed-containment-manual-verification.md`. It catches three
+    /// things: that the files exist before `build_sealed_root` binds them, that there is an fd to
+    /// build each rule from (without one, Landlock matches the *host's* `/etc/passwd` inode and the
     /// bound synthetic file is mounted-but-`EACCES`), and that neither is created on a tier that
     /// composes no root.
     #[test]
