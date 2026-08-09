@@ -17,8 +17,9 @@
 //! `execve` was denied for a non-root user until the child re-enabled its own flag. The
 //! asymmetry is the point: this process may hold raw, unfiltered secrets in its environment, while
 //! the child's environment is already reduced to `shell::DEFAULT_ENV_BASELINE` plus explicit
-//! overrides by `shell::build_shell_env` before it is spawned. The resulting exposure is stated
-//! in `docs/content/reference/security-warnings.md`.
+//! overrides by `shell::build_shell_env` before it is spawned. The resulting exposure, and the
+//! hand-run check for it, are in
+//! `docs/content/reference/workdir-device-node-manual-verification.md`.
 
 /// Marks the current process non-dumpable so no same-UID process — including its own
 /// shell descendants — can read this process's `/proc/<pid>/environ`.

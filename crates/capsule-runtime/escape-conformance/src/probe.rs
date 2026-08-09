@@ -8,7 +8,7 @@
 //! their loader and library closure — so a probe written as a shell pipeline of `cat`, `dd`,
 //! `stat`, `ln` and `mknod` would not be measuring the boundary, it would be failing to start.
 //! Every case therefore runs as a single `python3` invocation, which is the same choice
-//! `security-warnings.md`'s existing AF_UNIX acceptance procedure already makes for the same
+//! `af-unix-sockets-manual-verification.md`'s acceptance procedure already makes for the same
 //! reason.
 //!
 //! # Why the verdict comes from a file and not from stdout

@@ -13,7 +13,7 @@ exclude_docs: |
   # Hand-run acceptance procedures addressed to the team, not to users. They stay in
   # the repo at these paths (code comments cite them by path) but are not published.
   # reference/verification.md is the published landing page that links to them on GitHub.
-  # Note: links *inside* these eight are no longer checked by `mkdocs build --strict`.
+  # Note: links *inside* these are no longer checked by `mkdocs build --strict`.
   reference/sealed-containment-manual-verification.md
   reference/resource-limits-manual-verification.md
   reference/seccomp-notify-toctou-audit.md
@@ -22,6 +22,9 @@ exclude_docs: |
   reference/network-namespace-egress-proxy-manual-verification.md
   reference/workdir-exec-landlock-manual-verification.md
   reference/shell-binary-reachability-manual-verification.md
+  reference/workdir-device-node-manual-verification.md
+  reference/af-unix-sockets-manual-verification.md
+  reference/capsule-device-set-manual-verification.md
 
 theme:
   name: material

@@ -1050,8 +1050,7 @@ pub(crate) struct CapsuleDeviceGrant {
 ///
 /// Widening this list is allowed but must be evidence-driven: add a fourth entry only after a real
 /// workload has been observed failing on the missing device, and record that failure in the same
-/// place this list is documented (`docs/content/reference/security-warnings.md`, "Manual acceptance
-/// procedure — the fixed capsule device set").
+/// place this list is documented (`docs/content/reference/capsule-device-set-manual-verification.md`).
 ///
 /// **Future shape.** Enumerating devices path by path is the `scoped`-containment-class answer.
 /// Once a `sealed` class exists, the capsule gets a private `/dev` tmpfs carrying the OCI default
@@ -2784,9 +2783,9 @@ mod linux_enforce {
     ///     filesystem object with a kernel-side identity beyond a regular file), but unlike the
     ///     two device rights this one is a genuine open question: some build tooling and some
     ///     language-toolchain daemons `bind()` a unix socket in their working tree, and a fix
-    ///     that breaks those is not a fix. The manual acceptance procedure on the
-    ///     security-warnings reference page ("Manual acceptance procedure — workdir device-node
-    ///     escape") carries an explicit unix-socket scenario for exactly this; if the team's
+    ///     that breaks those is not a fix. The manual acceptance procedure in
+    ///     `docs/content/reference/workdir-device-node-manual-verification.md` carries an
+    ///     explicit unix-socket scenario for exactly this; if the team's
     ///     real-hardware run finds a workload that needs it, add `MakeSock` back to this list.
     ///
     /// `MakeFifo` stays granted: real build tooling does create named pipes in its working tree,
@@ -4910,8 +4909,8 @@ mod tests {
     // buys one thing: changing a constant cannot happen by accident.
     //
     // The enforcement claim for this constant is verified only by the manual procedure in
-    // `docs/content/reference/security-warnings.md` ("Manual acceptance procedure — the fixed
-    // capsule device set"), on real, uncontainerized Linux hardware.
+    // `docs/content/reference/capsule-device-set-manual-verification.md`, on real,
+    // uncontainerized Linux hardware.
 
     #[test]
     fn capsule_device_grants_are_exactly_three_devices_with_only_dev_null_writable() {
@@ -4977,8 +4976,8 @@ mod tests {
     //
     // Content checks — see the `CAPSULE_DEVICE_GRANTS` section above for what that is and is not
     // worth. That `socket(AF_UNIX, ...)` is actually denied on a real host is verified only by the
-    // manual procedure in `docs/content/reference/security-warnings.md` ("Manual acceptance
-    // procedure — unmediated AF_UNIX sockets"), on real Linux hardware.
+    // manual procedure in `docs/content/reference/af-unix-sockets-manual-verification.md`, on
+    // real Linux hardware.
 
     #[test]
     fn denied_socket_domains_denies_unix_by_default() {
@@ -5469,7 +5468,8 @@ mod linux_integration_tests {
     /// re-adding device-node creation becomes a test failure instead of a silent regression.
     ///
     /// It proves **nothing** about whether the kernel enforces that set — that is the manual
-    /// acceptance procedure on `docs/content/reference/security-warnings.md`, not this test.
+    /// acceptance procedure in
+    /// `docs/content/reference/workdir-device-node-manual-verification.md`, not this test.
     /// It lives in this `#[cfg(target_os = "linux")]` module rather than the cross-platform
     /// `tests` module only because `landlock::AccessFs` is a Linux-only dependency.
     #[test]

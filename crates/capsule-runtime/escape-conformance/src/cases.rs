@@ -656,7 +656,8 @@ def main():
                       (WORKDIR_ACCESS_RIGHTS). EPERM is the missing CAP_MKNOD — which an \
                       ordinary uid never had, so on a non-root run this case cannot distinguish \
                       the fix from the pre-fix state. Re-run as root to exercise the deployment \
-                      shape that was actually exposed; security-warnings.md scenario 4 records \
+                      shape that was actually exposed; scenario 4 of \
+                      workdir-device-node-manual-verification.md records \
                       the same caveat. This is the case the negative control flips: restore \
                       MakeBlock to WORKDIR_ACCESS_RIGHTS, rebuild, and it must go ALLOWED.\
                       At `sealed` the measured errno is EACCES, so on this class the non-root \

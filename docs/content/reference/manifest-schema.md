@@ -339,7 +339,7 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `capabilities.network.allow` | list<string> | no | host/URL allow entries. Governs IP destinations only — it has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately |
+| `capabilities.network.allow` | list<string> | no | host/URL allow entries. Governs **IP destinations only — TCP and UDP alike**, decided by destination address and port at `connect(2)`/`sendto(2)`. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent `allow` therefore means no TCP or UDP destination is reachable, not that the capsule has no way to communicate |
 | `capabilities.network.unix_sockets` | bool | no | defaults to **`false`**. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`, enforced by seccomp on both Linux tiers. Set `true` only if a shell tool genuinely needs a local daemon socket — it is a coarse, capsule-wide grant, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. `AF_NETLINK` and `AF_PACKET` are always refused and have no equivalent key. No effect on non-Linux hosts, which have no kernel enforcement at all — see [`W-SEC-001`](security-warnings.md#w-sec-001) |
 | `capabilities.filesystem.scope` | string | no | relative scope under workdir |
 | `capabilities.filesystem.workdir_exec` | bool | no | defaults to **`false`**. When false, the session workdir's Landlock rule withholds the `Execute` right, so nothing the capsule writes there can be executed — under any name, including one that appears in `capabilities.shell.allow`. That withholding is what makes `shell.allow` a complete, kernel-enforced statement rather than a name-matching convention. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](security-warnings.md#w-sec-011) at staging. See [Executable workdirs](#field-workdir-exec) below. No effect on non-Linux hosts or on Linux without a usable Landlock ABI, neither of which mediates exec at all — see [`W-SEC-001`](security-warnings.md#w-sec-001) and [`W-SEC-002`](security-warnings.md#w-sec-002) |
@@ -646,7 +646,7 @@ error[E-CAP-003]: declared containment class 'sealed' is not achievable on this 
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 ```
 
-Inside a container without `CAP_SYS_ADMIN` — the case a CI or SWE-bench-style harness hits — the
+Inside a container without `CAP_SYS_ADMIN` — the case a CI or containerised test harness hits — the
 same declaration refuses with a different remediation, and never falls back to `scoped`:
 
 ```text
