@@ -309,13 +309,118 @@ pub const SEALED_RUNTIME_PATHS: &[&str] = &[
 /// launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedEtcPath {
-    /// Absolute host path, bind-mounted read-only at the same path inside the composed root.
+    /// Absolute path inside the composed root. Also the host path bind-mounted there, except for
+    /// an entry carrying [`Self::synthetic`], whose content the parent writes itself.
     pub path: &'static str,
     /// Whether this path is a directory on a mainstream Linux host, and therefore whether its
     /// Landlock rule carries `ReadDir`. `false` for regular files and for symlinks (the symlink is
     /// followed when the rule's fd is opened, so `/etc/localtime`'s rule lands on the zoneinfo file
     /// it points at).
     pub directory: bool,
+    /// `Some` when [`Self::path`] is backed by a file the *parent* synthesises rather than by the
+    /// host's own file at that path — the account databases, and nothing else.
+    ///
+    /// Carried on the entry for the same reason as `directory`: the alternative is a second
+    /// parallel list of "the ones we do not mirror", which is free to drift out of step with this
+    /// one. Typed rather than a `bool` so the content each synthetic entry gets is decided by an
+    /// exhaustive `match` — adding a third one is then a compile error until it is given content,
+    /// instead of a launch-time failure to bind a file nobody wrote.
+    pub synthetic: Option<SyntheticEtcFile>,
+}
+
+/// An `/etc` file a composed root gets in synthesised form instead of the host's.
+///
+/// Both are account databases, and both are world-readable on every distribution — so binding the
+/// host's copy hands the capsule the machine's full account list for no benefit. What a capsule
+/// actually needs from them is that `getpwuid(3)`/`getgrgid(3)` resolve *its own* id: a shell's `~`
+/// expansion, `os.path.expanduser`, `whoami`, and anything reading `$HOME` through the password
+/// database. Two entries — `root` and the id the capsule runs as — satisfy all of that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticEtcFile {
+    /// `/etc/passwd`, in the seven colon-separated fields of `passwd(5)`.
+    Passwd,
+    /// `/etc/group`, in the four colon-separated fields of `group(5)`.
+    Group,
+}
+
+/// The uid/gid a capsule's subprocesses run as, and the `HOME` they are given.
+///
+/// Read off the session workdir the parent created rather than from `getuid(2)`: this crate is
+/// `#![deny(unsafe_code)]` and the workdir's owner *is* the spawning process's identity, so
+/// `std::fs::metadata(workdir).uid()` answers the question in safe std — the same pattern
+/// `crate::resources` already uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapsuleIdentity<'a> {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    /// The synthetic `HOME`, exactly as `crate::shell::build_shell_env` sets it in the subprocess
+    /// environment. Byte-identical or the whole exercise is pointless: a `pw_dir` that disagrees
+    /// with `$HOME` is worse than no entry at all, because tools silently pick one of the two.
+    pub(crate) home: &'a str,
+}
+
+/// Login shell recorded for both synthetic accounts. Present in the composed root
+/// (`/bin` is on [`SEALED_RUNTIME_PATHS`]) and *not* thereby made runnable — the exec allowlist is
+/// Landlock's, and a shell field is a string in a database, not a grant.
+const SYNTHETIC_LOGIN_SHELL: &str = "/bin/sh";
+
+/// Account and group name for the capsule's own entry. Deliberately not the host's login name:
+/// that name is itself part of the account list this file exists to stop leaking.
+const SYNTHETIC_ACCOUNT_NAME: &str = "capsule";
+
+impl SyntheticEtcFile {
+    /// File name under [`SEALED_ETC_STAGING_DIR_NAME`]. The basename of the target path, so the
+    /// staging directory reads like the `/etc` it stands in for.
+    pub(crate) fn file_name(self) -> &'static str {
+        match self {
+            Self::Passwd => "passwd",
+            Self::Group => "group",
+        }
+    }
+
+    /// The exact bytes written to the staging file, for one capsule identity.
+    ///
+    /// At most two lines: `root`, plus the capsule's own id when that is not already 0. A capsule
+    /// running as root gets **one** line — the `root` line, with `$HOME` as its home directory —
+    /// rather than a duplicate entry for uid 0, which `getpwuid(3)` would resolve to whichever came
+    /// first.
+    ///
+    /// Fails rather than emits a corrupt database when the home path contains a field separator or
+    /// a newline: `passwd(5)` has no escaping, so a workdir named with a `:` would silently shift
+    /// every field after it. Parent-side and synchronous, so it surfaces as a named launch failure.
+    pub(crate) fn render(self, identity: &CapsuleIdentity) -> Result<String, String> {
+        let CapsuleIdentity { uid, gid, home } = *identity;
+        match self {
+            Self::Passwd => {
+                if home.contains(':') || home.contains('\n') {
+                    return Err(format!(
+                        "sealed: the synthetic HOME {home} contains a character /etc/passwd cannot \
+                         quote (':' or a newline), so no valid passwd entry can name it"
+                    ));
+                }
+                // name:password:uid:gid:gecos:home:shell — `x` in the password field is the
+                // universal "look in shadow", and there is no shadow file in a composed root.
+                if uid == 0 {
+                    return Ok(format!(
+                        "root:x:0:{gid}:root:{home}:{SYNTHETIC_LOGIN_SHELL}\n"
+                    ));
+                }
+                Ok(format!(
+                    "root:x:0:0:root:/root:{SYNTHETIC_LOGIN_SHELL}\n\
+                     {SYNTHETIC_ACCOUNT_NAME}:x:{uid}:{gid}:Murmur capsule:{home}:\
+                     {SYNTHETIC_LOGIN_SHELL}\n"
+                ))
+            }
+            // name:password:gid:members — the member list is empty because membership of the
+            // capsule's own group comes from its passwd entry's gid field.
+            Self::Group => {
+                if gid == 0 {
+                    return Ok("root:x:0:\n".to_string());
+                }
+                Ok(format!("root:x:0:\n{SYNTHETIC_ACCOUNT_NAME}:x:{gid}:\n"))
+            }
+        }
+    }
 }
 
 /// The only `/etc` entries that exist inside a composed root, each bind-mounted read-only and each
@@ -328,35 +433,39 @@ pub struct SealedEtcPath {
 /// trust store, DNS configuration, the timezone, and the passwd/group databases `getpwuid(3)`
 /// needs.
 ///
-/// Residual exposure: `/etc/passwd` and `/etc/group` are world-readable on
-/// every distribution, so binding them leaks the host's account names into the capsule. They are
-/// bound rather than synthesised because synthesising them means writing files from inside the
-/// `pre_exec` window, and this module's discipline is that that window performs no work the parent
-/// could have done for it. Synthesising a two-line passwd/group in the parent is the obvious
-/// follow-up.
+/// `/etc/passwd` and `/etc/group` are the two entries the host does *not* supply. They are
+/// world-readable on every distribution, so binding the host's copies would hand the capsule the
+/// machine's full account list; instead the parent writes a two-line database naming only `root`
+/// and the capsule's own id, and the composed root binds *that* at the same path, read-only. See
+/// [`SyntheticEtcFile`]. It stays on this list because the list is also the grant list — an entry
+/// removed from here loses its Landlock rule and becomes unreadable, which is the opposite of what
+/// this narrowing is for.
 ///
 /// Binding these is only half the job: Landlock still mediates *inside* the composed root, so an
 /// entry bound here but absent from the ruleset exists and is unopenable — a trust store present
 /// at `/etc/ssl/certs/ca-certificates.crt` but `EACCES` on open fails TLS verification.
 /// `sandbox::resolve_sealed_etc_landlock_grants` turns this list into the matching read grants.
-/// Keep the two sets aligned.
+/// Keep the two sets aligned. A Landlock rule names the *inode* an fd resolved to, not the path
+/// string it was opened by, so an entry whose bind source is not the host path of the same name
+/// needs its rule taken on the file actually bound — see `sandbox::LandlockChildFds`'s
+/// `sealed_identity_fds`, which does that for the two synthetic entries.
 pub const SEALED_ETC_PATHS: &[SealedEtcPath] = &[
-    SealedEtcPath { path: "/etc/ld.so.cache", directory: false },
-    SealedEtcPath { path: "/etc/ld.so.conf", directory: false },
-    SealedEtcPath { path: "/etc/ld.so.conf.d", directory: true },
-    SealedEtcPath { path: "/etc/alternatives", directory: true },
-    SealedEtcPath { path: "/etc/ssl", directory: true },
-    SealedEtcPath { path: "/etc/pki", directory: true },
-    SealedEtcPath { path: "/etc/ca-certificates", directory: true },
-    SealedEtcPath { path: "/etc/ca-certificates.conf", directory: false },
-    SealedEtcPath { path: "/etc/resolv.conf", directory: false },
-    SealedEtcPath { path: "/etc/hosts", directory: false },
-    SealedEtcPath { path: "/etc/nsswitch.conf", directory: false },
-    SealedEtcPath { path: "/etc/localtime", directory: false },
-    SealedEtcPath { path: "/etc/timezone", directory: false },
-    SealedEtcPath { path: "/etc/terminfo", directory: true },
-    SealedEtcPath { path: "/etc/passwd", directory: false },
-    SealedEtcPath { path: "/etc/group", directory: false },
+    SealedEtcPath { path: "/etc/ld.so.cache", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/ld.so.conf", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/ld.so.conf.d", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/alternatives", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/ssl", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/pki", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/ca-certificates", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/ca-certificates.conf", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/resolv.conf", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/hosts", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/nsswitch.conf", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/localtime", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/timezone", directory: false, synthetic: None },
+    SealedEtcPath { path: "/etc/terminfo", directory: true, synthetic: None },
+    SealedEtcPath { path: "/etc/passwd", directory: false, synthetic: Some(SyntheticEtcFile::Passwd) },
+    SealedEtcPath { path: "/etc/group", directory: false, synthetic: Some(SyntheticEtcFile::Group) },
 ];
 
 /// One entry of the private `/dev` tmpfs.
@@ -428,6 +537,27 @@ pub const SEALED_DEVICE_SYMLINKS: &[(&str, &str)] = &[
 /// bytes written to `/tmp` land in the workdir, are counted by the existing workdir-size guard
 /// (`capabilities.resources.workdir_max_bytes`), and are discarded with the session.
 pub const SEALED_TMP_DIR_NAME: &str = ".mur-tmp";
+
+/// Directory created inside the session workdir holding the synthetic `/etc` files, each of which
+/// the composed root binds read-only over its [`SEALED_ETC_PATHS`] target.
+///
+/// Inside the workdir for the same reason as [`SEALED_TMP_DIR_NAME`]: it is the one host directory
+/// the parent already owns, already creates per session, and already discards with it. The capsule
+/// can read — and, since the workdir is its one writable path, rewrite — its own copy here; that
+/// buys it nothing, because the file is never read by anything outside the capsule and names no
+/// account the capsule is not already running as.
+pub const SEALED_ETC_STAGING_DIR_NAME: &str = ".mur-etc";
+
+/// Host path of the staging file backing one synthetic `/etc` entry.
+///
+/// The single place this path is composed. Three callers need to agree on it byte for byte — the
+/// planner that binds it, the parent that writes it, and the Landlock fd that grants it — and two
+/// of them run in different phases of the launch.
+pub(crate) fn synthetic_etc_source(workdir: &Path, file: SyntheticEtcFile) -> PathBuf {
+    workdir
+        .join(SEALED_ETC_STAGING_DIR_NAME)
+        .join(file.file_name())
+}
 
 /// Directory the old root is parked in between `pivot_root(2)` and `umount2(MNT_DETACH)`.
 /// Removed immediately afterwards, so it does not exist for any process the capsule can run.
@@ -624,8 +754,23 @@ pub(crate) fn plan_composed_root(
     }
 
     // 2. The narrow /etc allowlist, read-only. Everything else under /etc simply does not exist.
-    for path in SEALED_ETC_PATHS.iter().map(|entry| Path::new(entry.path)) {
-        builder.mirror(path, host, /* required */ false);
+    //
+    //    An entry marked synthetic is not mirrored from the host at all: its target is bound from
+    //    the staging file the parent wrote inside the workdir, exactly as /tmp is in step 5 below.
+    //    `required: true` there, unlike the host-mirrored entries' `required: false` — those are
+    //    optional because a distribution may genuinely not have them, whereas the parent wrote
+    //    these two itself, so a bind that fails is a broken runtime rather than a narrower one, and
+    //    the empty `MkFile` left in its place would be a passwd database with no accounts in it.
+    for entry in SEALED_ETC_PATHS {
+        let path = Path::new(entry.path);
+        match entry.synthetic {
+            None => builder.mirror(path, host, /* required */ false),
+            Some(file) => builder.bind_file(
+                synthetic_etc_source(workdir, file),
+                rebase(base, path),
+                /* required */ true,
+            ),
+        }
     }
 
     // 3. A private /dev tmpfs carrying the OCI default device set, sealed read-only once it is
@@ -804,18 +949,28 @@ impl PlanBuilder {
                     required,
                 );
             }
-            PathKind::File => {
-                if let Some(parent) = target.parent() {
-                    self.mkdir_p(parent);
-                }
-                self.made.insert(target.clone());
-                self.push(RootOp::MkFile(target.clone()), required);
-                self.push(
-                    RootOp::Bind { source: source.to_path_buf(), target, read_only: true },
-                    required,
-                );
-            }
+            PathKind::File => self.bind_file(source.to_path_buf(), target, required),
         }
+    }
+
+    /// Schedules the mountpoint-then-bind pair one file bind needs: `mkdir -p` of its parent, an
+    /// empty file to mount over (a bind needs an existing target of the right kind), then the
+    /// read-only bind itself.
+    ///
+    /// Takes `source` and `target` separately rather than deriving one from the other, which is the
+    /// whole reason it is a method: [`Self::mirror`] binds a host path at its own path, while a
+    /// synthetic `/etc` entry binds a file from inside the workdir at a path that names something
+    /// else entirely.
+    fn bind_file(&mut self, source: PathBuf, target: PathBuf, required: bool) {
+        if self.made.contains(&target) {
+            return;
+        }
+        if let Some(parent) = target.parent() {
+            self.mkdir_p(parent);
+        }
+        self.made.insert(target.clone());
+        self.push(RootOp::MkFile(target.clone()), required);
+        self.push(RootOp::Bind { source, target, read_only: true }, required);
     }
 }
 
@@ -1629,7 +1784,10 @@ mod tests {
             map.insert(PathBuf::from("/lib64"), PathKind::Symlink(PathBuf::from("usr/lib64")));
             map.insert(PathBuf::from("/etc/ld.so.cache"), PathKind::File);
             map.insert(PathBuf::from("/etc/ssl"), PathKind::Dir);
+            // Present on the fake host precisely so the synthesis tests below can show that having
+            // them is not what decides whether they are mirrored.
             map.insert(PathBuf::from("/etc/passwd"), PathKind::File);
+            map.insert(PathBuf::from("/etc/group"), PathKind::File);
             for device in SEALED_DEVICE_NODES {
                 map.insert(PathBuf::from(device.path), PathKind::File);
             }
@@ -1741,6 +1899,102 @@ mod tests {
         assert!(!bound.iter().any(|path| path.starts_with("/etc/shadow")));
         assert!(!bound.iter().any(|path| path.starts_with("/root")));
         assert!(!bound.iter().any(|path| path.starts_with("/home/u/.ssh")));
+    }
+
+    /// The host has both files (see `FakeHost::usrmerge`) and the plan mirrors neither: their
+    /// targets are bound from the workdir-backed staging files the parent writes instead.
+    #[test]
+    fn passwd_and_group_are_bound_from_the_staging_files_never_from_the_host() {
+        let plan = plan_for("/home/u/w");
+        let workdir = Path::new("/home/u/w");
+
+        for host_path in ["/etc/passwd", "/etc/group"] {
+            assert!(
+                !plan.steps.iter().any(|step| matches!(
+                    &step.op,
+                    RootOp::Bind { source, .. } if source == Path::new(host_path)
+                )),
+                "the host's {host_path} carries every account on the machine and must not be \
+                 bound into a capsule",
+            );
+        }
+
+        for (file, target) in [
+            (SyntheticEtcFile::Passwd, "/tmp/etc/passwd"),
+            (SyntheticEtcFile::Group, "/tmp/etc/group"),
+        ] {
+            let expected = RootStep {
+                op: RootOp::Bind {
+                    source: synthetic_etc_source(workdir, file),
+                    target: PathBuf::from(target),
+                    read_only: true,
+                },
+                // Not the host-mirrored entries' `required: false`: the parent wrote this file, so
+                // a failed bind is a broken runtime, not a distribution that lacks the path.
+                required: true,
+            };
+            assert!(
+                plan.steps.contains(&expected),
+                "expected {expected:?} in {:?}",
+                plan.steps,
+            );
+            // And the mountpoint the bind lands on, since a bind needs an existing target.
+            assert!(ops(&plan).contains(&RootOp::MkFile(PathBuf::from(target))));
+        }
+
+        // Every other /etc entry is still the host's own file, untouched by this.
+        assert!(ops(&plan).contains(&RootOp::Bind {
+            source: PathBuf::from("/etc/ld.so.cache"),
+            target: PathBuf::from("/tmp/etc/ld.so.cache"),
+            read_only: true,
+        }));
+    }
+
+    /// Two lines, and the `pw_dir` field is the synthetic `HOME` verbatim — the property a capsule
+    /// observes as `pwd.getpwuid(os.getuid()).pw_dir == os.environ["HOME"]`.
+    #[test]
+    fn the_synthetic_databases_name_root_and_the_capsules_own_id_and_nothing_else() {
+        let identity = CapsuleIdentity { uid: 1000, gid: 1000, home: "/w/.capsule-home" };
+
+        let passwd = SyntheticEtcFile::Passwd.render(&identity).unwrap();
+        assert_eq!(
+            passwd,
+            "root:x:0:0:root:/root:/bin/sh\n\
+             capsule:x:1000:1000:Murmur capsule:/w/.capsule-home:/bin/sh\n"
+        );
+        let group = SyntheticEtcFile::Group.render(&identity).unwrap();
+        assert_eq!(group, "root:x:0:\ncapsule:x:1000:\n");
+
+        for (file, contents) in
+            [(SyntheticEtcFile::Passwd, &passwd), (SyntheticEtcFile::Group, &group)]
+        {
+            assert_eq!(contents.lines().count(), 2, "{file:?} must stay a two-line database");
+            assert!(contents.ends_with('\n'), "{file:?} must end its last record with a newline");
+        }
+    }
+
+    /// A capsule already running as uid 0 gets *one* passwd line, not a second `root` — two entries
+    /// for uid 0 would leave `getpwuid(0)` resolving to whichever the parser saw first.
+    #[test]
+    fn a_root_capsule_gets_a_single_passwd_line_carrying_its_own_home() {
+        let identity = CapsuleIdentity { uid: 0, gid: 0, home: "/w/.capsule-home" };
+
+        assert_eq!(
+            SyntheticEtcFile::Passwd.render(&identity).unwrap(),
+            "root:x:0:0:root:/w/.capsule-home:/bin/sh\n"
+        );
+        assert_eq!(SyntheticEtcFile::Group.render(&identity).unwrap(), "root:x:0:\n");
+    }
+
+    /// `passwd(5)` has no escaping, so a home path containing the field separator would silently
+    /// shift every field after it — a `pw_shell` of half a path, or worse.
+    #[test]
+    fn a_home_path_that_cannot_be_spelled_in_a_passwd_field_is_refused() {
+        for home in ["/w/od:d", "/w/two\nlines"] {
+            let identity = CapsuleIdentity { uid: 1000, gid: 1000, home };
+            let error = SyntheticEtcFile::Passwd.render(&identity).unwrap_err();
+            assert!(error.contains(home), "the message must name the offending path: {error}");
+        }
     }
 
     #[test]
