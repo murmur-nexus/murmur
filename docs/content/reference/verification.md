@@ -2,22 +2,50 @@
 
 Every containment claim murmur makes — Landlock scoping, seccomp filtering, `pivot_root` onto a
 composed root, cgroup v2 resource ceilings, file-descriptor hygiene across `exec` — is a claim
-about what a *kernel* does. Each claim can be verified manually against a real Linux host, and
-this page lists the procedures for doing so: what each one covers, and where to read it. Every
-procedure carries its own run status, recorded in the procedure itself.
+about what a *kernel* does, so each one is checked against a real Linux host. Two things do the
+checking, and they cover different ground.
 
-## Why these are not automated
+| | Escape-conformance harness | Manual procedures |
+|---|---|---|
+| Form | One command, graded against a declared containment class | Written scenarios with exact commands and expected output |
+| Covers | Filesystem escape, `/proc` re-open paths, inherited descriptors, device-node creation, the exec allowlist, network egress, unix sockets, the dangerous-syscall table, resource exhaustion | Launch-time refusals, the composed root observed from inside a live capsule, the fixed device set, shell-binary reachability, staged runtimes, the child's capability sets |
+| Where the result lives | A dated record file the run writes | A dated entry in the procedure itself |
 
-A containment boundary can only be asserted on a host that has the mechanism behind it. On a host
-without one — an unprivileged container, a kernel below 5.13, macOS — a test asserting that a fork
-bomb was contained, or that a path outside the composed root does not exist, passes vacuously or
-skips. Either outcome reports on a boundary the run never touched. So these properties are checked
-on a real host, with the observed output recorded in the procedure itself.
+The rest of the test suite asserts the *decision* logic: which enforcement tier a probe resolves to,
+which containment class a tier achieves, that a zero limit value is rejected.
 
-The automated tests assert the *decision* logic instead: which enforcement tier a probe resolves
-to, which containment class a tier achieves, that a zero limit value is rejected.
+## The escape-conformance harness
 
-## The procedures
+[`crates/capsule-runtime/escape-conformance`](https://github.com/murmur-nexus/murmur/tree/main/crates/capsule-runtime/escape-conformance)
+drives a real capsule through a registry of escape probes and grades each verdict against what the
+declared class promises. It is its own workspace root, so build and run it from its own directory:
+
+```bash
+cd crates/capsule-runtime/escape-conformance
+cargo build --release
+./target/release/escape-conformance --class sealed
+```
+
+`--class` takes `advisory`, `scoped` or `sealed` and is what the run is graded against.
+`--list-cases` prints the registry with each case's expectation per class, and `--help` lists the
+remaining options.
+
+The run needs a built `mur` binary, `python3`, and a delegated cgroup v2 subtree — the harness wraps
+each capsule in `systemd-run --user --scope --property=Delegate=yes` by default to get one. It runs
+on bare metal: a host that cannot back the class under test, and a host that looks like a container,
+are both refused before the first case runs, and a refused run writes no record.
+
+The exit code separates a refusal from a failure, and an escape from a ceiling that gave way:
+
+| exit | meaning | record |
+|---|---|---|
+| `0` | every asserted case matched its expected verdict | written |
+| `1` | usage error | none |
+| `2` | refused — this host cannot back the class, or a prerequisite is missing | none |
+| `3` | a boundary case failed — a containment escape | written |
+| `4` | boundary clean, a resource ceiling did not hold — denial of service | written |
+
+## The manual procedures
 
 Each procedure lives in the murmur repository on the `main` branch; the name links to it.
 
