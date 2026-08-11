@@ -1,6 +1,6 @@
 # Capsule I/O Schema
 
-Capsules communicate with their runtime environment through structured files in the session workdir. This page documents the typed I/O envelope.
+Capsules communicate with their runtime environment through structured files in the session workdir. This page documents the typed I/O envelope used by agent capsules.
 
 ---
 
@@ -189,9 +189,3 @@ committed by the time the write is attempted.
 
 This log exists to capture the summary text itself, which `trace.jsonl`'s `compaction` event
 does not record (it carries only the two token counts).
-
----
-
-## Script capsules
-
-Script capsules are not affected by this schema. The `out/result.json` writer is part of the native agent loop only. Script capsules continue to write their own output to `out/result.txt` (or other paths) as before.

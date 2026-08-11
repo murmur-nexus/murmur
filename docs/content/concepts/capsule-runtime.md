@@ -1,10 +1,8 @@
 # Capsule Runtime
 
-An **agent capsule** is a capsule that runs a built-in LLM inference loop instead of a WASM
-component. It is defined entirely by its `murmur.yaml` — no `.wasm` file is needed. The
-runtime detects agent mode from the presence of an `inference:` block in the manifest and
-branches directly into the native inference loop; no WASM component is compiled or
-instantiated.
+An **agent capsule** runs the LLM inference loop built into the runtime. It is defined
+entirely by its `murmur.yaml`: an `inference:` block in the manifest is what puts the capsule
+in agent mode.
 
 ```yaml
 # minimal agent manifest
@@ -33,22 +31,20 @@ inference:
     artifact: murmur-driver-anthropic
 ```
 
-`mur build` packages this as a manifest-only `.mur.zip` (no `.wasm` required).
+`mur build` packages this as a manifest-only `.mur.zip`.
 
 ---
 
 ## How the runtime executes a capsule
 
-Whether a capsule is an agent capsule or a WASM script capsule, the same underlying runtime
-turns its manifest into an executing process:
+Every capsule goes through the same runtime, which turns its manifest into a running process:
 
 - Parses capsule and artifact metadata
 - Resolves dependencies from local/remote registry sources
-- Configures capability grants (filesystem, network, shell) — explicit and manifest-driven:
-  no implicit network access, no implicit host filesystem access, shell access is
-  allowlist-based and auditable. This holds for every guest kind, hooks included: a hook's
-  grant comes from its entry in the capsule's own manifest and defaults to nothing (see
-  [Hook capabilities](#hook-model))
+- Configures capability grants (filesystem, network, shell) from the manifest. Every grant is
+  declared: filesystem and network access start closed, and shell access is allowlist-based.
+  The same applies to hooks — a hook's grant comes from its entry in the capsule's manifest and
+  starts empty (see [Hook capabilities](#hook-model))
 - Links and invokes runtime interfaces for tools and artifact management
 - Captures outputs and logs in a predictable workspace layout
 
@@ -59,24 +55,24 @@ consistent agent behavior regardless of tool implementation language.
 
 ### Execution limits { #execution-limits }
 
-Every guest the runtime executes — capsule `run`, tool/driver `run`, and each hook lifecycle
-call — runs bounded by two independent limits: an **epoch deadline** (a wall-clock budget per
-guest invocation; a guest that never returns traps once its deadline elapses instead of
-hanging the session) and a **resource limiter** (caps on linear-memory growth, table growth,
-and instance count; a guest that tries to grow past its cap traps rather than consuming host
-memory without bound).
+Every component call the runtime makes — a capsule `run`, a tool or driver `run`, and each
+hook lifecycle call — is bounded by two independent limits:
 
-Both are configured per-manifest via `capabilities.limits` (see [Manifest
-Schema](../reference/manifest-schema.md#field-capabilities)) and fall back to generous
-built-in defaults when omitted — a silent manifest means defaults, not "unlimited". A deadline
-trap and a resource-limit trap are each distinguishable from an ordinary guest panic, and on
-the hook path a trap is treated like any other per-hook error: it's logged and the runtime
-moves on to the next hook rather than aborting the session.
+| Limit | Bounds | What happens at the limit |
+|---|---|---|
+| **Deadline** | Wall-clock time for one component call | A call that never returns is stopped with an error instead of hanging the session |
+| **Resource limiter** | Memory growth, table growth, and instance count | A call that tries to grow past its cap is stopped with an error instead of consuming host memory without bound |
 
-**Caveat:** an epoch deadline can only fire while guest wasm code is executing. Time a guest
-spends blocked inside a host call (for example, an inference driver awaiting a streaming
-provider response) elapses against the same budget but cannot be interrupted until control
-returns to the guest — this bounds runaway *guest compute*, not general-purpose I/O.
+Both are set per-manifest under `capabilities.limits` (see [Manifest
+Schema](../reference/manifest-schema.md#field-capabilities)). Omitting them applies generous
+built-in defaults — a manifest that says nothing gets the defaults, not unlimited resources.
+Hitting either limit is reported distinctly from an ordinary crash. On the hook path it is
+handled like any other hook error: logged, and the runtime moves on to the next hook.
+
+**Caveat:** the deadline only counts down while the component's own code is running. Time it
+spends waiting on the runtime (for example, a driver awaiting a streaming provider response)
+counts against the same budget but cannot be cut short until control returns to the
+component. The deadline bounds runaway compute, not slow I/O.
 
 ---
 
@@ -165,7 +161,7 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 
 **Execution mode** — how the runtime waits: **`blocking`** (runtime waits for the hook before
 proceeding — mandatory for `on-stage` and `on-compaction`) or **`async`** (runtime fires the
-hook and continues immediately; only valid with `commit_policy: none` at MVP).
+hook and continues immediately; only valid with `commit_policy: none`).
 
 **Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
 observability hooks), **`replace-context`** (runtime replaces conversation history; used for
@@ -220,13 +216,11 @@ artifacts:
         scope: hook-state
 ```
 
-With no `capabilities:` block a hook gets no network (no raw WASI sockets, and an empty
-outbound allow-list so every HTTP request is denied) and no preopened directory at all — it
-cannot read or write any file, including in its own working directory. A granted hook reaches
-declared hosts through the same allow-list gate a capsule's or tool's outbound HTTP goes
-through, and sees exactly one directory, `<workdir>/<scope>`, mounted as its current
-directory. All three hook instantiation paths — `on-stage`, blocking, and async — apply the
-identical grant; no binding or execution mode is exempt. See
+With no `capabilities:` block a hook has no network and no directory at all — every outbound
+request is denied, and it cannot read or write any file. A granted hook reaches its declared
+hosts through the same allow-list gate a capsule's or tool's outbound HTTP goes through, and
+sees exactly one directory, `<workdir>/<scope>`, as its current directory. Every hook gets its
+grant the same way, whatever its binding or execution mode. See
 [Hook capabilities](../reference/manifest-schema.md#hook-capabilities) for the full rules.
 
 ### Turn limit (`inference.max_turns`)
@@ -241,28 +235,25 @@ A hook bound to `on-task-end` with `commit_policy: reopen-task` can veto a task'
 instead of just observing it. When it returns `reopen-task(reason)`, the runtime does not
 finalize the task: it re-runs the task's agent loop with `reason` injected into the task
 content as feedback, then fires `on-task-end` again so the hook can re-inspect the new result.
-A hook that never returns `reopen-task` (the common case — plain `none`) sees no behavior
-change from this mechanism.
 
-This repeats up to a per-task budget, `inference.max_task_reopens` (default **1**; `0` disables
-reopening entirely — unlike `max_turns`, an explicit `0` is valid rather than rejected).
-Reopening never grants turns beyond the capsule's `inference.max_turns` ceiling: every attempt
-of a task shares one cumulative turn count, so a task cannot out-run its turn budget just
-because a hook keeps asking for another try.
+This repeats up to the reopen limit set by `inference.max_task_reopens` (default **1**; `0`
+disables reopening entirely — unlike `max_turns`, an explicit `0` is accepted). Reopening never
+grants extra turns: every attempt of a task shares one cumulative turn count against the
+capsule's `inference.max_turns` limit, so a task cannot out-run its turn budget just because a
+hook keeps asking for another try.
 
-If the reopen budget (or the turn ceiling) is exhausted while a hook still wants to reopen, the
-task ends as a distinct, non-silent failure: `exit_status: "reopen_budget_exhausted"` rather than
-an ordinary `"ok"`/`"failed"`. The task registry / A2A task state records this the same way as
-any other failed task.
+If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task
+ends with its own exit status — `exit_status: "reopen_budget_exhausted"` rather than an
+ordinary `"ok"`/`"failed"` — and the task registry / A2A task state records it like any other
+failed task.
 
 Every reopen is written to `trace.jsonl` as a `task_reopened` event (the hook's name, its
 feedback text, and a 1-based ordinal), and the terminal `task_end` record carries a
 `reopen_count` field — `0` for a task that ran once. See [Session trace
 (`trace.jsonl`) schema](../reference/cli.md#session-trace-tracejsonl) for the exact shapes.
 
-The reopen budget is scoped to a single task, not accumulated across a `task_acceptance: queue`
-session: each task starts with a fresh count of `0` reopens used, regardless of what a prior
-task in the same session consumed.
+The reopen limit applies per task: in a `task_acceptance: queue` session, each task starts
+fresh at `0` reopens used, regardless of what an earlier task consumed.
 
 ```yaml
 name: murmur-hook-gatekeeper
@@ -276,14 +267,18 @@ description: "Rejects a task's result until its own checks pass."
 
 ### Tool dispatch
 
-Each tool call is resolved in a fixed precedence order: a native binary staged for that
-artifact, then the shell allowlist, then a skill artifact (`workdir/tools/<name>/skill.md`,
-returned directly with no WASM dispatch), then a WASM-artifact tool, and finally an error if
-nothing matches. Non-zero shell exit codes are data, not errors — only
-spawn/IO failures set `is_error: true`. An undeclared tool feeds an error back to the model as
-a `tool_result`; the session continues, no trap occurs. See [Lock down a capsule's
-capabilities](../how-to/lock-down-capsule.md) for how the native/shell subprocess environment is
-built.
+Each tool call is resolved in a fixed precedence order:
+
+1. A native binary staged for that artifact
+2. The shell allowlist
+3. A skill artifact (`workdir/tools/<name>/skill.md`, returned directly)
+4. A WASM-artifact tool
+5. Otherwise, an error
+
+Non-zero shell exit codes are data, not errors — only spawn/IO failures set `is_error: true`.
+An undeclared tool feeds an error back to the model as a `tool_result` and the session
+continues. See [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md) for how the
+native/shell subprocess environment is built.
 
 **Per-tool narrowing** — by default every WASM tool, and the inference driver, runs on the
 capsule-wide `capabilities:` ceiling: the same allow-list and the same preopened workdir. A
@@ -304,14 +299,12 @@ artifacts:
         scope: cache
 ```
 
-This is the same key and vocabulary hooks use, with the opposite baseline: a hook with no block
-gets nothing, whereas a tool with no block keeps the full ceiling (today's behavior, unchanged).
-The effective grant is always the intersection with the ceiling, so a per-artifact block can only
-subtract — an entry naming a host the capsule itself may not reach is dropped, with a
+This uses the same key and vocabulary as hooks, with the opposite starting point: a hook with
+no block gets nothing, a tool with no block keeps the full ceiling. A per-artifact block can
+only subtract — an entry naming a host the capsule itself may not reach is dropped, with a
 [`W-SEC-007`](../reference/security-warnings.md#w-sec-007) warning. Like a hook's, the grant is
-read only from the capsule operator's entry, never from the tool's own bundled manifest. Because
-drivers dispatch through the identical path, the artifact named by `inference.driver.artifact`
-narrows the same way. See [Tool and driver
+read only from the capsule operator's entry, never from the tool's own bundled manifest. The
+artifact named by `inference.driver.artifact` narrows the same way. See [Tool and driver
 capabilities](../reference/manifest-schema.md#tool-capabilities) for the full rules.
 
 ### `MURMUR.md`
@@ -368,16 +361,13 @@ hard limit:
 2. After each driver response, it checks whether `session_tokens / context.max_tokens` has
    crossed `inference.compaction.threshold`.
 3. Once crossed, the runtime fires the `on-compaction` lifecycle event with the full message
-   history. Any hook bound to `on-compaction` receives it — the runtime selects the compaction
-   hook by binding, not by name, so no artifact name is configured anywhere. `murmur-hook-compact`
-   is the reference implementation, but any hook bound to `on-compaction` works.
-4. The hook returns a condensed message array; the runtime replaces the in-memory history
-   and recounts tokens against it. Each returned `message.content` (a WIT `string`) may be
-   either a JSON-encoded plain string (e.g. a one-paragraph summary) or a JSON-encoded array
-   of content blocks — the runtime normalizes either shape into a block array before the next
-   driver call, so a custom compaction hook does not need to wrap its summary in blocks
-   itself. A `tool`-role message is only kept if the hook returned it unmodified; any other
-   `tool`-role message is dropped rather than replayed with a synthesized `tool_call_id`.
+   history. The runtime picks the compaction hook by binding, so you configure no artifact name
+   anywhere — any hook bound to `on-compaction` receives the event. `murmur-hook-compact` is the
+   reference implementation.
+4. The hook returns a condensed message array; the runtime replaces the in-memory history and
+   recounts tokens against it. Each returned `message.content` may be a plain summary string or
+   an array of content blocks — the runtime accepts either. A `tool`-role message survives only
+   if the hook returns it unmodified.
 5. The agent loop continues — the model's next turn sees the compacted history.
 
 Compaction never consumes a turn slot. Whether a failure to compact is fatal depends on why it

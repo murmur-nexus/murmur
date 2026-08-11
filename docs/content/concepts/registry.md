@@ -156,7 +156,3 @@ disk — goes through a shared hardening layer before any of its bytes are trust
 This is independent of the sha256/lock verification above: hardening protects against a
 malformed or malicious archive shape, while hash verification protects against a
 tampered-but-well-formed one.
-
-## What Nexus does not do
-
-Nexus is intentionally passive: it does not orchestrate capsule execution and it does not manage runtime state.
