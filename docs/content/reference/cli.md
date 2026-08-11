@@ -959,7 +959,7 @@ in a session), and `timestamp` (Unix milliseconds).
 | `message_id` | string | `messageId` from the incoming A2A Message |
 | `traceparent_from_caller` | string \| null | W3C `traceparent` header from the incoming request |
 
-**`a2a_send`** — written when a script capsule calls `murmur:message/send`
+**`a2a_send`** — written when a capsule component calls `murmur:message/send`
 
 | Field | Type | Notes |
 |---|---|---|

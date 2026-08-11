@@ -356,10 +356,10 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.shell.staged_runtime[].source_path` | string | yes | absolute host path (must start with `/`) of an already-pinned runtime tree — a vendored toolchain directory, a baked-in conda env. Not resolved, discovered or version-sniffed by the runtime, and not required to exist on the machine that merely *parses* the manifest |
 | `capabilities.shell.staged_runtime[].pin` | string | yes | non-empty, opaque identifier of which build the tree is. Never inferred: it exists so a human can compare the declared pin across two hosts and confirm the same runtime shipped to both |
 | `capabilities.env.allow` | list<string> | no | host env var names a WASM guest (capsule/tool/driver component) may observe. Omitted or `[]` — a legitimate no-op, not an error — grants nothing beyond the runtime's own `MURMUR_*` injections. |
-| `capabilities.limits.memory_bytes` | integer | no | cap on a guest's linear-memory growth, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
-| `capabilities.limits.table_elements` | integer | no | cap on a guest's table growth, in elements. Default: 100000. Must be > 0. |
+| `capabilities.limits.memory_bytes` | integer | no | cap on a component's linear-memory growth, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
+| `capabilities.limits.table_elements` | integer | no | cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | cap on the number of instances a single store may create. Default: 1000. Must be > 0. |
-| `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single guest invocation (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes). Must be > 0. |
+| `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single component call (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes). Must be > 0. |
 | `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how much past the runtime's own uid baseline its tree may add, in the unit the kernel enforces against (threads on Linux, processes on macOS). Default: 128. Must be > 0. See the per-uid note below. |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
@@ -1041,8 +1041,8 @@ Rejected examples:
 
 ### Execution limits
 
-`capabilities.limits` bounds how long a guest (capsule, tool/driver, or hook) may run and how
-much store memory it may consume — see [Execution limits](../concepts/capsule-runtime.md#execution-limits)
+`capabilities.limits` bounds how long a component (capsule, tool/driver, or hook) may run and
+how much memory it may consume — see [Execution limits](../concepts/capsule-runtime.md#execution-limits)
 for the runtime-level behavior. Every field is optional and independently defaulted; omitting
 the whole block is equivalent to omitting every field.
 
@@ -1062,17 +1062,17 @@ capabilities:
   error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.limits.memory_bytes': must be greater than zero
   ```
 
-- A guest that exceeds `deadline_seconds` traps with an `E-RUN-001` naming the deadline that
-  fired; a guest that grows past `memory_bytes` or `table_elements` traps with an `E-RUN-001`
-  naming the limit and the size it tried to reach. Both are distinguishable from a plain guest
-  panic — see [CLI error codes](cli.md#error-codes).
+- A component that exceeds `deadline_seconds` fails with an `E-RUN-001` naming the deadline that
+  fired; one that grows past `memory_bytes` or `table_elements` fails with an `E-RUN-001` naming
+  the limit and the size it tried to reach. Both are reported distinctly from a plain crash —
+  see [CLI error codes](cli.md#error-codes).
 
 ### Host resource limits
 
 `capabilities.resources` bounds the **operating-system processes** the runtime spawns for
 `capabilities.shell.allow` binaries and for native-implementation tool artifacts. It is a
-different subject from `capabilities.limits` above, which bounds a WASM *guest* inside its
-wasmtime store: a capsule that cannot escape its containment can still wedge its host by forking,
+different subject from `capabilities.limits` above, which bounds a WASM *component* inside the
+runtime: a capsule that cannot escape its containment can still wedge its host by forking,
 allocating, opening files or writing without bound. That is denial of service, not a containment
 escape — nothing outside the capsule's granted scope is read, written, or reached — but the host
 is wedged either way.
