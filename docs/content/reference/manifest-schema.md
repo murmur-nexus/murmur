@@ -904,7 +904,7 @@ Hook behavior:
 |---|---|
 | Model visibility | Hook artifacts are not included in the tool inventory or `MURMUR.md` installed-tool list. |
 | Invocation order | Multiple hooks are invoked in manifest declaration order for each event. |
-| Failure handling | A hook handler that returns `Err(string)` does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log` and also recorded as a `hook_dispatch_error` event in `trace.jsonl`. |
+| Failure handling | A hook handler that returns `Err(string)` does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log`. For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears — a blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
 | Workdir access | Hook components receive the session workdir as their WASI `.` preopen. |
 | Reference hook | `murmur-hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
 | Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
