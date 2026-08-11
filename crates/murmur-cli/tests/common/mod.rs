@@ -99,6 +99,7 @@ pub fn stage_agent_session(
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            on_overflow: artifact.on_overflow,
             capabilities: artifact.capabilities.clone(),
         });
     }

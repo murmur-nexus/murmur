@@ -278,6 +278,7 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
                 version: a.version.clone(),
                 runtime: a.runtime.clone(),
                 source: a.source.clone(),
+                on_overflow: a.on_overflow,
                 capabilities: a.capabilities.clone(),
             }
         })

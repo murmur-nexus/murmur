@@ -569,6 +569,10 @@ pub fn stage_session(
                     component: hook_component,
                     config: hook_config,
                     grant,
+                    // Operator-sourced like `grant`, for the same reason: how much of the
+                    // agent's telemetry may be dropped to keep the loop moving is the
+                    // operator's call, not the hook author's.
+                    on_overflow: artifact.on_overflow,
                 });
             }
             ArtifactRuntime::Skill => {
@@ -652,7 +656,7 @@ pub fn stage_session(
         &hook_components,
         request.capability_policy.shell_allow.clone(),
         &stage_env,
-        request.capability_policy.limits,
+        request.capability_policy.hook_limits(),
     )?;
 
     // Write MURMUR.md now for agent sessions so that tooling that inspects the workdir after
@@ -981,8 +985,10 @@ pub fn launch_session(
                             conversation_mode.clone(),
                         ));
 
-                    // Read before `capability_policy` moves into the store state below.
-                    let hook_limits = capability_policy.limits;
+                    // Read before `capability_policy` moves into the store state below. Hooks
+                    // get the same resource caps as every other guest but their own, lower
+                    // deadline default — see `CapabilityPolicy::hook_limits`.
+                    let hook_limits = capability_policy.hook_limits();
 
                     // Build CapsuleStoreState ONCE — reused across all task iterations
                     let mut state = CapsuleStoreState {
@@ -1393,6 +1399,13 @@ pub fn launch_session(
                         )
                         .await;
 
+                    // Every async hook's queue is drained — and its worker awaited — while the
+                    // `LocalSet` is still alive. Without this, `run_until` returning would drop
+                    // the workers mid-call and take the session-end export with them. Bounded,
+                    // so a wedged hook delays the exit by at most the drain budget; whatever it
+                    // did not finish is reported through the same fault path as any other hook
+                    // fault, which is why this runs *before* the flush below.
+                    hooks.drain_async_hooks().await;
                     agent::flush_hook_dispatch_faults(&mut hooks, &mut trace).await;
                     let _ = trace.write_session_end_if_not_ended("failed").await;
                     otel.emit_session_end_if_not_ended("failed").await;
@@ -3820,6 +3833,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                on_overflow: Default::default(),
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
@@ -3901,6 +3915,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                on_overflow: Default::default(),
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
@@ -3974,6 +3989,7 @@ mod tests {
                 version: "0.0.1".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                on_overflow: Default::default(),
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
@@ -4046,6 +4062,7 @@ mod tests {
                 version: "0.0.9".to_string(),
                 runtime: ArtifactRuntime::Tool,
                 source: None,
+                on_overflow: Default::default(),
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
@@ -4200,6 +4217,7 @@ mod tests {
                 version: "local".to_string(),
                 runtime: ArtifactRuntime::Skill,
                 source: Some("skills/my-skill".to_string()),
+                on_overflow: Default::default(),
                 capabilities: None,
             }],
             allowlisted_tools: HashSet::new(),
@@ -5181,6 +5199,7 @@ mod tests {
             version: "1.0.0".to_string(),
             runtime: ArtifactRuntime::Tool,
             source: None,
+            on_overflow: Default::default(),
             capabilities: Some(murmur_artifact::Capabilities {
                 network: Some(murmur_artifact::NetworkCapabilities {
                     allow: vec!["http://127.0.0.1:1".to_string()],
@@ -5200,6 +5219,7 @@ mod tests {
             version: "1.0.0".to_string(),
             runtime: ArtifactRuntime::Tool,
             source: None,
+            on_overflow: Default::default(),
             capabilities: None,
         };
 
@@ -5224,6 +5244,7 @@ mod tests {
             version: "1.0.0".to_string(),
             runtime: ArtifactRuntime::Tool,
             source: None,
+            on_overflow: Default::default(),
             capabilities: Some(murmur_artifact::Capabilities {
                 network: None,
                 filesystem: Some(murmur_artifact::FilesystemCapabilities {
@@ -5447,6 +5468,7 @@ mod tests {
                 commit_policy: murmur_artifact::HookCommitPolicy::ReopenTask,
             },
             grant: HookCapabilityGrant::default(),
+            on_overflow: Default::default(),
         };
 
         let mut hooks = HookRuntime::new(
