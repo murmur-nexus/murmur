@@ -3356,8 +3356,8 @@ mod tests {
 
     /// No exempt instantiation path — async hooks. The single instance built for an async
     /// hook at `HookRuntime::new` applies the grant carried on its `StagedHookArtifact`,
-    /// under the project dir, exactly as the blocking path does — the reuse rewrite changed
-    /// how often the grant is applied, never whether it is.
+    /// under the project dir, exactly as the blocking path does: how often the grant is
+    /// applied differs between the two paths, whether it is applied does not.
     #[test]
     fn async_hook_instantiation_applies_the_grant() {
         let session = TempDir::new().unwrap();
@@ -4003,8 +4003,8 @@ artifacts:
     /// Scenario (e): an async hook returning a non-`none` arm the event does not honor is
     /// logged exactly once to `logs/hook-<name>.log` *and* recorded as a dispatch fault, so
     /// it reaches `trace.jsonl` as `hook_dispatch_error` on the same terms a blocking hook's
-    /// fault does. Drain replaces the old bounded-yield polling: the worker is awaited, so
-    /// there is nothing left in flight to race with.
+    /// fault does. The drain awaits the worker directly, so nothing is left in flight to
+    /// race with the assertion.
     #[test]
     fn async_hook_unsupported_arm_is_logged_and_traced() {
         let session = TempDir::new().unwrap();
@@ -4461,13 +4461,12 @@ artifacts:
         );
     }
 
-    /// The core regression this slice fixes: work queued by the last `emit` of a session
-    /// finishes *before* the `LocalSet` that owns the workers is torn down.
+    /// Invariant: work queued by the last `emit` of a session finishes *before* the
+    /// `LocalSet` that owns the workers is torn down.
     ///
     /// Deliberately shaped like `runtime.rs`: everything happens inside
     /// `local.run_until(...)`, and the assertion runs after that future has returned and
-    /// `local` has been dropped. Before the drain existed, the `on-session-end` call was a
-    /// task that got dropped there — a coin flip at best.
+    /// `local` has been dropped, matching how a real session tears down.
     #[test]
     fn async_hook_session_end_work_survives_local_set_teardown() {
         let session = TempDir::new().unwrap();
@@ -4699,8 +4698,8 @@ artifacts:
         );
     }
 
-    /// Invariant (unchanged, re-verified after the rewrite): an async hook never commits
-    /// output. `replace-context` is the arm `on-compaction` *does* honor for a blocking hook;
+    /// Invariant: an async hook never commits output. `replace-context` is the arm
+    /// `on-compaction` *does* honor for a blocking hook;
     /// from an async hook it is discarded silently — no replacement, and not a fault either,
     /// since the hook did nothing wrong.
     #[test]

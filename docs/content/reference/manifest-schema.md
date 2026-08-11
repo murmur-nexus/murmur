@@ -184,6 +184,7 @@ mur_version: "0.4.9"
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default, in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 | `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool`, and `runtime: driver`. The baseline differs by role: on a hook, absent = no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent = the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). Declaring it on `runtime: skill` is a manifest validation error (`E-MAN-003`). |
+| `artifacts[].on_overflow` | `drop \| block` | no | Recognized only on `runtime: hook`; declaring it on any other role is a manifest validation error. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook overflow policy](#hook-overflow). Defaults to `drop`. Legal (but inert) on a hook that turns out to be `execution_mode: blocking`, since a blocking hook has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
 
@@ -359,7 +360,7 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.limits.memory_bytes` | integer | no | cap on a component's linear-memory growth, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
 | `capabilities.limits.table_elements` | integer | no | cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
 | `capabilities.limits.instances` | integer | no | cap on the number of instances a single store may create. Default: 1000. Must be > 0. |
-| `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single component call (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes). Must be > 0. |
+| `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single component call (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes) for a capsule, tool, or driver call; 30 seconds for a hook lifecycle call. An explicit value here overrides both defaults, hooks included. Must be > 0. |
 | `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how much past the runtime's own uid baseline its tree may add, in the unit the kernel enforces against (threads on Linux, processes on macOS). Default: 128. Must be > 0. See the per-uid note below. |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
@@ -903,11 +904,46 @@ Hook behavior:
 |---|---|
 | Model visibility | Hook artifacts are not included in the tool inventory or `MURMUR.md` installed-tool list. |
 | Invocation order | Multiple hooks are invoked in manifest declaration order for each event. |
-| Failure handling | A hook handler that returns `Err(string)` does not abort the agent loop. The error is appended asynchronously to `workdir/logs/hook-<name>.log`. |
+| Failure handling | A hook handler that returns `Err(string)` does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log` and also recorded as a `hook_dispatch_error` event in `trace.jsonl`. |
 | Workdir access | Hook components receive the session workdir as their WASI `.` preopen. |
 | Reference hook | `murmur-hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
+| Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
 
 The runtime generates one UUID v7 session id at startup, used uniformly for the workdir folder name, `trace.jsonl`, `MURMUR_SESSION_ID`, and hook context.
+
+### Async hook execution { #hook-overflow }
+
+An `execution_mode: async` hook (declared in the hook artifact's own `murmur.yaml` — see
+[Hook model](../concepts/capsule-runtime.md#hook-model)) is instantiated once for the session
+and reused for every event: state the hook keeps in memory (a running counter, a buffered
+span, an open client) survives across calls. Each async hook has its own bounded, ordered job
+queue and a dedicated worker that drains it one call at a time — dispatching an event to an
+async hook returns immediately, and calls to that hook are never reordered or run concurrently
+with each other. Every async hook's queue is drained, and its in-flight call awaited, before
+the session ends, so a queued `on-session-end` call (a final metrics export, for example) is
+not lost when the session tears down. A hook that is still working when the drain's bounded
+budget runs out is abandoned and reported the same way any other hook fault is.
+
+`on_overflow:` on the capsule's own `artifacts:` entry for a `runtime: hook` artifact controls
+what happens when that hook's queue is full — which only happens when the hook is falling
+behind the rate of lifecycle events:
+
+| Value | Behavior |
+|---|---|
+| `drop` (default) | The event is discarded and counted. Dispatch never waits, so a slow or stuck async hook cannot delay the agent loop. |
+| `block` | Dispatch waits for the hook's worker to make room. No event is lost, at the cost of putting a slow hook back on the critical path. |
+
+```yaml
+artifacts:
+  - name: murmur-hook-grafana
+    version: "{{ v.murmur_hook_grafana }}"
+    runtime: hook
+    on_overflow: block   # wait for room instead of dropping events under load
+```
+
+An async hook's output — even an arm that would be honored for a blocking hook on the same
+binding — is always discarded: nothing waits for its answer, so there is nowhere to apply it.
+`execution_mode: async` is only valid with `commit_policy: none` for this reason.
 
 ### OTel span emission
 

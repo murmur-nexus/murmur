@@ -160,8 +160,13 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 | *(omitted)* | All session events (`on-session-start` through `on-session-end`). Does not include `on-stage`. |
 
 **Execution mode** — how the runtime waits: **`blocking`** (runtime waits for the hook before
-proceeding — mandatory for `on-stage` and `on-compaction`) or **`async`** (runtime fires the
-hook and continues immediately; only valid with `commit_policy: none`).
+proceeding — mandatory for `on-stage` and `on-compaction`) or **`async`** (runtime enqueues the
+event and continues immediately; only valid with `commit_policy: none`). An async hook is
+instantiated once per session and reused for every event, so state it keeps in memory persists
+across calls, and its calls are always serialized and delivered in dispatch order — never
+reordered or run concurrently with each other. Every async hook's outstanding work is finished
+before the session ends. See [Async hook execution](../reference/manifest-schema.md#hook-overflow)
+for queue and overflow behavior.
 
 **Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
 observability hooks), **`replace-context`** (runtime replaces conversation history; used for

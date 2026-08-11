@@ -63,8 +63,13 @@ pub const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 /// whole agent loop, so the capsule-wide default would let a wedged hook stall the session for
 /// most of ten minutes *per event*. Applies to blocking and async hooks alike, and only when
 /// the operator left `capabilities.limits.deadline_seconds` unset — an explicit value is
-/// honored verbatim for every guest, hooks included. See [`ExecutionLimits::resolve_for_hooks`].
+/// honored verbatim for every guest, hooks included. See [`ExecutionLimits::for_hook_calls`].
 pub const HOOK_DEFAULT_DEADLINE_SECONDS: u64 = 30;
+
+const _: () = assert!(
+    HOOK_DEFAULT_DEADLINE_SECONDS < DEFAULT_DEADLINE_SECONDS,
+    "a hook call must not be able to stall a session for the capsule-wide budget"
+);
 
 /// Fully-resolved execution limits for one session's guests: the manifest's
 /// `capabilities.limits` block with every omitted field replaced by its `DEFAULT_*`.
@@ -378,10 +383,6 @@ mod tests {
 
         assert_eq!(capsule.deadline_seconds, DEFAULT_DEADLINE_SECONDS);
         assert_eq!(hook.deadline_seconds, HOOK_DEFAULT_DEADLINE_SECONDS);
-        assert!(
-            HOOK_DEFAULT_DEADLINE_SECONDS < DEFAULT_DEADLINE_SECONDS,
-            "a hook call must not be able to stall a session for the capsule-wide budget"
-        );
         assert_eq!(hook.memory_bytes, capsule.memory_bytes);
         assert_eq!(hook.table_elements, capsule.table_elements);
         assert_eq!(hook.instances, capsule.instances);
