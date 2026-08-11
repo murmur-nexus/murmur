@@ -180,6 +180,7 @@ pub(crate) fn run_run(
             version: artifact.version.clone(),
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
+            on_overflow: artifact.on_overflow,
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -218,6 +219,7 @@ pub(crate) fn run_run(
                         version: entry.resolved_version.clone(),
                         runtime: artifact.runtime.clone(),
                         source: None,
+                        on_overflow: artifact.on_overflow,
                         capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {

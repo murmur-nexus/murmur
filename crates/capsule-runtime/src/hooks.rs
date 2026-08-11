@@ -5,10 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use wasmtime::{
-    component::{Component, Linker},
-    Store,
-};
+use wasmtime::{component::Linker, Store};
 use wasmtime_wasi::{
     DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
@@ -17,7 +14,10 @@ use wasmtime_wasi_http::{
     WasiHttpCtx,
 };
 
-use murmur_artifact::{HookBinding, HookConfig, HookExecutionMode, PACKED_MANIFEST_ENTRY};
+use murmur_artifact::{
+    HookBinding, HookConfig, HookExecutionMode, HookOverflowPolicy, PACKED_MANIFEST_ENTRY,
+};
+use tokio::sync::mpsc;
 
 use crate::{
     bindings::hook::exports::murmur::hook::lifecycle::{
@@ -56,28 +56,64 @@ fn missing_lifecycle_msg(subject: &str) -> String {
     )
 }
 
+/// Depth of every async hook's job queue.
+///
+/// Fixed in code rather than exposed as a manifest knob: the depth only decides how long a
+/// burst may outrun a hook before `on_overflow` starts applying, and that policy — not the
+/// buffer size — is the operator-facing choice. Generous enough that no realistic burst of
+/// lifecycle events reaches it while a healthy hook is keeping up; a queue that fills has a
+/// hook that is genuinely too slow, which is a fact to report, not to buffer harder.
+const ASYNC_HOOK_QUEUE_DEPTH: usize = 1024;
+
+/// Total budget for [`HookRuntime::drain_async_hooks`], shared across every async hook.
+///
+/// Bounds how long session teardown may wait for hooks that are still working — long enough
+/// for a queued session-end export to finish an HTTP round trip, short enough that a wedged
+/// hook cannot hold the process open. Whatever a hook has not finished by then is abandoned
+/// and reported (see [`FAULT_ARM_TIMEOUT`]).
+const ASYNC_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// [`DispatchFault::event`] for a fault raised by the session-end drain rather than by one
+/// lifecycle call — there is no single event to name when a whole queue ran out of time.
+const FAULT_EVENT_DRAIN: &str = "drain";
+
+/// [`DispatchFault::arm`] for a hook call that returned a genuine `Err`, which has no
+/// `hook-output` arm to name.
+const FAULT_ARM_ERROR: &str = "error";
+
+/// [`DispatchFault::arm`] for a lifecycle event discarded because an async hook's queue was
+/// full and its entry declares `on_overflow: drop`.
+const FAULT_ARM_QUEUE_OVERFLOW: &str = "queue-overflow";
+
+/// [`DispatchFault::arm`] for an async hook that was still working when the drain budget ran
+/// out.
+const FAULT_ARM_TIMEOUT: &str = "timeout";
+
 pub(crate) struct HookRuntime {
-    engine: wasmtime::Engine,
-    /// Execution limits applied to every hook store — retained because async hooks are
-    /// instantiated lazily, one fresh store per event, long after `new` returns.
-    limits: ExecutionLimits,
     /// Session directory — used for error log paths and mounted as "." in hook WASI contexts.
     workdir: PathBuf,
-    /// User-visible project directory — mounted as "/project" in hook WASI contexts
-    /// so hooks can read project files while still writing output to the session dir.
-    accessible_workdir: PathBuf,
     blocking_hooks: Vec<HookInstance>,
-    async_hooks: Vec<AsyncHookSpec>,
+    /// One entry per `execution_mode: async` hook: its queue and the worker draining it. The
+    /// instance itself lives inside that worker, instantiated once at [`Self::new`] exactly
+    /// like a blocking hook's, so hook-side state survives across events.
+    async_hooks: Vec<AsyncHookQueue>,
+    /// Faults raised off the `&mut self` dispatch path — by an async hook's worker task, or by
+    /// dispatch itself when a queue overflows. A channel rather than a direct push because a
+    /// worker runs concurrently with (and outlives the borrow of) the dispatch loop; folded
+    /// into [`Self::drain_dispatch_faults`] alongside [`Self::dispatch_faults`].
+    fault_tx: mpsc::UnboundedSender<DispatchFault>,
+    fault_rx: mpsc::UnboundedReceiver<DispatchFault>,
     context: SessionContextData,
     /// Backing for the `murmur:runtime/inference` host import. `None` when the
     /// capsule has no usable inference driver — `run-inference` then returns a
     /// clear `err` instead of the import failing to link.
     inference: Option<Arc<HookInferenceCtx>>,
     /// Unsupported-arm faults produced by blocking hooks since the last drain, in
-    /// dispatch order. Drained by the agent loop via [`Self::drain_dispatch_faults`]
-    /// and written to `trace.jsonl` as `hook_dispatch_error` events before each
-    /// `session_end` write. Mirrors the drain idiom used for `run-inference`
-    /// records (see [`Self::drain_inference_records`]).
+    /// dispatch order, plus drain-timeout faults. Drained by the agent loop via
+    /// [`Self::drain_dispatch_faults`] and written to `trace.jsonl` as `hook_dispatch_error`
+    /// events before each `session_end` write. Mirrors the drain idiom used for
+    /// `run-inference` records (see [`Self::drain_inference_records`]). Faults raised off
+    /// this path arrive through [`Self::fault_tx`] instead.
     dispatch_faults: Vec<DispatchFault>,
     started: Instant,
     total_input_tokens: u64,
@@ -184,20 +220,24 @@ fn format_dispatch_fault(hook_name: &str, event: &str, arm: &str) -> String {
     )
 }
 
-/// A blocking hook returned a non-`none` `hook-output` arm the event does not honor.
-/// Buffered by [`HookRuntime::dispatch`] and drained via
-/// [`HookRuntime::drain_dispatch_faults`] so the agent loop can write it to
-/// `trace.jsonl` as a `hook_dispatch_error` event. Faults from `on-stage` (which
-/// runs before the trace writer exists) and from async hooks (fire-and-forget) are
-/// logged but never buffered here — matching how those two paths already handle a
-/// genuine hook `Err`.
+/// Something went wrong dispatching one event to one hook, in a way the session survives.
+/// Buffered by [`HookRuntime`] and drained via [`HookRuntime::drain_dispatch_faults`] so the
+/// agent loop can write it to `trace.jsonl` as a `hook_dispatch_error` event.
+///
+/// Raised for a blocking hook's unsupported-arm return, and for all four ways an async hook
+/// can fail visibly: an unsupported arm, a genuine `Err`, a dropped event, and a drain
+/// timeout. Only `on-stage` faults stay log-only — that path runs during staging, before the
+/// trace writer exists.
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchFault {
-    /// Manifest name of the hook that returned the unsupported arm.
+    /// Manifest name of the hook the fault is attributed to.
     pub hook_name: String,
-    /// WIT lifecycle function name the arm was returned from (e.g. `on-tool-call`).
+    /// WIT lifecycle function name the fault arose from (e.g. `on-tool-call`), or
+    /// [`FAULT_EVENT_DRAIN`] for a fault not tied to a single call.
     pub event: String,
-    /// The unsupported `hook-output` arm name (e.g. `write-manifests`).
+    /// The unsupported `hook-output` arm name (e.g. `write-manifests`), or one of
+    /// [`FAULT_ARM_ERROR`] / [`FAULT_ARM_QUEUE_OVERFLOW`] / [`FAULT_ARM_TIMEOUT`] for a fault
+    /// with no arm to name.
     pub arm: String,
 }
 
@@ -211,14 +251,42 @@ struct HookInstance {
     funcs: HashMap<String, wasmtime::component::Func>,
 }
 
-/// Async hooks are not instantiated eagerly — a fresh instance is spawned per event.
-struct AsyncHookSpec {
+/// One async hook's dispatch endpoint, held by [`HookRuntime`] for the life of the session.
+///
+/// The hook's [`HookInstance`] is not here: it was moved into [`Self::worker`] at
+/// instantiation and stays there, so the only thing the agent loop ever does to an async hook
+/// is put a job on [`Self::tx`]. That is what makes `execution_mode: async` mean "off the
+/// critical path" — and, because the worker holds one instance for the whole session, what
+/// lets a hook accumulate state across events the way a blocking hook can.
+struct AsyncHookQueue {
     name: String,
-    config: HookConfig,
-    component: Component,
-    /// Retained from staging so each per-event instantiation applies the same grant a
-    /// blocking hook would get — there is no execution mode that escapes the capability model.
-    grant: HookCapabilityGrant,
+    /// The hook's own declared binding, copied out of its `HookConfig` at instantiation so
+    /// dispatch can filter events without reaching into the worker's instance.
+    binding: HookBinding,
+    /// The operator's declared full-queue policy for this hook.
+    on_overflow: HookOverflowPolicy,
+    /// Bounded FIFO of pending calls, [`ASYNC_HOOK_QUEUE_DEPTH`] deep. Dropping it is what
+    /// tells the worker to finish what it has and return; see
+    /// [`HookRuntime::drain_async_hooks`].
+    tx: mpsc::Sender<AsyncHookJob>,
+    /// The one task draining `tx`'s receiver, one call at a time and in order.
+    worker: tokio::task::JoinHandle<()>,
+    /// Events discarded because the queue was full under [`HookOverflowPolicy::Drop`].
+    /// Reported per event as a [`FAULT_ARM_QUEUE_OVERFLOW`] fault and summarized in the
+    /// hook's log at drain time.
+    dropped: u64,
+}
+
+/// One queued lifecycle call for an async hook.
+///
+/// Carries the pieces of session state a hook call needs that only the `&mut self` dispatch
+/// path can read, captured at *enqueue* time: a call that waits in the queue must still
+/// report the elapsed time and totals as of the event, not as of whenever the worker reached
+/// it.
+struct AsyncHookJob {
+    event: HookEvent,
+    elapsed: Duration,
+    totals: HookTotals,
 }
 
 struct HookStoreState {
@@ -573,9 +641,20 @@ where
 }
 
 impl HookRuntime {
-    /// Instantiate all blocking hook components; register async specs without instantiating.
+    /// Instantiate every hook component — blocking and async alike — exactly once, and start
+    /// one worker task per async hook to drain that hook's queue.
+    ///
+    /// Both modes go through the same [`instantiate_hook`] call with the same `env_vars`, so
+    /// an async hook gets the session's real environment (`MURMUR_OTEL_ENDPOINT` and friends)
+    /// and keeps one `Store` — one linear memory, one set of guest-side globals — for the
+    /// whole session. Only what happens *after* instantiation differs: a blocking hook's
+    /// instance is called inline by `dispatch`, an async hook's is owned by its worker.
     ///
     /// `instantiate_async` is required because the engine has `async_support(true)`.
+    ///
+    /// Must be called from inside a `tokio::task::LocalSet` whenever any staged hook is
+    /// async: the workers are `spawn_local` tasks, because a `Store<HookStoreState>` is not
+    /// `Send`. The session's `LocalSet` in `runtime.rs` is that context.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         engine: &wasmtime::Engine,
@@ -589,41 +668,48 @@ impl HookRuntime {
     ) -> Result<Self, RuntimeError> {
         let mut blocking_hooks = Vec::new();
         let mut async_hooks = Vec::new();
+        let (fault_tx, fault_rx) = mpsc::unbounded_channel();
 
         for staged in staged_hooks {
+            let instance = instantiate_hook(
+                engine,
+                accessible_workdir,
+                &staged,
+                &env_vars,
+                limits,
+                inference.clone(),
+            )
+            .await?;
+
             match staged.config.execution_mode {
+                HookExecutionMode::Blocking => blocking_hooks.push(instance),
                 HookExecutionMode::Async => {
-                    async_hooks.push(AsyncHookSpec {
-                        name: staged.name,
-                        config: staged.config,
-                        component: staged.component,
-                        grant: staged.grant,
+                    let (tx, rx) = mpsc::channel(ASYNC_HOOK_QUEUE_DEPTH);
+                    let worker = tokio::task::spawn_local(run_async_hook_worker(
+                        instance,
+                        rx,
+                        context.clone(),
+                        workdir.to_path_buf(),
+                        fault_tx.clone(),
+                    ));
+                    async_hooks.push(AsyncHookQueue {
+                        name: staged.name.clone(),
+                        binding: staged.config.binding.clone(),
+                        on_overflow: staged.on_overflow,
+                        tx,
+                        worker,
+                        dropped: 0,
                     });
-                }
-                HookExecutionMode::Blocking => {
-                    let instance =
-                        instantiate_blocking_hook(
-                            engine,
-                            workdir,
-                            accessible_workdir,
-                            &staged,
-                            &env_vars,
-                            limits,
-                            inference.clone(),
-                        )
-                        .await?;
-                    blocking_hooks.push(instance);
                 }
             }
         }
 
         Ok(Self {
-            engine: engine.clone(),
-            limits,
             workdir: workdir.to_path_buf(),
-            accessible_workdir: accessible_workdir.to_path_buf(),
             blocking_hooks,
             async_hooks,
+            fault_tx,
+            fault_rx,
             context,
             inference,
             dispatch_faults: Vec::new(),
@@ -655,14 +741,93 @@ impl HookRuntime {
             .unwrap_or_default()
     }
 
-    /// Take every unsupported-arm fault a blocking hook produced since the last
-    /// drain. The agent loop calls this immediately before each `session_end` write
-    /// and records each one through the session's `TraceWriter` as a
-    /// `hook_dispatch_error` event, so no fault is lost regardless of which exit path
-    /// the session takes. `on-stage` and async faults are never buffered here (they
-    /// are logged only), so this never carries them.
+    /// Take every dispatch fault produced since the last drain, from both sources: those
+    /// buffered inline by [`Self::dispatch`] and those sent over [`Self::fault_tx`] by an
+    /// async hook's worker. The agent loop calls this immediately before each `session_end`
+    /// write and records each one through the session's `TraceWriter` as a
+    /// `hook_dispatch_error` event, so no fault is lost regardless of which exit path the
+    /// session takes. `on-stage` faults are logged only and never appear here.
     pub(crate) fn drain_dispatch_faults(&mut self) -> Vec<DispatchFault> {
-        std::mem::take(&mut self.dispatch_faults)
+        let mut faults = std::mem::take(&mut self.dispatch_faults);
+        while let Ok(fault) = self.fault_rx.try_recv() {
+            faults.push(fault);
+        }
+        faults
+    }
+
+    /// Finish every async hook's outstanding work, under one shared bounded budget.
+    ///
+    /// Closing a hook's queue is what ends its worker: the worker completes the jobs already
+    /// enqueued, in order, sees the channel close, and returns. This awaits that — which is
+    /// the whole point, because the session's `LocalSet` is torn down immediately afterwards
+    /// and would otherwise drop a worker mid-call, taking a queued `on-session-end` export
+    /// with it.
+    ///
+    /// Bounded by [`ASYNC_HOOK_DRAIN_TIMEOUT`] across all hooks together, so N slow hooks
+    /// cannot multiply the delay. A hook that runs out of budget is abandoned, logged, and
+    /// recorded as a [`FAULT_ARM_TIMEOUT`] fault for `trace.jsonl` — call this *before*
+    /// `drain_dispatch_faults` so those faults are still picked up.
+    ///
+    /// Idempotent: it takes the queues, so a second call has nothing left to drain. Async
+    /// hooks dispatched to after it are silently skipped, which is correct at session end and
+    /// is the only place it is called.
+    pub(crate) async fn drain_async_hooks(&mut self) {
+        self.drain_async_hooks_within(ASYNC_HOOK_DRAIN_TIMEOUT)
+            .await;
+    }
+
+    /// [`Self::drain_async_hooks`] with an explicit budget, so the timeout path can be
+    /// exercised without waiting out the production one.
+    async fn drain_async_hooks_within(&mut self, budget: Duration) {
+        let queues = std::mem::take(&mut self.async_hooks);
+        if queues.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + budget;
+
+        for queue in queues {
+            let AsyncHookQueue {
+                name,
+                tx,
+                mut worker,
+                dropped,
+                ..
+            } = queue;
+            drop(tx);
+
+            if dropped > 0 {
+                let summary = format!(
+                    "hook '{name}' discarded {dropped} lifecycle event(s): its queue \
+                     ({ASYNC_HOOK_QUEUE_DEPTH} deep) was full and the capsule manifest declares \
+                     'on_overflow: drop' for this hook"
+                );
+                log_hook_error(&self.workdir, &name, &summary).await;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, &mut worker).await {
+                // A worker only returns after its queue is empty, so this is the drained case.
+                Ok(Ok(())) => {}
+                Ok(Err(join_error)) => {
+                    let message = format!("hook '{name}' worker task failed: {join_error}");
+                    log_hook_error(&self.workdir, &name, &message).await;
+                }
+                Err(_) => {
+                    worker.abort();
+                    let message = format!(
+                        "hook '{name}' did not finish its queued lifecycle calls within the \
+                         {}ms session-end drain budget; the remaining calls were abandoned",
+                        budget.as_millis()
+                    );
+                    log_hook_error(&self.workdir, &name, &message).await;
+                    self.dispatch_faults.push(DispatchFault {
+                        hook_name: name,
+                        event: FAULT_EVENT_DRAIN.to_string(),
+                        arm: FAULT_ARM_TIMEOUT.to_string(),
+                    });
+                }
+            }
+        }
     }
 
     /// Dispatch `event` to all bound hooks. Returns every artifact emitted by
@@ -673,7 +838,8 @@ impl HookRuntime {
     }
 
     /// Shared dispatch path used by every Lifecycle Event. Iterates the blocking
-    /// hooks (binding-filtered), then spawns each matching async hook fire-and-forget.
+    /// hooks (binding-filtered) and calls each inline, then enqueues the event on each
+    /// matching async hook's queue and returns without waiting for any of them.
     /// Returns `(artifacts, replacement, first_error, reopen)`: `artifacts` collects every
     /// `on-inference` `HookOutput::Artifact`; `replacement` is the first `on-compaction`
     /// `HookOutput::ReplaceContext`; `first_error` is the message of the first bound
@@ -772,41 +938,42 @@ impl HookRuntime {
         }
         self.dispatch_faults.append(&mut faults);
 
-        for spec in &self.async_hooks {
-            if !binding_matches_event(&spec.config.binding, &event) {
+        // Async hooks: enqueue and move on. The call itself runs later on that hook's own
+        // worker, against the instance it has been reusing since `new` — nothing here waits
+        // for a hook to answer, which is what `execution_mode: async` buys.
+        let elapsed = self.started.elapsed();
+        for queue in &mut self.async_hooks {
+            if !binding_matches_event(&queue.binding, &event) {
                 continue;
             }
-            let engine = self.engine.clone();
-            let session_workdir = self.workdir.clone();
-            let accessible_workdir = self.accessible_workdir.clone();
-            let component = spec.component.clone();
-            let name = spec.name.clone();
-            let context = self.context.clone();
-            let event = event.clone();
-            let elapsed = self.started.elapsed();
-            let limits = self.limits;
-            let inference = self.inference.clone();
-            let grant = spec.grant.clone();
-
-            tokio::task::spawn_local(async move {
-                if let Err(err) = call_async_hook(
-                    &engine,
-                    &accessible_workdir,
-                    &component,
-                    &name,
-                    &context,
-                    &event,
-                    elapsed,
-                    totals,
-                    limits,
-                    inference,
-                    &grant,
-                )
-                .await
-                {
-                    log_hook_error(&session_workdir, &name, &err).await;
+            let job = AsyncHookJob {
+                event: event.clone(),
+                elapsed,
+                totals,
+            };
+            match queue.on_overflow {
+                // Never blocks: a full queue means the hook cannot keep up, and the operator
+                // asked for the agent loop to stay moving. The discard is counted and traced.
+                HookOverflowPolicy::Drop => match queue.tx.try_send(job) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(job)) => {
+                        queue.dropped = queue.dropped.saturating_add(1);
+                        let _ = self.fault_tx.send(DispatchFault {
+                            hook_name: queue.name.clone(),
+                            event: event_fn_name(&job.event).to_string(),
+                            arm: FAULT_ARM_QUEUE_OVERFLOW.to_string(),
+                        });
+                    }
+                    // Only reachable after `drain_async_hooks` has closed the queue, or if the
+                    // worker died — both already reported at their own site.
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                },
+                // The operator chose losslessness over latency: wait for the worker to make
+                // room, putting this hook back on the critical path for as long as it is full.
+                HookOverflowPolicy::Block => {
+                    let _ = queue.tx.send(job).await;
                 }
-            });
+            }
         }
 
         (artifacts, replacement, first_error, reopen)
@@ -826,7 +993,7 @@ impl HookRuntime {
     /// `HookEvent::Compaction` and reads both the `replacement` and `first_error`
     /// halves of the result. An error wins over a replacement produced by some other
     /// hook in the same dispatch — a partially-failed compaction is still a failure.
-    /// Async hooks fire-and-forget; their output is always discarded. Checkpoint
+    /// An async hook is only handed the event; its output is always discarded. Checkpoint
     /// signing after a successful replacement happens inside `dispatch`.
     pub(crate) async fn dispatch_compaction(
         &mut self,
@@ -856,8 +1023,8 @@ impl HookRuntime {
     /// did. A thin wrapper over the shared [`Self::dispatch`] path, mirroring
     /// [`Self::dispatch_compaction`]: it builds a `HookEvent::TaskEnd` and reads only
     /// the `reopen` half of the four-tuple. `on-task-end` honors no artifact or
-    /// replacement arm, so those halves are discarded; async hooks still fire
-    /// fire-and-forget. A hook-returned `Err` is logged per-hook inside `dispatch`
+    /// replacement arm, so those halves are discarded; async hooks are still only
+    /// enqueued. A hook-returned `Err` is logged per-hook inside `dispatch`
     /// and does not abort the task, matching `emit`.
     pub(crate) async fn dispatch_task_end(
         &mut self,
@@ -891,9 +1058,14 @@ fn binding_matches_event(binding: &HookBinding, event: &HookEvent) -> bool {
     }
 }
 
-async fn instantiate_blocking_hook(
+/// Instantiate one staged hook against its own `Store`, resolve its lifecycle exports, and
+/// hand back the reusable instance.
+///
+/// The single instantiation path for both execution modes — a hook's store, WASI context,
+/// capability grant and dispatch table are built the same way whether the runtime will call
+/// it inline or from a worker task. Called once per hook, from [`HookRuntime::new`].
+async fn instantiate_hook(
     engine: &wasmtime::Engine,
-    _workdir: &Path,
     project_dir: &Path,
     staged: &StagedHookArtifact,
     env_vars: &HookEnvVars<'_>,
@@ -1268,67 +1440,50 @@ fn event_fn_name(event: &HookEvent) -> &'static str {
     }
 }
 
-/// Fresh-instantiation call for async hooks (output discarded).
-#[allow(clippy::too_many_arguments)]
-async fn call_async_hook(
-    engine: &wasmtime::Engine,
-    root_dir: &Path,
-    component: &Component,
-    name: &str,
-    context: &SessionContextData,
-    event: &HookEvent,
-    elapsed: Duration,
-    totals: HookTotals,
-    limits: ExecutionLimits,
-    inference: Option<Arc<HookInferenceCtx>>,
-    grant: &HookCapabilityGrant,
-) -> Result<(), String> {
-    let mut linker: Linker<HookStoreState> = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
-    wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
-    add_inference_to_linker(&mut linker, format!("hook:{name}"), inference)?;
-
-    let env = HookEnvVars::default();
-    let state = HookStoreState {
-        limits: limits.limiter(),
-        table: ResourceTable::new(),
-        wasi: build_wasi_ctx(root_dir, &env, grant).map_err(|e| e.to_string())?,
-        http: WasiHttpCtx::new(),
-        http_hooks: NetworkPolicyHooks {
-            network_allow_rules: grant.network_allow_rules.clone(),
-        },
-    };
-    let mut store = Store::new(engine, state);
-    store.limiter(|state| &mut state.limits);
-    store.set_epoch_deadline(limits.deadline_ticks());
-
-    let instance = linker
-        .instantiate_async(&mut store, component)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let obs_idx =
-        resolve_lifecycle_iface(&instance, &mut store).ok_or_else(|| missing_lifecycle_msg(name))?;
-
-    let funcs = resolve_hook_fns(&instance, &mut store, &obs_idx, |fn_name| {
-        format!("hook {name} missing {LIFECYCLE_IFACE}#{fn_name}")
-    })?;
-
-    let mut tmp = HookInstance {
-        name: name.to_string(),
-        config: HookConfig::default(),
-        funcs,
-        store,
-    };
-    // Async hooks fire-and-forget; any committable output is intentionally discarded.
-    // An unsupported-arm result is routed to the same `Err` channel a genuine hook
-    // error takes, so the caller's existing `log_hook_error` records it once — logged
-    // but never traced, matching how async errors are already handled.
-    match call_hook(&mut tmp, context, event, elapsed, totals).await? {
-        HookCallResult::UnsupportedArm { event: ev, arm } => {
-            Err(format_dispatch_fault(name, &ev, &arm))
+/// The body of one async hook's worker task: drain `jobs` forever, one call at a time.
+///
+/// Serialization is the point, not an implementation detail — `recv().await` hands over one
+/// job, the hook call runs to completion against the single reused `instance`, and only then
+/// is the next job taken. So calls to a given async hook happen in dispatch order and never
+/// overlap, which is what makes a `Store` (and any state the guest keeps in it) safe to reuse.
+///
+/// Returns when the queue is closed and empty, i.e. when [`HookRuntime::drain_async_hooks`]
+/// drops the sender.
+async fn run_async_hook_worker(
+    mut instance: HookInstance,
+    mut jobs: mpsc::Receiver<AsyncHookJob>,
+    context: SessionContextData,
+    workdir: PathBuf,
+    faults: mpsc::UnboundedSender<DispatchFault>,
+) {
+    while let Some(job) = jobs.recv().await {
+        match call_hook(&mut instance, &context, &job.event, job.elapsed, job.totals).await {
+            Ok(HookCallResult::UnsupportedArm { event, arm }) => {
+                log_hook_error(
+                    &workdir,
+                    &instance.name,
+                    &format_dispatch_fault(&instance.name, &event, &arm),
+                )
+                .await;
+                let _ = faults.send(DispatchFault {
+                    hook_name: instance.name.clone(),
+                    event,
+                    arm,
+                });
+            }
+            // Any committable output an async hook returns is discarded here, including an
+            // arm this event would honor for a blocking hook: nothing waited for the answer,
+            // so there is nowhere left to apply it. Permanent, not a gap.
+            Ok(_) => {}
+            Err(error) => {
+                log_hook_error(&workdir, &instance.name, &error).await;
+                let _ = faults.send(DispatchFault {
+                    hook_name: instance.name.clone(),
+                    event: event_fn_name(&job.event).to_string(),
+                    arm: FAULT_ARM_ERROR.to_string(),
+                });
+            }
         }
-        _ => Ok(()),
     }
 }
 
@@ -1415,6 +1570,7 @@ mod tests {
     use super::*;
     use crate::inference_import::INFERENCE_IFACE_VERSIONED;
     use tempfile::TempDir;
+    use wasmtime::component::Component;
 
     /// A retired lifecycle instance name. The host accepts [`LIFECYCLE_IFACE`] and
     /// nothing else, so a double exporting this must fail to resolve — that is what
@@ -1484,6 +1640,7 @@ mod tests {
             component,
             config: HookConfig::default(),
             grant,
+            on_overflow: Default::default(),
         }
     }
 
@@ -1512,6 +1669,27 @@ mod tests {
         staged: Vec<StagedHookArtifact>,
         limits: ExecutionLimits,
     ) -> Result<HookRuntime, RuntimeError> {
+        new_with_hooks_full(
+            engine,
+            workdir,
+            accessible,
+            staged,
+            limits,
+            HookEnvVars::default(),
+        )
+        .await
+    }
+
+    /// [`new_with_hooks_limited`] with an explicit environment, so the env-delivery suite can
+    /// ask for the non-default values a real session passes in.
+    async fn new_with_hooks_full(
+        engine: &wasmtime::Engine,
+        workdir: &Path,
+        accessible: &Path,
+        staged: Vec<StagedHookArtifact>,
+        limits: ExecutionLimits,
+        env_vars: HookEnvVars<'_>,
+    ) -> Result<HookRuntime, RuntimeError> {
         HookRuntime::new(
             engine,
             workdir,
@@ -1524,7 +1702,7 @@ mod tests {
                 model: "test-model".to_string(),
                 capabilities: Vec::new(),
             },
-            HookEnvVars::default(),
+            env_vars,
             limits,
             None,
         )
@@ -1623,6 +1801,7 @@ mod tests {
                 ..HookConfig::default()
             },
             grant: HookCapabilityGrant::default(),
+            on_overflow: Default::default(),
         }
     }
 
@@ -3175,46 +3354,37 @@ mod tests {
         );
     }
 
-    /// No exempt instantiation path — async hooks. Each per-event instantiation applies the
-    /// grant carried on its `AsyncHookSpec`.
+    /// No exempt instantiation path — async hooks. The single instance built for an async
+    /// hook at `HookRuntime::new` applies the grant carried on its `StagedHookArtifact`,
+    /// under the project dir, exactly as the blocking path does: how often the grant is
+    /// applied differs between the two paths, whether it is applied does not.
     #[test]
     fn async_hook_instantiation_applies_the_grant() {
-        let root = TempDir::new().unwrap();
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
         let engine = hook_test_engine();
-        let component = hook_double(&engine, &REQUIRED_HOOK_FNS);
+        let staged = staged_async_granted(
+            "async-hook",
+            HookBinding::All,
+            hook_double(&engine, &REQUIRED_HOOK_FNS),
+            grant_of(None, Some("hook-state")),
+            HookOverflowPolicy::Drop,
+        );
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let _ = call_async_hook(
-                &engine,
-                root.path(),
-                &component,
-                "async-hook",
-                &SessionContextData {
-                    capsule_name: "test-capsule".to_string(),
-                    capsule_version: "0.1.0".to_string(),
-                    session_id: "sess-test".to_string(),
-                    model: "test-model".to_string(),
-                    capabilities: Vec::new(),
-                },
-                &HookEvent::SessionStart,
-                Duration::from_secs(0),
-                HookTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    tool_calls: 0,
-                    shell_calls: 0,
-                },
-                ExecutionLimits::default(),
-                None,
-                &grant_of(None, Some("hook-state")),
-            )
-            .await;
+        run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("a granted async hook instantiates");
+            hooks.drain_async_hooks().await;
         });
 
         assert!(
-            root.path().join("hook-state").is_dir(),
+            accessible.path().join("hook-state").is_dir(),
             "the async path preopens the scope like the other two"
+        );
+        assert!(
+            !session.path().join("hook-state").exists(),
+            "the session dir is not an async hook's root and must stay untouched"
         );
     }
 
@@ -3830,96 +4000,30 @@ artifacts:
         );
     }
 
-    /// Scenario (e): an async hook returning an unsupported arm is routed to the
-    /// same `Err` channel a genuine async error takes — `call_async_hook` returns
-    /// `Err` naming the event and arm, which the `dispatch` spawn site logs once via
-    /// the unchanged `log_hook_error` path (never traced).
+    /// Scenario (e): an async hook returning a non-`none` arm the event does not honor is
+    /// logged exactly once to `logs/hook-<name>.log` *and* recorded as a dispatch fault, so
+    /// it reaches `trace.jsonl` as `hook_dispatch_error` on the same terms a blocking hook's
+    /// fault does. The drain awaits the worker directly, so nothing is left in flight to
+    /// race with the assertion.
     #[test]
-    fn async_hook_unsupported_arm_routes_to_error_channel() {
-        let root = TempDir::new().unwrap();
-        let engine = hook_test_engine();
-        // arm 2 = write-manifests, unsupported for on-tool-call.
-        let component = hook_tool_call_arm_double(&engine, 2);
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = rt.block_on(async {
-            call_async_hook(
-                &engine,
-                root.path(),
-                &component,
-                "async-hook",
-                &SessionContextData {
-                    capsule_name: "test-capsule".to_string(),
-                    capsule_version: "0.1.0".to_string(),
-                    session_id: "sess-test".to_string(),
-                    model: "test-model".to_string(),
-                    capabilities: Vec::new(),
-                },
-                &tool_call_event(),
-                Duration::from_secs(0),
-                HookTotals {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    tool_calls: 0,
-                    shell_calls: 0,
-                },
-                ExecutionLimits::default(),
-                None,
-                &HookCapabilityGrant::default(),
-            )
-            .await
-            .expect_err("an unsupported arm must surface as an Err on the async path")
-        });
-
-        assert!(err.contains("on-tool-call"), "async fault names the event: {err}");
-        assert!(err.contains("write-manifests"), "async fault names the arm: {err}");
-    }
-
-    /// Scenario (e), full path: an async hook (`execution_mode: async`) returning an
-    /// unsupported arm is logged exactly once to `logs/hook-<name>.log` via the
-    /// fire-and-forget `spawn_local` site in `dispatch`, and buffers no fault (async
-    /// faults are never traced).
-    #[test]
-    fn async_hook_unsupported_arm_logged_once_and_not_buffered() {
+    fn async_hook_unsupported_arm_is_logged_and_traced() {
         let session = TempDir::new().unwrap();
         let accessible = TempDir::new().unwrap();
         let engine = hook_test_engine();
-        let component = hook_tool_call_arm_double(&engine, 2);
+        // arm 2 = write-manifests, unsupported for on-tool-call.
+        let staged = staged_async(
+            "async-tool",
+            HookBinding::OnToolCall,
+            hook_tool_call_arm_double(&engine, 2),
+        );
 
-        let staged = StagedHookArtifact {
-            name: "async-tool".to_string(),
-            version: "0.0.1".to_string(),
-            component,
-            config: HookConfig {
-                binding: HookBinding::OnToolCall,
-                execution_mode: HookExecutionMode::Async,
-                ..HookConfig::default()
-            },
-            grant: HookCapabilityGrant::default(),
-        };
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, async {
+        let faults = run_local(async {
             let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
                 .await
                 .expect("async double instantiates");
             hooks.emit(session.path(), tool_call_event()).await;
-            // The async hook is fire-and-forget via spawn_local; yield until it has
-            // run to completion and logged (bounded so a genuine failure still ends).
-            for _ in 0..2000 {
-                if hook_log_lines(session.path(), "async-tool") >= 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                hooks.drain_dispatch_faults().is_empty(),
-                "async faults are logged but never buffered for the trace"
-            );
+            hooks.drain_async_hooks().await;
+            hooks.drain_dispatch_faults()
         });
 
         assert_eq!(
@@ -3927,6 +4031,10 @@ artifacts:
             1,
             "the async unsupported-arm fault is logged exactly once"
         );
+        assert_eq!(faults.len(), 1, "and reaches the trace path exactly once");
+        assert_eq!(faults[0].hook_name, "async-tool");
+        assert_eq!(faults[0].event, "on-tool-call");
+        assert_eq!(faults[0].arm, "write-manifests");
     }
 
     /// The honored-arm table has exactly one entry per WIT lifecycle function, and
@@ -3959,5 +4067,678 @@ artifacts:
                 );
             }
         }
+    }
+
+    // ── Async hooks: one reused instance, one serialized queue, a guaranteed drain ──
+
+    /// Run `body` on a current-thread runtime inside a `LocalSet` — the shape the session's
+    /// agent loop runs in. Async hook workers are `spawn_local` tasks, so `HookRuntime::new`
+    /// needs this context whenever a staged hook is async.
+    fn run_local<F: std::future::Future>(body: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime builds");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, body)
+    }
+
+    /// A staged `execution_mode: async` hook with the default (deny-everything) grant and the
+    /// default `on_overflow: drop`.
+    fn staged_async(name: &str, binding: HookBinding, component: Component) -> StagedHookArtifact {
+        staged_async_granted(
+            name,
+            binding,
+            component,
+            HookCapabilityGrant::default(),
+            HookOverflowPolicy::Drop,
+        )
+    }
+
+    /// [`staged_async`] with an explicit grant and overflow policy.
+    fn staged_async_granted(
+        name: &str,
+        binding: HookBinding,
+        component: Component,
+        grant: HookCapabilityGrant,
+        on_overflow: HookOverflowPolicy,
+    ) -> StagedHookArtifact {
+        StagedHookArtifact {
+            name: name.to_string(),
+            version: "0.0.1".to_string(),
+            component,
+            config: HookConfig {
+                binding,
+                execution_mode: HookExecutionMode::Async,
+                ..HookConfig::default()
+            },
+            grant,
+            on_overflow,
+        }
+    }
+
+    /// Guest address of [`hook_marker_double`]'s history buffer. Above the fixed address its
+    /// `realloc` hands out, so lowering an event's strings into the guest cannot overwrite the
+    /// history the test reads back.
+    const MARKER_BUFFER: i32 = 4096;
+
+    /// A double that records its own call history in guest memory and reports it once, at the
+    /// end.
+    ///
+    /// Each call appends one byte to a buffer held in the instance's linear memory — `S` for
+    /// `on-session-start`, `T` for `on-tool-call`, `E` for `on-session-end` — and returns
+    /// `ok(none)`. `on-session-end` additionally returns `err(<the whole buffer>)`, which
+    /// `log_hook_error` writes verbatim as the single line of `logs/hook-<name>.log`.
+    ///
+    /// So one log line answers three questions at once: whether the same instance (and
+    /// therefore the same linear memory) was reused across events, in what order the calls
+    /// actually ran, and how many of them ran at all. A hook re-instantiated per event would
+    /// report a one-character history; a reordered or interleaved queue would spell a
+    /// different string.
+    fn hook_marker_double(engine: &wasmtime::Engine) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| !matches!(**n, "on-session-start" | "on-tool-call" | "on-session-end"))
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = LIFECYCLE_IFACE;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (global $n (mut i32) (i32.const 0))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 1024)
+    ;; Append one marker byte and return ok(none): discriminant 0 (ok) at 128,
+    ;; hook-output discriminant 0 (none) at 132.
+    (func $mark (param $ch i32)
+      (i32.store8 (i32.add (i32.const {MARKER_BUFFER}) (global.get $n)) (local.get $ch))
+      (global.set $n (i32.add (global.get $n) (i32.const 1))))
+    (func $ok (result i32)
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const 0))
+      (i32.const 128))
+    (func (export "onstart") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      (call $mark (i32.const 83))
+      (call $ok))
+    (func (export "ontool") (param i32 i32 i32 i64 i64 i64 i32 i32) (result i32)
+      (call $mark (i32.const 84))
+      (call $ok))
+    ;; err(<history>): discriminant 1 at 128, string (ptr,len) at 132/136.
+    (func (export "onend") (param i32 i64 i64 i32 i32 i64 i32 i32) (result i32)
+      (call $mark (i32.const 69))
+      (i32.store (i32.const 128) (i32.const 1))
+      (i32.store (i32.const 132) (i32.const {MARKER_BUFFER}))
+      (i32.store (i32.const 136) (global.get $n))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)))
+  (type $session-context (record
+    (field "capsule-name" string)
+    (field "capsule-version" string)
+    (field "session-id" string)
+    (field "model" string)
+    (field "capabilities" (list string))))
+  (type $tool-event (record
+    (field "turn" u32)
+    (field "tool-name" string)
+    (field "input-bytes" u64)
+    (field "output-bytes" u64)
+    (field "duration-ms" u64)
+    (field "status" string)))
+  (type $session-end-event (record
+    (field "total-turns" u32)
+    (field "total-input-tokens" u64)
+    (field "total-output-tokens" u64)
+    (field "total-tool-calls" u32)
+    (field "total-shell-calls" u32)
+    (field "duration-ms" u64)
+    (field "exit-status" string)))
+  (type $fs (func (param "ctx" $session-context) (result (result $hook-output (error string)))))
+  (type $ft (func (param "event" $tool-event) (result (result $hook-output (error string)))))
+  (type $fe (func (param "event" $session-end-event) (result (result $hook-output (error string)))))
+
+  (func $os (type $fs)
+    (canon lift (core func $i "onstart") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $ot (type $ft)
+    (canon lift (core func $i "ontool") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $oe (type $fe)
+    (canon lift (core func $i "onend") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "session-context" (type $session-context))
+    (export "tool-event" (type $tool-event))
+    (export "session-end-event" (type $session-end-event))
+    (export "on-session-start" (func $os))
+    (export "on-tool-call" (func $ot))
+    (export "on-session-end" (func $oe))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("marker component WAT parses");
+        Component::new(engine, &bytes).expect("marker component double compiles")
+    }
+
+    /// The single line a [`hook_marker_double`] wrote: its whole call history.
+    fn marker_history(session: &Path, hook_name: &str) -> String {
+        let path = session.join("logs").join(format!("hook-{hook_name}.log"));
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} must exist: {e}", path.display()));
+        contents.trim_end().to_string()
+    }
+
+    /// Invariant: an async hook is instantiated once and reused, so state it accumulates in
+    /// its linear memory survives across lifecycle events. Two *different* events reach the
+    /// same instance; the history it reports at session end spells both, which a per-event
+    /// re-instantiation could not produce.
+    #[test]
+    fn async_hook_reuses_one_instance_across_events() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async("stateful", HookBinding::All, hook_marker_double(&engine));
+
+        run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates once, at new");
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks.emit(session.path(), tool_call_event()).await;
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::SessionEnd {
+                        total_turns: 1,
+                        exit_status: "ok".to_string(),
+                    },
+                )
+                .await;
+            hooks.drain_async_hooks().await;
+        });
+
+        assert_eq!(
+            marker_history(session.path(), "stateful"),
+            "STE",
+            "the second and third calls must see the state the first left behind"
+        );
+    }
+
+    /// Invariant: one queue, one worker, one call at a time — the order the hook observes is
+    /// the order the agent loop dispatched in. The dispatch calls below return without ever
+    /// yielding to the worker, so every job is queued before any of them runs.
+    #[test]
+    fn async_hook_calls_are_serialized_in_dispatch_order() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async("ordered", HookBinding::All, hook_marker_double(&engine));
+
+        run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            hooks.emit(session.path(), tool_call_event()).await;
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks.emit(session.path(), tool_call_event()).await;
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::SessionEnd {
+                        total_turns: 2,
+                        exit_status: "ok".to_string(),
+                    },
+                )
+                .await;
+            hooks.drain_async_hooks().await;
+        });
+
+        assert_eq!(
+            marker_history(session.path(), "ordered"),
+            "TSTE",
+            "the hook must observe exactly the dispatch order, with no interleaving"
+        );
+    }
+
+    /// A double that reports the first environment variable of its WASI context back to the
+    /// host as its `on-session-start` error string, so the test reads the value the *guest*
+    /// actually sees rather than a host-side stand-in.
+    ///
+    /// [`build_wasi_ctx`] injects `MURMUR_OTEL_ENDPOINT` first, so entry 0 is that endpoint
+    /// whenever the session declares one. An empty environment reports `no-env`, which is why
+    /// a hook that was handed `HookEnvVars::default()` cannot be mistaken for one that was
+    /// handed the real thing.
+    fn hook_env_probe_double(engine: &wasmtime::Engine) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-session-start")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = LIFECYCLE_IFACE;
+        let wat = format!(
+            r#"(component
+  (import "wasi:cli/environment@0.2.12" (instance $envi
+    (export "get-environment" (func (result (list (tuple string string)))))))
+
+  ;; The memory must exist before `get-environment` can be lowered against it, and the
+  ;; lowered function must exist before the module using it can be instantiated — hence
+  ;; the split into an allocator module and a body module.
+  (core module $alloc
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 1024))
+    (data (i32.const 700) "no-env")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $r i32)
+      (global.set $bump
+        (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (local.set $r (global.get $bump))
+      (global.set $bump (i32.add (global.get $bump) (local.get 3)))
+      (local.get $r))
+  )
+  (core instance $a (instantiate $alloc))
+  (alias core export $a "memory" (core memory $mem))
+  (alias core export $a "realloc" (core func $realloc))
+  (core func $get-env
+    (canon lower (func $envi "get-environment")
+      (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "host" "memory" (memory 1))
+    (import "host" "get-environment" (func $get_env (param i32)))
+    ;; err(<first env value>): result discriminant 1 at 128, string (ptr,len) at 132/136.
+    (func (export "onstart") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      (local $base i32)
+      (call $get_env (i32.const 512))
+      (local.set $base (i32.load (i32.const 512)))
+      (i32.store (i32.const 128) (i32.const 1))
+      (if (i32.eqz (i32.load (i32.const 516)))
+        (then
+          (i32.store (i32.const 132) (i32.const 700))
+          (i32.store (i32.const 136) (i32.const 6)))
+        (else
+          (i32.store (i32.const 132)
+            (i32.load (i32.add (local.get $base) (i32.const 8))))
+          (i32.store (i32.const 136)
+            (i32.load (i32.add (local.get $base) (i32.const 12))))))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $imports
+    (export "memory" (memory $mem))
+    (export "get-environment" (func $get-env))
+  )
+  (core instance $i (instantiate $m (with "host" (instance $imports))))
+
+  (type $message (record (field "role" string) (field "content" string)))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)))
+  (type $session-context (record
+    (field "capsule-name" string)
+    (field "capsule-version" string)
+    (field "session-id" string)
+    (field "model" string)
+    (field "capabilities" (list string))))
+  (type $fs (func (param "ctx" $session-context) (result (result $hook-output (error string)))))
+
+  (func $os (type $fs)
+    (canon lift (core func $i "onstart") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "session-context" (type $session-context))
+    (export "on-session-start" (func $os))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("env-probe component WAT parses");
+        Component::new(engine, &bytes).expect("env-probe component double compiles")
+    }
+
+    /// Invariant: an async hook is built with the session's real [`HookEnvVars`], not
+    /// `HookEnvVars::default()`. This is what makes an async OTel exporter possible at all —
+    /// without it the hook never learns its endpoint.
+    #[test]
+    fn async_hook_receives_the_session_environment() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async(
+            "exporter",
+            HookBinding::OnSessionStart,
+            hook_env_probe_double(&engine),
+        );
+
+        run_local(async {
+            let mut hooks = new_with_hooks_full(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged],
+                ExecutionLimits::default(),
+                HookEnvVars {
+                    otel_endpoint: Some("http://example.test:4318"),
+                    ..HookEnvVars::default()
+                },
+            )
+            .await
+            .expect("env-probe double instantiates");
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks.drain_async_hooks().await;
+        });
+
+        assert_eq!(
+            marker_history(session.path(), "exporter"),
+            "http://example.test:4318",
+            "the async instance must carry the session's real MURMUR_OTEL_ENDPOINT"
+        );
+    }
+
+    /// Invariant: work queued by the last `emit` of a session finishes *before* the
+    /// `LocalSet` that owns the workers is torn down.
+    ///
+    /// Deliberately shaped like `runtime.rs`: everything happens inside
+    /// `local.run_until(...)`, and the assertion runs after that future has returned and
+    /// `local` has been dropped, matching how a real session tears down.
+    #[test]
+    fn async_hook_session_end_work_survives_local_set_teardown() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async("exporter", HookBinding::All, hook_marker_double(&engine));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let local = tokio::task::LocalSet::new();
+            local
+                .run_until(async {
+                    let mut hooks =
+                        new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                            .await
+                            .expect("async double instantiates");
+                    hooks.emit(session.path(), HookEvent::SessionStart).await;
+                    hooks.emit(session.path(), tool_call_event()).await;
+                    hooks
+                        .emit(
+                            session.path(),
+                            HookEvent::SessionEnd {
+                                total_turns: 1,
+                                exit_status: "ok".to_string(),
+                            },
+                        )
+                        .await;
+                    hooks.drain_async_hooks().await;
+                })
+                .await;
+        });
+
+        assert_eq!(
+            marker_history(session.path(), "exporter"),
+            "STE",
+            "the session-end call must have completed, not been dropped with the LocalSet"
+        );
+    }
+
+    /// Invariant: the drain is bounded and reports what it abandoned. The spinner's first
+    /// queued call burns past the budget (only its epoch deadline can end it), so the second
+    /// is still outstanding when the budget expires: the worker is abandoned and the hook is
+    /// named in the log and in a `hook_dispatch_error`-bound fault rather than silently lost.
+    #[test]
+    fn async_hook_that_overruns_the_drain_budget_is_reported() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        // Without a running ticker the epoch never advances and the spinner never returns
+        // at all — the drain's own timer cannot preempt guest code on this thread.
+        let _ticker = crate::limits::EpochTicker::spawn(&engine);
+        let limits = ExecutionLimits {
+            deadline_seconds: 1,
+            ..ExecutionLimits::default()
+        };
+        let staged = staged_async(
+            "wedged",
+            HookBinding::OnSessionStart,
+            hook_spin_double(&engine),
+        );
+
+        let faults = run_local(async {
+            let mut hooks = new_with_hooks_limited(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged],
+                limits,
+            )
+            .await
+            .expect("the spin double instantiates");
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .drain_async_hooks_within(Duration::from_millis(50))
+                .await;
+            hooks.drain_dispatch_faults()
+        });
+
+        assert!(
+            faults
+                .iter()
+                .any(|f| f.hook_name == "wedged" && f.event == FAULT_EVENT_DRAIN && f.arm == FAULT_ARM_TIMEOUT),
+            "the abandoned hook must reach the trace path: {faults:?}"
+        );
+        let log = std::fs::read_to_string(session.path().join("logs").join("hook-wedged.log"))
+            .expect("the drain must log what it abandoned");
+        assert!(
+            log.contains("drain budget"),
+            "the log must name the budget that ran out: {log}"
+        );
+    }
+
+    /// Invariant: `on_overflow: drop` (the default) never blocks the agent loop. The
+    /// dispatches below never yield, so the worker cannot drain anything while they run: the
+    /// queue fills at [`ASYNC_HOOK_QUEUE_DEPTH`] and every event past that is discarded,
+    /// counted, and reported per event.
+    #[test]
+    fn async_hook_overflow_drop_discards_and_counts() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let surplus = 5;
+        let staged = staged_async(
+            "lossy",
+            HookBinding::OnToolCall,
+            hook_marker_double(&engine),
+        );
+
+        let (dropped, faults) = run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
+                hooks.emit(session.path(), tool_call_event()).await;
+            }
+            let dropped = hooks.async_hooks[0].dropped;
+            (dropped, hooks.drain_dispatch_faults())
+        });
+
+        assert_eq!(
+            dropped, surplus as u64,
+            "exactly the events past the queue's depth are discarded"
+        );
+        let overflow: Vec<_> = faults
+            .iter()
+            .filter(|f| f.arm == FAULT_ARM_QUEUE_OVERFLOW)
+            .collect();
+        assert_eq!(
+            overflow.len(),
+            surplus,
+            "every discarded event is reported, not just counted: {faults:?}"
+        );
+        assert_eq!(overflow[0].hook_name, "lossy");
+        assert_eq!(overflow[0].event, "on-tool-call");
+    }
+
+    /// Invariant: `on_overflow: block` loses nothing. Past the queue's depth the dispatch
+    /// call waits for the worker to make room instead of discarding, so the hook observes
+    /// every event — which the history it reports at session end counts exactly.
+    #[test]
+    fn async_hook_overflow_block_applies_backpressure() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let surplus = 3;
+        let staged = staged_async_granted(
+            "lossless",
+            HookBinding::All,
+            hook_marker_double(&engine),
+            HookCapabilityGrant::default(),
+            HookOverflowPolicy::Block,
+        );
+
+        let dropped = run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
+                hooks.emit(session.path(), tool_call_event()).await;
+            }
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::SessionEnd {
+                        total_turns: 0,
+                        exit_status: "ok".to_string(),
+                    },
+                )
+                .await;
+            let dropped = hooks.async_hooks[0].dropped;
+            hooks.drain_async_hooks().await;
+            dropped
+        });
+
+        assert_eq!(dropped, 0, "block must never discard an event");
+        let history = marker_history(session.path(), "lossless");
+        assert_eq!(
+            history.len(),
+            ASYNC_HOOK_QUEUE_DEPTH + surplus + 1,
+            "every dispatched event must reach the hook"
+        );
+        assert!(history.ends_with('E'), "history: {}", &history[..8]);
+    }
+
+    /// Invariant: an async hook's genuine `Err` reaches `trace.jsonl` as a
+    /// `hook_dispatch_error`, not just `logs/hook-<name>.log`. The marker double's
+    /// `on-session-end` returns `err(<history>)`, which is the async equivalent of any hook
+    /// call that fails outright.
+    #[test]
+    fn async_hook_error_reaches_the_trace_fault_path() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async(
+            "failing",
+            HookBinding::OnSessionEnd,
+            hook_marker_double(&engine),
+        );
+
+        let faults = run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::SessionEnd {
+                        total_turns: 0,
+                        exit_status: "ok".to_string(),
+                    },
+                )
+                .await;
+            hooks.drain_async_hooks().await;
+            hooks.drain_dispatch_faults()
+        });
+
+        assert_eq!(faults.len(), 1, "the error must be traced once: {faults:?}");
+        assert_eq!(faults[0].hook_name, "failing");
+        assert_eq!(faults[0].event, "on-session-end");
+        assert_eq!(faults[0].arm, FAULT_ARM_ERROR);
+        assert_eq!(
+            hook_log_lines(session.path(), "failing"),
+            1,
+            "and still be logged exactly once"
+        );
+    }
+
+    /// Invariant: an async hook never commits output. `replace-context` is the arm
+    /// `on-compaction` *does* honor for a blocking hook;
+    /// from an async hook it is discarded silently — no replacement, and not a fault either,
+    /// since the hook did nothing wrong.
+    #[test]
+    fn async_hook_replace_context_is_never_applied() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async(
+            "compactor",
+            HookBinding::OnCompaction,
+            hook_compaction_echo_model_double(&engine),
+        );
+
+        let (result, faults) = run_local(async {
+            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                .await
+                .expect("async double instantiates");
+            let result = hooks
+                .dispatch_compaction(
+                    vec![Message {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                    }],
+                    1234,
+                    0.98,
+                    Some("claude-haiku-4-5".to_string()),
+                    None,
+                )
+                .await;
+            hooks.drain_async_hooks().await;
+            (result, hooks.drain_dispatch_faults())
+        });
+
+        assert!(
+            result
+                .expect("an async hook cannot fail the compaction")
+                .is_none(),
+            "an async hook's replace-context must never reach the conversation"
+        );
+        assert!(faults.is_empty(), "and is not a fault either: {faults:?}");
     }
 }

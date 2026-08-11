@@ -56,6 +56,21 @@ pub const DEFAULT_INSTANCES: usize = 1_000;
 /// `capabilities.limits.deadline_seconds` explicitly.
 pub const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 
+/// Default wall-clock budget for a single *hook lifecycle call* — 30 seconds.
+///
+/// An order of magnitude below [`DEFAULT_DEADLINE_SECONDS`], and deliberately so: a hook call
+/// is one bounded piece of work (an HTTP POST to a collector, a scorer invocation), not a
+/// whole agent loop, so the capsule-wide default would let a wedged hook stall the session for
+/// most of ten minutes *per event*. Applies to blocking and async hooks alike, and only when
+/// the operator left `capabilities.limits.deadline_seconds` unset — an explicit value is
+/// honored verbatim for every guest, hooks included. See [`ExecutionLimits::for_hook_calls`].
+pub const HOOK_DEFAULT_DEADLINE_SECONDS: u64 = 30;
+
+const _: () = assert!(
+    HOOK_DEFAULT_DEADLINE_SECONDS < DEFAULT_DEADLINE_SECONDS,
+    "a hook call must not be able to stall a session for the capsule-wide budget"
+);
+
 /// Fully-resolved execution limits for one session's guests: the manifest's
 /// `capabilities.limits` block with every omitted field replaced by its `DEFAULT_*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +112,22 @@ impl ExecutionLimits {
             deadline_seconds: declared
                 .deadline_seconds
                 .unwrap_or(defaults.deadline_seconds),
+        }
+    }
+
+    /// This limit block re-flavored for hook lifecycle calls: every resource cap unchanged,
+    /// but the wall-clock budget falls back to [`HOOK_DEFAULT_DEADLINE_SECONDS`] instead of
+    /// [`DEFAULT_DEADLINE_SECONDS`] when the operator declared none.
+    ///
+    /// Takes the *undefaulted* `capabilities.limits.deadline_seconds` rather than reading it
+    /// back off `self`, because that is the only way to tell "the operator set nothing" from
+    /// "the operator explicitly set 600" — the second must be honored verbatim, hooks
+    /// included. Callers get it from [`crate::CapabilityPolicy::hook_limits`].
+    #[must_use]
+    pub fn for_hook_calls(self, declared_deadline_seconds: Option<u64>) -> Self {
+        Self {
+            deadline_seconds: declared_deadline_seconds.unwrap_or(HOOK_DEFAULT_DEADLINE_SECONDS),
+            ..self
         }
     }
 
@@ -341,6 +372,42 @@ mod tests {
         assert_eq!(limits.deadline_seconds, 5);
         assert_eq!(limits.table_elements, DEFAULT_TABLE_ELEMENTS);
         assert_eq!(limits.instances, DEFAULT_INSTANCES);
+    }
+
+    /// A hook call gets the lower default when the manifest declared no deadline, while every
+    /// resource cap stays exactly what the capsule-wide resolution produced.
+    #[test]
+    fn hook_calls_get_the_lower_deadline_default_when_none_is_declared() {
+        let capsule = ExecutionLimits::resolve(None);
+        let hook = capsule.for_hook_calls(None);
+
+        assert_eq!(capsule.deadline_seconds, DEFAULT_DEADLINE_SECONDS);
+        assert_eq!(hook.deadline_seconds, HOOK_DEFAULT_DEADLINE_SECONDS);
+        assert_eq!(hook.memory_bytes, capsule.memory_bytes);
+        assert_eq!(hook.table_elements, capsule.table_elements);
+        assert_eq!(hook.instances, capsule.instances);
+    }
+
+    /// An explicitly declared deadline wins for hooks too — including one that happens to
+    /// equal the capsule-wide default, which is why resolution keys on the undefaulted
+    /// `Option` rather than on the resolved value.
+    #[test]
+    fn an_explicit_deadline_is_honored_for_hook_calls() {
+        let declared = murmur_artifact::ResourceLimits {
+            memory_bytes: None,
+            table_elements: None,
+            instances: None,
+            deadline_seconds: Some(DEFAULT_DEADLINE_SECONDS),
+        };
+        let capsule = ExecutionLimits::resolve(Some(&declared));
+
+        assert_eq!(
+            capsule
+                .for_hook_calls(declared.deadline_seconds)
+                .deadline_seconds,
+            DEFAULT_DEADLINE_SECONDS
+        );
+        assert_eq!(capsule.for_hook_calls(Some(5)).deadline_seconds, 5);
     }
 
     #[test]

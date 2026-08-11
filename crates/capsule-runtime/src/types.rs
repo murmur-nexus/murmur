@@ -73,6 +73,13 @@ pub struct ArtifactRequest {
     /// unchanged); the manifest parser rejects the key on `runtime: skill`. Never sourced
     /// from the artifact's own bundled `murmur.yaml`, so an artifact cannot self-grant.
     pub capabilities: Option<murmur_artifact::Capabilities>,
+    /// What the runtime does when this hook's async job queue is full, copied verbatim from
+    /// `on_overflow:` on this artifact's entry in the capsule operator's own manifest — the
+    /// same operator-only sourcing rule `capabilities` above follows. Consumed for
+    /// `runtime: hook` and inert for every other role (the manifest parser rejects the key
+    /// there); inert too for a hook that turns out to be `execution_mode: blocking`, which is
+    /// never queued.
+    pub on_overflow: murmur_artifact::HookOverflowPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +167,25 @@ pub struct CapabilityPolicy {
     /// actually installs a composed root for this session — a capsule that declared `scoped` must
     /// keep getting `scoped`'s mechanism. See `sandbox::applied_tier`.
     pub containment_floor: murmur_artifact::ContainmentClass,
+    /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
+    /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
+    /// above purely so hook calls can apply their own, lower default without mistaking an
+    /// explicit `600` for silence. See [`Self::hook_limits`].
+    pub declared_deadline_seconds: Option<u64>,
+}
+
+impl CapabilityPolicy {
+    /// Execution limits for hook lifecycle calls — [`Self::limits`] with the hook-specific
+    /// deadline default substituted when the manifest declared none.
+    ///
+    /// A hook call is one bounded piece of work, so it does not inherit the capsule-wide
+    /// ten-minute budget that exists for a capsule's whole `run`: a wedged hook would
+    /// otherwise stall the session for most of that, every event. An explicitly declared
+    /// `deadline_seconds` still wins, for hooks as for every other guest.
+    #[must_use]
+    pub fn hook_limits(&self) -> ExecutionLimits {
+        self.limits.for_hook_calls(self.declared_deadline_seconds)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +208,11 @@ pub(crate) struct StagedHookArtifact {
     /// operator's own manifest entry. Applied identically by all three hook instantiation
     /// paths in `hooks.rs`; `HookCapabilityGrant::default()` is full default-deny.
     pub grant: HookCapabilityGrant,
+    /// What to do when this hook's async job queue is full — from the operator's manifest
+    /// entry (via [`ArtifactRequest::on_overflow`]), on the same terms as `grant` and never
+    /// from `config`. Read only when `config.execution_mode` is `Async`; a blocking hook has
+    /// no queue to overflow.
+    pub on_overflow: murmur_artifact::HookOverflowPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +388,9 @@ pub fn capability_policy_from_runtime_manifest(
         .unwrap_or_default();
 
     let limits = ExecutionLimits::resolve(caps.and_then(|c| c.limits.as_ref()));
+    let declared_deadline_seconds = caps
+        .and_then(|c| c.limits.as_ref())
+        .and_then(|l| l.deadline_seconds);
 
     let resources = crate::resources::resolve(caps.and_then(|c| c.resources.as_ref()));
 
@@ -377,6 +411,7 @@ pub fn capability_policy_from_runtime_manifest(
         containment_floor: caps
             .and_then(|c| c.containment)
             .unwrap_or_default(),
+        declared_deadline_seconds,
     }
 }
 
@@ -388,6 +423,53 @@ mod tests {
         let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
             .expect("manifest fixture must parse");
         capability_policy_from_runtime_manifest(&manifest)
+    }
+
+    /// A manifest that sets no deadline gives hook calls the hook-specific default while the
+    /// capsule's own guests keep the capsule-wide one — one manifest, two budgets.
+    #[test]
+    fn a_silent_manifest_gives_hook_calls_the_lower_deadline() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+"#,
+        );
+
+        assert_eq!(
+            policy.limits.deadline_seconds,
+            crate::limits::DEFAULT_DEADLINE_SECONDS
+        );
+        assert_eq!(
+            policy.hook_limits().deadline_seconds,
+            crate::limits::HOOK_DEFAULT_DEADLINE_SECONDS
+        );
+        // The default policy a hand-built fixture gets must agree with the silent-manifest one.
+        assert_eq!(
+            CapabilityPolicy::default().hook_limits().deadline_seconds,
+            crate::limits::HOOK_DEFAULT_DEADLINE_SECONDS
+        );
+    }
+
+    /// An explicit `deadline_seconds` applies to every guest, hooks included — the hook
+    /// default only fills a silence.
+    #[test]
+    fn an_explicit_deadline_applies_to_hook_calls_too() {
+        let policy = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+artifacts: []
+capabilities:
+  limits:
+    deadline_seconds: 120
+"#,
+        );
+
+        assert_eq!(policy.declared_deadline_seconds, Some(120));
+        assert_eq!(policy.limits.deadline_seconds, 120);
+        assert_eq!(policy.hook_limits().deadline_seconds, 120);
     }
 
     /// `capabilities.shell.staged_runtime` lowers onto the policy verbatim — binary, source path

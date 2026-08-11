@@ -217,6 +217,39 @@ pub enum HookCommitPolicy {
     ReopenTask,
 }
 
+/// What the runtime does with a lifecycle event for an `execution_mode: async` hook
+/// whose job queue is already full.
+///
+/// Declared via `on_overflow:` on the hook's entry in the **capsule operator's own**
+/// manifest — not in the hook artifact's bundled murmur.yaml, because keeping up with
+/// the agent loop is the operator's trade-off, not the hook author's. Inert on a hook
+/// that turns out to be `execution_mode: blocking` (a blocking hook is never queued);
+/// the operator-manifest parser cannot tell the two apart, since the mode lives in the
+/// artifact's own manifest and is only known at staging time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOverflowPolicy {
+    /// `"drop"` (the default) — discard the event and count it. The agent loop never
+    /// waits on a slow hook; telemetry is lossy under sustained overload, and the loss
+    /// is reported rather than silent.
+    #[default]
+    Drop,
+    /// `"block"` — the agent loop waits for the hook's worker to make room. No event is
+    /// lost, at the cost of putting a slow hook back on the critical path.
+    Block,
+}
+
+impl HookOverflowPolicy {
+    /// The manifest spelling of this policy, for diagnostics.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Drop => "drop",
+            Self::Block => "block",
+        }
+    }
+}
+
 /// Behavioral contract for a hook artifact, read from its own murmur.yaml.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookConfig {
@@ -404,6 +437,11 @@ pub struct RuntimeArtifact {
     /// capsule-wide block, but only `network` and `filesystem` are consumed by the runtime
     /// per-artifact; the other sub-blocks are inert here.
     pub capabilities: Option<Capabilities>,
+    /// What the runtime does when this hook's async job queue is full, declared via
+    /// `on_overflow:` on this entry. Defaults to [`HookOverflowPolicy::Drop`] when absent.
+    /// Accepted only on `runtime: hook` entries — every other role is rejected at parse
+    /// time, since nothing would ever consult it there.
+    pub on_overflow: HookOverflowPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -935,6 +973,8 @@ struct RawArtifact {
     prompt_payload: Option<bool>,
     #[serde(default)]
     capabilities: Option<RawCapabilities>,
+    #[serde(default)]
+    on_overflow: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1273,6 +1313,41 @@ impl RuntimeManifest {
                     }
                 };
 
+                // `on_overflow:` governs an async hook's job queue, which only exists for
+                // `runtime: hook`. On any other role it would be silently ignored, so it is
+                // a parse error for the same reason per-artifact `capabilities:` is on a
+                // skill. It stays legal on a *blocking* hook entry (simply inert): the
+                // execution mode lives in the artifact's own manifest and is unknown here.
+                let on_overflow = match artifact.on_overflow.as_deref() {
+                    None => HookOverflowPolicy::default(),
+                    Some(raw) => {
+                        if runtime != ArtifactRuntime::Hook {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'on_overflow:' but has \
+                                     'runtime: {}'; the key governs an async hook's job queue \
+                                     and is only recognized on 'runtime: hook' entries",
+                                    runtime.as_str()
+                                ),
+                            });
+                        }
+                        match raw {
+                            "drop" => HookOverflowPolicy::Drop,
+                            "block" => HookOverflowPolicy::Block,
+                            other => {
+                                return Err(RuntimeManifestError::InvalidArtifact {
+                                    index,
+                                    message: format!(
+                                        "artifact '{name}' declares unknown on_overflow \
+                                         '{other}'; expected: drop, block"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                };
+
                 Ok(RuntimeArtifact {
                     name,
                     version,
@@ -1281,6 +1356,7 @@ impl RuntimeManifest {
                     local_source,
                     prompt_payload,
                     capabilities,
+                    on_overflow,
                 })
             })
             .collect::<Result<Vec<_>, RuntimeManifestError>>()?;
@@ -4733,6 +4809,122 @@ artifacts:
             "error was: {msg}"
         );
         assert!(msg.contains("runtime: skill"), "error was: {msg}");
+    }
+
+    // ── Per-artifact `on_overflow:` (async hook queue policy) ────────────────
+
+    /// `on_overflow: block` on a hook entry parses to the blocking policy.
+    #[test]
+    fn hook_on_overflow_block_parses() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-hook-grafana
+    version: 1.0.0
+    runtime: hook
+    on_overflow: block
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.artifacts[0].on_overflow,
+            HookOverflowPolicy::Block
+        );
+    }
+
+    /// Omitting the key means `drop`: an operator who says nothing gets the loop kept moving,
+    /// not backpressure they never asked for.
+    #[test]
+    fn hook_on_overflow_defaults_to_drop() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-hook-grafana
+    version: 1.0.0
+    runtime: hook
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.artifacts[0].on_overflow, HookOverflowPolicy::Drop);
+        assert_eq!(HookOverflowPolicy::default(), HookOverflowPolicy::Drop);
+    }
+
+    /// Only a hook has a job queue, so the key is rejected on every other role rather than
+    /// silently ignored — the same rule per-artifact `capabilities:` follows on a skill.
+    #[test]
+    fn on_overflow_on_a_non_hook_artifact_is_rejected() {
+        let yaml = r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: git
+    version: 1.0.0
+    runtime: tool
+    on_overflow: block
+"#;
+        let err = match RuntimeManifest::from_yaml_str(yaml) {
+            Ok(_) => panic!("on_overflow must be rejected outside runtime: hook"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            RuntimeManifestError::InvalidArtifact { index: 0, .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("git"), "error was: {msg}");
+        assert!(
+            msg.contains("only recognized on 'runtime: hook' entries"),
+            "error was: {msg}"
+        );
+    }
+
+    /// An unknown value is a typo, not a policy — rejected with both spellings named.
+    #[test]
+    fn unknown_on_overflow_value_is_rejected() {
+        let yaml = r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-hook-grafana
+    version: 1.0.0
+    runtime: hook
+    on_overflow: spill
+"#;
+        let err = RuntimeManifest::from_yaml_str(yaml).expect_err("unknown policy is rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("spill"), "error was: {msg}");
+        assert!(msg.contains("expected: drop, block"), "error was: {msg}");
+    }
+
+    /// The key is legal on a *blocking* hook entry and simply inert: the operator manifest
+    /// cannot know a hook's execution mode, which lives in the artifact's own manifest.
+    #[test]
+    fn on_overflow_is_accepted_on_any_hook_entry() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-hook-eval
+    version: 1.0.0
+    runtime: hook
+    on_overflow: drop
+    capabilities:
+      network:
+        allow:
+          - https://telemetry.example.com
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.artifacts[0].on_overflow, HookOverflowPolicy::Drop);
+        assert!(manifest.artifacts[0].capabilities.is_some());
     }
 
     /// The capsule-wide top-level block is untouched by the per-artifact field: both may be
