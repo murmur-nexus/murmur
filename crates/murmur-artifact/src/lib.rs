@@ -46,8 +46,9 @@ pub use registry::{
     PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
 };
 pub use runtime_manifest::{
-    effective_containment_floor, load_runtime_manifest, parse_hook_config_from_yaml,
-    parse_tool_implementation_from_yaml, read_hook_config, read_tool_implementation, AfterTask,
+    commit_policy_for_binding, effective_containment_floor, load_runtime_manifest,
+    parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_hook_config,
+    read_tool_implementation, AfterTask,
     ArtifactImplementation, ArtifactRuntime, Capabilities, CompactionConfig, ContainmentClass,
     ContextConfig, ConversationMode, EnvCapabilities, EvalConfig, FilesystemCapabilities,
     HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,

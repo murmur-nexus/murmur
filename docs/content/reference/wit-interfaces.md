@@ -196,6 +196,16 @@ A handler may return any `hook-output` arm, but the runtime commits only one arm
 | `on-task-end` | `reopen-task` |
 | All others | none — only `none` is silent |
 
+This table is also enforced ahead of time. A hook artifact declares in its own `murmur.yaml`
+which handler it binds to (`binding:`) and what it expects committed (`commit_policy:`), and the
+runtime checks the pair against this table when the capsule is staged — before the hook
+component is compiled. A `commit_policy` the binding's handler cannot commit (say
+`commit_policy: reopen-task` on `binding: on-stage`) fails staging with an error naming the
+binding, the declared policy, and the one this binding honors, rather than becoming a
+mid-session dispatch fault. A hook with no `binding:` receives every event, so any
+`commit_policy` is valid for it. See [Hook contract
+fields](manifest-schema.md#hook-contract-fields).
+
 Returning `none` is always silent, and is the normal case for an observational hook. Returning
 any other non-`none` arm is a loud but non-fatal fault:
 

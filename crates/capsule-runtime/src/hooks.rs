@@ -4069,6 +4069,51 @@ artifacts:
         }
     }
 
+    /// Cross-crate invariant: the runtime's honored-arm table and the manifest parser's
+    /// `commit_policy_for_binding` (which `parse_hook_config_from_yaml` validates a hook's
+    /// declared `commit_policy` against at staging time) must describe the same thing. If
+    /// one table gains, loses, or renames an entry without the other, this fails here
+    /// rather than as a silent mid-session `hook_dispatch_error`.
+    #[test]
+    fn honored_output_arm_agrees_with_manifest_commit_policy_for_binding() {
+        use murmur_artifact::HookCommitPolicy;
+
+        for binding in [
+            HookBinding::OnStage,
+            HookBinding::OnSessionStart,
+            HookBinding::OnTaskStart,
+            HookBinding::OnInference,
+            HookBinding::OnToolCall,
+            HookBinding::OnShell,
+            HookBinding::OnCompaction,
+            HookBinding::OnTaskEnd,
+            HookBinding::OnSessionEnd,
+        ] {
+            let event = binding.as_str();
+            let arm = honored_arm(event);
+            let policy = murmur_artifact::commit_policy_for_binding(&binding);
+
+            if binding == HookBinding::OnInference {
+                // The one pair that cannot agree, by construction: `on-inference` honors
+                // the `artifact` arm, but `HookCommitPolicy` has no `artifact` spelling —
+                // so no non-`none` policy is declarable for this binding, and the parser
+                // rejects every one.
+                assert_eq!(arm, Some("artifact"), "{event}");
+                assert_eq!(policy, None, "{event}");
+                continue;
+            }
+
+            // Everywhere else the two tables must say the same thing: the arm the runtime
+            // commits is exactly the policy a hook may declare, and an event that honors
+            // nothing admits no policy but `none`.
+            assert_eq!(
+                arm,
+                policy.as_ref().map(HookCommitPolicy::as_str),
+                "{event}: honored arm and declarable commit_policy disagree"
+            );
+        }
+    }
+
     // ── Async hooks: one reused instance, one serialized queue, a guaranteed drain ──
 
     /// Run `body` on a current-thread runtime inside a `LocalSet` — the shape the session's
