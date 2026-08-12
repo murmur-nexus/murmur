@@ -219,7 +219,7 @@ any other non-`none` arm is a loud but non-fatal fault:
 `reopen-task` is a control arm: returning it from `on-task-end` re-runs the task's agent loop
 with the arm's string injected as feedback, subject to `inference.max_task_reopens` and
 `inference.max_turns`. See [Task
-reopening](../concepts/capsule-runtime.md#task-reopening-commit_policy-reopen-task).
+reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task).
 
 ### Event field notes
 

@@ -716,8 +716,8 @@ top-level fields for convenience; `effective_grants` is the one place a finished
 |---|---|---:|---|
 | `inference.transport` | string | yes (if `inference` present) | `http` (WASM driver) or `process` (claude CLI subprocess) |
 | `inference.model` | string | yes (if `inference` present) | model identifier passed to the driver or CLI |
-| `inference.max_turns` | integer | no | Maximum LLM inference calls per session. Default: `10`. Must be > 0. |
-| `inference.max_task_reopens` | integer | no | Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. Default: `1`. Unlike `max_turns`, `0` is a valid explicit value — it disables reopening entirely. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/capsule-runtime.md#task-reopening-commit_policy-reopen-task). |
+| `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. |
+| `inference.max_task_reopens` | integer | no | Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. Default: `1`. Unlike `max_turns`, `0` is a valid explicit value — it disables reopening entirely. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `inference.max_tokens` | integer | `http` only | Maximum output tokens the model may generate **per turn**, sent as `max_tokens` in the driver wire payload. Default: `8192`. Must be > 0; not clamped at the top end. Invalid for `transport: process`. Distinct from [`context.max_tokens`](#field-context), which is the session-wide budget for compaction. |
 | `inference.endpoint` | string | `http` only | base URL for inference API requests; invalid for `transport: process`. Must be `https://` (any host) or `http://` with a loopback host (`localhost` or an `IpAddr::is_loopback()` address, e.g. `127.0.0.1`, `::1`) — see [Endpoint scheme and host validation](#endpoint-validation) |
 | `inference.api_key` | string | no | literal value or `${ENV_VAR}` reference; `http` transport only; invalid for `transport: process` |
@@ -951,8 +951,8 @@ runtime side of the same table.
 
 ### Async hook execution { #hook-overflow }
 
-An `execution_mode: async` hook (declared in the hook artifact's own `murmur.yaml` — see
-[Hook model](../concepts/capsule-runtime.md#hook-model)) is instantiated once for the session
+An `execution_mode: async` hook (declared in the hook artifact's own `murmur.yaml`) is
+instantiated once for the session
 and reused for every event: state the hook keeps in memory (a running counter, a buffered
 span, an open client) survives across calls. Each async hook has its own bounded, ordered job
 queue and a dedicated worker that drains it one call at a time — dispatching an event to an
@@ -1116,7 +1116,7 @@ Rejected examples:
 ### Execution limits
 
 `capabilities.limits` bounds how long a component (capsule, tool/driver, or hook) may run and
-how much memory it may consume — see [Execution limits](../concepts/capsule-runtime.md#execution-limits)
+how much memory it may consume — see [Execution limits](../concepts/capsules.md#execution-limits)
 for the runtime-level behavior. Every field is optional and independently defaulted; omitting
 the whole block is equivalent to omitting every field.
 

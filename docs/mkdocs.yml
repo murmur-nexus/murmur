@@ -25,6 +25,12 @@ exclude_docs: |
   reference/af-unix-sockets-manual-verification.md
   reference/capsule-device-set-manual-verification.md
 
+validation:
+  links:
+    absolute_links: warn
+    unrecognized_links: warn
+    anchors: warn
+
 theme:
   name: material
   logo: assets/img/murmur-logo-white.png
@@ -63,6 +69,7 @@ plugins:
   - redirects:
       redirect_maps:
         how-to/agent-shell-access.md: how-to/lock-down-capsule.md
+        concepts/capsule-runtime.md: concepts/session-loop.md
 
 extra:
   v:
@@ -112,8 +119,15 @@ nav:
       - Quickstart: getting-started/quickstart.md
   - Concepts:
       - Capsules: concepts/capsules.md
+      - Artifacts: concepts/artifacts.md
+      - Session Loop: concepts/session-loop.md
+      - Hooks: concepts/hooks.md
+      - Tools: concepts/tools.md
+      - Access Control: concepts/access-control.md
+      - Context: concepts/context.md
+      - Formations: concepts/formations.md
+      - Observability: concepts/observability.md
       - Registry: concepts/registry.md
-      - Capsule Runtime: concepts/capsule-runtime.md
   - How-to Guides:
       - Configure a long-running capsule: how-to/long-running-capsule.md
       - Lock down a capsule's capabilities: how-to/lock-down-capsule.md
@@ -134,6 +148,7 @@ nav:
       - Python Tool Quickstart (Native): language-guides/python-native.md
   - Reference:
       - CLI Commands: reference/cli.md
+      - Installing Artifacts: reference/installing-artifacts.md
       - Manifest Schema: reference/manifest-schema.md
       - Capsule I/O Schema: reference/capsule-io.md
       - Security Warnings: reference/security-warnings.md

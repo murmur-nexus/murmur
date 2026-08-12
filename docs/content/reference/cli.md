@@ -1006,7 +1006,7 @@ Written unconditionally after the task's last attempt, even on error exit (exit_
 | `reopen_number` | u32 | 1-based ordinal of this reopen within the task (first reopen = `1`) |
 
 Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
-reopening](../concepts/capsule-runtime.md#task-reopening-commit_policy-reopen-task) for the full
+reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
 mechanism.
 
 **`hook_dispatch_error`** — written when a hook returns a `hook-output` arm the lifecycle event it fired from does not honor (see [Honored `hook-output` arm per event](wit-interfaces.md#murmurhooklifecycle))
@@ -1513,7 +1513,7 @@ never consulted, same as any other project-level `inference.api_key`.
 ### `registry:` section
 
 See [Artifact index and custom registry URL](#artifact-index-and-custom-registry-url) below for
-`registry.index_url`, and [Multiple sources and fallthrough](../concepts/registry.md#multiple-sources-and-fallthrough) for
+`registry.index_url`, and [Multiple sources and fallthrough](installing-artifacts.md#multiple-sources-and-fallthrough) for
 `registry.sources`.
 
 ### `beta:` section

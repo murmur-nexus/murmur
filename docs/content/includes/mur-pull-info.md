@@ -25,4 +25,4 @@
     mur install github:<username>/<repo>@<tag>
     ```
 
-    See [Installing artifacts](../concepts/registry.md#installing-artifacts) to learn more.
+    See [Installing artifacts](../reference/installing-artifacts.md) to learn more.
