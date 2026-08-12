@@ -212,8 +212,9 @@ any other non-`none` arm is a loud but non-fatal fault:
 - A line naming the hook, the handler, and the discarded arm is appended to
   `workdir/logs/hook-<name>.log`.
 - A `hook_dispatch_error` event is written to `trace.jsonl` — see [Session trace
-  schema](cli.md#session-trace-tracejsonl). The exceptions are `on-stage`, which runs before the
-  trace file exists, and `async` hooks, which never produce a trace record.
+  schema](cli.md#session-trace-tracejsonl). The one exception is `on-stage`, which runs before the
+  trace file exists. An `async` hook's fault reaches the trace by the same path; the trace and the
+  log are the only places it appears, since the agent loop never sees an async hook's return value.
 
 `reopen-task` is a control arm: returning it from `on-task-end` re-runs the task's agent loop
 with the arm's string injected as feedback, subject to `inference.max_task_reopens` and

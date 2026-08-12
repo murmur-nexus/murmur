@@ -920,7 +920,7 @@ capsule operator cannot change them by editing their own manifest.
 | Field | Values | Default | Meaning |
 |---|---|---|---|
 | `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every session event | Which lifecycle event(s) the hook is dispatched for. |
-| `execution_mode` | `blocking`, `async` | `blocking` | Whether the runtime waits for the hook's result. An `async` hook's output is never committed, so it requires `commit_policy: none`. |
+| `execution_mode` | `blocking`, `async` | `blocking` | Whether the agent loop waits for the hook. A binding that commits an arm must be `blocking`, so `async` requires `commit_policy: none`. |
 | `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task` | `none` | What the runtime does with the hook's successful output. |
 
 **`binding` is the single source of truth for what a hook can commit**, and `commit_policy` is
