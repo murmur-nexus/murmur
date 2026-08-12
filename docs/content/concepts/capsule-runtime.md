@@ -188,8 +188,7 @@ hook commits nothing, so it requires `commit_policy: none`, and `on-stage` may n
 Of the shipped hooks, `murmur-hook-debug` is the only `async` one, and it is stateless — it appends
 one JSON line per event and nothing waits on it. `murmur-hook-grafana` and `murmur-hook-eval`
 declare no `execution_mode` and so run `blocking` even though both commit nothing: each buffers
-session state in memory and exports it once at `on-session-end`, work a per-call instance — what
-`async` meant before async hooks became one reused instance — would have discarded.
+session state in memory across every call and exports it once at `on-session-end`.
 
 ```yaml
 name: murmur-hook-example
