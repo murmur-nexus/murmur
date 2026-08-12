@@ -159,38 +159,37 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 | `on-session-end` | After the task loop exits (idle timeout, shutdown, or explicit exit). Once per capsule launch. |
 | *(omitted)* | All session events (`on-session-start` through `on-session-end`). Does not include `on-stage`. |
 
-**Execution mode** — how the runtime waits: **`blocking`** (runtime waits for the hook before
-proceeding — mandatory for `on-stage` and `on-compaction`) or **`async`** (runtime enqueues the
-event and continues immediately; only valid with `commit_policy: none`). An async hook is
-instantiated once per session and reused for every event, so state it keeps in memory persists
-across calls, and its calls are always serialized and delivered in dispatch order — never
-reordered or run concurrently with each other. Every async hook's outstanding work is finished
-before the session ends. See [Async hook execution](../reference/manifest-schema.md#hook-overflow)
-for queue and overflow behavior.
+**Execution mode** — whether the agent loop waits for the hook. **`blocking`** (the default) stops
+the loop until the hook returns; **`async`** enqueues the event and lets the loop continue. If the
+loop needs the hook's answer, use `blocking`; otherwise `async` keeps the work off the critical
+path — which matters for a hook doing network I/O on every event, since a `blocking` one pays that
+round trip inline every time. An async hook is one reused instance per session, so in-memory state
+persists across calls; its calls are serialized in dispatch order and finish before the session
+ends. See [Async hook execution](../reference/manifest-schema.md#hook-overflow) for overflow rules.
 
 **Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
 observability hooks), **`replace-context`** (runtime replaces conversation history; used for
 compaction), **`write-manifests`** (runtime writes tool manifest records to
 `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file; used for shell tool
 enrichment during staging), or **`reopen-task`** (runtime re-runs the task's agent loop with the
-hook's feedback instead of finalizing it; only valid with `binding: on-task-end` — see [Task
-reopening](#task-reopening-commit_policy-reopen-task) below).
+hook's feedback instead of finalizing it — see [Task
+reopening](#task-reopening-commit_policy-reopen-task) below). `binding` is the single source of
+truth for what a hook commits: each binding honors exactly one arm, so it admits that one policy
+plus `none`, and a `commit_policy` the binding cannot honor fails at capsule-staging time — before
+the hook component is compiled — with an error naming the binding, the declared policy, and the
+policy the binding honors. A hook with no `binding:` receives every event, so any policy is
+valid for it — see [Hook contract fields](../reference/manifest-schema.md#hook-contract-fields).
 
-| execution_mode | commit_policy | Valid? | Notes |
-|---|---|---|---|
-| `blocking` | `none` | ✓ | Observability that must complete before proceeding |
-| `blocking` | `replace-context` | ✓ | Compaction |
-| `blocking` | `write-manifests` | ✓ | Shell tool enrichment |
-| `blocking` | `reopen-task` | ✓ | Task reopening; only meaningful with `binding: on-task-end` |
-| `async` | `none` | ✓ | Normal observability (Grafana, OTel) |
-| `async` | `replace-context` | ✗ | Not implemented |
-| `async` | `write-manifests` | ✗ | Not implemented |
-| `async` | `reopen-task` | ✗ | Not implemented — a reopen decision must block on the task's outcome |
-| any | any | ✗ if `on-stage` + `async` | Staging must complete before launch |
+The two fields meet in one rule: a binding that commits an arm must be blocking, because every
+committable arm is a decision the agent loop is blocked on — the context it continues from, the
+manifests it stages with, the feedback that reopens a task. `async` is available exactly where a
+hook commits nothing, so it requires `commit_policy: none`, and `on-stage` may never be `async`.
 
-`write-manifests` is only ever processed for `on-stage`-bound hooks — that binding is the sole
-place the runtime commits manifest writes. Declaring `write-manifests` on any other binding
-passes validation but has no effect: the output is silently discarded.
+Of the shipped hooks, `murmur-hook-debug` is the only `async` one, and it is stateless — it appends
+one JSON line per event and nothing waits on it. `murmur-hook-grafana` and `murmur-hook-eval`
+declare no `execution_mode` and so run `blocking` even though both commit nothing: each buffers
+session state in memory and exports it once at `on-session-end`, work a per-call instance — what
+`async` meant before async hooks became one reused instance — would have discarded.
 
 ```yaml
 name: murmur-hook-example
