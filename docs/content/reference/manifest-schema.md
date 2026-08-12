@@ -911,6 +911,44 @@ Hook behavior:
 
 The runtime generates one UUID v7 session id at startup, used uniformly for the workdir folder name, `trace.jsonl`, `MURMUR_SESSION_ID`, and hook context.
 
+### Hook contract fields { #hook-contract-fields }
+
+These three fields live in the **hook artifact's own** `murmur.yaml`, not in the capsule
+manifest that installs it — they are the hook author's declaration of what the hook does, so a
+capsule operator cannot change them by editing their own manifest.
+
+| Field | Values | Default | Meaning |
+|---|---|---|---|
+| `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every session event | Which lifecycle event(s) the hook is dispatched for. |
+| `execution_mode` | `blocking`, `async` | `blocking` | Whether the runtime waits for the hook's result. An `async` hook's output is never committed, so it requires `commit_policy: none`. |
+| `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task` | `none` | What the runtime does with the hook's successful output. |
+
+**`binding` is the single source of truth for what a hook can commit**, and `commit_policy` is
+checked against it when the capsule is staged. Each binding honors exactly one output, so it
+admits exactly one `commit_policy` (plus `none`, which is always valid and means the hook only
+observes):
+
+| `binding` | Valid `commit_policy` |
+|---|---|
+| `on-stage` | `write-manifests` or `none` |
+| `on-compaction` | `replace-context` or `none` |
+| `on-task-end` | `reopen-task` or `none` |
+| `on-inference` | `none` only — `on-inference` commits an `artifact` output, which has no `commit_policy` spelling |
+| `on-session-start`, `on-task-start`, `on-tool-call`, `on-shell`, `on-session-end` | `none` only — these events commit nothing |
+| absent (all events) | any value — the hook receives every event, including all four that commit something |
+
+Declaring a `commit_policy` the `binding` cannot honor is an error at capsule-staging time,
+before the hook component is compiled or run — for example `binding: on-task-end` with
+`commit_policy: replace-context` fails with:
+
+```
+hook my-hook@1.0.0 invalid config: commit_policy 'replace-context' is not valid for binding
+'on-task-end'; binding 'on-task-end' honors commit_policy 'reopen-task'
+```
+
+See [What each handler can commit](wit-interfaces.md#what-each-handler-can-commit) for the
+runtime side of the same table.
+
 ### Async hook execution { #hook-overflow }
 
 An `execution_mode: async` hook (declared in the hook artifact's own `murmur.yaml` — see

@@ -188,6 +188,28 @@ pub enum HookBinding {
     All,
 }
 
+impl HookBinding {
+    /// The manifest spelling of this binding, which is also the WIT lifecycle function
+    /// name the runtime dispatches to — the key `capsule-runtime`'s honored-arm table is
+    /// written against. [`HookBinding::All`] has no spelling of its own (it is what an
+    /// omitted `binding:` means), so it renders as `"all"` for diagnostics only.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OnStage => "on-stage",
+            Self::OnSessionStart => "on-session-start",
+            Self::OnTaskStart => "on-task-start",
+            Self::OnInference => "on-inference",
+            Self::OnToolCall => "on-tool-call",
+            Self::OnShell => "on-shell",
+            Self::OnCompaction => "on-compaction",
+            Self::OnTaskEnd => "on-task-end",
+            Self::OnSessionEnd => "on-session-end",
+            Self::All => "all",
+        }
+    }
+}
+
 /// Whether the runtime waits for the hook result.
 ///
 /// Declared via `execution_mode:` in the artifact's own murmur.yaml.
@@ -215,6 +237,19 @@ pub enum HookCommitPolicy {
     /// `"reopen-task"` — runtime re-runs the task's agent loop with the hook's feedback.
     /// Valid only with on-task-end.
     ReopenTask,
+}
+
+impl HookCommitPolicy {
+    /// The manifest spelling of this policy, for diagnostics.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ReplaceContext => "replace-context",
+            Self::WriteManifests => "write-manifests",
+            Self::ReopenTask => "reopen-task",
+        }
+    }
 }
 
 /// What the runtime does with a lifecycle event for an `execution_mode: async` hook
@@ -265,6 +300,40 @@ impl Default for HookConfig {
             execution_mode: HookExecutionMode::Blocking,
             commit_policy: HookCommitPolicy::None,
         }
+    }
+}
+
+/// The one `commit_policy` a hook bound to `binding` can actually have committed, or
+/// `None` when no `commit_policy` value other than `none` is ever honored for it.
+///
+/// This is the manifest-side mirror of `capsule-runtime`'s `HONORED_OUTPUT_ARM` table,
+/// which decides — keyed on the same lifecycle function names [`HookBinding::as_str`]
+/// produces — which `hook-output` arm the runtime commits for each event. Two bindings
+/// return `None` for different reasons, and the distinction matters:
+///
+/// - `on-session-start`, `on-task-start`, `on-tool-call`, `on-shell`, `on-session-end`
+///   honor no arm at all; every output from them is discarded.
+/// - `on-inference` *does* honor an arm (`artifact`), but that arm has no
+///   `commit_policy` spelling — [`HookCommitPolicy`] has no `Artifact` variant — so no
+///   non-`none` policy is declarable for it either.
+///
+/// [`HookBinding::All`] (an omitted `binding:`) also returns `None`, and that is a third
+/// reason again: an `All`-bound hook is dispatched to *every* event, so there is no single
+/// honored policy to name. It is deliberately **not** validated against this function —
+/// [`parse_hook_config_from_yaml`] accepts every `commit_policy` for it.
+#[must_use]
+pub fn commit_policy_for_binding(binding: &HookBinding) -> Option<HookCommitPolicy> {
+    match binding {
+        HookBinding::OnStage => Some(HookCommitPolicy::WriteManifests),
+        HookBinding::OnCompaction => Some(HookCommitPolicy::ReplaceContext),
+        HookBinding::OnTaskEnd => Some(HookCommitPolicy::ReopenTask),
+        HookBinding::OnSessionStart
+        | HookBinding::OnTaskStart
+        | HookBinding::OnInference
+        | HookBinding::OnToolCall
+        | HookBinding::OnShell
+        | HookBinding::OnSessionEnd
+        | HookBinding::All => None,
     }
 }
 
@@ -343,12 +412,7 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
         return Err(format!(
             "async-with-commit not supported: execution_mode 'async' requires commit_policy 'none' \
              (got '{}')",
-            match &commit_policy {
-                HookCommitPolicy::None => "none",
-                HookCommitPolicy::ReplaceContext => "replace-context",
-                HookCommitPolicy::WriteManifests => "write-manifests",
-                HookCommitPolicy::ReopenTask => "reopen-task",
-            }
+            commit_policy.as_str()
         ));
     }
     if binding == HookBinding::OnStage && execution_mode == HookExecutionMode::Async {
@@ -357,6 +421,28 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
              'on-stage'"
                 .to_string(),
         );
+    }
+    // `binding` is the single source of truth for what the runtime commits; a declared
+    // `commit_policy` the binding can never honor is a mistake that is fully knowable here,
+    // at staging time, rather than mid-session as a `hook_dispatch_error`. An omitted
+    // `binding:` (`All`) reaches every event, so every policy stays valid for it.
+    if binding != HookBinding::All && commit_policy != HookCommitPolicy::None {
+        let honored = commit_policy_for_binding(&binding);
+        if honored.as_ref() != Some(&commit_policy) {
+            let note = if binding == HookBinding::OnInference {
+                " (on-inference commits an 'artifact' output, which has no commit_policy spelling)"
+            } else {
+                ""
+            };
+            return Err(format!(
+                "commit_policy '{}' is not valid for binding '{}'; binding '{}' honors \
+                 commit_policy '{}'{note}",
+                commit_policy.as_str(),
+                binding.as_str(),
+                binding.as_str(),
+                honored.as_ref().map_or("none", HookCommitPolicy::as_str)
+            ));
+        }
     }
 
     Ok(HookConfig {
@@ -4419,6 +4505,247 @@ context:
         let err = parse_hook_config_from_yaml(yaml).unwrap_err();
         assert!(err.contains("async-with-commit"), "error was: {err}");
         assert!(err.contains("reopen-task"), "error was: {err}");
+    }
+
+    // ── binding is the single source of truth for what a hook commits ─────────────
+
+    /// The five bindings whose events honor no `hook-output` arm at all cannot declare
+    /// any non-`none` `commit_policy`. The error names the binding, the declared policy,
+    /// and `none` as what the binding honors.
+    #[test]
+    fn hook_config_non_committing_binding_rejects_any_commit_policy() {
+        for binding in [
+            "on-session-start",
+            "on-task-start",
+            "on-tool-call",
+            "on-shell",
+            "on-session-end",
+        ] {
+            let yaml = format!(
+                "name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: replace-context\n"
+            );
+            let err = parse_hook_config_from_yaml(&yaml).unwrap_err();
+            assert!(err.contains(binding), "error was: {err}");
+            assert!(err.contains("replace-context"), "error was: {err}");
+            assert!(
+                err.contains("honors commit_policy 'none'"),
+                "error was: {err}"
+            );
+        }
+    }
+
+    /// A binding that honors one arm rejects every *other* policy, naming the one it does
+    /// honor so the fix is obvious from the message alone.
+    #[test]
+    fn hook_config_binding_rejects_a_different_bindings_commit_policy() {
+        for (binding, declared, honored) in [
+            ("on-stage", "reopen-task", "write-manifests"),
+            ("on-compaction", "write-manifests", "replace-context"),
+            ("on-task-end", "replace-context", "reopen-task"),
+        ] {
+            let yaml = format!(
+                "name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: {declared}\n"
+            );
+            let err = parse_hook_config_from_yaml(&yaml).unwrap_err();
+            assert!(err.contains(binding), "error was: {err}");
+            assert!(
+                err.contains(&format!("commit_policy '{declared}' is not valid")),
+                "error was: {err}"
+            );
+            assert!(
+                err.contains(&format!("honors commit_policy '{honored}'")),
+                "error was: {err}"
+            );
+        }
+    }
+
+    /// `on-inference` honors the `artifact` arm, which has no `commit_policy` spelling —
+    /// so *no* non-`none` policy is ever valid for it, including `write-manifests`.
+    #[test]
+    fn hook_config_on_inference_rejects_every_non_none_commit_policy() {
+        for declared in ["replace-context", "write-manifests", "reopen-task"] {
+            let yaml = format!(
+                "name: gate\nruntime: hook\nbinding: on-inference\ncommit_policy: {declared}\n"
+            );
+            let err = parse_hook_config_from_yaml(&yaml).unwrap_err();
+            assert!(err.contains("on-inference"), "error was: {err}");
+            assert!(err.contains(declared), "error was: {err}");
+            assert!(
+                err.contains("honors commit_policy 'none'"),
+                "error was: {err}"
+            );
+            assert!(err.contains("artifact"), "error was: {err}");
+        }
+    }
+
+    /// A binding declaring exactly the policy it honors is accepted, for all three
+    /// representable pairs.
+    #[test]
+    fn hook_config_matching_binding_and_commit_policy_is_valid() {
+        for (binding, policy, expected) in [
+            (
+                "on-stage",
+                "write-manifests",
+                HookCommitPolicy::WriteManifests,
+            ),
+            (
+                "on-compaction",
+                "replace-context",
+                HookCommitPolicy::ReplaceContext,
+            ),
+            ("on-task-end", "reopen-task", HookCommitPolicy::ReopenTask),
+        ] {
+            let yaml =
+                format!("name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: {policy}\n");
+            let config = parse_hook_config_from_yaml(&yaml).unwrap();
+            assert_eq!(config.commit_policy, expected);
+        }
+    }
+
+    /// Every binding may declare `commit_policy: none` — including the ones that honor
+    /// an arm, which simply means the hook opts out of committing.
+    #[test]
+    fn hook_config_commit_policy_none_is_valid_for_every_binding() {
+        for binding in [
+            "on-stage",
+            "on-session-start",
+            "on-task-start",
+            "on-inference",
+            "on-tool-call",
+            "on-shell",
+            "on-compaction",
+            "on-task-end",
+            "on-session-end",
+        ] {
+            let yaml =
+                format!("name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: none\n");
+            let config = parse_hook_config_from_yaml(&yaml).unwrap();
+            assert_eq!(config.commit_policy, HookCommitPolicy::None);
+        }
+    }
+
+    /// Resolved ambiguity: an omitted `binding:` is `HookBinding::All`, which is dispatched
+    /// to every event — including all four that honor an arm — so every `commit_policy` is
+    /// accepted for it. Deliberate: no narrowing for `All`.
+    #[test]
+    fn hook_config_omitted_binding_accepts_every_commit_policy() {
+        for (policy, expected) in [
+            ("replace-context", HookCommitPolicy::ReplaceContext),
+            ("write-manifests", HookCommitPolicy::WriteManifests),
+            ("reopen-task", HookCommitPolicy::ReopenTask),
+            ("none", HookCommitPolicy::None),
+        ] {
+            let yaml = format!("name: gate\nruntime: hook\ncommit_policy: {policy}\n");
+            let config = parse_hook_config_from_yaml(&yaml).unwrap();
+            assert_eq!(config.binding, HookBinding::All);
+            assert_eq!(config.commit_policy, expected);
+        }
+    }
+
+    /// Every hook artifact shipped in `default-artifacts` today must keep parsing after the
+    /// binding/commit_policy check exists — this change is non-breaking for all eight. The
+    /// field combinations are reproduced literally rather than read from that repo, so this
+    /// suite stays self-contained.
+    #[test]
+    fn hook_config_shipped_default_artifact_manifests_still_parse() {
+        let shipped: [(&str, &str, HookConfig); 8] = [
+            (
+                "murmur-hook-compact",
+                "binding: on-compaction\nexecution_mode: blocking\ncommit_policy: replace-context\n",
+                HookConfig {
+                    binding: HookBinding::OnCompaction,
+                    execution_mode: HookExecutionMode::Blocking,
+                    commit_policy: HookCommitPolicy::ReplaceContext,
+                },
+            ),
+            (
+                "murmur-hook-shell-desc",
+                "binding: on-stage\nexecution_mode: blocking\ncommit_policy: write-manifests\n",
+                HookConfig {
+                    binding: HookBinding::OnStage,
+                    execution_mode: HookExecutionMode::Blocking,
+                    commit_policy: HookCommitPolicy::WriteManifests,
+                },
+            ),
+            (
+                // No `binding:` line in the shipped manifest — `All`, not `on-task-end`.
+                "murmur-hook-regression-verifier",
+                "execution_mode: blocking\ncommit_policy: reopen-task\n",
+                HookConfig {
+                    binding: HookBinding::All,
+                    execution_mode: HookExecutionMode::Blocking,
+                    commit_policy: HookCommitPolicy::ReopenTask,
+                },
+            ),
+            (
+                "murmur-hook-memory-jsonl",
+                "execution_mode: blocking\ncommit_policy: replace-context\n",
+                HookConfig {
+                    binding: HookBinding::All,
+                    execution_mode: HookExecutionMode::Blocking,
+                    commit_policy: HookCommitPolicy::ReplaceContext,
+                },
+            ),
+            (
+                "murmur-hook-debug",
+                "execution_mode: async\ncommit_policy: none\n",
+                HookConfig {
+                    binding: HookBinding::All,
+                    execution_mode: HookExecutionMode::Async,
+                    commit_policy: HookCommitPolicy::None,
+                },
+            ),
+            (
+                "murmur-hook-diff-summary",
+                "execution_mode: blocking\ncommit_policy: none\n",
+                HookConfig {
+                    binding: HookBinding::All,
+                    execution_mode: HookExecutionMode::Blocking,
+                    commit_policy: HookCommitPolicy::None,
+                },
+            ),
+            ("murmur-hook-eval", "", HookConfig::default()),
+            ("murmur-hook-grafana", "", HookConfig::default()),
+        ];
+
+        for (name, fields, expected) in shipped {
+            let yaml = format!("name: {name}\nruntime: hook\n{fields}");
+            let config = parse_hook_config_from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("shipped hook {name} must still parse: {e}"));
+            assert_eq!(config, expected, "shipped hook {name}");
+        }
+    }
+
+    /// The manifest-side honored-policy table agrees with the manifest spellings the
+    /// parser accepts; `capsule-runtime` separately cross-checks it against its own
+    /// `HONORED_OUTPUT_ARM` dispatch table.
+    #[test]
+    fn commit_policy_for_binding_matches_the_declarable_pairs() {
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnStage),
+            Some(HookCommitPolicy::WriteManifests)
+        );
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnCompaction),
+            Some(HookCommitPolicy::ReplaceContext)
+        );
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnTaskEnd),
+            Some(HookCommitPolicy::ReopenTask)
+        );
+        // `on-inference` honors `artifact`, which has no `commit_policy` spelling; the
+        // other five honor nothing. `All` is unconstrained by design.
+        for binding in [
+            HookBinding::OnSessionStart,
+            HookBinding::OnTaskStart,
+            HookBinding::OnInference,
+            HookBinding::OnToolCall,
+            HookBinding::OnShell,
+            HookBinding::OnSessionEnd,
+            HookBinding::All,
+        ] {
+            assert_eq!(commit_policy_for_binding(&binding), None, "{binding:?}");
+        }
     }
 
     #[test]
