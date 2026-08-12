@@ -489,7 +489,7 @@ mur run murmur.yaml --task 'run this shell command: ulimit -Hn'
 
 **Do not run scenario 2 on macOS expecting containment.** It will not be contained, and that is
 the documented, permanent gap `W-SEC-010` exists to state — see
-[Security Warnings](security-warnings.md#w-sec-010).
+[Security Warnings](diagnostics.md#w-sec-010).
 
 ---
 
@@ -499,10 +499,10 @@ When this procedure has actually been run, record — here, in this file — the
 version, systemd version), the date, and per scenario: what happened, the exact `resource_limit`
 string the trace carried, and whether the host stayed responsive. Until that edit lands, every
 claim on this page is a design intent, not a verified result, and the "not yet verified" framing
-in [Security Warnings](security-warnings.md) stands as written.
+in [Security Warnings](diagnostics.md) stands as written.
 
 Scenarios 1, 2, 3, 5 and 6 are also driven automatically by the maintainer conformance procedure
-described in [Security Warnings](security-warnings.md#w-sec-005), where resource exhaustion is
+described in [Security Warnings](diagnostics.md#w-sec-005), where resource exhaustion is
 reported as **its own category** — denial of service — and is never merged into the escape
 findings. That is not a substitute for running them here: it grades each scenario from a single
 automated signal, while the scenarios above also ask a person to watch the host stay responsive and

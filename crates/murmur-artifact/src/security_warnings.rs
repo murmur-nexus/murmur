@@ -2,7 +2,7 @@
 //!
 //! Mirrors the `E-<CATEGORY>-NNN` convention `murmur-cli`'s `CliError` uses for fatal errors
 //! (see `murmur_cli::error`), but for warnings: printed and the session continues. Each code
-//! has a matching `#w-sec-nnn` anchor on the security-warnings reference page, so callers can
+//! has a matching `#w-sec-nnn` anchor on the diagnostics reference page, so callers can
 //! append [`security_warning_link`] to the message instead of re-explaining the issue inline.
 
 /// `capabilities.shell.allow` is non-empty but the host has no kernel-level subprocess
@@ -96,12 +96,12 @@ pub const W_SEC_011: &str = "W-SEC-011";
 /// once per uncovered helper, at staging, only under a declared `sealed` floor.
 pub const W_SEC_012: &str = "W-SEC-012";
 
-const SECURITY_WARNINGS_DOC_URL: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/";
+const DIAGNOSTICS_DOC_URL: &str =
+    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
-/// Builds the doc link for a `W-SEC-*` code, e.g. `.../security-warnings/#w-sec-001`.
+/// Builds the doc link for a `W-SEC-*` code, e.g. `.../diagnostics/#w-sec-001`.
 pub fn security_warning_link(code: &str) -> String {
-    format!("{SECURITY_WARNINGS_DOC_URL}#{}", code.to_lowercase())
+    format!("{DIAGNOSTICS_DOC_URL}#{}", code.to_lowercase())
 }
 
 #[cfg(test)]
@@ -112,7 +112,7 @@ mod tests {
     fn link_lowercases_the_code_into_the_anchor() {
         assert_eq!(
             security_warning_link(W_SEC_001),
-            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/#w-sec-001"
+            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-001"
         );
     }
 }

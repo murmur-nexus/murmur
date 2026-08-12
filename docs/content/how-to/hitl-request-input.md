@@ -6,8 +6,8 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [artifacts[].runtime](../reference/manifest-schema.md#field-artifacts) | Whether a WASM artifact is a model-visible tool, inference driver, or hook |
-| [lifecycle.input_timeout_secs](../reference/manifest-schema.md#lifecycle-input-timeout-secs) | Maximum seconds to wait before failing the task if no reply arrives |
+| [artifacts[].runtime](../reference/manifest.md#field-artifacts) | Whether a WASM artifact is a model-visible tool, inference driver, or hook |
+| [lifecycle.input_timeout_secs](../reference/manifest.md#lifecycle-input-timeout-secs) | Maximum seconds to wait before failing the task if no reply arrives |
 
 ---
 

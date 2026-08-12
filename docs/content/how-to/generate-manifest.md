@@ -14,9 +14,9 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [lifecycle.task_acceptance](../reference/manifest-schema.md#lifecycle-task-acceptance) | How the capsule accepts tasks; always `single` in generated manifests |
-| [lifecycle.after_task](../reference/manifest-schema.md#lifecycle-after-task) | What happens after the task completes; always `exit` in generated manifests |
-| [inference.model](../reference/manifest-schema.md#field-inference) | The model the generated capsule will use; defaults to Claude Haiku |
+| [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | How the capsule accepts tasks; always `single` in generated manifests |
+| [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What happens after the task completes; always `exit` in generated manifests |
+| [inference.model](../reference/manifest.md#field-inference) | The model the generated capsule will use; defaults to Claude Haiku |
 
 ---
 
@@ -261,7 +261,8 @@ The generator picks one of two shapes based on the task description.
         allow:
           - https://api.anthropic.com
       spawn:
-        scoped: true
+        allow:
+          - climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -291,7 +292,8 @@ The generator picks one of two shapes based on the task description.
         allow:
           - https://api.openai.com
       spawn:
-        scoped: true
+        allow:
+          - climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -321,7 +323,8 @@ The generator picks one of two shapes based on the task description.
         allow:
           - https://api.deepseek.com
       spawn:
-        scoped: true
+        allow:
+          - climate-data-worker
 
     lifecycle:
       task_acceptance: single
@@ -414,10 +417,10 @@ mur run --manifest murmur.yaml --input task.md
 | `--registry <url>` | Queries a custom artifact index; GitHub URLs receive the bearer token automatically |
 | `MURMUR_REGISTRY_TOKEN` | GitHub PAT injected as `Authorization: Bearer` on `raw.githubusercontent.com` and `api.github.com` requests; required for private repos, optional for public |
 | Single capsule | Generated for focused, bounded tasks — no `spawn` block |
-| Orchestrator | Generated for research and pipeline tasks — adds `spawn.scoped: true` |
+| Orchestrator | Generated for research and pipeline tasks — adds a `capabilities.spawn.allow` list |
 | Validation | Generated YAML is validated before writing; nothing written if validation fails |
 | Inference config | Config file (`inference:` in `~/.murmur/config.yaml`) → env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) → interactive first-run wizard |
-| Generator artifacts | `murmur-driver-anthropic` (or `murmur-driver-openai`) and `murmur-tool-registry-search` must both be installed |
+| Generator artifacts | `murmur-driver-anthropic` (or `murmur-driver-openai`), `murmur-tool-registry-search`, `murmur-tool-editor` and `murmur-skill-create-manifest` must all be installed |
 | `inference.model` | Defaults to `claude-haiku-4-5-20251001`; change it in the generated manifest if needed |
 
 ---

@@ -16,10 +16,10 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [lifecycle.task_acceptance](../reference/manifest-schema.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
-| [lifecycle.after_task](../reference/manifest-schema.md#lifecycle-after-task) | What the capsule does after a task completes |
-| [network.internal_port](../reference/manifest-schema.md#field-capabilities) | Pins the worker capsule to a fixed port so the orchestrator capsule allow list stays stable |
-| [capabilities.network.allow](../reference/manifest-schema.md#field-capabilities) | Host/URL patterns the capsule may connect to — must include peer capsule URLs |
+| [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
+| [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What the capsule does after a task completes |
+| [network.internal_port](../reference/manifest.md#field-capabilities) | Pins the worker capsule to a fixed port so the orchestrator capsule allow list stays stable |
+| [capabilities.network.allow](../reference/manifest.md#field-capabilities) | Host/URL patterns the capsule may connect to — must include peer capsule URLs |
 
 ---
 

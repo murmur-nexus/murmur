@@ -77,7 +77,7 @@ Inspect the final output at `workdir/<session_id>/out/result.txt`, for example:
 Pong! 🏓
 ```
 
-Learn how to [use a subscription instead](https://docs.murmur.nexus/getting-started/quickstart/#want-to-use-a-subscription), or explore every option of the `murmur.yaml` manifest in our [Manifest Schema documentation](https://docs.murmur.nexus/reference/manifest-schema/).
+Learn how to [use a subscription instead](https://docs.murmur.nexus/getting-started/quickstart/#want-to-use-a-subscription), or explore every option of the `murmur.yaml` manifest in our [Manifest Schema documentation](https://docs.murmur.nexus/reference/manifest/).
 
 ---
 

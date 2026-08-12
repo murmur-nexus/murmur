@@ -3,7 +3,7 @@
 //! These are the mistakes `mur build` can see in the file set it is about to pack but which
 //! still produce a working artifact: a redundant declaration, a payload the runtime will
 //! silently shadow, a build input that has no business shipping. Each one carries a `W-BLD-NNN`
-//! code and a link back to its section on the build-lints reference page, mirroring the
+//! code and a link back to its section on the diagnostics reference page, mirroring the
 //! `W-SEC-NNN` convention in [`crate::security_warnings`].
 //!
 //! Anything that makes the artifact *unlaunchable* is a [`BuildError`] instead — see
@@ -36,12 +36,12 @@ pub const W_BLD_003: &str = "W-BLD-003";
 /// which is what [`W_BLD_001`] and [`W_BLD_002`] report.
 pub const RESERVED_ROOT_ENTRIES: [&str; 2] = [PACKED_MANIFEST_ENTRY, CAPSULE_WASM_ENTRY];
 
-const BUILD_LINTS_DOC_URL: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/build-lints/";
+const DIAGNOSTICS_DOC_URL: &str =
+    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
-/// Builds the doc link for a `W-BLD-*` code, e.g. `.../build-lints/#w-bld-001`.
+/// Builds the doc link for a `W-BLD-*` code, e.g. `.../diagnostics/#w-bld-001`.
 pub fn build_warning_link(code: &str) -> String {
-    format!("{BUILD_LINTS_DOC_URL}#{}", code.to_lowercase())
+    format!("{DIAGNOSTICS_DOC_URL}#{}", code.to_lowercase())
 }
 
 /// One thing worth telling the author about an otherwise successful build.
@@ -197,7 +197,7 @@ mod tests {
     fn link_lowercases_the_code_into_the_anchor() {
         assert_eq!(
             build_warning_link(W_BLD_001),
-            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/build-lints/#w-bld-001"
+            "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-bld-001"
         );
     }
 

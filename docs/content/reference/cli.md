@@ -26,8 +26,6 @@ This page documents the **currently implemented** `mur` CLI surface in this repo
 | `mur search` | Search the public artifact index for artifacts matching a keyword |
 | `mur topology` | Render capsule sessions as a DAG from Grafana Tempo OTel data |
 
-> `init` is described in design docs but is not implemented in this codebase yet.
-
 ---
 
 ## `mur new`
@@ -53,14 +51,15 @@ mur new "<task description>" [--registry <URL|local>]
 
     `mur new` reads and writes the global file only — it does not consult or write the
     project-level `<cwd>/.murmur/config.yaml` file described in
-    [Configuration files](#configuration-files) below.
-- The driver artifact for your chosen provider must be installed:
-    - Anthropic: `murmur-driver-anthropic@0.3.32`
-    - OpenAI: `murmur-driver-openai@0.3.33`
-- `murmur-tool-registry-search@0.4.13` must be installed
+    [Configuration files](config.md#configuration-files).
+- The generator's own artifacts must be installed:
+    - the driver for your chosen provider — `murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}` or `murmur-driver-openai@{{ v.murmur_driver_openai }}`
+    - `murmur-tool-registry-search@{{ v.murmur_tool_registry_search }}`
+    - `murmur-tool-editor@{{ v.murmur_tool_editor }}`
+    - `murmur-skill-create-manifest@{{ v.murmur_skill_create_manifest }}`
 
 Install missing artifacts with `mur install <name>@<version>`. `mur new` exits with a clear
-error and install hint if either artifact is missing.
+error and install hint naming the first artifact it cannot resolve.
 
 **Output:**
 
@@ -76,7 +75,7 @@ mur new "review this PR for security issues"
 # Use locally installed artifacts (ensures generated versions are available)
 mur new "summarise a document" --registry local
 
-# Research/report task — generator adds spawn.scoped: true
+# Research/report task — generator adds a spawn capability
 mur new "research climate change trends and produce a report"
 ```
 
@@ -85,7 +84,7 @@ mur new "research climate change trends and produce a report"
 The generator automatically infers whether the task is:
 
 - **Single capsule** — focused, bounded task (e.g. "review this PR", "summarise a document"): produces a minimal manifest without `spawn`.
-- **Orchestrator** — research, multi-step, pipeline, or report tasks: adds `capabilities.spawn.scoped: true` so the capsule can spawn child capsules.
+- **Orchestrator** — research, multi-step, pipeline, or report tasks: adds a `capabilities.spawn` block so the capsule can spawn child capsules.
 
 **Generator behavior:**
 
@@ -136,15 +135,15 @@ mur build .
 ```
 
 - Reads `murmur.yaml` (requires `name` and `version` fields)
-- Scans `murmur.yaml` and optional `murmur.yaml` for literal secret patterns and emits warnings
+- Scans `murmur.yaml` for literal secret patterns and emits warnings
 - Packages **`murmur.yaml` plus exactly the files listed in `requires_files:`** — the rest of the
   source directory (`src/`, `Cargo.toml`, `README.md`, editor files, build output) is not packaged.
   `mur build` never compiles anything, so a `.wasm` payload must already exist on disk and be
   declared. A native or static artifact that declares no `requires_files:` builds to a
   manifest-only archive; a **wasm** artifact does not — with no root `*.wasm` to pack it fails
-  with [`E-BLD-003`](build-lints.md#e-bld-003).
+  with [`E-BLD-003`](diagnostics.md#e-bld-003).
 - Validates the manifest `name:`, the `requires_files:` paths and the resulting payload shape,
-  and warns about redundant or misplaced declarations — see [Build Lints](build-lints.md)
+  and warns about redundant or misplaced declarations — see [Build Lints](diagnostics.md)
 - Output written **inside the source directory** unless `--output` is specified
 
 ### Skill packaging (`--skill`)
@@ -290,7 +289,7 @@ mur run
 Example — install a specific artifact:
 
 ```bash
-mur install murmur-tool-git@0.3.31
+mur install murmur-tool-git@1.0.0
 ```
 
 Behavior:
@@ -298,29 +297,6 @@ Behavior:
 1. Resolve artifact from configured registry source (falls back through source chain if not found locally)
 2. Verify SHA256 integrity
 3. Store into the project-local store (or global store with `-g`)
-
-### Partial failure (`mur install` with no args)
-
-When installing from `murmur.yaml`, every declared artifact is fetched independently — one artifact
-failing to resolve does not discard the others. Every artifact that succeeds is stored **and**
-pinned into `murmur.lock`, even if other artifacts in the same run fail. If any artifact fails,
-`mur install` exits with status `1` and prints a plain-text report naming each failing artifact and
-its error, followed by a roll-up of how many artifacts installed successfully (omitted if none did):
-
-```
-1 of 3 artifacts failed to install:
-
-  smoke-missing@9.9.9
-    error[E-REG-001]: artifact smoke-missing@9.9.9 not found in registry
-      hint: configure a registry.sources entry in ~/.murmur/config.yaml
-
-installed 2 artifacts  567 B
-```
-
-This report is printed with plain `println!` output (not the progress-bar UI), so it is visible even
-when stdout is redirected or piped — for example in CI logs. A subsequent `mur run` will succeed for
-any artifact that installed successfully, without needing to rerun `mur install` for the whole
-project.
 
 ---
 
@@ -349,16 +325,16 @@ Example output (`mur list`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORM
-murmur-driver-anthropic  0.3.32   driver   wasm
-murmur-tool-git          0.3.31   tool     darwin-aarch64
+murmur-driver-anthropic  1.0.0    driver   wasm
+murmur-tool-git          1.0.0    tool     darwin-aarch64
 ```
 
 Example output (`mur list --all`):
 
 ```text
 NAME                     VERSION  RUNTIME  PLATFORM        SCOPE
-murmur-driver-anthropic  0.3.32   driver   wasm            project
-murmur-tool-git          0.3.31   tool     darwin-aarch64  global
+murmur-driver-anthropic  1.0.0    driver   wasm            project
+murmur-tool-git          1.0.0    tool     darwin-aarch64  global
 ```
 
 ---
@@ -383,8 +359,8 @@ There is no hardcoded artifact list: the checklist is derived entirely from `mur
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur-driver-anthropic@0.3.32   darwin-aarch64
-  ✓  murmur-tool-git@0.3.31           darwin-aarch64
+  ✓  murmur-driver-anthropic@1.0.0    darwin-aarch64
+  ✓  murmur-tool-git@1.0.0            darwin-aarch64
 
 All checks passed.
 ```
@@ -393,16 +369,18 @@ All checks passed.
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  murmur-tool-git@0.3.31   darwin-aarch64   — missing
+  ✗  murmur-tool-git@1.0.0   darwin-aarch64   — missing
 
 0 checks passed, 1 error found.
 
-Fix: mur install murmur-tool-git@0.3.31
+Fix: mur install murmur-tool-git@1.0.0
 ```
 
 ### Lock integrity
 
-When `murmur.lock` is present in the project, `mur doctor` checks every registry-resolved (non-local-source) artifact against it the same way `mur run` does before staging a session: the lock must have an entry for the artifact, that entry's `resolved_version` must match the version `murmur.yaml` declares, and its recorded sha256 must match the sha256 of the bytes actually installed. Any disagreement turns that artifact's line into a `✗`, counts toward the failure tally, and gets a `Fix:` line — so `mur doctor` never reports "All checks passed." on a project `mur run` would reject. When no `murmur.lock` exists, `mur doctor` falls back to presence-only checking and prints nothing lock-related, exactly as before this check existed.
+Each registry-resolved artifact is also checked against `murmur.lock` when one is present — see
+[Lock integrity](../concepts/registry.md#lock-integrity). A disagreement produces one of three
+failure lines:
 
 - `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
 - `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares
@@ -420,8 +398,6 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
 
 Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
 ```
-
-A `murmur.lock` that exists but fails to parse or fails validation is a hard failure — `mur doctor` reports it and exits before printing any checklist line, the same way a malformed `murmur.yaml` already does.
 
 **Exit codes:**
 
@@ -445,17 +421,25 @@ A setup failure (no project found, the manifest fails to load, or the lockfile f
 Run capsule component and resolve declared artifacts.
 
 ```bash
-mur run [--manifest <path>] [--input <path>] [--json]
+mur run [--manifest <path>] [--task <path-or-text>] [--json]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
-| `--task` | — | File to copy into the capsule workdir as `task.md` before launch |
-| `--json` | off | Emit launch info as a single JSON line instead of human-readable output |
+| `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
+| `--workdir` | temporary directory | Directory mounted as the capsule's accessible workspace. Session artifacts are created inside it |
+| `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines |
+| `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
+| `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines |
+| `--lifecycle-task-acceptance` | — | Override `lifecycle.task_acceptance` (`none`\|`single`\|`queue`) |
+| `--lifecycle-after-task` | — | Override `lifecycle.after_task` (`exit`\|`sleep`) |
 | `--no-env-file` | off | Skip auto-loading the workspace-root `.env` file for this invocation. Recommended default for CI/CD pipelines |
-| `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](manifest-schema.md#field-containment) |
-| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no registry pull, no component compile, no workdir. Reports even when the declared floor is not met. See [`--explain-scope`](manifest-schema.md#explain-scope) |
+| `--containment` | — | Require at least this containment class (`advisory`\|`scoped`\|`sealed`). Combines with the manifest's `capabilities.containment` and the workspace `containment` config by taking the strongest of the three — this flag can only raise the effective floor, never lower one another source already set. See [Containment class](containment.md#field-containment) |
+| `--explain-scope` | off | Print the effective grant set and the declared/achieved containment classes, then exit `0` without staging or launching anything — no registry pull, no component compile, no workdir. Reports even when the declared floor is not met |
+
+For the output modes, the read-only pre-flight checks and driving a capsule over HTTP, see
+[Run a capsule from the CLI or from another program](../how-to/different-ways-to-run-murmur.md).
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
 - Creates/uses `murmur.lock` in manifest directory
@@ -471,56 +455,6 @@ Current runtime constraints:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
 - Agent capsules require either `transport: http` (with `inference.driver.artifact`) or `transport: process` (with `inference.command`) in `murmur.yaml`; missing driver config exits with `error[E-RUN-005]` or `error[E-RUN-006]` respectively
-
-### Human-readable output (default)
-
-Without `--json`, `mur run` prints three lines to stdout after the session completes:
-
-```text
-murmur: url localhost:<port>
-session: <id>
-workdir: <absolute-path>
-status:  ok
-```
-
-The `murmur: url` line is emitted immediately after the capsule's HTTP server port is bound (before the agent loop starts). The `session:`, `workdir:`, and `status:` lines are printed after the session completes.
-
-### Programmatic output (`--json`)
-
-Pass `--json` to emit a single JSON line to stdout immediately after the capsule's HTTP server port is bound, before the agent loop starts. This enables any external process to discover the capsule URL without parsing human-readable stdout.
-
-```bash
-mur run --json --manifest ./murmur.yaml
-```
-
-Output — one JSON line written to stdout after port binding:
-
-```json
-{"url":"localhost:PORT","pid":12345,"session_id":"ses_..."}
-```
-
-Field semantics:
-
-| Field | Type | Description |
-|---|---|---|
-| `url` | string | `localhost:PORT` — the capsule's A2A HTTP endpoint; use this for `message/send`, `tasks/get`, `message/stream`, and `/.well-known/agent-card.json` |
-| `pid` | number | The `mur` process ID (`u32`); use this to manage process lifecycle (wait, kill) |
-| `session_id` | string | The session identifier assigned to this run; correlates with the `session_id` field in `workdir/<session_id>/trace.jsonl`'s `session_start` event |
-
-**Trace correlation:** The `session_id` in the JSON output is the same identifier written to `workdir/<session_id>/trace.jsonl` as the `session_start.session_id` field. Use it to join the programmatic launch record with the session's trace for log correlation and post-run analysis.
-
-**Startup latency:** The JSON line is written after the TCP port is bound and the HTTP server is listening, but callers should connect with retry/backoff since a small window exists between port binding and the accept loop processing the first request.
-
-**Error behavior:** If `mur run --json` fails before port binding (e.g. bad manifest path, missing artifact), stdout is empty — no JSON is emitted and no human-readable output appears on stdout. The error message goes to stderr. Exit code is non-zero.
-
-### Containment floor
-
-Before any registry resolution, component compile, or workdir creation, `mur run` checks the
-declared containment floor against what the host can actually achieve. If the host falls short,
-the run is refused with `error[E-CAP-003]` and no workdir is created. See
-[Containment class](manifest-schema.md#field-containment) for the declaration sources and
-[`--explain-scope`](manifest-schema.md#explain-scope) for a read-only way to inspect the floor
-without launching.
 
 ---
 
@@ -709,7 +643,7 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
 
 Read and analyze `trace.jsonl` files produced by `mur run`. These commands are read-only — they do not modify any file and do not require a running registry or runtime.
 
-See [Session trace (`trace.jsonl`)](#session-trace-tracejsonl) below for the file format.
+See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-tracejsonl) for the file format.
 
 ### `mur trace show`
 
@@ -870,178 +804,13 @@ Notes:
 - The Per-task averages section only appears when at least one multi-task session (more than one task) is present. Old-format traces (no task events) are excluded from per-task aggregation.
 - Exits non-zero if the directory does not exist or contains no `.jsonl` files.
 
-### Session trace (`trace.jsonl`) schema { #session-trace-tracejsonl }
-
-Every agent session produces a structured trace at `workdir/<session_id>/trace.jsonl`. The
-file is written by the runtime — not by the capsule — and cannot be suppressed or falsified
-by the capsule. It exists even when no hook artifacts are declared.
-
-**Format:** one JSON object per line (JSONL), UTF-8, line-terminated. Every line carries
-`event_type` (discriminator), `session_id` (runtime-generated UUID v7, identical on every line
-in a session), and `timestamp` (Unix milliseconds).
-
-**Event types** — six standard events, plus two A2A events, three task events, and a hook-fault event:
-
-**`session_start`** — written before the first inference call
-
-| Field | Type |
-|---|---|
-| `capsule_name` | string |
-| `capsule_version` | string |
-| `model` | string |
-| `max_turns` | u32 |
-| `capabilities` | string[] |
-| `tools_declared` | string[] |
-| `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the effective declared floor, always present even when no manifest/config/flag ever declared one (defaults to `"advisory"`) |
-| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the host's probed kernel capability, capped by `workdir_exec` below. Nothing in a manifest can raise it |
-| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its Landlock `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](security-warnings.md#w-sec-011) |
-| `effective_grants` | object | The complete grant set this session ran under — same object, field for field, as [`mur run --explain-scope --json`](manifest-schema.md#explain-scope) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `enforcement_tier`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, and `shortfall_reason` (present only when `floor_met` is `false`). Unlike `capabilities` above, which only names *categories* (`"network"`, `"shell"`, ...), this field names the actual destinations, binaries and paths granted — the property an auditor reading a finished trace needs, without re-parsing the manifest |
-
-**`inference`** — written after each driver response is parsed
-
-| Field | Type | Notes |
-|---|---|---|
-| `turn` | u32 | Zero-based turn index |
-| `input_tokens` | u64 | |
-| `output_tokens` | u64 | |
-| `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` |
-| `tool_name` | string \| null | Present only when `decision` is `"tool_call"` |
-
-**`tool_call`** — written after each tool invocation returns
-
-| Field | Type | Notes |
-|---|---|---|
-| `turn` | u32 | |
-| `tool_name` | string | |
-| `input_bytes` | u64 | Byte length of the serialized tool input |
-| `output_bytes` | u64 | Byte length of the tool output text |
-| `duration_ms` | u64 | |
-| `status` | string | `"ok"` \| `"error"` |
-
-**`shell`** — written after each shell command returns (follows its `tool_call` line)
-
-| Field | Type | Notes |
-|---|---|---|
-| `turn` | u32 | |
-| `binary` | string | The program that ran — canonicalized absolute path when the invoked name resolved against the host `PATH` (e.g. `/usr/bin/pytest`), else the bare invoked name |
-| `command` | string | First 200 characters |
-| `exit_code` | i32 | Non-zero is data, not an error |
-| `stdout_bytes` | u64 | |
-| `stderr_bytes` | u64 | |
-| `duration_ms` | u64 | |
-
-**`compaction`** — written when context compaction fires
-
-| Field | Type |
-|---|---|
-| `turn` | u32 |
-| `tokens_before` | u64 |
-| `tokens_after` | u64 |
-
-**`session_end`** — always the last line; written on every exit path
-
-| Field | Type | Notes |
-|---|---|---|
-| `total_turns` | u32 | Equals the count of `inference` lines |
-| `total_input_tokens` | u64 | |
-| `total_output_tokens` | u64 | |
-| `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
-| `total_shell_calls` | u32 | Equals the count of `shell` lines |
-| `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` |
-
-**`a2a_task_received`** — written when an incoming message reserves the task slot
-
-| Field | Type | Notes |
-|---|---|---|
-| `task_id` | string | Runtime-generated UUID |
-| `context_id` | string | Echoed or generated `contextId` |
-| `message_id` | string | `messageId` from the incoming A2A Message |
-| `traceparent_from_caller` | string \| null | W3C `traceparent` header from the incoming request |
-
-**`a2a_send`** — written when a capsule component calls `murmur:message/send`
-
-| Field | Type | Notes |
-|---|---|---|
-| `peer_url` | string | Target capsule URL |
-| `message_id` | string | `message-id` from the outgoing Message |
-| `task_id` | string | Task ID returned by the peer |
-| `context_id` | string | Context ID returned by the peer |
-| `traceparent` | string \| null | W3C `traceparent` injected on the outgoing request |
-
-**`task_start`** — written at the start of each task, before `run_agent_loop`
-
-| Field | Type | Notes |
-|---|---|---|
-| `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
-| `context_id` | string | Context UUID for this task |
-| `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path |
-| `message_parts_bytes` | u64 | Byte length of the task message text |
-
-Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for `task.md` tasks.
-
-**`task_end`** — written after `run_agent_loop` returns (and any hook-requested reopens are resolved), for every task
-
-| Field | Type | Notes |
-|---|---|---|
-| `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt returned `Ok(())`; `"failed"` if it returned `Err(_)`; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `inference.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
-| `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
-| `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
-| `input_tokens` | u64 | Input tokens for this task only |
-| `output_tokens` | u64 | Output tokens for this task only |
-| `tool_calls` | u32 | Tool calls for this task only |
-| `shell_calls` | u32 | Shell calls for this task only |
-| `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). Absent in traces written before this field existed; readers should default it to `0`. |
-
-Written unconditionally after the task's last attempt, even on error exit (exit_status will be `"failed"` or `"reopen_budget_exhausted"`). Always follows the corresponding `session_end`.
-
-**`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task, when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and the reopen is granted
-
-| Field | Type | Notes |
-|---|---|---|
-| `task_id` | string | The task being reopened |
-| `hook_name` | string | Manifest name of the hook that requested the reopen |
-| `reason` | string | Feedback text the hook asked to inject into the reopened task content |
-| `reopen_number` | u32 | 1-based ordinal of this reopen within the task (first reopen = `1`) |
-
-Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
-reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
-mechanism.
-
-**`hook_dispatch_error`** — written when a hook returns a `hook-output` arm the lifecycle event it fired from does not honor (see [Honored `hook-output` arm per event](wit-interfaces.md#murmurhooklifecycle))
-
-| Field | Type | Notes |
-|---|---|---|
-| `hook_name` | string | Manifest name of the hook that returned the unsupported arm |
-| `event` | string | WIT lifecycle function name, e.g. `"on-tool-call"` |
-| `arm` | string | The unsupported `hook-output` arm name, e.g. `"write-manifests"` |
-
-Non-fatal: the session continues exactly as if the hook had returned `none`. Written just before the `session_end`/`task_end` it precedes, so it always appears earlier in the file than the event that flushed it. Never written for `on-stage` (staging runs before `trace.jsonl` exists) or for async hooks (fire-and-forget; logged to `workdir/logs/hook-<name>.log` only) — both still get a log line, just no trace record.
-
-**Guarantees:**
-
-- `trace.jsonl` exists after any capsule session, regardless of exit cause.
-- For single-task (ephemeral) sessions: `session_start` is the first event and `session_end` is the last.
-- For multi-task (persistent) sessions: `task_start` precedes `session_start` for each task; `task_end` follows `session_end` for each task. Each task produces exactly one `task_start`/`task_end` pair.
-- `session_id` is identical on every line and matches `StagedSession.session_id`.
-- Count fields in the last `session_end` equal the cumulative per-event totals across all tasks in the session.
-- For multi-task sessions, the last `session_end` total fields equal the sum of all `task_end` per-task fields.
-- Field names are snake_case translations of the hook WIT kebab-case field names (e.g. `input-tokens` → `input_tokens`).
-
-**Non-obvious behaviour:**
-
-- The trace is written by direct file append; it does **not** route through the `murmur:hook/lifecycle` WIT interface. A capsule that declares no hook artifacts still produces `trace.jsonl`.
-- Compaction trace write errors are non-fatal (logged to `bootstrap.log`) because `try_compact_messages` itself is non-fatal. All other trace write errors surface as `RuntimeError::AgentLoopFailed`.
-- If `run_agent_loop` returns `Err` before `session_start` is written (e.g. driver artifact missing), `trace.jsonl` is created but empty. `session_end` is not written because no session started.
-
 ---
 
 ## `mur eval`
 
 Read and analyze `eval.jsonl` files produced by `murmur-hook-eval`, or drive a capsule against a dataset. These commands are read-only except for `mur eval run`, which launches real capsule sessions. They do not require a running registry (unless the capsule needs to pull artifacts).
 
-See [Structured evaluation (`eval.jsonl`)](#structured-evaluation-evaljsonl) below for the file format.
+See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-evaluation-evaljsonl) for the file format.
 
 ### `mur eval show`
 
@@ -1144,53 +913,6 @@ pass: 2/2
 - A case that fails to stage (e.g. missing artifact) is recorded as `stage_failed` and does not count toward `pass`.
 - `MURMUR_DATASET_ID` is taken from `observability.eval.dataset_id` in the manifest, not from the dataset file.
 
-### Structured evaluation (`eval.jsonl`) schema { #structured-evaluation-evaljsonl }
-
-When `murmur-hook-eval` is declared in the capsule manifest with at least one scorer configured, the hook writes `workdir/<session_id>/eval.jsonl` at `session_end`. The file is **not** written by the runtime itself — it is written by the hook component. `trace.jsonl` is always written by the runtime; `eval.jsonl` is only written when `murmur-hook-eval` is active and has at least one scorer. The two files are siblings in the same session workdir and share the same session scope.
-
-**Format:** one JSON object per line (JSONL). Two record types, distinguished by `record_type`.
-
-**Per-event score** (`record_type = "event_score"`) — one line per scorer:
-
-| Field | Type | Notes |
-|---|---|---|
-| `record_type` | `"event_score"` | discriminator |
-| `ts` | u64 | Unix milliseconds |
-| `turn` | u32 | Turn count at the time of scoring |
-| `event_type` | string | Lifecycle event that triggered the score (e.g. `"session_end"`) |
-| `scorer` | string | Scorer name from manifest |
-| `result` | `"pass"` \| `"fail"` | Binary outcome |
-| `score` | f64 | `1.0` = pass, `0.0` = fail |
-| `reason` | string | Human-readable explanation (e.g. `"turns=3 max=5"`) |
-
-**Dataset run summary** (`record_type = "dataset_run"`) — one line per session, always last:
-
-| Field | Type | Notes |
-|---|---|---|
-| `record_type` | `"dataset_run"` | discriminator |
-| `ts` | u64 | Unix milliseconds |
-| `dataset_id` | string \| null | From `observability.eval.dataset_id` |
-| `case_id` | string \| null | From `MURMUR_CASE_ID` (set by `mur eval run`) |
-| `overall` | `"pass"` \| `"fail"` \| `"no_scores"` | `fail` if any scorer fails; `no_scores` if no scores were emitted |
-| `scores` | object | Map of scorer name → float score |
-
-Example:
-
-```jsonl
-{"record_type":"event_score","ts":1778161473790,"turn":2,"event_type":"session_end","scorer":"turn_limit","result":"pass","score":1.0,"reason":"turns=2 max=5"}
-{"record_type":"dataset_run","ts":1778161473790,"dataset_id":"my-ds","case_id":"case_001","overall":"pass","scores":{"turn_limit":1.0,"success_check":1.0}}
-```
-
-**Scorer types:**
-
-| Type | Passes when |
-|---|---|
-| `exit_ok` | `exit_status == "ok"` |
-| `max_turns` | `total_turns <= max` |
-| `max_tokens` | `total_input_tokens + total_output_tokens <= max` |
-| `tool_sequence` | `expected` list is a subsequence of observed tool calls |
-| `llm_judge` | *deferred* — recognized but logs a warning and emits no score |
-
 ---
 
 ## `mur topology`
@@ -1259,14 +981,14 @@ mur search <query> [--registry <URL|local>] [--limit <n>]
 | `--registry` | public index URL | `local` scans `~/.murmur/artifacts/`; an absolute file path reads a local index file; any URL fetches that index |
 | `--limit` | `10` | Maximum number of results to show |
 
-**Default behaviour (no `--registry`):** fetches the public artifact index from the configured URL (default: the Murmur default-artifacts repository). Override the URL with `registry.index_url` in the effective (global + project-level, merged) config — see [Artifact index and custom registry URL](#artifact-index-and-custom-registry-url) and [Configuration files](#configuration-files).
+**Default behaviour (no `--registry`):** fetches the public artifact index from the configured URL (default: the Murmur default-artifacts repository). Override the URL with `registry.index_url` in the effective (global + project-level, merged) config — see [Artifact index and custom registry URL](config.md#artifact-index-and-custom-registry-url) and [Configuration files](config.md#configuration-files).
 
 **Output format:**
 
 ```text
 NAME                     VERSION  RUNTIME  DESCRIPTION
-murmur-tool-git          0.3.31   tool     Structured git interface for Murmur capsules.
-murmur-driver-anthropic  0.3.32   driver   Anthropic Messages API inference driver for Murmur agent capsules.
+murmur-tool-git          1.0.0    tool     Structured git interface for Murmur capsules.
+murmur-driver-anthropic  1.0.0    driver   Anthropic Messages API inference driver for Murmur agent capsules.
 ```
 
 When no artifacts match, prints `No results found.` and exits `0` (not an error).
@@ -1310,7 +1032,7 @@ mur beta disable <feature>
 ### `mur beta list`
 
 Reads the effective (global + project-level, merged) config — see
-[Configuration files](#configuration-files) — so a `beta.enabled` flag set in either
+[Configuration files](config.md#configuration-files) — so a `beta.enabled` flag set in either
 `~/.murmur/config.yaml` or `<cwd>/.murmur/config.yaml` shows as enabled. Lists all beta features
 compiled into this build and their current enabled status. On a
 standard release build with no beta features compiled in, prints:
@@ -1361,14 +1083,14 @@ mur beta disable blueprint
 ```
 
 **Persistence:** enabled flags are written to `~/.murmur/config.yaml` under the `beta:` section.
-See [Configuration files](#configuration-files) below.
+See [Configuration files](config.md#configuration-files).
 
 ---
 
 ## `mur config`
 
 Read and write individual keys in the CLI config files described in
-[Configuration files](#configuration-files) below.
+[Configuration files](config.md#configuration-files).
 
 ```bash
 mur config set <key> <value> [-g|--global]
@@ -1425,227 +1147,4 @@ mur config set nonsense.field value
     ```
 
     No warning is printed for a `${VAR}`-shaped value — see
-    [`inference.api_key` is always global](#inferenceapi_key-is-always-global) below.
-
----
-
-## Configuration files
-
-Murmur CLI configuration lives in up to two YAML files, resolved into one *effective* config:
-
-| File | Scope | Discovery |
-|---|---|---|
-| `~/.murmur/config.yaml` | Global (per-user) | Fixed path |
-| `<cwd>/.murmur/config.yaml` | Project (per-workspace) | `<cwd>` only — unlike project-root manifest discovery elsewhere in the CLI, this does **not** walk up to parent directories |
-
-Both files are optional; a missing file is treated as empty. Write them with
-[`mur config set`](#mur-config) (project by default, `-g` for global) or edit the YAML by hand.
-
-### Merge rules
-
-Where both files set a value, the effective config is built per field:
-
-| Field | Rule |
-|---|---|
-| `registry.default` | Project wins if non-empty, else global, else the built-in default (`official`) |
-| `registry.index_url` | Same non-empty-wins rule |
-| `inference.provider` / `inference.model` / `inference.endpoint` | Same non-empty-wins rule |
-| `inference.api_key` | **Always** the global value — see below |
-| `registry.sources` | Union by `name`: a project entry sharing a global entry's name replaces it in place (position preserved); a project entry with a new name is appended; global-only entries are never dropped |
-| `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
-| `containment` | **Strongest wins**, not project-wins — see [Containment class](manifest-schema.md#field-containment) |
-
-If the project file does not exist, the effective config is exactly the global config (with
-built-in defaults applied where global is also empty).
-
-### `inference:` section
-
-Configures the inference provider used by `mur new`. When present and complete in the global
-file, it takes priority over the `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars and the
-interactive wizard. (`mur new` reads `~/.murmur/config.yaml` directly, not the merged effective
-config — see the note under [`mur new`](#mur-new).)
-
-```yaml
-inference:
-  provider: anthropic              # "anthropic" or "openai"
-  model: claude-haiku-4-5-20251001
-  api_key: sk-ant-...
-  endpoint: ""                     # optional; leave empty for the provider default
-```
-
-| Key | Required | Description |
-|---|---|---|
-| `provider` | yes | `"anthropic"` or `"openai"` |
-| `model` | yes | Model name passed to the inference driver |
-| `api_key` | yes | API key for the provider |
-| `endpoint` | no | Override the base URL (e.g. for a proxy); empty = provider default |
-
-**Provider defaults:**
-
-| Provider | Default endpoint | Default model (wizard) |
-|---|---|---|
-| `anthropic` | `https://api.anthropic.com` | `claude-haiku-4-5-20251001` |
-| `openai` | `https://api.openai.com` | `gpt-4o-mini` |
-
-**Env var override behavior:** `inference:` in the global file is checked first; if absent or
-incomplete, the env vars `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are checked (in that order); if
-neither is set, the interactive wizard fires. To disable the env var fallback, set `inference:`
-in the global config file.
-
-#### `inference.api_key` is always global
-
-`inference.api_key` is the one field that does not follow "project wins": the effective config
-reads it from `~/.murmur/config.yaml` only, regardless of what the project file contains — even
-if the project value is a `${VAR}` reference. If the global file has no `inference:` block at
-all, the effective `api_key` is `""`.
-
-A **literal** (non-`${VAR}`) `inference.api_key` in the project file triggers a warning — both
-when the effective config is loaded and when `mur config set` writes it (see
-[`mur config set`](#mur-config-set-key-value) above):
-
-```text
-warning: <cwd>/.murmur/config.yaml sets inference.api_key to a literal value, but inference.api_key is always read from the global config (~/.murmur/config.yaml); this project-level value will be ignored
-```
-
-A `${VAR}`-shaped value (e.g. `${MY_ORG_KEY}`) prints no warning on either path — it's simply
-never consulted, same as any other project-level `inference.api_key`.
-
-### `registry:` section
-
-See [Artifact index and custom registry URL](#artifact-index-and-custom-registry-url) below for
-`registry.index_url`, and [Multiple sources and fallthrough](installing-artifacts.md#multiple-sources-and-fallthrough) for
-`registry.sources`.
-
-### `beta:` section
-
-Stores the list of beta features opted into via `mur beta enable`/`mur beta disable`. Those
-commands always read and write the global file only (no `-g`/project flag). `beta.enabled` is
-not a settable `mur config set` key (see [`mur config set`](#mur-config-set-key-value)) — a
-project-level `beta.enabled` entry can only be added by hand-editing
-`<cwd>/.murmur/config.yaml`.
-
-```yaml
-beta:
-  enabled:
-    - blueprint
-    - dag-topology
-```
-
-| Key | Type | Description |
-|---|---|---|
-| `enabled` | array of strings | Feature names opted into |
-
-An absent `beta:` section is equivalent to `enabled: []`. Features listed here but not compiled
-into the current binary are silently ignored — they take effect once a binary that includes them
-is installed.
-
-### Where the effective (merged) config is used
-
-The merged global+project config is read by:
-
-- Beta feature gating (which subcommands `mur --help` shows, and `mur beta list`'s enabled column)
-- `mur install`'s registry source-chain resolution
-- `mur search`'s `registry.index_url` resolution
-
-`mur new` and `mur deploy` — both beta-gated — still read `~/.murmur/config.yaml` only; this is a
-deliberate scope limit, not an oversight.
-
----
-
-## Artifact index and custom registry URL
-
-`mur search` fetches a static JSON catalog called `artifacts-index.json` hosted at a canonical public URL. The default URL points to the Murmur default-artifacts repository. To use a different URL (for example a private org catalog), add this to `~/.murmur/config.yaml` — or `<cwd>/.murmur/config.yaml` to scope it to one project — or set it with `mur config set registry.index_url <url>`:
-
-```yaml
-registry:
-  index_url: https://my-org.example.com/artifacts-index.json
-```
-
-The `registry.index_url` key overrides the default for all `mur search` invocations that do not pass an explicit `--registry` flag. See [Configuration files](#configuration-files) for how the project and global values merge.
-
-**`artifacts-index.json` schema:**
-
-```json
-{
-  "schema_version": "1",
-  "updated_at": "2026-06-07T00:00:00Z",
-  "artifacts": [
-    {
-      "name": "murmur-tool-git",
-      "version": "0.3.31",
-      "runtime": "tool",
-      "description": "Structured git interface for Murmur capsules.",
-      "tags": ["tool", "git"],
-      "platforms": ["darwin-aarch64", "linux-aarch64", "linux-x86_64"]
-    }
-  ]
-}
-```
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `schema_version` | string | yes | Always `"1"` — future incompatible changes bump this |
-| `updated_at` | string | yes | ISO 8601 UTC timestamp of last regeneration |
-| `artifacts` | array | yes | One entry per published artifact |
-| `name` | string | yes | Artifact name (matches `name:` in murmur.yaml) |
-| `version` | string | yes | SemVer string |
-| `runtime` | string | yes | `driver`, `hook`, `tool`, or `skill` |
-| `description` | string | yes | Short description from murmur.yaml |
-| `tags` | array[string] | no | Keyword tags; empty array if absent |
-| `platforms` | array[string] | no | e.g. `darwin-aarch64`; empty for skill artifacts |
-
-**Regenerating the index:** the index is regenerated by `scripts/apply-versions.sh` in the default-artifacts repository whenever artifact versions are bumped. Run that script from the default-artifacts repo root to update `artifacts-index.json` in place.
-
----
-
-## Registry selection rules
-
-Resolution order in CLI:
-
-1. `--registry <url>` flag
-2. `murmur.yaml` `registry.remote_url`
-3. `murmur.yaml` `registry.default` (`local` or `remote`)
-4. fallback local mode
-
-Remote mode requires:
-
-- `NEXUS_API_KEY` environment variable
-
----
-
-## Error codes
-
-| Code | Meaning |
-|---|---|
-| `E-CFG-002` | `mur config set` given an unsupported dotted key |
-| `E-MAN-001` | Missing required manifest field |
-| `E-MAN-002` | YAML syntax error in manifest |
-| `E-MAN-003` | Field type mismatch in manifest |
-| `E-BLD-001` | Manifest `name:` is not a valid artifact identifier ([build lints](build-lints.md#e-bld-001)) |
-| `E-BLD-002` | `requires_files:` entry is unsafe (absolute, `..`, symlink) or collides inside the archive ([build lints](build-lints.md#e-bld-002)) |
-| `E-BLD-003` | Packed entry set is not a launchable wasm payload ([build lints](build-lints.md#e-bld-003)) |
-| `E-RUN-001` | Capsule trap, compile failure, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) |
-| `E-RUN-002` | Missing WASI import (linker error) |
-| `E-RUN-003` | Lock version mismatch or missing lock entry |
-| `E-RUN-004` | Capsule WASM not found at expected path |
-| `E-RUN-005` | Inference driver not configured in manifest |
-| `E-RUN-006` | Inference driver artifact not installed |
-| `E-RUN-007` | Agent loop failed at runtime |
-| `E-RUN-008` | Required artifact not installed locally |
-| `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read |
-| `E-RUN-010` | `network.internal_port` is already bound |
-| `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit ([host resource limits](manifest-schema.md#host-resource-limits)) |
-| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) — see [host resource limits](manifest-schema.md#host-resource-limits) |
-| `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` |
-| `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess — see [containment class](manifest-schema.md#field-containment) |
-| `E-CAP-003` | Declared containment floor (`advisory`\|`scoped`\|`sealed`) is not achievable on this host |
-| `E-CAP-005` | This host cannot give the capsule's native subprocess tree its own network namespace, so `capabilities.network.allow` cannot be enforced for it |
-| `E-IO-001` | File or directory not found |
-| `E-IO-003` | General I/O error (read/write failure) |
-| `E-DEPLOY-003` | SSH connection or remote command failed |
-| `E-DEPLOY-004` | Capsule did not emit startup JSON within 30s |
-| `E-TRC-001` | Trace file parse error (malformed JSON, missing required `session_start`/`session_end`, empty file); unknown event types are silently skipped |
-| `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number |
-| `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format |
-| `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) |
-| `E-TOP-003` | Tempo response JSON parse failure |
+    [`inference.api_key` is always global](config.md#inferenceapi_key-is-always-global).

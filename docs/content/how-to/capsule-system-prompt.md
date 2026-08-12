@@ -6,9 +6,9 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [inference.system_prompt](../reference/manifest-schema.md#inference-system-prompt) | Inline text injected as the system prompt on every turn |
-| [inference.system_prompt_file](../reference/manifest-schema.md#inference-system-prompt) | Path to a file whose content is used as the system prompt |
-| [inference.system_prompt_artifact](../reference/manifest-schema.md#inference-system-prompt) | Name of a skill artifact whose `skill.md` is read at launch and used as the system prompt |
+| [inference.system_prompt](../reference/manifest.md#inference-system-prompt) | Inline text injected as the system prompt on every turn |
+| [inference.system_prompt_file](../reference/manifest.md#inference-system-prompt) | Path to a file whose content is used as the system prompt |
+| [inference.system_prompt_artifact](../reference/manifest.md#inference-system-prompt) | Name of a skill artifact whose `skill.md` is read at launch and used as the system prompt |
 
 ---
 
@@ -183,7 +183,7 @@ At launch, the runtime reads `workdir/tools/code-review-conventions/skill.md` an
 Validation happens at parse time:
 
 - The named artifact must be declared in `artifacts:` — if not, `mur run` exits with a clear error before starting.
-- It must declare `prompt_payload: true` — `runtime: skill` defaults to this, so skills work with no extra declaration; a `tool`, `driver`, or `hook` artifact must set `prompt_payload: true` explicitly to be eligible, and one that doesn't is a manifest error. See [`inference.system_prompt_artifact`](../reference/manifest-schema.md#inference-system-prompt-artifact).
+- It must declare `prompt_payload: true` — `runtime: skill` defaults to this, so skills work with no extra declaration; a `tool`, `driver`, or `hook` artifact must set `prompt_payload: true` explicitly to be eligible, and one that doesn't is a manifest error. See [`inference.system_prompt_artifact`](../reference/manifest.md#inference-system-prompt-artifact).
 - The skill's `skill.md` must be readable at launch — a missing file exits with `error[E-RUN-009]`.
 
 ---

@@ -180,7 +180,7 @@ requires_files:
 ```
 
 `requires_files:` is what `mur build` packages alongside the manifest. Without it the compiled
-`tool.wasm` is not put in the artifact — see [`requires_files`](../reference/manifest-schema.md).
+`tool.wasm` is not put in the artifact — see [`requires_files`](../reference/manifest.md).
 
 ---
 

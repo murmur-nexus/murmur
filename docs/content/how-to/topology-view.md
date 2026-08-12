@@ -21,7 +21,7 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [observability.otel_endpoint](../reference/manifest-schema.md#field-observability) | OTLP/HTTP endpoint where the runtime posts spans at session end |
+| [observability.otel_endpoint](../reference/manifest.md#field-observability) | OTLP/HTTP endpoint where the runtime posts spans at session end |
 
 ---
 

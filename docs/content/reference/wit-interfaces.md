@@ -86,7 +86,7 @@ from the session's registry, verifies its bytes against the registry hash and an
 `murmur.lock`. A hash mismatch returns an error before anything is written. A pulled artifact is
 immediately visible to `list()` and `describe()` and, for WASM tools, callable via `invoke()`.
 
-`search` and `remove` are not implemented yet.
+`search` and `remove` are unimplemented: calling either returns an error.
 
 The native agent loop does not use this interface; it accesses artifact state directly.
 
@@ -127,7 +127,7 @@ It is available in the `tool` world only, and only while the capsule is running 
 Called anywhere else, it returns an error immediately.
 
 **Timeout:** `lifecycle.input_timeout_secs` in the manifest (see
-[lifecycle.input_timeout_secs](manifest-schema.md#lifecycle-input-timeout-secs)). When it fires,
+[lifecycle.input_timeout_secs](manifest.md#lifecycle-input-timeout-secs)). When it fires,
 the component is aborted and the task transitions to `failed`.
 
 ---
@@ -204,7 +204,7 @@ component is compiled. A `commit_policy` the binding's handler cannot commit (sa
 binding, the declared policy, and the one this binding honors, rather than becoming a
 mid-session dispatch fault. A hook with no `binding:` receives every event, so any
 `commit_policy` is valid for it. See [Hook contract
-fields](manifest-schema.md#hook-contract-fields).
+fields](manifest.md#hook-contract-fields).
 
 Returning `none` is always silent, and is the normal case for an observational hook. Returning
 any other non-`none` arm is a loud but non-fatal fault:
@@ -212,7 +212,7 @@ any other non-`none` arm is a loud but non-fatal fault:
 - A line naming the hook, the handler, and the discarded arm is appended to
   `workdir/logs/hook-<name>.log`.
 - A `hook_dispatch_error` event is written to `trace.jsonl` — see [Session trace
-  schema](cli.md#session-trace-tracejsonl). The one exception is `on-stage`, which runs before the
+  schema](observability-schemas.md#session-trace-tracejsonl). The one exception is `on-stage`, which runs before the
   trace file exists. An `async` hook's fault reaches the trace by the same path; the trace and the
   log are the only places it appears, since the agent loop never sees an async hook's return value.
 
@@ -226,7 +226,7 @@ reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
 - `compaction-event.model` carries `inference.compaction.model` verbatim so a compaction hook
   knows which model to use for its own summarization call. It is absent when the manifest leaves
   the field unset, and the hook resolves its own default. `compaction-event.system-prompt` is
-  always absent today; manifest wiring for it lands later.
+  always absent: no manifest field feeds it.
 - `shell-event.binary` is the program the shell tool actually invoked — a canonicalized absolute
   path (for example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the
   bare invoked name when nothing resolved. `shell-event.command` carries the argument list alone

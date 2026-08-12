@@ -2,11 +2,11 @@
 
 !!! warning "Status: **NOT RUN.** Implemented and unit-tested; never executed on a real Linux host."
 
-    This page, not the published [security warnings](security-warnings.md) reference, is where the
+    This page, not the published [security warnings](diagnostics.md) reference, is where the
     run status of this mechanism lives. Record the outcome of each scenario below, verbatim, in
     [Recording the result](#recording-the-result) — including the date and the host it ran on.
 
-This procedure confirms the `socket(2)` domain denial described under [W-SEC-005](security-warnings.md#w-sec-005) — that
+This procedure confirms the `socket(2)` domain denial described under [W-SEC-005](diagnostics.md#w-sec-005) — that
 a capsule cannot reach `/var/run/docker.sock`, and cannot open netlink or packet sockets at all — on
 real hardware. **It is deliberately not automated.** There is deliberately *no* committed test that
 asserts "`socket(AF_UNIX, ...)` is refused", and a green `cargo test`/CI run is not evidence: this
@@ -303,9 +303,9 @@ including the scenario-1 Landlock finding verbatim, the scenario-5 compatibility
 host, kernel version and resolved tier the run was made on. Then update the status box at the top of
 this page.
 
-Run status does not go on the published [security warnings](security-warnings.md) page. That page
+Run status does not go on the published [security warnings](diagnostics.md) page. That page
 states what the `socket(2)`-domain rule enforces and what
-[`capabilities.network.unix_sockets`](manifest-schema.md#field-capabilities) re-widens, and links
+[`capabilities.network.unix_sockets`](manifest.md#field-capabilities) re-widens, and links
 here for anyone who wants to check it by hand; it carries no verification status, no dated run, and
 no scenario. If scenario 5 forces a **narrower** rule, the published description of the rule changes
 with it — but a compatibility failure is never answered by flipping the default back to allow.

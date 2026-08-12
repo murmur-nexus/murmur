@@ -12,7 +12,7 @@ exclude_docs: |
   includes/
   # Hand-run acceptance procedures addressed to the team, not to users. They stay in
   # the repo at these paths (code comments cite them by path) but are not published.
-  # reference/verification.md is the published landing page that links to them on GitHub.
+  # reference/containment.md links to them on GitHub.
   # Note: links *inside* these are no longer checked by `mkdocs build --strict`.
   reference/sealed-containment-manual-verification.md
   reference/resource-limits-manual-verification.md
@@ -70,6 +70,11 @@ plugins:
       redirect_maps:
         how-to/agent-shell-access.md: how-to/lock-down-capsule.md
         concepts/capsule-runtime.md: concepts/session-loop.md
+        reference/manifest-schema.md: reference/manifest.md
+        reference/security-warnings.md: reference/diagnostics.md
+        reference/build-lints.md: reference/diagnostics.md
+        reference/capsule-io.md: reference/workdir.md
+        reference/verification.md: reference/containment.md
 
 extra:
   v:
@@ -143,17 +148,21 @@ nav:
       - Decompose tasks recursively within a single capsule: how-to/task-decomposition-single-capsule.md
       - Generate a capsule manifest with mur new: how-to/generate-manifest.md
       - Visualise capsule sessions with mur topology: how-to/topology-view.md
+      - Run a capsule from the CLI or from another program: how-to/different-ways-to-run-murmur.md
   - Language Guides:
       - Python Tool Quickstart (WASM): language-guides/python.md
       - Python Tool Quickstart (Native): language-guides/python-native.md
   - Reference:
       - CLI Commands: reference/cli.md
+      - Manifest Schema: reference/manifest.md
+      - Configuration: reference/config.md
+      - Containment: reference/containment.md
+      - Resource Limits: reference/resource-limits.md
+      - Diagnostics: reference/diagnostics.md
+      - Session Workdir: reference/workdir.md
+      - Observability Schemas: reference/observability-schemas.md
+      - First-party Artifacts: reference/first-party-artifacts.md
       - Installing Artifacts: reference/installing-artifacts.md
-      - Manifest Schema: reference/manifest-schema.md
-      - Capsule I/O Schema: reference/capsule-io.md
-      - Security Warnings: reference/security-warnings.md
-      - Verification: reference/verification.md
-      - Build Lints: reference/build-lints.md
       - WIT Interfaces: reference/wit-interfaces.md
       - Nexus API: reference/nexus-api.md
       - Roost API: reference/roost-api.md

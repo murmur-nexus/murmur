@@ -32,8 +32,8 @@ pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabiliti
 pub const E_RUN_014: &str = "E-RUN-014"; // a sealed session's composed root could not be built after the host probe had cleared it
 
 // Capability enforcement
-pub const E_CAP_001: &str = "E-CAP-001"; // network call to unlisted host
-pub const E_CAP_002: &str = "E-CAP-002"; // filesystem access outside declared scope
+pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
+pub const E_CAP_002: &str = "E-CAP-002"; // capabilities.filesystem.scope value is not a usable workdir subpath
 pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared containment class
 pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a sealed containment floor
 pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree its own network namespace
@@ -267,7 +267,7 @@ impl From<RuntimeError> for CliError {
                  `--containment sealed`) so the capsule gets a composed root to stage the runtime \
                  into, or remove the capabilities.shell.staged_runtime grant. Run `mur run \
                  --explain-scope` to see the declared grants and whether this host can back \
-                 `sealed` — see docs/content/reference/manifest-schema.md",
+                 `sealed` — see docs/content/reference/containment.md",
             ),
             // Sits next to E-CAP-004 and is deliberately not it: that one means a grant was
             // declared at too low a floor (raise the floor, or drop the grant), this one means the
@@ -285,7 +285,7 @@ impl From<RuntimeError> for CliError {
                  closure. Alternatively point `capabilities.shell.allow` at a copy that already \
                  lives under a fixed sealed runtime path (a distro `/usr/bin` interpreter and its \
                  system packages need no grant at all). See \
-                 docs/content/reference/manifest-schema.md",
+                 docs/content/reference/containment.md",
             ),
             // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
             // with another: this one is not about the containment ladder at all. A network

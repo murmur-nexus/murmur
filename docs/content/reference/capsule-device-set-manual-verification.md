@@ -2,12 +2,12 @@
 
 !!! warning "Status: **NOT RUN.** Implemented and unit-tested; never executed on a real Landlock-capable Linux host."
 
-    This page, not the published [security warnings](security-warnings.md) reference, is where the
+    This page, not the published [security warnings](diagnostics.md) reference, is where the
     run status of this mechanism lives. Record the outcome of each scenario below, verbatim, in
     [Recording the result](#recording-the-result) — including the date and the host it ran on.
 
-This procedure confirms the [fixed capsule device set](security-warnings.md#capsule-device-set) described under
-[W-SEC-005](security-warnings.md#w-sec-005) — that a capsule can read *and write* `/dev/null`, can read but not write
+This procedure confirms the [fixed capsule device set](containment.md#capsule-device-set) described under
+[W-SEC-005](diagnostics.md#w-sec-005) — that a capsule can read *and write* `/dev/null`, can read but not write
 `/dev/zero` and `/dev/urandom`, and cannot open any other device at all — on real hardware.
 **It is deliberately not automated.** There is deliberately *no* committed test that asserts "a
 capsule can write `/dev/null`" or "a capsule cannot open `/dev/random`", and a green `cargo
@@ -188,7 +188,7 @@ with open(\"/dev/urandom\", \"rb\") as f:
 
 The read-only grants must be exactly that. This is what keeps `/dev/null` the *sole* writable path
 outside the workdir (on `sealed`, `/tmp` is writable too — but it *is* the workdir, bound there from
-`<workdir>/.mur-tmp`; see [the note above](security-warnings.md#capsule-device-set)).
+`<workdir>/.mur-tmp`; see [the note above](containment.md#capsule-device-set)).
 
 ```bash
 SCRATCH_SCRIPT='
@@ -335,9 +335,9 @@ tier the run was made on. Then update the status box at the top of this page. If
 justified a fourth device, the recorded failure goes in scenario 6 above, next to the widening it
 caused.
 
-Run status does not go on the published [security warnings](security-warnings.md) page. That page
+Run status does not go on the published [security warnings](diagnostics.md) page. That page
 states which three devices every capsule gets and that every other device is refused, and links here
 for anyone who wants to check it by hand; it carries no verification status, no dated run, and no
 scenario. A fourth device is the one outcome that *does* change the published page, because it
 changes what the mechanism enforces — see
-[the fixed capsule device set](security-warnings.md#capsule-device-set).
+[the fixed capsule device set](containment.md#capsule-device-set).

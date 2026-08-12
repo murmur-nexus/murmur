@@ -1851,7 +1851,7 @@ impl ShellEnforcement {
 
 /// Core messages shared between the stderr line and `logs/bootstrap.log` line for each tier
 /// warning, matching the shared-const convention used by `runtime::BASH_NETWORK_BYPASS_WARNING`.
-/// Full detail lives on the security-warnings doc page (`security_warning_link`); keep each to
+/// Full detail lives on the diagnostics doc page (`security_warning_link`); keep each to
 /// one or two concise sentences.
 ///
 /// The Landlock filesystem scope now derives a narrow read+execute grant (the `shell.allow`
@@ -4925,7 +4925,7 @@ mod tests {
              and a shell `2>/dev/null` redirect opens it O_WRONLY, so a read-only grant breaks \
              both. Widening this list is allowed only on demonstrated workload failure, and the \
              failure gets recorded alongside the widening (see the manual acceptance procedure on \
-             the security-warnings reference page)."
+             the diagnostics reference page)."
         );
     }
 
@@ -5283,7 +5283,7 @@ mod tests {
         );
         assert!(
             log.contains(&security_warning_link(W_SEC_005)),
-            "must link to the security-warnings doc page: {log}"
+            "must link to the diagnostics doc page: {log}"
         );
     }
 
@@ -5316,7 +5316,7 @@ mod tests {
         assert!(log.contains(W_SEC_002), "must carry its warning code: {log}");
         assert!(
             log.contains(&security_warning_link(W_SEC_002)),
-            "must link to the security-warnings doc page: {log}"
+            "must link to the diagnostics doc page: {log}"
         );
     }
 

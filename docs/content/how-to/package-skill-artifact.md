@@ -9,9 +9,9 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [artifacts[].runtime](../reference/manifest-schema.md#field-artifacts) | Declares a skill artifact; set to `skill` to install `skill.md` at session start |
-| [artifacts[].source](../reference/manifest-schema.md#local-source-skills) | Points at a local `skill.md` so the runtime installs it directly — no build, no publish. Skills get this for free (`local_source` defaults to `true` for `runtime: skill`); other roles must declare `local_source: true` to opt in. |
-| [inference.system_prompt_artifact](../reference/manifest-schema.md#inference-system-prompt) | Bind a skill as the system prompt; reads its `skill.md` once at launch instead of on-demand |
+| [artifacts[].runtime](../reference/manifest.md#field-artifacts) | Declares a skill artifact; set to `skill` to install `skill.md` at session start |
+| [artifacts[].source](../reference/manifest.md#local-source-skills) | Points at a local `skill.md` so the runtime installs it directly — no build, no publish. Skills get this for free (`local_source` defaults to `true` for `runtime: skill`); other roles must declare `local_source: true` to opt in. |
+| [inference.system_prompt_artifact](../reference/manifest.md#inference-system-prompt) | Bind a skill as the system prompt; reads its `skill.md` once at launch instead of on-demand |
 
 There are two ways to get a skill into a capsule:
 

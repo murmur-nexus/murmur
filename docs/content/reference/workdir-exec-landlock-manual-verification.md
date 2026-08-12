@@ -23,13 +23,13 @@ The mechanism is one Landlock right. Each allowlisted binary gets a narrow read+
 `PathBeneath` grant at its real host path (plus its ELF interpreter and its `DT_NEEDED` closure, so
 it can actually link). The session workdir — the one place the capsule can write — gets every other
 ABI v1 right *except* `Execute`, unless the manifest declares
-[`capabilities.filesystem.workdir_exec: true`](manifest-schema.md#field-workdir-exec).
+[`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec).
 
 This replaced a seccomp-notify exec supervisor that intercepted `execve(2)`/`execveat(2)` and
 compared a pathname read out of the stopped child's `/proc/<pid>/mem` against a canonical allowlist.
 That mechanism is **deleted**, not demoted to a fallback: continue-based
 argument inspection cannot be made sound, because the kernel dereferences the same pointer again
-after the decision. See [`W-SEC-002`](security-warnings.md#w-sec-002) for what a host without
+after the decision. See [`W-SEC-002`](diagnostics.md#w-sec-002) for what a host without
 Landlock now gets instead (no exec mediation at all, and no path to the `scoped` class).
 
 Two properties are under test, and they are opposites of each other:
@@ -398,7 +398,7 @@ cd /tmp/we-true && "$BIN" run --manifest /tmp/we-true/murmur.yaml
 Expected — `W-SEC-011` on stderr, once, before anything else:
 
 ```
-[capsule-runtime] warning[W-SEC-011]: capabilities.filesystem.workdir_exec is true — the session workdir keeps its Landlock Execute right, so anything the capsule writes there can run regardless of capabilities.shell.allow; this capsule reports containment class 'advisory' on every host, including a Landlock-capable one (https://docs.murmur.nexus/murmur-nexus/murmur/reference/security-warnings/#w-sec-011)
+[capsule-runtime] warning[W-SEC-011]: capabilities.filesystem.workdir_exec is true — the session workdir keeps its Landlock Execute right, so anything the capsule writes there can run regardless of capabilities.shell.allow; this capsule reports containment class 'advisory' on every host, including a Landlock-capable one (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-011)
 status:  failed
 error[E-RUN-001]: failed to compile capsule component: failed to parse WebAssembly module
 ```
@@ -533,6 +533,6 @@ serialization test and not a substitute for reading a real session's trace.
 
 ## Related
 
-* [`W-SEC-011`](security-warnings.md#w-sec-011) — the warning this mechanism fires.
-* [`capabilities.filesystem.workdir_exec`](manifest-schema.md#field-workdir-exec) — the field.
-* [Verification](verification.md) — the index of hand-run procedures.
+* [`W-SEC-011`](diagnostics.md#w-sec-011) — the warning this mechanism fires.
+* [`capabilities.filesystem.workdir_exec`](containment.md#field-workdir-exec) — the field.
+* [Verification](containment.md#verification) — the index of hand-run procedures.

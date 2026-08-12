@@ -3525,7 +3525,7 @@ mod tests {
         assert!(log.contains(W_SEC_003), "log should carry its warning code: {log}");
         assert!(
             log.contains(&security_warning_link(W_SEC_003)),
-            "log should link to the security-warnings doc page: {log}"
+            "log should link to the diagnostics doc page: {log}"
         );
     }
 

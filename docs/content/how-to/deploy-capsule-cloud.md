@@ -13,11 +13,11 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [mur_version](../reference/manifest-schema.md#field-mur-version) | Pins the exact `mur` binary version installed on the VM |
-| [inference.driver.artifact](../reference/manifest-schema.md#field-inference) | Inference driver — required for agent capsules |
-| [inference.system_prompt_file](../reference/manifest-schema.md#inference-system-prompt) | Local file uploaded alongside the manifest as the system prompt |
-| [lifecycle.task_acceptance](../reference/manifest-schema.md#lifecycle-task-acceptance) | Whether the deployed capsule accepts incoming A2A tasks |
-| [lifecycle.after_task](../reference/manifest-schema.md#lifecycle-after-task) | What the capsule does after a task completes |
+| [mur_version](../reference/manifest.md#field-mur-version) | Pins the exact `mur` binary version installed on the VM |
+| [inference.driver.artifact](../reference/manifest.md#field-inference) | Inference driver — required for agent capsules |
+| [inference.system_prompt_file](../reference/manifest.md#inference-system-prompt) | Local file uploaded alongside the manifest as the system prompt |
+| [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether the deployed capsule accepts incoming A2A tasks |
+| [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What the capsule does after a task completes |
 
 ---
 

@@ -77,7 +77,7 @@ pub struct CaseOutcome {
 
 /// Derives the host directories `python3` needs outside the workdir, by asking the interpreter.
 ///
-/// Hardcoding `/usr/lib/python3.11` (as `manifest-schema.md`'s example does) would break on the
+/// Hardcoding `/usr/lib/python3.11` (as `containment.md`'s example does) would break on the
 /// next point release, and `W-SEC-009` exists precisely to warn that such a grant couples a
 /// capsule to one host layout. Asking the interpreter keeps the harness portable across distros.
 ///

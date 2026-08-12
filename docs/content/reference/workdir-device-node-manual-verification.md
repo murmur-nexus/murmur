@@ -2,11 +2,11 @@
 
 !!! warning "Status: **NOT RUN.** Implemented and unit-tested; never executed on a real Landlock-capable Linux host."
 
-    This page, not the published [security warnings](security-warnings.md) reference, is where the
+    This page, not the published [security warnings](diagnostics.md) reference, is where the
     run status of this mechanism lives. Record the outcome of each scenario below, verbatim, in
     [Recording the result](#recording-the-result) — including the date and the host it ran on.
 
-This procedure confirms the two mechanisms described under [W-SEC-005](security-warnings.md#w-sec-005) — the narrowed
+This procedure confirms the two mechanisms described under [W-SEC-005](diagnostics.md#w-sec-005) — the narrowed
 Landlock workdir grant and the child capability drop — on real hardware. **It is deliberately not
 automated.** There is no committed test that asserts "`mknod` is refused", and a green
 `cargo test`/CI run is not evidence that any of this works: this repo's CI has never resolved to a
@@ -166,7 +166,7 @@ SCRATCH_SCRIPT='mkdir ./d && echo x > ./d/f && cat ./d/f && ln -s ./d/f ./l && \
 running it is to find out whether that failure matters for a real workload before the caveat is
 discovered in production. Record the result either way.
 
-> **Note:** as of the `socket(2)` domain rule described under [W-SEC-005](security-warnings.md#w-sec-005), this scenario
+> **Note:** as of the `socket(2)` domain rule described under [W-SEC-005](diagnostics.md#w-sec-005), this scenario
 > now fails *earlier* than it used to and for a different reason. With the default
 > `capabilities.network.unix_sockets: false`, the `socket(socket.AF_UNIX, ...)` constructor itself
 > raises `PermissionError` (`EACCES`) from seccomp, so `bind()` is never reached and the scenario
@@ -189,14 +189,14 @@ harness's `shell_allow` vector, or use any other tool that binds an `AF_UNIX` pa
 - **Expected as shipped:** a `PermissionError`/`OSError` from `bind`, not `SOCK_BIND_OK`.
 - **Decision to record:** if any tool the team actually runs under `capabilities.shell.allow` needs
   to bind a unix socket in its working tree, add `MakeSock` back to `WORKDIR_ACCESS_RIGHTS` in
-  `crates/capsule-runtime/src/sandbox.rs`, update the [W-SEC-005](security-warnings.md#w-sec-005) section, and re-run
+  `crates/capsule-runtime/src/sandbox.rs`, update the [W-SEC-005](diagnostics.md#w-sec-005) section, and re-run
   scenario 1 to confirm the device-node refusal is unaffected (it is a separate bit — it will be).
   `MakeChar`/`MakeBlock` are not up for reconsideration either way.
 
 ### Scenario 4 — `CAP_MKNOD` is the sole gate for the device half (non-root)
 
 This scenario needs no murmur code at all; it establishes the baseline claim in
-[W-SEC-005](security-warnings.md#w-sec-005) that a non-root capsule was never exposed to this escape.
+[W-SEC-005](diagnostics.md#w-sec-005) that a non-root capsule was never exposed to this escape.
 
 ```bash
 # As an ordinary, non-root user, with no ambient capabilities:
@@ -246,9 +246,9 @@ Record what actually happened **in this file**, under a dated `### Run of YYYY-M
 including the scenario-3 decision on `MakeSock`, and the host, kernel version and resolved tier the
 run was made on. Then update the status box at the top of this page.
 
-Run status does not go on the published [security warnings](security-warnings.md) page. That page
+Run status does not go on the published [security warnings](diagnostics.md) page. That page
 states what each mechanism enforces and links here for anyone who wants to check it by hand; it
 carries no verification status, no dated run, and no scenario. If a scenario's outcome changes what
 a mechanism *does* — a `MakeSock` decision that widens the workdir grant, say — then the published
 description of the mechanism changes too, and so does
-[W-SEC-005](security-warnings.md#w-sec-005). Nothing else on that page moves.
+[W-SEC-005](diagnostics.md#w-sec-005). Nothing else on that page moves.

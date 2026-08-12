@@ -79,7 +79,7 @@ failed task.
 Every reopen is written to `trace.jsonl` as a `task_reopened` event (the hook's name, its
 feedback text, and a 1-based ordinal), and the terminal `task_end` record carries a
 `reopen_count` field — `0` for a task that ran once. See [Session trace
-(`trace.jsonl`) schema](../reference/cli.md#session-trace-tracejsonl) for the exact shapes.
+(`trace.jsonl`) schema](../reference/observability-schemas.md#session-trace-tracejsonl) for the exact shapes.
 
 The reopen limit applies per task: in a `task_acceptance: queue` session, each task starts
 fresh at `0` reopens used, regardless of what an earlier task consumed.

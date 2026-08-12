@@ -26,7 +26,7 @@ loop needs the hook's answer, use `blocking`; otherwise `async` keeps the work o
 path — which matters for a hook doing network I/O on every event, since a `blocking` one pays that
 round trip inline every time. An async hook is one reused instance per session, so in-memory state
 persists across calls; its calls are serialized in dispatch order and finish before the session
-ends. See [Async hook execution](../reference/manifest-schema.md#hook-overflow) for overflow rules.
+ends. See [Async hook execution](../reference/manifest.md#hook-overflow) for overflow rules.
 
 **Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
 observability hooks), **`replace-context`** (runtime replaces conversation history; used for
@@ -39,7 +39,7 @@ source of truth for what a hook commits: each binding honors exactly one arm, so
 policy plus `none`, and a `commit_policy` the binding cannot honor fails at capsule-staging time —
 before the hook component is compiled — with an error naming the binding, the declared policy, and
 the policy the binding honors. A hook with no `binding:` receives every event, so any policy is
-valid for it — see [Hook contract fields](../reference/manifest-schema.md#hook-contract-fields).
+valid for it — see [Hook contract fields](../reference/manifest.md#hook-contract-fields).
 
 The two fields meet in one rule: a binding that commits an arm must be blocking, because every
 committable arm is a decision the agent loop is blocked on — the context it continues from, the

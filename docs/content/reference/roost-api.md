@@ -61,7 +61,7 @@ Enqueue a capsule for execution and return a job ID immediately.
 | `input` | string | no | Serialized structured task input. When present and non-empty, roost writes it to the worker staging root as `input.json` before launch |
 | `spawned_by` | string | no | Job ID of the capsule making this request (see [Per-job allow lists](#per-job-allow-lists)) |
 
-`input` is usually a serialized [Capsule I/O](capsule-io.md) `murmur.code_task.request.v1` envelope. If both the caller seed and the spawn request provide `input.json`, the request `input` overwrites the copied seed file.
+`input` is usually a serialized [`input.json`](workdir.md#inputjson-task-input) `murmur.code_task.request.v1` envelope. If both the caller seed and the spawn request provide `input.json`, the request `input` overwrites the copied seed file.
 
 **Success — `202 Accepted`**
 

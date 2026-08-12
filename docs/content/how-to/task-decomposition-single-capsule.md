@@ -9,12 +9,12 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [lifecycle.task_acceptance](../reference/manifest-schema.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
-| [lifecycle.after_task](../reference/manifest-schema.md#lifecycle-after-task) | What the capsule does after a task completes |
-| [lifecycle.queue_depth](../reference/manifest-schema.md#field-lifecycle) | How many tasks can be buffered while one is running |
-| [network.internal_port](../reference/manifest-schema.md#field-capabilities) | Pins the capsule to a fixed port so self-dispatched sub-tasks always find it |
-| [capabilities.network.allow](../reference/manifest-schema.md#field-capabilities) | Host/URL patterns the capsule may connect to — must include `localhost:52222` for self-dispatch |
-| [capabilities.shell.allow](../reference/manifest-schema.md#field-capabilities) | Shell binaries the capsule may call — must include `curl` for self-dispatch |
+| [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
+| [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What the capsule does after a task completes |
+| [lifecycle.queue_depth](../reference/manifest.md#field-lifecycle) | How many tasks can be buffered while one is running |
+| [network.internal_port](../reference/manifest.md#field-capabilities) | Pins the capsule to a fixed port so self-dispatched sub-tasks always find it |
+| [capabilities.network.allow](../reference/manifest.md#field-capabilities) | Host/URL patterns the capsule may connect to — must include `localhost:52222` for self-dispatch |
+| [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | Shell binaries the capsule may call — must include `curl` for self-dispatch |
 
 ---
 

@@ -6,10 +6,10 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [artifacts[].runtime](../reference/manifest-schema.md#field-artifacts) | Whether a declared artifact is a driver, tool, hook, or skill |
-| [capabilities.network.allow](../reference/manifest-schema.md#field-capabilities) | Which hosts the capsule may reach |
-| [inference.driver.artifact](../reference/manifest-schema.md#field-inference) | Which driver artifact performs the model calls |
-| [inference.model](../reference/manifest-schema.md#field-inference) | Which model the driver calls |
+| [artifacts[].runtime](../reference/manifest.md#field-artifacts) | Whether a declared artifact is a driver, tool, hook, or skill |
+| [capabilities.network.allow](../reference/manifest.md#field-capabilities) | Which hosts the capsule may reach |
+| [inference.driver.artifact](../reference/manifest.md#field-inference) | Which driver artifact performs the model calls |
+| [inference.model](../reference/manifest.md#field-inference) | Which model the driver calls |
 
 ---
 
@@ -231,4 +231,4 @@ Tool artifacts work under `transport: process` too — declare them exactly as y
 
     Because the CLI owns the model calls, `mur trace show` records turns, tool calls, declared tools, and exit status — but **not** per-turn token usage. When you need full token accounting, use `transport: http`. System prompts and lifecycle hooks apply on both paths.
 
-Learn more about the `murmur.yaml` manifest in the [Manifest Schema reference](../reference/manifest-schema.md).
+Learn more about the `murmur.yaml` manifest in the [Manifest Schema reference](../reference/manifest.md).

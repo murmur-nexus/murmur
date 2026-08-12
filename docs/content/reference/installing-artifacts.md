@@ -6,12 +6,12 @@
 
 | Form | Example |
 |---|---|
-| Bare name with version | `murmur-tool-git@0.3.18` |
+| Bare name with version | `murmur-tool-git@1.0.0` |
 | GitHub release | `github:<owner>/<repo>@<tag>` |
 | Nexus | `nexus:<name>@<version>` |
 
 ```bash
-mur install murmur-tool-git@0.3.18
+mur install murmur-tool-git@1.0.0
 ```
 
 ## Bare name vs explicit GitHub URI
@@ -106,8 +106,8 @@ registry:
 
 An optional project-level file at `<cwd>/.murmur/config.yaml` merges with this global file —
 `registry.sources` entries union by `name` (a project entry can add or override a source without
-disturbing the rest). See [Configuration files](cli.md#configuration-files) in the
-CLI reference for the full merge rules and `mur config set`.
+disturbing the rest). See [Configuration files](config.md#configuration-files) for the full
+merge rules, and [`mur config set`](cli.md#mur-config) for writing them from the command line.
 
 ## Per-command override
 

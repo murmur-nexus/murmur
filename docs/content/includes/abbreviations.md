@@ -57,3 +57,5 @@
 *[observability.eval.dataset_id]: labels dataset_run records in eval.jsonl
 
 *[observability.eval.scorers]: scorer types: exit_ok | max_turns | max_tokens | tool_sequence
+
+*[capabilities.containment]: advisory: no kernel enforcement · default | scoped: Landlock + seccomp | sealed: composed root · refuses launch when host falls short

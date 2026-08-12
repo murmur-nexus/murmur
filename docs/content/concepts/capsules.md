@@ -84,7 +84,7 @@ hook lifecycle call — is bounded by two independent limits:
 | **Resource limiter** | Memory growth, table growth, and instance count | A call that tries to grow past its cap is stopped with an error instead of consuming host memory without bound |
 
 Both are set per-manifest under `capabilities.limits` (see [Manifest
-Schema](../reference/manifest-schema.md#field-capabilities)). Omitting them applies generous
+Schema](../reference/manifest.md#field-capabilities)). Omitting them applies generous
 built-in defaults — a manifest that says nothing gets the defaults, not unlimited resources.
 Hitting either limit is reported distinctly from an ordinary crash. On the hook path it is
 handled like any other hook error: logged, and the runtime moves on to the next hook.

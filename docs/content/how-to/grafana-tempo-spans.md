@@ -10,7 +10,7 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [observability.otel_endpoint](../reference/manifest-schema.md#field-observability) | OTLP/HTTP endpoint where the runtime posts spans at session end |
+| [observability.otel_endpoint](../reference/manifest.md#field-observability) | OTLP/HTTP endpoint where the runtime posts spans at session end |
 
 ---
 
@@ -327,7 +327,7 @@ Once spans are flowing into Tempo, the topology view can query the same backend 
 | What to do | How |
 |---|---|
 | Emit spans | Set `observability.otel_endpoint: http://localhost:4318` in `murmur.yaml` |
-| Enrich spans with hook-side data | Declare `murmur-hook-grafana` as a `runtime: hook` artifact, and grant it the collector host via the entry's own `capabilities.network.allow` — hooks have no network by default (see [Hook capabilities](../reference/manifest-schema.md#hook-capabilities)) |
+| Enrich spans with hook-side data | Declare `murmur-hook-grafana` as a `runtime: hook` artifact, and grant it the collector host via the entry's own `capabilities.network.allow` — hooks have no network by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
 | Confirm spans arrived | `curl .../api/search?q=...` returns `traces.length > 0` |
 | Find sessions in Grafana | Explore → Tempo → TraceQL `{resource.service.name="my-capsule"}` |
 | Inspect a session | Click a trace ID → flame graph → span detail panel |

@@ -6,8 +6,8 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [observability.eval.scorers](../reference/manifest-schema.md#field-observability) | List of scorer configurations; at least one required to activate the hook |
-| [observability.eval.dataset_id](../reference/manifest-schema.md#field-observability) | Label applied to every `dataset_run` record in `eval.jsonl` |
+| [observability.eval.scorers](../reference/manifest.md#field-observability) | List of scorer configurations; at least one required to activate the hook |
+| [observability.eval.dataset_id](../reference/manifest.md#field-observability) | Label applied to every `dataset_run` record in `eval.jsonl` |
 
 ---
 
@@ -391,7 +391,7 @@ mur trace show
 | Step | What you do |
 |---|---|
 | Declare `murmur-hook-eval` with `runtime: hook` | Activates the eval hook for this capsule |
-| Grant it `capabilities.filesystem.scope` on its own entry | Lets it write `eval.jsonl`; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest-schema.md#hook-capabilities)) |
+| Grant it `capabilities.filesystem.scope` on its own entry | Lets it write `eval.jsonl`; hooks have no filesystem access by default (see [Hook capabilities](../reference/manifest.md#hook-capabilities)) |
 | Declare `murmur-tool-editor` with `runtime: tool` | Gives the agent file-read capability; required for `tool_sequence` cases |
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |

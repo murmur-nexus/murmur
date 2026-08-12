@@ -11,14 +11,14 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [capabilities.network.allow](../reference/manifest-schema.md#field-capabilities) | The capsule-wide network ceiling every artifact clamps to |
-| [capabilities.filesystem.scope](../reference/manifest-schema.md#field-capabilities) | The capsule-wide filesystem scope every artifact clamps to |
-| [capabilities.shell.allow](../reference/manifest-schema.md#field-capabilities) | Which binaries the agent may invoke as shell tools |
-| [capabilities.shell.strip_env](../reference/manifest-schema.md#field-capabilities) | Glob patterns for host env vars to remove from the subprocess environment |
-| [capabilities.shell.baseline_env](../reference/manifest-schema.md#field-capabilities) | Additional host env vars to expose beyond the default baseline |
-| [artifacts[].capabilities](../reference/manifest-schema.md#tool-capabilities) | Optional per-artifact grant that narrows one tool or driver below the ceiling |
-| [artifacts[].capabilities.network.allow](../reference/manifest-schema.md#tool-capabilities) | Hosts one artifact may reach, intersected with the ceiling |
-| [artifacts[].capabilities.filesystem.scope](../reference/manifest-schema.md#tool-capabilities) | Workdir subtree one artifact preopens instead of the whole workdir |
+| [capabilities.network.allow](../reference/manifest.md#field-capabilities) | The capsule-wide network ceiling every artifact clamps to |
+| [capabilities.filesystem.scope](../reference/manifest.md#field-capabilities) | The capsule-wide filesystem scope every artifact clamps to |
+| [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | Which binaries the agent may invoke as shell tools |
+| [capabilities.shell.strip_env](../reference/manifest.md#field-capabilities) | Glob patterns for host env vars to remove from the subprocess environment |
+| [capabilities.shell.baseline_env](../reference/manifest.md#field-capabilities) | Additional host env vars to expose beyond the default baseline |
+| [artifacts[].capabilities](../reference/manifest.md#tool-capabilities) | Optional per-artifact grant that narrows one tool or driver below the ceiling |
+| [artifacts[].capabilities.network.allow](../reference/manifest.md#tool-capabilities) | Hosts one artifact may reach, intersected with the ceiling |
+| [artifacts[].capabilities.filesystem.scope](../reference/manifest.md#tool-capabilities) | Workdir subtree one artifact preopens instead of the whole workdir |
 
 ---
 
@@ -147,7 +147,7 @@ capabilities:
 `filesystem.scope` is a path relative to the session workdir — here `<workdir>/repo`, created on demand. This is the boundary every artifact in the capsule inherits and the subtree the coding agent checks the repository out into.
 
 !!! warning "`bash` still reaches the whole machine on this platform"
-    The ceiling's `filesystem.scope` and `network.allow` are only a real boundary for a `bash` subprocess when a kernel sandbox enforces them, and whether one does is a property of the host — see [Subprocess enforcement tiers](../reference/security-warnings.md#subprocess-enforcement-tiers) for which hosts enforce what. Where nothing enforces them, treat these settings as advisory for `bash`: it can read and write files outside `repo` and open connections to hosts outside `network.allow` regardless of what the manifest declares ([`W-SEC-001`](../reference/security-warnings.md#w-sec-001), [`W-SEC-003`](../reference/security-warnings.md#w-sec-003)). Pairing `bash` with any external-fetch capability is the [maximum-risk combination](../reference/manifest-schema.md#threat-model) the threat model describes — Step 4 shows how to move work into artifacts whose scope *is* enforced on every platform.
+    The ceiling's `filesystem.scope` and `network.allow` are only a real boundary for a `bash` subprocess when a kernel sandbox enforces them, and whether one does is a property of the host — see [Subprocess enforcement tiers](../reference/containment.md#subprocess-enforcement-tiers) for which hosts enforce what. Where nothing enforces them, treat these settings as advisory for `bash`: it can read and write files outside `repo` and open connections to hosts outside `network.allow` regardless of what the manifest declares ([`W-SEC-001`](../reference/diagnostics.md#w-sec-001), [`W-SEC-003`](../reference/diagnostics.md#w-sec-003)). Pairing `bash` with any external-fetch capability is the [maximum-risk combination](../concepts/access-control.md#threat-model) the threat model describes — Step 4 shows how to move work into artifacts whose scope *is* enforced on every platform.
 
 ### Prefer specific binaries over a full shell
 
@@ -162,10 +162,10 @@ capabilities:
       - jq
 ```
 
-The agent can now run `git`, `python3`, and `jq` but has no general shell. Any bare binary name on the host `PATH` is accepted; there is no fixed list to choose from. This also removes the `bash`-specific network-bypass warning, which matches the literal string `bash` — declaring `sh` or `zsh` instead would silence [`W-SEC-003`](../reference/security-warnings.md#w-sec-003) without reducing the risk, so swapping one shell for another is not the point. Dropping the general shell is.
+The agent can now run `git`, `python3`, and `jq` but has no general shell. Any bare binary name on the host `PATH` is accepted; there is no fixed list to choose from. This also removes the `bash`-specific network-bypass warning, which matches the literal string `bash` — declaring `sh` or `zsh` instead would silence [`W-SEC-003`](../reference/diagnostics.md#w-sec-003) without reducing the risk, so swapping one shell for another is not the point. Dropping the general shell is.
 
 !!! warning "A narrower binary is still an arbitrary-execution vector"
-    Listing specific binaries shrinks the *tool surface the model sees*, not what a running binary may do. A general-purpose program can still execute other programs — `git -c core.sshCommand=...`, `python3 -c ...`, and `find -exec` all run arbitrary commands. The kernel exec-allowlist that would confine a granted binary to executing only other allowlisted binaries is Linux-only and unverified ([`W-SEC-005`](../reference/security-warnings.md#w-sec-005)), so on a typical host this narrowing is least-privilege *intent*, not a containment boundary. Declare the narrowest set the task genuinely needs, and push anything you can into the scoped tool artifacts of Step 4, whose filesystem and network scope is enforced on every platform.
+    Listing specific binaries shrinks the *tool surface the model sees*, not what a running binary may do. A general-purpose program can still execute other programs — `git -c core.sshCommand=...`, `python3 -c ...`, and `find -exec` all run arbitrary commands. The kernel exec-allowlist that would confine a granted binary to executing only other allowlisted binaries is Linux-only and unverified ([`W-SEC-005`](../reference/diagnostics.md#w-sec-005)), so on a typical host this narrowing is least-privilege *intent*, not a containment boundary. Declare the narrowest set the task genuinely needs, and push anything you can into the scoped tool artifacts of Step 4, whose filesystem and network scope is enforced on every platform.
 
 ---
 
@@ -304,7 +304,7 @@ The effective grant is the intersection of what an artifact declares and the cei
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.
 
 !!! warning "Write the narrowing at least as specific as the ceiling entry"
-    A bare host like `github.com` spans both schemes and every port, so it is *broader* than a `https://github.com` ceiling entry and does **not** fit under it. The runtime drops the uncovered entry and prints a [`W-SEC-007`](../reference/security-warnings.md#w-sec-007) warning naming the artifact and the dropped entry — the artifact ends up with less access than asked for, never more. Match the ceiling entry exactly. This is the most common way to trip the warning by accident.
+    A bare host like `github.com` spans both schemes and every port, so it is *broader* than a `https://github.com` ceiling entry and does **not** fit under it. The runtime drops the uncovered entry and prints a [`W-SEC-007`](../reference/diagnostics.md#w-sec-007) warning naming the artifact and the dropped entry — the artifact ends up with less access than asked for, never more. Match the ceiling entry exactly. This is the most common way to trip the warning by accident.
 
 ---
 
@@ -352,10 +352,10 @@ Each shell invocation the agent makes appears in `workdir/<session_id>/trace.jso
 
 Per-artifact grants resolve at staging, before the session workdir exists, so any capability warning goes to stderr as the run starts. Two are worth knowing:
 
-- **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/security-warnings.md#w-sec-007).
-- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, or `limits`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. Scope a native tool through the capsule-wide `capabilities.shell.*` block instead, or ship it as WASM if you need per-artifact narrowing. See [W-SEC-008](../reference/security-warnings.md#w-sec-008).
+- **`W-SEC-007`** — a per-artifact `network.allow` entry the ceiling does not itself cover was dropped, not granted. Nothing is ever widened, but a tool that silently cannot reach a host it looks "granted" is hard to trace back to the manifest. See [W-SEC-007](../reference/diagnostics.md#w-sec-007).
+- **`W-SEC-008`** — a per-artifact block declared `shell`, `spawn`, `env`, or `limits`, or sat on a tool with a native (non-WASM) implementation. Only `network` and `filesystem` narrow; the rest parse but are inert. Scope a native tool through the capsule-wide `capabilities.shell.*` block instead, or ship it as WASM if you need per-artifact narrowing. See [W-SEC-008](../reference/diagnostics.md#w-sec-008).
 
-Keep credentials out of the manifest itself. Reference them by environment variable — `api_key: ${ANTHROPIC_API_KEY}`, as every example above does — never as a literal string. A literal secret prints a [`W-SEC-004`](../reference/security-warnings.md#w-sec-004) warning and risks leaking into version control.
+Keep credentials out of the manifest itself. Reference them by environment variable — `api_key: ${ANTHROPIC_API_KEY}`, as every example above does — never as a literal string. A literal secret prints a [`W-SEC-004`](../reference/diagnostics.md#w-sec-004) warning and risks leaking into version control.
 
 To confirm what each artifact actually did during a run, inspect the trace:
 

@@ -1,4 +1,4 @@
-# Capsule I/O Schema
+# Session Workdir
 
 Capsules communicate with their runtime environment through structured files in the session workdir. This page documents the typed I/O envelope used by agent capsules.
 
@@ -161,7 +161,7 @@ Set alongside `MURMUR_ROOST_URL` in the capsule's `shell_baseline_env`. Only pre
 **Location:** `<session-workdir>/out/compaction-summaries.jsonl`
 
 Written only when the manifest sets `inference.compaction.dump_summaries: true` (default
-`false`; see [`inference.compaction.dump_summaries`](manifest-schema.md#field-inference)). Not
+`false`; see [`inference.compaction.dump_summaries`](manifest.md#field-inference)). Not
 part of the `murmur.message.v1` envelope — this is a flat JSONL eval log, one line per
 **committed** compaction, appended in the order compactions occur:
 
@@ -189,3 +189,27 @@ committed by the time the write is attempted.
 
 This log exists to capture the summary text itself, which `trace.jsonl`'s `compaction` event
 does not record (it carries only the two token counts).
+
+---
+
+## Lockfile (`murmur.lock`)
+
+```yaml
+lock_version: 1
+artifacts:
+  - name: some-tool
+    resolved_version: "1.2.3"
+    sha256:
+      wasm: "<sha256>"
+```
+
+Used for pinned version + integrity checks. Three code paths read and write this file, all
+sharing the same "verify against the pin, then upsert" rule — a registry-resolved artifact
+whose hash disagrees with an existing entry is always rejected (non-zero exit / error, nothing
+written to disk or to the lock), never silently overwritten:
+
+| Path | When it writes |
+|---|---|
+| `mur run` | Only creates `murmur.lock` if it doesn't exist yet; once present, `mur run` only verifies against it — it never refreshes an existing entry. |
+| `mur install <name>@<version>` (registry-resolved, project-scoped) | Upserts this artifact's entry on every successful install, preserving all other entries. Skipped entirely for `-g`/global installs (no project directory) and for local-file/`--all-platforms` installs (no independent registry hash to pin). |
+| `manage.pull()` (in-capsule runtime call) | Same verify-then-upsert behavior as `mur install`, invoked by a running capsule's guest code instead of the CLI. |

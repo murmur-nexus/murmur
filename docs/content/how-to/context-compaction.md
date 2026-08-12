@@ -6,12 +6,12 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [context.max_tokens](../reference/manifest-schema.md#field-context) | Token budget for the session; required to enable compaction |
-| [inference.compaction.threshold](../reference/manifest-schema.md#field-inference) | Fraction of `context.max_tokens` that triggers compaction |
-| [inference.compaction.model](../reference/manifest-schema.md#field-inference) | Model used for the compaction call (optional override) |
-| [inference.compaction.system_prompt](../reference/manifest-schema.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
-| [inference.compaction.system_prompt_file](../reference/manifest-schema.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
-| [inference.compaction.dump_summaries](../reference/manifest-schema.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` (optional; default `false`) |
+| [context.max_tokens](../reference/manifest.md#field-context) | Token budget for the session; required to enable compaction |
+| [inference.compaction.threshold](../reference/manifest.md#field-inference) | Fraction of `context.max_tokens` that triggers compaction |
+| [inference.compaction.model](../reference/manifest.md#field-inference) | Model used for the compaction call (optional override) |
+| [inference.compaction.system_prompt](../reference/manifest.md#field-inference) | System prompt override for the compaction call (optional; hook picks its own default when unset) |
+| [inference.compaction.system_prompt_file](../reference/manifest.md#field-inference) | Same override, loaded from a file next to the manifest (optional; mutually exclusive with `system_prompt`) |
+| [inference.compaction.dump_summaries](../reference/manifest.md#field-inference) | When `true`, appends one JSON line per committed compaction to `out/compaction-summaries.jsonl` (optional; default `false`) |
 
 ---
 
@@ -321,7 +321,7 @@ Each committed compaction then appends one line to `out/compaction-summaries.jso
 {"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
 ```
 
-See [out/compaction-summaries.jsonl](../reference/capsule-io.md#compaction-summaries) for the
+See [out/compaction-summaries.jsonl](../reference/workdir.md#compaction-summaries) for the
 full field reference. The file is only created once the first compaction actually commits, and
 a compaction the tool-call-pairing safety net rejects writes nothing.
 

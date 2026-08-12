@@ -6,10 +6,10 @@ The relevant manifest options are:
 
 | Option | Controls |
 |---|---|
-| [lifecycle.task_acceptance](../reference/manifest-schema.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
-| [lifecycle.after_task](../reference/manifest-schema.md#lifecycle-after-task) | What the capsule does after a task completes |
-| [lifecycle.queue_depth](../reference/manifest-schema.md#field-lifecycle) | How many tasks can be buffered while one is running |
-| [lifecycle.conversation](../reference/manifest-schema.md#lifecycle-conversation) | Whether tasks with the same contextId accumulate conversation history |
+| [lifecycle.task_acceptance](../reference/manifest.md#lifecycle-task-acceptance) | Whether and how many A2A tasks the capsule accepts |
+| [lifecycle.after_task](../reference/manifest.md#lifecycle-after-task) | What the capsule does after a task completes |
+| [lifecycle.queue_depth](../reference/manifest.md#field-lifecycle) | How many tasks can be buffered while one is running |
+| [lifecycle.conversation](../reference/manifest.md#lifecycle-conversation) | Whether tasks with the same contextId accumulate conversation history |
 
 ---
 
