@@ -88,7 +88,7 @@ The generator automatically infers whether the task is:
 
 **Generator behavior:**
 
-The generator runs `murmur-tool-registry-search` to discover relevant artifacts, then outputs a complete `murmur.yaml` as its final text response. The CLI reads `out/result.txt`, strips any markdown fences, validates the YAML via `RuntimeManifest::from_yaml_str`, and copies the result to `./murmur.yaml`.
+The generator reads its manifest guide, calls `murmur-tool-registry-search` to find artifacts for the task, and writes the manifest to `out/murmur.yaml` in its own session workdir. The CLI reads that file, validates the YAML, then writes it to `murmur.yaml` in the current directory through a temporary file and a rename, so an interrupted run leaves no partial manifest. A generator that writes no `out/murmur.yaml` fails with `E-NEW-001`, quoting whatever the agent did produce.
 
 If the generated YAML fails validation, nothing is written to CWD and the error is printed to stderr.
 
@@ -108,7 +108,8 @@ mur run --manifest murmur.yaml  # run it locally
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode |
 | `E-RUN-008` | A required generator artifact is not installed |
 | `E-MAN-002` | Generated YAML failed structural validation |
-| `E-IO-003` | Generator produced no output, or `murmur.yaml` could not be written |
+| `E-NEW-001` | The generator produced no `out/murmur.yaml` |
+| `E-IO-003` | `out/murmur.yaml` could not be read, or `murmur.yaml` could not be written to the current directory |
 
 See the `mur new` how-to guide for a full walkthrough.
 
@@ -276,6 +277,7 @@ mur install --all-platforms <name@version>
 | `mur install github:<owner>/<repo>@<tag>` | Fetches directly from a GitHub release into the project-local store |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
 | `mur install --all-platforms <name@version>` | Downloads all platform variants into the global store; useful for CI and cross-platform build seeding |
+| `mur install --registry <url\|local> <ref>` | Resolves `name@version` against that registry for this invocation — a URL forces remote mode, `local` forces the local store. See [Registry selection rules](config.md#registry-selection-rules) |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not found in the local registry it falls back to the configured source chain automatically.
 
@@ -294,9 +296,10 @@ mur install murmur-tool-git@1.0.0
 
 Behavior:
 
-1. Resolve artifact from configured registry source (falls back through source chain if not found locally)
-2. Verify SHA256 integrity
+1. Resolve the artifact from the registry — the local store by default, a remote Nexus with `--registry`
+2. On a registry hit, verify the bytes against the SHA-256 the registry reports; on a miss, fall through to the configured source chain and download from there
 3. Store into the project-local store (or global store with `-g`)
+4. Pin the name, resolved version and SHA-256 in `murmur.lock` — project installs only, since `-g` has no project to pin
 
 ---
 
@@ -428,7 +431,7 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
-| `--workdir` | temporary directory | Directory mounted as the capsule's accessible workspace. Session artifacts are created inside it |
+| `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |
 | `--verbose`, `-v` | off | Add `workdir:`, `manifest:`, `driver:` and `skills:` to the startup lines |
@@ -524,7 +527,7 @@ mur deploy --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 2. Wait up to 30s for SSH to become available on the VM
 3. Upload `mur` binary via `scp` to `/usr/local/bin/mur`
 4. Upload manifest and optional workdir via `scp`
-5. Run `mur run --manifest <path> --json` on the VM; wait up to 30s for the JSON line
+5. Run `mur run --manifest <path> --json` on the VM; wait up to 120s for the JSON line
 6. Parse `localhost:PORT` from the JSON output; construct the public URL
 7. Persist to `~/.murmur/deployments.json`; print the JSON line
 
@@ -548,8 +551,10 @@ mur deploy \
 | Code | Meaning |
 |---|---|
 | `E-IO-001` | `--manifest`, `--workdir`, or `--mur-binary` path not found |
+| `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` |
 | `E-DEPLOY-003` | SSH connection or remote command failed |
-| `E-DEPLOY-004` | Capsule did not emit startup JSON within 30s |
+| `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s |
+| `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub |
 
 ---
 
@@ -1119,7 +1124,7 @@ edit `registry.sources` by hand in the YAML file, and use
 Setting a key never clobbers other keys already present in the target file:
 
 ```bash
-mur config set registry.default local
+mur config set registry.default official
 # Set registry.default in ./.murmur/config.yaml
 
 mur config set inference.model claude-haiku-4-5-20251001 -g

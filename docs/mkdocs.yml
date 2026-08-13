@@ -161,7 +161,7 @@ nav:
       - Diagnostics: reference/diagnostics.md
       - Session Workdir: reference/workdir.md
       - Observability Schemas: reference/observability-schemas.md
-      - First-party Artifacts: reference/first-party-artifacts.md
+      - Default Artifacts: reference/default-artifacts.md
       - Installing Artifacts: reference/installing-artifacts.md
       - WIT Interfaces: reference/wit-interfaces.md
       - Nexus API: reference/nexus-api.md

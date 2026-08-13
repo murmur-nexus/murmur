@@ -19,8 +19,9 @@ section that explains it.
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
+| `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
 | `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy`](cli.md#mur-deploy) |
-| `E-DEPLOY-004` | Capsule did not emit startup JSON within 30s | [`mur deploy`](cli.md#mur-deploy) |
+| `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy`](cli.md#mur-deploy) |
 | `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub | [`mur deploy`](cli.md#mur-deploy) |
 | `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number | [`eval.jsonl` schema](observability-schemas.md#structured-evaluation-evaljsonl) |
 | `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
@@ -29,24 +30,25 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure) | — |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest | — |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config) | — |
+| `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
 | `E-REG-001` | Artifact not found in registry | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-REG-003` | An artifact of that name and version is already published | [`mur publish`](cli.md#mur-publish) |
 | `E-REG-004` | Reserved version string (`latest`, `stable`, `edge`) | [`mur publish`](cli.md#mur-publish) |
-| `E-REG-005` | A registry-resolved artifact's hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
-| `E-RUN-001` | Capsule crashed, compile failure, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
+| `E-REG-005` | A registry-resolved artifact's version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
 | `E-RUN-003` | Lock version mismatch or missing lock entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
-| `E-RUN-006` | Inference driver artifact not installed | [Inference configuration](manifest.md#inference-config) |
+| `E-RUN-006` | Inference driver artifact not installed, or `inference.command` is not on `PATH` | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-007` | Agent loop failed at runtime | — |
 | `E-RUN-008` | Required artifact not installed locally | [`mur run`](cli.md#mur-run) |
 | `E-RUN-009` | `inference.system_prompt_file` (or the compaction system-prompt file) could not be read | [`inference.system_prompt`](manifest.md#inference-system-prompt) |
 | `E-RUN-010` | `network.internal_port` is already bound | — |
-| `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Host resource limits](resource-limits.md#host-resource-limits) |
-| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Host resource limits](resource-limits.md#host-resource-limits) |
+| `E-RUN-011` | A native subprocess was killed for exceeding a `capabilities.resources` limit | [Which limit a subprocess hit](resource-limits.md#which-limit) |
+| `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Platform behavior](resource-limits.md#platform-behavior) |
 | `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` | [Host resource limits](resource-limits.md#host-resource-limits) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
@@ -61,7 +63,7 @@ section that explains it.
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
 | `W-SEC-004` | Literal secret value found in a manifest field | [W-SEC-004](#w-sec-004) |
-| `W-SEC-005` | What the Linux kernel enforcement layer contains, and the one key that re-widens it | [W-SEC-005](#w-sec-005) |
+| `W-SEC-005` | Linux kernel enforcement is in force — what it covers, and the one key that re-widens it | [W-SEC-005](#w-sec-005) |
 | `W-SEC-006` | A hook's `capabilities:` block declares a sub-key that is inert on hooks | [W-SEC-006](#w-sec-006) |
 | `W-SEC-007` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped | [W-SEC-007](#w-sec-007) |
 | `W-SEC-008` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply | [W-SEC-008](#w-sec-008) |
@@ -76,8 +78,8 @@ section that explains it.
 
 ### E-CAP-001 — invalid `network.allow` entry { #e-cap-001 }
 
-An entry in a `capabilities.network.allow` list could not be parsed, so the capsule is refused at
-manifest load, before any session starts:
+An entry in a `capabilities.network.allow` list could not be parsed, so the capsule is refused
+before any registry pull, artifact compile or workdir creation:
 
 ```text
 error[E-CAP-001]: invalid network allow entry '<entry>': <reason>
@@ -97,9 +99,9 @@ error[E-CAP-002]: invalid filesystem scope '<scope>': scope cannot escape the wo
 ```
 
 The same two rules apply wherever a scope is declared: the capsule-wide
-`capabilities.filesystem.scope`, a per-hook grant, and a per-tool or per-driver narrowing. The
-scope is a real directory grant, not a label, so it is checked before any component is
-instantiated. `scope: "."` is the explicit "whole workdir" grant. See
+`capabilities.filesystem.scope`, a per-hook grant, and a per-tool or per-driver narrowing. Like
+`E-CAP-001`, the check runs before any registry pull, artifact compile or workdir creation.
+`scope: "."` is the explicit "whole workdir" grant. See
 [Filesystem scope](manifest.md#filesystem-scope).
 
 ### E-CAP-003 — declared floor not achievable on this host { #e-cap-003 }
@@ -116,12 +118,18 @@ error[E-CAP-003]: declared containment class 'scoped' is not achievable on this 
 ```
 
 For `sealed` the reason names the *specific* missing piece and the command that fixes it, because
-"no mount namespace here" has several completely different causes:
+"no mount namespace here" has several completely different causes. The runtime never falls back to
+a weaker class, whichever one it reports:
 
 | Reason reported | What to do |
 |---|---|
+| This platform has no mount namespace and never will | Nothing — macOS and every other non-Linux host stay at `advisory` permanently |
 | AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. To turn the restriction off host-wide instead: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` |
-| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it. The runtime never falls back to a weaker class |
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it |
+| The namespace was created but its identity `uid_map`/`gid_map` could not be written, so the process cannot own it | Check that `/proc/sys/user/max_user_namespaces` is non-zero, that no LSM policy blocks `uid_map` writes for this binary, and that `mur` is not already running inside an unmapped user namespace |
+| The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN` | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, add `--cap-add SYS_ADMIN`, or establish the mount namespace outside it |
+| The kernel provides no unprivileged user namespaces at all (`CONFIG_USER_NS=n`, or `user.max_user_namespaces=0`) | `sudo sysctl -w user.max_user_namespaces=10000` if the sysctl is merely zeroed, otherwise run on a kernel built with `CONFIG_USER_NS=y` |
+| No usable Landlock ABI, which `sealed` keeps inside the composed root as defence in depth | Run on Linux 5.13+ — a host that cannot back `scoped` cannot back `sealed` either |
 
 **One case names the manifest rather than the host**, because no host can satisfy it:
 [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec) declared
@@ -132,29 +140,40 @@ enforceable property of the capsule, and the achieved class is capped at `adviso
 Remove `workdir_exec`, or lower the declared floor to `advisory`.
 
 A `sealed` host that clears the probe at launch and *then* fails to build the composed root for a
-particular subprocess is a different event and gets its own code, `E-RUN-014`. It means something
-moved underneath the runtime mid-session (a profile reloaded, a container policy changed), not that
-the floor was mis-declared.
+particular subprocess is a different event and gets its own code, `E-RUN-014`. Two causes reach it,
+and the message names the failing step and its errno:
+
+- A [`capabilities.shell.staged_runtime`](containment.md#field-staged-runtime) grant whose
+  `source_path` does not exist on this host. Each grant is planned as a *required* bind ahead of
+  `pivot_root`, so the `mount(2)` fails with `ENOENT` and the session aborts. Fix the path, or drop
+  the grant.
+- Something moved underneath the runtime mid-session — an AppArmor profile reloaded, a container
+  policy changed. Re-probe with `mur run --explain-scope`.
+
+Neither means the declared floor was wrong; `E-CAP-003` covers that.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
-**`sealed` is required, and it is checked against the declared floor.** A `staged_runtime` grant is
-staged into a composed root, and a composed root is built only for a capsule that asked for
-`sealed` (see [A weaker declaration is never silently upgraded](containment.md#field-containment)). So a capsule
-declaring `staged_runtime` below an effective `sealed` floor is refused before any registry pull,
-artifact compile or workdir creation:
+A `staged_runtime` grant is staged into a composed root, and a composed root is built only for a
+capsule that asked for `sealed` (see
+[A weaker declaration is never silently upgraded](containment.md#field-containment)). A capsule
+declaring `staged_runtime` below an effective `sealed` floor is therefore refused before any
+registry pull, artifact compile or workdir creation:
 
 ```text
 error[E-CAP-004]: capabilities.shell.staged_runtime is declared for python3 but the effective containment floor is 'scoped' — staging a runtime tree requires the 'sealed' floor, because there is no composed root to bind-mount it into below that
   hint: set `capabilities.containment: sealed` in murmur.yaml (or pass `--containment sealed`) so the capsule gets a composed root to stage the runtime into, or remove the capabilities.shell.staged_runtime grant.
 ```
 
-This is deliberately **not** the same check as `E-CAP-003`, and the two remedies are opposites.
-`E-CAP-003` means the host is too weak for what the capsule declared — lower the floor or move
-hosts. `E-CAP-004` means the capsule declared too little for what it asked for — raise the floor or
-drop the grant. `E-CAP-004` therefore fires identically on a host that could deliver `sealed`,
-because the operator never asked for it. `mur doctor` surfaces the same condition as a warning
-ahead of a run.
+The check reads the declared floor alone, so it fires identically on a host that could deliver
+`sealed`. That is what separates it from `E-CAP-003`, whose remedy points the opposite way:
+
+| | `E-CAP-003` | `E-CAP-004` |
+|---|---|---|
+| What went wrong | the host is too weak for what the capsule declared | the capsule declared too little for what it asked for |
+| Remedy | lower the floor, or move hosts | raise the floor, or drop the grant |
+
+`mur doctor` surfaces the same condition as a warning ahead of a run.
 
 ### E-CAP-005 — no network namespace for the subprocess tree { #e-cap-005 }
 
@@ -181,21 +200,20 @@ It is not part of the containment ladder — every class needs the namespace equ
 raising nor lowering a declared floor changes this answer. `mur doctor` reports the same condition
 ahead of a run.
 
-### Under `sealed`, a missing grant is caught at launch { #e-cap-006 }
+### E-CAP-006 — interpreted entrypoint unreachable under `sealed` { #e-cap-006 }
 
-Staging a `shell.allow` binary's own ELF dependency closure into the composed root is necessary for
-that binary to run, and for two kinds of program it is not sufficient. Either would otherwise launch
-cleanly and fail deep into a run, so under a declared `sealed` floor both are decided at staging,
-before any registry pull, artifact compile or workdir creation.
+Staging a `shell.allow` binary's own ELF dependency closure into the composed root is what makes
+that binary runnable, and for an interpreted entrypoint it stages nothing useful. A console script
+such as `pip` at `~/.local/bin/pip` is a `#!` script, not an ELF image, so its dependency closure
+is *empty* — and the package it needs (`~/.local/lib/python3.12/site-packages/pip`) is a different
+directory nothing derives. The capsule would launch cleanly and fail deep into a run, so under a
+declared `sealed` floor this is decided at staging, before any registry pull, artifact compile or
+workdir creation.
 
-**An interpreted entrypoint refuses with `E-CAP-006`.** A console script such as `pip` at
-`~/.local/bin/pip` is a `#!` script, not an ELF image, so its dependency closure is *empty* — the
-staging that makes `/usr/bin/bash` work stages nothing at all of what the script imports, and the
-package it needs (`~/.local/lib/python3.12/site-packages/pip`) is a different directory nothing
-derives. Under `sealed`, `mur run` refuses unless one of the following holds: the script
-already resolves under a fixed sealed runtime path (`/usr`, `/bin`, …), or it lives inside a
-directory a `staged_runtime`/`interpreter_runtime` grant already names, or some such grant names
-the script or its shebang interpreter:
+`mur run` refuses unless one of the following holds: the script already resolves under a fixed
+sealed runtime path (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`), or it lives
+inside a directory a `staged_runtime`/`interpreter_runtime` grant already names, or some such grant
+names the script or its shebang interpreter:
 
 ```text
 error[E-CAP-006]: capabilities.shell.allow grants 'pip' (/home/dev/.local/bin/pip, a script run by 'python3') under the 'sealed' containment floor, but nothing declared makes the interpreted entrypoint's own package tree reachable inside the composed root — ...
@@ -204,31 +222,26 @@ error[E-CAP-006]: capabilities.shell.allow grants 'pip' (/home/dev/.local/bin/pi
 
 The name match is deliberately loose, and the guarantee is correspondingly narrow: declaring
 `interpreter_runtime` for `python3` satisfies every `python3` script, whatever directories the
-grant names. murmur does not try to derive an interpreted program's import closure — `sys.path`,
-`.pth` files and whatever the script does at runtime make that undecidable in general — so this
-check verifies you declared *something*, never that the directory you declared is the right one.
+grant names. murmur does not derive an interpreted program's import closure — `sys.path`, `.pth`
+files and whatever the script does at runtime make that undecidable in general — so this check
+verifies you declared *something*, never that the directory you declared is the right one.
 Measuring it is still yours to do, which is why the hint names the `strace` invocation.
 
-Distinguish this from `E-CAP-004` above: that one fires when a grant exists at too low a floor
-(*raise the floor*), this one when the floor is already `sealed` and no grant exists (*add a
-grant*).
+The check reads only the *declared* floor, never a host probe, and is inert at `scoped` and
+`advisory`: below `sealed` there is no composed root, and the host filesystem is simply the host
+filesystem. `mur doctor` surfaces the same condition ahead of a run, as a warning.
 
-**A compiler driver warns with `W-SEC-012`.** `cc`/`gcc`/`g++`/`c++` fork and exec `cc1`,
-`cc1plus`, `as`, `ld` and `collect2` — separate binaries, outside the driver's own dependency
-closure, living under `/usr`, which a composed root binds read-only and grants `ReadFile +
-ReadDir` but deliberately **not** `Execute`. The driver therefore starts and the first real compile
-fails partway through. This one warns rather than refuses, because the probe behind it is a
-heuristic over a fixed driver/helper table; see
-[`W-SEC-012`](#w-sec-012) for the full comparison and the fix.
+Two neighbouring codes are easy to confuse with this one:
 
-Both checks read only the *declared* floor, never a host probe, and are completely inert at
-`scoped` and `advisory` — below `sealed` there is no composed root, and the host filesystem is
-simply the host filesystem. `mur doctor` surfaces both ahead of a run, as warnings, without
-launching anything.
+| Code | Fires when | Say |
+|---|---|---|
+| [`E-CAP-004`](#e-cap-004) | a grant exists at too low a floor | raise the floor |
+| `E-CAP-006` | the floor is already `sealed` and no grant exists | add a grant |
+| [`W-SEC-012`](#w-sec-012) | an allowlisted compiler driver's helpers have no `Execute` grant | name the helper's directory in a grant |
 
 ---
 
-## Build Lints
+## Build lints
 
 `mur build` checks the file set it is about to pack before it writes a byte of zip. What it
 finds is reported two ways:
@@ -242,20 +255,11 @@ Both classes are about *packaging*: what ends up inside the archive, and whether
 will be able to launch it. They are distinct from the [`W-SEC-NNN`](#security-warnings)
 warnings, which are about capability and enforcement posture.
 
-| Code | Kind | Summary |
-|---|---|---|
-| [`E-BLD-001`](#e-bld-001) | error | `name:` is not a valid artifact identifier |
-| [`E-BLD-002`](#e-bld-002) | error | A `requires_files:` entry is unsafe or collides inside the archive |
-| [`E-BLD-003`](#e-bld-003) | error | The packed entry set is not a launchable wasm payload |
-| [`W-BLD-001`](#w-bld-001) | warning | A declaration names an archive entry the packer already fills |
-| [`W-BLD-002`](#w-bld-002) | warning | `capsule.wasm` shadows another root `*.wasm` |
-| [`W-BLD-003`](#w-bld-003) | warning | A compiled artifact packages build inputs |
+### E-BLD-001 — invalid artifact name { #e-bld-001 }
 
----
-
-### E-BLD-001
-
-**`invalid artifact name '<name>': <reason>`**
+```text
+error[E-BLD-001]: invalid artifact name '<name>': <reason>
+```
 
 An artifact `name:` becomes a filename (`<name>-<version>.mur.zip`), a registry key and a
 directory in the local store, so it is held to the lowest common denominator of all three:
@@ -276,18 +280,20 @@ name: my_tool        # E-BLD-001
 name: -my-tool       # E-BLD-001
 ```
 
-### E-BLD-002
+### E-BLD-002 — unsafe or colliding `requires_files:` entry { #e-bld-002 }
 
-**`requires_files entry '<entry>' has an unsafe path: <reason>`**
-**`requires_files entry '<entry>' is a symlink (<path>); declare the file it points to instead`**
-**`requires_files entries '<a>' and '<b>' both pack as the archive entry '<name>'`**
+```text
+error[E-BLD-002]: requires_files entry '<entry>' has an unsafe path: <reason>
+error[E-BLD-002]: requires_files entry '<entry>' is a symlink (<path>); declare the file it points to instead
+error[E-BLD-002]: requires_files entries '<a>' and '<b>' both pack as the archive entry '<name>'
+```
 
 Every `requires_files:` entry must be a plain relative path to a real file inside the source
 directory, and the entries must not collide once they are inside the archive:
 
 - **No absolute paths.** `/etc/hosts` joined onto the source directory *is* `/etc/hosts`.
-- **No `..` components.** This is the same rule any `.mur.zip` reader applies to an entry name
-  it unpacks (see `sanitize_entry_path`), applied at authoring time.
+- **No `..` components.** This is the same rule a `.mur.zip` reader applies to an entry name it
+  unpacks, applied at authoring time.
 - **No symlinks.** The link is not followed: packing it would ship whatever it resolves to —
   plausibly from outside the source tree — under the declared name.
 - **No two declarations claiming one archive entry.** The archive name is a rewrite of the
@@ -297,18 +303,20 @@ directory, and the entries must not collide once they are inside the archive:
 A `requires_files:` entry that redundantly names `murmur.yaml` is *not* a collision — it is
 dropped before packing, and reported as [`W-BLD-001`](#w-bld-001) instead.
 
-### E-BLD-003
+### E-BLD-003 — packed entry set is not a launchable payload { #e-bld-003 }
 
-**`missing root .wasm file (expected capsule.wasm or one root *.wasm)`**
-**`multiple root .wasm files found: <names>`**
+```text
+error[E-BLD-003]: missing root .wasm file (expected capsule.wasm or one root *.wasm)
+error[E-BLD-003]: multiple root .wasm files found: <names>
+```
 
 The artifact's `runtime:`/`execution:` resolve to a **wasm** artifact, but the entry set about
 to be packed does not contain exactly one payload the runtime could select. `mur build` never
 compiles anything, so a `.wasm` must already exist on disk *and* be declared in
 `requires_files:`.
 
-The rule is the runtime's own payload-selection rule, and the message is the runtime's message
-verbatim — a build that passes this check cannot fail payload selection at `mur run` time:
+The rule and the message are the runtime's own, so a build that passes this check cannot fail
+payload selection at `mur run` time:
 
 - exactly one root `*.wasm` entry → selected
 - a root `capsule.wasm` → always selected, however many other root `*.wasm` entries exist
@@ -320,9 +328,11 @@ A `*.wasm` in a subdirectory is not a root entry and does not count. This check 
 wasm artifacts — native (`implementation: native`) and static (`runtime: skill`,
 `execution: static`) artifacts are packed without it.
 
-### W-BLD-001
+### W-BLD-001 — declaration names a reserved archive entry { #w-bld-001 }
 
-**`requires_files entry '<entry>' names the reserved archive entry '<name>', which mur build already packs`**
+```text
+warning[W-BLD-001]: requires_files entry '<entry>' names the reserved archive entry '<name>', which mur build already packs
+```
 
 Two root entries have a fixed meaning inside a `.mur.zip`: `murmur.yaml` is seeded by the
 packer itself, and `capsule.wasm` is the payload the runtime prefers over every other root
@@ -331,9 +341,11 @@ deduplicated away and the artifact is byte-identical without it.
 
 Remove the declaration.
 
-### W-BLD-002
+### W-BLD-002 — `capsule.wasm` shadows another root payload { #w-bld-002 }
 
-**`root 'capsule.wasm' is always selected as the payload, so <names> ships but never runs`**
+```text
+warning[W-BLD-002]: root 'capsule.wasm' is always selected as the payload, so <names> ships but never runs
+```
 
 The artifact carries a root `capsule.wasm` *and* at least one other root `*.wasm`. The build
 succeeds — `capsule.wasm` makes payload selection unambiguous — but the other file is shipped
@@ -341,9 +353,11 @@ and never executed.
 
 Keep exactly one root `*.wasm`: drop `capsule.wasm`, or rename the payload you meant to run.
 
-### W-BLD-003
+### W-BLD-003 — compiled artifact packages build inputs { #w-bld-003 }
 
-**`compiled artifact packages build inputs: <names>`**
+```text
+warning[W-BLD-003]: compiled artifact packages build inputs: <names>
+```
 
 A wasm or native artifact declares an obvious build input in `requires_files:` — `Cargo.toml`,
 `Cargo.lock`, a `*.rs` file, or anything under a `target/` path. A compiled artifact ships its
@@ -353,12 +367,11 @@ Static artifacts (`runtime: skill`) are exempt: their files *are* their content.
 
 ---
 
-## Security Warnings
+## Security warnings
 
-`mur run` and `mur build` can print non-fatal warnings about capability/enforcement gaps in a
-manifest or host. These are distinct from the `E-<CATEGORY>-NNN` [error codes](#index) — a
-warning does not stop the session or the build, it flags a posture issue you should be aware of.
-Each one carries a `W-SEC-NNN` code and a link back to its section on this page:
+`mur run`, `mur build` and `mur doctor` print non-fatal warnings about capability and enforcement
+gaps in a manifest or host. Each one carries a `W-SEC-NNN` code and a link back to its section on
+this page:
 
 ```text
 [capsule-runtime] warning[W-SEC-001]: capabilities.shell.allow is non-empty but this platform
@@ -367,23 +380,13 @@ environment-only (synthetic HOME + credential env-stripping). This is permanent 
 platform. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-001)
 ```
 
-Warnings from `mur run` go to both stderr and `workdir/<session_id>/logs/bootstrap.log`.
-Warnings from `mur build` go to stderr only.
+Where a warning is written depends on whether a session workdir exists yet:
 
-| Code | Fires from | Summary |
-|---|---|---|
-| [`W-SEC-001`](#w-sec-001) | `mur run` | No kernel-level subprocess sandbox on this platform |
-| [`W-SEC-002`](#w-sec-002) | `mur run` | Linux host without Landlock — filesystem scope and exec unenforced |
-| [`W-SEC-003`](#w-sec-003) | `mur run` | `network.allow` doesn't constrain bash's own outbound connections |
-| [`W-SEC-004`](#w-sec-004) | `mur build` | Literal secret value found in a manifest field |
-| [`W-SEC-005`](#w-sec-005) | `mur run` | What the Linux kernel enforcement layer contains, and the one key that re-widens it |
-| [`W-SEC-006`](#w-sec-006) | `mur run` | A hook's `capabilities:` block declares a sub-key that is inert on hooks |
-| [`W-SEC-007`](#w-sec-007) | `mur run` | A tool/driver narrowed to a host the capsule-wide ceiling does not allow — the entry was dropped |
-| [`W-SEC-008`](#w-sec-008) | `mur run` | A tool/driver `capabilities:` block declares something per-artifact narrowing does not apply |
-| [`W-SEC-009`](#w-sec-009) | `mur run`, `mur doctor` | `capabilities.shell.interpreter_runtime` couples the capsule to a specific host interpreter-version layout |
-| [`W-SEC-010`](#w-sec-010) | `mur run` | No cgroup on this platform — the subprocess tree has no aggregate memory/pids/cpu bound |
-| [`W-SEC-011`](#w-sec-011) | `mur run` | An executable workdir makes `capabilities.shell.allow` advisory |
-| [`W-SEC-012`](#w-sec-012) | `mur run`, `mur doctor` | A compiler driver's helper binaries have no `Execute` grant under `sealed` |
+| Warning | Written to |
+|---|---|
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
 
@@ -410,25 +413,21 @@ allowlists to contain a compromised subprocess.
 **Fires when:** `capabilities.shell.allow` is non-empty and the host resolves to the Seccomp-only
 tier — see [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers).
 
-**Why it matters:** filesystem reads/writes outside the capsule workdir are not kernel-enforced at
-all on this tier. **Nor is exec:** `capabilities.shell.allow` is enforced by granting the Landlock
-`Execute` right on exactly the allowlisted binaries, so without Landlock there is no exec mediation
-here and a shell subprocess can run any binary its uid can reach.
+**Why it matters:** filesystem reads and writes outside the capsule workdir are not kernel-enforced
+at all on this tier. **Nor is exec:** `capabilities.shell.allow` is enforced by granting the
+Landlock `Execute` right on exactly the allowlisted binaries, so without Landlock there is no exec
+mediation here and a shell subprocess can run any binary its uid can reach.
 
-The [fixed capsule device set](containment.md#capsule-device-set) does **not** apply on this tier either, and the
-direction of that gap is worth being explicit about: it is a Landlock rule list, so without Landlock
-there is nothing to grant *and* nothing to deny. A capsule here can open `/dev/null`, `/dev/zero`
-and `/dev/urandom` — but equally `/dev/random`, `/dev/mem` and any raw block device its uid can
-reach. The Full tier's device set is a *narrowing* of this tier's behavior, never a widening of it.
+The [fixed capsule device set](containment.md#capsule-device-set) is a Landlock rule list, so it
+does not apply here either — and the direction of that gap is worth being explicit about. Without
+Landlock there is nothing to grant *and* nothing to deny: a capsule here can open `/dev/null`,
+`/dev/zero` and `/dev/urandom`, but equally `/dev/random`, `/dev/mem` and any raw block device its
+uid can reach.
 
-Two things the Full tier has *do* survive here, because neither involves Landlock:
-
-- the capability drop — a `prctl`/`capset` sequence in the forked child, so a root-operated
-  `mur run` still hands its shell subprocess an empty capability set;
-- the `socket(2)` domain denial — `AF_UNIX` refused with `EACCES` unless
-  `capabilities.network.unix_sockets: true` is declared, `AF_NETLINK`/`AF_PACKET` refused
-  unconditionally. It behaves *identically* on this tier and the Full tier, so a host stuck below
-  kernel 5.13 is not exposed to the `/var/run/docker.sock` escape.
+What survives on this tier is everything that needs no Landlock — the shell child's capability drop
+and the `socket(2)` domain denial, both described under
+[What every Linux tier grants](containment.md#subprocess-enforcement-tiers). A host stuck below
+kernel 5.13 is therefore not exposed to the `/var/run/docker.sock` escape.
 
 **What to do:** upgrade the host kernel to move to the Full tier. Until then, treat filesystem scope
 and exec scope as advisory on this host — neither has a mechanism here. This is also why this tier
@@ -438,24 +437,15 @@ cannot reach the `scoped` containment class.
 
 ### W-SEC-003 — `bash` bypasses the network allowlist { #w-sec-003 }
 
-**Fires when:** `capabilities.shell.allow` contains `"bash"` and `capabilities.network.allow` is
-non-empty, on a host where network access isn't kernel-enforced (the Environment-only tier —
-see [W-SEC-001](#w-sec-001)). On the enforcing tiers a `bash` subprocess's own outbound connections
-*are* constrained by the same allowlist, so this warning does not fire there.
+**Fires when:** `capabilities.shell.allow` contains the literal entry `"bash"` and
+`capabilities.network.allow` is non-empty, on a host that resolves to the Environment-only tier
+(see [W-SEC-001](#w-sec-001)). On the enforcing tiers a `bash` subprocess's own outbound
+connections *are* constrained by the same allowlist, so this warning does not fire there.
 
 **Why it matters:** `capabilities.network.allow` constrains requests the runtime itself makes
 (WASI HTTP calls from tool/driver components). It does not constrain a `bash` subprocess's own
 outbound connections on this tier — `bash` can reach any host regardless of what
 `network.allow` declares.
-
-**What the allowlist covers where it *is* enforced.** `capabilities.network.allow` governs **IP
-destinations only — TCP and UDP alike**, decided by destination address and port at `connect(2)` and
-`sendto(2)`, through the capsule's own network namespace and egress proxy. It is not a full egress
-control: unix-domain sockets are a separate capability
-([`capabilities.network.unix_sockets`](manifest.md#field-capabilities), default `false`,
-see [W-SEC-005](#w-sec-005)), and `AF_NETLINK`/`AF_PACKET` are refused outright with no key to
-re-enable them. An empty `network.allow` therefore does not mean "no communication" — it means no
-TCP or UDP destination is reachable.
 
 **Maximum-risk combination:** `bash` in `shell.allow` combined with any external-fetch
 capability (`network.allow`, or a tool/driver artifact that fetches independently) gives a
@@ -465,15 +455,17 @@ injection.
 
 **What to do:** run on a host that resolves to an enforcing tier (see
 [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers)), or avoid pairing `bash` with a
-non-empty `network.allow` on platforms without one.
+non-empty `network.allow` on platforms without one. Declaring `sh` or `zsh` instead only silences
+the warning: the check matches the literal string `bash`, and the exposure is the same.
 
 ---
 
 ### W-SEC-004 — Literal secret in manifest { #w-sec-004 }
 
-**Fires when:** `mur build` scans `murmur.yaml` and finds a credential-shaped field
-(`api_key`, `token`, `secret`, `password`, or a value matching a known API-key prefix like
-`sk-ant-`) set to a literal string instead of a `${VAR_NAME}` reference.
+**Fires when:** `mur build` scans `murmur.yaml` and finds a credential-shaped field — one whose
+key contains `api_key`, `token`, `secret` or `password` — holding a string that is not a
+`${VAR_NAME}` reference and is either longer than 8 characters or begins with a known API-key
+prefix (`sk-`, `sk-ant-`).
 
 **Why it matters:** a literal secret in `murmur.yaml` ships inside the built artifact and is easy
 to accidentally commit to version control.
@@ -484,39 +476,32 @@ but the artifact should not be published or committed until the literal is remov
 
 ---
 
-### W-SEC-005 — What the Full tier enforces, and the one key that re-widens it { #w-sec-005 }
+### W-SEC-005 — Linux kernel enforcement is in force { #w-sec-005 }
 
-**Fires when:** `capabilities.shell.allow` is non-empty and the host resolves to the **Full** tier
-(see [Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers)).
+**Fires when:** `capabilities.shell.allow` is non-empty and the host resolves to the **Full** or
+the **Sealed** tier (see
+[Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers)). The strongest tiers
+warn rather than stay silent, because each is a scope with documented exceptions and silence would
+imply it has none.
 
-**What this tier enforces.** Four kernel mechanisms, all applied at launch:
+**What the message says.** On the Full tier it names what the Landlock scope, the fixed device set,
+the `socket(2)` domain deny and the default-deny syscall allowlist cover — see
+[Subprocess enforcement tiers](containment.md#subprocess-enforcement-tiers) for the full grant. On
+the Sealed tier it names what the composed root adds and states its one exception: `/proc` is a bind
+of the host's rather than a masked private procfs, because mounting one unprivileged needs a PID
+namespace this tier does not create, so host process metadata stays visible inside the root exactly
+as it is under `scoped`.
 
-- **A Landlock workdir scope plus a derived exec grant.** The session workdir gets a near-full
-  access set — near-full because it withholds character-device, block-device and unix-socket
-  creation, and withholds `Execute` unless the manifest declares
-  [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec). Outside it,
-  a narrow *derived* read+execute grant covers exactly the `shell.allow` binaries, their dynamic
-  loader, and the transitive closure of their shared libraries. Those two together are the whole of
-  exec enforcement here: `Execute` where the operator named a binary, nowhere the capsule can write.
-- **A fixed device set.** `/dev/null` read **and** write, `/dev/zero` and `/dev/urandom` read-only,
-  no other device at all — see [the fixed capsule device set](containment.md#capsule-device-set).
-- **A `socket(2)`-domain deny.** `AF_UNIX`, `AF_NETLINK` and `AF_PACKET` are refused at socket
-  creation, before any `connect()` is attempted. It is a plain seccomp rule with no Landlock
-  involvement, so it applies identically on **both** Linux tiers.
-- **A default-deny syscall allowlist.** The seccomp filter's default action is a deny, so a syscall
-  named by none of the mechanisms above is refused rather than falling through to an implicit allow
-  — see [Default-deny syscall allowlist](containment.md#default-deny-syscall-allowlist).
-
-**The one documented exception.**
+**The one documented exception a manifest controls.**
 [`capabilities.network.unix_sockets: true`](manifest.md#field-capabilities) re-widens the
-`AF_UNIX` half of the domain deny. Nothing else on this list has an opt-out:
+`AF_UNIX` half of the domain deny. Nothing else on the list has an opt-out:
 
 | `socket(2)` domain | Default | Can a manifest widen it? |
 |---|---|---|
 | `AF_UNIX` | denied (`EACCES`) | yes — `capabilities.network.unix_sockets: true` |
 | `AF_NETLINK` | denied (`EACCES`) | **no** |
 | `AF_PACKET` | denied (`EACCES`) | **no** |
-| `AF_INET`, `AF_INET6`, everything else | unaffected | governed by `capabilities.network.allow` — TCP and UDP by IP destination, see [`W-SEC-003`](#w-sec-003) |
+| `AF_INET`, `AF_INET6`, everything else | unaffected | governed by `capabilities.network.allow` — TCP and UDP by IP destination |
 
 That key is coarse on purpose: it is a whole address family, not a per-socket-path allowlist, so
 declaring it `true` re-exposes every unix socket the process can reach — `/var/run/docker.sock`,
@@ -539,18 +524,17 @@ the `CAP_MKNOD` the workdir device-node restriction exists to backstop.
 
 ### W-SEC-006 — Inert sub-key in a hook's `capabilities:` block { #w-sec-006 }
 
-**Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares
-`shell`, `spawn`, `env`, or `limits`. Per-hook grants (see
+**Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares `shell`,
+`spawn`, `env`, `limits`, `resources` or `containment`. Per-hook grants (see
 [`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network` and
-`filesystem` — the other sub-blocks are structurally accepted (for vocabulary consistency with
-the capsule-wide `capabilities:` block) but nothing enforces them per-hook.
+`filesystem` — the other sub-blocks are structurally accepted but nothing enforces them per-hook.
 
 **Why it matters:** an operator who declares, say, `capabilities.shell.allow` on a hook entry
 expecting it to scope that hook's shell access would otherwise have no signal that the runtime
 never reads it there — it is silently inert rather than rejected.
 
-**What to do:** remove the inert sub-key from the hook's entry. If you need to scope
-shell/spawn/env/limits at all, that is a capsule-wide concern today — use the top-level
+**What to do:** remove the inert sub-key from the hook's entry. Shell, spawn, env, limits,
+resources and the containment floor are capsule-wide concerns — declare them in the top-level
 `capabilities:` block instead. See [Hook capabilities](manifest.md#hook-capabilities) for
 the full rules on what a per-hook grant does and does not cover.
 
@@ -576,9 +560,6 @@ widened, so this is never an escalation — but a tool that silently cannot reac
 capsule should be able to reach it), or make the per-artifact entry at least as specific as the
 ceiling entry it should sit under, or delete it if the drop was what you actually wanted.
 
-Like [`W-SEC-006`](#w-sec-006), this fires during artifact staging — before the session workdir
-exists — so it goes to stderr only, not to `logs/bootstrap.log`.
-
 ---
 
 ### W-SEC-008 — Unapplied per-artifact grant on a tool or driver { #w-sec-008 }
@@ -586,8 +567,9 @@ exists — so it goes to stderr only, not to `logs/bootstrap.log`.
 **Fires when:** either
 
 - a `runtime: tool`/`runtime: driver` entry's `capabilities:` block declares `shell`, `spawn`,
-  `env`, or `limits` — per-artifact narrowing only reads `network` and `filesystem`, exactly as
-  per-hook grants do ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case); or
+  `env`, `limits`, `resources` or `containment` — per-artifact narrowing only reads `network` and
+  `filesystem`, exactly as per-hook grants do ([`W-SEC-006`](#w-sec-006) is the hook-side twin of
+  this case); or
 - a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
   all. A native tool runs as a host subprocess under the capsule-wide shell/sandbox machinery, not
   through the WASI tool path narrowing is applied on, so the whole block is inert.
@@ -596,13 +578,9 @@ exists — so it goes to stderr only, not to `logs/bootstrap.log`.
 case in particular, the tool keeps the full capsule ceiling despite an entry that looks like it
 locked it down.
 
-**What to do:** for an inert sub-key, remove it — `shell`/`spawn`/`env`/`limits` are capsule-wide
-concerns, so use the top-level `capabilities:` block. For a native tool, scope it through
-`capabilities.shell.*` on the capsule-wide block instead, or ship the tool as WASM if you need
-per-artifact narrowing.
-
-Like [`W-SEC-006`](#w-sec-006), this fires during artifact staging — before the session workdir
-exists — so it goes to stderr only, not to `logs/bootstrap.log`.
+**What to do:** for an inert sub-key, remove it and declare it in the top-level `capabilities:`
+block instead. For a native tool, scope it through `capabilities.shell.*` on the capsule-wide
+block, or ship the tool as WASM if you need per-artifact narrowing.
 
 ---
 
@@ -613,26 +591,21 @@ more grants. Fires once per grant, from both `mur run` (at staging) and `mur doc
 
 **Why it matters:** an `interpreter_runtime` grant widens an already-allowlisted binary's Landlock
 scope to specific host directories *outside* the workdir so a path-based interpreter (e.g. CPython)
-can reach its standard library — the `DT_NEEDED` closure alone reaches only an ELF's linked
-libraries, never the `.so` extension modules the interpreter `dlopen`s at import time or the
-pure-Python stdlib files it discovers by listing each `sys.path` entry. That makes the grant
-necessary to run such an interpreter, but it also **couples the capsule to a specific host
-distro/interpreter-version layout**: a grant naming `/usr/lib/python3.11` stops resolving the moment
-the host ships Python 3.12, and a capsule that runs on Debian may not run on Alpine. This is the
-honest cost, and the reason the durable fix is
+can reach its standard library. That makes the grant necessary to run such an interpreter, and it
+**couples the capsule to a specific host distro/interpreter-version layout**: a grant naming
+`/usr/lib/python3.11` stops resolving the moment the host ships Python 3.12, and a capsule that
+runs on Debian may not run on Alpine. The durable fix is
 [`capabilities.shell.staged_runtime`](containment.md#field-staged-runtime), which bind-mounts a
-pinned runtime tree into the capsule's own composed root instead of reaching out to the host's — this
-grant exists only to bridge for capsules that cannot use that (it requires an effective `sealed`
-floor; `interpreter_runtime` works at `scoped` too).
+pinned runtime tree into the capsule's own composed root instead of reaching out to the host's; it
+requires an effective `sealed` floor, while `interpreter_runtime` works at `scoped` too.
 
 **What it grants, exactly:** one Landlock rule per named directory, and nothing else. Each directory
 carries its own required `list_dir`:
 
-- `list_dir: true` → `Execute + ReadFile + ReadDir`. The directory's own entries are enumerable
-  (what CPython's `FileFinder` needs for a `sys.path` entry).
-- `list_dir: false` → `Execute + ReadFile`. Files inside can still be opened **by exact name**
-  (Landlock's read rights apply to the subtree beneath a granted directory), but the directory
-  itself cannot be listed.
+| `list_dir` | Rights granted | Effect |
+|---|---|---|
+| `true` | `Execute + ReadFile + ReadDir` | The directory's own entries are enumerable — what CPython's `FileFinder` needs for a `sys.path` entry |
+| `false` | `Execute + ReadFile` | Files inside can still be opened **by exact name**, but the directory itself cannot be listed |
 
 There is no field that accepts a prefix and expands it, and `ReadDir` is never inferred — it is
 granted only where an author wrote `list_dir: true`, and only on that one directory, never on its
@@ -640,20 +613,19 @@ parent or siblings. A directory not named in the manifest receives no rule at al
 
 **What to do:** name the narrowest set of directories that actually works — measure the real
 requirement with `strace -f -e trace=openat,getdents64 <interpreter> -c "import ..."` rather than
-guessing, and set `list_dir: false` on any directory you only open known files inside (do not
-reflexively set `list_dir: true` "to be safe" — it only changes whether the directory can be
-*enumerated*, and files inside a `list_dir: false` directory are still openable by name). Accept
+guessing, and set `list_dir: false` on any directory you only open known files inside. Accept
 that the capsule is now pinned to this host's interpreter layout, or switch to
 `capabilities.shell.staged_runtime` if the capsule can run at an effective `sealed` floor — it
-bind-mounts a pinned tree into the composed root instead of reaching out to the host's, so it
 carries no host-layout coupling and fires no `W-SEC-009`.
 
-**Parse-time rejections.** A malformed `interpreter_runtime` fails `mur run`/`mur doctor` at
-manifest parse time (not a warning — a hard error naming the offending value): a `binary` not
-present in the same block's `shell.allow` (this mechanism narrows filesystem access alongside an
-exec grant that already exists — it never itself grants exec), a `dirs[].path` that is not absolute
-(does not start with `/`), a `dirs[]` entry that omits `list_dir` (enumerability is never inferred),
-or an `interpreter_runtime[]` entry with an empty `dirs` list.
+**Parse-time rejections.** A malformed `interpreter_runtime` fails `mur run`/`mur doctor` with
+[`E-MAN-003`](#index) at manifest parse time, naming the offending value:
+
+- a `binary` not present in the same block's `shell.allow` — this mechanism narrows filesystem
+  access alongside an exec grant that already exists, and never itself grants exec
+- a `dirs[].path` that is not absolute (does not start with `/`)
+- a `dirs[]` entry that omits `list_dir` — enumerability is never inferred
+- an `interpreter_runtime[]` entry with an empty `dirs` list
 
 ---
 
@@ -700,7 +672,7 @@ property of the platform.
 
 **Fires when:** the manifest declares
 [`capabilities.filesystem.workdir_exec: true`](containment.md#field-workdir-exec). Once, at
-staging, on stderr — before any session workdir exists.
+staging, on stderr — from both `mur run` and `mur doctor`.
 
 **Why it matters:** `capabilities.shell.allow` is enforced by granting the Landlock `Execute` right
 on exactly the allowlisted binaries' own paths and withholding it everywhere the capsule can write
@@ -710,9 +682,9 @@ regardless of what the allowlist says. There is no name check to defeat, because
 check: the kernel is granting `Execute` on the path, and the path is inside the granted directory.
 
 This is a *stated trade*, not a defect. Compile-and-run workloads — a capsule that runs
-`gcc`/`cargo build` in its workdir and then executes the artefact — need
-it, and there is no narrower form of the grant that distinguishes "a binary this capsule compiled"
-from "a binary this capsule downloaded". What the runtime refuses to do is let the trade be silent.
+`gcc`/`cargo build` in its workdir and then executes the artefact — need it, and there is no
+narrower form of the grant that distinguishes "a binary this capsule compiled" from "a binary this
+capsule downloaded". What the runtime refuses to do is let the trade be silent.
 
 **What the runtime does about it, beyond this warning:**
 
@@ -777,23 +749,18 @@ cc -print-prog-name=as         # `as` — deferred to PATH, i.e. /usr/bin/as
 
 The warning itself names the helper's containing directory, so the common case is a copy-paste.
 
-**Why this is a warning and not a refusal.** The check is a probe, not a measurement of what the
-driver will actually do: it asks a fixed list of helper names via `-print-prog-name=`, which is a
-GCC-driver convention, and reasons about a fixed list of four driver names. A capsule may compile
-successfully without every probed helper — a link-only workload never reaches `cc1` — and a driver
-family outside the list is not probed at all. Refusing a launch on that basis would block capsules
-that would have worked, to prevent a failure the operator can now see coming. Compare
-[`E-CAP-006`](#w-sec-012-vs-e-cap-006) below, which *is* a refusal, because there the evidence is
-categorical rather than heuristic.
-
-#### Not to be confused with `E-CAP-006` { #w-sec-012-vs-e-cap-006 }
+#### Why this warns where `E-CAP-006` refuses { #w-sec-012-vs-e-cap-006 }
 
 Both fire only under a declared `sealed` floor, and both are about a `shell.allow` binary that
 starts and then cannot finish. They differ in what is known:
 
-| | `E-CAP-006` (refusal) | `W-SEC-012` (warning) |
+| | [`E-CAP-006`](#e-cap-006) (refusal) | `W-SEC-012` (warning) |
 |---|---|---|
 | Trigger | an allowlisted `#!` script with no covering grant | an allowlisted compiler driver with an uncovered helper |
-| Evidence | categorical — a script's ELF closure is *empty*, so staging it stages nothing it imports | heuristic — a `-print-prog-name=` probe over a fixed driver/helper table |
+| Evidence | categorical — a script's ELF closure is *empty*, so staging it stages nothing it imports | heuristic — a `-print-prog-name=` probe over a fixed table of four driver names |
 | Failure it predicts | a missing-module error inside the root, not a denial | an exec failure partway through a compile |
 | Outcome | launch refused before any registry pull | launch proceeds, operator warned |
+
+A capsule may compile successfully without every probed helper — a link-only workload never reaches
+`cc1` — and a driver family outside the table is not probed at all, so refusing a launch on this
+evidence would block capsules that would have worked.

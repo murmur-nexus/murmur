@@ -86,8 +86,11 @@ hook lifecycle call — is bounded by two independent limits:
 Both are set per-manifest under `capabilities.limits` (see [Manifest
 Schema](../reference/manifest.md#field-capabilities)). Omitting them applies generous
 built-in defaults — a manifest that says nothing gets the defaults, not unlimited resources.
-Hitting either limit is reported distinctly from an ordinary crash. On the hook path it is
-handled like any other hook error: logged, and the runtime moves on to the next hook.
+The default deadline for a hook lifecycle call is 30 seconds, against 600 for a capsule, tool
+or driver call, so one wedged hook cannot stall a session for the capsule-wide budget on every
+event; a declared `deadline_seconds` replaces both defaults and applies to every component call,
+hooks included. Hitting either limit is reported distinctly from an ordinary crash. On the hook
+path it is handled like any other hook error: logged, and the runtime moves on to the next hook.
 
 **Caveat:** the deadline only counts down while the component's own code is running. Time it
 spends waiting on the runtime (for example, a driver awaiting a streaming provider response)

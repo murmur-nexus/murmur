@@ -1,17 +1,26 @@
 # Resource Limits
 
-`capabilities.limits` bounds the components the runtime runs; `capabilities.resources`
-bounds the operating-system processes it spawns. This page covers both blocks, their
-defaults, and what each platform enforces.
+`capabilities.limits` bounds the components the runtime runs; `capabilities.resources` bounds the
+operating-system processes it spawns. Field types, defaults and validation for both blocks are in
+the [manifest reference](manifest.md#field-capabilities); this page covers what enforces them, what
+happens when one is crossed, and what each platform can enforce.
+
+Both blocks are optional field by field: an omitted field takes its default, and an omitted block
+is the same as omitting every field in it. A silent manifest means defaults, never "unlimited". A
+field declared as `0` is rejected when the manifest is parsed, before any component runs:
+
+```
+error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.limits.memory_bytes': must be greater than zero
+```
 
 ---
 
-## Execution limits
+## Execution limits { #execution-limits }
 
-`capabilities.limits` bounds how long a component (capsule, tool/driver, or hook) may run and
-how much memory it may consume — see [Execution limits](../concepts/capsules.md#execution-limits)
-for the runtime-level behavior. Every field is optional and independently defaulted; omitting
-the whole block is equivalent to omitting every field.
+`capabilities.limits` bounds every component call — a capsule `run`, a tool or driver `run`, and
+each hook lifecycle call — in wall-clock time and in the memory, table space and instances it may
+take. See [Execution limits](../concepts/capsules.md#execution-limits) for what a deadline does and
+does not bound.
 
 ```yaml
 capabilities:
@@ -22,31 +31,19 @@ capabilities:
     deadline_seconds: 30
 ```
 
-- Setting any field to `0` is rejected at manifest-parse time with `E-MAN-003`, before any WASM
-  executes:
+| Field crossed | What happens |
+|---|---|
+| `deadline_seconds` | The call is interrupted and fails with `E-RUN-001` naming the deadline that fired |
+| `memory_bytes`, `table_elements` | The growth is refused and the call fails with `E-RUN-001` naming the limit and the size it tried to reach |
 
-  ```
-  error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.limits.memory_bytes': must be greater than zero
-  ```
+Both are reported distinctly from a plain crash — see [CLI error codes](diagnostics.md#index).
 
-- A component that exceeds `deadline_seconds` fails with an `E-RUN-001` naming the deadline that
-  fired; one that grows past `memory_bytes` or `table_elements` fails with an `E-RUN-001` naming
-  the limit and the size it tried to reach. Both are reported distinctly from a plain crash —
-  see [CLI error codes](diagnostics.md#index).
+## Host resource limits { #host-resource-limits }
 
-## Host resource limits
-
-`capabilities.resources` bounds the **operating-system processes** the runtime spawns for
-`capabilities.shell.allow` binaries and for native-implementation tool artifacts. It is a
-different subject from `capabilities.limits` above, which bounds a WASM *component* inside the
-runtime: a capsule that cannot escape its containment can still wedge its host by forking,
-allocating, opening files or writing without bound. That is denial of service, not a containment
-escape — nothing outside the capsule's granted scope is read, written, or reached — but the host
-is wedged either way.
-
-Every field is optional and independently defaulted; omitting the whole block is equivalent to
-omitting every field. **A silent manifest means defaults, never "unlimited"** — the same rule
-`capabilities.limits` already follows.
+`capabilities.resources` bounds the operating-system processes the runtime spawns:
+`capabilities.shell.allow` and `capabilities.spawn.allow` binaries, and native-implementation tool
+artifacts. A capsule that cannot escape its containment can still wedge the host it runs on by
+forking, allocating, opening files or writing without bound; this block is what stops that.
 
 ```yaml
 capabilities:
@@ -60,59 +57,52 @@ capabilities:
     workdir_max_bytes: 1073741824   # 1 GiB
 ```
 
-Three mechanisms enforce these, in descending order of portability:
+Three mechanisms enforce the block, in descending order of portability:
 
-- **`setrlimit(2)` ceilings**, applied to every spawned subprocess before `execve` on every
-  platform. They are set as **hard** limits (`rlim_cur == rlim_max`), not soft ones: an
-  unprivileged process may raise its own soft limit up to the hard one at any time, so a
-  soft-only cap is advisory against a hostile capsule. From inside a capsule, `ulimit -Hn`
-  reports the configured ceiling and any attempt to raise past it is refused by the kernel. A
-  value above the runtime's own inherited hard limit is clamped down to it rather than rejected.
-  `RLIMIT_CORE` is additionally pinned to `0` with no manifest surface at all.
+| Mechanism | Fields | Platforms | Notes |
+|---|---|---|---|
+| `setrlimit(2)` ceilings, applied to each spawned process before it execs | `max_processes`, `max_open_files`, `max_file_size_bytes`, `cpu_seconds`, `memory_bytes` | Every platform | Set as hard limits, so a process cannot raise them from inside. A declared value above the ceiling `mur` itself inherited is clamped down to that ceiling rather than rejected. Core dumps are disabled outright, with no manifest field |
+| A cgroup v2 scope around the whole subprocess tree | `cgroup_memory_bytes`, `cgroup_pids_max`, `cgroup_cpu_percent`, `cgroup_io_bytes_per_sec` | Linux only | The only bound that applies to the tree in aggregate. `RLIMIT_NPROC` is a per-user ceiling, so a fork bomb of distinct, short-lived processes evades it; a cgroup's `pids.max` does not |
+| A periodic workdir-size check | `workdir_max_bytes` | Every platform | The workdir is walked every 10 seconds, and the cadence has no manifest field, so a breach is caught within one interval rather than at the moment it happens. It ends the session with `E-RUN-013` and blocks any further subprocess |
 
-    `max_processes` is the one field applied as **headroom rather than an absolute number**, and
-    the reason is `RLIMIT_NPROC`'s own semantics: it counts everything already owned by the *uid*,
-    not the entries in the capsule's tree — and the unit it counts differs by platform. On Linux
-    it is **threads**: `setrlimit(2)` describes the limit as "the maximum number of processes (or,
-    more precisely on Linux, threads) that can be created for the real user ID". On macOS, whose
-    BSD-derived limit is genuinely per-process, it is **processes**. A workstation account is
-    routinely several hundred processes and several *thousand* threads deep before a capsule
-    starts, so a literal hard ceiling of 128 would not bound the capsule at 128 — it would make
-    the subprocess's very first `fork()` fail with `EAGAIN` before the capsule did anything. The
-    runtime therefore measures the uid's live count once at launch, in that platform's own unit
-    (threads on Linux, processes on macOS), and sets `RLIMIT_NPROC = baseline + max_processes`.
-    The Linux cgroup `pids.max` needs no such adjustment, because it counts only the tasks in the
-    capsule's own scope — which is exactly why it, and not this field, is the bound that actually
-    stops a fork bomb.
-- **A cgroup v2 scope** around the whole subprocess tree (`cgroup_*` fields), **Linux only**.
-  This is what rlimits structurally cannot do: `RLIMIT_NPROC` is a per-**uid** ceiling, so a fork
-  bomb of distinct, short-lived processes evades it; `pids.max` on a cgroup does not.
-- **A periodic workdir-size check** (`workdir_max_bytes`), on every platform. A breach is caught
-  within one poll interval — not at the instant it happens — and terminates the session with
-  `E-RUN-013`. The interval is an internal constant, not a manifest key.
+### `max_processes` is headroom, not a ceiling { #max-processes-headroom }
 
-Setting any field to `0` is rejected at manifest-parse time with `E-MAN-003`, before any WASM
-executes:
+`RLIMIT_NPROC` counts everything the user account already owns rather than the processes in the
+capsule's tree, and the unit it counts differs by platform: threads on Linux, processes on macOS.
+The runtime measures the account's live count in that unit once at launch and sets the limit to
+that baseline plus `max_processes`, so the field means how much a capsule's tree may add to what
+the host is already using. `cgroup_pids_max` needs no such adjustment — it counts only the tasks in
+the capsule's own scope, which is why it, and not `max_processes`, is the bound that stops a fork
+bomb.
 
-```
-error[E-MAN-003]: murmur.yaml: invalid capability config for 'capabilities.resources.max_processes': must be greater than zero
-```
+### Platform behavior { #platform-behavior }
 
-**Platform behavior.** On Linux, a capsule that can spawn *any* native subprocess
-(`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact)
-refuses to launch with `E-RUN-012` when the host cannot delegate a cgroup — running that tree
-with no aggregate ceiling is worse than not running it. This requires systemd user delegation
-(`Delegate=yes` for `memory pids cpu io` on the unit `mur` runs under); see
-[Verification](containment.md#verification) for how these bounds are checked by hand. A capsule that
-declares no subprocess capability at all is never blocked — there is no process tree to bound.
-On macOS (and any non-Linux host) cgroups cannot exist, so the launch always proceeds with
-rlimits only and `W-SEC-010` documents the residual gap: no aggregate bound, and — because macOS
-has no `RLIMIT_AS` and does not enforce `RLIMIT_DATA` — no per-process memory bound either.
+**Linux.** A capsule that can spawn any native subprocess — through `capabilities.shell.allow`,
+`capabilities.spawn.allow`, or a native-implementation artifact — refuses to launch with
+`E-RUN-012` when the host cannot delegate a cgroup, rather than running that tree with no aggregate
+ceiling. Delegation comes from systemd: `Delegate=yes` for `memory pids cpu io` on the unit `mur`
+runs under. A capsule that declares no subprocess capability is never blocked. See
+[Verification](containment.md#verification) for how these bounds are checked by hand.
 
-When a subprocess is killed for exceeding a limit and the kernel's own evidence names exactly
-one, the `shell` event in `trace.jsonl` carries a `resource_limit` field naming it
-(`cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes`, `cgroup_pids_max`). Cases the
-kernel does not identify unambiguously — `RLIMIT_AS`/`RLIMIT_DATA` (surfaces as `ENOMEM` inside
-the child's allocator), `RLIMIT_NPROC` and `RLIMIT_NOFILE` (fail a `fork()`/`open()` with
-`EAGAIN`/`EMFILE` inside the child, killing nothing) — are deliberately left unattributed rather
-than guessed at.
+**macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone
+and [`W-SEC-010`](diagnostics.md#w-sec-010) names the residual gap: no aggregate bound across the
+tree, and no per-process memory bound either, because macOS has no `RLIMIT_AS` and its kernel does
+not enforce `RLIMIT_DATA`.
+
+### Which limit a subprocess hit { #which-limit }
+
+When a subprocess dies or fails on a resource ceiling and the kernel's own evidence names exactly
+one limit, the `shell` event in `trace.jsonl` carries a `resource_limit` field:
+
+| `resource_limit` | Evidence |
+|---|---|
+| `cpu_seconds` | The process was killed by `SIGXCPU` |
+| `max_file_size_bytes` | The process was killed by `SIGXFSZ` |
+| `cgroup_memory_bytes` | The scope's `memory.events` `oom_kill` counter moved |
+| `cgroup_pids_max` | The scope's `pids.events` `max` counter moved |
+
+Every other case is left unnamed rather than guessed at: `memory_bytes` surfaces as an allocation
+failure inside the process, `max_processes` as a `fork()` failing with `EAGAIN`, and
+`max_open_files` as an `open()` failing with `EMFILE` — none of which kills anything the runtime can
+attribute. An absent `resource_limit` means the limit could not be identified, not that no limit
+was involved.

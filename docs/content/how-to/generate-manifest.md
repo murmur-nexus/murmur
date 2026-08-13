@@ -403,7 +403,7 @@ mur install
 Create a `task.md` file with the task description for the capsule, then run it:
 
 ```bash
-mur run --manifest murmur.yaml --input task.md
+mur run --manifest murmur.yaml --task task.md
 ```
 
 ---

@@ -8,29 +8,27 @@ formats and the OpenTelemetry span tree they map onto.
 ## Session trace (`trace.jsonl`) schema { #session-trace-tracejsonl }
 
 Every agent session produces a structured trace at `workdir/<session_id>/trace.jsonl`. The
-file is written by the runtime — not by the capsule — and cannot be suppressed or falsified
-by the capsule. It exists even when no hook artifacts are declared.
+runtime writes it directly: a capsule that declares no hook artifacts still produces one, and
+nothing the capsule does can suppress or rewrite it.
 
 **Format:** one JSON object per line (JSONL), UTF-8, line-terminated. Every line carries
-`event_type` (discriminator), `session_id` (runtime-generated UUID v7, identical on every line
-in a session), and `timestamp` (Unix milliseconds).
+`event_type` (discriminator), `session_id` (identical on every line in a session, and the name of
+the session directory) and `timestamp` (Unix milliseconds).
 
-**Event types** — six standard events, plus two A2A events, three task events, and a hook-fault event:
+**`session_start`** — written before the first inference call of an agent-loop attempt
 
-**`session_start`** — written before the first inference call
-
-| Field | Type |
-|---|---|
-| `capsule_name` | string |
-| `capsule_version` | string |
-| `model` | string |
-| `max_turns` | u32 |
-| `capabilities` | string[] |
-| `tools_declared` | string[] |
-| `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the effective declared floor, always present even when no manifest/config/flag ever declared one (defaults to `"advisory"`) |
-| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the host's probed kernel capability, capped by `workdir_exec` below. Nothing in a manifest can raise it |
-| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its Landlock `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
-| `effective_grants` | object | The complete grant set this session ran under — same object, field for field, as [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `enforcement_tier`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, and `shortfall_reason` (present only when `floor_met` is `false`). Unlike `capabilities` above, which only names *categories* (`"network"`, `"shell"`, ...), this field names the actual destinations, binaries and paths granted — the property an auditor reading a finished trace needs, without re-parsing the manifest |
+| Field | Type | Notes |
+|---|---|---|
+| `capsule_name` | string | Manifest `name` |
+| `capsule_version` | string | Manifest `version` |
+| `model` | string | `inference.model` |
+| `max_turns` | u32 | Turns this attempt may spend: `inference.max_turns`, less whatever earlier attempts of a reopened task already spent |
+| `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
+| `tools_declared` | string[] | Names of the tools offered to the model |
+| `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
+| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this host can enforce, capped by `workdir_exec`. Nothing in a manifest can raise it. See [Containment](containment.md) |
+| `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
+| `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants` and `staged_runtime_grants`. Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
 
 **`inference`** — written after each driver response is parsed
 
@@ -40,7 +38,9 @@ in a session), and `timestamp` (Unix milliseconds).
 | `input_tokens` | u64 | |
 | `output_tokens` | u64 | |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` |
-| `tool_name` | string \| null | Present only when `decision` is `"tool_call"` |
+| `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
+| `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
+| `model` | string | The model this call was sent to. Written only alongside `origin` |
 
 **`tool_call`** — written after each tool invocation returns
 
@@ -48,10 +48,27 @@ in a session), and `timestamp` (Unix milliseconds).
 |---|---|---|
 | `turn` | u32 | |
 | `tool_name` | string | |
+| `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
+| `output` | string | The tool output text. Written only when the manifest sets `trace.include_tool_output: true` (default `false`) |
 | `output_bytes` | u64 | Byte length of the tool output text |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |
+| `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none — see [`state_effect`](wit-interfaces.md#murmurtoolrun) |
+| `resource_id` | string | The resource this call addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none |
+
+**`skill_call`** — written after each skill invocation returns
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `skill_name` | string | |
+| `output_bytes` | u64 | Byte length of the returned `skill.md` text |
+| `duration_ms` | u64 | |
+| `status` | string | `"ok"` \| `"error"` |
+
+Skill calls are counted separately from tool calls: they never raise `total_tool_calls` or a
+`task_end`'s `tool_calls`.
 
 **`shell`** — written after each shell command returns (follows its `tool_call` line)
 
@@ -59,11 +76,12 @@ in a session), and `timestamp` (Unix milliseconds).
 |---|---|---|
 | `turn` | u32 | |
 | `binary` | string | The program that ran — canonicalized absolute path when the invoked name resolved against the host `PATH` (e.g. `/usr/bin/pytest`), else the bare invoked name |
-| `command` | string | First 200 characters |
+| `command` | string | The argument list alone; for a shell interpreter, the script text passed via `-c`. Read `binary` to know what ran |
 | `exit_code` | i32 | Non-zero is data, not an error |
 | `stdout_bytes` | u64 | |
 | `stderr_bytes` | u64 | |
 | `duration_ms` | u64 | |
+| `resource_limit` | string | The `capabilities.resources` field this subprocess hit — `cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes` or `cgroup_pids_max`. Written only when the kernel's own evidence names exactly one limit, and omitted from the line otherwise — see [Which limit a subprocess hit](resource-limits.md#which-limit) |
 
 **`compaction`** — written when context compaction fires
 
@@ -73,7 +91,7 @@ in a session), and `timestamp` (Unix milliseconds).
 | `tokens_before` | u64 |
 | `tokens_after` | u64 |
 
-**`session_end`** — always the last line; written on every exit path
+**`session_end`** — written on every exit path of an agent-loop attempt
 
 | Field | Type | Notes |
 |---|---|---|
@@ -104,7 +122,7 @@ in a session), and `timestamp` (Unix milliseconds).
 | `context_id` | string | Context ID returned by the peer |
 | `traceparent` | string \| null | W3C `traceparent` injected on the outgoing request |
 
-**`task_start`** — written at the start of each task, before `run_agent_loop`
+**`task_start`** — written at the start of each task, before the agent loop runs
 
 | Field | Type | Notes |
 |---|---|---|
@@ -113,25 +131,27 @@ in a session), and `timestamp` (Unix milliseconds).
 | `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
-Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for `task.md` tasks.
+Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
+`task.md` tasks.
 
-**`task_end`** — written after `run_agent_loop` returns (and any hook-requested reopens are resolved), for every task
+**`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
+for every task, on every exit path
 
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt returned `Ok(())`; `"failed"` if it returned `Err(_)`; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `inference.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `inference.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
 | `output_tokens` | u64 | Output tokens for this task only |
 | `tool_calls` | u32 | Tool calls for this task only |
 | `shell_calls` | u32 | Shell calls for this task only |
-| `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0`. |
+| `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
 
-Written unconditionally after the task's last attempt, even on error exit (exit_status will be `"failed"` or `"reopen_budget_exhausted"`). Always follows the corresponding `session_end`.
-
-**`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task, when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and the reopen is granted
+**`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task,
+when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and
+the reopen is granted
 
 | Field | Type | Notes |
 |---|---|---|
@@ -144,37 +164,48 @@ Appears zero or more times per task, always before the task's terminal `task_end
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
 mechanism.
 
-**`hook_dispatch_error`** — written when a hook returns a `hook-output` arm the lifecycle event it fired from does not honor (see [Honored `hook-output` arm per event](wit-interfaces.md#murmurhooklifecycle))
+**`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 
 | Field | Type | Notes |
 |---|---|---|
-| `hook_name` | string | Manifest name of the hook that returned the unsupported arm |
-| `event` | string | WIT lifecycle function name, e.g. `"on-tool-call"` |
-| `arm` | string | The unsupported `hook-output` arm name, e.g. `"write-manifests"` |
+| `hook_name` | string | Manifest name of the hook the fault is attributed to |
+| `event` | string | WIT lifecycle function name, e.g. `"on-tool-call"`, or `"drain"` for a fault raised by the session-end drain rather than by one call |
+| `arm` | string | The unsupported [`hook-output` arm](wit-interfaces.md#what-each-handler-can-commit), e.g. `"write-manifests"`; or, for an async hook, `"error"` when the call returned an error, `"queue-overflow"` when its queue was full and its entry declares `on_overflow: drop`, and `"timeout"` when it was still working when the drain budget ran out |
 
-Non-fatal: the session continues exactly as if the hook had returned `none`. Written just before the `session_end`/`task_end` it precedes, so it always appears earlier in the file than the event that flushed it. Never written for `on-stage` (staging runs before `trace.jsonl` exists) or for async hooks (fire-and-forget; logged to `workdir/logs/hook-<name>.log` only) — both still get a log line, just no trace record.
+Non-fatal: the session continues exactly as if the hook had returned `none`. A blocking hook is
+recorded here when it returns an arm the event does not honor; an async hook is recorded for that
+and for the three failures nothing else can surface. `on-stage` faults never reach the trace,
+because staging runs before `trace.jsonl` exists. Every fault is also written to
+`workdir/logs/hook-<name>.log`. Faults are flushed just before the `session_end` they precede, so
+they always appear earlier in the file than the event that flushed them.
 
 **Guarantees:**
 
 - `trace.jsonl` exists after any capsule session, regardless of exit cause.
-- For single-task (ephemeral) sessions: `session_start` is the first event and `session_end` is the last.
-- For multi-task (persistent) sessions: `task_start` precedes `session_start` for each task; `task_end` follows `session_end` for each task. Each task produces exactly one `task_start`/`task_end` pair.
-- `session_id` is identical on every line and matches `StagedSession.session_id`.
-- Count fields in the last `session_end` equal the cumulative per-event totals across all tasks in the session.
-- For multi-task sessions, the last `session_end` total fields equal the sum of all `task_end` per-task fields.
-- Field names are snake_case translations of the hook WIT kebab-case field names (e.g. `input-tokens` → `input_tokens`).
+- Each task writes one `task_start`/`task_end` pair, with one `session_start`/`session_end` pair
+  per agent-loop attempt nested inside it. A task an `on-task-end` hook reopens produces one such
+  pair per attempt.
+- `session_id` is identical on every line.
+- Count fields in the last `session_end` are cumulative across every task and attempt in the
+  session, and equal the sum of the corresponding per-task fields on every `task_end`.
 
 **Non-obvious behaviour:**
 
-- The trace is written by direct file append; it does **not** route through the `murmur:hook/lifecycle` WIT interface. A capsule that declares no hook artifacts still produces `trace.jsonl`.
-- Compaction trace write errors are non-fatal (logged to `bootstrap.log`) because `try_compact_messages` itself is non-fatal. All other trace write errors surface as `RuntimeError::AgentLoopFailed`.
-- If `run_agent_loop` returns `Err` before `session_start` is written (e.g. driver artifact missing), `trace.jsonl` is created but empty. `session_end` is not written because no session started.
+- A trace write that fails ends the session with `E-RUN-007` (see [Diagnostics](diagnostics.md)).
+  The one exception is the `compaction` event: that failure is logged to
+  `workdir/logs/bootstrap.log` and the session continues.
+- When the agent loop fails before `session_start` is written (a missing driver artifact, for
+  example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
+  started.
 
 ---
 
 ## Structured evaluation (`eval.jsonl`) schema { #structured-evaluation-evaljsonl }
 
-When `murmur-hook-eval` is declared in the capsule manifest with at least one scorer configured, the hook writes `workdir/<session_id>/eval.jsonl` at `session_end`. The file is **not** written by the runtime itself — it is written by the hook component. `trace.jsonl` is always written by the runtime; `eval.jsonl` is only written when `murmur-hook-eval` is active and has at least one scorer. The two files are siblings in the same session workdir and share the same session scope.
+`murmur-hook-eval` writes `workdir/<session_id>/eval.jsonl` at session end when the capsule
+declares the hook and [`observability.eval.scorers`](manifest.md#field-observability) holds at
+least one scorer. The hook writes this file, not the runtime; it is a sibling of `trace.jsonl` in
+the same session workdir and shares its session scope.
 
 **Format:** one JSON object per line (JSONL). Two record types, distinguished by `record_type`.
 
@@ -209,7 +240,8 @@ Example:
 {"record_type":"dataset_run","ts":1778161473790,"dataset_id":"my-ds","case_id":"case_001","overall":"pass","scores":{"turn_limit":1.0,"success_check":1.0}}
 ```
 
-**Scorer types:**
+**Scorer types**, configured under
+[`observability.eval.scorers`](manifest.md#field-observability):
 
 | Type | Passes when |
 |---|---|
@@ -217,34 +249,41 @@ Example:
 | `max_turns` | `total_turns <= max` |
 | `max_tokens` | `total_input_tokens + total_output_tokens <= max` |
 | `tool_sequence` | `expected` list is a subsequence of observed tool calls |
-| `llm_judge` | recognized but not implemented — logs a warning, emits no score |
+| `llm_judge` | unimplemented: it logs a warning and emits no score |
 
 ---
 
 ## OTel span emission
 
-When `observability.otel_endpoint` is set, the runtime runs two independent emission paths at `session_end`:
+Setting [`observability.otel_endpoint`](manifest.md#field-observability) turns on two independent
+export paths:
 
-1. **Native `OtelEmitter`** (host process) — collects lifecycle spans in memory and POSTs them as a single OTLP/HTTP JSON batch to `<otel_endpoint>/v1/traces`. This path is always present; no artifact is required.
+| Path | Exports | Failures |
+|---|---|---|
+| The runtime's own emitter | Each span as an OTLP/HTTP JSON POST to `<otel_endpoint>/v1/traces`, sent as its event happens; the root `capsule.session` span goes last. Always present — no artifact required | Logged to `workdir/logs/otel.log` |
+| Hook-side export | The runtime injects the endpoint as the `MURMUR_OTEL_ENDPOINT` environment variable into every hook component. `murmur-hook-grafana` (and any hook that reads it) uses this to export its own enriched span tree | Logged to `workdir/logs/hook-<name>.log` |
 
-2. **Hook-side emission via `MURMUR_OTEL_ENDPOINT`** — the runtime injects the endpoint as a WASI environment variable into every hook component. `murmur-hook-grafana` (and any hook that reads `MURMUR_OTEL_ENDPOINT`) uses this to export its own enriched span tree.
-
-The two paths are completely independent: an error in one cannot suppress or corrupt the other. Hook OTLP failures are logged to `workdir/logs/hook-<name>.log` and are non-fatal.
+Neither path can suppress or corrupt the other, and a failure on either is non-fatal.
 
 **Span schema** — how `trace.jsonl` events map to OTel span names and attributes:
 
-| Span name | Source event | Key attributes |
+| Span name | Source event | Attributes |
 |---|---|---|
-| `capsule.session` | `session_start` / `session_end` | `service.name` (capsule name), `service.version`, `model`, `exit_status`, `murmur.session_id` |
-| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` |
+| `capsule.session` | `session_start` / `session_end` | `exit_status` |
+| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` (when the response asked for one), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
-| `capsule.shell` | `shell` | `command` (first 200 chars), `exit_code`, `duration_ms` |
+| `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
 | `capsule.compaction` | `compaction` | `tokens_before`, `tokens_after` |
+
+Every span carries two resource attributes: `service.name` (the capsule name) and
+`service.version` (the manifest `version`). The `skill_call`, task and A2A events have no span of
+their own — they appear in `trace.jsonl` alone.
 
 **Non-obvious behaviour:**
 
-- Export is **batched at session end** — the root span's duration is known before any POST fires. There are no partial traces.
-- OTel emission is **non-blocking from the agent loop**. The single synchronous TCP call happens after `run_agent_loop` returns, so a slow or unreachable endpoint never stalls inference.
-- `trace.jsonl` is **always written** regardless of `otel_endpoint` — it is not conditional on a reachable endpoint.
-- `service.version` is the manifest `version` for sessions launched with the current runtime.
-- The `MURMUR_FORMATION_ID` host environment variable, when set, is forwarded into every hook's WASI env and added as `murmur.formation_id` to the root span by `murmur-hook-grafana`.
+- Each span is POSTed as its event happens, over a connection the agent loop waits on, so a slow
+  endpoint slows the session down.
+- `trace.jsonl` is written whether or not `observability.otel_endpoint` is set, and whether or not
+  the endpoint is reachable.
+- The `MURMUR_FORMATION_ID` host environment variable, when set, is forwarded into every hook's
+  WASI environment and added as `murmur.formation_id` to the root span by `murmur-hook-grafana`.

@@ -1,51 +1,41 @@
 # Manifest Schema
 
-This page reflects the manifest fields parsed by the **current implementation**.
-
-Murmur currently uses two parsers:
-
-1. **Build/publish manifest parser** (`murmur_artifact::manifest`) — minimal identity fields
-2. **Run-time manifest parser** (`murmur_artifact::runtime_manifest`) — capsule artifact + capability fields
+`murmur.yaml` serves two roles, each with its own set of fields. An artifact's own manifest
+declares its identity and what `mur build` packages. A capsule's manifest declares what `mur run`
+launches: the artifacts it installs, the capabilities it grants, and how it reaches a model.
 
 ---
 
-## 1) Minimal artifact manifest (`mur build`, `mur publish`)
+## Artifact manifest { #artifact-manifest }
 
-Required fields:
+The manifest that ships inside a `.mur.zip`, read by `mur build` and `mur publish`.
 
-```yaml
-name: my-artifact
-version: "0.1.0"
-```
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `name` | string | yes | Lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing `-`), non-empty, at most 100 characters. Anything else fails the build with [`E-BLD-001`](diagnostics.md#e-bld-001). |
+| `version` | string | yes | `latest`, `stable` and `edge` are reserved and cannot be published (`E-REG-004`). |
+| `runtime` | string | yes | The artifact's role. Two values change how it is packaged when `execution` is absent: `skill` packages as `static`, and `tool` with `implementation: native` packages as `native`. Everything else packages as `wasm`. |
+| `implementation` | `wasm \| native` | no | How a `runtime: tool` artifact is implemented. Default: `wasm`. |
+| `execution` | `wasm \| native \| static` | no | Declares the registry packaging type directly. When set it is authoritative for `mur publish` and overrides the derivation from `runtime` and `implementation`. Case-insensitive. An unrecognized value is a parse error. |
+| `requires_files` | list<string> | no | Companion files that must sit beside `murmur.yaml` — and the complete list of what `mur build` packages besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Default: `["skill.md"]` for `runtime: skill`, empty for every other role; an explicit value, including `[]`, always overrides that default. A missing file fails the build with `E-IO-003`, naming the first missing entry. Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected with [`E-BLD-002`](diagnostics.md#e-bld-002). An artifact with a compiled payload must declare it here, or the built `.mur.zip` contains nothing but `murmur.yaml` — for a wasm artifact that is [`E-BLD-003`](diagnostics.md#e-bld-003). |
 
-Rules:
-
-- both fields are required
-- both must be strings
-- `name` is lowercase letters, digits and inner hyphens (`[a-z0-9-]`, no leading or trailing
-  `-`), non-empty and at most 100 characters — anything else fails the build with
-  [`E-BLD-001`](diagnostics.md#e-bld-001)
-- reserved versions (`latest`, `stable`, `edge`) cannot be published
-
-Optional fields:
-
-| Field | Type | Notes |
-|---|---|---|
-| `execution` | `wasm \| native \| static` | Declares this artifact's registry packaging type directly. When set, it is authoritative for `mur publish` and overrides the role-based derivation (`runtime: skill` → `static`, `runtime: tool` + `implementation: native` → `native`, everything else → `wasm`). Case-insensitive. An unrecognized value is a parse-time error, never a silent fallback. |
-| `requires_files` | list<string> | Companion files `mur build` requires to exist alongside `murmur.yaml` — **and the complete list of what it packages** besides the manifest itself. Paths are relative to the source directory and may be nested (`assets/logo.png`). Defaults to `["skill.md"]` for `runtime: skill` and to an empty list for every other role. An explicit value — including `[]` — always overrides that default, so a skill can opt out of the `skill.md` requirement by declaring `requires_files: []`. Missing files fail the build with `BuildError::MissingRequiredFile`, naming the first missing entry. An artifact with a compiled payload must declare it here or the built `.mur.zip` will contain nothing but `murmur.yaml` — for a wasm artifact that is a build failure ([`E-BLD-003`](diagnostics.md#e-bld-003)). Entries must be plain relative paths to real files: absolute paths, `..` components and symlinks are rejected ([`E-BLD-002`](diagnostics.md#e-bld-002)). |
+A hook artifact's own manifest carries three more fields — see
+[Hook contract fields](#hook-contract-fields).
 
 ```yaml
 name: my-tool
 version: "0.1.0"
 runtime: tool
-execution: static      # optional: force registry_runtime() to Static instead of the derived Wasm
-requires_files:        # optional: the files build_artifact requires — and packages — under source_dir
+execution: static
+requires_files:
   - config.json
 ```
 
 ---
 
-## 2) Runtime capsule manifest (`mur run`)
+## Capsule manifest { #capsule-manifest }
+
+The manifest `mur run` reads.
 
 ### Supported shape
 
@@ -75,13 +65,13 @@ capabilities:
       - AWS_*
     baseline_env:      # optional: env var patterns to keep after stripping
       - PATH
-    interpreter_runtime:            # optional: host dirs a path-based interpreter needs (see W-SEC-009)
+    interpreter_runtime:            # optional: host dirs a path-based interpreter needs
       - binary: python3             # MUST already appear in allow above
         dirs:
           - path: /usr/lib/python3.11
-            list_dir: true          # Execute+ReadFile+ReadDir — the dir's entries are enumerable
+            list_dir: true          # the dir's entries are enumerable
           - path: /usr/lib/python3.11/lib-dynload
-            list_dir: false         # Execute+ReadFile — files openable by exact name, dir not listable
+            list_dir: false         # files openable by exact name, dir not listable
     staged_runtime:                 # optional: pinned host runtime trees to bind-mount into a sealed root
       - binary: python3             # MUST already appear in allow above; MUST NOT also have an interpreter_runtime grant
         source_path: /opt/testbed/conda/envs/django__django   # absolute host path to an already-pinned tree
@@ -91,7 +81,7 @@ capabilities:
       - MY_APP_REGION
 
 network:
-  internal_port: 14159  # optional capsule-declared internal port; local mode still binds an OS-assigned external port
+  internal_port: 14159  # optional; omit to let the OS assign a free port
 
 context:
   max_tokens: 200000   # enables context compaction; omit to disable
@@ -113,11 +103,14 @@ observability:
         name: tool_order
         expected: [bash, python]
 
+trace:
+  include_tool_output: true  # optional; default false: record raw tool output in trace.jsonl
+
 inference:
   transport: http
   endpoint: https://api.anthropic.com
   model: claude-opus-4-5
-  api_key: ${ANTHROPIC_API_KEY}  # optional; supports literal or ${ENV_VAR}
+  api_key: ${ANTHROPIC_API_KEY}  # optional; literal value or ${ENV_VAR}
   driver:
     artifact: murmur-driver-anthropic
     config:
@@ -128,7 +121,7 @@ inference:
     system_prompt: |             # optional; defaults to the compaction hook's own prompt
       task = X, currently editing Y, already tried Z.
     # system_prompt_file: compaction-instructions.md  # alternative: load from file
-    # dump_summaries: true         # optional; default false — see below
+    # dump_summaries: true       # optional; default false
     # The compaction hook is selected by binding, not named here: declare an
     # artifact with `runtime: hook` and `binding: on-compaction` (see artifacts:).
   system_prompt: |              # optional; injected as `system` on every API call
@@ -136,7 +129,7 @@ inference:
   # system_prompt_file: conventions.md  # alternative: load from file
   # max_turns: 10               # optional; default 10
 
-# Alternative: spawn the claude CLI as a subprocess (no ANTHROPIC_API_KEY required)
+# Alternative: spawn a CLI as a subprocess (no ANTHROPIC_API_KEY required)
 # inference:
 #   transport: process
 #   command: claude              # CLI binary name; must be on PATH
@@ -148,6 +141,7 @@ lifecycle:
   after_task: sleep       # exit (default) | sleep
   queue_depth: 2          # only meaningful for queue mode; default: 1
   input_timeout_secs: 60  # optional; absent = wait indefinitely for request-input reply
+  conversation: threaded  # stateless (default) | threaded
 ```
 
 ### Field reference
@@ -156,9 +150,9 @@ lifecycle:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `name` | string | yes | capsule identity |
-| `version` | string | yes | capsule version |
-| `mur_version` | string | no | pins the `mur` runtime version required by this capsule; see [`mur_version`](#field-mur-version) |
+| `name` | string | yes | Capsule identity. |
+| `version` | string | yes | Capsule version. |
+| `mur_version` | string | no | Pins the `mur` runtime version this capsule requires — see [`mur_version`](#field-mur-version). |
 
 #### `mur_version` { #field-mur-version }
 
@@ -168,31 +162,32 @@ Pins the exact version of the `mur` binary that must run this capsule.
 mur_version: "1.0.0"
 ```
 
-**`mur deploy` behaviour:** when set, `mur deploy` downloads `mur-{version}-linux-x86_64` from GitHub releases and installs it on the target VM, regardless of which `mur` version is running locally. The binary is cached at `~/.murmur/bin/mur-{version}-{platform}` and reused on subsequent deploys. If omitted, the version of the locally running `mur` binary is used.
-
-**`mur run` behaviour:** if the field is set and the running `mur` version does not match, a warning is printed to stderr. The run is not aborted — local development commonly runs ahead of a pinned version.
+| Command | Behaviour |
+|---|---|
+| `mur deploy` | Downloads `mur-{version}-{platform}` from GitHub releases and installs it on the target VM, regardless of which `mur` version is running locally. The binary is cached at `~/.murmur/bin/mur-{version}-{platform}` and reused on subsequent deploys. Omitted, the running `mur` binary's version is used. |
+| `mur run` | Prints a warning to stderr when the running `mur` version does not match. The run continues. |
 
 #### `artifacts` { #field-artifacts }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `artifacts` | list | no | defaults to empty |
-| `artifacts[].name` | string | yes (per entry) | artifact name |
-| `artifacts[].version` | string | yes (per entry), **unless `source` is set** | artifact version. Optional when `source` is present — see `artifacts[].source` below. |
-| `artifacts[].runtime` | `tool \| driver \| hook \| skill` | no | defaults to `tool`; `tool` artifacts are model-visible; `driver`, `hook`, and `skill` artifacts are hidden from the model. Using `wasm` or `native` here is a parse error — implementation details belong in the artifact's own `murmur.yaml` (`implementation: wasm \| native`). |
-| `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry — no `.mur.zip`, no `mur publish`. Requires `local_source: true` (see below). See [Local-source artifacts](#local-source-skills) below. |
-| `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default, in both directions. See [Local-source artifacts](#local-source-skills). |
-| `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Defaults to `true` for `runtime: skill` and `false` for every other role — an explicit value always overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
-| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool`, and `runtime: driver`. The baseline differs by role: on a hook, absent = no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent = the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). Declaring it on `runtime: skill` is a manifest validation error (`E-MAN-003`). |
-| `artifacts[].on_overflow` | `drop \| block` | no | Recognized only on `runtime: hook`; declaring it on any other role is a manifest validation error. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook overflow policy](#hook-overflow). Defaults to `drop`. Legal (but inert) on a hook that turns out to be `execution_mode: blocking`, since a blocking hook has no queue. |
+| `artifacts` | list | no | Defaults to empty. |
+| `artifacts[].name` | string | yes (per entry) | Artifact name. |
+| `artifacts[].version` | string | yes (per entry) | Optional when `source` is set — see [Local-source artifacts](#local-source-skills). |
+| `artifacts[].runtime` | `tool \| driver \| hook \| skill` | no | Default: `tool`. `tool` and `skill` artifacts are model-visible; `driver` and `hook` artifacts are hidden from the model. `wasm` and `native` are rejected here — those belong in the artifact's own manifest as `implementation`. |
+| `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry. Requires `local_source: true`. See [Local-source artifacts](#local-source-skills). |
+| `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
+| `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
+| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). Declaring it on `runtime: skill` fails with `E-MAN-003`. |
+| `artifacts[].on_overflow` | `drop \| block` | no | Default: `drop`. Recognized only on `runtime: hook`; declaring it on any other role fails with `E-MAN-003`. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook execution](#hook-overflow). Legal but inert on a hook that turns out to be `execution_mode: blocking`, which has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
 
-A hook runs **default-deny**: a `runtime: hook` entry with no `capabilities:` block gets zero
-network capability (no raw WASI sockets, and an empty outbound allow-list so every HTTP request
-is denied) and no directory at all — it cannot read or write any file, not even in its own
-working directory. Network and filesystem are granted back one hook at a time, from that hook's
-entry in **your own** `murmur.yaml`:
+A hook runs default-deny: a `runtime: hook` entry with no `capabilities:` block gets no network
+capability (no raw WASI sockets, and an empty outbound allow-list, so every HTTP request is
+denied) and no directory at all — it cannot read or write any file, not even in its own working
+directory. Network and filesystem are granted back one hook at a time, from that hook's entry in
+**your own** `murmur.yaml`:
 
 ```yaml
 artifacts:
@@ -216,29 +211,26 @@ artifacts:
 Rules:
 
 - **Only the capsule operator can grant.** The grant is read from your capsule manifest's artifact
-  entry, never from the hook artifact's own bundled `murmur.yaml`. A `capabilities:` key inside a
-  published hook artifact is inert — nothing carried in a `.mur.zip` can widen what the host lets
-  that hook do.
-- **The grant is per-hook, not shared.** The capsule-wide top-level [`capabilities`](#field-capabilities)
-  block does not reach hooks, and a hook's grant does not widen the capsule.
-- **`network.allow` uses the same entries and the same enforcement as the capsule-wide block** —
-  same `host`, `host:port`, and `scheme://host[:port]` forms, checked by the same allow-list gate a
-  capsule's or tool's outbound HTTP goes through. Anything not listed is denied.
-- **`filesystem.scope` is a real directory grant, not advisory.** Exactly one directory —
-  `<workdir>/<scope>` — is mounted as the hook's current directory, and it is created if missing.
-  Paths outside that subtree (a sibling artifact's directory, the workdir root, `..`) are
-  unreachable because no descriptor for them exists. An absolute scope, or one that escapes the
-  workdir via `..`, fails at launch (`E-CAP-002`) before any hook component is instantiated.
-- **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, and `limits` parse
-  here but are capsule-wide concerns the runtime does not apply per-hook; declaring one prints a
-  [`W-SEC-006`](diagnostics.md#w-sec-006) warning saying so.
+  entry. A `capabilities:` key inside a published hook artifact is inert.
+- **The grant is per-hook.** The capsule-wide [`capabilities`](#field-capabilities) block does not
+  reach hooks, and a hook's grant does not widen the capsule.
+- **`network.allow` takes the same entries and the same enforcement as the capsule-wide block** —
+  the `host`, `host:port` and `scheme://host[:port]` forms of
+  [Network allow entries](#network-allow-entries). Anything not listed is denied.
+- **`filesystem.scope` is a real directory grant.** Exactly one directory — `<workdir>/<scope>` —
+  is mounted as the hook's current directory, and is created if missing. Paths outside that subtree
+  are unreachable. An absolute scope, or one that escapes the workdir via `..`, fails at launch with
+  [`E-CAP-002`](diagnostics.md#e-cap-002) before any hook component is instantiated.
+- **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, `limits`, `resources`
+  and `containment` parse here but are capsule-wide concerns the runtime does not apply per-hook;
+  declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
 
 ##### Tool and driver capabilities { #tool-capabilities }
 
-A `runtime: tool` or `runtime: driver` entry may carry the same `capabilities:` key, but the
-baseline is the opposite of a hook's: **inherit-and-clamp**, not default-deny. An entry with no
-`capabilities:` block runs on the full capsule-wide [`capabilities`](#field-capabilities) ceiling.
-Declaring a block *narrows* that one artifact:
+A `runtime: tool` or `runtime: driver` entry takes the same `capabilities:` key, but the baseline
+is inherit-and-clamp rather than default-deny. An entry with no `capabilities:` block runs on the
+full capsule-wide [`capabilities`](#field-capabilities) ceiling. Declaring a block *narrows* that
+one artifact:
 
 ```yaml
 capabilities:            # the capsule-wide ceiling
@@ -268,31 +260,33 @@ artifacts:
 Rules:
 
 - **Narrowing only ever subtracts.** The effective grant is `declaration ∩ ceiling`. An entry
-  naming a host the ceiling does not itself allow is dropped, never granted, and prints a
-  [`W-SEC-007`](diagnostics.md#w-sec-007) warning naming the artifact and the dropped entry.
-  Staging continues — the resulting posture is tighter than asked for, not looser.
+  naming a host the ceiling does not itself allow is dropped, and prints
+  [`W-SEC-007`](diagnostics.md#w-sec-007) naming the artifact and the dropped entry. Staging
+  continues.
 - **A bare host does not fit under a scheme-bound ceiling entry.** `api.example.com` spans both
   schemes and every port, so a ceiling of `https://api.example.com` does not cover it and it is
   dropped. Write the narrowing at least as specific as the ceiling entry it sits under.
 - **`network.allow: []` is a real narrowing to zero**, distinct from omitting the key: an explicit
   empty list denies that artifact all outbound HTTP while its siblings keep the ceiling.
-- **`filesystem.scope` is a real directory grant.** `<accessible workdir>/<scope>` is mounted as that
-  artifact's current directory instead of the whole workdir, and is created if missing. `scope: "."`
-  is the explicit "whole workdir" grant. An absolute scope, or one escaping via `..`, fails at
-  staging (`E-CAP-002`) before the tool runs.
+- **`filesystem.scope` is a real directory grant.** `<accessible workdir>/<scope>` is mounted as
+  that artifact's current directory instead of the whole workdir, and is created if missing.
+  `scope: "."` is the explicit "whole workdir" grant. An absolute scope, or one escaping via `..`,
+  fails at staging with [`E-CAP-002`](diagnostics.md#e-cap-002).
 - **Only the capsule operator can grant**, exactly as for hooks: the block is read from your
   manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
 - **Drivers narrow identically.** The artifact named by `inference.driver.artifact` dispatches
   through the same path as any WASM tool, so a `capabilities:` block on its entry applies to every
   driver call — including one made by a hook's `run-inference`.
-- **Only `network` and `filesystem` narrow.** `shell`, `spawn`, `env`, and `limits` parse but are
-  inert here and print a [`W-SEC-008`](diagnostics.md#w-sec-008) warning, as does a grant on a
-  tool with a **native** (non-WASM) implementation, which never runs through the WASI tool path at
-  all.
+- **Only `network` and `filesystem` narrow.** `shell`, `spawn`, `env`, `limits`, `resources` and
+  `containment` parse but are inert here and print
+  [`W-SEC-008`](diagnostics.md#w-sec-008), as does a grant on a tool with a **native** (non-WASM)
+  implementation, which never runs through the WASI tool path at all.
 
 ##### Local-source artifacts { #local-source-skills }
 
-Any artifact can be sourced from a local path instead of the registry by setting `source:` and declaring `local_source: true`. This is the authoring loop for skills (and any other role that opts in): edit the file, relaunch the capsule, and the change is live — no build/publish round-trip.
+Any artifact can be sourced from a local path instead of the registry by setting `source:` and
+declaring `local_source: true`. This is the authoring loop for skills, and for any other role that
+opts in: edit the file, relaunch the capsule, and the change is live — no build/publish round-trip.
 
 ```yaml
 artifacts:
@@ -315,52 +309,69 @@ artifacts:
 
 Rules:
 
-- **`local_source` gates `source:`, not the role directly.** When `local_source` is absent, its value is derived from the role: `true` for `runtime: skill`, `false` for everything else — this reproduces the skill-only behavior every existing manifest already relies on. Declaring `local_source: true` on a `tool`, `driver`, or `hook` artifact opts it in; declaring `local_source: false` on a skill opts it back out. Setting `source:` while `local_source` is `false` (explicit or defaulted) is a manifest validation error (`E-MAN-003`).
-- **`version` is optional when `source` is set.** A local file has no registry version, so the runtime substitutes the literal `local` wherever a version is shown (the installed-path label and the `MURMUR.md` listing). If you set `version` anyway, it is ignored and a warning is printed to stderr.
-- **Relative paths resolve against the directory containing `murmur.yaml`**, not the current working directory. Absolute paths are used as-is.
-- **For a skill, `source` may point at a `skill.md` file or at a directory.** For a directory, the runtime finds `skill.md` case-insensitively (`SKILL.md`, `Skill.md`, … all match) and installs it as lowercase `skill.md`. A file path is read directly regardless of its name.
-- Everything downstream is identical to a registry skill: the file is installed to `workdir/tools/<name>/skill.md`, listed under `## Installed Skills` in `MURMUR.md`, and never injected into the system prompt.
-- A non-skill artifact declaring `local_source: true` passes manifest validation, but only a skill-shaped local payload (a `skill.md` file or a directory containing one) resolves at launch.
+- **`local_source` gates `source:`, not the role directly.** When `local_source` is absent its
+  value is derived from the role: `true` for `runtime: skill`, `false` for everything else.
+  Declaring `local_source: true` on a `tool`, `driver` or `hook` artifact opts it in; declaring
+  `local_source: false` on a skill opts it back out.
+- **`version` is optional when `source` is set.** A local file has no registry version, so the
+  runtime substitutes the literal `local` wherever a version is shown (the installed-path label and
+  the `MURMUR.md` listing). A `version` set anyway is ignored, and a warning is printed to stderr.
+- **Relative paths resolve against the directory containing `murmur.yaml`**, not the current
+  working directory. Absolute paths are used as-is.
+- **For a skill, `source` may point at a `skill.md` file or at a directory.** For a directory, the
+  runtime finds `skill.md` case-insensitively (`SKILL.md`, `Skill.md`, … all match) and installs it
+  as lowercase `skill.md`. A file path is read directly regardless of its name.
+- Everything downstream is identical to a registry skill: the file is installed to
+  `workdir/tools/<name>/skill.md` and listed under `## Installed Skills` in `MURMUR.md`.
+- A non-skill artifact declaring `local_source: true` passes manifest validation, but only a
+  skill-shaped local payload — a `skill.md` file, or a directory containing one — resolves at
+  launch.
 
 Failure modes (all exit non-zero before the workdir is created):
 
-| Condition | Error code | Message |
+| Condition | Code | Message |
 |---|---|---|
 | `source` declared without `local_source: true` | `E-MAN-003` | `artifact '<name>' declares 'source:' but does not declare 'local_source: true' (runtime: <role>)` |
 | `source` path does not exist | `E-IO-001` | `skill source path not found: <path>` |
 | `source` directory has no `skill.md` | `E-IO-001` | `skill source directory '<path>' contains no skill.md` |
 
-Local-source artifacts are never written to `murmur.lock` and are skipped by `mur install` — they are resolved fresh from disk on every `mur run`.
+Local-source artifacts are never written to `murmur.lock` and are skipped by `mur install` — they
+are resolved fresh from disk on every `mur run`.
 
 ##### `inference.system_prompt_artifact` { #inference-system-prompt-artifact }
 
-Names an artifact declared in `artifacts:` whose content is read once at launch and bound as the system prompt, instead of being called on demand. The named artifact must declare `prompt_payload: true` (or default to it, as `runtime: skill` does) — naming an artifact where `prompt_payload` is `false` is a manifest validation error. See [Shape agent behavior with a system prompt](../how-to/capsule-system-prompt.md#step-4-load-the-prompt-from-a-skill-artifact).
+Names an artifact declared in `artifacts:` whose content is read once at launch and bound as the
+system prompt, instead of being called on demand. The named artifact must declare
+`prompt_payload: true`, or default to it as `runtime: skill` does; naming an artifact where
+`prompt_payload` is `false` fails with `E-MAN-003`. A skill bound this
+way is excluded from the callable tool inventory, because it is already in the system prompt. See
+[Shape agent behavior with a system prompt](../how-to/capsule-system-prompt.md#step-4-load-the-prompt-from-a-skill-artifact).
 
 #### `capabilities` { #field-capabilities }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `capabilities.network.allow` | list<string> | no | host/URL allow entries. Governs **IP destinations only — TCP and UDP alike**, decided by destination address and port at `connect(2)`/`sendto(2)`. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent `allow` therefore means no TCP or UDP destination is reachable, not that the capsule has no way to communicate |
-| `capabilities.network.unix_sockets` | bool | no | defaults to **`false`**. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`, enforced by seccomp on both Linux tiers. Set `true` only if a shell tool genuinely needs a local daemon socket — it is a coarse, capsule-wide grant, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. `AF_NETLINK` and `AF_PACKET` are always refused and have no equivalent key. No effect on non-Linux hosts, which have no kernel enforcement at all — see [`W-SEC-001`](diagnostics.md#w-sec-001) |
-| `capabilities.filesystem.scope` | string | no | relative scope under workdir |
-| `capabilities.filesystem.workdir_exec` | bool | no | defaults to **`false`**. When false, the session workdir's Landlock rule withholds the `Execute` right, so nothing the capsule writes there can be executed — under any name, including one that appears in `capabilities.shell.allow`. That withholding is what makes `shell.allow` a complete, kernel-enforced statement rather than a name-matching convention. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). No effect on non-Linux hosts or on Linux without a usable Landlock ABI, neither of which mediates exec at all — see [`W-SEC-001`](diagnostics.md#w-sec-001) and [`W-SEC-002`](diagnostics.md#w-sec-002) |
-| `capabilities.shell.allow` | list<string> | no | shell binaries the agent may invoke (e.g. `bash`); each listed binary gets a synthetic tool manifest staged at launch |
-| `capabilities.shell.strip_env` | list<string> | no | glob patterns for env vars to strip from subprocess environment (e.g. `AWS_*`) |
-| `capabilities.shell.baseline_env` | list<string> | no | glob patterns for env vars to keep after stripping (e.g. `PATH`) |
-| `capabilities.shell.interpreter_runtime` | list<grant> | no | narrows an allowlisted binary's Landlock scope to specific host directories its import machinery needs outside the workdir (a path-based interpreter's stdlib). Fires [`W-SEC-009`](diagnostics.md#w-sec-009) at staging. See below for the per-entry shape. |
-| `capabilities.shell.interpreter_runtime[].binary` | string | yes | a binary that MUST already appear in `capabilities.shell.allow` — this narrows filesystem access alongside an existing exec grant, it never grants exec |
-| `capabilities.shell.interpreter_runtime[].dirs` | list<dir> | yes | the host directories to grant; must name at least one |
-| `capabilities.shell.interpreter_runtime[].dirs[].path` | string | yes | an absolute host path (must start with `/`) outside the workdir |
-| `capabilities.shell.interpreter_runtime[].dirs[].list_dir` | bool | yes | `true` → `Execute+ReadFile+ReadDir` (directory entries enumerable); `false` → `Execute+ReadFile` (files openable by exact name, directory not listable). Never inferred — must be written explicitly. |
-| `capabilities.shell.staged_runtime` | list<grant> | no | names a pinned host runtime tree to bind-mount **read-only into a `sealed` capsule's composed root**, so the interpreter is present inside the root rather than reachable outside it. Requires an effective `sealed` containment floor, and is mutually exclusive per binary with `interpreter_runtime`. See [Staged runtime](containment.md#field-staged-runtime). |
-| `capabilities.shell.staged_runtime[].binary` | string | yes | a binary that MUST already appear in `capabilities.shell.allow`, and MUST NOT also have a `capabilities.shell.interpreter_runtime` grant — this says where an existing exec grant's runtime comes from, it never grants exec |
-| `capabilities.shell.staged_runtime[].source_path` | string | yes | absolute host path (must start with `/`) of an already-pinned runtime tree — a vendored toolchain directory, a baked-in conda env. Not resolved, discovered or version-sniffed by the runtime, and not required to exist on the machine that merely *parses* the manifest |
-| `capabilities.shell.staged_runtime[].pin` | string | yes | non-empty, opaque identifier of which build the tree is. Never inferred: it exists so a human can compare the declared pin across two hosts and confirm the same runtime shipped to both |
-| `capabilities.env.allow` | list<string> | no | host env var names a WASM guest (capsule/tool/driver component) may observe. Omitted or `[]` — a legitimate no-op, not an error — grants nothing beyond the runtime's own `MURMUR_*` injections. |
-| `capabilities.limits.memory_bytes` | integer | no | cap on how much memory a component may allocate, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
-| `capabilities.limits.table_elements` | integer | no | cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
-| `capabilities.limits.instances` | integer | no | cap on the number of component instances one call may create. Default: 1000. Must be > 0. |
-| `capabilities.limits.deadline_seconds` | integer | no | wall-clock budget for a single component call (capsule `run`, tool/driver `run`, or one hook lifecycle call), in seconds. Default: 600 (10 minutes) for a capsule, tool, or driver call; 30 seconds for a hook lifecycle call. An explicit value here overrides both defaults, hooks included. Must be > 0. |
+| `capabilities.network.allow` | list<string> | no | Host/URL entries the capsule may reach — see [Network allow entries](#network-allow-entries) for the accepted forms. Governs IP destinations only, TCP and UDP alike. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent list means no IP destination is reachable. |
+| `capabilities.network.unix_sockets` | bool | no | Default: `false`. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`. Set `true` only if a shell tool genuinely needs a local daemon socket — the grant is capsule-wide, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. No effect on non-Linux hosts, which have no kernel enforcement — see [`W-SEC-001`](diagnostics.md#w-sec-001). |
+| `capabilities.filesystem.scope` | string | no | Relative scope under the workdir; see [Filesystem scope](#filesystem-scope). Omitted, the capsule sees the whole workdir. |
+| `capabilities.filesystem.workdir_exec` | bool | no | Default: `false`. When false, nothing the capsule writes into the session workdir can be executed — under any name, including one that appears in `capabilities.shell.allow`. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). |
+| `capabilities.shell.allow` | list<string> | no | Shell binaries the agent may invoke (e.g. `bash`); see [Shell allow](#shell-allow). |
+| `capabilities.shell.strip_env` | list<string> | no | Glob patterns for env vars to strip from the subprocess environment (e.g. `AWS_*`). |
+| `capabilities.shell.baseline_env` | list<string> | no | Glob patterns for env vars to keep after stripping (e.g. `PATH`). |
+| `capabilities.shell.interpreter_runtime` | list<grant> | no | Widens an allowlisted binary's filesystem scope to specific host directories its import machinery needs outside the workdir (a path-based interpreter's stdlib). Fires [`W-SEC-009`](diagnostics.md#w-sec-009) at staging. |
+| `capabilities.shell.interpreter_runtime[].binary` | string | yes | A binary that must already appear in `capabilities.shell.allow` — this widens filesystem access alongside an existing exec grant, it never grants exec. |
+| `capabilities.shell.interpreter_runtime[].dirs` | list<dir> | yes | The host directories to grant; must name at least one. |
+| `capabilities.shell.interpreter_runtime[].dirs[].path` | string | yes | An absolute host path (must start with `/`) outside the workdir. |
+| `capabilities.shell.interpreter_runtime[].dirs[].list_dir` | bool | yes | `true` grants execute, read and directory listing; `false` grants execute and read only, so files are openable by exact name but the directory cannot be listed. Never inferred — must be written explicitly. |
+| `capabilities.shell.staged_runtime` | list<grant> | no | Names a pinned host runtime tree to bind-mount read-only into a `sealed` capsule's composed root, so the interpreter is present inside the root rather than reachable outside it. Requires an effective `sealed` containment floor ([`E-CAP-004`](diagnostics.md#e-cap-004)), and is mutually exclusive per binary with `interpreter_runtime`. See [Staged runtime](containment.md#field-staged-runtime). |
+| `capabilities.shell.staged_runtime[].binary` | string | yes | A binary that must already appear in `capabilities.shell.allow`, and must not also have a `capabilities.shell.interpreter_runtime` grant. This says where an existing exec grant's runtime comes from; it never grants exec. |
+| `capabilities.shell.staged_runtime[].source_path` | string | yes | Absolute host path (must start with `/`) of an already-pinned runtime tree — a vendored toolchain directory, a baked-in conda env. Not resolved, discovered or version-sniffed by the runtime, and not required to exist on the machine that merely *parses* the manifest. |
+| `capabilities.shell.staged_runtime[].pin` | string | yes | Non-empty, opaque identifier of which build the tree is. Never inferred: it exists so a human can compare the declared pin across two hosts and confirm the same runtime shipped to both. |
+| `capabilities.env.allow` | list<string> | no | Host env var names a WASM guest (capsule, tool or driver component) may observe. Omitted or `[]` grants nothing beyond the runtime's own `MURMUR_*` injections. |
+| `capabilities.limits.memory_bytes` | integer | no | Cap on how much memory a component may allocate, in bytes. Default: 536870912 (512 MiB). Must be > 0. |
+| `capabilities.limits.table_elements` | integer | no | Cap on a component's table growth, in elements. Default: 100000. Must be > 0. |
+| `capabilities.limits.instances` | integer | no | Cap on the number of component instances one call may create. Default: 1000. Must be > 0. |
+| `capabilities.limits.deadline_seconds` | integer | no | Wall-clock budget for a single component call, in seconds. Default: 600 for a capsule, tool or driver call; 30 for a hook lifecycle call. An explicit value overrides both defaults, hooks included. Must be > 0. |
 | `capabilities.resources.max_processes` | integer | no | `RLIMIT_NPROC` headroom for each native subprocess — how much past the runtime's own uid baseline its tree may add, in the unit the kernel enforces against (threads on Linux, processes on macOS). Default: 128. Must be > 0. See the [per-uid note](resource-limits.md#host-resource-limits). |
 | `capabilities.resources.max_open_files` | integer | no | `RLIMIT_NOFILE` hard ceiling on each native subprocess. Default: 1024. Must be > 0. |
 | `capabilities.resources.max_file_size_bytes` | integer | no | `RLIMIT_FSIZE` hard ceiling — largest single file a subprocess may write, in bytes. Default: 4294967296 (4 GiB). Must be > 0. |
@@ -370,86 +381,118 @@ Names an artifact declared in `artifacts:` whose content is read once at launch 
 | `capabilities.resources.cgroup_pids_max` | integer | no | cgroup v2 `pids.max` — aggregate task count across the whole subprocess tree. Default: 256. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
-| `capabilities.resources.workdir_max_bytes` | integer | no | ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp` — see the note below. |
-| `capabilities.containment` | string | no | minimum containment class this capsule requires: `advisory`, `scoped`, or `sealed` (ascending strength). Omitted means the capsule states no requirement — see [Containment class](containment.md#field-containment). Only meaningful capsule-wide; declaring it on a per-artifact (tool/driver/hook) entry has no effect and warns at staging |
-| `capabilities.spawn.allow` | list<string> | no | binaries a capsule component may spawn as native subprocesses. Like `capabilities.shell.allow`, a non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux (`E-CAP-005`). `--explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `spawn_allow`. |
+| `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
+| `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging. |
+| `capabilities.spawn.allow` | list<string> | no | Binaries a capsule component may spawn as native subprocesses. Like `capabilities.shell.allow`, a non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
-Under the [`sealed` containment class](containment.md#field-containment), `/tmp` inside the composed root is
-writable, and it is backed by a directory *inside* the session workdir. Writes to `/tmp` therefore
-count against `capabilities.resources.workdir_max_bytes` like any other workdir write, and are
-discarded when the session ends — a `sealed` capsule cannot use `/tmp` to escape its workdir ceiling
-or to leave anything behind on the host.
+A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
+treated as an error: the run proceeds with that host contributing no addresses to the launch-time
+IP allowlist a shell subprocess falls back to when it reaches a destination by address rather than
+by name. This only ever shrinks what a shell binary can reach. Malformed host *syntax*, as opposed
+to a resolution failure, is still rejected outright with
+[`E-CAP-001`](diagnostics.md#e-cap-001).
 
-A `capabilities.network.allow` host that fails DNS resolution at launch is skipped, not treated as a fatal error — the run proceeds with that host simply contributing no addresses to the launch-time IP allowlist that `capabilities.shell.allow` subprocesses fall back to when they reach a destination by address rather than by name (a native subprocess's `network.allow` is enforced day to day by name, through the capsule's own DNS responder, not by this launch-time set alone). This only ever *shrinks* what a shell binary can reach; it does not widen what the capsule's own outbound HTTP calls may reach, since that check is a host-pattern match against `network.allow` and never depends on DNS. Malformed host *syntax* (as opposed to a resolution failure) is still rejected outright.
-
-A WASM guest never inherits the host process's environment: `capabilities.env.allow` is the only way to expose a host variable, and even a name declared there is dropped if it is credential-shaped (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the exact pattern list — the same backstop applies here) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable is silently omitted, not an error.
+A WASM guest never inherits the host process's environment. `capabilities.env.allow` is the only
+way to expose a host variable, and even a name declared there is dropped if it is credential-shaped
+(see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)
+for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
+is omitted rather than reported.
 
 #### `network` { #field-network }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `network.internal_port` | integer | no | The localhost port the capsule's A2A HTTP server binds. When set, the runtime binds exactly that port and fails with `E-RUN-010` if it is already in use. When omitted, the OS assigns a free port. Either way the bound port is the one `mur run` prints and the one `MURMUR_CAPSULE_URL` carries. |
+| `network.internal_port` | integer | no | The port the capsule's A2A HTTP server binds. When set, the runtime binds exactly that port and fails with `E-RUN-010` if it is already in use. When omitted, the OS assigns a free port. Either way the bound port is the one `mur run` prints and the one `MURMUR_CAPSULE_URL` carries. |
 
 #### `inference` { #field-inference }
 
+The `inference` block is optional; a capsule with no inference block runs its tools without a
+model. These fields are read under both transports:
+
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `inference.transport` | string | yes (if `inference` present) | `http` (WASM driver) or `process` (claude CLI subprocess) |
-| `inference.model` | string | yes (if `inference` present) | model identifier passed to the driver or CLI |
+| `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` spawns a CLI subprocess. See [Inference configuration](#inference-config). |
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. |
-| `inference.max_task_reopens` | integer | no | Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. Default: `1`. Unlike `max_turns`, `0` is a valid explicit value — it disables reopening entirely. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
-| `inference.max_tokens` | integer | `http` only | Maximum output tokens the model may generate **per turn**, sent as `max_tokens` in the driver wire payload. Default: `8192`. Must be > 0; not clamped at the top end. Invalid for `transport: process`. Distinct from [`context.max_tokens`](#field-context), which is the session-wide budget for compaction. |
-| `inference.endpoint` | string | `http` only | base URL for inference API requests; invalid for `transport: process`. Must be `https://` (any host) or `http://` with a loopback host (`localhost` or an `IpAddr::is_loopback()` address, e.g. `127.0.0.1`, `::1`) — see [Endpoint scheme and host validation](#endpoint-validation) |
-| `inference.api_key` | string | no | literal value or `${ENV_VAR}` reference; `http` transport only; invalid for `transport: process` |
-| `inference.driver.artifact` | string | `http` only | inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`; invalid for `transport: process` |
-| `inference.driver.config` | object | no | driver-specific JSON object passed via WASI env (`MURMUR_INFERENCE_DRIVER_CONFIG`); `http` transport only |
-| `inference.provider.artifact` | string | no | older spelling of `inference.driver.artifact`, still accepted; `inference.driver.artifact` wins when both are set |
-| `inference.command` | string | `process` only | CLI binary name to spawn; must be on `PATH`. Invalid for `transport: http`. Defaults to `claude` when omitted. |
+| `inference.max_task_reopens` | integer | no | Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. Default: `1`. Unlike `max_turns`, `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
+| `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
+| `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
+| `inference.system_prompt_artifact` | string | no | Name of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
+
+These fields are read under `transport: http`, and setting any of them under
+`transport: process` is a manifest error:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `inference.endpoint` | string | yes | Base URL for inference API requests. Must be `https://` (any host) or `http://` with a loopback host — see [Endpoint scheme and host validation](#endpoint-validation). |
+| `inference.model` | string | yes | Model identifier passed to the driver. |
+| `inference.driver.artifact` | string | yes | Inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`. |
+| `inference.driver.config` | object | no | Driver-specific JSON object, passed to the driver as `MURMUR_INFERENCE_DRIVER_CONFIG`. |
+| `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
+| `inference.api_key` | string | no | Literal value or `${ENV_VAR}` reference — see [`inference.api_key` resolution](#inference-api-key). |
+| `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
+
+These fields are read under `transport: process`:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `inference.command` | string | yes | CLI binary to spawn; must be on `PATH`. A command whose base name is `codex` selects the codex wire protocol; anything else selects the Claude Code protocol. Invalid for `transport: http`. |
+| `inference.model` | string | no | Model identifier passed to the CLI. Omitted, the CLI uses its own configured default. |
+
+The `inference.compaction` block parses under either transport but takes effect only under
+`transport: http`; the CLI subprocess loop has no compaction step, so under `transport: process`
+these fields are accepted and inert:
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
 | `inference.compaction.threshold` | float (0.0–1.0] | no | Fraction of `context.max_tokens` at which compaction fires. Default: `0.98`. |
 | `inference.compaction.model` | string | no | Model override for compaction calls. Defaults to the primary inference model. |
-| `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit, or format check. Defaults to `none`; the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
+| `inference.compaction.system_prompt` | string | no | System prompt override for compaction calls, passed verbatim to the compaction hook. No trimming, length limit or format check. Omitted, the compaction hook picks its own default prompt. Mutually exclusive with `inference.compaction.system_prompt_file`. |
 | `inference.compaction.system_prompt_file` | string | no | Path to a file whose content is passed verbatim as the compaction system prompt. Relative to the manifest directory; read when the session launches. Mutually exclusive with `inference.compaction.system_prompt`. |
-| `inference.compaction.dump_summaries` | boolean | no | When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session workdir, recording the verbatim summary text plus token counts. Default: `false` — no file is written. |
-| `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. Mutually exclusive with `inference.system_prompt_file`. |
-| `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt. Relative to the manifest directory. Mutually exclusive with `inference.system_prompt`. |
+| `inference.compaction.dump_summaries` | bool | no | Default: `false`. When `true`, every committed compaction appends one JSON line to `out/compaction-summaries.jsonl` in the session workdir, recording the verbatim summary text plus token counts. |
 
 #### `context` { #field-context }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable entirely. Must be > 0. Not to be confused with [`inference.max_tokens`](#field-inference), the per-turn output cap. |
+| `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
 
 #### `observability` { #field-observability }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `observability.otel_endpoint` | string | no | OTLP/HTTP endpoint for OTel span export (e.g. `http://localhost:4318`). When set, the runtime emits a full span tree at session end and injects `MURMUR_OTEL_ENDPOINT` into every hook component's WASI environment. When absent, no outbound telemetry is sent and `trace.jsonl` is the only output. Empty strings are treated as unset. |
+| `observability.otel_endpoint` | string | no | OTLP/HTTP endpoint for OTel span export (e.g. `http://localhost:4318`). When set, the runtime exports one span per session event as the event happens, and injects `MURMUR_OTEL_ENDPOINT` into every hook component's environment — see [OTel span emission](observability-schemas.md#otel-span-emission). When absent, no outbound telemetry is sent and `trace.jsonl` is the only output. An empty string counts as absent. |
 | `observability.eval.dataset_id` | string | no | Labels the `dataset_run` record in `eval.jsonl` and is forwarded to hooks as `MURMUR_DATASET_ID`. Useful when diffing runs from multiple datasets. |
-| `observability.eval.scorers` | list | no | List of scorer configurations (see below). When present with at least one valid scorer, `murmur-hook-eval` writes `eval.jsonl`. When absent or empty, the hook is a no-op and logs a warning. |
-| `observability.eval.scorers[].type` | string | yes (per entry) | Scorer type. One of: `exit_ok`, `max_turns`, `max_tokens`, `tool_sequence`, `llm_judge` (recognized but not implemented — logs a warning, emits no score). |
-| `observability.eval.scorers[].name` | string | yes (per entry) | Scorer name; appears as the key in `eval.jsonl` score records. |
-| `observability.eval.scorers[].max` | integer | yes for `max_turns`, `max_tokens` | Upper bound for the scorer. |
-| `observability.eval.scorers[].expected` | list<string> | yes for `tool_sequence` | Ordered list of tool names that must appear as a subsequence of observed calls. |
+| `observability.eval.scorers` | list | no | Scorer configurations. When present with at least one valid scorer, `murmur-hook-eval` writes `eval.jsonl`. When absent or empty, the hook is a no-op and logs a warning. |
+| `observability.eval.scorers[].type` | string | yes (per entry) | One of `exit_ok`, `max_turns`, `max_tokens`, `tool_sequence`, `llm_judge`. An unrecognized type is skipped with a message on stderr. `llm_judge` is unimplemented: it parses, logs a warning and emits no score. |
+| `observability.eval.scorers[].name` | string | no | Key this scorer's records appear under in `eval.jsonl`. Defaults to the scorer's `type`. |
+| `observability.eval.scorers[].max` | integer | no | Upper bound for `max_turns` and `max_tokens`. Default: `10` for `max_turns`, `100000` for `max_tokens`. Ignored by every other type. |
+| `observability.eval.scorers[].expected` | list<string> | no | Ordered list of tool names that must appear as a subsequence of observed calls, for `tool_sequence`. Defaults to empty. Ignored by every other type. |
+
+#### `trace` { #field-trace }
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `trace.include_tool_output` | bool | no | Default: `false`. Whether each `tool_call` event in `trace.jsonl` carries the tool's raw output text alongside `output_bytes`. Tool output can be large — file diffs, shell dumps — so it is left out unless asked for. See the [`tool_call` event](observability-schemas.md#session-trace-tracejsonl). |
 
 #### `lifecycle` { #field-lifecycle }
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `lifecycle.task_acceptance` | `none \| single \| queue` | no | How the capsule accepts incoming A2A tasks. `none`: runs from `task.md` only, rejects all incoming messages. `single`: accepts one task then exits (default). `queue`: accepts a queue of tasks, processing them serially. |
-| `lifecycle.after_task` | `exit \| sleep` | no | What the capsule does after completing a task. `exit`: terminate immediately (default). `sleep`: return to the idle loop and wait for the next task (only meaningful with `queue`). |
-| `lifecycle.queue_depth` | integer | no | Maximum number of pending (not-yet-started) tasks the capsule will hold when `task_acceptance: queue`. Default: `1`. Tasks beyond this limit receive `state: "rejected"`. |
-| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely. When the timeout fires the task transitions to `failed` with message `"input-timeout"`. |
-| `lifecycle.conversation` | `stateless \| threaded` | no | Conversation threading mode. `stateless` (default): every task starts with an empty context. `threaded`: tasks sharing a `contextId` load and persist the full conversation history for that thread. |
+| `lifecycle.task_acceptance` | `none \| single \| queue` | no | Default: `single`. How the capsule accepts incoming A2A tasks — see [`lifecycle.task_acceptance`](#lifecycle-task-acceptance). |
+| `lifecycle.after_task` | `exit \| sleep` | no | Default: `exit`. What the capsule does after completing a task — see [`lifecycle.after_task`](#lifecycle-after-task). |
+| `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`. Tasks beyond this limit receive `state: "rejected"`. |
+| `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
+| `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 
 ---
 
 ## Inference configuration { #inference-config }
 
-The `inference` block is optional for plain tool capsules. Two transports are supported:
-
 ### `transport: http` — WASM driver { #transport-http }
 
-The default transport. Murmur loads a WASM driver artifact and routes all inference calls through it. Requires `inference.driver.artifact` to be declared in `artifacts:` with `runtime: driver`. If the driver artifact is missing at launch, `mur run` exits with `error[E-RUN-005]`.
+The default transport. Murmur loads a WASM driver artifact and routes every inference call through
+it. The driver must be declared in `artifacts:` with `runtime: driver`; a driver that is named but
+not installed fails with `E-RUN-006`.
 
 ```yaml
 inference:
@@ -464,86 +507,83 @@ inference:
 
 #### Output cap: `inference.max_tokens` { #inference-max-tokens }
 
-`inference.max_tokens` is the per-turn **output** cap — the `max_tokens` field of the payload the runtime hands the driver, which every driver forwards verbatim to its provider API. Omit it and the runtime sends `8192`.
+`inference.max_tokens` is the per-turn **output** cap — the `max_tokens` field of the payload the
+runtime hands the driver, which every driver forwards verbatim to its provider API. Omit it and the
+runtime sends `8192`. It is provider-agnostic and reaches every driver through the same wire field,
+so no `driver.config` entry is needed for it.
 
-Two things worth separating:
+[`context.max_tokens`](#field-context) is the session-wide token budget that decides when
+compaction fires, counted across the whole conversation; `inference.max_tokens` bounds a single
+response. They are parsed and validated independently and never share a default.
 
-- [`context.max_tokens`](#field-context) is the session-wide token budget that decides when compaction fires, counted across the whole conversation; `inference.max_tokens` bounds a single response. They are parsed and validated independently and never share a default.
-- `inference.max_tokens` is provider-agnostic and reaches every driver through the same wire field, so no `driver.config` entry is needed for it.
+Validation is one-sided: `0` is rejected at parse time, but a value larger than a given model's
+documented maximum is neither rejected nor clamped — an over-large cap surfaces as the provider's
+own error at request time.
 
-Validation is deliberately one-sided: `0` is rejected at parse time as an authoring mistake, but a value larger than any given model's documented maximum is **not** rejected or clamped — an over-large cap surfaces as the provider's own error at request time rather than as a manifest load failure against a ceiling Murmur would have to guess.
+Two interactions worth knowing:
 
-One interaction worth knowing: the anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering this value also squeezes a configured thinking budget.
-
-Hook-initiated completions (e.g. the compaction hook's own summarization call) always use the built-in `8192` default, not this value — it caps the agent's turns, not the runtime's internal calls.
+- The anthropic driver caps extended thinking's `budget_tokens` to `max_tokens - 1`, so lowering
+  this value also squeezes a configured thinking budget.
+- Hook-initiated completions, such as the compaction hook's own summarization call, always use the
+  built-in `8192` default. This field caps the agent's own responses, not the runtime's internal
+  calls.
 
 #### Endpoint scheme and host validation { #endpoint-validation }
 
-`inference.endpoint` is validated at manifest parse time, before any capsule launches or any network call is made. This closes the "redirect the trust root" attack where a manifest points inference traffic at an attacker-controlled host over plain HTTP.
+`inference.endpoint` is validated when the manifest is parsed, before any capsule launches or any
+network call is made.
 
-Accepted:
-- Any `https://` URL, regardless of host (e.g. `https://api.anthropic.com`).
-- An `http://` URL whose host is the literal string `localhost`, or an IP literal for which Rust's `IpAddr::is_loopback()` returns `true` (e.g. `127.0.0.1`, `::1`) — this covers local model servers such as Ollama (`http://localhost:11434`).
+| Value | Result |
+|---|---|
+| Any `https://` URL, any host (`https://api.anthropic.com`) | Accepted |
+| `http://` with host `localhost`, or a loopback IP literal (`http://127.0.0.1:11434`, `http://[::1]`) | Accepted — this covers local model servers such as Ollama |
+| `http://` with a non-loopback host (`http://api.attacker.example.com`) | Rejected |
+| A schemeless or malformed value (`api.anthropic.com`, `"not a url"`) | Rejected |
+| Any scheme other than `http`/`https` (`ftp://example.com`) | Rejected |
 
-Rejected, with a manifest error naming the endpoint and the reason:
-- An `http://` URL whose host is not loopback (e.g. `http://api.attacker.example.com`).
-- A schemeless or otherwise malformed value (e.g. `api.anthropic.com`, `"not a url"`).
-- Any scheme other than `http`/`https` (e.g. `ftp://example.com`).
+Each rejection names the endpoint and the reason. The check runs only for `transport: http`, which
+is the only transport that accepts `endpoint` at all.
 
-This check only applies to `transport: http`; it does not run for `transport: process`, which rejects `endpoint` outright.
+### `transport: process` — CLI subprocess { #transport-process }
 
-### `transport: process` — Anthropic CLI subprocess { #transport-process }
-
-Murmur spawns the `claude` CLI as a persistent subprocess and communicates via JSON-lines over stdin/stdout. No `ANTHROPIC_API_KEY` is required — authentication uses whatever the `claude` CLI is already configured with (typically Claude Max or a Pro subscription).
+Murmur spawns `inference.command` as a subprocess and communicates over stdin/stdout. No
+`ANTHROPIC_API_KEY` is required — authentication uses whatever the CLI is already configured with.
+The base name of `command` selects the wire protocol: `codex` speaks the codex-exec dialect,
+anything else speaks the Claude Code dialect. No WASM driver artifact is needed or staged.
 
 ```yaml
 inference:
   transport: process
-  command: claude        # must be on PATH; defaults to "claude" if omitted
+  command: claude        # must be on PATH
   model: claude-haiku-4-5-20251001
   max_turns: 10
 ```
 
-**Pre-flight check:** `mur run` verifies that `command` is on `PATH` before creating the workdir. If not found, it exits with `error[E-RUN-006]` and a hint to install the claude CLI.
-
-**Field rules for `transport: process`:**
-
-| Field | Status under `transport: process` |
+| Behaviour | Details |
 |---|---|
-| `command`, `model` | required |
-| `endpoint`, `driver.artifact`, `api_key`, `max_tokens` | invalid — setting any of these is a manifest error |
-
-No WASM driver artifact is needed or staged.
-
-**What the subprocess sees:**
-
-The process is spawned with these flags:
-
-```
-claude --print --output-format stream-json --verbose \
-       --input-format stream-json --model <model> --tools ""
-```
-
-Murmur writes the task as a single JSON-line to stdin, then closes stdin. It reads stdout line-by-line, counting assistant turns and enforcing `max_turns`. A 10-minute wall-clock timeout applies. The final result (the `"result"` field from the claude result event) is written to `out/result.txt`.
-
-**Observability:** session/inference/tool hooks, `trace.jsonl`, and OTel spans are all emitted normally. Token counts are reported as 0 (not available from the subprocess protocol).
-
-**Limitations:** capsule WASM tools are not exposed to the subprocess. The claude CLI uses its own built-in tools (e.g. `Bash`, `WebSearch`) — these are visible in the event stream for hook observability but are not dispatched through murmur's tool registry. Use `transport: http` when you need murmur-managed tool dispatch.
+| Pre-flight check | `mur run` verifies `command` is on `PATH` before staging the session. If it is not found the run exits with `E-RUN-006` and a hint naming that CLI's install page. |
+| Tool dispatch | When the capsule declares tool artifacts, murmur stands up a loopback MCP server and points the CLI at it, so the model calls the capsule's own tools and murmur executes them. The CLI's built-in host tools are disabled. With no tools declared, the CLI runs as pure inference. |
+| Turn limit | Each assistant response counts as one turn, bounded by `inference.max_turns`. |
+| Wall-clock limit | One subprocess run — all turns and tool calls — is capped at 10 minutes. |
+| Result | The CLI's final result text is written to `out/result.txt`. |
+| Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. Token counts are reported as 0, which the subprocess protocol does not carry. |
+| Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the CLI manages its own context. |
 
 ### `inference.api_key` resolution { #inference-api-key }
 
 `api_key` accepts two forms:
 
 - **Literal string:** `api_key: sk-ant-xxxx`
-- **Environment variable reference:** `api_key: ${ANTHROPIC_API_KEY}` — resolved at parse time from the host environment. If the variable is not set, `mur run` exits with an error before launch.
+- **Environment variable reference:** `api_key: ${ANTHROPIC_API_KEY}` — resolved at parse time from
+  the host environment. If the variable is not set, `mur run` exits with an error before launch.
 
-Only `${UPPER_SNAKE_CASE}` references are expanded. Anything not matching that pattern is treated as a literal value.
+Only `${UPPER_SNAKE_CASE}` references are expanded. Anything else is treated as a literal value.
 
 ### `inference.system_prompt` / `system_prompt_file` { #inference-system-prompt }
 
-The `inference.system_prompt` and `inference.system_prompt_file` fields let you inject a
-static prompt as the top-level `system` parameter on every API call — including the first
-turn and every subsequent turn in a multi-turn session.
+`inference.system_prompt` and `inference.system_prompt_file` inject a static prompt as the
+top-level `system` parameter on every API call, including the first turn and every subsequent turn
+in a multi-turn session.
 
 ```yaml
 # Option A: inline text
@@ -559,17 +599,21 @@ inference:
 
 Rules:
 
-- **Mutually exclusive** — setting both fields is a manifest error (`error[E-MAN-003]`).
-- **File path** is relative to the directory containing `murmur.yaml`, not to the session workdir.
-- **File is read once at launch time** (before any inference call). If the file is missing or unreadable, `mur run` exits with `error[E-RUN-009]` before making any API call.
-- **File content is used verbatim** — whitespace is preserved; no trimming is applied to the file's contents.
-- When neither field is set, no `system` parameter is emitted — behaviour is unchanged from a manifest without the field.
+- **At most one prompt source.** Setting more than one of `system_prompt`, `system_prompt_file`
+  and [`system_prompt_artifact`](#inference-system-prompt-artifact) fails with `E-MAN-003`.
+- **File paths are relative to the directory containing `murmur.yaml`**, not to the session workdir.
+- **The file is read once at launch**, before any inference call. If it is missing or unreadable,
+  `mur run` exits with `E-RUN-009` before making any API call.
+- **File content is used verbatim** — whitespace is preserved and no trimming is applied.
+- With no prompt source set, no `system` parameter is emitted.
 
 ---
 
 ## Hook artifacts { #hook-artifacts }
 
-Declare hook artifacts with `runtime: hook` in `artifacts:`. Hook artifacts are WASM components that implement `murmur:hook/lifecycle`; the runtime calls them synchronously at fixed lifecycle points and discards successful return values.
+Declare hook artifacts with `runtime: hook` in `artifacts:`. Hook artifacts are WASM components
+that implement `murmur:hook/lifecycle`; the runtime calls them at fixed lifecycle points, and what
+it does with a successful return value is set by the hook's own `commit_policy`.
 
 ```yaml
 artifacts:
@@ -581,35 +625,30 @@ observability:
   otel_endpoint: "http://localhost:4318"
 ```
 
-Hook behavior:
-
-| Behavior | Details |
+| Behaviour | Details |
 |---|---|
-| Model visibility | Hook artifacts are not included in the tool inventory or `MURMUR.md` installed-tool list. |
+| Model visibility | Hook artifacts are not included in the tool inventory or the `MURMUR.md` installed-tool list. |
 | Invocation order | Multiple hooks are invoked in manifest declaration order for each event. |
-| Failure handling | A hook handler that returns `Err(string)` does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log`. For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears — a blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
+| Failure handling | A hook that returns an error does not abort the agent loop. The error is appended to `workdir/logs/hook-<name>.log`. For an `execution_mode: async` hook it is also recorded as a `hook_dispatch_error` event in `trace.jsonl`, since the log is otherwise the only place it appears. A blocking hook's error is additionally surfaced to the agent loop, which is fatal only for compaction. |
 | Workdir access | A hook sees one directory, and only where its entry in the capsule manifest grants a `filesystem.scope` — see [Hook capabilities](#hook-capabilities). |
 | Reference hook | `murmur-hook-debug` writes one JSON object per event to `workdir/hook-debug.jsonl`. |
 | Call deadline | Each hook lifecycle call gets its own wall-clock budget: `capabilities.limits.deadline_seconds` when the manifest sets it, otherwise 30 seconds — well below the capsule-wide 600-second default, so one wedged hook cannot stall a session for most of ten minutes per event. |
 
-The runtime generates one UUID v7 session id at startup, used uniformly for the workdir folder name, `trace.jsonl`, `MURMUR_SESSION_ID`, and hook context.
-
 ### Hook contract fields { #hook-contract-fields }
 
-These three fields live in the **hook artifact's own** `murmur.yaml`, not in the capsule
-manifest that installs it — they are the hook author's declaration of what the hook does, so a
-capsule operator cannot change them by editing their own manifest.
+These three fields live in the **hook artifact's own** `murmur.yaml`, not in the capsule manifest
+that installs it. They are the hook author's declaration of what the hook does, so a capsule
+operator cannot change them by editing their own manifest.
 
 | Field | Values | Default | Meaning |
 |---|---|---|---|
-| `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every session event | Which lifecycle event(s) the hook is dispatched for. |
-| `execution_mode` | `blocking`, `async` | `blocking` | Whether the agent loop waits for the hook. A binding that commits an arm must be `blocking`, so `async` requires `commit_policy: none`. |
+| `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every event | Which lifecycle event(s) the hook is dispatched for. |
+| `execution_mode` | `blocking`, `async` | `blocking` | Whether the agent loop waits for the hook. A binding that commits an arm must be `blocking`, so `async` requires `commit_policy: none`. `on-stage` must be `blocking`. |
 | `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task` | `none` | What the runtime does with the hook's successful output. |
 
 **`binding` is the single source of truth for what a hook can commit**, and `commit_policy` is
-checked against it when the capsule is staged. Each binding honors exactly one output, so it
-admits exactly one `commit_policy` (plus `none`, which is always valid and means the hook only
-observes):
+checked against it when the capsule is staged. Each binding honors exactly one output, so it admits
+exactly one `commit_policy` — plus `none`, which is always valid and means the hook only observes:
 
 | `binding` | Valid `commit_policy` |
 |---|---|
@@ -620,8 +659,8 @@ observes):
 | `on-session-start`, `on-task-start`, `on-tool-call`, `on-shell`, `on-session-end` | `none` only — these events commit nothing |
 | absent (all events) | any value — the hook receives every event, including all four that commit something |
 
-Declaring a `commit_policy` the `binding` cannot honor is an error at capsule-staging time,
-before the hook component is compiled or run — for example `binding: on-task-end` with
+Declaring a `commit_policy` the `binding` cannot honor is an error at capsule-staging time, before
+the hook component is compiled or run. For example `binding: on-task-end` with
 `commit_policy: replace-context` fails with:
 
 ```
@@ -629,27 +668,25 @@ hook my-hook@1.0.0 invalid config: commit_policy 'replace-context' is not valid 
 'on-task-end'; binding 'on-task-end' honors commit_policy 'reopen-task'
 ```
 
-See [What each handler can commit](wit-interfaces.md#what-each-handler-can-commit) for the
-runtime side of the same table.
+See [What each handler can commit](wit-interfaces.md#what-each-handler-can-commit) for the runtime
+side of the same table.
 
 ### Async hook execution { #hook-overflow }
 
-An `execution_mode: async` hook (declared in the hook artifact's own `murmur.yaml`) is
-instantiated once for the session
-and reused for every event: state the hook keeps in memory (a running counter, a buffered
-span, an open client) survives across calls. Each async hook has its own bounded, ordered job
-queue and a dedicated worker that drains it one call at a time — dispatching an event to an
-async hook returns immediately, and calls to that hook are never reordered or run concurrently
-with each other. Every async hook's queue is drained, and its in-flight call awaited, before
-the session ends, so a queued `on-session-end` call (a final metrics export, for example) is
-not lost when the session tears down. A hook that is still working when the drain's bounded
-budget runs out is abandoned and reported the same way any other hook fault is.
+An `execution_mode: async` hook is instantiated once for the session and reused for every event:
+state the hook keeps in memory — a running counter, a buffered span, an open client — survives
+across calls. Each async hook has its own bounded, ordered job queue and a dedicated worker that
+drains it one call at a time, so dispatching an event to an async hook returns immediately and
+calls to that hook are never reordered or run concurrently with each other. Every async hook's
+queue is drained, and its in-flight call awaited, before the session ends, so a queued
+`on-session-end` call — a final metrics export, for example — is not lost when the session tears
+down. A hook still working when the drain's bounded budget runs out is abandoned and reported the
+same way any other hook fault is.
 
-`on_overflow:` on the capsule's own `artifacts:` entry for a `runtime: hook` artifact controls
-what happens when that hook's queue is full — which only happens when the hook is falling
-behind the rate of lifecycle events:
+`on_overflow:` on the capsule's own `artifacts:` entry controls what happens when that hook's queue
+is full, which only happens when the hook is falling behind the rate of lifecycle events:
 
-| Value | Behavior |
+| Value | Behaviour |
 |---|---|
 | `drop` (default) | The event is discarded and counted. Dispatch never waits, so a slow or stuck async hook cannot delay the agent loop. |
 | `block` | Dispatch waits for the hook's worker to make room. No event is lost, at the cost of putting a slow hook back on the critical path. |
@@ -662,9 +699,9 @@ artifacts:
     on_overflow: block   # wait for room instead of dropping events under load
 ```
 
-An async hook's output — even an arm that would be honored for a blocking hook on the same
-binding — is always discarded: nothing waits for its answer, so there is nowhere to apply it.
-`execution_mode: async` is only valid with `commit_policy: none` for this reason.
+An async hook's output is always discarded, even an arm that would be honored for a blocking hook
+on the same binding: nothing waits for its answer, so there is nowhere to apply it. That is why
+`execution_mode: async` is only valid with `commit_policy: none`.
 
 ---
 
@@ -678,33 +715,36 @@ Accepted forms:
 - host only: `api.example.com`
 - host + port: `localhost:11434`
 
-Rejected examples:
-
-- URL with path/query/fragment (for example `https://api.example.com/v1`)
-- invalid URL/scheme
+A URL entry must carry no path, query or fragment, and its scheme must be `http` or `https`.
+Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
 
 ### Filesystem scope
 
-- must be relative (not absolute)
-- cannot escape with leading `..`
+- must be relative, not absolute
+- cannot escape the workdir via `..`
+
+A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002).
 
 ### Shell allow
 
-- `capabilities.shell` present with an empty `allow` list is rejected at parse time
-- Each entry is a bare binary name (e.g. `bash`, `jq`) — paths are not supported
-- A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for each listed binary; the agent discovers these alongside artifact-backed tools
+- Each entry is a bare binary name (`bash`, `jq`) — paths are not supported.
+- A `capabilities.shell` block present with an empty `allow` list is rejected at parse time.
+- A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for
+  each listed binary; the agent discovers these alongside artifact-backed tools.
 
 ---
 
 ## Lifecycle { #lifecycle }
 
-The `lifecycle:` block controls how long a capsule runs and how many tasks it accepts. Omitting it is equivalent to:
+The `lifecycle:` block controls how long a capsule runs and how many tasks it accepts. Omitting it
+is equivalent to:
 
 ```yaml
 lifecycle:
   task_acceptance: single
   after_task: exit
   queue_depth: 1
+  conversation: stateless
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }
@@ -719,20 +759,20 @@ lifecycle:
 
 | Value | Behaviour |
 |---|---|
-| `exit` (default) | The capsule exits immediately after the task finishes (or the idle timeout fires). |
+| `exit` (default) | The capsule exits immediately after the task finishes, or after the idle timeout fires. |
 | `sleep` | The capsule loops back to wait for the next task. Only useful with `task_acceptance: queue`; with `single` it behaves like `exit`. |
 
 ### `lifecycle.input_timeout_secs` { #lifecycle-input-timeout-secs }
 
-Controls how long the capsule waits for a `message/send` reply after a WASM tool component
-calls `murmur:task/task#request-input`.
+Controls how long the capsule waits for a `message/send` reply after a WASM tool component calls
+`murmur:task/task#request-input`.
 
 | Value | Behaviour |
 |---|---|
 | absent (default) | Wait indefinitely — the task stays in `input-required` state until a reply arrives or the process is killed. |
 | `N` (positive integer) | If no `message/send` arrives within `N` seconds, the task transitions to `failed` with status message `"input-timeout"`. SSE clients receive a final `TaskStatusUpdateEvent` with `"final":true`. |
 
-Example: require a reply within 5 minutes:
+Example — require a reply within 5 minutes:
 
 ```yaml
 lifecycle:
@@ -740,7 +780,7 @@ lifecycle:
   input_timeout_secs: 300
 ```
 
-See [request-input WIT import](../reference/wit-interfaces.md#murmurtasktask) and
+See [request-input WIT import](wit-interfaces.md#murmurtasktask) and
 [Pause the agent loop for human input](../how-to/hitl-request-input.md).
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
@@ -749,12 +789,11 @@ Controls whether tasks that share a `contextId` accumulate conversation history 
 
 | Value | Behaviour |
 |---|---|
-| `stateless` (default) | Every task starts with an empty message history. The `contextId` field in the incoming message is recorded but has no effect on context. |
-| `threaded` | When a task arrives with a `contextId` that has prior completed tasks in this session, the agent loads the full conversation history for that thread before running. History is persisted to `workdir/contexts/<contextId>/history.json` after every successful `end_turn` or `max_tokens` stop. A failed task does not overwrite the history, preserving the last known good state. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` in addition to the shared `workdir/out/result.txt`. |
+| `stateless` (default) | Every task starts with an empty message history. The `contextId` on the incoming message is recorded but has no effect on context. |
+| `threaded` | When a task arrives with a `contextId` that has prior completed tasks in this session, the agent loads the full conversation history for that thread before running. History is persisted to `workdir/contexts/<contextId>/history.json` after every successful `end_turn` or `max_tokens` stop. A failed task does not overwrite the history, preserving the last known good state. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
 
-Threaded mode requires a long-running capsule (`task_acceptance: queue`, `after_task: sleep`). It is not useful with `task_acceptance: single` because the capsule exits after the first task and cannot receive a follow-up.
-
-Example:
+Threaded mode requires a long-running capsule (`task_acceptance: queue`, `after_task: sleep`). With
+`task_acceptance: single` the capsule exits after the first task and can never receive a follow-up.
 
 ```yaml
 lifecycle:
@@ -766,21 +805,22 @@ lifecycle:
 
 ### Idle timeout
 
-When waiting for the next A2A message (`task_acceptance: single` or `queue`), the capsule waits up to **30 seconds**. If no task arrives within the window:
+How long a capsule waits for the next A2A message depends on the lifecycle it declares:
 
-- `queue` mode: clean exit.
-- `single` mode: backward-compatible fallback — runs the agent loop with an empty task.
+| Lifecycle | Behaviour when no message arrives |
+|---|---|
+| `task_acceptance: queue` with `after_task: sleep` | Waits indefinitely. Shutdown is the host's responsibility. |
+| Every other combination | Waits 30 seconds, then runs the agent loop once with an empty task and exits. |
 
-The timeout is configurable via the `MURMUR_A2A_TIMEOUT_SECS` environment variable (used in tests to keep wait times short).
+The 30-second window is set by the `MURMUR_A2A_TIMEOUT_SECS` environment variable, which tests use
+to keep wait times short.
 
 ### CLI overrides
 
-The `mur run` command accepts two flags to override the manifest's lifecycle without editing the file:
+`mur run` accepts two flags that override the manifest's lifecycle without editing the file:
 
 ```bash
-mur run --manifest murmur.yaml \
-  --lifecycle-task-acceptance queue \
-  --lifecycle-after-task sleep
+mur run --manifest murmur.yaml --lifecycle-task-acceptance queue --lifecycle-after-task sleep
 ```
 
-Valid values follow the same `snake_case` names as the manifest fields.
+Values follow the same `snake_case` names as the manifest fields.

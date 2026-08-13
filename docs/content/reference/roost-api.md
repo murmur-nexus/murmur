@@ -1,27 +1,26 @@
 # mur-roost HTTP API
 
-`mur-roost` is the local orchestration daemon that manages spawned capsules. It exposes a small HTTP API consumed by `mur run` (auto-start path) and by capsule shell tools that make direct `curl` calls.
+`mur-roost` is a local daemon that spawns capsules on request. It listens on loopback and exposes three endpoints: a health check, one to spawn a capsule, and one to poll a spawned job.
+
+Two things call it: a plan's `capsule` step, which the capsule runtime dispatches through the daemon, and shell tools inside a capsule that call the endpoints directly.
 
 ---
 
 ## Start the daemon
 
 ```bash
-mur-roost \
-  --port 7700 \
-  --nexus-url http://localhost:7800 \
-  --spawn-allow orchestrator,worker-a,worker-b \
-  [--scoped] \
-  [--max-concurrent 4]
+mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 ```
 
-| Flag | Default | Notes |
+| Flag | Default | Description |
 |---|---|---|
-| `--port` | `7700` | Port to bind |
-| `--nexus-url` | `http://localhost:7800` | Nexus registry base URL |
-| `--spawn-allow` | *(required)* | Comma-separated list of capsule names that may be spawned |
-| `--scoped` | false | Stage each spawned worker in its own isolated job root |
-| `--max-concurrent` | unlimited | Maximum simultaneous scoped workers (only used with `--scoped`) |
+| `--port` | `7700` | Port to bind on `127.0.0.1` |
+| `--registry-path` | `$HOME/.murmur/artifacts` | Local artifact registry the daemon resolves spawned capsules from |
+| `--spawn-allow` | *(empty)* | One capsule name that may be spawned at top level. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
+
+`--spawn-allow` takes a single name per occurrence, not a comma-separated list. Started with no `--spawn-allow` at all, the daemon refuses every spawn request that omits `spawned_by`.
+
+Any other flag is rejected and the daemon exits.
 
 ---
 
@@ -29,17 +28,17 @@ mur-roost \
 
 ### `GET /health`
 
-Returns `200 OK` when the daemon is ready.
+Returns `200 OK` once the daemon is listening.
 
 ```json
-{ "status": "ok" }
+{}
 ```
 
 ---
 
 ### `POST /spawn`
 
-Enqueue a capsule for execution and return a job ID immediately.
+Resolve a capsule from the registry, stage it, and launch it. The response returns once the capsule has bound its port, so the caller can address it immediately.
 
 **Request body**
 
@@ -48,98 +47,98 @@ Enqueue a capsule for execution and return a job ID immediately.
   "name":       "worker-a",
   "version":    "0.1.0",
   "workdir":    "/abs/path/to/workdir",
-  "input":      "{\"schema\":\"murmur.message.v1\",\"type\":\"murmur.code_task.request.v1\",\"job_id\":null,\"payload\":{\"objective\":\"Do the worker task\"}}",
   "spawned_by": "optional-job-id"
 }
 ```
 
 | Field | Type | Required | Notes |
-|---|---|---|---|
-| `name` | string | yes | Capsule name; must be in the active allow list |
+|---|---|---:|---|
+| `name` | string | yes | Capsule name; must be in the applicable allow list |
 | `version` | string | yes | Capsule version |
-| `workdir` | string | yes | Absolute path to an existing directory; seeded into the worker's session |
-| `input` | string | no | Serialized structured task input. When present and non-empty, roost writes it to the worker staging root as `input.json` before launch |
-| `spawned_by` | string | no | Job ID of the capsule making this request (see [Per-job allow lists](#per-job-allow-lists)) |
+| `workdir` | string | yes | Absolute path to an existing directory; used as the spawned capsule's session workdir |
+| `spawned_by` | string | no | Job ID of the capsule making the request. Selects which allow list applies — see [Per-job allow lists](#per-job-allow-lists) |
 
-`input` is usually a serialized [`input.json`](workdir.md#inputjson-task-input) `murmur.code_task.request.v1` envelope. If both the caller seed and the spawn request provide `input.json`, the request `input` overwrites the copied seed file.
-
-**Success — `202 Accepted`**
+**Success — `200 OK`**
 
 ```json
-{ "job_id": "job_550e8400e29b41d4a716446655440000" }
+{
+  "job_id":      "550e8400-e29b-41d4-a716-446655440000",
+  "capsule_url": "http://localhost:53124"
+}
 ```
+
+`capsule_url` is the spawned capsule's A2A endpoint. Send it a `message/send` JSON-RPC call to give it work — the daemon itself carries no task payload.
 
 **Error responses**
 
 | Status | Condition |
 |---|---|
-| `400 Bad Request` | Missing or invalid fields |
-| `403 Forbidden` | Capsule name not in the relevant allow list |
+| `400 Bad Request` | Body is not valid JSON, or a required field is missing |
+| `403 Forbidden` | `name` is not in the applicable allow list, or `spawned_by` names a job the daemon does not know |
+| `500 Internal Server Error` | The capsule could not be resolved from the registry, staged or launched, or it did not bind a port within 60 seconds |
 
 ---
 
 ### `GET /status/{job_id}`
 
-Poll the status of a previously spawned job.
+Poll a spawned job.
 
 **Success — `200 OK`**
 
 ```json
-{ "status": "queued" }
 { "status": "running" }
-{ "status": "complete", "output_path": "/abs/path/to/workdir/workdir/<session-id>" }
-{ "status": "failed",   "error": "..." }
 ```
 
-The `output_path` directory contains `out/result.txt` (and optionally `out/result.json`) written by the capsule.
+| `status` | Meaning |
+|---|---|
+| `running` | Launched and still executing |
+| `complete` | The session ended without error |
+| `failed` | Staging or launch failed, or the session ended with an error |
 
 **Error — `404 Not Found`**
 
 ```json
-{ "error": "job '<id>' was not found" }
+{ "error": "job not found" }
 ```
+
+Job records are held in memory. Restarting the daemon discards them, and every job ID from before the restart then returns `404`.
 
 ---
 
 ## Per-job allow lists
 
-`mur-roost` enforces two levels of capsule allow lists:
+`mur-roost` keeps two levels of capsule allow list, and `spawned_by` selects between them.
 
-**Global list** (`--spawn-allow`): set at daemon start. Applies to all spawn requests that do **not** carry `spawned_by`.
+| Request | List consulted | Where it comes from |
+|---|---|---|
+| No `spawned_by` | Global | The daemon's `--spawn-allow` flags |
+| `spawned_by` present | Per-job | `capabilities.spawn.allow` in the manifest of the capsule that owns that job, read when the job was created |
 
-**Per-job list**: derived from the spawning capsule's own `capabilities.spawn.allow` manifest field at job creation time. Applies when `spawned_by` is present and refers to an existing job.
+A capsule that sets `spawned_by` can spawn only the names listed in its *own* manifest, even where the global list permits more:
 
-A capsule that sets `spawned_by` can only spawn names listed in its *own* manifest — even if the global `--spawn-allow` list would permit more. Example:
-
-- Global allow list: `[orchestrator, worker-a, worker-b]`
-- Capsule A manifest: `capabilities.spawn.allow: [worker-a]`
+- Daemon started with `--spawn-allow orchestrator --spawn-allow worker-a --spawn-allow worker-b`
+- Capsule A's manifest: `capabilities.spawn.allow: [worker-a]`
 - Capsule A is spawned; its job ID is `job-123`
 - Capsule A sends `POST /spawn` with `name: worker-b` and `spawned_by: job-123` → **403**
 
-This ensures each capsule in a spawn hierarchy is limited to the names its own author declared.
+A `spawned_by` the daemon does not recognise is refused with `403`; it falls back to no other list.
 
 !!! note "Trust boundary"
-    Within a single-machine local deployment the process boundary is the trust boundary. A capsule can claim any known job ID as `spawned_by` and receive that job's allow list. Per-job spawn tokens are deferred to post-v1.0.0.
+    Within a single-machine local deployment the process boundary is the trust boundary. A capsule can claim any known job ID as `spawned_by` and receive that job's allow list.
 
 ---
 
-## MURMUR_ROOST_URL propagation
+## Environment variables
 
-`mur-roost` injects `MURMUR_ROOST_URL=http://127.0.0.1:<port>` into every capsule it launches via the `shell_baseline_env` capability. Shell tools inside the capsule can use this to make further spawn calls without hard-coding the port:
+| Variable | Set by | Purpose |
+|---|---|---|
+| `MURMUR_ROOST_URL` | The environment of the process that runs the capsule | Base URL a plan's `capsule` step calls to spawn its child. When it is unset or blank, the step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
+| `MURMUR_JOB_ID` | The runtime, in every capsule launched with a job ID | The capsule's own job ID, which it passes as `spawned_by` so its per-job allow list applies |
+
+A shell tool inside a capsule can call the daemon directly:
 
 ```bash
-curl -s -X POST "$MURMUR_ROOST_URL/spawn" \
+curl -s -X POST "http://127.0.0.1:7700/spawn" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"worker-a\",\"version\":\"0.1.0\",\"workdir\":\"$PWD\",\"spawned_by\":\"$MURMUR_JOB_ID\"}"
 ```
-
-This propagation is transitive: a capsule spawned by `mur-roost` that itself spawns another capsule will also see `MURMUR_ROOST_URL` set.
-
----
-
-## Source references
-
-- `crates/mur-roost/src/server.rs` — route handlers
-- `crates/mur-roost/src/job_store.rs` — job and allow-list storage
-- `crates/mur-roost/src/worker.rs` — capsule resolution, env injection, and execution
-- `crates/mur-roost/src/main.rs` — CLI and daemon startup

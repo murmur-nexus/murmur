@@ -1,169 +1,75 @@
 # Session Workdir
 
-Capsules communicate with their runtime environment through structured files in the session workdir. This page documents the typed I/O envelope used by agent capsules.
+Every session runs against two directories: the one the capsule can see, and the one the runtime
+keeps its bookkeeping in.
+
+| Directory | Path | Holds |
+|---|---|---|
+| Accessible workdir | The directory passed to `mur run --workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | The capsule's current directory — its task, everything it writes, and the `$HOME` its shell commands run under |
+| Session workdir | `<accessible-workdir>/.murmur/<session-id>` when `--workdir` is passed, otherwise the accessible workdir itself | Runtime bookkeeping: staged artifacts, results, traces and logs |
+
+Without `--workdir` the two are one directory and everything below lands in the same place.
 
 ---
 
-## Overview
+## Task input
 
-All structured capsule I/O uses a common JSON envelope:
+The agent reads its task from the accessible workdir at the start of every task, taking the first
+of:
 
-```json
-{
-  "schema": "murmur.message.v1",
-  "type": "<message-type>",
-  "job_id": "<uuid-or-null>",
-  "payload": { ... }
-}
-```
+1. `task.md`
+2. `input.txt`
+3. Neither, in which case the agent starts with an empty task.
 
-| Field | Type | Description |
-|---|---|---|
-| `schema` | string | Always `"murmur.message.v1"` |
-| `type` | string | Message type identifier |
-| `job_id` | string \| null | Job UUID assigned by mur-roost; `null` for direct `mur run` |
-| `payload` | object | Type-specific payload (see below) |
+`task.md` has three writers:
 
----
-
-## input.json — Task input
-
-**Location:** `<session-workdir>/input.json`
-
-**Type string:** `murmur.code_task.request.v1`
-
-Written by `mur run` when `--input` or `--instructions` is passed. Also written by mur-roost when spawning a worker with a structured task.
-
-```json
-{
-  "schema": "murmur.message.v1",
-  "type": "murmur.code_task.request.v1",
-  "job_id": null,
-  "payload": {
-    "objective": "Build a CLI tool in Python",
-    "instructions": "Write only implementation files, no tests",
-    "context": null,
-    "output_format": null
-  }
-}
-```
-
-### Payload fields
-
-| Field | Type | Description |
-|---|---|---|
-| `objective` | string | The task goal (maps from `--input`) |
-| `instructions` | string \| null | Role or constraint guidance (maps from `--instructions`) |
-| `context` | string \| null | Background context; currently only set programmatically |
-| `output_format` | string \| null | Desired output format; currently unused (reserved) |
-
-### Fallback chain
-
-The agent runtime reads the task in this order:
-
-1. `input.json` — parsed as `murmur.code_task.request.v1`; formats task as:
-   ```
-   Objective: <objective>
-
-   Instructions: <instructions>   (omitted when null)
-
-   Context: <context>             (omitted when null)
-   ```
-2. `task.md` — raw text fallback
-3. `input.txt` — raw text fallback
-4. Empty string — agent receives no task
-
-If `input.json` exists but cannot be parsed, the runtime falls through to `task.md`.
-
----
-
-## out/result.json — Task output
-
-**Location:** `<session-workdir>/out/result.json`
-
-**Type string:** `murmur.code_task.result.v1`
-
-Written by the runtime at the end of a successful agent run (`stop_reason: end_turn` or `max_tokens`). **Not written on error paths** — those write only `out/result.txt`.
-
-```json
-{
-  "schema": "murmur.message.v1",
-  "type": "murmur.code_task.result.v1",
-  "job_id": "job_3f8a1b2c...",
-  "payload": {
-    "status": null,
-    "summary": null,
-    "files": null,
-    "output": "The CLI tool is complete. See output/ for generated files."
-  }
-}
-```
-
-### Payload fields
-
-| Field | Type | Description |
-|---|---|---|
-| `status` | string \| null | `null` until the evaluator runs (planned); do not interpret yet |
-| `summary` | string \| null | Short summary of what the agent did; currently always `null` |
-| `files` | array \| null | List of output file paths; currently always `null` |
-| `output` | string | Final agent output — same content as `out/result.txt` |
-
-### When result.json is NOT written
-
-| Stop reason | result.json written? |
+| Writer | When |
 |---|---|
-| `end_turn` | ✅ yes |
-| `max_tokens` | ✅ yes |
-| `error` (driver-side failure) | ❌ no — only `result.txt` |
-| Driver invocation failure | ❌ no — only `result.txt` |
-| Unsupported stop reason | ❌ no — only `result.txt` |
-| Missing tool-call blocks | ❌ no — only `result.txt` |
-| Turn limit exhausted | ❌ no — only `result.txt` |
+| `mur run --task <value>` | Before launch. A value naming an existing file is copied; anything else is written as text |
+| The runtime | On each incoming A2A message, and again when an `on-task-end` hook returns `reopen-task` — rewritten as the original task plus every reopen's feedback so far |
+| The capsule | Through its own file tools, like any other file in the accessible workdir |
+
+Under `lifecycle.task_acceptance: queue` the runtime deletes `task.md` after each task, so the next
+task comes from the queue rather than from a stale file.
 
 ---
 
-## meta/job_id.txt — Worker identity
+## Session workdir files
 
-**Location:** `<session-workdir>/meta/job_id.txt`
+| Path | Notes |
+|---|---|
+| `MURMUR.md` | The capsule's generated inventory: identity, directory layout, installed tools and skills, shell access. Agent sessions only. Written at staging and rewritten once the capsule's port is bound |
+| `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md) |
+| `eval.jsonl` | Scorer output for the session. `mur eval` reads it after each case. See [Observability schemas](observability-schemas.md) |
+| `out/result.txt` | The agent's final output. Written on every terminal outcome; a failure writes `error: <message>` |
+| `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's. Only under `lifecycle.conversation: threaded` |
+| `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
+| `contexts/<context-id>/history.json` | Full message history for one A2A `contextId`, reloaded when a later task arrives on the same context. Only under `lifecycle.conversation: threaded`, and only after a task succeeds |
+| `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, compaction decisions, and non-fatal write failures |
+| `logs/otel.log` | OpenTelemetry exporter diagnostics |
+| `logs/hook-<hook-name>.log` | Errors from one hook, one per line |
+| `tools/<name>/murmur.yaml` | A staged artifact's manifest |
+| `tools/<name>/<name>` | A staged native binary, marked executable |
+| `tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
 
-**Written by:** mur-roost at spawn time, before staging the worker session.
+## Accessible workdir files
 
-Contains the job UUID string assigned to this worker by mur-roost.
+| Path | Notes |
+|---|---|
+| `task.md`, `input.txt` | The task, as above |
+| `.capsule-home` | `$HOME` for every shell command. Created on the first shell invocation |
+| `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KB. The tool result carries the path |
+| `checkpoints/` | `summary.md`, `plan.json` and `decisions.json`. `MURMUR.md` directs the agent to write state here to survive compaction; the runtime neither reads nor writes them |
 
-```
-job_3f8a1b2c4d5e6f789012abcdef012345
-```
-
-The same UUID is available as:
-
-- `meta/job_id.txt` — readable by the capsule as a workdir file
-- `MURMUR_JOB_ID` environment variable — available to shell tools
-- `result.json["job_id"]` — included in the structured output envelope
-
----
-
-## MURMUR_JOB_ID environment variable
-
-Injected into the worker's shell environment by mur-roost at spawn time.
-
-```bash
-# Available inside shell tool invocations
-echo $MURMUR_JOB_ID
-# → job_3f8a1b2c4d5e6f789012abcdef012345
-```
-
-Set alongside `MURMUR_ROOST_URL` in the capsule's `shell_baseline_env`. Only present in workers spawned by mur-roost — not set for top-level `mur run`.
+Everything else in this directory belongs to the capsule.
 
 ---
 
-## out/compaction-summaries.jsonl — Compaction summary log { #compaction-summaries }
+## out/compaction-summaries.jsonl { #compaction-summaries }
 
-**Location:** `<session-workdir>/out/compaction-summaries.jsonl`
-
-Written only when the manifest sets `inference.compaction.dump_summaries: true` (default
-`false`; see [`inference.compaction.dump_summaries`](manifest.md#field-inference)). Not
-part of the `murmur.message.v1` envelope — this is a flat JSONL eval log, one line per
-**committed** compaction, appended in the order compactions occur:
+Written only when the manifest sets `inference.compaction.dump_summaries: true` (default `false`;
+see [`inference.compaction.dump_summaries`](manifest.md#field-inference)). One line per committed
+compaction, appended in the order compactions occur:
 
 ```json
 {"turn":17,"tokens_before":81501,"tokens_after":334,"summary":"1. THE BUG: ..."}
@@ -174,25 +80,25 @@ part of the `murmur.message.v1` envelope — this is a flat JSONL eval log, one 
 | `turn` | integer | The turn the compaction fired on |
 | `tokens_before` | integer | Session token count immediately before compaction |
 | `tokens_after` | integer | Session token count immediately after the replacement context committed |
-| `summary` | string | The compaction hook's replacement text, verbatim — the exact string that replaced the context, not a re-inferred or re-encoded copy |
+| `summary` | string | The text of the committed replacement context, tool messages excluded |
 
-**When a line is written.** Only after a compaction hook returns `replace-context` *and* that
-replacement passes the existing tool-call-pairing safety net and actually commits. A compaction
-attempt the safety net rejects, or a session where no hook returns `replace-context` at all,
-appends nothing. This means the file (and the `out/` entry for it) is created lazily on the
-first successful compaction — a run with `dump_summaries: true` that never compacts leaves no
-file behind.
+A line is written only after a compaction hook returns `replace-context` **and** that replacement
+survives the tool-call-pairing check and commits. A rejected replacement, or a session where no
+hook returns `replace-context`, appends nothing — so the file appears on the first successful
+compaction, and a run that never compacts leaves none behind.
 
-**Failure handling.** A write failure (for example a permission error) is logged to
-`logs/bootstrap.log` and does not fail the session — the compaction itself has already
-committed by the time the write is attempted.
+A write failure is logged to `logs/bootstrap.log` and does not fail the session; the compaction has
+already committed by then.
 
-This log exists to capture the summary text itself, which `trace.jsonl`'s `compaction` event
-does not record (it carries only the two token counts).
+This log is the only place the summary text is kept. The `compaction` event in `trace.jsonl` records
+the turn and the two token counts, not the text.
 
 ---
 
-## Lockfile (`murmur.lock`)
+## Lockfile (`murmur.lock`) { #lockfile-murmurlock }
+
+`murmur.lock` sits in the project directory beside `murmur.yaml`, not in the workdir. It pins every
+registry-resolved artifact to a version and a hash:
 
 ```yaml
 lock_version: 1
@@ -203,13 +109,17 @@ artifacts:
       wasm: "<sha256>"
 ```
 
-Used for pinned version + integrity checks. Three code paths read and write this file, all
-sharing the same "verify against the pin, then upsert" rule — a registry-resolved artifact
-whose hash disagrees with an existing entry is always rejected (non-zero exit / error, nothing
-written to disk or to the lock), never silently overwritten:
+`lock_version` must be `1`. Every path below verifies against the pin before writing anything: a
+registry-resolved artifact whose version or hash disagrees with an existing entry is rejected, with
+nothing written to disk or to the lock.
 
 | Path | When it writes |
 |---|---|
-| `mur run` | Only creates `murmur.lock` if it doesn't exist yet; once present, `mur run` only verifies against it — it never refreshes an existing entry. |
-| `mur install <name>@<version>` (registry-resolved, project-scoped) | Upserts this artifact's entry on every successful install, preserving all other entries. Skipped entirely for `-g`/global installs (no project directory) and for local-file/`--all-platforms` installs (no independent registry hash to pin). |
-| `manage.pull()` (in-capsule runtime call) | Same verify-then-upsert behavior as `mur install`, invoked by a running capsule's guest code instead of the CLI. |
+| `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
+| `mur eval` | As `mur run`, once for the whole dataset run |
+| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms` |
+| `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI |
+
+A missing entry for a manifest artifact, or an unsupported `lock_version`, fails the run with
+`E-RUN-003`. An install whose registry hash disagrees with the pin fails with `E-REG-005`. See
+[Diagnostics](diagnostics.md).

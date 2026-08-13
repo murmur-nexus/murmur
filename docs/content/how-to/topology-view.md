@@ -180,7 +180,7 @@ Reply with the single word "pong" and nothing else.
 ## Step 3 — run the capsule and confirm the span arrives
 
 ```bash
-mur run --manifest murmur.yaml --input task.md
+mur run --manifest murmur.yaml --task task.md
 ```
 
 The capsule runs one inference turn and exits. The runtime emits a `capsule.session` span to Tempo immediately at session end.

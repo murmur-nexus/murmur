@@ -16,7 +16,7 @@ commands read and write it.
 
 Murmur supports:
 
-- **Local registry mode** — resolves artifacts from the [local cache](../reference/installing-artifacts.md#local-artifact-cache) at `~/.murmur/artifacts/`. The default source for cache population is the `murmur-nexus/default-artifacts` GitHub repository.
+- **Local registry mode** — resolves artifacts from the [local stores](../reference/installing-artifacts.md#local-artifact-cache) on disk: the project store at `<project root>/.murmur/artifacts/` and the global store at `~/.murmur/artifacts/`. `mur run` checks the project store first and the global store second. The default source for populating them is the `murmur-nexus/default-artifacts` GitHub repository.
 - **Remote registry mode** — resolves artifacts from a Nexus instance over HTTP. Requires `NEXUS_API_KEY` to be set.
 
 ## Lock integrity { #lock-integrity }

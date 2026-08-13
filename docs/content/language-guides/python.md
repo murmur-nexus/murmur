@@ -91,11 +91,9 @@ Notes:
 - Keep only this file in the `wit/` directory for this quickstart.
 - Pass the `wit/` directory to `--wit-path`.
 - The `@0.1.0` on the `package` line matches the version the host's `murmur:tool`
-  WIT currently ships (see [WIT Interfaces](../reference/wit-interfaces.md)). The
-  host resolves a tool's `murmur:tool/run` export by versioned name first and
-  falls back to the unversioned name, so an unversioned `package murmur:tool;`
-  still works today — but pin the version so `mur build` output matches what the
-  host actually expects.
+  WIT ships (see [WIT Interfaces](../reference/wit-interfaces.md)). The host
+  resolves a tool's `murmur:tool/run` export by versioned name and nothing else,
+  so an unversioned `package murmur:tool;` fails to load. Always pin the version.
 
 ---
 

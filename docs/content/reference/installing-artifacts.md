@@ -1,51 +1,58 @@
 # Installing Artifacts
 
-`mur install` downloads an artifact from a configured source into the local store. How you reference the artifact determines what gets fetched and where authentication comes from.
+`mur install` fetches an artifact from a configured source and writes it into a local store. How you reference the artifact determines what gets fetched and where authentication comes from.
 
-## URI forms
+## Reference forms
 
-| Form | Example |
-|---|---|
-| Bare name with version | `murmur-tool-git@1.0.0` |
-| GitHub release | `github:<owner>/<repo>@<tag>` |
-| Nexus | `nexus:<name>@<version>` |
+| Form | Example | Resolved against |
+|---|---|---|
+| Name and version | `murmur-tool-git@1.0.0` | The registry first, then the configured sources |
+| Bare name | `murmur-tool-git` | The configured sources, latest release |
+| GitHub release | `github:<owner>/<repo>@<tag>` | That release, directly |
+| Local file | `./murmur-tool-git-1.0.0.mur.zip` | A path on disk. A reference counts as a path when it starts with `./`, `../` or `/`, or contains `/` and ends in `.mur.zip` |
 
 ```bash
 mur install murmur-tool-git@1.0.0
 ```
 
-## Bare name vs explicit GitHub URI
+## Which assets an install pulls
 
-These two forms behave differently when a release contains multiple `.mur.zip` files:
+| Reference | Assets installed |
+|---|---|
+| `<name>` or `<name>@<version>` | One — the matching asset from the first source that has it |
+| `github:<owner>/<repo>@<tag>` | Every `.mur.zip` asset in that release |
 
-- **Bare name** — matches by artifact name. Searches configured sources in order and picks the asset whose filename matches `<name>.mur.zip` or `<name>-*.mur.zip`. Only the matching artifact is installed.
-- **`github:<owner>/<repo>@<tag>`** — goes directly to that release and installs every `.mur.zip` asset in it. There is no way to target a single asset with the explicit URI form.
+Use a name reference to take a single artifact out of a release that contains several; the `github:` form cannot target one asset. A name reference needs the repository configured as a source — see [Multiple sources and fallthrough](#multiple-sources-and-fallthrough).
 
-Use the bare-name form when you want a specific artifact from a release that contains several. This requires the repository to be configured as a source in [`~/.murmur/config.yaml`](#user-config-murmurconfigyaml).
+`<name>@<version>` searches the release tagged `<version>`, then `v<version>`, then the source's latest release, so a repository whose release tags are independent of artifact versions still resolves. Within a release, assets are matched by filename in this order, where `<platform>` is the host platform — `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64` or `linux-x86_64`:
+
+| Reference | Filenames tried, in order |
+|---|---|
+| `<name>@<version>` | `<name>-<version>-<platform>.mur.zip`, `<name>-<version>.mur.zip` |
+| `<name>` | `<name>-*-<platform>.mur.zip`, `<name>.mur.zip`, `<name>-*.mur.zip` |
 
 ## Authentication
 
 Token resolution happens in this order:
 
-1. The `token` field of the matching `registry.sources` entry in the effective config (global
-   `~/.murmur/config.yaml` merged with any project-level `<cwd>/.murmur/config.yaml`)
-2. The `GITHUB_TOKEN` environment variable — used as a fallback for both configured and explicit URI pulls
+1. The `token` field of the matching `registry.sources` entry in the [effective config](config.md#configuration-files)
+2. The `GITHUB_TOKEN` environment variable
 
-For explicit `github:` URIs, Murmur checks whether `<owner>/<repo>` matches any configured source and borrows that source's token if found, then falls back to `GITHUB_TOKEN`. Public repositories work without a token. Private repositories require one.
+For `github:` URIs, Murmur borrows the token of the configured source whose `repo` is `<owner>/<repo>`, then falls back to `GITHUB_TOKEN`. Public repositories work without a token; private repositories require one.
 
 The `token` field accepts three forms:
 
 | Value | Resolved as |
 |---|---|
-| `${GITHUB_TOKEN}` | Value of the `GITHUB_TOKEN` env var |
+| `${GITHUB_TOKEN}` | Value of the `GITHUB_TOKEN` env var. No token is sent when the variable is unset |
 | `MY_TOKEN` | Value of the `MY_TOKEN` env var, or the literal string if the var is unset |
 | `ghp_abc123` | Used as-is |
 
 ## Multiple sources and fallthrough
 
-For bare-name lookups, configured sources are tried in the order they appear in the effective
-`registry.sources` list, with the `default` source moved to the front. If the first source does
-not contain the requested artifact, the lookup falls through to the next.
+For lookups by name, configured sources are tried in the order they appear in the effective
+`registry.sources` list, with the source named by `registry.default` moved to the front. A source
+that does not have the requested artifact falls through to the next.
 
 ```yaml
 registry:
@@ -60,55 +67,33 @@ registry:
       repo: murmur-nexus/default-artifacts
 ```
 
+`type` is `github`. Full field reference: [`registry:` section](config.md#registry-section).
+
 ## Default source
 
-When `~/.murmur/config.yaml` does not exist, `mur install` falls back to `murmur-nexus/default-artifacts` as its source. No token is required for this public repository.
-
-This default is a Rust literal compiled into the `murmur-cli` binary (`impl Default for MurConfig` in `crates/murmur-cli/src/config.rs`) — it is never fetched from any remote location at install time or any other point. A local `~/.murmur/config.yaml` legitimately overrides it by declaring its own `registry.sources`, but that override is read from a local file path only; nothing in the config-loading path makes an HTTP call that could be hijacked to substitute a different trust root.
+With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `mur install` uses one built-in source: the public GitHub repository `murmur-nexus/default-artifacts`, which needs no token. Once `~/.murmur/config.yaml` exists, its `registry.sources` list is the whole chain — see [Merge rules](config.md#merge-rules).
 
 ## Local artifact cache
 
-Downloaded artifacts are stored on disk at:
+`mur install` writes into the project store; `mur install -g` writes into the global store.
 
-```
-~/.murmur/artifacts/<name>/<version>/<name>-<version>.mur.zip
-```
+| Store | Root |
+|---|---|
+| Project | `<project root>/.murmur/artifacts/` — the nearest directory at or above the working directory that holds a `murmur.yaml`. Installing without one fails with `E-IO-001` |
+| Global | `~/.murmur/artifacts/` |
 
-The path is derived from `$HOME` (or `$USERPROFILE` on Windows). There is no environment variable to override the cache location — if you need to relocate it, set `HOME` before invoking `mur`.
+Under either root, an artifact occupies `<name>/<version>/`:
 
-## Workspace config (`murmur.yaml`)
+| File | Holds |
+|---|---|
+| `<name>-<version>.mur.zip` | The artifact |
+| `<name>-<version>.sha256` | Its SHA-256 |
+| `<name>-<version>.meta.json` | Its name, version, runtime, description and tags |
 
-Place a `murmur.yaml` file in your project directory to configure registry resolution for that workspace:
+`mur install --all-platforms <name>@<version>` writes `<name>-<version>-<platform>.mur.zip` and `<name>-<version>-<platform>.sha256` into the global store instead, one pair per platform.
 
-```yaml
-registry:
-  default: local          # "local" (default) or "remote"
-  remote_url: http://your-nexus:7800   # only used when default is "remote"
-```
+The global root is derived from `$HOME` (or `$USERPROFILE` on Windows). No environment variable overrides it; to relocate the store, set `HOME` before invoking `mur`.
 
-`remote_url` overrides the CLI default of `http://localhost:7800`.
+## Registry selection
 
-## User config (`~/.murmur/config.yaml`)
-
-User-level settings live at `~/.murmur/config.yaml` and configure which remote sources `mur install` pulls from:
-
-```yaml
-registry:
-  default: official
-  sources:
-    - name: official
-      type: github
-      repo: murmur-nexus/default-artifacts
-      token: "${GITHUB_TOKEN}"     # env reference or literal token
-```
-
-`type` is one of `github` or `nexus`. The `token` field accepts a `${VAR}` reference (resolved at run time) or a bare environment variable name.
-
-An optional project-level file at `<cwd>/.murmur/config.yaml` merges with this global file —
-`registry.sources` entries union by `name` (a project entry can add or override a source without
-disturbing the rest). See [Configuration files](config.md#configuration-files) for the full
-merge rules, and [`mur config set`](cli.md#mur-config) for writing them from the command line.
-
-## Per-command override
-
-Pass `--registry <url>` to any command that contacts a registry to force remote mode with that URL for that invocation, regardless of workspace config.
+A `<name>@<version>` reference is resolved against a registry first, and falls through to the configured sources only when the registry does not have it. The registry is the local store unless remote mode is selected, by `--registry <url>`, by `registry.remote_url` in `murmur.yaml`, or by `registry.default: remote` in `murmur.yaml`. Remote mode requires the `NEXUS_API_KEY` environment variable. See [Registry selection rules](config.md#registry-selection-rules).

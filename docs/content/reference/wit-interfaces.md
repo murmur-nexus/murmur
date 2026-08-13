@@ -4,22 +4,23 @@ WASM artifacts — capsules, tools, drivers, and hooks — talk to the runtime t
 interfaces. This page lists each interface, who uses it, and what its behaviour means for you.
 The type definitions themselves live in the repository under
 [`crates/capsule-runtime/wit/`](https://github.com/murmur-nexus/murmur/tree/main/crates/capsule-runtime/wit);
-each row below links to its source.
+each row below links to its source, and [Package versioning](#package-versioning) lists the
+version each one carries.
 
 ## Interfaces
 
-| Interface | Version | Used by | Purpose |
-|---|---|---|---|
-| [`murmur:tool/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool.wit) | `0.1.0` | Exported by tool and driver components | The entrypoint the runtime calls to run a tool or an inference driver |
-| [`murmur:tool-registry/invoke`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool-registry.wit) | `0.1.0` | Imported by capsule components | Call an allowlisted tool by name |
-| [`murmur:capsule/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/capsule.wit) | `0.1.0` | Exported by capsule components | The capsule entrypoint |
-| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | `0.1.0` | Provided by the runtime to capsule components | List, describe, and pull artifacts during a session |
-| [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | `0.1.0` | Provided by the runtime | Run an allowlisted shell binary |
-| [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | `0.1.0` | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
-| [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | `0.1.0` | Imported by tool components | Pause the agent loop and wait for external input |
-| [`murmur:text/chunks`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-text/stream.wit) | `0.1.0` | Imported by tool and driver components | Emit response and thinking chunks to the session's SSE stream |
-| [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | `0.5.0` | Exported by hook artifacts | The lifecycle handlers the runtime calls |
-| [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | `0.2.0` | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
+| Interface | Used by | Purpose |
+|---|---|---|
+| [`murmur:tool/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool.wit) | Exported by tool and driver components | The entrypoint the runtime calls to run a tool or an inference driver |
+| [`murmur:tool-registry/invoke`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/tool-registry.wit) | Imported by capsule components | Call an allowlisted tool by name |
+| [`murmur:capsule/run`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/capsule.wit) | Exported by capsule components | The capsule entrypoint |
+| [`murmur:artifact-manager/manage`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/artifact-manager.wit) | Provided by the runtime to capsule components | List, describe, and pull artifacts during a session |
+| [`murmur:shell/execute`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/shell-execute.wit) | Implemented natively by the runtime | Run an allowlisted shell binary |
+| [`murmur:message/send`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/message/send.wit) | Provided by the runtime to capsule components | Send an A2A task to a peer capsule |
+| [`murmur:task/task`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-task/task.wit) | Imported by tool components | Pause the agent loop and wait for external input |
+| [`murmur:text/chunks`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-text/stream.wit) | Imported by tool and driver components | Emit response and thinking chunks to the session's SSE stream |
+| [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
+| [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
 
 ## Worlds
 
@@ -31,10 +32,10 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | `tool` | `task/task`, `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `hook` | `runtime/inference` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
-| `runtime-host` | The interfaces the runtime provides to guests | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
+| `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 
-Agent capsules compile against no world — the inference loop is native Rust inside the runtime,
-and the capsule is defined by its manifest alone.
+Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
+is defined by its manifest alone.
 
 ---
 
@@ -50,9 +51,8 @@ These keys are reserved:
 | `resource_id` | Opaque, tool-defined string | Which resource this call addressed. Recorded verbatim on the `tool_call` trace event. |
 
 `state_effect` and `resource_id` together let `mur trace` spot redundant calls without knowing
-anything about your tool. Omit either and the call counts as "unknown": the runtime treats it
-conservatively and never credits it as a redundant read, so a tool that declares nothing is
-never misreported.
+anything about your tool. Omit either and the call counts as "unknown": it is never credited as a
+redundant read.
 
 For `resource_id`, scope the value by addressing scheme (for example `"sym:Foo::bar"`) so it
 cannot collide with an unrelated resource of the same name. Two calls address the same resource
@@ -80,28 +80,27 @@ the smaller payload actually sent, so continuation never changes when compaction
 
 ## `murmur:artifact-manager/manage`
 
-Lets a capsule component inspect and install artifacts mid-session. `pull` resolves an artifact
-from the session's registry, verifies its bytes against the registry hash and any pinned
-`murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and updates
-`murmur.lock`. A hash mismatch returns an error before anything is written. A pulled artifact is
-immediately visible to `list()` and `describe()` and, for WASM tools, callable via `invoke()`.
+Lets a capsule component inspect and install artifacts mid-session: `list` and `describe` report
+what is installed, `diagnostics` returns the session id alongside that list, and `pull` installs a
+new artifact. `search` and `remove` are unimplemented: calling either returns an error.
 
-`search` and `remove` are unimplemented: calling either returns an error.
-
-The native agent loop does not use this interface; it accesses artifact state directly.
+`pull` resolves an artifact from the session's registry, verifies its bytes against the registry
+hash and any pinned `murmur.lock` entry, then installs it under `<workdir>/tools/<name>/` and
+updates `murmur.lock`. A hash mismatch, or a version or hash that conflicts with an existing
+`murmur.lock` pin, returns an error before anything is written. A pulled artifact is immediately
+visible to `list()` and `describe()` and, for WASM tools, callable via `invoke()`.
 
 ---
 
 ## `murmur:shell/execute`
 
-The contract for running an allowlisted shell binary. The runtime implements it in Rust; the WIT
-definition exists so future guest implementations bind against the same types.
+The contract for running an allowlisted shell binary. The runtime implements it natively.
 
 | Behaviour | Detail |
 |---|---|
 | Non-zero exit code | Data, not an error — the call only errs on spawn/IO failure |
-| `truncated: true` | Output exceeded 16 KiB and was cut; `full-output-path` points at the untruncated log in the workdir |
-| Allowlist | `binary` must appear in `capabilities.shell.allow`; anything else is rejected before `run` is reached |
+| `truncated: true` | stdout or stderr exceeded 16 KiB and was cut; `full-output-path` points at the untruncated log in the workdir |
+| Allowlist | `binary` must appear in `capabilities.shell.allow`; anything else is rejected before the process is spawned |
 
 ---
 
@@ -110,14 +109,6 @@ definition exists so future guest implementations bind against the same types.
 `request-input` pauses the agent loop at a decision boundary and waits for a reply delivered by
 `message/send`. From the component's perspective the call is synchronous: pass a prompt string,
 receive the reply string.
-
-```rust
-// imports: murmur:task/task
-use murmur::task::task::request_input;
-
-let answer = request_input("Which branch should I target?");
-// the agent loop is suspended here until a message/send delivers the reply
-```
 
 Call it when the agent has reached a decision it cannot make on its own — ambiguous
 requirements, or a consequential action that needs approval — and a human or supervisor capsule
@@ -134,35 +125,24 @@ the component is aborted and the task transitions to `failed`.
 
 ## `murmur:message/send`
 
-Sends a task to a peer capsule. The runtime handles the JSON-RPC 2.0 wire format, so the capsule
-never sees it.
-
-```rust
-// imports: murmur:message/send
-let result = send::send(
-    "localhost:52322",
-    send::Message {
-        message_id: "m1".to_string(),
-        context_id: Some("ctx-1".to_string()),
-        text: "Summarise the file at /data/report.csv".to_string(),
-    },
-)?;
-// result.state == "submitted" | "rejected" | "working" | "completed" | "failed"
-```
+Sends a task to a peer capsule. `send` takes the peer URL and a message — a `message-id`, an
+optional `context-id`, and the `text` — and returns the peer's `task-id`, `context-id`, and
+`state`. The runtime handles the JSON-RPC 2.0 wire format, so the capsule never sees it.
 
 | Behaviour | Detail |
 |---|---|
 | Allowlist | The peer URL must appear in the sender's `capabilities.network.allow`. Otherwise the call returns `Err("network policy: '...' not in capabilities.network.allow")` and no connection is made. |
 | Tracing | With OTel configured, the runtime injects a W3C `traceparent` header so the peer's session span nests under the sender's. |
-| Result state | `task-result.state` is the peer's immediate response (`submitted` or `rejected`). Poll the peer's `tasks/get` endpoint for the final state. |
+| Result state | `task-result.state` is the peer's response to the send: `submitted`, `working`, `input-required`, `completed`, `failed`, or `rejected`. Poll the peer's `tasks/get` endpoint for the final state. |
 
 ---
 
 ## `murmur:hook/lifecycle`
 
 Hook artifacts (`runtime: hook`) export this interface. The runtime calls each handler
-synchronously. Returning an error logs it to `workdir/logs/hook-<name>.log` and the session
-continues.
+synchronously. Returning an error logs it to `logs/hook-<name>.log` in the workdir and the
+session continues — except at `on-compaction`, where the error fails the session, because the
+runtime has no other way back under the token budget.
 
 | Handler | Fires |
 |---|---|
@@ -172,17 +152,18 @@ continues.
 | `on-inference` | After each inference driver response is parsed |
 | `on-tool-call` | After each model-requested tool invocation returns or errors |
 | `on-shell` | After each allowed shell command returns |
-| `on-compaction` | After a successful context compaction updates message history |
+| `on-compaction` | When the session token threshold is reached, before any history is replaced |
 | `on-task-end` | Once per task, immediately after that task's agent loop returns |
 | `on-session-end` | Once per capsule launch, after the task loop exits |
 
 With `task_acceptance: none` or `single`, `on-task-start` coincides with `on-session-start`; with
-`queue` it fires once per queued task. `session-id` is a UUID generated once per run and stable
-across every hook event in that run.
+`queue` it fires once per queued task. `session-id` is the session identifier — `ses_` followed by
+32 hex characters — and is the same value in every hook event of a run.
 
-`on-task-start` and `on-task-end` are optional exports — a hook compiled before these events
-existed still loads and is simply never dispatched for them. Every other handler is required; a
-component missing one fails to load with an error naming it.
+`on-task-start` and `on-task-end` are optional exports: a component that omits them loads and is
+simply never dispatched for them. The six session handlers are required — a component missing one
+fails to load with an error naming it. A missing `on-stage` is logged rather than fatal, and
+staging continues.
 
 ### What each handler can commit
 
@@ -198,19 +179,18 @@ A handler may return any `hook-output` arm, but the runtime commits only one arm
 
 This table is also enforced ahead of time. A hook artifact declares in its own `murmur.yaml`
 which handler it binds to (`binding:`) and what it expects committed (`commit_policy:`), and the
-runtime checks the pair against this table when the capsule is staged — before the hook
-component is compiled. A `commit_policy` the binding's handler cannot commit (say
-`commit_policy: reopen-task` on `binding: on-stage`) fails staging with an error naming the
-binding, the declared policy, and the one this binding honors, rather than becoming a
-mid-session dispatch fault. A hook with no `binding:` receives every event, so any
-`commit_policy` is valid for it. See [Hook contract
+runtime checks the pair against this table when the capsule is staged. A `commit_policy` the
+binding's handler cannot commit (say `commit_policy: reopen-task` on `binding: on-stage`) fails
+staging with an error naming the binding, the declared policy, and the one this binding honors,
+rather than becoming a mid-session dispatch fault. A hook with no `binding:` receives every
+event, so any `commit_policy` is valid for it. See [Hook contract
 fields](manifest.md#hook-contract-fields).
 
 Returning `none` is always silent, and is the normal case for an observational hook. Returning
 any other non-`none` arm is a loud but non-fatal fault:
 
 - A line naming the hook, the handler, and the discarded arm is appended to
-  `workdir/logs/hook-<name>.log`.
+  `logs/hook-<name>.log`.
 - A `hook_dispatch_error` event is written to `trace.jsonl` — see [Session trace
   schema](observability-schemas.md#session-trace-tracejsonl). The one exception is `on-stage`, which runs before the
   trace file exists. An `async` hook's fault reaches the trace by the same path; the trace and the
@@ -223,10 +203,11 @@ reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
 
 ### Event field notes
 
-- `compaction-event.model` carries `inference.compaction.model` verbatim so a compaction hook
-  knows which model to use for its own summarization call. It is absent when the manifest leaves
-  the field unset, and the hook resolves its own default. `compaction-event.system-prompt` is
-  always absent: no manifest field feeds it.
+- `compaction-event.model` and `compaction-event.system-prompt` carry
+  `inference.compaction.model` and `inference.compaction.system_prompt` verbatim, so a compaction
+  hook knows which model and which prompt to use for its own summarization call. Setting
+  `inference.compaction.system_prompt_file` instead delivers that file's contents. Either field
+  is absent when the manifest leaves it unset, and the hook resolves its own default.
 - `shell-event.binary` is the program the shell tool actually invoked — a canonicalized absolute
   path (for example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the
   bare invoked name when nothing resolved. `shell-event.command` carries the argument list alone
@@ -241,8 +222,7 @@ A runtime-provided import available to any hook component that declares it. Noth
 exported and nothing in the manifest changes.
 
 `run-inference` runs exactly one LLM completion through the capsule's configured driver
-(`inference.driver.artifact`), reusing the same driver invocation an ordinary agent turn uses —
-one HTTP client, one credential path.
+(`inference.driver.artifact`).
 
 | Case | Behaviour |
 |---|---|
@@ -276,16 +256,21 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:text` | `0.1.0` |
 | `murmur:hook` | `0.5.0` |
 | `murmur:runtime` | `0.2.0` |
+| `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
 
-| Bump | When |
+| Tier | When |
 |---|---|
-| Patch (`x.y.Z`) | Doc or comment edits, no ABI change |
-| Minor (`x.Y.0`) | A wholly new function or interface the runtime treats as optional to export |
-| Major (`X.0.0`) | Any signature change, any change to an existing `record` or `variant`, or removing or renaming a function or interface |
+| Patch | Doc or comment edits, no ABI change |
+| Minor | A wholly new function or interface the runtime treats as optional to export |
+| Breaking | Any signature change, any change to an existing `record` or `variant`, or removing or renaming a function or interface |
 
-Adding a field to an existing `record` or a case to an existing `variant` is always a major bump:
-the Component Model's ABI is positional, so both are breaking.
+Every `murmur:*` package is pre-1.0, so the minor field is the breaking axis: a breaking change to
+`0.4.0` ships as `0.5.0`, not `1.0.0`. Only a patch moves the patch field.
+
+Adding a field to an existing `record` or a case to an existing `variant` is always breaking,
+never minor: every field and case is positional in the binary encoding, so an addition changes
+the shape of every call that carries the type.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an
