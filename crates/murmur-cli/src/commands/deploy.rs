@@ -652,6 +652,24 @@ fn abandon_step(pb: &ProgressBar, style: &ProgressStyle, msg: impl Into<String>)
     pb.abandon_with_message(msg.into());
 }
 
+/// Build the shell script that starts the capsule on the remote host.
+///
+/// The flags here must stay a subset of what `mur run` actually accepts — an
+/// unknown flag makes the remote `mur run` exit on argument parsing, which
+/// deploy only discovers as a 120s `tail -f` timeout. Artifacts are pre-staged
+/// by the upload step before this runs, so no fetch flag belongs here.
+fn build_start_script(remote_deploy_dir: &str, remote_manifest: &str) -> String {
+    format!(
+        "[ -f {remote_deploy_dir}/.env ] && set -a && . {remote_deploy_dir}/.env && set +a; \
+         > /tmp/mur-start.json; \
+         nohup /usr/local/bin/mur run --manifest {remote_manifest} \
+         --workdir {remote_deploy_dir} \
+         --json \
+         >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
+         timeout 120 tail -f /tmp/mur-start.json | head -n 1"
+    )
+}
+
 // ─── run_deploy ───────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1194,15 +1212,7 @@ pub(crate) fn run_deploy(
     // ── 8. Start capsule ──────────────────────────────────────────────────────
     activate_step(&start_pb, &spinner_style, "→ starting capsule...");
 
-    let start_script = format!(
-        "[ -f {remote_deploy_dir}/.env ] && set -a && . {remote_deploy_dir}/.env && set +a; \
-         > /tmp/mur-start.json; \
-         nohup /usr/local/bin/mur run --manifest {remote_manifest} \
-         --workdir {remote_deploy_dir} \
-         --json --auto-pull \
-         >/tmp/mur-start.json 2>/tmp/mur-start.err </dev/null & \
-         timeout 120 tail -f /tmp/mur-start.json | head -n 1"
-    );
+    let start_script = build_start_script(&remote_deploy_dir, &remote_manifest);
     let raw_output = ssh_exec(host, key_ref, ssh_user, &start_script)?;
     let json_line = raw_output.trim().to_string();
 
@@ -1328,6 +1338,26 @@ mod tests {
         ] {
             assert_eq!(base64_encode(plain.as_bytes()), encoded);
         }
+    }
+
+    // ─── build_start_script ───────────────────────────────────────────────────
+
+    #[test]
+    fn start_script_passes_no_auto_pull_flag() {
+        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        assert!(
+            !script.contains("--auto-pull"),
+            "`mur run` has no --auto-pull flag; sending it makes the remote process \
+             exit on argument parsing: {script}"
+        );
+    }
+
+    #[test]
+    fn start_script_uses_only_flags_mur_run_accepts() {
+        let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
+        assert!(script.contains("mur run --manifest /root/mur-abc123/murmur.yaml"), "{script}");
+        assert!(script.contains("--workdir /root/mur-abc123"), "{script}");
+        assert!(script.contains("--json"), "{script}");
     }
 
     // ─── parse_env_var ────────────────────────────────────────────────────────
