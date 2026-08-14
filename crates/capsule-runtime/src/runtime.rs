@@ -707,6 +707,7 @@ pub fn stage_session(
         resolved_lock_artifacts,
         installed_artifacts,
         inference: request.inference,
+        system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         engine,
         capsule_component,
@@ -933,6 +934,11 @@ pub fn launch_session(
             .map(|d| d.artifact.clone())
             .filter(|a| !a.is_empty());
         let trace_include_tool_output = staged.trace_include_tool_output;
+        // The trace records the *resolved* prompt — what `resolve_system_prompt` returned, before
+        // `build_augmented_system_prompt` prepends the `[Capsule]` block — so a reader compares
+        // what the manifest (or `--system-prompt`) actually said, not the runtime's framing of it.
+        let trace_system_prompt = system_prompt.clone();
+        let system_prompt_overridden = staged.system_prompt_overridden;
         let registry_for_pull = Arc::clone(&staged.registry);
         let lock_path_for_pull = staged.manifest_dir.join("murmur.lock");
 
@@ -957,6 +963,8 @@ pub fn launch_session(
                 capabilities.clone(),
                 effective_grants,
                 trace_include_tool_output,
+                trace_system_prompt,
+                system_prompt_overridden,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
@@ -1571,6 +1579,8 @@ pub fn launch_session(
                 String::new(),
                 Vec::new(),
                 staged.scope_report.clone(),
+                false,
+                None,
                 false,
             )
             .await
@@ -3510,6 +3520,129 @@ mod tests {
         fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
     }
 
+    /// An `InferenceConfig` with every system-prompt field empty, for the prompt-resolution
+    /// tests below to fill in one at a time.
+    fn inference_without_prompt() -> murmur_artifact::InferenceConfig {
+        murmur_artifact::InferenceConfig {
+            transport: "http".to_string(),
+            endpoint: Some("http://127.0.0.1:1".to_string()),
+            model: "test-model".to_string(),
+            api_key: None,
+            driver: None,
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: 10,
+            max_task_reopens: 1,
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn resolve_system_prompt_returns_none_when_nothing_is_declared() {
+        let tmp = TempDir::new().unwrap();
+        let resolved =
+            resolve_system_prompt(tmp.path(), tmp.path(), &inference_without_prompt()).unwrap();
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn resolve_system_prompt_returns_the_inline_prompt_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt: Some("Be terse.".to_string()),
+            ..inference_without_prompt()
+        };
+        let resolved = resolve_system_prompt(tmp.path(), tmp.path(), &inference).unwrap();
+        assert_eq!(resolved.as_deref(), Some("Be terse."));
+    }
+
+    /// File contents are used exactly as they sit on disk — trailing newline included. The
+    /// trimming that applies to the inline form happens at manifest parse time and has no
+    /// counterpart here.
+    #[test]
+    fn resolve_system_prompt_reads_the_prompt_file_verbatim_relative_to_the_manifest_dir() {
+        let manifest_dir = TempDir::new().unwrap();
+        let workdir = TempDir::new().unwrap();
+        fs::write(manifest_dir.path().join("conventions.md"), "  Be terse.\n").unwrap();
+
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_file: Some("conventions.md".to_string()),
+            ..inference_without_prompt()
+        };
+        let resolved =
+            resolve_system_prompt(manifest_dir.path(), workdir.path(), &inference).unwrap();
+        assert_eq!(resolved.as_deref(), Some("  Be terse.\n"));
+    }
+
+    #[test]
+    fn resolve_system_prompt_errors_when_the_prompt_file_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_file: Some("missing-conventions.md".to_string()),
+            ..inference_without_prompt()
+        };
+        match resolve_system_prompt(tmp.path(), tmp.path(), &inference) {
+            Err(RuntimeError::SystemPromptFileRead { path, .. }) => {
+                assert!(path.ends_with("missing-conventions.md"), "got {path}");
+            }
+            other => panic!("expected SystemPromptFileRead, got {other:?}"),
+        }
+    }
+
+    /// The artifact branch reads the staged skill's `skill.md` out of the *workdir*, not the
+    /// manifest directory — it is a resolved artifact, not a file the author wrote beside
+    /// murmur.yaml.
+    #[test]
+    fn resolve_system_prompt_reads_skill_md_from_the_staged_artifact() {
+        let manifest_dir = TempDir::new().unwrap();
+        let workdir = TempDir::new().unwrap();
+        let skill_dir = workdir.path().join("tools").join("house-style");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("skill.md"), "# House style\nBe terse.").unwrap();
+
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_artifact: Some("house-style".to_string()),
+            ..inference_without_prompt()
+        };
+        let resolved =
+            resolve_system_prompt(manifest_dir.path(), workdir.path(), &inference).unwrap();
+        assert_eq!(resolved.as_deref(), Some("# House style\nBe terse."));
+    }
+
+    #[test]
+    fn resolve_system_prompt_errors_when_the_prompt_artifact_has_no_skill_md() {
+        let tmp = TempDir::new().unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt_artifact: Some("house-style".to_string()),
+            ..inference_without_prompt()
+        };
+        match resolve_system_prompt(tmp.path(), tmp.path(), &inference) {
+            Err(RuntimeError::SystemPromptArtifactRead { name, .. }) => {
+                assert_eq!(name, "house-style");
+            }
+            other => panic!("expected SystemPromptArtifactRead, got {other:?}"),
+        }
+    }
+
+    /// `mur run --system-prompt` overrides by clearing the other two fields and setting the
+    /// inline one, so resolution never reaches a declaration the operator replaced — including
+    /// a `system_prompt_file` pointing at a file that does not exist.
+    #[test]
+    fn resolve_system_prompt_ignores_cleared_declarations() {
+        let tmp = TempDir::new().unwrap();
+        let inference = murmur_artifact::InferenceConfig {
+            system_prompt: Some("CLI prompt".to_string()),
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            ..inference_without_prompt()
+        };
+        let resolved = resolve_system_prompt(tmp.path(), tmp.path(), &inference).unwrap();
+        assert_eq!(resolved.as_deref(), Some("CLI prompt"));
+    }
+
     #[test]
     fn bash_and_network_together_trigger_warning() {
         let tmp = TempDir::new().unwrap();
@@ -3840,6 +3973,7 @@ mod tests {
             lock_expectations: None,
             capability_policy: CapabilityPolicy::default(),
             inference: None,
+            system_prompt_overridden: false,
             context: None,
             otel_endpoint: None,
             eval_config_json: None,
@@ -3926,6 +4060,7 @@ mod tests {
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
+            system_prompt_overridden: false,
             context: None,
             otel_endpoint: None,
             eval_config_json: None,
@@ -4000,6 +4135,7 @@ mod tests {
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
+            system_prompt_overridden: false,
             context: None,
             otel_endpoint: None,
             eval_config_json: None,
@@ -4073,6 +4209,7 @@ mod tests {
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
+            system_prompt_overridden: false,
             context: None,
             otel_endpoint: None,
             eval_config_json: None,
@@ -4224,6 +4361,7 @@ mod tests {
             lock_expectations: None,
             capability_policy: CapabilityPolicy::default(),
             inference: Some(inference),
+            system_prompt_overridden: false,
             context: None,
             otel_endpoint: None,
             eval_config_json: None,
@@ -4748,6 +4886,8 @@ mod tests {
                     sandbox::EnforcementTier::EnvironmentOnly,
                     None,
                 ),
+                false,
+                None,
                 false,
             )
             .await
@@ -5451,6 +5591,8 @@ mod tests {
                 sandbox::EnforcementTier::EnvironmentOnly,
                 None,
             ),
+            false,
+            None,
             false,
         )
         .await

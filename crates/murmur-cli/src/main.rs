@@ -149,6 +149,14 @@ enum Commands {
         #[arg(long)]
         task: Option<String>,
 
+        /// Replace the manifest's system prompt for this invocation only.
+        /// Overrides inference.system_prompt, system_prompt_file and system_prompt_artifact
+        /// alike; the value is trimmed, and an empty or whitespace-only value clears the
+        /// prompt instead of setting one. murmur.yaml is not modified.
+        /// Requires an agent capsule (a manifest with an inference: block).
+        #[arg(long, value_name = "TEXT")]
+        system_prompt: Option<String>,
+
         /// Override manifest lifecycle.task_acceptance (none|single|queue)
         #[arg(long, value_name = "MODE")]
         lifecycle_task_acceptance: Option<String>,
@@ -373,6 +381,7 @@ fn main() {
         Commands::Run {
             manifest,
             task,
+            system_prompt,
             lifecycle_task_acceptance,
             lifecycle_after_task,
             workdir,
@@ -385,6 +394,7 @@ fn main() {
         } => run_run(
             &manifest,
             task.as_deref(),
+            system_prompt.as_deref(),
             lifecycle_task_acceptance.as_deref(),
             lifecycle_after_task.as_deref(),
             workdir,
