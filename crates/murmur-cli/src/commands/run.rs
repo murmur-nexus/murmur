@@ -13,8 +13,8 @@ use capsule_runtime::{
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override,
     load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, Registry,
-    ResolvedArtifact, LOCK_VERSION,
+    InferenceConfig, LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
+    Registry, ResolvedArtifact, LOCK_VERSION,
 };
 
 use crate::{
@@ -38,6 +38,7 @@ fn fail(session_id: &str, workdir: &std::path::Path, error: CliError, json: bool
 pub(crate) fn run_run(
     manifest_arg: &Path,
     task_arg: Option<&str>,
+    system_prompt_arg: Option<&str>,
     lifecycle_task_acceptance: Option<&str>,
     lifecycle_after_task: Option<&str>,
     workdir_arg: Option<PathBuf>,
@@ -145,6 +146,20 @@ pub(crate) fn run_run(
         }
         return Ok(());
     }
+
+    // `--system-prompt` is applied here, to the `InferenceConfig` clone that becomes
+    // `StageRequest.inference`, rather than inside the runtime's own prompt resolution: the tool
+    // inventory and MURMUR.md's skill listing read `system_prompt_artifact` straight off this
+    // same struct, so clearing the manifest's declaration here is what keeps every reader of it
+    // agreeing with the override. Placed after the `--explain-scope` return above, which reports
+    // capability grants and is unaffected by a system prompt.
+    let (staged_inference, system_prompt_overridden) = apply_system_prompt_override(
+        runtime_manifest.inference.clone(),
+        system_prompt_arg,
+        &session_id,
+        &workdir,
+        json,
+    )?;
 
     // Pre-flight: for process transport, verify the CLI binary is on PATH before staging.
     if let Some(ref inference) = runtime_manifest.inference {
@@ -290,7 +305,8 @@ pub(crate) fn run_run(
         allowlisted_tools,
         lock_expectations,
         capability_policy,
-        inference: runtime_manifest.inference.clone(),
+        inference: staged_inference,
+        system_prompt_overridden,
         context: runtime_manifest.context.clone(),
         otel_endpoint: runtime_manifest
             .observability
@@ -541,6 +557,51 @@ fn parse_containment_flag(
             json,
         )
     })
+}
+
+/// Applies `--system-prompt` to the manifest's inference config, returning the config to stage
+/// and whether the override was in effect — the latter being the only thing left afterwards that
+/// distinguishes an overridden prompt from a manifest that declared the same text inline, which
+/// is what `session_start.system_prompt_source` reports.
+///
+/// The override replaces all three manifest declaration forms at once: `system_prompt_file` and
+/// `system_prompt_artifact` are cleared rather than left to lose a precedence contest, so a file
+/// that does not exist or an artifact that was never installed cannot fail the launch that was
+/// explicitly told not to use it.
+fn apply_system_prompt_override(
+    inference: Option<InferenceConfig>,
+    value: Option<&str>,
+    session_id: &str,
+    workdir: &std::path::Path,
+    json: bool,
+) -> Result<(Option<InferenceConfig>, bool), CliError> {
+    let Some(value) = value else {
+        return Ok((inference, false));
+    };
+
+    let Some(mut inference) = inference else {
+        return Err(fail(
+            session_id,
+            workdir,
+            CliError::with_hint(
+                E_IO_003,
+                "--system-prompt requires an agent capsule: this manifest has no inference: block",
+                "add an inference: block to murmur.yaml, or drop --system-prompt",
+            ),
+            json,
+        ));
+    };
+
+    // Trimmed on the same terms `optional_trimmed_string` applies to `inference.system_prompt` at
+    // manifest parse time, so `--system-prompt "$(cat prompt.md)"` and the inline manifest form
+    // reach the model as the same bytes. An all-whitespace value therefore clears the prompt —
+    // still an override, just one that resolves to nothing.
+    let trimmed = value.trim();
+    inference.system_prompt = (!trimmed.is_empty()).then(|| trimmed.to_string());
+    inference.system_prompt_file = None;
+    inference.system_prompt_artifact = None;
+
+    Ok((Some(inference), true))
 }
 
 fn parse_lifecycle_override(

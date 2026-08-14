@@ -226,6 +226,12 @@ pub struct StageRequest {
     pub lock_expectations: Option<Vec<LockExpectation>>,
     pub capability_policy: CapabilityPolicy,
     pub inference: Option<InferenceConfig>,
+    /// Whether `inference` above had its system-prompt declaration replaced by the caller
+    /// (`mur run --system-prompt`) rather than read from the manifest. Purely a provenance
+    /// signal for the trace: the override itself is already applied to `inference`, which by
+    /// this point is indistinguishable from a manifest that declared the same prompt inline.
+    /// `true` even when the override cleared the prompt to nothing.
+    pub system_prompt_overridden: bool,
     pub context: Option<ContextConfig>,
     /// OTLP/HTTP endpoint for span export; None = no external OTel emission.
     pub otel_endpoint: Option<String>,
@@ -276,6 +282,10 @@ pub struct StagedSession {
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) inference: Option<InferenceConfig>,
+    /// Copied from [`StageRequest::system_prompt_overridden`] — the only record left that the
+    /// prompt in `inference` came from `--system-prompt` and not from the manifest. Passed to
+    /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.
+    pub(crate) system_prompt_overridden: bool,
     pub(crate) context: Option<ContextConfig>,
     pub(crate) engine: Engine,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.

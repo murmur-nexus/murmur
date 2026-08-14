@@ -347,6 +347,10 @@ system prompt, instead of being called on demand. The named artifact must declar
 way is excluded from the callable tool inventory, because it is already in the system prompt. See
 [Shape agent behavior with a system prompt](../how-to/capsule-system-prompt.md#step-4-load-the-prompt-from-a-skill-artifact).
 
+Overriding the prompt with [`mur run --system-prompt`](cli.md#mur-run) releases the named artifact
+back into the callable inventory for that run, and `MURMUR.md` stops describing it as bound: it is
+no longer in the system prompt, so there is nothing to double-inject.
+
 #### `capabilities` { #field-capabilities }
 
 | Field | Type | Required | Notes |
@@ -604,8 +608,11 @@ Rules:
 - **File paths are relative to the directory containing `murmur.yaml`**, not to the session workdir.
 - **The file is read once at launch**, before any inference call. If it is missing or unreadable,
   `mur run` exits with `E-RUN-009` before making any API call.
-- **File content is used verbatim** — whitespace is preserved and no trimming is applied.
+- **File content is used verbatim** — whitespace is preserved and no trimming is applied. Inline
+  `system_prompt` text is trimmed at parse time.
 - With no prompt source set, no `system` parameter is emitted.
+- **A run can override whatever is declared here.** [`mur run --system-prompt`](cli.md#mur-run)
+  replaces all three sources for that invocation only and leaves `murmur.yaml` untouched.
 
 ---
 

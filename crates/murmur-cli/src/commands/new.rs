@@ -119,6 +119,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         lock_expectations: None, // ephemeral generator; no lockfile
         capability_policy,
         inference: runtime_manifest.inference.clone(),
+        system_prompt_overridden: false,
         context: runtime_manifest.context.clone(),
         otel_endpoint: None,
         eval_config_json: None,

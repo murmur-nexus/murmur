@@ -118,6 +118,7 @@ pub fn stage_agent_session(
             lock_expectations: None,
             capability_policy: capability_policy_from_runtime_manifest(&runtime_manifest),
             inference: runtime_manifest.inference.clone(),
+            system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
             otel_endpoint: None,
             eval_config_json: None,

@@ -227,8 +227,18 @@ cat workdir/<session_id>/out/result.txt
 
 Replace `<session_id>` with the value printed by `mur run`. For the data analyst persona above, you would expect exactly one summary sentence and a bullet list — no preamble, no closing remarks.
 
-!!! note "The trace does not log the system prompt"
-    `mur trace show` and `mur trace steps` record token counts and turn decisions, not the raw API payload. The manifest is the definitive record of what was sent — `inference.system_prompt` is passed to the driver verbatim on every inference call with no transformation. If it is in the manifest, it was sent.
+The session trace records which prompt was in effect. Every `session_start` line in `workdir/<session_id>/trace.jsonl` carries `system_prompt_source` (`"manifest"`, `"cli"` or `"none"`) and `system_prompt_sha256`, the hash of the prompt as resolved:
+
+```bash
+mur trace show
+```
+
+--8<-- "includes/mur-trace-show-info.md"
+
+--8<-- "includes/mur-trace-explore.md"
+
+!!! note "The prompt text is recorded only when you ask for it"
+    `system_prompt_source` and `system_prompt_sha256` are always written. The prompt itself is written to `session_start` as `system_prompt` only when the manifest sets `trace.include_tool_output: true` — the same opt-in that captures tool output text. Without it the hash still tells you whether two sessions ran with the same prompt. See [Session trace schema](../reference/observability-schemas.md).
 
 If the agent is ignoring your constraints, add a more explicit rule to the system prompt and re-run.
 
@@ -252,6 +262,33 @@ Both manifests reference the same file. Updating the persona in one place update
 
 ---
 
+## Step 8 — override the prompt for a single run
+
+To try a different persona without editing `murmur.yaml`, pass [`mur run --system-prompt`](../reference/cli.md#mur-run):
+
+```bash
+mur run --task task.md --system-prompt "You are a terse code reviewer. Reply with numbered findings only."
+```
+
+```
+murmur: url localhost:52222
+session: ses_019ed2af53da75c2aefee84ee10c34af
+status:  ok
+```
+
+The flag replaces whichever of the three manifest fields the capsule declared — inline, file, or artifact — and applies just as well to a manifest that declared none. It never writes to `murmur.yaml`: the next run without the flag is back to the manifest's own prompt.
+
+Two consequences worth knowing:
+
+- The value is trimmed. An empty or whitespace-only value clears the prompt entirely, so the run sends no `system` parameter beyond the runtime's own identity block — useful for checking how much of the agent's behaviour the persona is responsible for.
+- Overriding a `system_prompt_artifact` releases that skill back into the callable tool inventory, since it is no longer already in context. `MURMUR.md` lists it as callable for that run.
+
+The trace records the override: `session_start.system_prompt_source` reads `"cli"`, and `system_prompt_sha256` is the hash of the trimmed value you passed.
+
+On a capsule with no `inference:` block there is no prompt to override, and the run fails with `error[E-IO-003]` before anything is staged.
+
+---
+
 ## Summary
 
 | Setting | Behaviour |
@@ -262,3 +299,6 @@ Both manifests reference the same file. Updating the persona in one place update
 | More than one field set simultaneously | Parse error `error[E-MAN-003]` |
 | File or skill.md missing or unreadable | Launch error `error[E-RUN-009]` — session never starts |
 | No field set | No `system` parameter is sent; model receives no system prompt |
+| `mur run --system-prompt "text"` | Replaces whichever field the manifest set, for that run only; value is trimmed; empty value clears the prompt; `murmur.yaml` untouched |
+| `mur run --system-prompt` on a manifest with no `inference:` | CLI error `error[E-IO-003]` — nothing is staged |
+| `session_start.system_prompt_source` in `trace.jsonl` | `"manifest"` \| `"cli"` \| `"none"`, alongside `system_prompt_sha256`; the prompt text itself only when `trace.include_tool_output: true` |

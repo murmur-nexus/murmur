@@ -726,6 +726,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             lock_expectations: lock_expectations.clone(),
             capability_policy: capability_policy.clone(),
             inference: runtime_manifest.inference.clone(),
+            system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
             otel_endpoint: runtime_manifest
                 .observability

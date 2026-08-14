@@ -27,6 +27,19 @@ pub(crate) struct TraceWriter {
     /// class at the top level and another inside the report.
     effective_grants: ScopeReport,
     include_tool_output: bool,
+    /// Where the effective system prompt came from: `"manifest"`, `"cli"` or `"none"`. Derived
+    /// once in [`TraceWriter::open`] from the resolved prompt and the override flag, then repeated
+    /// on every `session_start` the same way `model` is — the prompt cannot change between the
+    /// tasks of one session.
+    system_prompt_source: &'static str,
+    /// SHA-256 (lowercase hex) of the resolved system prompt, or `None` when no prompt is in
+    /// effect. Always written to `session_start` (as `null` when absent) so a trace records *that*
+    /// a prompt was in effect and which one, even when the text itself is withheld.
+    system_prompt_sha256: Option<String>,
+    /// The resolved system prompt verbatim — populated only when the manifest opted in via
+    /// `trace.include_tool_output`, on the same terms as tool output text. `None` otherwise, which
+    /// omits the field from `session_start` entirely.
+    system_prompt: Option<String>,
     session_start_time: Instant,
     session_started: bool,
     session_ended: bool,
@@ -94,6 +107,24 @@ struct SessionStartEvent {
     /// reading a finished trace actually has. This field answers it without re-parsing the
     /// manifest, which by then may have changed or moved.
     effective_grants: ScopeReport,
+    /// Where the system prompt this session ran with came from: `"manifest"` when the manifest's
+    /// own `inference.system_prompt`/`system_prompt_file`/`system_prompt_artifact` supplied it,
+    /// `"cli"` when `mur run --system-prompt` overrode it (including when the override was empty
+    /// and therefore cleared it), `"none"` when no prompt was in effect at all.
+    ///
+    /// Always written, on the same terms as `workdir_exec`: its absence identifies a trace from a
+    /// runtime that predates the key, not a session that had no prompt.
+    system_prompt_source: &'static str,
+    /// SHA-256 (lowercase hex) of the resolved prompt — the text as `resolve_system_prompt`
+    /// returned it, before the `[Capsule]` identity block is prepended — or `null` when no prompt
+    /// was in effect. Always written, so two sessions can be compared for prompt equality without
+    /// either trace having to carry the prompt itself.
+    system_prompt_sha256: Option<String>,
+    /// The resolved prompt verbatim. Written only when the manifest set
+    /// `trace.include_tool_output: true`; omitted otherwise, since a system prompt is capsule
+    /// content on the same footing as tool output and is not captured by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -298,12 +329,24 @@ impl TraceWriter {
         capabilities: Vec<String>,
         effective_grants: ScopeReport,
         include_tool_output: bool,
+        system_prompt: Option<String>,
+        system_prompt_overridden: bool,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(workdir.join("trace.jsonl"))
             .await?;
+        // `"cli"` wins over `"none"` when the override cleared the prompt: the operator passed
+        // `--system-prompt ""`, which is a decision worth recording, not an absence.
+        let system_prompt_source = match (system_prompt_overridden, system_prompt.is_some()) {
+            (true, _) => "cli",
+            (false, true) => "manifest",
+            (false, false) => "none",
+        };
+        let system_prompt_sha256 = system_prompt
+            .as_ref()
+            .map(|prompt| murmur_artifact::sha256_hex(prompt.as_bytes()));
         Ok(Self {
             writer: BufWriter::new(file),
             session_id,
@@ -313,6 +356,9 @@ impl TraceWriter {
             capabilities,
             effective_grants,
             include_tool_output,
+            system_prompt_source,
+            system_prompt_sha256,
+            system_prompt: include_tool_output.then_some(system_prompt).flatten(),
             session_start_time: Instant::now(),
             session_started: false,
             session_ended: false,
@@ -350,6 +396,9 @@ impl TraceWriter {
             containment_achieved: self.effective_grants.achieved_containment,
             workdir_exec: self.effective_grants.workdir_exec,
             effective_grants: self.effective_grants.clone(),
+            system_prompt_source: self.system_prompt_source,
+            system_prompt_sha256: self.system_prompt_sha256.clone(),
+            system_prompt: self.system_prompt.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -735,6 +784,15 @@ mod tests {
     }
 
     async fn make_writer_with_opts(dir: &std::path::Path, include_tool_output: bool) -> TraceWriter {
+        make_writer_with_prompt(dir, include_tool_output, None, false).await
+    }
+
+    async fn make_writer_with_prompt(
+        dir: &std::path::Path,
+        include_tool_output: bool,
+        system_prompt: Option<&str>,
+        system_prompt_overridden: bool,
+    ) -> TraceWriter {
         TraceWriter::open(
             dir,
             "test-session-id".to_string(),
@@ -748,6 +806,8 @@ mod tests {
                 false,
             ),
             include_tool_output,
+            system_prompt.map(str::to_string),
+            system_prompt_overridden,
         )
         .await
         .unwrap()
@@ -788,6 +848,104 @@ mod tests {
         assert!(e["timestamp"].as_u64().unwrap() > 0);
     }
 
+    /// The three `system_prompt_source` values, each paired with the hash the same call derives.
+    /// A manifest prompt and a CLI override carrying the *same* text differ only in the source
+    /// field — which is the whole reason the override flag is threaded through separately rather
+    /// than inferred from the resolved prompt.
+    #[tokio::test]
+    async fn session_start_records_system_prompt_source_and_hash() {
+        let expected_sha = murmur_artifact::sha256_hex(b"Be terse.");
+
+        for (prompt, overridden, source, sha) in [
+            (Some("Be terse."), false, "manifest", Some(&expected_sha)),
+            (Some("Be terse."), true, "cli", Some(&expected_sha)),
+            (None, false, "none", None),
+            // `--system-prompt ""` cleared the manifest's prompt: no prompt is in effect, but the
+            // operator made that call, so the source is the CLI and not `"none"`.
+            (None, true, "cli", None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer_with_prompt(dir.path(), false, prompt, overridden).await;
+            w.write_session_start(1, Vec::new()).await.unwrap();
+            w.flush().await.unwrap();
+
+            let e = &read_events(dir.path())[0];
+            assert_eq!(e["system_prompt_source"], source, "prompt={prompt:?}");
+            match sha {
+                Some(sha) => assert_eq!(e["system_prompt_sha256"], sha.as_str()),
+                None => assert!(
+                    e["system_prompt_sha256"].is_null(),
+                    "no prompt in effect must hash to null, got {}",
+                    e["system_prompt_sha256"]
+                ),
+            }
+        }
+    }
+
+    /// The prompt text itself rides on `trace.include_tool_output`, the same opt-in that governs
+    /// tool output: withheld by default, verbatim when asked for. The source and hash are written
+    /// either way, so a default trace still records that a prompt was in effect.
+    #[tokio::test]
+    async fn session_start_writes_verbatim_system_prompt_only_when_tool_output_is_included() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_prompt(dir.path(), false, Some("Be terse."), false).await;
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let e = &read_events(dir.path())[0];
+        assert!(
+            e.get("system_prompt").is_none(),
+            "prompt text must be omitted without the opt-in, got {e}"
+        );
+        assert_eq!(
+            e["system_prompt_sha256"],
+            murmur_artifact::sha256_hex(b"Be terse.")
+        );
+
+        let opted_in = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_prompt(opted_in.path(), true, Some("Be terse."), false).await;
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        assert_eq!(
+            read_events(opted_in.path())[0]["system_prompt"],
+            "Be terse."
+        );
+    }
+
+    /// Opting in cannot conjure a prompt that was never in effect.
+    #[tokio::test]
+    async fn session_start_omits_verbatim_system_prompt_when_there_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_prompt(dir.path(), true, None, false).await;
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        assert!(read_events(dir.path())[0].get("system_prompt").is_none());
+    }
+
+    /// The prompt is a session constant, like `model` — every task's `session_start` repeats it.
+    #[tokio::test]
+    async fn every_task_session_start_repeats_the_same_system_prompt_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_prompt(dir.path(), false, Some("Be terse."), true).await;
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["system_prompt_source"],
+            events[1]["system_prompt_source"]
+        );
+        assert_eq!(
+            events[0]["system_prompt_sha256"],
+            events[1]["system_prompt_sha256"]
+        );
+        assert_eq!(events[1]["system_prompt_source"], "cli");
+    }
+
     /// The pairing an operator reads a trace for: `workdir_exec: true` next to the `advisory` it
     /// forces, on a session whose *declared* floor was higher. Without the flag on the record, a
     /// trace showing `achieved: advisory` is indistinguishable from one written on a host with no
@@ -808,6 +966,8 @@ mod tests {
                 EnforcementTier::KernelFull,
                 true,
             ),
+            false,
+            None,
             false,
         )
         .await
@@ -833,6 +993,8 @@ mod tests {
             "claude-test".to_string(),
             Vec::new(),
             report_for(ContainmentClass::Sealed, EnforcementTier::KernelFull, false),
+            false,
+            None,
             false,
         )
         .await
@@ -886,6 +1048,8 @@ mod tests {
             "claude-test".to_string(),
             vec!["network".to_string(), "shell".to_string()],
             expected.clone(),
+            false,
+            None,
             false,
         )
         .await
