@@ -460,7 +460,7 @@ const SKILL_CONTENT: &str = "# House style\nAlways answer in haiku.";
 ///
 /// The manifest declares no `shell` capability: none of these tests calls a tool, and granting
 /// shell would make the launch require a delegated cgroup scope for host-process bounding, which
-/// is a property of the host rather than of anything this slice changed.
+/// is a property of the host.
 struct CliFixture {
     home: TempDir,
     artifacts: TempDir,

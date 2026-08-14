@@ -897,14 +897,20 @@ mod tests {
             e.get("system_prompt").is_none(),
             "prompt text must be omitted without the opt-in, got {e}"
         );
-        assert_eq!(e["system_prompt_sha256"], murmur_artifact::sha256_hex(b"Be terse."));
+        assert_eq!(
+            e["system_prompt_sha256"],
+            murmur_artifact::sha256_hex(b"Be terse.")
+        );
 
         let opted_in = tempfile::tempdir().unwrap();
         let mut w = make_writer_with_prompt(opted_in.path(), true, Some("Be terse."), false).await;
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.flush().await.unwrap();
 
-        assert_eq!(read_events(opted_in.path())[0]["system_prompt"], "Be terse.");
+        assert_eq!(
+            read_events(opted_in.path())[0]["system_prompt"],
+            "Be terse."
+        );
     }
 
     /// Opting in cannot conjure a prompt that was never in effect.
