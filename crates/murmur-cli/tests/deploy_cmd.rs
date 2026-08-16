@@ -71,7 +71,9 @@ fn deploy_keys_dir(home: &std::path::Path, deployment_id: &str) -> std::path::Pa
 
 /// Staging counterpart of [`deploy_keys_dir`], likewise keyed by the full id.
 fn deploy_staging_dir(home: &std::path::Path, deployment_id: &str) -> std::path::PathBuf {
-    home.join(".murmur").join("deploy_staging").join(deployment_id)
+    home.join(".murmur")
+        .join("deploy_staging")
+        .join(deployment_id)
 }
 
 /// Populate the key and staging directories `mur destroy` is expected to sweep, each holding a
@@ -257,16 +259,16 @@ fn destroy_by_ambiguous_prefix_removes_nothing() {
     enable_deploy_beta(dir.path());
     write_deployments(
         dir.path(),
-        &[
-            (AMBIGUOUS_ID_A, "10.0.0.1"),
-            (AMBIGUOUS_ID_B, "10.0.0.2"),
-        ],
+        &[(AMBIGUOUS_ID_A, "10.0.0.1"), (AMBIGUOUS_ID_B, "10.0.0.2")],
     );
     seed_deployment_dirs(dir.path(), AMBIGUOUS_ID_A);
     seed_deployment_dirs(dir.path(), AMBIGUOUS_ID_B);
 
     let shared_prefix = &AMBIGUOUS_ID_A[..12];
-    assert!(AMBIGUOUS_ID_B.starts_with(shared_prefix), "fixture ids must share a prefix");
+    assert!(
+        AMBIGUOUS_ID_B.starts_with(shared_prefix),
+        "fixture ids must share a prefix"
+    );
 
     let out = Command::cargo_bin("mur")
         .unwrap()
@@ -277,13 +279,26 @@ fn destroy_by_ambiguous_prefix_removes_nothing() {
 
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ambiguous"), "expected ambiguity error, got: {stderr}");
+    assert!(
+        stderr.contains("ambiguous"),
+        "expected ambiguity error, got: {stderr}"
+    );
 
     for id in [AMBIGUOUS_ID_A, AMBIGUOUS_ID_B] {
-        assert!(deploy_keys_dir(dir.path(), id).exists(), "{id} key directory was removed");
-        assert!(deploy_staging_dir(dir.path(), id).exists(), "{id} staging directory was removed");
+        assert!(
+            deploy_keys_dir(dir.path(), id).exists(),
+            "{id} key directory was removed"
+        );
+        assert!(
+            deploy_staging_dir(dir.path(), id).exists(),
+            "{id} staging directory was removed"
+        );
     }
-    assert_eq!(read_deployments(dir.path()).len(), 2, "a record was dropped");
+    assert_eq!(
+        read_deployments(dir.path()).len(),
+        2,
+        "a record was dropped"
+    );
 }
 
 // ─── argument validation ──────────────────────────────────────────────────────
@@ -298,8 +313,10 @@ fn missing_manifest_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
-            "--host", "1.2.3.4",
-            "--manifest", "/nonexistent/path/murmur.yaml",
+            "--host",
+            "1.2.3.4",
+            "--manifest",
+            "/nonexistent/path/murmur.yaml",
         ])
         .output()
         .unwrap();
@@ -323,9 +340,12 @@ fn missing_workdir_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
-            "--host", "1.2.3.4",
-            "--manifest", manifest.to_str().unwrap(),
-            "--workdir", "/nonexistent/workdir-xyz",
+            "--host",
+            "1.2.3.4",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--workdir",
+            "/nonexistent/workdir-xyz",
         ])
         .output()
         .unwrap();
@@ -349,9 +369,12 @@ fn missing_mur_binary_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
-            "--host", "1.2.3.4",
-            "--manifest", manifest.to_str().unwrap(),
-            "--mur-binary", "/nonexistent/mur-linux",
+            "--host",
+            "1.2.3.4",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--mur-binary",
+            "/nonexistent/mur-linux",
         ])
         .output()
         .unwrap();
@@ -375,9 +398,12 @@ fn invalid_env_var_format_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
-            "--host", "1.2.3.4",
-            "--manifest", manifest.to_str().unwrap(),
-            "--env", "MISSING_EQUALS",
+            "--host",
+            "1.2.3.4",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--env",
+            "MISSING_EQUALS",
         ])
         .output()
         .unwrap();
@@ -512,10 +538,21 @@ fn deployments_json_schema_has_required_fields() {
     let r = &arr[0];
 
     for field in &[
-        "deployment_id", "provider", "provider_vm_id", "provider_key_id",
-        "region", "ip", "url", "manifest_path", "started_at", "status",
+        "deployment_id",
+        "provider",
+        "provider_vm_id",
+        "provider_key_id",
+        "region",
+        "ip",
+        "url",
+        "manifest_path",
+        "started_at",
+        "status",
     ] {
-        assert!(r.get(field).is_some(), "deployments.json missing field: {field}");
+        assert!(
+            r.get(field).is_some(),
+            "deployments.json missing field: {field}"
+        );
     }
     assert!(
         r.get("job_id").is_none(),
