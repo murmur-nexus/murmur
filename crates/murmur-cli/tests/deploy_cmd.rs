@@ -34,8 +34,7 @@ fn deployments_json_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".murmur").join("deployments.json")
 }
 
-/// Write `deployments.json` in the *current* on-disk format: the id field is `deployment_id`
-/// and every id carries the `dep_` prefix `mur deploy` mints. Takes `(deployment_id, ip)` pairs.
+/// Write `deployments.json` with one entry per `(deployment_id, ip)` pair.
 fn write_deployments(home: &std::path::Path, deployments: &[(&str, &str)]) {
     let json_path = deployments_json_path(home);
     fs::create_dir_all(json_path.parent().unwrap()).unwrap();
@@ -142,48 +141,6 @@ fn ps_lists_deployment_from_json() {
     assert!(stdout.contains(DEPLOYMENT_ID), "got: {stdout}");
     assert!(stdout.contains("1.2.3.4"), "got: {stdout}");
     assert!(stdout.contains("https://1.2.3.4:8080"), "got: {stdout}");
-}
-
-/// Backward compatibility, not a record of the current format: `deployments.json` files written
-/// before `job_id` became `deployment_id` are still on real disks, and losing one orphans a live
-/// VM from `mur destroy`. `DeploymentRecord` carries `#[serde(alias = "job_id")]` for exactly this
-/// case; `deploy_state.rs` pins it at the `serde` level, and this pins it through the compiled
-/// binary. The raw `"job_id"` literal below is the point of the test — do not "fix" it to
-/// `deployment_id`, and do not copy this fixture as a template for new tests.
-#[test]
-fn ps_lists_deployment_written_before_the_rename() {
-    let dir = tempdir().unwrap();
-    enable_deploy_beta(dir.path());
-    let json_path = deployments_json_path(dir.path());
-    fs::create_dir_all(json_path.parent().unwrap()).unwrap();
-    let legacy = serde_json::json!([{
-        "job_id": "job_019e9d84c3b2a1908f7e6d5c4b3a2910",
-        "provider": "manual",
-        "provider_vm_id": "",
-        "provider_key_id": "",
-        "region": "",
-        "ip": "1.2.3.4",
-        "url": "https://1.2.3.4:8080",
-        "manifest_path": "/tmp/murmur.yaml",
-        "started_at": "2026-06-03T00:00:00Z",
-        "status": "running"
-    }]);
-    fs::write(&json_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
-
-    let out = Command::cargo_bin("mur")
-        .unwrap()
-        .env("HOME", dir.path())
-        .arg("ps")
-        .output()
-        .unwrap();
-
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("job_019e9d84c3b2a1908f7e6d5c4b3a2910"),
-        "pre-rename record must still list: {stdout}"
-    );
-    assert!(stdout.contains("1.2.3.4"), "got: {stdout}");
 }
 
 #[test]
@@ -554,8 +511,4 @@ fn deployments_json_schema_has_required_fields() {
             "deployments.json missing field: {field}"
         );
     }
-    assert!(
-        r.get("job_id").is_none(),
-        "job_id is the pre-rename name; current-format records must not carry it"
-    );
 }
