@@ -9,12 +9,9 @@ use crate::error::{CliError, E_IO_001, E_IO_003};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct DeploymentRecord {
     /// Identifies one provisioned deployment (a VM plus its keys and staging directory), not a
-    /// capsule session — a deployment outlives the sessions that run on it.
-    ///
-    /// `alias` keeps deployments written before the rename loadable: the value is a path segment
-    /// under `~/.murmur/deploy_keys/` and `deploy_staging/`, so a record that failed to
-    /// deserialise would orphan a live VM from `mur destroy`.
-    #[serde(alias = "job_id")]
+    /// capsule session — a deployment outlives the sessions that run on it. Also the path segment
+    /// under `~/.murmur/deploy_keys/` and `deploy_staging/` for that deployment's key and staging
+    /// directories.
     pub deployment_id: String,
     pub provider: String,
     pub provider_vm_id: String,
@@ -161,10 +158,9 @@ mod tests {
     }
 
     #[test]
-    fn deployments_are_written_under_the_current_field_name() {
+    fn deployments_are_written_with_a_deployment_id_field() {
         let json = serde_json::to_string(&record()).unwrap();
         assert!(json.contains("\"deployment_id\""), "got: {json}");
-        assert!(!json.contains("\"job_id\""), "got: {json}");
     }
 
     /// `remove_deployment` accepts an unambiguous prefix, so callers must clean up under the
@@ -187,27 +183,5 @@ mod tests {
         assert_eq!(hit.len(), 1);
         assert_ne!(hit[0].deployment_id, prefix, "the record must carry the full id, not the prefix");
         assert_eq!(hit[0].deployment_id, full);
-    }
-
-    /// A `deployments.json` written before the rename still has to load: its id is a path segment
-    /// under `~/.murmur/deploy_keys/` and `deploy_staging/`, so a record that failed to
-    /// deserialise would strand a live VM with no way to reach it through `mur destroy`.
-    #[test]
-    fn deployments_written_before_the_rename_still_load() {
-        let legacy = r#"{
-            "job_id": "job_018f4b2c1234567890abcdef12345678",
-            "provider": "manual",
-            "provider_vm_id": "",
-            "provider_key_id": "",
-            "region": "",
-            "ip": "1.2.3.4",
-            "url": "https://1.2.3.4:8080",
-            "manifest_path": "/tmp/murmur.yaml",
-            "started_at": "2026-06-03T00:00:00Z",
-            "status": "running"
-        }"#;
-
-        let parsed: DeploymentRecord = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.deployment_id, "job_018f4b2c1234567890abcdef12345678");
     }
 }
