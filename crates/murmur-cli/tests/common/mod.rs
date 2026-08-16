@@ -136,6 +136,34 @@ pub fn fixture_native_tool_manifest() -> PathBuf {
     fixture_path("native-tool/murmur.yaml")
 }
 
+/// Pack a native tool artifact zip with the canonical `murmur.yaml` + `bin/<name>` layout:
+/// the manifest at the archive root and the binary executable at `bin/<name>`.
+pub fn create_native_tool_zip(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    manifest_bytes: &[u8],
+    binary_path: &Path,
+) -> PathBuf {
+    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
+    let file = fs::File::create(&artifact_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    zip.write_all(manifest_bytes).unwrap();
+
+    let exec_options: SimpleFileOptions = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+    zip.start_file(format!("bin/{name}"), exec_options).unwrap();
+    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
+
+    zip.finish().unwrap();
+    artifact_path
+}
+
 pub fn stage_agent_session(
     home: &TempDir,
     project_dir: &Path,

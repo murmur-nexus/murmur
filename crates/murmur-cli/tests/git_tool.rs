@@ -38,10 +38,6 @@ use murmur_artifact::{
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use zip::{
-    write::{FileOptions, SimpleFileOptions},
-    CompressionMethod, ZipWriter,
-};
 
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
@@ -109,32 +105,14 @@ fn git_tool_binary() -> Option<PathBuf> {
 /// inline fallback manifest, because a silently-substituted stub with no
 /// `input_schema` is what made the schema test pass vacuously before.
 fn create_fixture_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
-    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
-    let file = fs::File::create(&artifact_path).unwrap();
-    let mut zip = ZipWriter::new(file);
-
-    let options: SimpleFileOptions =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    zip.start_file("murmur.yaml", options).unwrap();
     let manifest = common::fixture_native_tool_manifest();
-    zip.write_all(&fs::read(&manifest).unwrap_or_else(|err| {
+    let manifest_bytes = fs::read(&manifest).unwrap_or_else(|err| {
         panic!(
             "fixture manifest {} must be readable: {err}",
             manifest.display()
         )
-    }))
-    .unwrap();
-
-    let exec_options: SimpleFileOptions = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-    zip.start_file(format!("bin/{TOOL_NAME}"), exec_options)
-        .unwrap();
-    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
-
-    zip.finish().unwrap();
-    artifact_path
+    });
+    common::create_native_tool_zip(dir, TOOL_NAME, TOOL_VERSION, &manifest_bytes, binary_path)
 }
 
 /// Publish the fixture tool artifact to a local registry.

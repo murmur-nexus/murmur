@@ -17,14 +17,10 @@ mod common;
 
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
 };
 
-use zip::{
-    write::{FileOptions, SimpleFileOptions},
-    CompressionMethod, ZipArchive, ZipWriter,
-};
+use zip::ZipArchive;
 
 const ARTIFACT_NAME: &str = common::FIXTURE_NATIVE_TOOL_NAME;
 const ARTIFACT_VERSION: &str = "0.1.0";
@@ -33,28 +29,16 @@ const ARTIFACT_VERSION: &str = "0.1.0";
 ///   murmur.yaml
 ///   bin/<ARTIFACT_NAME>
 fn create_canonical_native_zip(dir: &Path, binary_path: &Path) -> PathBuf {
-    let zip_path = dir.join(format!("{ARTIFACT_NAME}-{ARTIFACT_VERSION}.mur.zip"));
-    let file = fs::File::create(&zip_path).unwrap();
-    let mut zip = ZipWriter::new(file);
-
-    let text_opts: SimpleFileOptions =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-    let exec_opts: SimpleFileOptions = FileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o755);
-
-    zip.start_file("murmur.yaml", text_opts).unwrap();
-    writeln!(zip, "name: {ARTIFACT_NAME}").unwrap();
-    writeln!(zip, "version: \"{ARTIFACT_VERSION}\"").unwrap();
-    writeln!(zip, "runtime: tool").unwrap();
-    writeln!(zip, "implementation: native").unwrap();
-
-    zip.start_file(format!("bin/{ARTIFACT_NAME}"), exec_opts)
-        .unwrap();
-    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
-
-    zip.finish().unwrap();
-    zip_path
+    let manifest = format!(
+        "name: {ARTIFACT_NAME}\nversion: \"{ARTIFACT_VERSION}\"\nruntime: tool\nimplementation: native\n"
+    );
+    common::create_native_tool_zip(
+        dir,
+        ARTIFACT_NAME,
+        ARTIFACT_VERSION,
+        manifest.as_bytes(),
+        binary_path,
+    )
 }
 
 /// Verify the canonical .mur.zip layout for a native tool.
