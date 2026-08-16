@@ -38,6 +38,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 libseccomp = "0.4"
+# Linux-only, and deliberately not in `[dependencies]`: the only thing it is used for is asking
+# the systemd user manager for a delegated transient scope over the session bus (see
+# `cgroup::move_self_into_own_systemd_scope`), which is meaningless off Linux. `blocking-api` is
+# the sync wrapper the cgroup module calls on its own thread; `async-io` is zbus's default
+# reactor, kept rather than the `tokio` feature so the call never depends on being inside a
+# running tokio runtime.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [dev-dependencies]
 tempfile = "3"
