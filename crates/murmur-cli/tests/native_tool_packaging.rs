@@ -5,6 +5,12 @@
 //!   bin/<tool-name>       — compiled binary with executable permissions
 //!
 //! No source files, Cargo.toml, target/, or other build artifacts may appear.
+//!
+//! The binary packed here is the local fixture tool from
+//! `tests/fixtures/native-tool/`, built on demand by
+//! `common::fixture_native_tool_binary()`. Any executable would satisfy these
+//! structural assertions, but using the same fixture the dispatch tests use
+//! keeps one native tool in the suite instead of two.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -13,7 +19,6 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use zip::{
@@ -21,41 +26,14 @@ use zip::{
     CompressionMethod, ZipArchive, ZipWriter,
 };
 
-const ARTIFACT_NAME: &str = "murmur-tool-git";
-
-fn default_artifacts_dir() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dir = manifest_dir.ancestors().nth(3)?.join("default-artifacts");
-    if dir.exists() { Some(dir) } else { None }
-}
-
-/// Build the murmur-tool-git binary from default-artifacts.
-fn build_git_tool_binary() -> Option<PathBuf> {
-    let artifacts_dir = default_artifacts_dir()?;
-    let binary_path = artifacts_dir
-        .join("target")
-        .join("release")
-        .join("murmur-tool-git");
-
-    if !binary_path.exists() {
-        let status = Command::new("cargo")
-            .args(["build", "-p", "murmur-tool-git", "--release"])
-            .current_dir(&artifacts_dir)
-            .status()
-            .ok()?;
-        if !status.success() {
-            return None;
-        }
-    }
-
-    Some(binary_path)
-}
+const ARTIFACT_NAME: &str = common::FIXTURE_NATIVE_TOOL_NAME;
+const ARTIFACT_VERSION: &str = "0.1.0";
 
 /// Create a zip with the canonical native tool layout:
 ///   murmur.yaml
 ///   bin/<ARTIFACT_NAME>
 fn create_canonical_native_zip(dir: &Path, binary_path: &Path) -> PathBuf {
-    let zip_path = dir.join(format!("{ARTIFACT_NAME}-0.4.0-darwin-aarch64.mur.zip"));
+    let zip_path = dir.join(format!("{ARTIFACT_NAME}-{ARTIFACT_VERSION}.mur.zip"));
     let file = fs::File::create(&zip_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
@@ -67,11 +45,11 @@ fn create_canonical_native_zip(dir: &Path, binary_path: &Path) -> PathBuf {
 
     zip.start_file("murmur.yaml", text_opts).unwrap();
     writeln!(zip, "name: {ARTIFACT_NAME}").unwrap();
-    writeln!(zip, "version: \"0.4.0\"").unwrap();
+    writeln!(zip, "version: \"{ARTIFACT_VERSION}\"").unwrap();
     writeln!(zip, "runtime: tool").unwrap();
     writeln!(zip, "implementation: native").unwrap();
 
-    zip.start_file(&format!("bin/{ARTIFACT_NAME}"), exec_opts).unwrap();
+    zip.start_file(format!("bin/{ARTIFACT_NAME}"), exec_opts).unwrap();
     zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
 
     zip.finish().unwrap();
@@ -86,12 +64,9 @@ fn create_canonical_native_zip(dir: &Path, binary_path: &Path) -> PathBuf {
 /// - `bin/<tool-name>` has Unix executable permissions (mode includes 0o111)
 #[test]
 fn native_tool_zip_layout() {
-    let binary = match build_git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] native_tool_zip_layout: murmur-tool-git binary not available");
-            return;
-        }
+    let Some(binary) = common::fixture_native_tool_binary() else {
+        eprintln!("[SKIP] native_tool_zip_layout: fixture native tool binary not available");
+        return;
     };
 
     let dir = tempfile::tempdir().unwrap();

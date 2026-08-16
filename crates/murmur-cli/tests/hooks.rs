@@ -12,8 +12,16 @@ const HOOK_NAME: &str = "murmur-hook-debug";
 const HOOK_VERSION: &str = "0.3.0";
 
 #[test]
-#[ignore = "requires a default-artifacts checkout with murmur-hook-debug built; set MURMUR_DEFAULT_ARTIFACTS_DIR or clone it next to this repo"]
+#[ignore = "requires a default-artifacts checkout with murmur-hook-debug built; set MURMUR_DEFAULT_ARTIFACTS_DIR to point at it"]
 fn hook_debug_writes_lifecycle_jsonl() {
+    let Some(artifacts_dir) = common::default_artifacts_dir() else {
+        eprintln!(
+            "[SKIP] hook_debug_writes_lifecycle_jsonl: set MURMUR_DEFAULT_ARTIFACTS_DIR to a \
+             default-artifacts checkout with murmur-hook-debug built"
+        );
+        return;
+    };
+
     let server = common::ScriptedServer::start(two_turn_responses());
 
     let home = tempfile::tempdir().unwrap();
@@ -28,14 +36,15 @@ fn hook_debug_writes_lifecycle_jsonl() {
     );
     common::publish_local(&home, &driver_artifact).success();
 
-    let hook_wasm = common::default_artifacts_dir()
-        .join("hooks/murmur-hook-debug/murmur_hook_debug.wasm");
-    assert!(
-        hook_wasm.exists(),
-        "murmur-hook-debug wasm must be built in the default-artifacts checkout \
-         before this test (looked at {})",
-        hook_wasm.display()
-    );
+    let hook_wasm = artifacts_dir.join("hooks/murmur-hook-debug/murmur_hook_debug.wasm");
+    if !hook_wasm.exists() {
+        eprintln!(
+            "[SKIP] hook_debug_writes_lifecycle_jsonl: murmur-hook-debug wasm must be built in \
+             the default-artifacts checkout first (looked at {})",
+            hook_wasm.display()
+        );
+        return;
+    }
     let hook_artifact =
         common::create_hook_artifact(artifact_dir.path(), HOOK_NAME, HOOK_VERSION, &hook_wasm);
     common::publish_local(&home, &hook_artifact).success();

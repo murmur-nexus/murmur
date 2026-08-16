@@ -1,0 +1,29 @@
+name: murmur-tool-fixture
+version: 0.1.0
+runtime: tool
+implementation: native
+description: |
+  Fixture native tool for murmur's own test suite. Creates and lists
+  directories underneath a `repo` base path so the native tool dispatch path
+  can be exercised without reaching into a sibling artifact checkout.
+
+  | op           | inputs             | outputs                |
+  |--------------|--------------------|------------------------|
+  | create_dir   | repo?, path, label?| path, label            |
+  | list_entries | repo?, path?       | dir, entries:[]        |
+
+  repo: base directory the operation runs against. Defaults to the working
+  directory. Validated against MURMUR_FILESYSTEM_ALLOW when that is set.
+
+# Inline JSON, matching the style capsule-runtime uses for its own synthesised
+# shell tool manifests (crates/capsule-runtime/src/shell.rs). The `repo`
+# property is what the inventory -> input_schema mapping test asserts on.
+input_schema: '{"type":"object","properties":{"operation":{"type":"string","enum":["create_dir","list_entries"],"description":"Operation to perform."},"repo":{"type":"string","description":"Base directory the operation runs against. Defaults to the working directory."},"path":{"type":"string","description":"Path to create or list, resolved against repo."},"label":{"type":"string","description":"Optional marker text written into the created directory as label.txt."}},"required":["operation"]}'
+
+capabilities:
+  filesystem:
+    # Declarative intent only, exactly as for the real native tools: the capsule
+    # runtime has no filesystem.allow enforcement. The binary self-enforces it by
+    # reading MURMUR_FILESYSTEM_ALLOW — see resolve_base() in src/main.rs.
+    allow:
+      - "."

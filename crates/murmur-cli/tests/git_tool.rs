@@ -1,12 +1,21 @@
-//! Integration tests for the git-tool native artifact.
+//! Integration tests for the native tool dispatch path.
 //!
-//! These tests exercise the native tool dispatch path end-to-end:
-//! stage_session installs the binary, launch_session dispatches tool calls
-//! from a scripted LLM response, and we verify git filesystem effects.
+//! These tests exercise it end-to-end against a fixture tool built from
+//! `tests/fixtures/native-tool/`: stage_session installs the binary,
+//! launch_session dispatches tool calls from a scripted LLM response, and we
+//! verify the tool's filesystem effects and the schema the driver sends up.
 //!
-//! The tests compile murmur-tool-git from default-artifacts on first run
-//! (via `cargo build -p murmur-tool-git --release` in that workspace).
-//! Subsequent runs reuse the cached binary.
+//! The fixture tool deliberately replaces the real `murmur-tool-git` here. What
+//! these cases are about is murmur's side of the contract — dispatch, the
+//! inventory → `input_schema` mapping, and a native tool self-enforcing a path
+//! allow list — none of which is about git. Testing them against an artifact
+//! built in a sibling checkout meant the suite could not run without one.
+//!
+//! The `slice2_*` block further down is the exception: those are artifact tests
+//! for `murmur-tool-git`'s own operations that still live here, and they still
+//! build that binary out of a `default-artifacts` checkout next to this repo.
+//! They move to that repo under card 66fe14dc, and this file loses its last
+//! sibling-checkout dependency when they do.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -36,8 +45,8 @@ use zip::{
 
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
-const GIT_TOOL_NAME: &str = "murmur-tool-git";
-const GIT_TOOL_VERSION: &str = "0.4.0";
+const TOOL_NAME: &str = common::FIXTURE_NATIVE_TOOL_NAME;
+const TOOL_VERSION: &str = "0.1.0";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -45,7 +54,11 @@ fn fixture_path(relative: &str) -> PathBuf {
     common::fixture_path(relative)
 }
 
-/// Locate or compile the murmur-tool-git binary from default-artifacts.
+/// Locate or compile the murmur-tool-git binary from a `default-artifacts`
+/// checkout next to this repository.
+///
+/// Only the `slice2_*` block below uses this. Every other test in this file runs
+/// against the local fixture tool instead — see `common::fixture_native_tool_binary`.
 ///
 /// Returns None if the default-artifacts workspace cannot be found.
 fn git_tool_binary() -> Option<PathBuf> {
@@ -79,31 +92,24 @@ fn git_tool_binary() -> Option<PathBuf> {
         }
     }
 
+    // Re-checked after the build, not only in the branch that decides whether to
+    // build: a build that exits 0 without producing the binary has to skip cleanly
+    // rather than hand back a path that fails to spawn deep inside a test body.
+    if !binary_path.exists() {
+        eprintln!("[git_tool test] binary missing at {binary_path:?} after a successful build");
+        return None;
+    }
     Some(binary_path)
 }
 
-/// Locate the murmur-tool-git source manifest.yaml from default-artifacts.
+/// Pack the fixture native tool into a `.mur.zip` with the canonical layout.
 ///
-/// Returns None if the path cannot be resolved (e.g. the workspace layout changed).
-fn git_tool_source_manifest() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = manifest_dir
-        .ancestors()
-        .nth(3)?
-        .join("default-artifacts")
-        .join("tools")
-        .join("murmur-tool-git")
-        .join("murmur.yaml");
-    path.exists().then_some(path)
-}
-
-/// Create a proper native tool artifact zip for git-tool.
-///
-/// Uses the actual manifest.yaml from the source tree so that input_schema and
-/// capabilities are identical to what the published artifact contains. Falls back
-/// to a minimal inline manifest if the source tree is not found.
-fn create_git_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
-    let artifact_path = dir.join(format!("{GIT_TOOL_NAME}-{GIT_TOOL_VERSION}.mur.zip"));
+/// The manifest is the fixture crate's own `murmur.yaml`, so `input_schema` and
+/// `capabilities` are exactly what a published artifact would carry — there is no
+/// inline fallback manifest, because a silently-substituted stub with no
+/// `input_schema` is what made the schema test pass vacuously before.
+fn create_fixture_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
+    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
 
@@ -111,38 +117,29 @@ fn create_git_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
         FileOptions::default().compression_method(CompressionMethod::Deflated);
 
     zip.start_file("murmur.yaml", options).unwrap();
-    match git_tool_source_manifest() {
-        Some(p) => zip.write_all(&fs::read(p).unwrap()).unwrap(),
-        None => {
-            writeln!(zip, "name: {GIT_TOOL_NAME}").unwrap();
-            writeln!(zip, "version: \"{GIT_TOOL_VERSION}\"").unwrap();
-            writeln!(zip, "runtime: tool").unwrap();
-            writeln!(zip, "implementation: native").unwrap();
-            writeln!(
-                zip,
-                "description: \"Create and manage isolated git worktrees within a capsule workspace.\""
-            )
-            .unwrap();
-        }
-    }
+    let manifest = common::fixture_native_tool_manifest();
+    zip.write_all(&fs::read(&manifest).unwrap_or_else(|err| {
+        panic!("fixture manifest {} must be readable: {err}", manifest.display())
+    }))
+    .unwrap();
 
     let exec_options: SimpleFileOptions = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o755);
-    zip.start_file(&format!("bin/{GIT_TOOL_NAME}"), exec_options).unwrap();
+    zip.start_file(format!("bin/{TOOL_NAME}"), exec_options).unwrap();
     zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
 
     zip.finish().unwrap();
     artifact_path
 }
 
-/// Publish the git-tool artifact to a local registry.
-fn publish_git_tool(home: &TempDir, artifact_path: &Path) {
+/// Publish the fixture tool artifact to a local registry.
+fn publish_fixture_tool(home: &TempDir, artifact_path: &Path) {
     let registry = LocalRegistry::new(home.path().join(".murmur").join("artifacts"));
     let bytes = fs::read(artifact_path).unwrap();
     let meta = ArtifactMeta {
-        name: GIT_TOOL_NAME.to_string(),
-        version: GIT_TOOL_VERSION.to_string(),
+        name: TOOL_NAME.to_string(),
+        version: TOOL_VERSION.to_string(),
         runtime: RuntimeType::Native,
         artifact_runtime: "native".to_string(),
         platforms: Vec::new(),
@@ -152,7 +149,30 @@ fn publish_git_tool(home: &TempDir, artifact_path: &Path) {
     registry.publish(meta, &bytes).unwrap();
 }
 
+/// Publish the inference driver plus the fixture tool into a fresh local registry.
+///
+/// Returns the fixture binary path, or `None` when it could not be built — the
+/// caller turns that into a skip.
+fn publish_driver_and_fixture_tool(home: &TempDir, artifact_dir: &Path) -> Option<PathBuf> {
+    let binary = common::fixture_native_tool_binary()?;
+
+    let driver = common::create_driver_artifact(
+        artifact_dir,
+        DRIVER_NAME,
+        DRIVER_VERSION,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(home, &driver).success();
+
+    let tool_artifact = create_fixture_tool_artifact(artifact_dir, &binary);
+    publish_fixture_tool(home, &tool_artifact);
+
+    Some(binary)
+}
+
 /// Initialize a git repo with an initial commit and return the path.
+///
+/// Only the `slice2_*` block below needs this; the fixture tool is not a git tool.
 fn init_git_repo(dir: &Path) -> PathBuf {
     let repo = dir.join("repo");
     fs::create_dir_all(&repo).unwrap();
@@ -180,8 +200,8 @@ fn init_git_repo(dir: &Path) -> PathBuf {
     repo
 }
 
-/// Stage a capsule session with git-tool and an inference driver.
-fn stage_git_tool_session(
+/// Stage a capsule session with the fixture tool and an inference driver.
+fn stage_fixture_tool_session(
     home: &TempDir,
     project_dir: &Path,
     endpoint: &str,
@@ -191,14 +211,14 @@ fn stage_git_tool_session(
         project_dir.join("murmur.yaml"),
         format!(
             concat!(
-                "name: git-tool-capsule\n",
+                "name: native-tool-capsule\n",
                 "version: 0.1.0\n",
                 "artifacts:\n",
                 "  - name: {driver_name}\n",
                 "    version: {driver_version}\n",
                 "    runtime: driver\n",
-                "  - name: {git_tool_name}\n",
-                "    version: {git_tool_version}\n",
+                "  - name: {tool_name}\n",
+                "    version: {tool_version}\n",
                 "    runtime: tool\n",
                 "capabilities:\n",
                 "  network:\n",
@@ -214,8 +234,8 @@ fn stage_git_tool_session(
             ),
             driver_name = DRIVER_NAME,
             driver_version = DRIVER_VERSION,
-            git_tool_name = GIT_TOOL_NAME,
-            git_tool_version = GIT_TOOL_VERSION,
+            tool_name = TOOL_NAME,
+            tool_version = TOOL_VERSION,
             endpoint = endpoint,
         ),
     )
@@ -348,11 +368,11 @@ fn extract_result_text(tool_result: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Invoke the git-tool binary directly (bypassing the capsule runtime) with a JSON
+/// Invoke a native tool binary directly (bypassing the capsule runtime) with a JSON
 /// operation as input and optional environment variable overrides.
 ///
-/// Used for allowlist tests to avoid `std::env::set_var` cross-test contamination.
-fn invoke_git_tool_directly(binary: &Path, data: Value, extra_env: &[(&str, &str)]) -> Value {
+/// Used for allow-list tests to avoid `std::env::set_var` cross-test contamination.
+fn invoke_native_tool_directly(binary: &Path, data: Value, extra_env: &[(&str, &str)]) -> Value {
     let envelope = json!({
         "data": data,
         "log_path": null,
@@ -380,66 +400,40 @@ fn invoke_git_tool_directly(binary: &Path, data: Value, extra_env: &[(&str, &str
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-/// Test 1: create_worktree happy path — worktree appears on disk and tool result contains path/branch.
+/// Test 1: dispatch happy path — the tool runs as a subprocess, its filesystem effect
+/// lands in the capsule workdir, and its `data` object comes back as the tool result.
 ///
-/// The runtime sends `data || summary` as the tool result text (not the full JSON),
-/// so for a successful create_worktree the text is the data JSON object.
+/// The runtime sends `data || summary` as the tool result text (not the full JSON), so
+/// for a successful `create_dir` the text is the data object the fixture tool emitted.
 ///
-/// After adding `-C <repo>` to git calls, the relative path `./worktrees/feature-x` is
-/// resolved relative to the auto-discovered repo root, not the binary's CWD.
+/// The binary's CWD is the session workdir, so the relative `path` resolves there.
 #[test]
-fn git_tool_create_worktree_success() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_create_worktree_success: git-tool binary not available");
-            return;
-        }
-    };
-
+fn native_tool_dispatch_creates_directory() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 
-    // Publish driver
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!("[SKIP] native_tool_dispatch_creates_directory: fixture tool not available");
+        return;
+    }
 
-    // Publish git-tool
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
-
-    // Set up git repo in the project dir (capsule workdir is a subdirectory of project dir)
-    let repo = init_git_repo(project.path());
-    let branch = "feature/x";
-    Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
-
-    // The binary's CWD is the session workdir (repo/workdir/<ses>).
-    // With `-C <repo>`, `./worktrees/feature-x` is relative to the auto-discovered repo root.
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
             "toolu_create",
-            GIT_TOOL_NAME,
+            TOOL_NAME,
             json!({
-                "operation": "create_worktree",
-                "path": "./worktrees/feature-x",
-                "branch": branch,
+                "operation": "create_dir",
+                "path": "./made/here",
+                "label": "fixture-label",
             }),
         ),
-        end_turn_response("Worktree created successfully."),
+        end_turn_response("Directory created successfully."),
     ]);
 
-    let staged = stage_git_tool_session(&home, &repo, &server.endpoint);
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-    fs::write(workdir.join("task.md"), "Create a worktree for feature/x.").unwrap();
+    fs::write(workdir.join("task.md"), "Create ./made/here.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
@@ -448,537 +442,359 @@ fn git_tool_create_worktree_success() {
 
     let tool_result = find_tool_result(&requests, "toolu_create")
         .expect("tool_result block should exist in second request");
-
-    // The runtime sends `data || summary` as the tool result text.
-    // For a successful create_worktree the data JSON contains path and branch.
     let result_text = extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("worktrees/feature-x"),
-        "tool result should contain the worktree path; got:\n{result_text}"
+        result_text.contains("made/here"),
+        "tool result should contain the created path; got:\n{result_text}"
     );
     assert!(
-        result_text.contains("feature/x"),
-        "tool result should contain the branch name; got:\n{result_text}"
-    );
-    assert!(
-        !result_text.contains("error") || result_text.contains("feature/x"),
-        "tool result should not be an error; got:\n{result_text}"
+        result_text.contains("fixture-label"),
+        "tool result should contain the label; got:\n{result_text}"
     );
 
-    // With `-C <repo>`, relative path `./worktrees/feature-x` is resolved from the repo root.
-    // The workdir is repo/workdir/<session_id>, so the worktree lands at repo/worktrees/feature-x.
-    let worktree_path = repo.join("worktrees").join("feature-x");
-    assert!(
-        worktree_path.exists(),
-        "worktree should exist at {:?}",
-        worktree_path
+    // The real side effect, on disk where the tool's CWD put it.
+    let created = workdir.join("made").join("here");
+    assert!(created.is_dir(), "directory should exist at {created:?}");
+    assert_eq!(
+        fs::read_to_string(created.join("label.txt")).unwrap(),
+        "fixture-label"
     );
-
-    // Confirm it's on the right branch
-    let branch_out = Command::new("git")
-        .args(["-C", worktree_path.to_str().unwrap(), "branch", "--show-current"])
-        .output()
-        .unwrap();
-    let checked_out = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
-    assert_eq!(checked_out, branch, "worktree should be on branch {branch}");
 }
 
-/// Test 2: create_worktree with branch already checked out → tool result contains "already checked out".
+/// Test 2: a tool that reports `status: failed` surfaces its summary as the tool result,
+/// and its refusal leaves the conflicting path untouched.
 ///
-/// For an error result, the runtime sends the summary as the tool result text (data is null).
+/// For a failure the fixture tool emits a null `data`, so the runtime falls back to
+/// `summary` as the tool result text.
 #[test]
-fn git_tool_create_worktree_branch_conflict() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_create_worktree_branch_conflict: binary not available");
-            return;
-        }
-    };
-
+fn native_tool_dispatch_reports_failure_for_existing_path() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
-
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
-
-    let repo = init_git_repo(project.path());
-    let branch = "feature/x";
-    Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
-
-    // Pre-create a worktree for the branch so conflict is guaranteed.
-    // The binary runs from workdir (inside repo), so `git worktree list` will find this.
-    Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "worktree", "add", "./existing", branch])
-        .status()
-        .unwrap();
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!(
+            "[SKIP] native_tool_dispatch_reports_failure_for_existing_path: fixture tool \
+             not available"
+        );
+        return;
+    }
 
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
             "toolu_conflict",
-            GIT_TOOL_NAME,
+            TOOL_NAME,
             json!({
-                "operation": "create_worktree",
-                "path": "./worktrees/feature-x",
-                "branch": branch,
+                "operation": "create_dir",
+                "path": "./occupied",
+                "label": "should-not-be-written",
             }),
         ),
-        end_turn_response("Got an error, branch is already checked out."),
+        end_turn_response("Got an error, the path already exists."),
     ]);
 
-    let staged = stage_git_tool_session(&home, &repo, &server.endpoint);
+    // Stage first to learn the workdir, then occupy the target path inside it.
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-    fs::write(workdir.join("task.md"), "Try to create worktree on feature/x.").unwrap();
+    let occupied = workdir.join("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("pre-existing.txt"), "untouched\n").unwrap();
+    fs::write(workdir.join("task.md"), "Try to create ./occupied.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result = find_tool_result(&requests, "toolu_conflict")
-        .expect("tool_result block should exist");
-
-    // For an error, data is null so the runtime falls back to summary as the result text.
+    let tool_result =
+        find_tool_result(&requests, "toolu_conflict").expect("tool_result block should exist");
     let result_text = extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("already checked out"),
-        "error should mention 'already checked out'; got:\n{result_text}"
+        result_text.contains("already exists"),
+        "error should mention 'already exists'; got:\n{result_text}"
     );
 
-    // Confirm the conflict target path was not created
+    // The refusal must not have written anything into the occupied directory.
     assert!(
-        !workdir.join("worktrees").join("feature-x").exists(),
-        "duplicate worktree path should not have been created"
+        !occupied.join("label.txt").exists(),
+        "a refused create_dir must not write its label"
+    );
+    assert_eq!(
+        fs::read_to_string(occupied.join("pre-existing.txt")).unwrap(),
+        "untouched\n"
     );
 }
 
-/// Test 3: status operation returns structured entries for modified files.
-///
-/// Stage first to learn the workdir path, then create the worktree AT that path
-/// so the binary can access it via `./wt-status` relative to its CWD (workdir).
+/// Test 3: an operation that reads the filesystem returns structured entries through
+/// dispatch, addressed by a `path` relative to the tool's CWD (the session workdir).
 #[test]
-fn git_tool_status_returns_entries() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_status_returns_entries: binary not available");
-            return;
-        }
-    };
-
+fn native_tool_dispatch_lists_entries() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
-
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
-
-    let repo = init_git_repo(project.path());
-    let branch = "feature/status";
-    Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!("[SKIP] native_tool_dispatch_lists_entries: fixture tool not available");
+        return;
+    }
 
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
-            "toolu_status",
-            GIT_TOOL_NAME,
+            "toolu_list",
+            TOOL_NAME,
             json!({
-                "operation": "status",
-                "path": "./wt-status",
+                "operation": "list_entries",
+                "path": "./listing",
             }),
         ),
-        end_turn_response("Got status with modified files."),
+        end_turn_response("Listed the directory."),
     ]);
 
-    // Stage first to learn the workdir path.
-    let staged = stage_git_tool_session(&home, &repo, &server.endpoint);
+    // Stage first to learn the workdir path, then populate the directory inside it.
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-
-    // Create worktree AT the workdir-relative path so the binary can access ./wt-status.
-    // The workdir is inside the repo, so git worktree add works by traversing up to the repo root.
-    Command::new("git")
-        .args([
-            "worktree", "add",
-            workdir.join("wt-status").to_str().unwrap(),
-            branch,
-        ])
-        .current_dir(&repo)
-        .status()
-        .expect("git worktree add should succeed");
-
-    // Modify a file in the worktree so status has something to report.
-    fs::write(workdir.join("wt-status").join("README.md"), "modified\n").unwrap();
-
-    fs::write(workdir.join("task.md"), "Check status of ./wt-status.").unwrap();
+    let listing = workdir.join("listing");
+    fs::create_dir_all(&listing).unwrap();
+    fs::write(listing.join("alpha.txt"), "a\n").unwrap();
+    fs::write(listing.join("beta.txt"), "b\n").unwrap();
+    fs::write(workdir.join("task.md"), "List ./listing.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result = find_tool_result(&requests, "toolu_status").expect("tool_result");
-    // Runtime sends data || summary as the tool result text.
-    // For a successful status, data contains the entries JSON.
+    let tool_result = find_tool_result(&requests, "toolu_list").expect("tool_result");
     let result_text = extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("modified"),
-        "result should mention modified; got:\n{result_text}"
-    );
-    assert!(
-        result_text.contains("README.md"),
-        "result should include README.md; got:\n{result_text}"
+        result_text.contains("alpha.txt") && result_text.contains("beta.txt"),
+        "result should list both entries; got:\n{result_text}"
     );
 }
 
-/// Test 4: status returns modified files in a worktree.
+/// Test 4: the same read operation addressed by `repo` instead of `path`.
 ///
-/// Migrated from `list_files` (dropped from v1 dispatch table — not in scope).
-/// The original test verified that `git ls-files` returned tracked files; this
-/// version verifies that `status` reports a modified tracked file instead, which
-/// covers the same intent with the in-scope operation.
-///
-/// Stage first to learn the workdir path, then create the worktree AT that path
-/// so the binary can access it via `./wt-files` relative to its CWD (workdir).
+/// `repo` is the field the model has to learn about from the schema (test 8), so this
+/// keeps a dispatch case that actually travels through it rather than through `path`.
 #[test]
-fn git_tool_list_files() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_list_files (migrated to status): binary not available");
-            return;
-        }
-    };
-
+fn native_tool_dispatch_lists_entries_with_repo_base() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!(
+            "[SKIP] native_tool_dispatch_lists_entries_with_repo_base: fixture tool not available"
+        );
+        return;
+    }
 
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
-
-    let repo = init_git_repo(project.path());
-    let branch = "feature/files";
-    Command::new("git")
-        .args(["-C", repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
-
-    // Migrated: use `status` with `repo` instead of `list_files` with `path`.
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
-            "toolu_files",
-            GIT_TOOL_NAME,
+            "toolu_repo_list",
+            TOOL_NAME,
             json!({
-                "operation": "status",
-                "repo": "./wt-files",
+                "operation": "list_entries",
+                "repo": "./base",
             }),
         ),
-        end_turn_response("Got status with modified files."),
+        end_turn_response("Listed the base directory."),
     ]);
 
-    // Stage first to learn the workdir path.
-    let staged = stage_git_tool_session(&home, &repo, &server.endpoint);
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-
-    // Create worktree AT the workdir-relative path so the binary can access ./wt-files.
-    Command::new("git")
-        .args([
-            "worktree", "add",
-            workdir.join("wt-files").to_str().unwrap(),
-            branch,
-        ])
-        .current_dir(&repo)
-        .status()
-        .expect("git worktree add should succeed");
-
-    // Modify README.md so status has something to report (list_files listed all tracked
-    // files; status only shows changed files, so we need at least one change).
-    fs::write(workdir.join("wt-files").join("README.md"), "modified\n").unwrap();
-
-    fs::write(workdir.join("task.md"), "Check status of ./wt-files.").unwrap();
+    let base = workdir.join("base");
+    fs::create_dir_all(&base).unwrap();
+    fs::write(base.join("gamma.txt"), "g\n").unwrap();
+    fs::write(workdir.join("task.md"), "List ./base.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result = find_tool_result(&requests, "toolu_files").expect("tool_result");
+    let tool_result = find_tool_result(&requests, "toolu_repo_list").expect("tool_result");
     let result_text = extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("README.md"),
-        "result should include README.md; got:\n{result_text}"
+        result_text.contains("gamma.txt"),
+        "result should include gamma.txt; got:\n{result_text}"
     );
 }
 
-/// Test 5: create_worktree with an explicit `repo` field pointing to a repo that is NOT the
-/// capsule workdir confirms that `-C <repo>` drives the operation rather than CWD discovery.
+/// Test 5: an explicit `repo` outside the capsule workdir drives the operation, rather
+/// than the tool's CWD.
 ///
-/// The capsule project dir is a plain temp dir (no git repo), so auto-discovery would fail.
-/// The explicit `repo` field makes the operation succeed regardless.
+/// The target directory lives in a separate temp dir the capsule knows nothing about, so
+/// the effect can only land there if `repo` was honoured.
 #[test]
-fn git_tool_create_worktree_with_explicit_repo() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_create_worktree_with_explicit_repo: binary not available");
-            return;
-        }
-    };
-
+fn native_tool_dispatch_with_explicit_repo() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
-    // Project dir is NOT a git repo — auto-discovery would fail here.
     let project = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
 
-    // Create a SEPARATE git repo outside the capsule project dir.
-    let separate = TempDir::new().unwrap();
-    let target_repo = init_git_repo(separate.path());
-    let branch = "feature/explicit";
-    Command::new("git")
-        .args(["-C", target_repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
-
-    // Worktree will be created at this absolute path (sibling of the repo dir).
-    let worktree_path = separate.path().join("wt-explicit");
-
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
-
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!("[SKIP] native_tool_dispatch_with_explicit_repo: fixture tool not available");
+        return;
+    }
 
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
             "toolu_explicit",
-            GIT_TOOL_NAME,
+            TOOL_NAME,
             json!({
-                "operation": "create_worktree",
-                "repo": target_repo.to_str().unwrap(),
-                "path": worktree_path.to_str().unwrap(),
-                "branch": branch,
+                "operation": "create_dir",
+                "repo": outside.path().to_str().unwrap(),
+                "path": "made-outside",
+                "label": "explicit-repo",
             }),
         ),
-        end_turn_response("Worktree created with explicit repo."),
+        end_turn_response("Directory created with an explicit repo."),
     ]);
 
-    // Stage with the non-git project dir — binary's CWD is inside project, not target_repo.
-    let staged = stage_git_tool_session(&home, project.path(), &server.endpoint);
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-    fs::write(workdir.join("task.md"), "Create a worktree with explicit repo.").unwrap();
+    fs::write(workdir.join("task.md"), "Create a directory with an explicit repo.").unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "expected 2 LLM requests, got {}", requests.len());
 
-    let tool_result = find_tool_result(&requests, "toolu_explicit")
-        .expect("tool_result block should exist");
+    let tool_result =
+        find_tool_result(&requests, "toolu_explicit").expect("tool_result block should exist");
     let result_text = extract_result_text(&tool_result);
 
     assert!(
-        result_text.contains("wt-explicit") || result_text.contains("explicit"),
-        "tool result should mention the worktree; got:\n{result_text}"
-    );
-    assert!(
-        !result_text.to_lowercase().starts_with("error"),
-        "tool result should not be an error; got:\n{result_text}"
+        result_text.contains("made-outside"),
+        "tool result should mention the created directory; got:\n{result_text}"
     );
 
-    // Confirm worktree exists at the absolute path we specified.
-    assert!(
-        worktree_path.exists(),
-        "worktree should exist at {:?}",
-        worktree_path
+    let created = outside.path().join("made-outside");
+    assert!(created.is_dir(), "directory should exist at {created:?}");
+    assert_eq!(
+        fs::read_to_string(created.join("label.txt")).unwrap(),
+        "explicit-repo"
     );
-
-    let branch_out = Command::new("git")
-        .args(["-C", worktree_path.to_str().unwrap(), "branch", "--show-current"])
-        .output()
-        .unwrap();
-    let checked_out = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
-    assert_eq!(checked_out, branch, "worktree should be on branch {branch}");
+    assert!(
+        !workdir.join("made-outside").exists(),
+        "with an explicit repo nothing should have been created relative to the CWD"
+    );
 }
 
-/// Test 6: when MURMUR_FILESYSTEM_ALLOW is set and the repo path is outside every allowed
-/// prefix, the tool returns ok=false with a message referencing `filesystem.allow`.
+/// Test 6: when MURMUR_FILESYSTEM_ALLOW is set and the `repo` path is outside every
+/// allowed prefix, the tool refuses and says which mechanism refused it.
 ///
 /// Uses direct binary invocation to set the env var without cross-test contamination.
-///
-/// NOTE: assertions use the `ok`/`message` fields of the binary's JSON protocol.
-/// A previous version of the binary emitted `status`/`summary` (old wrapper format);
-/// the current source uses `ok`/`message`/`error_kind`.
+/// The runtime does not enforce `filesystem.allow` — a native tool that wants that
+/// boundary self-enforces it, and this is the coverage that the pattern works.
 #[test]
-fn git_tool_create_worktree_repo_not_in_allow_list() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_create_worktree_repo_not_in_allow_list: binary not available");
-            return;
-        }
+fn native_tool_repo_not_in_allow_list() {
+    let Some(binary) = common::fixture_native_tool_binary() else {
+        eprintln!("[SKIP] native_tool_repo_not_in_allow_list: fixture tool not available");
+        return;
     };
 
-    let repo_dir = TempDir::new().unwrap();
-    let target_repo = init_git_repo(repo_dir.path());
-
-    // Allow list points to a completely different temp dir — repo is not under it.
+    let target = TempDir::new().unwrap();
+    // Allow list points at a completely different temp dir — the repo is not under it.
     let other = TempDir::new().unwrap();
     let allow_val = other.path().to_str().unwrap().to_string();
 
-    let result = invoke_git_tool_directly(
+    let result = invoke_native_tool_directly(
         &binary,
         json!({
-            "operation": "create_worktree",
-            "repo": target_repo.to_str().unwrap(),
-            "path": repo_dir.path().join("wt-blocked").to_str().unwrap(),
-            "branch": "main",
+            "operation": "create_dir",
+            "repo": target.path().to_str().unwrap(),
+            "path": "blocked",
         }),
         &[("MURMUR_FILESYSTEM_ALLOW", &allow_val)],
     );
 
     assert_eq!(
-        result["ok"],
-        false,
-        "should return ok=false when repo is outside allow list; got: {result:?}"
+        result["status"], "failed",
+        "should fail when repo is outside the allow list; got: {result:?}"
     );
-    let message = result["message"].as_str().unwrap_or("");
+    let summary = result["summary"].as_str().unwrap_or("");
     assert!(
-        message.contains("filesystem.allow"),
-        "error message should reference filesystem.allow; got: {message}"
+        summary.contains("filesystem.allow"),
+        "message should reference filesystem.allow; got: {summary}"
+    );
+    assert!(
+        !target.path().join("blocked").exists(),
+        "a refused operation must not touch the filesystem"
     );
 }
 
-/// Test 7: when MURMUR_FILESYSTEM_ALLOW is set and the repo path IS within an allowed prefix,
-/// the operation succeeds and the worktree is created on disk.
-///
-/// Uses direct binary invocation to set the env var without cross-test contamination.
-///
-/// NOTE: assertions use the `ok` field of the binary's JSON protocol.
-/// A previous version of the binary emitted `status`/`summary` (old wrapper format);
-/// the current source uses `ok`/`message`/`error_kind`.
+/// Test 7: when MURMUR_FILESYSTEM_ALLOW is set and the `repo` path IS within an allowed
+/// prefix, the operation succeeds and its on-disk effect is really there.
 #[test]
-fn git_tool_create_worktree_repo_in_allow_list() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_create_worktree_repo_in_allow_list: binary not available");
-            return;
-        }
+fn native_tool_repo_in_allow_list() {
+    let Some(binary) = common::fixture_native_tool_binary() else {
+        eprintln!("[SKIP] native_tool_repo_in_allow_list: fixture tool not available");
+        return;
     };
 
-    let repo_dir = TempDir::new().unwrap();
-    let target_repo = init_git_repo(repo_dir.path());
-    let branch = "feature/allowlisted";
-    Command::new("git")
-        .args(["-C", target_repo.to_str().unwrap(), "branch", branch])
-        .status()
-        .unwrap();
+    let parent = TempDir::new().unwrap();
+    let target = parent.path().join("repo");
+    fs::create_dir_all(&target).unwrap();
 
-    let wt_path = repo_dir.path().join("wt-allowed");
-    // Allow list contains repo_dir (parent of target_repo) — repo IS under this prefix.
-    let allow_val = repo_dir.path().to_str().unwrap().to_string();
+    // Allow list contains the parent of the target — the repo IS under this prefix.
+    let allow_val = parent.path().to_str().unwrap().to_string();
 
-    let result = invoke_git_tool_directly(
+    let result = invoke_native_tool_directly(
         &binary,
         json!({
-            "operation": "create_worktree",
-            "repo": target_repo.to_str().unwrap(),
-            "path": wt_path.to_str().unwrap(),
-            "branch": branch,
+            "operation": "create_dir",
+            "repo": target.to_str().unwrap(),
+            "path": "allowed",
+            "label": "in-allow-list",
         }),
         &[("MURMUR_FILESYSTEM_ALLOW", &allow_val)],
     );
 
     assert_eq!(
-        result["ok"],
-        true,
-        "should return ok=true when repo is within allow list; got: {result:?}"
+        result["status"], "passed",
+        "should succeed when repo is within the allow list; got: {result:?}"
     );
-    assert!(
-        wt_path.exists(),
-        "worktree should exist at {:?}",
-        wt_path
+    let created = target.join("allowed");
+    assert!(created.is_dir(), "directory should exist at {created:?}");
+    assert_eq!(
+        fs::read_to_string(created.join("label.txt")).unwrap(),
+        "in-allow-list"
     );
 }
 
-/// Test 8: the tool manifest exposes an input_schema that includes `repo` as a named property.
+/// Test 8: the tool manifest's `input_schema` reaches the model as `input_schema`.
 ///
-/// This is the end-to-end path that caught the original production bug: the schema is read
-/// from the artifact zip's murmur.yaml, converted by build_tool_inventory, serialised by
-/// the Anthropic driver into `input_schema`, and sent to the model in the first API request.
-/// Without `repo` in the schema the model never passes it, and the tool silently falls back
-/// to CWD discovery, which fails when the capsule is not running from inside a git repo.
+/// This is the end-to-end path that caught the original production bug: the schema is
+/// read from the artifact zip's murmur.yaml, converted by build_tool_inventory, serialised
+/// by the Anthropic driver into `input_schema`, and sent to the model in the first API
+/// request. Without `repo` in the schema the model never passes it, and the tool silently
+/// falls back to CWD discovery.
+///
+/// The assertion is on named properties, not on the presence of `input_schema`: the bug
+/// that motivated this test was a fixture that packed a stub manifest with no schema at
+/// all, which read back as an empty object and made every softer assertion vacuous.
 #[test]
-fn git_tool_schema_includes_repo_field() {
-    let binary = match git_tool_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("[SKIP] git_tool_schema_includes_repo_field: binary not available");
-            return;
-        }
-    };
-
+fn native_tool_schema_includes_repo_field() {
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
 
-    let driver = common::create_driver_artifact(
-        artifact_dir.path(),
-        DRIVER_NAME,
-        DRIVER_VERSION,
-        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
-    );
-    common::publish_local(&home, &driver).success();
-
-    let git_artifact = create_git_tool_artifact(artifact_dir.path(), &binary);
-    publish_git_tool(&home, &git_artifact);
+    if publish_driver_and_fixture_tool(&home, artifact_dir.path()).is_none() {
+        eprintln!("[SKIP] native_tool_schema_includes_repo_field: fixture tool not available");
+        return;
+    }
 
     // One end_turn response is enough — we only need the first request to the model,
     // which carries the tools array.
-    let server = common::ScriptedServer::start(vec![
-        end_turn_response("done"),
-    ]);
+    let server = common::ScriptedServer::start(vec![end_turn_response("done")]);
 
-    let staged = stage_git_tool_session(&home, project.path(), &server.endpoint);
+    let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
     fs::write(workdir.join("task.md"), "no-op").unwrap();
 
@@ -992,13 +808,13 @@ fn git_tool_schema_includes_repo_field() {
         .and_then(|t| t.as_array())
         .expect("first request should contain a tools array");
 
-    let git_tool = tools
+    let tool = tools
         .iter()
-        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(GIT_TOOL_NAME))
-        .expect("murmur-tool-git should appear in the tools array");
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(TOOL_NAME))
+        .unwrap_or_else(|| panic!("{TOOL_NAME} should appear in the tools array: {tools:?}"));
 
     // The Anthropic driver maps inventory `parameters` → `input_schema` in the API call.
-    let properties = git_tool
+    let properties = tool
         .get("input_schema")
         .and_then(|s| s.get("properties"))
         .expect("tool should have input_schema.properties");
@@ -1010,7 +826,7 @@ fn git_tool_schema_includes_repo_field() {
     );
     assert!(properties.get("operation").is_some(), "schema must include 'operation'");
     assert!(properties.get("path").is_some(), "schema must include 'path'");
-    assert!(properties.get("branch").is_some(), "schema must include 'branch'");
+    assert!(properties.get("label").is_some(), "schema must include 'label'");
 }
 
 // ── Slice 2 helpers ───────────────────────────────────────────────────────────
@@ -1034,7 +850,7 @@ fn make_commit(repo: &Path, filename: &str, content: &str, message: &str) -> Str
 
 /// Convenience wrapper: invoke binary with no extra env vars.
 fn invoke_tool(binary: &Path, data: Value) -> Value {
-    invoke_git_tool_directly(binary, data, &[])
+    invoke_native_tool_directly(binary, data, &[])
 }
 
 // ── Slice 2 tests: COMMITS ────────────────────────────────────────────────────
