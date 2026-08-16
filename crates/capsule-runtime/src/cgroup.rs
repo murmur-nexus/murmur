@@ -40,6 +40,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::resources::HostResourceLimits;
 
@@ -297,10 +298,21 @@ fn parse_event_counter(contents: &str, key: &str) -> u64 {
 }
 
 /// Turn a session id into a directory name safe to create under the delegated base: everything
-/// outside `[A-Za-z0-9._-]` becomes `_`. Session ids are runtime-generated today, so this is a
-/// belt-and-braces guard against a future id source rather than a live escape vector.
+/// outside `[A-Za-z0-9._-]` becomes `_`.
+///
+/// The name is also made unique per scope, with the pid and a per-process serial. The id alone
+/// cannot carry that: `plan::execute` passes the plan's *authored* id, so two plans running
+/// concurrently in one process would otherwise land on the same directory — and because
+/// [`CgroupScope`]'s `Drop` removes the scope by path, the first to finish would delete a cgroup
+/// the other is still bounded by, leaving that subprocess tree unbounded. Sanitizing stays a
+/// belt-and-braces guard against a hostile id rather than a live escape vector.
+///
+/// Operators still find scopes by the documented `murmur-*` glob.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn scope_dir_name(session_id: &str) -> String {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let sanitized: String = session_id
         .chars()
         .map(|c| {
@@ -311,10 +323,11 @@ fn scope_dir_name(session_id: &str) -> String {
             }
         })
         .collect();
+    let pid = std::process::id();
     if sanitized.is_empty() {
-        format!("murmur-{}", std::process::id())
+        format!("murmur-{pid}-{serial}")
     } else {
-        format!("murmur-{sanitized}")
+        format!("murmur-{sanitized}-{pid}-{serial}")
     }
 }
 
@@ -385,8 +398,7 @@ impl CgroupScope {
         session_id: &str,
         workdir: &Path,
     ) -> Result<Self, String> {
-        let base = probe_delegation()?;
-        enable_controllers(&base)?;
+        let base = delegated_base()?;
 
         let path = base.join(scope_dir_name(session_id));
         if let Err(error) = std::fs::create_dir(&path) {
@@ -476,6 +488,36 @@ impl CgroupScope {
     }
 }
 
+/// The delegated cgroup root this process creates its scopes under, resolved once.
+///
+/// [`probe_delegation`] derives the root from `/proc/self/cgroup`, but establishing the first
+/// scope may move this process into `<root>/murmur-supervisor` to vacate the root — cgroup v2
+/// forbids a cgroup from both holding processes and enabling controllers for its children. Once
+/// that move has happened the process's own cgroup is no longer the delegated root, so
+/// re-deriving it per call mistakes the leaf for the root and nests one level deeper every time,
+/// until the nested leaf has no delegated controllers at all and every further session is
+/// refused. Any process that opens a second session — concurrently or in sequence — hits this.
+///
+/// Resolving once, under a lock, keeps every scope a sibling directly under the real root, and
+/// makes concurrent first-callers agree on that root instead of racing to relocate each other.
+/// Only success is cached: a host that is not delegated must keep reporting so on every attempt.
+#[cfg(target_os = "linux")]
+fn delegated_base() -> Result<PathBuf, String> {
+    static BASE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    // A poisoned lock guards no invariant worth honouring here: the cache is either populated or
+    // it is not, and a caller that panicked cannot have left it half-written.
+    let mut cached = BASE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(base) = cached.as_ref() {
+        return Ok(base.clone());
+    }
+
+    let base = probe_delegation()?;
+    enable_controllers(&base)?;
+    *cached = Some(base.clone());
+    Ok(base)
+}
+
 /// Locate the delegated cgroup v2 directory this process may create children under, confirming
 /// the controllers this runtime needs are actually available there.
 ///
@@ -497,7 +539,7 @@ fn probe_delegation() -> Result<PathBuf, String> {
         .map(|contents| parse_cgroup2_mount(&contents))
         .unwrap_or_else(|_| DEFAULT_CGROUP2_MOUNT.to_string());
 
-    let base = PathBuf::from(mount).join(relative.trim_start_matches('/'));
+    let base = ascend_out_of_supervisor_leaves(PathBuf::from(mount).join(relative.trim_start_matches('/')));
     if !base.is_dir() {
         return Err(format!(
             "delegated cgroup directory {} does not exist",
@@ -572,14 +614,59 @@ fn enable_controllers(base: &Path) -> Result<(), String> {
     }
 
     move_self_to_supervisor_leaf(base)?;
-    std::fs::write(&subtree_control, format!("{directive}\n")).map_err(|error| {
-        format!(
-            "could not enable controllers [{}] in {} ({error}); the unit `mur` runs under needs \
-             `Delegate=yes` for memory, pids, cpu and io",
-            missing.join(", "),
-            subtree_control.display()
-        )
-    })
+
+    // Stepping aside vacates *this* process, and cgroup v2 refuses the write while the base holds
+    // any task at all. When several murmur processes share a base — a test binary and the `mur`
+    // children it spawns, or two capsules launched together — each is independently discovering
+    // it must step aside, so the first write after our own move can still hit `EBUSY` on peers
+    // that have not moved yet. Retrying briefly lets the group finish draining; a peer that wins
+    // the race and enables the controllers first is just as good, which is why the loop re-reads
+    // `subtree_control` rather than only retrying the write.
+    //
+    // Bounded, because a task that never leaves is a genuine misconfiguration and has to surface
+    // as one rather than hang the launch.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut last_error = None;
+    loop {
+        let current = std::fs::read_to_string(&subtree_control).unwrap_or_default();
+        if missing_controllers(&current, &wanted).is_empty() {
+            return Ok(());
+        }
+        match std::fs::write(&subtree_control, format!("{directive}\n")) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Err(format!(
+        "could not enable controllers [{}] in {} ({}); the unit `mur` runs under needs \
+         `Delegate=yes` for memory, pids, cpu and io",
+        missing.join(", "),
+        subtree_control.display(),
+        last_error.map_or_else(|| "still occupied".to_string(), |error| error.to_string()),
+    ))
+}
+
+/// Walk up out of any `murmur-supervisor` leaves the path ends in.
+///
+/// The leaf is where a murmur process steps aside so controllers can be enabled on the delegated
+/// base. Every process it then spawns *inherits that leaf as its own cgroup* — so a `mur`
+/// subprocess reading `/proc/self/cgroup` would take the leaf for its delegated base and step
+/// aside again inside it, one level deeper per generation, until the innermost leaf has no
+/// controllers delegated to it at all and every launch below that point is refused.
+///
+/// Ascending here makes every generation agree on the same real base, which is also what lets
+/// them share one scope parent rather than fragmenting the delegation.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn ascend_out_of_supervisor_leaves(mut base: PathBuf) -> PathBuf {
+    while base.file_name().and_then(|name| name.to_str()) == Some(SUPERVISOR_LEAF) {
+        base.pop();
+    }
+    base
 }
 
 /// Move this process into `<base>/murmur-supervisor`, creating it if needed.
@@ -751,9 +838,39 @@ mod tests {
 
     #[test]
     fn scope_dir_name_is_sanitized_and_never_empty() {
-        assert_eq!(scope_dir_name("ses_abc123"), "murmur-ses_abc123");
-        assert_eq!(scope_dir_name("../escape"), "murmur-.._escape");
+        assert!(scope_dir_name("ses_abc123").starts_with("murmur-ses_abc123-"));
+        assert!(scope_dir_name("../escape").starts_with("murmur-.._escape-"));
+        assert!(!scope_dir_name("../escape").contains('/'));
         assert!(scope_dir_name("").starts_with("murmur-"));
+    }
+
+    /// A subprocess inherits its parent's cgroup, so a `mur` spawned by a runtime that already
+    /// stepped aside starts life *inside* the supervisor leaf. Reading that as its delegated base
+    /// would nest another leaf inside it, one per generation, until nothing is delegated.
+    #[test]
+    fn delegated_base_ascends_out_of_inherited_supervisor_leaves() {
+        let base = PathBuf::from("/sys/fs/cgroup/user.slice/app.slice/mur.scope");
+
+        assert_eq!(ascend_out_of_supervisor_leaves(base.clone()), base);
+        assert_eq!(
+            ascend_out_of_supervisor_leaves(base.join(SUPERVISOR_LEAF)),
+            base
+        );
+        assert_eq!(
+            ascend_out_of_supervisor_leaves(base.join(SUPERVISOR_LEAF).join(SUPERVISOR_LEAF)),
+            base,
+            "a base already nested by an earlier build must still resolve to the real root"
+        );
+    }
+
+    /// Two scopes must never share a directory even when handed the same id: `Drop` removes the
+    /// scope by path, so a collision would have one session delete the cgroup still bounding
+    /// another's subprocess tree.
+    #[test]
+    fn scope_dir_name_is_unique_per_call_for_one_id() {
+        let first = scope_dir_name("p");
+        let second = scope_dir_name("p");
+        assert_ne!(first, second, "same plan id must not reuse a scope directory");
     }
 
     #[test]

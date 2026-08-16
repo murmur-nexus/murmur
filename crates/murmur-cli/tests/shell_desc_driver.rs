@@ -102,7 +102,6 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )
@@ -199,7 +198,6 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )
@@ -300,7 +298,6 @@ fn shell_desc_driver_respects_custom_manifest() {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )

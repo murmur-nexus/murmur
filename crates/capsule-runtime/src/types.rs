@@ -258,10 +258,6 @@ pub struct StageRequest {
     /// binds strictly to this port and errors if it is already in use. When `None`, the OS
     /// assigns a port.
     pub internal_port: Option<u16>,
-    /// Job ID assigned by mur-roost for this capsule instance. Injected as MURMUR_JOB_ID so
-    /// spawned child capsules can set `spawned_by` when calling POST /spawn on mur-roost.
-    /// None when not launched via mur-roost (direct CLI, tests).
-    pub job_id: Option<String>,
     /// Minimum containment class this session must achieve, already combined across every
     /// source that asked for one (manifest / workspace config / `--containment`) by taking the
     /// strongest. Required rather than optional: "nobody declared anything" is
@@ -312,8 +308,6 @@ pub struct StagedSession {
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).
     pub(crate) internal_port: Option<u16>,
-    /// Job ID from mur-roost (copied from StageRequest::job_id).
-    pub(crate) job_id: Option<String>,
     /// Floor this session was staged against (copied from
     /// StageRequest::declared_containment_floor).
     pub(crate) declared_containment_floor: murmur_artifact::ContainmentClass,

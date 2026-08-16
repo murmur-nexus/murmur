@@ -1,4 +1,13 @@
+// Integration tests for `mur topology`.
+//
+// `topology` is gated twice: by the `beta-mur-topology` Cargo feature at compile time, and by
+// `beta.enabled` in the user's config at run time. Both have to be satisfied or the binary
+// answers with a clap-shaped `unrecognized subcommand 'topology'` — so this file is compiled
+// only under the feature, and every invocation runs against a `HOME` whose config opts in.
+#![cfg(feature = "beta-mur-topology")]
+
 use std::{
+    fs,
     io::{Read, Write},
     net::TcpListener,
     path::PathBuf,
@@ -9,8 +18,23 @@ use std::{
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-fn mur() -> Command {
-    Command::cargo_bin("mur").unwrap()
+/// A `mur` bound to a throwaway `HOME` that has the `mur-topology` beta switched on.
+///
+/// The `TempDir` is returned alongside the command because it has to outlive the run — dropping
+/// it deletes the config the binary is about to read.
+fn mur() -> (Command, TempDir) {
+    let home = TempDir::new().unwrap();
+    let config_dir = home.path().join(".murmur");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.yaml"),
+        "beta:\n  enabled:\n    - mur-topology\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("mur").unwrap();
+    cmd.env("HOME", home.path());
+    (cmd, home)
 }
 
 // ── Mock Tempo server ─────────────────────────────────────────────────────────
@@ -145,16 +169,16 @@ fn topology_graph_reconstruction_single_node() {
     let tmp = TempDir::new().unwrap();
     let output: PathBuf = tmp.path().join("topology.html");
 
-    mur()
-        .args([
-            "topology",
-            "--otel-endpoint",
-            &endpoint,
-            "--output",
-            output.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let (mut cmd, _home) = mur();
+    cmd.args([
+        "topology",
+        "--otel-endpoint",
+        &endpoint,
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
 
     let html = std::fs::read_to_string(&output).unwrap();
     assert!(html.contains("capsule-a"), "HTML must contain capsule name");
@@ -191,16 +215,16 @@ fn topology_graph_parent_child_edge() {
     let tmp = TempDir::new().unwrap();
     let output: PathBuf = tmp.path().join("topology.html");
 
-    mur()
-        .args([
-            "topology",
-            "--otel-endpoint",
-            &endpoint,
-            "--output",
-            output.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let (mut cmd, _home) = mur();
+    cmd.args([
+        "topology",
+        "--otel-endpoint",
+        &endpoint,
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
 
     let html = std::fs::read_to_string(&output).unwrap();
     assert!(html.contains("capsule-a"), "must contain capsule-a");
@@ -235,16 +259,16 @@ fn topology_node_color_by_exit_status() {
     let tmp = TempDir::new().unwrap();
     let output: PathBuf = tmp.path().join("topology.html");
 
-    mur()
-        .args([
-            "topology",
-            "--otel-endpoint",
-            &endpoint,
-            "--output",
-            output.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let (mut cmd, _home) = mur();
+    cmd.args([
+        "topology",
+        "--otel-endpoint",
+        &endpoint,
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
 
     let html = std::fs::read_to_string(&output).unwrap();
 
@@ -274,8 +298,8 @@ fn topology_cli_error_on_unreachable_endpoint() {
     };
     let endpoint = format!("http://127.0.0.1:{port}");
 
-    mur()
-        .args(["topology", "--otel-endpoint", &endpoint])
+    let (mut cmd, _home) = mur();
+    cmd.args(["topology", "--otel-endpoint", &endpoint])
         .assert()
         .failure()
         .stderr(predicates::str::contains(&endpoint));
@@ -294,16 +318,16 @@ fn topology_empty_search_result_renders_empty_graph_message() {
     let tmp = TempDir::new().unwrap();
     let output: PathBuf = tmp.path().join("topology.html");
 
-    mur()
-        .args([
-            "topology",
-            "--otel-endpoint",
-            &endpoint,
-            "--output",
-            output.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    let (mut cmd, _home) = mur();
+    cmd.args([
+        "topology",
+        "--otel-endpoint",
+        &endpoint,
+        "--output",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success();
 
     let html = std::fs::read_to_string(&output).unwrap();
     assert!(

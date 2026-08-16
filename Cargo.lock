@@ -1471,7 +1471,6 @@ dependencies = [
  "murmur-artifact",
  "serde",
  "serde_json",
- "uuid",
 ]
 
 [[package]]

@@ -128,12 +128,12 @@ After each group completes, level-2 items collapse. SSH disappears when the firs
   │  ∞  my-agent                            │
   │                                          │
   │  url   http://1.2.3.4:9000            │
-  │  job   job_01954a3b                    │
+  │  dep   dep_01954a3b                    │
   │  time  47s                             │
   └──────────────────────────────────────────┘
 ```
 
-All output goes to **stderr**. Save the `job_id` from the box — you will need it for `mur ps` and `mur destroy`.
+All output goes to **stderr**. Save the deployment ID from the box — you will need it for `mur ps` and `mur destroy`.
 
 ### All flags
 
@@ -227,9 +227,9 @@ mur ps
 ```
 
 ```text
-JOB_ID                                  PROVIDER    IP            STATUS      URL
+DEPLOYMENT_ID                           PROVIDER    IP            STATUS      URL
 ----------------------------------------------------------------------------------------------------
-job_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c  manual      1.2.3.4       running     http://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c  manual      1.2.3.4       running     http://1.2.3.4:9000
 ```
 
 All active deployments are stored in `~/.murmur/deployments.json`. Each row maps to one entry.
@@ -241,7 +241,7 @@ All active deployments are stored in `~/.murmur/deployments.json`. Each row maps
 When you no longer need a deployment, remove it from the tracking list:
 
 ```bash
-mur destroy job_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c
+mur destroy dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c
 ```
 
 This removes the entry from `~/.murmur/deployments.json`. It does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.
@@ -340,7 +340,7 @@ CARGO_PROFILE_DEV_DEBUG=0 cargo build --release \
 |---|---|
 | Command | `mur deploy --host <IP> --manifest <path>` |
 | Progress | All steps shown upfront as pending; each activates in turn; artifact downloads show bytes/total bar; artifact uploads run in parallel (stderr) |
-| Output | Success summary box on **stderr** showing url, job id (`job_` prefix + 8 hex chars), and elapsed time |
+| Output | Success summary box on **stderr** showing url, deployment id (`dep_` prefix + 8 hex chars), and elapsed time |
 | VM management | You create and delete VMs through your cloud provider; `mur deploy` never provisions or terminates VMs |
 | Recommended OS | Ubuntu 22.04 LTS or 24.04 LTS |
 | mur binary | Auto-downloaded from GitHub releases; pin with `mur_version` in the manifest |
@@ -350,5 +350,5 @@ CARGO_PROFILE_DEV_DEBUG=0 cargo build --release \
 | Timeout | 30s SSH wait + 120s capsule startup wait |
 | State file | `~/.murmur/deployments.json` — appended on deploy, entry removed on `mur destroy` |
 | Health check | `GET {url}/.well-known/agent-card.json` returns 200 when the capsule is alive |
-| Tear down | `mur destroy <job_id>` removes the tracking entry; delete the VM from your provider dashboard |
+| Tear down | `mur destroy <deployment_id>` removes the tracking entry; delete the VM from your provider dashboard |
 | List | `mur ps` — reads `~/.murmur/deployments.json` |

@@ -1,11 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     thread,
@@ -38,7 +38,7 @@ fn ctx<'a>(
             "flaky".to_string(),
         ]),
         capsule_versions: HashMap::from([("worker".to_string(), "0.1.0".to_string())]),
-        current_job_id: None,
+        current_session_id: None,
         invoke_tool,
     }
 }
@@ -179,11 +179,15 @@ fn test_capsule_step_spawns_and_reads_result() {
     assert!(find(&report, "worker").output.is_some());
 }
 
+/// A plain objective reaches the child capsule as plain text.
+///
+/// The child pushes whatever arrives straight at its model, and nothing parses a task envelope,
+/// so wrapping the objective in one would only hand the child JSON to decode before it can start.
 #[test]
-fn test_capsule_step_posts_murmur_message_input() {
+fn test_capsule_step_sends_objective_as_plain_text() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
-    let fake_roost = FakeRoost::start(dir.path());
+    let fake_roost = FakeRoost::start();
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -208,19 +212,21 @@ fn test_capsule_step_posts_murmur_message_input() {
         find(&report, "worker").output.as_deref(),
         Some("worker-output")
     );
-    let posted = fake_roost.spawn_request();
-    let input = posted.get("input").and_then(Value::as_str).unwrap();
-    let message: Value = serde_json::from_str(input).unwrap();
-    assert_eq!(message["schema"], "murmur.message.v1");
-    assert_eq!(message["type"], "murmur.code_task.request.v1");
-    assert_eq!(message["payload"]["objective"], "Echo this task");
+    // The spawn call names the capsule to start and nothing about the task; the task itself
+    // rides the A2A message that follows.
+    let spawned = fake_roost.spawn_request();
+    assert_eq!(spawned["name"], "worker");
+    assert!(spawned.get("input").is_none(), "{spawned}");
+    assert_eq!(fake_roost.sent_text(), "Echo this task");
 }
 
+/// Input this runtime does not model is passed through as the author's own JSON rather than
+/// flattened into one field, so nothing they wrote is dropped on the way to the child.
 #[test]
-fn test_capsule_step_input_fallback_uses_serialized_json_as_objective() {
+fn test_capsule_step_passes_unmodelled_input_through_as_json() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
-    let fake_roost = FakeRoost::start(dir.path());
+    let fake_roost = FakeRoost::start();
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -241,13 +247,7 @@ fn test_capsule_step_input_fallback_uses_serialized_json_as_objective() {
     std::env::remove_var("MURMUR_ROOST_URL");
 
     assert!(report.completed, "{report:?}");
-    let posted = fake_roost.spawn_request();
-    let input = posted.get("input").and_then(Value::as_str).unwrap();
-    let message: Value = serde_json::from_str(input).unwrap();
-    assert_eq!(
-        message["payload"]["objective"],
-        "{\"task\":\"fallback task\"}"
-    );
+    assert_eq!(fake_roost.sent_text(), "{\"task\":\"fallback task\"}");
 }
 
 #[test]
@@ -436,69 +436,120 @@ fn test_join_point_waits_for_multiple_upstreams() {
     assert_eq!(find(&report, "join").output.as_deref(), Some("joined"));
 }
 
+/// A stand-in for mur-roost *and* the capsule it spawns, served on one loopback listener.
+///
+/// `dispatch_capsule_step` speaks two protocols against this, in order: `POST /spawn` to
+/// mur-roost, which answers with the URL of the now-live capsule, then A2A JSON-RPC against that
+/// URL — `message/send` to hand over the task, then `tasks/get` polled until the state is
+/// terminal. Both are served here, routed on the request path.
+///
+/// The server loop polls for connections rather than parking in a blocking `accept`, and every
+/// read it makes is bounded, so `drop` can always stop it. A fake that could only be stopped by
+/// the client making exactly the sequence of calls it expected would turn every failed
+/// assertion into a hung test instead of a reported one — the panic unwinds into `drop`, which
+/// then joins a thread waiting on a connection that is never coming.
 struct FakeRoost {
     url: String,
-    request: Arc<Mutex<Option<Value>>>,
+    spawn_body: Arc<Mutex<Option<Value>>>,
+    sent_text: Arc<Mutex<Option<String>>>,
+    shutdown: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
 impl FakeRoost {
-    fn start(base_dir: &Path) -> Self {
+    fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{addr}");
-        let output_path = base_dir.join("fake-worker-output");
-        fs::create_dir_all(output_path.join("out")).unwrap();
-        fs::write(
-            output_path.join("out/result.json"),
-            json!({
-                "schema": "murmur.message.v1",
-                "type": "murmur.code_task.result.v1",
-                "job_id": Value::Null,
-                "payload": {
-                    "status": Value::Null,
-                    "summary": Value::Null,
-                    "files": Value::Null,
-                    "output": "worker-output"
+        let capsule_url = format!("{url}/capsule");
+
+        let spawn_body = Arc::new(Mutex::new(None));
+        let sent_text = Arc::new(Mutex::new(None));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let join = thread::spawn({
+            let spawn_body = Arc::clone(&spawn_body);
+            let sent_text = Arc::clone(&sent_text);
+            let shutdown = Arc::clone(&shutdown);
+            move || {
+                while !shutdown.load(Ordering::SeqCst) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+                    // `accept` on a non-blocking listener may hand back a non-blocking socket.
+                    // The request reader wants a blocking one, but time-bounded, so a client
+                    // that opens a connection and then says nothing cannot wedge the loop.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+
+                    let (path, body) = read_http_request(&mut stream);
+                    let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let response = if path == "/spawn" {
+                        *spawn_body.lock().unwrap() = Some(request);
+                        json!({ "capsule_url": capsule_url })
+                    } else {
+                        let id = request.get("id").cloned().unwrap_or(Value::Null);
+                        match request.get("method").and_then(Value::as_str) {
+                            Some("message/send") => {
+                                *sent_text.lock().unwrap() = Some(
+                                    request["params"]["message"]["parts"][0]["text"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                );
+                                json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
+                            }
+                            Some("tasks/get") => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "id": "task-1",
+                                    "status": {"state": "completed"},
+                                    "artifacts": [{"parts": [{"text": "worker-output"}]}]
+                                }
+                            }),
+                            other => panic!("unexpected request {other:?} at {path}"),
+                        }
+                    };
+                    write_http_json(&mut stream, &response);
                 }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let request = Arc::new(Mutex::new(None));
-        let captured = Arc::clone(&request);
-        let join = thread::spawn(move || {
-            let (mut spawn_stream, _) = listener.accept().unwrap();
-            let spawn_body = read_http_request_body(&mut spawn_stream);
-            let spawn_json: Value = serde_json::from_str(&spawn_body).unwrap();
-            *captured.lock().unwrap() = Some(spawn_json);
-            write_http_json(&mut spawn_stream, &json!({"job_id": "job-1"}));
-            drop(spawn_stream);
-
-            let (mut status_stream, _) = listener.accept().unwrap();
-            let _ = read_http_request_body(&mut status_stream);
-            write_http_json(
-                &mut status_stream,
-                &json!({"status": "complete", "output_path": output_path}),
-            );
-            drop(status_stream);
+            }
         });
 
         Self {
             url,
-            request,
+            spawn_body,
+            sent_text,
+            shutdown,
             join: Some(join),
         }
     }
 
+    /// The body of the `POST /spawn` that asked mur-roost for the capsule.
     fn spawn_request(&self) -> Value {
-        self.request.lock().unwrap().clone().unwrap()
+        self.spawn_body.lock().unwrap().clone().unwrap()
+    }
+
+    /// The task text the step handed to the capsule over A2A `message/send`, exactly as it
+    /// travelled in the single text part. This is where a capsule step's input lives — the spawn
+    /// call above carries only the capsule's identity and workdir. Returned unparsed: what the
+    /// child's model receives is this string, so that is what the tests assert on.
+    fn sent_text(&self) -> String {
+        self.sent_text.lock().unwrap().clone().unwrap()
     }
 }
 
 impl Drop for FakeRoost {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -510,14 +561,15 @@ fn roost_env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn read_http_request_body(stream: &mut TcpStream) -> String {
+/// Read one HTTP request, returning its request-target path and its body.
+fn read_http_request(stream: &mut TcpStream) -> (String, String) {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end;
     loop {
         let read = stream.read(&mut chunk).unwrap();
         if read == 0 {
-            return String::new();
+            return (String::new(), String::new());
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -527,6 +579,12 @@ fn read_http_request_body(stream: &mut TcpStream) -> String {
     }
 
     let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let path = headers
+        .lines()
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+        .unwrap_or_default()
+        .to_string();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -546,7 +604,10 @@ fn read_http_request_body(stream: &mut TcpStream) -> String {
         body.extend_from_slice(&chunk[..read]);
     }
 
-    String::from_utf8_lossy(&body[..content_length]).to_string()
+    (
+        path,
+        String::from_utf8_lossy(&body[..content_length]).to_string(),
+    )
 }
 
 fn write_http_json(stream: &mut TcpStream, body: &Value) {

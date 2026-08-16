@@ -217,7 +217,6 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )

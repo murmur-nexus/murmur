@@ -741,16 +741,18 @@ pub(crate) fn run_deploy(
         .collect::<Result<Vec<_>, _>>()?;
 
     // ── 0.2. IDs ──────────────────────────────────────────────────────────────
-    // job_ prefix + UUID v7 simple (32 hex, no dashes) — consistent with ses_/tsk_/ctx_ convention.
-    let job_id = format!("job_{}", Uuid::now_v7().simple());
-    // Short 6-char hex ID for the remote deploy directory (skip the "job_" prefix).
-    let short_id: String = job_id[4..].chars().take(6).collect();
+    // dep_ prefix + UUID v7 simple (32 hex, no dashes) — consistent with ses_/tsk_/ctx_.
+    // This names a *deployment* (a VM and its keys), not a capsule session; one deployment
+    // outlives the sessions that run on it, which is why it gets an id of its own.
+    let deployment_id = format!("dep_{}", Uuid::now_v7().simple());
+    // Short 6-char hex ID for the remote deploy directory (skip the 4-char prefix).
+    let short_id: String = deployment_id[4..].chars().take(6).collect();
 
     // ── 0.3. Home dir + staging dir ───────────────────────────────────────────
     let home_os = std::env::var_os("HOME")
         .ok_or_else(|| CliError::new(E_IO_001, "could not determine home directory"))?;
     let home = std::path::PathBuf::from(home_os);
-    let staging_dir = home.join(".murmur").join("deploy_staging").join(&job_id);
+    let staging_dir = home.join(".murmur").join("deploy_staging").join(&deployment_id);
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to create staging dir: {e}")))?;
     let _staging_guard = StagingGuard(staging_dir.clone());
@@ -1276,7 +1278,7 @@ pub(crate) fn run_deploy(
 
     // ── 10. Persist deployment record ─────────────────────────────────────────
     let record = DeploymentRecord {
-        job_id: job_id.clone(),
+        deployment_id: deployment_id.clone(),
         provider: "manual".to_string(),
         provider_vm_id: String::new(),
         provider_key_id: String::new(),
@@ -1299,8 +1301,8 @@ pub(crate) fn run_deploy(
         style(capsule_name).cyan().bold());
     let blank = String::new();
     let row_url  = format!("{}  {}", style("url ").dim(), style(&public_url).underlined());
-    // Show "job_" prefix + first 8 hex chars: "job_01954a3b" (12 chars, self-describing)
-    let row_job  = format!("{}  {}", style("job ").dim(), &job_id[..12]);
+    // Show "dep_" prefix + first 8 hex chars: "dep_01954a3b" (12 chars, self-describing)
+    let row_job  = format!("{}  {}", style("dep ").dim(), &deployment_id[..12]);
     let row_time = format!("{}  {}s", style("time").dim(), elapsed);
     let rows: &[&str] = &[&title, &blank, &row_url, &row_job, &row_time];
 
@@ -1565,11 +1567,11 @@ mod tests {
     // ─── staging path ─────────────────────────────────────────────────────────
 
     #[test]
-    fn staging_path_uses_job_dir_with_clean_filename() {
+    fn staging_path_uses_deployment_dir_with_clean_filename() {
         let home = tempdir().unwrap();
-        let job_id = "abc123-test-job-id";
+        let deployment_id = "abc123-test-deployment-id";
         let staging_dir =
-            home.path().join(".murmur").join("deploy_staging").join(job_id);
+            home.path().join(".murmur").join("deploy_staging").join(deployment_id);
 
         let stem = "murmur-driver-openai-0.3.33";
         let zip_path = staging_dir.join(format!("{stem}.mur.zip"));
@@ -1580,8 +1582,8 @@ mod tests {
 
         assert_eq!(zip_name, "murmur-driver-openai-0.3.33.mur.zip");
         assert_eq!(sha_name, "murmur-driver-openai-0.3.33.sha256");
-        assert!(!zip_name.contains(job_id), "filename must not contain job UUID: {zip_name}");
-        assert!(!sha_name.contains(job_id), "filename must not contain job UUID: {sha_name}");
+        assert!(!zip_name.contains(deployment_id), "filename must not contain deployment UUID: {zip_name}");
+        assert!(!sha_name.contains(deployment_id), "filename must not contain deployment UUID: {sha_name}");
     }
 
     #[test]
@@ -1770,11 +1772,11 @@ mod tests {
     // ─── remote deploy dir name ───────────────────────────────────────────────
 
     #[test]
-    fn short_id_is_six_hex_chars_from_job_prefix_job_id() {
-        // job_id format: "job_" + 32 hex chars (UUID v7 simple)
-        let job_id = "job_018f4b2c1234567890abcdef12345678";
-        // skip the "job_" prefix (4 chars), take first 6 hex chars
-        let short_id: String = job_id[4..].chars().take(6).collect();
+    fn short_id_is_six_hex_chars_after_the_four_char_prefix() {
+        // deployment_id format: "dep_" + 32 hex chars (UUID v7 simple)
+        let deployment_id = "dep_018f4b2c1234567890abcdef12345678";
+        // skip the 4-char prefix, take first 6 hex chars
+        let short_id: String = deployment_id[4..].chars().take(6).collect();
         assert_eq!(short_id, "018f4b");
         assert_eq!(short_id.len(), 6);
         assert!(short_id.chars().all(|c| c.is_ascii_alphanumeric() && (c.is_ascii_lowercase() || c.is_ascii_digit())));

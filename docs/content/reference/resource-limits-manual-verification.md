@@ -89,7 +89,7 @@ probe at launch and refuses with `E-RUN-012` naming what is missing.
 Running the capsule under a dedicated transient scope keeps its cgroup subtree out of the shell's:
 
 ```bash
-systemd-run --user --scope --property=Delegate=yes -- mur run murmur.yaml
+systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.yaml
 ```
 
 ### What the runtime does with the delegation
@@ -163,7 +163,7 @@ The host staying responsive throughout is part of every expected result, and is 
 ## Scenario 0 — a silent manifest gets defaults, not "unlimited" { #scenario-0 }
 
 ```bash
-mur run murmur-defaults.yaml --task 'run this shell command and report its exact output: ulimit -Hn; ulimit -Hu; ulimit -Ht'
+mur run --manifest murmur-defaults.yaml --task 'run this shell command and report its exact output: ulimit -Hn; ulimit -Hu; ulimit -Ht'
 ```
 
 **Expected:** `1024` (`max_open_files`), `3600` (`cpu_seconds`), and for `ulimit -Hu` **the
@@ -206,7 +206,7 @@ unprivileged process raise its soft limit up to its hard limit at any time, so a
 undone by one call from inside the capsule.
 
 ```bash
-mur run murmur.yaml --task 'run this shell command and report its exact output verbatim:
+mur run --manifest murmur.yaml --task 'run this shell command and report its exact output verbatim:
   echo "hard=$(ulimit -Hn) soft=$(ulimit -Sn)"; ulimit -n 4096 2>&1 || echo "raise refused"'
 ```
 
@@ -225,7 +225,7 @@ raise refused
 Now confirm the limit actually bites, at the declared value and not the default:
 
 ```bash
-mur run murmur.yaml --task 'run this shell command and report its exact output:
+mur run --manifest murmur.yaml --task 'run this shell command and report its exact output:
   bash -c "for i in \$(seq 1 40); do exec {fd}<>/tmp/fd-probe-\$i || { echo \"EMFILE at \$i\"; break; }; done"'
 ```
 
@@ -246,13 +246,13 @@ per-**uid** ceiling; a tree of distinct, rapidly-forking, short-lived processes 
 practice even when set correctly. `pids.max` is per-cgroup and does not.
 
 ```bash
-mur run murmur.yaml --task 'run this shell command: :(){ :|:& };:'
+mur run --manifest murmur.yaml --task 'run this shell command: :(){ :|:& };:'
 ```
 
 Or, if a named function is easier to get past prompt handling:
 
 ```bash
-mur run murmur.yaml --task 'run this shell command: bomb() { bomb | bomb & }; bomb'
+mur run --manifest murmur.yaml --task 'run this shell command: bomb() { bomb | bomb & }; bomb'
 ```
 
 **Expected:**
@@ -292,7 +292,7 @@ The point is *where* the kill happens: inside the capsule's scope, before host-w
 pressure forces the system OOM killer to pick an arbitrary victim.
 
 ```bash
-mur run murmur.yaml --task 'run this shell command:
+mur run --manifest murmur.yaml --task 'run this shell command:
   python3 -c "b=[]
 while True: b.append(bytearray(50*1024*1024))"'
 ```
@@ -300,7 +300,7 @@ while True: b.append(bytearray(50*1024*1024))"'
 If the capsule has no Python, use `bash` alone:
 
 ```bash
-mur run murmur.yaml --task 'run this shell command: s=""; while :; do s="$s$(head -c 10000000 /dev/zero | tr "\0" "x")"; done'
+mur run --manifest murmur.yaml --task 'run this shell command: s=""; while :; do s="$s$(head -c 10000000 /dev/zero | tr "\0" "x")"; done'
 ```
 
 **Expected:**
@@ -329,7 +329,7 @@ cgroup counter is evidence, which is why only the cgroup case is named.
 ## Scenario 4 — CPU hog: the one unambiguous rlimit signal { #scenario-4 }
 
 ```bash
-time mur run murmur.yaml --task 'run this shell command: while :; do :; done'
+time mur run --manifest murmur.yaml --task 'run this shell command: while :; do :; done'
 ```
 
 **Expected:**
@@ -352,7 +352,7 @@ if the process ignored `SIGXCPU` and the kernel followed with `SIGKILL`).
 ## Scenario 5 — disk filler, per-file: `RLIMIT_FSIZE` { #scenario-5 }
 
 ```bash
-mur run murmur.yaml --task 'run this shell command: dd if=/dev/zero of=./big bs=1M count=200'
+mur run --manifest murmur.yaml --task 'run this shell command: dd if=/dev/zero of=./big bs=1M count=200'
 ```
 
 **Expected:**
@@ -375,7 +375,7 @@ mur trace show --session <session_id> | grep -i resource_limit
 is what `workdir_max_bytes` covers.
 
 ```bash
-mur run murmur.yaml --task 'run this shell command:
+mur run --manifest murmur.yaml --task 'run this shell command:
   for i in $(seq 1 200); do dd if=/dev/zero of=./fill-$i bs=1M count=9 2>/dev/null; done'
 ```
 
@@ -420,7 +420,7 @@ Verify the Linux refusal is real, and that it is correctly scoped.
 without `Delegate=`), then:
 
 ```bash
-mur run murmur.yaml --task 'echo hello'
+mur run --manifest murmur.yaml --task 'echo hello'
 ```
 
 **Expected:** the launch fails **before any WASM is instantiated** and before any subprocess is
@@ -439,7 +439,7 @@ Confirm no shell subprocess ran at all — `workdir/<session_id>/trace.jsonl` mu
 block (or leave only `network:`), keeping delegation removed:
 
 ```bash
-mur run murmur-wasm-only.yaml --task 'echo hello'
+mur run --manifest murmur-wasm-only.yaml --task 'echo hello'
 ```
 
 **Expected:** the capsule runs normally. There is no process tree to bound, so requiring host
@@ -476,7 +476,7 @@ half of it. Do not record the missing seccomp/Landlock here as a regression.
 Run on the macOS development machine, not Linux:
 
 ```bash
-mur run murmur.yaml --task 'run this shell command: ulimit -Hn'
+mur run --manifest murmur.yaml --task 'run this shell command: ulimit -Hn'
 ```
 
 **Expected:**

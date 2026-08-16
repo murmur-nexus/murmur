@@ -510,17 +510,27 @@ mur deploy --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--mur-binary` | current executable | Path to a Linux x86_64 `mur` binary to upload. Defaults to `std::env::current_exe()`. Always specify this flag when deploying from macOS. |
 | `--env` | — | Environment variable in `KEY=VALUE` format; repeat for multiple vars |
 
-**Output — exactly one JSON line to stdout:**
+**Output — a summary box on stderr.** `mur deploy` emits no JSON and writes nothing to stdout;
+progress and the final box both go to stderr.
 
-```json
-{"url":"https://IP:PORT","ip":"IP","job_id":"UUID"}
+```
+  ┌────────────────────────────────┐
+  │  ∞  my-agent                   │
+  │                                │
+  │  url   https://1.2.3.4:9000    │
+  │  dep   dep_01954a3b            │
+  │  time  42s                     │
+  └────────────────────────────────┘
 ```
 
-| Field | Description |
+| Row | Description |
 |---|---|
 | `url` | Public A2A endpoint — `https://<VM_PUBLIC_IP>:<PORT>`. Use for `message/send`, `tasks/get`, and `/.well-known/agent-card.json`. |
-| `ip` | The VM's public IPv4 address |
-| `job_id` | UUID v4 — use with `mur destroy` and `mur ps` |
+| `dep` | The deployment ID, abbreviated to its `dep_` prefix and first 8 hex characters. The full `dep_` + UUID v7 is stored in `~/.murmur/deployments.json` and listed by [`mur ps`](#mur-ps); `mur destroy` accepts any unambiguous prefix. |
+| `time` | Elapsed wall-clock seconds |
+
+To script against a deployment, read `~/.murmur/deployments.json` or parse `mur ps` — the box is
+for humans and its layout is not a stable interface.
 
 **Deployment flow:**
 
@@ -530,7 +540,7 @@ mur deploy --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 4. Upload manifest and optional workdir via `scp`
 5. Run `mur run --manifest <path> --json` on the VM; wait up to 120s for the JSON line
 6. Parse `localhost:PORT` from the JSON output; construct the public URL
-7. Persist to `~/.murmur/deployments.json`; print the JSON line
+7. Persist to `~/.murmur/deployments.json`; print the summary box
 
 Artifacts are pre-staged in step 4 (uploaded to `/root/.murmur/artifacts/`), so the remote `mur run` finds them installed and starts without fetching anything.
 
@@ -544,7 +554,7 @@ mur deploy \
   --manifest ./my-agent/murmur.yaml \
   --mur-binary ./target/x86_64-unknown-linux-musl/release/mur \
   --env ANTHROPIC_API_KEY=sk-ant-...
-# {"url":"https://1.2.3.4:9000","ip":"1.2.3.4","job_id":"a1b2c3d4-..."}
+# summary box on stderr: url https://1.2.3.4:9000 / dep dep_01954a3b / time 42s
 ```
 
 **Error codes:**
@@ -564,17 +574,17 @@ mur deploy \
 Remove a deployment entry from `~/.murmur/deployments.json`. Does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.
 
 ```bash
-mur destroy <job_id>
+mur destroy <deployment_id>
 ```
 
-- `job_id` — the UUID returned by `mur deploy` (also listed by `mur ps`)
-- Exits non-zero with a clear error if `job_id` is not found in `~/.murmur/deployments.json`
+- `deployment_id` — the id returned by `mur deploy` (also listed by `mur ps`); a unique prefix is enough
+- Exits non-zero with a clear error if the id is not found in `~/.murmur/deployments.json`
 
 **Example:**
 
 ```bash
-mur destroy a1b2c3d4-e5f6-7890-abcd-ef1234567890
-# destroyed a1b2c3d4-... (1.2.3.4)
+mur destroy dep_01954a3b
+# destroyed dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b (1.2.3.4)
 ```
 
 ---
@@ -591,7 +601,7 @@ Output columns:
 
 | Column | Description |
 |---|---|
-| `JOB_ID` | UUID assigned at deploy time |
+| `DEPLOYMENT_ID` | Id assigned at deploy time (`dep_` + UUID v7) |
 | `PROVIDER` | Always `manual` — VMs are created by the user, not by `mur deploy` |
 | `IP` | Public IPv4 address of the VM |
 | `STATUS` | Always `running` for present entries (`mur destroy` removes the entry) |
@@ -602,9 +612,9 @@ Prints `no deployments` when `~/.murmur/deployments.json` is absent or empty.
 **Example:**
 
 ```text
-JOB_ID                                  PROVIDER    IP            STATUS      URL
+DEPLOYMENT_ID                           PROVIDER    IP            STATUS      URL
 ----------------------------------------------------------------------------------------------------
-a1b2c3d4-e5f6-7890-abcd-ef1234567890    manual      1.2.3.4       running     https://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual      1.2.3.4       running     https://1.2.3.4:9000
 ```
 
 ---
@@ -617,7 +627,7 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
 
 ```json
 {
-  "job_id":         "a1b2c3d4-...",
+  "deployment_id":  "dep_01954a3b...",
   "provider":       "manual",
   "provider_vm_id": "",
   "provider_key_id": "",
@@ -632,7 +642,7 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
 
 | Field | Description |
 |---|---|
-| `job_id` | UUID v4 — the deployment's identity across all commands |
+| `deployment_id` | `dep_` + UUID v7 — the deployment's identity across all commands |
 | `provider` | Always `"manual"` — VMs are created by the user outside of `mur` |
 | `provider_vm_id` | Always empty — reserved for future provider integrations |
 | `provider_key_id` | Always empty — reserved for future provider integrations |

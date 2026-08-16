@@ -188,7 +188,6 @@ fn stage_agent(home: &TempDir, manifest_path: &Path, lifecycle: Option<Lifecycle
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )

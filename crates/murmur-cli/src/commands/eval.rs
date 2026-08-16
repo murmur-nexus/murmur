@@ -12,13 +12,13 @@ use capsule_runtime::{
 use clap::Subcommand;
 use murmur_artifact::{
     load_dotenv_non_override, load_runtime_manifest, read_lockfile, resolve_manifest_path,
-    write_lockfile_atomic, ArtifactMeta, ArtifactRuntime, LocalRegistry, LockedArtifact,
-    LockedSha256, LockfileError, MurmurLock, PublishResult, Registry, RegistryError,
-    ResolvedArtifact, LOCK_VERSION,
+    write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact, LockedSha256,
+    LockfileError, MurmurLock, Registry, LOCK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
+use crate::registry_client::FallbackRegistry;
 
 use super::{fail_run, lockfile_error_to_cli, runtime_manifest_error_to_cli};
 
@@ -478,45 +478,6 @@ fn print_diff(a: &EvalMetrics, b: &EvalMetrics) {
     );
 }
 
-// ── Registry helpers ──────────────────────────────────────────────────────────
-
-/// Tries `primary` first; on `NotFound`, falls back to `secondary`.
-struct FallbackRegistry {
-    primary: LocalRegistry,
-    secondary: LocalRegistry,
-}
-
-impl Registry for FallbackRegistry {
-    fn resolve(&self, name: &str, version: &str) -> Result<ResolvedArtifact, RegistryError> {
-        match self.primary.resolve(name, version) {
-            Err(RegistryError::NotFound { .. }) => self.secondary.resolve(name, version),
-            other => other,
-        }
-    }
-
-    fn resolve_with_platform(
-        &self,
-        name: &str,
-        version: &str,
-        platform: Option<&str>,
-    ) -> Result<ResolvedArtifact, RegistryError> {
-        match self.primary.resolve_with_platform(name, version, platform) {
-            Err(RegistryError::NotFound { .. }) => {
-                self.secondary.resolve_with_platform(name, version, platform)
-            }
-            other => other,
-        }
-    }
-
-    fn publish(&self, meta: ArtifactMeta, bytes: &[u8]) -> Result<PublishResult, RegistryError> {
-        self.primary.publish(meta, bytes)
-    }
-
-    fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
-        self.primary.list_index()
-    }
-}
-
 // ── Run ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -741,7 +702,6 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
-            job_id: None,
             // `mur eval` has no --containment flag and reads no workspace config, so the
             // manifest is the only source of a floor here.
             declared_containment_floor: runtime_manifest
