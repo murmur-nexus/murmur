@@ -13,14 +13,14 @@ pub(crate) fn run_ps() -> Result<(), CliError> {
     // Header
     println!(
         "{:<38}  {:<12}  {:<12}  {:<10}  URL",
-        "JOB_ID", "PROVIDER", "REGION", "STATUS"
+        "DEPLOYMENT_ID", "PROVIDER", "REGION", "STATUS"
     );
     println!("{}", "-".repeat(100));
 
     for r in &records {
         println!(
             "{:<38}  {:<12}  {:<12}  {:<10}  {}",
-            r.job_id, r.provider, r.region, r.status, r.url
+            r.deployment_id, r.provider, r.region, r.status, r.url
         );
     }
 

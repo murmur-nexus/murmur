@@ -47,7 +47,7 @@ Resolve a capsule from the registry, stage it, and launch it. The response retur
   "name":       "worker-a",
   "version":    "0.1.0",
   "workdir":    "/abs/path/to/workdir",
-  "spawned_by": "optional-job-id"
+  "spawned_by": "optional-session-id"
 }
 ```
 
@@ -56,13 +56,13 @@ Resolve a capsule from the registry, stage it, and launch it. The response retur
 | `name` | string | yes | Capsule name; must be in the applicable allow list |
 | `version` | string | yes | Capsule version |
 | `workdir` | string | yes | Absolute path to an existing directory; used as the spawned capsule's session workdir |
-| `spawned_by` | string | no | Job ID of the capsule making the request. Selects which allow list applies — see [Per-job allow lists](#per-job-allow-lists) |
+| `spawned_by` | string | no | Session ID of the capsule making the request. Selects which allow list applies — see [Per-session allow lists](#per-session-allow-lists) |
 
 **Success — `200 OK`**
 
 ```json
 {
-  "job_id":      "550e8400-e29b-41d4-a716-446655440000",
+  "session_id":  "ses_01a000c58eae7ca0901d5e6b7427df28",
   "capsule_url": "http://localhost:53124"
 }
 ```
@@ -79,9 +79,9 @@ Resolve a capsule from the registry, stage it, and launch it. The response retur
 
 ---
 
-### `GET /status/{job_id}`
+### `GET /status/{session_id}`
 
-Poll a spawned job.
+Poll a spawned capsule.
 
 **Success — `200 OK`**
 
@@ -98,33 +98,33 @@ Poll a spawned job.
 **Error — `404 Not Found`**
 
 ```json
-{ "error": "job not found" }
+{ "error": "session not found" }
 ```
 
-Job records are held in memory. Restarting the daemon discards them, and every job ID from before the restart then returns `404`.
+Session records are held in memory. Restarting the daemon discards them, and every session ID from before the restart then returns `404`.
 
 ---
 
-## Per-job allow lists
+## Per-session allow lists
 
 `mur-roost` keeps two levels of capsule allow list, and `spawned_by` selects between them.
 
 | Request | List consulted | Where it comes from |
 |---|---|---|
 | No `spawned_by` | Global | The daemon's `--spawn-allow` flags |
-| `spawned_by` present | Per-job | `capabilities.spawn.allow` in the manifest of the capsule that owns that job, read when the job was created |
+| `spawned_by` present | Per-session | `capabilities.spawn.allow` in the manifest of the capsule that owns that session, read when the session was staged |
 
 A capsule that sets `spawned_by` can spawn only the names listed in its *own* manifest, even where the global list permits more:
 
 - Daemon started with `--spawn-allow orchestrator --spawn-allow worker-a --spawn-allow worker-b`
 - Capsule A's manifest: `capabilities.spawn.allow: [worker-a]`
-- Capsule A is spawned; its job ID is `job-123`
-- Capsule A sends `POST /spawn` with `name: worker-b` and `spawned_by: job-123` → **403**
+- Capsule A is spawned; its session ID is `ses_01a0…`
+- Capsule A sends `POST /spawn` with `name: worker-b` and `spawned_by: ses_01a0…` → **403**
 
 A `spawned_by` the daemon does not recognise is refused with `403`; it falls back to no other list.
 
 !!! note "Trust boundary"
-    Within a single-machine local deployment the process boundary is the trust boundary. A capsule can claim any known job ID as `spawned_by` and receive that job's allow list.
+    Within a single-machine local deployment the process boundary is the trust boundary. A capsule can claim any known session ID as `spawned_by` and receive that session's allow list.
 
 ---
 
@@ -133,12 +133,12 @@ A `spawned_by` the daemon does not recognise is refused with `403`; it falls bac
 | Variable | Set by | Purpose |
 |---|---|---|
 | `MURMUR_ROOST_URL` | The environment of the process that runs the capsule | Base URL a plan's `capsule` step calls to spawn its child. When it is unset or blank, the step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
-| `MURMUR_JOB_ID` | The runtime, in every capsule launched with a job ID | The capsule's own job ID, which it passes as `spawned_by` so its per-job allow list applies |
+| `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which it passes as `spawned_by` so its per-session allow list applies |
 
 A shell tool inside a capsule can call the daemon directly:
 
 ```bash
 curl -s -X POST "http://127.0.0.1:7700/spawn" \
   -H 'Content-Type: application/json' \
-  -d "{\"name\":\"worker-a\",\"version\":\"0.1.0\",\"workdir\":\"$PWD\",\"spawned_by\":\"$MURMUR_JOB_ID\"}"
+  -d "{\"name\":\"worker-a\",\"version\":\"0.1.0\",\"workdir\":\"$PWD\",\"spawned_by\":\"$MURMUR_SESSION_ID\"}"
 ```

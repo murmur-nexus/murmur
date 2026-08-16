@@ -14,7 +14,6 @@ use capsule_runtime::{
 };
 use murmur_artifact::{current_platform, ArtifactRuntime, LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -98,7 +97,14 @@ struct SpawnRequest {
 
 #[derive(Serialize)]
 struct SpawnResponse {
-    job_id: String,
+    /// The runtime's own session id for the spawned capsule (`ses_…`).
+    ///
+    /// roost does not mint an identifier of its own: `stage_session` already returns one, it is
+    /// the id the capsule knows itself by (`MURMUR_SESSION_ID`), the one its traces carry, and
+    /// the one `mur run` prints. A second id for the same thing would only have to be correlated
+    /// back to this one. It is what a child passes as `spawned_by`, so a spawn chain reads
+    /// end-to-end against existing trace data.
+    session_id: String,
     capsule_url: String,
 }
 
@@ -184,8 +190,8 @@ fn route(method: &str, path: &str, body: &str, state: &Arc<State>) -> String {
         ("GET", "/health") => ok(r#"{}"#),
         ("POST", "/spawn") => handle_spawn(body, state),
         ("GET", p) if p.starts_with("/status/") => {
-            let job_id = &p["/status/".len()..];
-            handle_status(job_id, state)
+            let session_id = &p["/status/".len()..];
+            handle_status(session_id, state)
         }
         _ => err(404, "Not Found", "not found"),
     }
@@ -200,11 +206,11 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
     };
 
     // Authorization check
-    if let Some(ref parent_job_id) = req.spawned_by {
+    if let Some(ref parent_session_id) = req.spawned_by {
         // Parent capsule is spawning — check parent's spawn_allow
         let jobs = state.jobs.lock().unwrap();
-        let Some(parent) = jobs.get(parent_job_id) else {
-            return err(403, "Forbidden", &format!("unknown parent job_id '{parent_job_id}'"));
+        let Some(parent) = jobs.get(parent_session_id) else {
+            return err(403, "Forbidden", &format!("unknown parent session '{parent_session_id}'"));
         };
         if !parent.capability_policy.spawn_allow.contains(&req.name) {
             return err(
@@ -284,10 +290,6 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         })
         .collect();
 
-    // Generate job_id before building StageRequest so it can be injected as MURMUR_JOB_ID
-    // into the child capsule's environment, enabling it to set spawned_by on sub-spawns.
-    let job_id = Uuid::new_v4().to_string();
-
     let workdir_path = PathBuf::from(&req.workdir);
     let stage_request = StageRequest {
         manifest_dir: workdir_path.clone(),
@@ -311,7 +313,6 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         workdir: Some(workdir_path),
         bind_addr: "127.0.0.1".to_string(),
         internal_port: manifest.network.as_ref().and_then(|n| n.internal_port),
-        job_id: Some(job_id.clone()),
         // The spawned child's own manifest is the only source of a floor here — roost has no
         // CLI flag and reads no workspace config on the child's behalf.
         declared_containment_floor: manifest
@@ -320,46 +321,45 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
             .and_then(|capabilities| capabilities.containment)
             .unwrap_or_default(),
     };
-    {
-        let mut jobs = state.jobs.lock().unwrap();
-        jobs.insert(
-            job_id.clone(),
-            JobRecord {
-                status: JobStatus::Running,
-                capability_policy: child_policy,
-            },
-        );
-    }
-
-    // Launch in a background thread; communicate the capsule_url via channel
-    let (url_tx, url_rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let job_id_bg = job_id.clone();
+    // The job is registered inside the launch thread rather than here, because its key is the
+    // session id and `stage_session` is what mints one. A spawn that fails to stage never
+    // becomes a job at all — nothing was started, and the caller is told synchronously below.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
     let jobs_bg = Arc::clone(&state.jobs);
     let registry_path_bg = state.registry_path.clone();
 
     thread::spawn(move || {
         let registry = LocalRegistry::new(&registry_path_bg);
         let staged = match stage_session(Arc::new(registry), stage_request) {
-            Ok(s) => s,
+            Ok(staged) => staged,
             Err(e) => {
-                url_tx.send(Err(format!("stage_session failed: {e}"))).ok();
-                let mut jobs = jobs_bg.lock().unwrap();
-                if let Some(job) = jobs.get_mut(&job_id_bg) {
-                    job.status = JobStatus::Failed;
-                }
+                ready_tx.send(Err(format!("stage_session failed: {e}"))).ok();
                 return;
             }
         };
+        let session_id = staged.session_id.clone();
 
-        let url_tx_inner = url_tx;
-        let result = launch_session(staged, |url| {
+        {
+            let mut jobs = jobs_bg.lock().unwrap();
+            jobs.insert(
+                session_id.clone(),
+                JobRecord {
+                    status: JobStatus::Running,
+                    capability_policy: child_policy,
+                },
+            );
+        }
+
+        let session_id_cb = session_id.clone();
+        let result = launch_session(staged, move |url| {
             // url is "localhost:{port}" — promote to "http://localhost:{port}"
-            let capsule_url = format!("http://{url}");
-            url_tx_inner.send(Ok(capsule_url)).ok();
+            ready_tx
+                .send(Ok((session_id_cb.clone(), format!("http://{url}"))))
+                .ok();
         });
 
         let mut jobs = jobs_bg.lock().unwrap();
-        if let Some(job) = jobs.get_mut(&job_id_bg) {
+        if let Some(job) = jobs.get_mut(&session_id) {
             job.status = match result {
                 Ok(_) => JobStatus::Complete,
                 Err(_) => JobStatus::Failed,
@@ -368,37 +368,29 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
     });
 
     // Wait up to 60s for the capsule to bind its port
-    let capsule_url = match url_rx.recv_timeout(Duration::from_secs(60)) {
-        Ok(Ok(url)) => url,
+    let (session_id, capsule_url) = match ready_rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(Ok(ready)) => ready,
         Ok(Err(e)) => {
-            let mut jobs = state.jobs.lock().unwrap();
-            if let Some(job) = jobs.get_mut(&job_id) {
-                job.status = JobStatus::Failed;
-            }
-            return err(500, "Internal Server Error", &format!("capsule launch failed: {e}"));
+            return err(500, "Internal Server Error", &format!("capsule launch failed: {e}"))
         }
         Err(_) => {
-            let mut jobs = state.jobs.lock().unwrap();
-            if let Some(job) = jobs.get_mut(&job_id) {
-                job.status = JobStatus::Failed;
-            }
             return err(
                 500,
                 "Internal Server Error",
                 "capsule did not bind a port within 60s",
-            );
+            )
         }
     };
 
-    let response = SpawnResponse { job_id, capsule_url };
+    let response = SpawnResponse { session_id, capsule_url };
     ok(&serde_json::to_string(&response).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
 }
 
-// ── GET /status/:job_id ───────────────────────────────────────────────────────
+// ── GET /status/:session_id ───────────────────────────────────────────────────
 
-fn handle_status(job_id: &str, state: &Arc<State>) -> String {
+fn handle_status(session_id: &str, state: &Arc<State>) -> String {
     let jobs = state.jobs.lock().unwrap();
-    match jobs.get(job_id) {
+    match jobs.get(session_id) {
         Some(job) => {
             let status = match job.status {
                 JobStatus::Running => "running",
@@ -407,7 +399,7 @@ fn handle_status(job_id: &str, state: &Arc<State>) -> String {
             };
             ok(&format!(r#"{{"status":"{status}"}}"#))
         }
-        None => err(404, "Not Found", "job not found"),
+        None => err(404, "Not Found", "session not found"),
     }
 }
 

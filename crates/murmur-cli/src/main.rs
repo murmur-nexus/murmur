@@ -275,8 +275,8 @@ enum Commands {
     #[cfg(feature = "beta-mur-deploy")]
     /// Terminate a deployed capsule VM and remove it from the deployment list
     Destroy {
-        /// Job ID returned by `mur deploy`
-        job_id: String,
+        /// Deployment ID returned by `mur deploy`; a unique prefix is enough
+        deployment_id: String,
     },
     #[cfg(feature = "beta-mur-deploy")]
     /// List all deployed capsules
@@ -464,7 +464,7 @@ fn main() {
             )
         }
         #[cfg(feature = "beta-mur-deploy")]
-        Commands::Destroy { job_id } => {
+        Commands::Destroy { deployment_id } => {
             if !beta_config.is_enabled("mur-deploy") {
                 eprintln!(
                     "error: unrecognized subcommand 'destroy'\n\n\
@@ -472,7 +472,7 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            run_destroy(&job_id)
+            run_destroy(&deployment_id)
         }
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Ps => {

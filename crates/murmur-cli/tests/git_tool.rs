@@ -93,7 +93,7 @@ fn git_tool_source_manifest() -> Option<PathBuf> {
         .join("default-artifacts")
         .join("tools")
         .join("murmur-tool-git")
-        .join("manifest.yaml");
+        .join("murmur.yaml");
     path.exists().then_some(path)
 }
 
@@ -166,7 +166,11 @@ fn init_git_repo(dir: &Path) -> PathBuf {
         assert!(status.success(), "git {:?} failed", args);
     };
 
-    run(&["init"]);
+    // `-b main` pins the initial branch: several tests below check out `main` by name, and a
+    // bare `git init` follows the host's `init.defaultBranch`, which is still `master` on a
+    // stock git. Without this the checkouts fail, and because they are not status-checked the
+    // test carries on from the wrong branch and fails somewhere unrelated.
+    run(&["init", "-b", "main"]);
     run(&["config", "user.email", "test@example.com"]);
     run(&["config", "user.name", "Test"]);
     fs::write(repo.join("README.md"), "hello\n").unwrap();
@@ -261,7 +265,6 @@ fn stage_git_tool_session(
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: ContainmentClass::Advisory,
         },
     )

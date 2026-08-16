@@ -20,6 +20,7 @@ use murmur_artifact::{
 use crate::{
     config::load_effective_mur_config_if_any_exists,
     error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008},
+    registry_client::FallbackRegistry,
 };
 
 use super::{fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus};
@@ -327,11 +328,20 @@ pub(crate) fn run_run(
         }),
         bind_addr: bind_addr.to_string(),
         internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
-        job_id: None,
         declared_containment_floor,
     };
 
-    let staged = stage_session(Arc::new(local_registry), stage_request)
+    // Stage against project-then-global, the same order `check_artifacts_installed` just
+    // pre-flighted. Handing staging only the project store made the two disagree: an artifact
+    // published to the global store passed the check and then failed to stage, surfacing as
+    // `E-REG-001 not found in registry` for something `mur list` could see.
+    let staged = stage_session(
+        Arc::new(FallbackRegistry {
+            primary: local_registry,
+            secondary: global_registry,
+        }),
+        stage_request,
+    )
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
     session_id = staged.session_id.clone();

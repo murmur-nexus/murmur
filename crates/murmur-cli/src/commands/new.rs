@@ -131,7 +131,6 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         workdir: None, // let runtime create session dir inside manifest_dir/workdir/
         bind_addr: "127.0.0.1".to_string(),
         internal_port: None,
-        job_id: None,
         // Ephemeral generator capsule: it declares no containment, so this is the default
         // floor every host clears rather than an inherited one.
         declared_containment_floor: runtime_manifest

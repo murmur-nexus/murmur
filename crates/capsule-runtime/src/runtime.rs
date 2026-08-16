@@ -735,7 +735,6 @@ pub fn stage_session(
             .unwrap_or(false),
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
-        job_id: request.job_id,
         declared_containment_floor: request.declared_containment_floor,
         scope_report,
         registry,
@@ -854,9 +853,6 @@ pub fn launch_session(
         ));
         all_env.push(("MURMUR_SESSION_ID".to_string(), session_id.clone()));
         all_env.push(("MURMUR_CAPSULE_URL".to_string(), capsule_url.clone()));
-        if let Some(ref job_id) = staged.job_id {
-            all_env.push(("MURMUR_JOB_ID".to_string(), job_id.clone()));
-        }
 
         murmur_md::write_murmur_md(
             &workdir,
@@ -3985,7 +3981,6 @@ mod tests {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
@@ -4072,7 +4067,6 @@ mod tests {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
@@ -4147,7 +4141,6 @@ mod tests {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
@@ -4221,7 +4214,6 @@ mod tests {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 
@@ -4373,7 +4365,6 @@ mod tests {
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
-            job_id: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
         };
 

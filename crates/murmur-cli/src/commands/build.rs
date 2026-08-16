@@ -32,7 +32,7 @@ pub(crate) fn run_build(
             let out = build_skill_artifact(
                 &input_path,
                 name.as_deref(),
-                version.unwrap_or("1.0.0"),
+                version.unwrap_or("0.1.0"),
                 &cwd,
                 summary,
             )?;

@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use murmur_artifact::{CodeTaskRequest, MurmurMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
@@ -81,7 +80,7 @@ pub struct SchedulerContext<'a> {
     pub capability_policy: CapabilityPolicy,
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
-    pub current_job_id: Option<String>,
+    pub current_session_id: Option<String>,
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
 }
 
@@ -599,7 +598,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         "name": capsule,
         "version": version,
         "workdir": ctx.workdir,
-        "spawned_by": ctx.current_job_id,
+        "spawned_by": ctx.current_session_id,
     })
     .to_string();
 
@@ -621,10 +620,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     let capsule_url = capsule_url.trim_end_matches('/').to_string();
 
     // Step 2: Build the A2A message/send JSON-RPC body with the task input.
-    let input_text = match capsule_step_input_message(input) {
-        Ok(text) => text,
-        Err(error) => return failed(&step.id, error),
-    };
+    let input_text = capsule_step_input_text(input);
     let req_id = format!("plan-{}", step.id);
     let msg_id = format!("msg-{}", step.id);
     let a2a_send_body = json!({
@@ -738,25 +734,33 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     }
 }
 
-fn capsule_step_input_message(input: Value) -> Result<String, String> {
-    let request = serde_json::from_value::<CodeTaskRequest>(input.clone()).unwrap_or_else(|_| {
-        CodeTaskRequest {
-            objective: serde_json::to_string(&input).unwrap_or_default(),
-            instructions: None,
-            context: None,
-            output_format: None,
-        }
-    });
-    let message = MurmurMessage {
-        schema: "murmur.message.v1".to_string(),
-        message_type: "murmur.code_task.request.v1".to_string(),
-        job_id: None,
-        payload: request,
-    };
+/// The task text a capsule step hands to the child capsule.
+///
+/// Whatever this returns becomes the child's user message verbatim: the receiving side pushes
+/// the delivered text straight at the model (`agent::process`), and nothing anywhere parses a
+/// task envelope. Wrapping the objective in one therefore does not deliver structure — it
+/// delivers prose that happens to be JSON, and spends the child's first turn on decoding it.
+/// So a plain `objective` is sent as plain text.
+///
+/// Any richer shape is passed through as its own JSON rather than flattened to one field, so a
+/// plan carrying data this runtime does not model still delivers everything its author wrote.
+/// The routing design that would give such structure a real reader — mur-roost staging a workdir
+/// the worker reads from — is still unbuilt; see
+/// `.nexus/roadmap/dag-capsule-step-workdir-and-input-routing-gap.md`.
+fn capsule_step_input_text(input: Value) -> String {
+    let bare_objective = input
+        .get("objective")
+        .and_then(Value::as_str)
+        .filter(|_| {
+            ["instructions", "context", "output_format"]
+                .iter()
+                .all(|key| input.get(key).map_or(true, Value::is_null))
+        });
 
-    serde_json::to_string(&message).map_err(|error| {
-        format!("failed to serialize capsule step input as MurmurMessage: {error}")
-    })
+    match bare_objective {
+        Some(objective) => objective.to_string(),
+        None => serde_json::to_string(&input).unwrap_or_default(),
+    }
 }
 
 fn interpolate_value(
@@ -914,7 +918,7 @@ mod tests {
                 "b".to_string(),
             ]),
             capsule_versions: HashMap::new(),
-            current_job_id: None,
+            current_session_id: None,
             invoke_tool,
         }
     }

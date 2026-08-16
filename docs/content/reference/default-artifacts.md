@@ -176,7 +176,6 @@ into every tool artifact.
 | `MURMUR_CAPSULE_VERSION` | `version` from the manifest | Same |
 | `MURMUR_SESSION_ID` | The session ID | Same |
 | `MURMUR_CAPSULE_URL` | `localhost:<port>`, the address the capsule's HTTP server bound | Same |
-| `MURMUR_JOB_ID` | The job ID, for a capsule spawned by [roost](roost-api.md). Not set otherwise | Same |
 
 `transport: process` loads no driver component: `inference.endpoint`, `inference.driver` and
 `inference.api_key` are rejected in the manifest, and the agent loop spawns `inference.command`
