@@ -49,7 +49,8 @@ fn create_canonical_native_zip(dir: &Path, binary_path: &Path) -> PathBuf {
     writeln!(zip, "runtime: tool").unwrap();
     writeln!(zip, "implementation: native").unwrap();
 
-    zip.start_file(format!("bin/{ARTIFACT_NAME}"), exec_opts).unwrap();
+    zip.start_file(format!("bin/{ARTIFACT_NAME}"), exec_opts)
+        .unwrap();
     zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
 
     zip.finish().unwrap();
@@ -116,10 +117,7 @@ fn native_tool_zip_layout() {
             !name.starts_with(".cargo/"),
             ".cargo directory must not appear in zip: {name}"
         );
-        assert!(
-            name != "Cargo.toml",
-            "Cargo.toml must not appear in zip"
-        );
+        assert!(name != "Cargo.toml", "Cargo.toml must not appear in zip");
     }
 
     // Binary must have executable permission bits set (Unix mode 0o755 → mode & 0o111 != 0).

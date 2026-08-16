@@ -14,8 +14,8 @@
 //! The `slice2_*` block further down is the exception: those are artifact tests
 //! for `murmur-tool-git`'s own operations that still live here, and they still
 //! build that binary out of a `default-artifacts` checkout next to this repo.
-//! They move to that repo under card 66fe14dc, and this file loses its last
-//! sibling-checkout dependency when they do.
+//! Once those cases are ported to that repo, this file can lose its last
+//! sibling-checkout dependency.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -33,8 +33,8 @@ use capsule_runtime::{
     StageRequest,
 };
 use murmur_artifact::{
-    load_runtime_manifest, ArtifactMeta, ArtifactRuntime, ContainmentClass, LocalRegistry, Registry,
-    RuntimeType,
+    load_runtime_manifest, ArtifactMeta, ArtifactRuntime, ContainmentClass, LocalRegistry,
+    Registry, RuntimeType,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -64,13 +64,13 @@ fn fixture_path(relative: &str) -> PathBuf {
 fn git_tool_binary() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // crates/mur-cli → murmur/ → _murmur/ → default-artifacts/
-    let default_artifacts = manifest_dir
-        .ancestors()
-        .nth(3)?
-        .join("default-artifacts");
+    let default_artifacts = manifest_dir.ancestors().nth(3)?.join("default-artifacts");
 
     if !default_artifacts.exists() {
-        eprintln!("[git_tool test] default-artifacts not found at {:?}", default_artifacts);
+        eprintln!(
+            "[git_tool test] default-artifacts not found at {:?}",
+            default_artifacts
+        );
         return None;
     }
 
@@ -119,14 +119,18 @@ fn create_fixture_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
     zip.start_file("murmur.yaml", options).unwrap();
     let manifest = common::fixture_native_tool_manifest();
     zip.write_all(&fs::read(&manifest).unwrap_or_else(|err| {
-        panic!("fixture manifest {} must be readable: {err}", manifest.display())
+        panic!(
+            "fixture manifest {} must be readable: {err}",
+            manifest.display()
+        )
     }))
     .unwrap();
 
     let exec_options: SimpleFileOptions = FileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o755);
-    zip.start_file(format!("bin/{TOOL_NAME}"), exec_options).unwrap();
+    zip.start_file(format!("bin/{TOOL_NAME}"), exec_options)
+        .unwrap();
     zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
 
     zip.finish().unwrap();
@@ -359,7 +363,9 @@ fn extract_result_text(tool_result: &Value) -> String {
         .and_then(|blocks| {
             blocks.iter().find_map(|b| {
                 if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                    b.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -393,9 +399,9 @@ fn invoke_native_tool_directly(binary: &Path, data: Value, extra_env: &[(&str, &
     child.stdin.take().unwrap().write_all(&stdin_bytes).unwrap();
     let out = child.wait_with_output().unwrap();
 
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
-        json!({"status": "error", "summary": "binary produced invalid JSON output"})
-    })
+    serde_json::from_slice(&out.stdout).unwrap_or_else(
+        |_| json!({"status": "error", "summary": "binary produced invalid JSON output"}),
+    )
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -438,7 +444,12 @@ fn native_tool_dispatch_creates_directory() {
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2, "expected 2 LLM requests, got {}", requests.len());
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected 2 LLM requests, got {}",
+        requests.len()
+    );
 
     let tool_result = find_tool_result(&requests, "toolu_create")
         .expect("tool_result block should exist in second request");
@@ -658,12 +669,21 @@ fn native_tool_dispatch_with_explicit_repo() {
 
     let staged = stage_fixture_tool_session(&home, project.path(), &server.endpoint);
     let workdir = staged.workdir.clone();
-    fs::write(workdir.join("task.md"), "Create a directory with an explicit repo.").unwrap();
+    fs::write(
+        workdir.join("task.md"),
+        "Create a directory with an explicit repo.",
+    )
+    .unwrap();
 
     launch_session(staged, |_| {}).expect("launch should succeed");
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2, "expected 2 LLM requests, got {}", requests.len());
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected 2 LLM requests, got {}",
+        requests.len()
+    );
 
     let tool_result =
         find_tool_result(&requests, "toolu_explicit").expect("tool_result block should exist");
@@ -824,9 +844,18 @@ fn native_tool_schema_includes_repo_field() {
         "'repo' must be a named property in the tool schema so the model knows to pass it; \
          got properties: {properties}"
     );
-    assert!(properties.get("operation").is_some(), "schema must include 'operation'");
-    assert!(properties.get("path").is_some(), "schema must include 'path'");
-    assert!(properties.get("label").is_some(), "schema must include 'label'");
+    assert!(
+        properties.get("operation").is_some(),
+        "schema must include 'operation'"
+    );
+    assert!(
+        properties.get("path").is_some(),
+        "schema must include 'path'"
+    );
+    assert!(
+        properties.get("label").is_some(),
+        "schema must include 'label'"
+    );
 }
 
 // ── Slice 2 helpers ───────────────────────────────────────────────────────────
@@ -835,7 +864,11 @@ fn native_tool_schema_includes_repo_field() {
 fn make_commit(repo: &Path, filename: &str, content: &str, message: &str) -> String {
     fs::write(repo.join(filename), content).unwrap();
     let run = |args: &[&str]| {
-        let s = Command::new("git").args(args).current_dir(repo).status().unwrap();
+        let s = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .status()
+            .unwrap();
         assert!(s.success(), "git {:?} failed", args);
     };
     run(&["add", filename]);
@@ -859,44 +892,71 @@ fn invoke_tool(binary: &Path, data: Value) -> Value {
 fn slice2_commit_success() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_commit_success"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_commit_success");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     fs::write(repo.join("new.txt"), "content\n").unwrap();
-    Command::new("git").args(["-C", repo_s, "add", "new.txt"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "add", "new.txt"])
+        .status()
+        .unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "commit",
-        "repo": repo_s,
-        "message": "add new.txt",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "commit",
+            "repo": repo_s,
+            "message": "add new.txt",
+        }),
+    );
 
     assert_eq!(result["ok"], true, "commit should succeed; got: {result:?}");
-    assert!(!result["hash"].as_str().unwrap_or("").is_empty(), "hash must be populated");
-    assert!(!result["short_hash"].as_str().unwrap_or("").is_empty(), "short_hash must be populated");
-    assert_eq!(result["subject"], "add new.txt", "subject must match commit message");
+    assert!(
+        !result["hash"].as_str().unwrap_or("").is_empty(),
+        "hash must be populated"
+    );
+    assert!(
+        !result["short_hash"].as_str().unwrap_or("").is_empty(),
+        "short_hash must be populated"
+    );
+    assert_eq!(
+        result["subject"], "add new.txt",
+        "subject must match commit message"
+    );
 }
 
 #[test]
 fn slice2_commit_nothing() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_commit_nothing"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_commit_nothing");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
 
     // Nothing staged — should fail
-    let result = invoke_tool(&binary, json!({
-        "operation": "commit",
-        "repo": repo.to_str().unwrap(),
-        "message": "should fail",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "commit",
+            "repo": repo.to_str().unwrap(),
+            "message": "should fail",
+        }),
+    );
 
-    assert_eq!(result["ok"], false, "commit with nothing staged should fail");
+    assert_eq!(
+        result["ok"], false,
+        "commit with nothing staged should fail"
+    );
     assert_eq!(result["error_kind"], "nothing_to_commit");
 }
 
@@ -904,19 +964,28 @@ fn slice2_commit_nothing() {
 fn slice2_commit_allow_empty() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_commit_allow_empty"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_commit_allow_empty");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "commit",
-        "repo": repo.to_str().unwrap(),
-        "message": "empty commit",
-        "allow_empty": true,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "commit",
+            "repo": repo.to_str().unwrap(),
+            "message": "empty commit",
+            "allow_empty": true,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "allow_empty commit on clean tree should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "allow_empty commit on clean tree should succeed; got: {result:?}"
+    );
     assert!(!result["hash"].as_str().unwrap_or("").is_empty());
     assert_eq!(result["subject"], "empty commit");
 }
@@ -925,57 +994,90 @@ fn slice2_commit_allow_empty() {
 fn slice2_cherry_pick_success() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_cherry_pick_success"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_cherry_pick_success");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     // Create feature branch and make a unique commit on it
-    Command::new("git").args(["-C", repo_s, "checkout", "-b", "feature"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "-b", "feature"])
+        .status()
+        .unwrap();
     let pick_hash = make_commit(&repo, "cherry.txt", "cherry content\n", "add cherry.txt");
 
     // Switch back to main
-    Command::new("git").args(["-C", repo_s, "checkout", "main"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "main"])
+        .status()
+        .unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "cherry_pick",
-        "repo": repo_s,
-        "ref": pick_hash,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "cherry_pick",
+            "repo": repo_s,
+            "ref": pick_hash,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "cherry-pick should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "cherry-pick should succeed; got: {result:?}"
+    );
     assert!(!result["hash"].as_str().unwrap_or("").is_empty());
     assert_eq!(result["subject"], "add cherry.txt");
-    assert!(repo.join("cherry.txt").exists(), "cherry.txt should exist in main after pick");
+    assert!(
+        repo.join("cherry.txt").exists(),
+        "cherry.txt should exist in main after pick"
+    );
 }
 
 #[test]
 fn slice2_cherry_pick_conflict() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_cherry_pick_conflict"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_cherry_pick_conflict");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     // feature: modify README.md one way and commit
-    Command::new("git").args(["-C", repo_s, "checkout", "-b", "feature"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "-b", "feature"])
+        .status()
+        .unwrap();
     let pick_hash = make_commit(&repo, "README.md", "feature version\n", "feature change");
 
     // main: modify README.md a different way and commit (creates divergence)
-    Command::new("git").args(["-C", repo_s, "checkout", "main"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "main"])
+        .status()
+        .unwrap();
     make_commit(&repo, "README.md", "main version\n", "main change");
 
     // cherry-pick feature commit onto main → conflict
-    let result = invoke_tool(&binary, json!({
-        "operation": "cherry_pick",
-        "repo": repo_s,
-        "ref": pick_hash,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "cherry_pick",
+            "repo": repo_s,
+            "ref": pick_hash,
+        }),
+    );
 
-    assert_eq!(result["ok"], false, "conflicting cherry-pick should fail; got: {result:?}");
+    assert_eq!(
+        result["ok"], false,
+        "conflicting cherry-pick should fail; got: {result:?}"
+    );
     assert_eq!(result["error_kind"], "conflict");
 
     // Repo must still be in conflict state (not auto-aborted)
@@ -996,51 +1098,77 @@ fn slice2_cherry_pick_conflict() {
 fn slice2_branch_list() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_branch_list"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_branch_list");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "list",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "list",
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "branch list should succeed; got: {result:?}");
-    let branches = result["branches"].as_array().expect("branches must be an array");
+    assert_eq!(
+        result["ok"], true,
+        "branch list should succeed; got: {result:?}"
+    );
+    let branches = result["branches"]
+        .as_array()
+        .expect("branches must be an array");
     let current = branches.iter().find(|b| b["current"] == true);
     assert!(current.is_some(), "one branch should be flagged as current");
     let current_name = current.unwrap()["name"].as_str().unwrap_or("");
-    assert!(!current_name.is_empty(), "current branch name must not be empty");
+    assert!(
+        !current_name.is_empty(),
+        "current branch name must not be empty"
+    );
 }
 
 #[test]
 fn slice2_branch_create() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_branch_create"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_branch_create");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "create",
-        "name": "new-feature",
-    }));
-    assert_eq!(result["ok"], true, "branch create should succeed; got: {result:?}");
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "create",
+            "name": "new-feature",
+        }),
+    );
+    assert_eq!(
+        result["ok"], true,
+        "branch create should succeed; got: {result:?}"
+    );
     assert_eq!(result["name"], "new-feature");
 
     // Verify branch appears in list
-    let list = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "list",
-    }));
+    let list = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "list",
+        }),
+    );
     let branches = list["branches"].as_array().unwrap();
     assert!(
         branches.iter().any(|b| b["name"] == "new-feature"),
@@ -1052,35 +1180,50 @@ fn slice2_branch_create() {
 fn slice2_branch_delete() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_branch_delete"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_branch_delete");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     // Create a branch (same content as main → will be "merged")
-    invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "create",
-        "name": "to-delete",
-    }));
+    invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "create",
+            "name": "to-delete",
+        }),
+    );
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "delete",
-        "name": "to-delete",
-    }));
-    assert_eq!(result["ok"], true, "branch delete should succeed; got: {result:?}");
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "delete",
+            "name": "to-delete",
+        }),
+    );
+    assert_eq!(
+        result["ok"], true,
+        "branch delete should succeed; got: {result:?}"
+    );
     assert_eq!(result["name"], "to-delete");
 
     // Verify branch is gone
-    let list = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "list",
-    }));
+    let list = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "list",
+        }),
+    );
     let branches = list["branches"].as_array().unwrap();
     assert!(
         !branches.iter().any(|b| b["name"] == "to-delete"),
@@ -1092,23 +1235,35 @@ fn slice2_branch_delete() {
 fn slice2_branch_delete_not_merged() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_branch_delete_not_merged"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_branch_delete_not_merged");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     // Create branch and add a commit not in main → not merged
-    Command::new("git").args(["-C", repo_s, "checkout", "-b", "unmerged"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "-b", "unmerged"])
+        .status()
+        .unwrap();
     make_commit(&repo, "extra.txt", "data\n", "unmerged commit");
-    Command::new("git").args(["-C", repo_s, "checkout", "main"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "main"])
+        .status()
+        .unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "branch",
-        "repo": repo_s,
-        "subcommand": "delete",
-        "name": "unmerged",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "branch",
+            "repo": repo_s,
+            "subcommand": "delete",
+            "name": "unmerged",
+        }),
+    );
 
     assert_eq!(result["ok"], false, "deleting unmerged branch should fail");
     assert_eq!(result["error_kind"], "not_merged");
@@ -1120,21 +1275,33 @@ fn slice2_branch_delete_not_merged() {
 fn slice2_checkout_switch_branch() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_checkout_switch_branch"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_checkout_switch_branch");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
-    Command::new("git").args(["-C", repo_s, "branch", "other"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "branch", "other"])
+        .status()
+        .unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "checkout",
-        "repo": repo_s,
-        "ref": "other",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "checkout",
+            "repo": repo_s,
+            "ref": "other",
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "checkout should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "checkout should succeed; got: {result:?}"
+    );
     assert_eq!(result["branch"], "other");
     assert_eq!(result["detached"], false);
 }
@@ -1143,20 +1310,29 @@ fn slice2_checkout_switch_branch() {
 fn slice2_checkout_create() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_checkout_create"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_checkout_create");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "checkout",
-        "repo": repo_s,
-        "ref": "fresh-branch",
-        "create": true,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "checkout",
+            "repo": repo_s,
+            "ref": "fresh-branch",
+            "create": true,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "checkout -b should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "checkout -b should succeed; got: {result:?}"
+    );
     assert_eq!(result["branch"], "fresh-branch");
     assert_eq!(result["detached"], false);
 }
@@ -1165,27 +1341,42 @@ fn slice2_checkout_create() {
 fn slice2_checkout_dirty() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_checkout_dirty"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_checkout_dirty");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
     // Create `other` branch where README.md differs from main
-    Command::new("git").args(["-C", repo_s, "checkout", "-b", "other"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "-b", "other"])
+        .status()
+        .unwrap();
     make_commit(&repo, "README.md", "other branch version\n", "other change");
-    Command::new("git").args(["-C", repo_s, "checkout", "main"]).status().unwrap();
+    Command::new("git")
+        .args(["-C", repo_s, "checkout", "main"])
+        .status()
+        .unwrap();
 
     // Dirty the working tree: modify README.md locally (unstaged) so it conflicts with `other`
     fs::write(repo.join("README.md"), "local dirty change\n").unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "checkout",
-        "repo": repo_s,
-        "ref": "other",
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "checkout",
+            "repo": repo_s,
+            "ref": "other",
+        }),
+    );
 
-    assert_eq!(result["ok"], false, "checkout with conflicting dirty tree should fail");
+    assert_eq!(
+        result["ok"], false,
+        "checkout with conflicting dirty tree should fail"
+    );
     assert_eq!(result["error_kind"], "dirty_working_tree");
 }
 
@@ -1193,20 +1384,29 @@ fn slice2_checkout_dirty() {
 fn slice2_switch_create() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_switch_create"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_switch_create");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
     let repo_s = repo.to_str().unwrap();
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "switch",
-        "repo": repo_s,
-        "branch": "switched-branch",
-        "create": true,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "switch",
+            "repo": repo_s,
+            "branch": "switched-branch",
+            "create": true,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "switch -c should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "switch -c should succeed; got: {result:?}"
+    );
     assert_eq!(result["branch"], "switched-branch");
 }
 
@@ -1216,7 +1416,10 @@ fn slice2_switch_create() {
 fn slice2_reset_soft() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_reset_soft"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_reset_soft");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
@@ -1235,16 +1438,25 @@ fn slice2_reset_soft() {
     make_commit(&repo, "extra.txt", "data\n", "second commit");
 
     // Soft reset back to the initial commit
-    let result = invoke_tool(&binary, json!({
-        "operation": "reset",
-        "repo": repo_s,
-        "mode": "soft",
-        "ref": &parent_hash,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "reset",
+            "repo": repo_s,
+            "mode": "soft",
+            "ref": &parent_hash,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "reset soft should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "reset soft should succeed; got: {result:?}"
+    );
     let resolved = result["ref"].as_str().unwrap_or("");
-    assert_eq!(resolved, parent_hash, "HEAD should point to the parent commit after soft reset");
+    assert_eq!(
+        resolved, parent_hash,
+        "HEAD should point to the parent commit after soft reset"
+    );
 
     // With soft reset, changes should be staged (index should still have extra.txt)
     let status_out = Command::new("git")
@@ -1262,7 +1474,10 @@ fn slice2_reset_soft() {
 fn slice2_reset_hard() {
     let binary = match git_tool_binary() {
         Some(b) => b,
-        None => { eprintln!("[SKIP] slice2_reset_hard"); return; }
+        None => {
+            eprintln!("[SKIP] slice2_reset_hard");
+            return;
+        }
     };
     let dir = TempDir::new().unwrap();
     let repo = init_git_repo(dir.path());
@@ -1278,14 +1493,20 @@ fn slice2_reset_hard() {
 
     make_commit(&repo, "extra.txt", "data\n", "second commit");
 
-    let result = invoke_tool(&binary, json!({
-        "operation": "reset",
-        "repo": repo_s,
-        "mode": "hard",
-        "ref": &parent_hash,
-    }));
+    let result = invoke_tool(
+        &binary,
+        json!({
+            "operation": "reset",
+            "repo": repo_s,
+            "mode": "hard",
+            "ref": &parent_hash,
+        }),
+    );
 
-    assert_eq!(result["ok"], true, "reset hard should succeed; got: {result:?}");
+    assert_eq!(
+        result["ok"], true,
+        "reset hard should succeed; got: {result:?}"
+    );
     assert_eq!(result["ref"].as_str().unwrap_or(""), parent_hash);
 
     // Hard reset: extra.txt must not exist and working dir must be clean

@@ -59,8 +59,13 @@ pub fn run_capsule_with_env(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    cmd.args(["run", "--manifest", manifest_path.to_str().unwrap(), "--verbose"])
-        .assert()
+    cmd.args([
+        "run",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--verbose",
+    ])
+    .assert()
 }
 
 pub fn fixture_path(relative: &str) -> PathBuf {
@@ -75,9 +80,8 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 ///
 /// `MURMUR_DEFAULT_ARTIFACTS_DIR` is the only way to find that checkout, and
 /// `None` means it was not set. There is deliberately no relative-path fallback
-/// to a sibling directory: a fallback makes the suite pass or fail on how the
-/// machine happens to be laid out, which is exactly what it used to do.
-/// Callers must skip when this returns `None`.
+/// to a sibling directory: a fallback would make the suite pass or fail on how
+/// the machine happens to be laid out. Callers must skip when this returns `None`.
 pub fn default_artifacts_dir() -> Option<PathBuf> {
     std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR").map(PathBuf::from)
 }
