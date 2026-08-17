@@ -41,6 +41,12 @@ available: **nothing in this codebase ever runs as root or drops privileges**, s
 privileged phase to create a cgroup from. The mechanism that fits is systemd user delegation, the
 same one rootless Docker and Podman use for the identical problem.
 
+On a host with a reachable systemd user session, `mur` requests its own delegated scope
+automatically on every launch (see [below](#what-the-runtime-does-with-the-delegation)) and this
+section can be skipped. It matters when no systemd user session is reachable: the runtime then
+falls back to whatever cgroup it already inherited, which must already carry the delegation
+described below.
+
 ### Confirm the host is cgroup v2 unified
 
 ```bash
@@ -84,29 +90,34 @@ mkdir "$CG/murmur-delegation-probe" && rmdir "$CG/murmur-delegation-probe" && ec
 If the `mkdir` fails with `EACCES`, the delegation did not apply; the runtime performs this exact
 probe at launch and refuses with `E-RUN-012` naming what is missing.
 
-### Running `mur` under its own scope (optional, recommended)
-
-Running the capsule under a dedicated transient scope keeps its cgroup subtree out of the shell's:
-
-```bash
-systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.yaml
-```
-
 ### What the runtime does with the delegation
 
 At launch, before any WASM is instantiated, if the capsule can spawn a native subprocess
 (`capabilities.shell.allow`, `capabilities.spawn.allow`, or a native-implementation artifact) the
 runtime:
 
-1. reads `/proc/self/cgroup` for the `0::` line and joins it to the `cgroup2` mount from
+1. asks the systemd user session, over the session D-Bus bus, for a fresh transient scope carrying
+   `Delegate=yes` and moves itself into it — the same mechanism rootless Podman and Docker use —
+   so the scope it builds under is one it is the only process in, regardless of what cgroup it was
+   started from (an interactive shell, `cargo test`, anything else). This step is silent and
+   best-effort: on a host with no systemd user session reachable, it is skipped and step 2 runs
+   against whatever cgroup the process actually inherited;
+2. reads `/proc/self/cgroup` for the `0::` line and joins it to the `cgroup2` mount from
    `/proc/mounts` to find its delegated base;
-2. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`
+3. enables `memory`, `pids`, `cpu` (and `io`, if delegated) in that base's `cgroup.subtree_control`
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
-3. creates `<base>/murmur-<session_id>` and writes `memory.max`, `pids.max`, `cpu.max` (fatal on
+4. creates `<base>/murmur-<session_id>` and writes `memory.max`, `pids.max`, `cpu.max` (fatal on
    failure) and `io.max` (best-effort, logged on failure);
-4. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
+5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
    from inside its `pre_exec`, before `execve`.
+
+Wrapping `mur` itself in an outer delegated scope still works and is harmless — `mur` still asks
+for its own scope inside it — but is no longer necessary for the launch to succeed:
+
+```bash
+systemd-run --user --scope --property=Delegate=yes -- mur run --manifest murmur.yaml
+```
 
 Inspect a live scope while a capsule runs:
 
@@ -415,12 +426,16 @@ landed on the host's `/tmp` and counted against nothing.
 
 Verify the Linux refusal is real, and that it is correctly scoped.
 
-**7a — subprocess-capable capsule, no delegation → refuse.** Temporarily remove the drop-in from
-[the install section](#install-requirement-systemd-user-cgroup-delegation) (or run under a unit
-without `Delegate=`), then:
+**7a — subprocess-capable capsule, no delegation → refuse.** `mur` asks the systemd user session
+for its own scope on every launch, so triggering a genuine refusal means making that request
+impossible to satisfy, not just removing the drop-in from
+[the install section](#install-requirement-systemd-user-cgroup-delegation): make the session D-Bus
+bus unreachable for this one invocation, so both the self-acquired scope and the inherited-cgroup
+fallback have nothing to work with:
 
 ```bash
-mur run --manifest murmur.yaml --task 'echo hello'
+env -u DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR=/nonexistent-for-this-test \
+  mur run --manifest murmur.yaml --task 'echo hello'
 ```
 
 **Expected:** the launch fails **before any WASM is instantiated** and before any subprocess is

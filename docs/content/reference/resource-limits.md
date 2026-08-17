@@ -80,8 +80,12 @@ bomb.
 **Linux.** A capsule that can spawn any native subprocess — through `capabilities.shell.allow`,
 `capabilities.spawn.allow`, or a native-implementation artifact — refuses to launch with
 `E-RUN-012` when the host cannot delegate a cgroup, rather than running that tree with no aggregate
-ceiling. Delegation comes from systemd: `Delegate=yes` for `memory pids cpu io` on the unit `mur`
-runs under. A capsule that declares no subprocess capability is never blocked. See
+ceiling. On launch, `mur` asks the systemd user session for a fresh delegated scope of its own —
+the same mechanism rootless Podman and Docker use — so it works from an ordinary shell without any
+setup. When no systemd user session is reachable, it falls back to whatever cgroup it already
+inherited, which must itself carry `Delegate=yes` for `memory pids cpu io` (for example, by running
+under a unit configured that way, or via `systemd-run --user --scope --property=Delegate=yes`). A
+capsule that declares no subprocess capability is never blocked. See
 [Verification](containment.md#verification) for how these bounds are checked by hand.
 
 **macOS and other non-Linux hosts.** No cgroup can exist, so the launch proceeds with rlimits alone
