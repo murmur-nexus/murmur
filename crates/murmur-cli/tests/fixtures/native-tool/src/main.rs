@@ -77,7 +77,11 @@ fn run(raw: &str) -> Value {
 
     if let Some(log_path) = envelope.get("log_path").and_then(Value::as_str) {
         let operation = op.get("operation").and_then(Value::as_str).unwrap_or("");
-        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
             let _ = writeln!(file, "murmur-tool-fixture: {operation}");
         }
     }
