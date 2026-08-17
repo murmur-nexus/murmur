@@ -21,27 +21,23 @@
 //! identical problem. The exact unit configuration is in
 //! `docs/content/reference/resource-limits-manual-verification.md`.
 //!
-//! ## Asking for that delegation rather than waiting to inherit it
+//! ## Self-relocation before probing an inherited cgroup
 //!
-//! Inheriting a delegated cgroup is not enough on its own: cgroup v2 refuses to enable
-//! controllers for a cgroup's children while that cgroup still holds tasks, so the runtime can
-//! only build a bounded child under a base it is the *sole* occupant of. An interactive shell's
-//! cgroup holds the shell, its pane scope and everything else the user is running; under
-//! `cargo test`, `cargo` itself stays resident beside every test binary. Stepping aside into
-//! [`SUPERVISOR_LEAF`] moves this process and no one else, so on those hosts the launch used to
-//! be refused for a host that was in fact perfectly capable of delegation.
+//! cgroup v2 refuses to enable controllers for a cgroup's children while that cgroup still holds
+//! tasks, so a bounded child can only be built under a base this process is the *sole* occupant
+//! of. An interactive shell's cgroup holds the shell, its pane scope, and everything else the
+//! user is running; under `cargo test`, `cargo` stays resident beside every test binary. Stepping
+//! aside into [`SUPERVISOR_LEAF`] moves only this process, so co-residency alone makes the base
+//! unusable regardless of delegation.
 //!
-//! So the runtime asks for a cgroup instead of hoping for one: at the moment it first needs a
-//! base, [`move_self_into_own_systemd_scope`] asks the systemd *user* manager over the session
-//! bus for a freshly created transient scope carrying `Delegate=yes`, which moves this process
-//! out of whatever cgroup it inherited and into a brand-new one — a sibling of what it left, not
-//! a child — that it is by construction the only process in. Rootless Podman and Docker do
-//! exactly this for the same reason. The step-aside logic below then succeeds unconditionally,
-//! because nothing else is ever there to contend with.
+//! [`move_self_into_own_systemd_scope`] asks the systemd *user* manager over the session bus for
+//! a freshly created transient scope carrying `Delegate=yes`, moving this process into a
+//! brand-new cgroup — a sibling of whatever it left, not a child — that it is the sole occupant
+//! of by construction. The step-aside logic below then always succeeds, since nothing else is
+//! ever in that scope to contend with.
 //!
-//! That request is best-effort and silent: on a non-systemd init, with no session bus, or under
-//! a policy denial, the runtime simply probes whatever cgroup it did inherit, exactly as it did
-//! before — which still succeeds on a properly delegated unit and still fails closed otherwise.
+//! The request is best-effort and silent: with no systemd, no session bus, or a policy denial,
+//! the runtime probes whatever cgroup it inherited, exactly as it does when this step is skipped.
 //!
 //! ## Fail closed, but only where the threat exists
 //!
@@ -534,10 +530,8 @@ fn delegated_base() -> Result<PathBuf, String> {
         return Ok(base.clone());
     }
 
-    // Before reading where this process happens to live, try to make that answer a cgroup worth
-    // having: one this process is alone in. Best-effort by design — on failure the probe below
-    // runs against the inherited cgroup, which is the pre-existing behaviour and still the right
-    // one on a host with no systemd to ask.
+    // Best-effort: relocate into our own scope before probing. On failure, the probe below runs
+    // against the inherited cgroup — the correct fallback on a host with no systemd to ask.
     move_self_into_own_systemd_scope();
 
     let base = probe_delegation()?;
@@ -549,17 +543,12 @@ fn delegated_base() -> Result<PathBuf, String> {
 /// Ask the systemd user manager for a freshly created, delegated transient scope holding this
 /// process, so the cgroup this runtime builds under is one it is the only occupant of.
 ///
-/// **Best-effort and non-fatal, on purpose.** Nothing here returns an error to the caller: every
-/// failure mode — no systemd, no session bus, a policy denial, a systemd too old to honour the
-/// properties, a migration that never lands — leaves the process exactly where it already was,
-/// which is precisely the state [`probe_delegation`] was written for. A host that had a usable
-/// delegated cgroup all along keeps working unchanged; a host that never did still refuses to
-/// launch, with the same message it gives today. Turning a failed *optimisation* into a launch
-/// refusal would break both.
+/// Best-effort and non-fatal: every failure here (no systemd, no session bus, policy denial, a
+/// migration that never lands) leaves the process exactly where it was — the state
+/// [`probe_delegation`] handles. Never let a failed optimisation become a launch refusal.
 ///
-/// Attempted at most once per process: a scope is a property of the process, not of a session, so
-/// a second attempt could only ever create a second unit for a process already in the first.
-/// [`delegated_base`] retries on failure (it caches only success), so the guard has to live here.
+/// Runs at most once per process — a scope is a property of the process, not the session, and
+/// [`delegated_base`] retries on failure but caches only success, so the guard has to live here.
 #[cfg(target_os = "linux")]
 fn move_self_into_own_systemd_scope() {
     static ATTEMPTED: std::sync::Once = std::sync::Once::new();
@@ -585,9 +574,8 @@ fn transient_scope_unit_name() -> String {
 /// actually moved us.
 #[cfg(target_os = "linux")]
 fn request_transient_scope(unit: &str) -> Result<(), String> {
-    // zbus's blocking API drives its own executor. Running it on a dedicated thread keeps it
-    // clear of whichever async runtime the caller is inside — `runtime::launch_session` reaches
-    // here from within tokio — instead of blocking a worker on a nested reactor.
+    // zbus's blocking API drives its own executor; run it off-thread so it never blocks a
+    // caller already inside another async runtime (e.g. tokio) on a nested reactor.
     let owned_unit = unit.to_string();
     std::thread::Builder::new()
         .name("murmur-cgroup-scope".to_string())
@@ -646,16 +634,14 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
 
 /// Wait until `/proc/self/cgroup` actually reports us inside `unit`'s cgroup.
 ///
-/// `StartTransientUnit` returns as soon as the job is *enqueued*, so its success says nothing
-/// about where this process currently lives — and every later step (the delegation probe, the
-/// controller enable, the scope directory) reads exactly that. Confirming migration from
-/// `/proc/self/cgroup` checks the one thing that matters, at the source the rest of this module
-/// already trusts, rather than inferring it from a job object path.
+/// `StartTransientUnit` returns once the job is *enqueued*, not once the move has happened, and
+/// every later step (the delegation probe, the controller enable, the scope directory) depends on
+/// where this process actually lives — so migration is confirmed from `/proc/self/cgroup`, the
+/// same source the rest of this module reads, rather than inferred from a job object path.
 ///
-/// The 2s deadline in 20ms steps mirrors [`enable_controllers`] deliberately: both are waiting on
-/// systemd/kernel bookkeeping that normally completes in a millisecond or two, and in both a wait
-/// that has gone on for seconds means something structural is wrong and has to surface instead of
-/// hanging the launch. Here surfacing costs nothing — the caller ignores the error and falls back
+/// The 2s deadline in 20ms steps mirrors [`enable_controllers`]: both wait on systemd/kernel
+/// bookkeeping that normally completes in a millisecond or two, and a wait that long means
+/// something structural is wrong. A timeout here is cheap — the caller ignores it and falls back
 /// to probing the inherited cgroup.
 #[cfg(target_os = "linux")]
 fn await_scope_membership(unit: &str) -> Result<(), String> {
