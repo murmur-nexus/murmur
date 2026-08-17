@@ -21,6 +21,24 @@
 //! identical problem. The exact unit configuration is in
 //! `docs/content/reference/resource-limits-manual-verification.md`.
 //!
+//! ## Self-relocation before probing an inherited cgroup
+//!
+//! cgroup v2 refuses to enable controllers for a cgroup's children while that cgroup still holds
+//! tasks, so a bounded child can only be built under a base this process is the *sole* occupant
+//! of. An interactive shell's cgroup holds the shell, its pane scope, and everything else the
+//! user is running; under `cargo test`, `cargo` stays resident beside every test binary. Stepping
+//! aside into [`SUPERVISOR_LEAF`] moves only this process, so co-residency alone makes the base
+//! unusable regardless of delegation.
+//!
+//! [`move_self_into_own_systemd_scope`] asks the systemd *user* manager over the session bus for
+//! a freshly created transient scope carrying `Delegate=yes`, moving this process into a
+//! brand-new cgroup — a sibling of whatever it left, not a child — that it is the sole occupant
+//! of by construction. The step-aside logic below then always succeeds, since nothing else is
+//! ever in that scope to contend with.
+//!
+//! The request is best-effort and silent: with no systemd, no session bus, or a policy denial,
+//! the runtime probes whatever cgroup it inherited, exactly as it does when this step is skipped.
+//!
 //! ## Fail closed, but only where the threat exists
 //!
 //! On Linux, a capsule that can spawn *any* native subprocess and cannot be given a cgroup
@@ -512,10 +530,136 @@ fn delegated_base() -> Result<PathBuf, String> {
         return Ok(base.clone());
     }
 
+    // Best-effort: relocate into our own scope before probing. On failure, the probe below runs
+    // against the inherited cgroup — the correct fallback on a host with no systemd to ask.
+    move_self_into_own_systemd_scope();
+
     let base = probe_delegation()?;
     enable_controllers(&base)?;
     *cached = Some(base.clone());
     Ok(base)
+}
+
+/// Ask the systemd user manager for a freshly created, delegated transient scope holding this
+/// process, so the cgroup this runtime builds under is one it is the only occupant of.
+///
+/// Best-effort and non-fatal: every failure here (no systemd, no session bus, policy denial, a
+/// migration that never lands) leaves the process exactly where it was — the state
+/// [`probe_delegation`] handles. Never let a failed optimisation become a launch refusal.
+///
+/// Runs at most once per process — a scope is a property of the process, not the session, and
+/// [`delegated_base`] retries on failure but caches only success, so the guard has to live here.
+#[cfg(target_os = "linux")]
+fn move_self_into_own_systemd_scope() {
+    static ATTEMPTED: std::sync::Once = std::sync::Once::new();
+    ATTEMPTED.call_once(|| {
+        let _ = request_transient_scope(&transient_scope_unit_name());
+    });
+}
+
+/// Name of the transient scope unit to ask systemd for.
+///
+/// `murmur-` keeps the operator-facing convention the scope *directories* already use
+/// ([`scope_dir_name`]), so `systemctl --user list-units 'murmur-*.scope'` finds the runtime's
+/// units the same way a `murmur-*` glob finds its cgroup directories. The pid and a per-process
+/// serial keep it unique against a recycled pid whose earlier unit systemd has not yet collected.
+#[cfg(target_os = "linux")]
+fn transient_scope_unit_name() -> String {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("murmur-{}-{serial}.scope", std::process::id())
+}
+
+/// The D-Bus half of [`move_self_into_own_systemd_scope`], plus confirmation that the kernel
+/// actually moved us.
+#[cfg(target_os = "linux")]
+fn request_transient_scope(unit: &str) -> Result<(), String> {
+    // zbus's blocking API drives its own executor; run it off-thread so it never blocks a
+    // caller already inside another async runtime (e.g. tokio) on a nested reactor.
+    let owned_unit = unit.to_string();
+    std::thread::Builder::new()
+        .name("murmur-cgroup-scope".to_string())
+        .spawn(move || start_transient_scope(&owned_unit))
+        .map_err(|error| format!("could not spawn the D-Bus thread: {error}"))?
+        .join()
+        .map_err(|_| "the D-Bus thread panicked".to_string())??;
+
+    await_scope_membership(unit)
+}
+
+/// `StartTransientUnit` on the systemd user manager: create `unit` as a scope containing this
+/// process, with its cgroup subtree delegated to us.
+///
+/// The call is
+/// `org.freedesktop.systemd1.Manager.StartTransientUnit(in s name, in s mode, in a(sv) properties,
+/// in a(sa(sv)) aux)` on `/org/freedesktop/systemd1` at the well-known name
+/// `org.freedesktop.systemd1`, over the **session** bus (`$DBUS_SESSION_BUS_ADDRESS`, falling back
+/// to `$XDG_RUNTIME_DIR/bus`) so the unit lands in this user's manager and needs no privilege.
+/// The properties are the same set `systemd-run --user --scope -p Delegate=yes` sends:
+///
+/// * `PIDs` (`au`) — this process, which is what makes systemd *move* it rather than fork a new one.
+/// * `Delegate` (`b`) — hand the scope's subtree to us, controllers and all, and stop managing it.
+/// * `CollectMode` (`s`) — `inactive-or-failed`, so the unit is garbage-collected when this
+///   process exits rather than lingering as a failed unit an operator has to reset.
+/// * `Description` (`s`) — what `systemctl --user list-units` shows beside the unit.
+#[cfg(target_os = "linux")]
+fn start_transient_scope(unit: &str) -> Result<(), String> {
+    use zbus::zvariant::Value;
+
+    let connection = zbus::blocking::Connection::session()
+        .map_err(|error| format!("no systemd session bus: {error}"))?;
+
+    let properties: Vec<(&str, Value<'_>)> = vec![
+        ("Description", Value::from("Murmur capsule subprocess scope")),
+        ("PIDs", Value::from(vec![std::process::id()])),
+        ("Delegate", Value::from(true)),
+        ("CollectMode", Value::from("inactive-or-failed")),
+    ];
+    // No auxiliary units: a scope has none.
+    let aux: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+
+    connection
+        .call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "StartTransientUnit",
+            // "fail" rather than "replace": a name collision means something is wrong with our
+            // assumption of uniqueness, and displacing an unrelated unit is never the fix.
+            &(unit, "fail", properties, aux),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("systemd refused to start {unit}: {error}"))
+}
+
+/// Wait until `/proc/self/cgroup` actually reports us inside `unit`'s cgroup.
+///
+/// `StartTransientUnit` returns once the job is *enqueued*, not once the move has happened, and
+/// every later step (the delegation probe, the controller enable, the scope directory) depends on
+/// where this process actually lives — so migration is confirmed from `/proc/self/cgroup`, the
+/// same source the rest of this module reads, rather than inferred from a job object path.
+///
+/// The 2s deadline in 20ms steps mirrors [`enable_controllers`]: both wait on systemd/kernel
+/// bookkeeping that normally completes in a millisecond or two, and a wait that long means
+/// something structural is wrong. A timeout here is cheap — the caller ignores it and falls back
+/// to probing the inherited cgroup.
+#[cfg(target_os = "linux")]
+fn await_scope_membership(unit: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let current = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        if let Some(path) = parse_unified_cgroup_path(&current) {
+            if path.rsplit('/').next() == Some(unit) {
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "systemd accepted the request for {unit} but this process is not in it"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Locate the delegated cgroup v2 directory this process may create children under, confirming
@@ -759,6 +903,38 @@ mod tests {
         let scope = prepare_scope(true, &HostResourceLimits::default(), "ses_test", temp.path())
             .expect("a non-Linux host must not refuse to launch for a missing cgroup");
         assert!(scope.is_none());
+    }
+
+    /// The point of asking systemd for a scope: a Linux host with a working user session hands
+    /// out a bounded scope no matter what this process's *inherited* cgroup looked like — an
+    /// interactive shell's cgroup full of co-resident processes, or the one `cargo test` keeps
+    /// itself resident in while running this very binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_required_scope_is_created_whatever_cgroup_this_process_inherited() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = prepare_scope(true, &HostResourceLimits::default(), "ses_selftest", temp.path())
+            .expect("a Linux host with a systemd user session must be able to bound a subprocess tree")
+            .expect("a required scope on Linux is never `None`");
+
+        for file in ["memory.max", "pids.max", "cpu.max"] {
+            let contents = std::fs::read_to_string(scope.path().join(file))
+                .unwrap_or_else(|error| panic!("{file} unreadable in the scope: {error}"));
+            assert!(!contents.trim().is_empty(), "{file} was left unset");
+            assert_ne!(contents.trim(), "max", "{file} carries no ceiling");
+        }
+    }
+
+    /// The unit name systemd is asked for stays inside the `murmur-*` convention operators
+    /// already use to find this runtime's cgroup directories, and stays unique per request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transient_scope_unit_names_are_murmur_prefixed_and_unique() {
+        let first = transient_scope_unit_name();
+        let second = transient_scope_unit_name();
+        assert!(first.starts_with(&format!("murmur-{}-", std::process::id())));
+        assert!(first.ends_with(".scope"));
+        assert_ne!(first, second);
     }
 
     #[test]
