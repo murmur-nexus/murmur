@@ -8,9 +8,7 @@
 //!
 //! The binary packed here is the local fixture tool from
 //! `tests/fixtures/native-tool/`, built on demand by
-//! `common::fixture_native_tool_binary()`. Any executable would satisfy these
-//! structural assertions, but using the same fixture the dispatch tests use
-//! keeps one native tool in the suite instead of two.
+//! `common::fixture_native_tool_binary()`.
 
 #[path = "common/mod.rs"]
 mod common;

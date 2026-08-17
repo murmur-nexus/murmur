@@ -5,17 +5,16 @@
 //! launch_session dispatches tool calls from a scripted LLM response, and we
 //! verify the tool's filesystem effects and the schema the driver sends up.
 //!
-//! The fixture tool deliberately replaces the real `murmur-tool-git` here. What
-//! these cases are about is murmur's side of the contract — dispatch, the
-//! inventory → `input_schema` mapping, and a native tool self-enforcing a path
-//! allow list — none of which is about git. Testing them against an artifact
-//! built in a sibling checkout meant the suite could not run without one.
+//! The fixture tool stands in for the real `murmur-tool-git`: these cases are
+//! about murmur's side of the contract — dispatch, the inventory →
+//! `input_schema` mapping, and a native tool self-enforcing a path allow list —
+//! none of which is about git, and none of which needs an artifact from another
+//! checkout.
 //!
-//! The `slice2_*` block further down is the exception: those are artifact tests
-//! for `murmur-tool-git`'s own operations that still live here, and they still
-//! build that binary out of a `default-artifacts` checkout next to this repo.
-//! Once those cases are ported to that repo, this file can lose its last
-//! sibling-checkout dependency.
+//! The `slice2_*` block is the exception: those are artifact tests for
+//! `murmur-tool-git`'s own operations, and they build that binary out of the
+//! `default-artifacts` checkout named by `MURMUR_DEFAULT_ARTIFACTS_DIR`. They
+//! skip when it is unset.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -50,22 +49,20 @@ fn fixture_path(relative: &str) -> PathBuf {
     common::fixture_path(relative)
 }
 
-/// Locate or compile the murmur-tool-git binary from a `default-artifacts`
-/// checkout next to this repository.
+/// Locate or compile the murmur-tool-git binary in the `default-artifacts`
+/// checkout named by `MURMUR_DEFAULT_ARTIFACTS_DIR`.
 ///
 /// Only the `slice2_*` block below uses this. Every other test in this file runs
 /// against the local fixture tool instead — see `common::fixture_native_tool_binary`.
 ///
-/// Returns None if the default-artifacts workspace cannot be found.
+/// `None` — for the caller to turn into a skip — when the variable is unset, when
+/// it names a directory that does not exist, or when the build produces no binary.
 fn git_tool_binary() -> Option<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/mur-cli → murmur/ → _murmur/ → default-artifacts/
-    let default_artifacts = manifest_dir.ancestors().nth(3)?.join("default-artifacts");
+    let default_artifacts = common::default_artifacts_dir()?;
 
     if !default_artifacts.exists() {
         eprintln!(
-            "[git_tool test] default-artifacts not found at {:?}",
-            default_artifacts
+            "[git_tool test] MURMUR_DEFAULT_ARTIFACTS_DIR names {default_artifacts:?}, which does not exist"
         );
         return None;
     }
@@ -88,9 +85,8 @@ fn git_tool_binary() -> Option<PathBuf> {
         }
     }
 
-    // Re-checked after the build, not only in the branch that decides whether to
-    // build: a build that exits 0 without producing the binary has to skip cleanly
-    // rather than hand back a path that fails to spawn deep inside a test body.
+    // A build can exit 0 without producing the binary, so the caller gets a clean skip
+    // rather than a path that fails to spawn inside a test body.
     if !binary_path.exists() {
         eprintln!("[git_tool test] binary missing at {binary_path:?} after a successful build");
         return None;
@@ -101,9 +97,9 @@ fn git_tool_binary() -> Option<PathBuf> {
 /// Pack the fixture native tool into a `.mur.zip` with the canonical layout.
 ///
 /// The manifest is the fixture crate's own `murmur.yaml`, so `input_schema` and
-/// `capabilities` are exactly what a published artifact would carry — there is no
-/// inline fallback manifest, because a silently-substituted stub with no
-/// `input_schema` is what made the schema test pass vacuously before.
+/// `capabilities` are exactly what a published artifact would carry. There is no
+/// inline fallback manifest: a stub with no `input_schema` reads back as an empty
+/// object, which makes the schema test pass vacuously.
 fn create_fixture_tool_artifact(dir: &Path, binary_path: &Path) -> PathBuf {
     let manifest = common::fixture_native_tool_manifest();
     let manifest_bytes = fs::read(&manifest).unwrap_or_else(|err| {
@@ -768,15 +764,13 @@ fn native_tool_repo_in_allow_list() {
 
 /// Test 8: the tool manifest's `input_schema` reaches the model as `input_schema`.
 ///
-/// This is the end-to-end path that caught the original production bug: the schema is
-/// read from the artifact zip's murmur.yaml, converted by build_tool_inventory, serialised
-/// by the Anthropic driver into `input_schema`, and sent to the model in the first API
-/// request. Without `repo` in the schema the model never passes it, and the tool silently
-/// falls back to CWD discovery.
+/// The schema is read from the artifact zip's murmur.yaml, converted by
+/// build_tool_inventory, serialised by the Anthropic driver into `input_schema`, and sent
+/// to the model in the first API request. Without `repo` in the schema the model never
+/// passes it, and the tool silently falls back to CWD discovery.
 ///
-/// The assertion is on named properties, not on the presence of `input_schema`: the bug
-/// that motivated this test was a fixture that packed a stub manifest with no schema at
-/// all, which read back as an empty object and made every softer assertion vacuous.
+/// The assertion is on named properties, not on the presence of `input_schema`: a manifest
+/// with no schema reads back as an empty object, which satisfies any softer assertion.
 #[test]
 fn native_tool_schema_includes_repo_field() {
     let home = TempDir::new().unwrap();

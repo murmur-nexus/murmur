@@ -79,9 +79,9 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 /// `#[ignore]` that depend on artifacts built there.
 ///
 /// `MURMUR_DEFAULT_ARTIFACTS_DIR` is the only way to find that checkout, and
-/// `None` means it was not set. There is deliberately no relative-path fallback
-/// to a sibling directory: a fallback would make the suite pass or fail on how
-/// the machine happens to be laid out. Callers must skip when this returns `None`.
+/// `None` means it was not set. No relative-path fallback to a sibling directory:
+/// one would make the suite pass or fail on how the machine happens to be laid
+/// out. Callers must skip when this returns `None`.
 pub fn default_artifacts_dir() -> Option<PathBuf> {
     std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR").map(PathBuf::from)
 }
@@ -117,9 +117,8 @@ pub fn fixture_native_tool_binary() -> Option<PathBuf> {
         }
     }
 
-    // Re-checked *after* the build, not only in the "should I build" branch above:
-    // a build that exits 0 but puts nothing here must skip cleanly, rather than hand
-    // back a path that fails to spawn deep inside a test body.
+    // A build can exit 0 without producing the binary, so the caller gets a clean skip
+    // rather than a path that fails to spawn inside a test body.
     if !binary_path.exists() {
         eprintln!(
             "[fixture] {FIXTURE_NATIVE_TOOL_NAME} not found at {} after a successful build",
