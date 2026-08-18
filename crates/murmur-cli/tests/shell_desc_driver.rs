@@ -14,20 +14,22 @@ const SHELL_DESC_DRIVER_VERSION: &str = "0.1.0";
 /// Path to the debug-built driver binary inside the default-artifacts
 /// checkout. Build it there first:
 ///   cargo build -p murmur-driver-shell-desc
-fn shell_desc_binary() -> PathBuf {
-    common::default_artifacts_dir().join("target/debug/murmur-driver-shell-desc")
+///
+/// `None` when `MURMUR_DEFAULT_ARTIFACTS_DIR` is unset — the caller skips.
+fn shell_desc_binary() -> Option<PathBuf> {
+    Some(common::default_artifacts_dir()?.join("target/debug/murmur-driver-shell-desc"))
 }
 
 #[test]
-#[ignore = "requires a default-artifacts checkout with murmur-driver-shell-desc built; set MURMUR_DEFAULT_ARTIFACTS_DIR or clone it next to this repo"]
+#[ignore = "requires a default-artifacts checkout with murmur-driver-shell-desc built; set MURMUR_DEFAULT_ARTIFACTS_DIR to point at it"]
 fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
-    let binary_path = shell_desc_binary();
-    assert!(
-        binary_path.exists(),
-        "murmur-driver-shell-desc must be built in the default-artifacts checkout \
-         first (looked at {})",
-        binary_path.display()
-    );
+    let Some(binary_path) = shell_desc_binary().filter(|path| path.exists()) else {
+        eprintln!(
+            "[SKIP] shell_desc_driver_writes_enriched_manifest_for_known_binary: set \
+             MURMUR_DEFAULT_ARTIFACTS_DIR to a checkout with murmur-driver-shell-desc built"
+        );
+        return;
+    };
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -219,13 +221,15 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
 }
 
 #[test]
-#[ignore = "requires a default-artifacts checkout with murmur-driver-shell-desc built; set MURMUR_DEFAULT_ARTIFACTS_DIR or clone it next to this repo"]
+#[ignore = "requires a default-artifacts checkout with murmur-driver-shell-desc built; set MURMUR_DEFAULT_ARTIFACTS_DIR to point at it"]
 fn shell_desc_driver_respects_custom_manifest() {
-    let binary_path = shell_desc_binary();
-    if !binary_path.exists() {
-        eprintln!("Skipping custom-manifest test: driver binary not built");
+    let Some(binary_path) = shell_desc_binary().filter(|path| path.exists()) else {
+        eprintln!(
+            "[SKIP] shell_desc_driver_respects_custom_manifest: set \
+             MURMUR_DEFAULT_ARTIFACTS_DIR to a checkout with murmur-driver-shell-desc built"
+        );
         return;
-    }
+    };
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();

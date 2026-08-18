@@ -84,5 +84,7 @@ cargo test -p murmur-cli --test build   # one integration suite (see crates/murm
 Every PR that changes behavior must include tests — see the testing section of the
 [contributor guidelines](https://github.com/murmur-nexus/murmur/blob/main/.github/CONTRIBUTING.md#testing-your-change)
 for where tests go and how much coverage is expected. A few integration tests are marked
-`#[ignore]` because they depend on a sibling `default-artifacts` checkout; they only run
-with `cargo test -- --ignored`.
+`#[ignore]` because they depend on a `default-artifacts` checkout with certain artifacts
+built; set `MURMUR_DEFAULT_ARTIFACTS_DIR` to point at one, then run with
+`cargo test -- --ignored`. Without that variable set, these tests skip themselves; every
+other test runs without needing a `default-artifacts` checkout at all.

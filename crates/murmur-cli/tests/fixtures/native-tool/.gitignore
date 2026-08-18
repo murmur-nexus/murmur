@@ -1,0 +1,3 @@
+# The tests build this crate with `--target-dir <workspace>/target/native-tool-fixture`,
+# so nothing normally lands here — this only catches a plain `cargo build` run by hand.
+target/

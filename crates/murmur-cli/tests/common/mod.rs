@@ -59,8 +59,13 @@ pub fn run_capsule_with_env(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
-    cmd.args(["run", "--manifest", manifest_path.to_str().unwrap(), "--verbose"])
-        .assert()
+    cmd.args([
+        "run",
+        "--manifest",
+        manifest_path.to_str().unwrap(),
+        "--verbose",
+    ])
+    .assert()
 }
 
 pub fn fixture_path(relative: &str) -> PathBuf {
@@ -71,14 +76,91 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 }
 
 /// Root of a local `default-artifacts` checkout, used by tests marked
-/// `#[ignore]` that depend on artifacts built there. Set
-/// `MURMUR_DEFAULT_ARTIFACTS_DIR` to point at the checkout; without the
-/// override, a checkout next to this repository is assumed.
-pub fn default_artifacts_dir() -> PathBuf {
-    match std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../default-artifacts"),
+/// `#[ignore]` that depend on artifacts built there.
+///
+/// `MURMUR_DEFAULT_ARTIFACTS_DIR` is the only way to find that checkout, and
+/// `None` means it was not set. No relative-path fallback to a sibling directory:
+/// one would make the suite pass or fail on how the machine happens to be laid
+/// out. Callers must skip when this returns `None`.
+pub fn default_artifacts_dir() -> Option<PathBuf> {
+    std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR").map(PathBuf::from)
+}
+
+/// Name of the fixture native tool crate under `tests/fixtures/native-tool/`,
+/// used both as the artifact name and as the binary name inside `bin/`.
+pub const FIXTURE_NATIVE_TOOL_NAME: &str = "murmur-tool-fixture";
+
+/// Build (once) and locate the fixture native tool binary.
+///
+/// Returns `None` — for the caller to turn into a clean skip — if the build
+/// cannot run or leaves nothing at the expected path. Unlike the WASM fixtures
+/// alongside it, this binary is host-native and therefore not portable across
+/// the project's platform targets, so it is compiled here rather than checked
+/// in. Output lands in the workspace target directory, so repeat runs reuse it.
+pub fn fixture_native_tool_binary() -> Option<PathBuf> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = fixture_path("native-tool/Cargo.toml");
+    let target_dir = workspace_root.join("target").join("native-tool-fixture");
+    let binary_path = target_dir.join("release").join(FIXTURE_NATIVE_TOOL_NAME);
+
+    if !binary_path.exists() {
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "--manifest-path"])
+            .arg(&manifest)
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .status()
+            .ok()?;
+        if !status.success() {
+            eprintln!("[fixture] cargo build of {FIXTURE_NATIVE_TOOL_NAME} failed");
+            return None;
+        }
     }
+
+    // A build can exit 0 without producing the binary, so the caller gets a clean skip
+    // rather than a path that fails to spawn inside a test body.
+    if !binary_path.exists() {
+        eprintln!(
+            "[fixture] {FIXTURE_NATIVE_TOOL_NAME} not found at {} after a successful build",
+            binary_path.display()
+        );
+        return None;
+    }
+    Some(binary_path)
+}
+
+/// The fixture native tool's own `murmur.yaml`, the manifest the tests pack into
+/// its artifact zip so `input_schema` matches what a real artifact carries.
+pub fn fixture_native_tool_manifest() -> PathBuf {
+    fixture_path("native-tool/murmur.yaml")
+}
+
+/// Pack a native tool artifact zip with the canonical `murmur.yaml` + `bin/<name>` layout:
+/// the manifest at the archive root and the binary executable at `bin/<name>`.
+pub fn create_native_tool_zip(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    manifest_bytes: &[u8],
+    binary_path: &Path,
+) -> PathBuf {
+    let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
+    let file = fs::File::create(&artifact_path).unwrap();
+    let mut zip = ZipWriter::new(file);
+
+    let options: SimpleFileOptions =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("murmur.yaml", options).unwrap();
+    zip.write_all(manifest_bytes).unwrap();
+
+    let exec_options: SimpleFileOptions = FileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+    zip.start_file(format!("bin/{name}"), exec_options).unwrap();
+    zip.write_all(&fs::read(binary_path).unwrap()).unwrap();
+
+    zip.finish().unwrap();
+    artifact_path
 }
 
 pub fn stage_agent_session(
