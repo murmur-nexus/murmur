@@ -899,6 +899,9 @@ mod tests {
 
     use super::*;
 
+    /// The `shell_allow` grant below is what makes every test built on this context need a
+    /// delegated cgroup v2 scope: `execute` bounds the plan's whole subprocess tree before
+    /// running a step, and fails closed when it cannot.
     fn test_ctx<'a>(
         workdir: PathBuf,
         invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
@@ -942,6 +945,11 @@ mod tests {
 
     #[test]
     fn dependent_step_receives_upstream_output() {
+        if crate::cgroup::skip_without_cgroup_delegation(
+            "plan::tests::dependent_step_receives_upstream_output",
+        ) {
+            return;
+        }
         let dir = tempdir().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_tool = Arc::clone(&seen);
@@ -974,6 +982,11 @@ mod tests {
 
     #[test]
     fn parallel_tool_steps_run_concurrently() {
+        if crate::cgroup::skip_without_cgroup_delegation(
+            "plan::tests::parallel_tool_steps_run_concurrently",
+        ) {
+            return;
+        }
         let dir = tempdir().unwrap();
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
@@ -1006,6 +1019,11 @@ mod tests {
 
     #[test]
     fn on_error_and_retries_are_applied() {
+        if crate::cgroup::skip_without_cgroup_delegation(
+            "plan::tests::on_error_and_retries_are_applied",
+        ) {
+            return;
+        }
         let dir = tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let invoke_calls = Arc::clone(&calls);
@@ -1035,6 +1053,11 @@ mod tests {
 
     #[test]
     fn condition_false_skips_step() {
+        if crate::cgroup::skip_without_cgroup_delegation(
+            "plan::tests::condition_false_skips_step",
+        ) {
+            return;
+        }
         let dir = tempdir().unwrap();
         let invoke = |_name: &str, _input: ToolInput| {
             Ok(tool_result(ToolStatus::Passed, Some("ok".to_string())))

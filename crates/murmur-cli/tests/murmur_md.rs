@@ -297,6 +297,11 @@ fn native_artifact_binary_staged_to_workdir() {
 #[cfg(unix)]
 #[test]
 fn native_tool_dispatch_executes_binary_and_returns_result() {
+    if common::skip_without_cgroup_delegation(
+        "native_tool_dispatch_executes_binary_and_returns_result",
+    ) {
+        return;
+    }
     let server = ScriptedServer::start(two_turn_responses_with_tool("test-native"));
 
     let home = TempDir::new().unwrap();

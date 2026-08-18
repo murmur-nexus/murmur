@@ -852,6 +852,69 @@ fn open_write_only(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
         .map(std::os::fd::OwnedFd::from)
 }
 
+/// Whether this host can hand the runtime a delegated cgroup v2 scope — the precondition
+/// [`prepare_scope`] fails closed on.
+///
+/// Test support, not a runtime code path: `mur` never asks this question, it asks systemd for a
+/// scope and reports [`crate::errors::RuntimeError::CgroupDelegationUnavailable`] when it cannot
+/// get one. Tests that launch a capsule tripping [`requires_process_bounding`] call this to skip
+/// visibly instead, because a containerised runner has no delegable subtree to give and the
+/// refusal there says nothing about the code under test. What CI therefore cannot cover is
+/// covered by hand: `docs/content/reference/resource-limits-manual-verification.md`.
+///
+/// Probed by actually creating a transient `--user` scope with `Delegate=yes`, since a
+/// `systemd-run` binary on `PATH` says nothing about a reachable user manager — and the user
+/// manager is the half a runner is missing. Off Linux there are no cgroups, this module is inert
+/// and nothing is ever refused, so the answer is `true`.
+pub fn cgroup_delegation_available() -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            std::process::Command::new("systemd-run")
+                .args([
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "-p",
+                    "Delegate=yes",
+                    "--",
+                    "true",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// Skip guard for a test that cannot run without [`cgroup_delegation_available`], written as
+/// `if skip_without_cgroup_delegation("test_name") { return; }`.
+///
+/// Prints exactly one `[SKIP-CGROUP]`-prefixed line per skipped test, on stderr, so the CI job's
+/// summary step can report the size of the skipped set as a count of matching lines. Cargo
+/// swallows a passing test's output, so the line only reaches the log under `--nocapture`.
+pub fn skip_without_cgroup_delegation(test_name: &str) -> bool {
+    if cgroup_delegation_available() {
+        return false;
+    }
+    eprintln!(
+        "[SKIP-CGROUP] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
+         that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
+         this test observes happens — see \
+         docs/content/reference/resource-limits-manual-verification.md"
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +975,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_required_scope_is_created_whatever_cgroup_this_process_inherited() {
+        if skip_without_cgroup_delegation(
+            "a_required_scope_is_created_whatever_cgroup_this_process_inherited",
+        ) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let scope = prepare_scope(true, &HostResourceLimits::default(), "ses_selftest", temp.path())
             .expect("a Linux host with a systemd user session must be able to bound a subprocess tree")

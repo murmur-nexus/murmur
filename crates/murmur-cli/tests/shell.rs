@@ -17,6 +17,9 @@ const DRIVER_VERSION: &str = "0.1.4";
 
 #[test]
 fn shell_execute_bash_and_reads_stdout() {
+    if common::skip_without_cgroup_delegation("shell_execute_bash_and_reads_stdout") {
+        return;
+    }
     let server = ScriptedServer::start(vec![
         json!({
             "id": "msg_1",
@@ -83,6 +86,9 @@ fn shell_execute_bash_and_reads_stdout() {
 
 #[test]
 fn shell_blocks_undeclared_binary() {
+    if common::skip_without_cgroup_delegation("shell_blocks_undeclared_binary") {
+        return;
+    }
     let server = ScriptedServer::start(vec![
         json!({
             "id": "msg_1",
@@ -154,6 +160,9 @@ fn shell_blocks_undeclared_binary() {
 
 #[test]
 fn shell_propagates_nonzero_exit_code() {
+    if common::skip_without_cgroup_delegation("shell_propagates_nonzero_exit_code") {
+        return;
+    }
     let server = ScriptedServer::start(vec![
         json!({
             "id": "msg_1",

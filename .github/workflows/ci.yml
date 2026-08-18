@@ -22,6 +22,54 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets
 
+  cargo-test:
+    name: cargo-test
+    runs-on: ubuntu-latest
+    # The full suite runs for roughly 20 minutes; the ceiling is there so a hung test is a failed
+    # job rather than a job that burns the runner's own limit.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libseccomp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Run the workspace test suite
+        # `--features` pulls in `topology_cmd` and `deploy_cmd`, which are `#![cfg(feature = ...)]`
+        # files and contribute zero tests without it. `--no-fail-fast` keeps one broken suite from
+        # hiding the state of every other. `--nocapture` is what lets the summary below see the
+        # skip lines at all: cargo swallows a passing test's output otherwise.
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast \
+            --features "beta-mur-topology beta-mur-deploy" \
+            -- --nocapture 2>&1 | tee test-output.log
+      - name: Report the tests this runner could not run
+        if: always()
+        # Runs even when the suite failed, so a red job still says how much of the suite was
+        # skipped rather than executed.
+        run: |
+          if [ ! -f test-output.log ]; then
+            echo "No test output was captured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          cgroup_skips=$(grep -c '\[SKIP-CGROUP\]' test-output.log || true)
+          other_skips=$(grep -c '\[SKIP\]' test-output.log || true)
+          {
+            echo "## Tests this runner did not execute"
+            echo
+            echo "| Skipped for | Tests |"
+            echo "| --- | ---: |"
+            echo "| No delegated cgroup v2 scope (\`[SKIP-CGROUP]\`) | $cgroup_skips |"
+            echo "| A local fixture or checkout this runner does not have (\`[SKIP]\`) | $other_skips |"
+            echo
+            echo "GitHub's runners are containerised and cannot delegate cgroup v2 controllers, so a"
+            echo "capsule that spawns native subprocesses refuses to launch here with \`E-RUN-012\`."
+            echo "Those $cgroup_skips tests are covered by the manual procedure in"
+            echo "\`docs/content/reference/resource-limits-manual-verification.md\`, which must be run by"
+            echo "hand on a real uncontainerised Linux host."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   wit-versions:
     name: wit-versions
     runs-on: ubuntu-latest
