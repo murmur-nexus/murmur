@@ -88,3 +88,9 @@ for where tests go and how much coverage is expected. A few integration tests ar
 built; set `MURMUR_DEFAULT_ARTIFACTS_DIR` to point at one, then run with
 `cargo test -- --ignored`. Without that variable set, these tests skip themselves; every
 other test runs without needing a `default-artifacts` checkout at all.
+
+CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
+request. Tests that need a delegated cgroup v2 scope skip themselves with a
+`[SKIP-CGROUP]`-prefixed line instead of failing, since a CI runner cannot provide one; the job's
+step summary reports how many tests were skipped for that reason and points at
+`docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
