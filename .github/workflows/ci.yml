@@ -25,11 +25,14 @@ jobs:
   cargo-test:
     name: cargo-test
     runs-on: ubuntu-latest
-    # The full suite runs for roughly 20 minutes; the ceiling is there so a hung test is a failed
-    # job rather than a job that burns the runner's own limit.
+    # Compilation, not the suite, is what the ceiling has to accommodate; it is here so a hung
+    # test fails the job rather than burning the runner's own limit.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Compilation dominates this job: the suite itself runs in about five minutes, and
+      # `timeout-minutes` is sized against the total, not against that.
+      - uses: Swatinem/rust-cache@v2
       - name: Install libseccomp
         run: |
           sudo apt-get update
@@ -53,8 +56,11 @@ jobs:
             echo "No test output was captured." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          cgroup_skips=$(grep -c '\[SKIP-CGROUP\]' test-output.log || true)
-          other_skips=$(grep -c '\[SKIP\]' test-output.log || true)
+          # `--nocapture` interleaves the output of concurrently running tests, so two markers can
+          # share a line: the count is of matches, not of lines. `[SKIP-CGROUP]` never matches the
+          # `[SKIP]` pattern -- the `]` is literal -- so the two counts stay disjoint.
+          cgroup_skips=$(grep -o '\[SKIP-CGROUP\]' test-output.log | wc -l)
+          other_skips=$(grep -o '\[SKIP\]' test-output.log | wc -l)
           {
             echo "## Tests this runner did not execute"
             echo
