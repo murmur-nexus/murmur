@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
@@ -34,6 +38,10 @@ jobs:
       # `timeout-minutes` is sized against the total, not against that.
       - uses: Swatinem/rust-cache@v2
       - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
