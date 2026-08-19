@@ -874,25 +874,12 @@ pub fn cgroup_delegation_available() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *AVAILABLE.get_or_init(|| {
-            std::process::Command::new("systemd-run")
-                .args([
-                    "--user",
-                    "--scope",
-                    "--quiet",
-                    "--collect",
-                    "-p",
-                    "Delegate=yes",
-                    "--",
-                    "true",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
+        // Answered through `delegated_base`, the same call `prepare_scope` makes, so the answer
+        // cannot disagree with what a launch does on this host. A separate `systemd-run` probe
+        // answers a different question and is wrong in both directions: a user manager hands out
+        // a scope on a host whose controllers `enable_controllers` cannot delegate, and the
+        // inherited cgroup carries delegated controllers on a host with no reachable session bus.
+        delegated_base().is_ok()
     }
 }
 
