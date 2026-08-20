@@ -185,25 +185,6 @@ fn mur_in_delegated_scope(home: &TempDir, project: &Path) -> Command {
     command
 }
 
-/// Whether `systemd-run --user` can create a transient scope here at all. Probed by actually
-/// creating one, since a systemd binary on `PATH` says nothing about a reachable user manager.
-fn delegated_scope_available() -> bool {
-    std::process::Command::new("systemd-run")
-        .args([
-            "--user",
-            "--scope",
-            "--quiet",
-            "--collect",
-            "-p",
-            "Delegate=yes",
-            "--",
-            "true",
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
 /// The `bash` tool's result text as the driver reported it back to the model on the second turn.
 fn tool_result_text(request: &Value, tool_use_id: &str) -> String {
     let messages = request["messages"].as_array().expect("messages array");
@@ -269,7 +250,20 @@ fn events_of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
 }
 
 /// Drives one full `mur run` and asserts the allowlisted binary actually executed.
-fn assert_allowlisted_exec_succeeds(containment_yaml: &str) {
+///
+/// `test_name` names the caller in the skip line below, since the cgroup gate is reached from more
+/// than one test and the CI summary counts one line per skipped test.
+fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
+    // The other fail-closed launch gate, asked first because no retry can get past it. `mur run`
+    // refuses a subprocess-capable capsule that cannot have its own network namespace, and that
+    // refusal is not `E-RUN-012` -- so the cgroup retry below neither recognises it nor helps.
+    // Only the namespace half of the host check is asked here: the cgroup half is answered by the
+    // delegated-scope retry, which can succeed on a host where this test harness's own cgroup
+    // cannot delegate.
+    if capsule_runtime::skip_without_egress_namespace(test_name) {
+        return;
+    }
+
     let server = common::ScriptedServer::start(vec![
         tool_call_response(&format!("echo {PROBE_SENTINEL}")),
         end_turn_response(),
@@ -295,7 +289,10 @@ fn assert_allowlisted_exec_succeeds(containment_yaml: &str) {
     // subprocesses refuses to launch unless a cgroup v2 scope can bound the process tree, and the
     // cgroup a test harness runs in is normally undelegated. Retry with `mur` in a delegated scope
     // of its own; there is nothing to observe about *this* slice until it launches.
-    if !output.status.success() && stderr.contains(CGROUP_REFUSAL) && delegated_scope_available() {
+    if !output.status.success()
+        && stderr.contains(CGROUP_REFUSAL)
+        && common::cgroup_delegation_available()
+    {
         fs::remove_dir_all(project.path().join("workdir")).ok();
         output = mur_in_delegated_scope(&home, project.path())
             .args(run_args)
@@ -307,9 +304,9 @@ fn assert_allowlisted_exec_succeeds(containment_yaml: &str) {
 
     if !output.status.success() && stderr.contains(CGROUP_REFUSAL) {
         eprintln!(
-            "skipping: this host cannot delegate a cgroup v2 scope to `mur`, so `mur run` refuses \
-             with {CGROUP_REFUSAL} before spawning any subprocess — no execve happens and this \
-             slice's behaviour is unobservable here"
+            "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope to `mur`, so \
+             `mur run` refuses with {CGROUP_REFUSAL} before spawning any subprocess — no execve \
+             happens and this slice's behaviour is unobservable here"
         );
         return;
     }
@@ -389,7 +386,10 @@ fn advisory_containment_executes_an_allowlisted_shell_binary() {
         return;
     }
 
-    assert_allowlisted_exec_succeeds("");
+    assert_allowlisted_exec_succeeds(
+        "advisory_containment_executes_an_allowlisted_shell_binary",
+        "",
+    );
 }
 
 /// Scenario 2: non-root, containment `scoped`. Skipped (not failed) on a host whose kernel cannot
@@ -420,5 +420,8 @@ fn scoped_containment_executes_an_allowlisted_shell_binary() {
     }
     drop(probe_project);
 
-    assert_allowlisted_exec_succeeds(containment_yaml);
+    assert_allowlisted_exec_succeeds(
+        "scoped_containment_executes_an_allowlisted_shell_binary",
+        containment_yaml,
+    );
 }

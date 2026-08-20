@@ -16,11 +16,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y libseccomp-dev
       - name: Check workspace
         run: cargo check --workspace --all-targets
+
+  cargo-test:
+    name: cargo-test
+    runs-on: ubuntu-latest
+    # Compilation, not the suite, is what the ceiling has to accommodate; it is here so a hung
+    # test fails the job rather than burning the runner's own limit.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Compilation dominates this job: the suite itself runs in about five minutes, and
+      # `timeout-minutes` is sized against the total, not against that.
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Run the workspace test suite
+        # `--features` pulls in `topology_cmd` and `deploy_cmd`, which are `#![cfg(feature = ...)]`
+        # files and contribute zero tests without it. `--no-fail-fast` keeps one broken suite from
+        # hiding the state of every other. `--nocapture` is what lets the summary below see the
+        # skip lines at all: cargo swallows a passing test's output otherwise.
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast \
+            --features "beta-mur-topology beta-mur-deploy" \
+            -- --nocapture 2>&1 | tee test-output.log
+      - name: Report the tests this runner could not run
+        if: always()
+        # Runs even when the suite failed, so a red job still says how much of the suite was
+        # skipped rather than executed.
+        run: |
+          if [ ! -f test-output.log ]; then
+            echo "No test output was captured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # `--nocapture` interleaves the output of concurrently running tests, so two markers can
+          # share a line: the count is of matches, not of lines. `[SKIP-HOST]` never matches the
+          # `[SKIP]` pattern -- the `]` is literal -- so the two counts stay disjoint.
+          host_skips=$(grep -o '\[SKIP-HOST\]' test-output.log | wc -l)
+          other_skips=$(grep -o '\[SKIP\]' test-output.log | wc -l)
+          {
+            echo "## Tests this runner did not execute"
+            echo
+            echo "| Skipped for | Tests |"
+            echo "| --- | ---: |"
+            echo "| Host cannot isolate a capsule (\`[SKIP-HOST]\`) | $host_skips |"
+            echo "| A local fixture or checkout this runner does not have (\`[SKIP]\`) | $other_skips |"
+            echo
+            echo "A capsule that spawns native subprocesses needs both a delegated cgroup v2 scope and"
+            echo "its own network namespace. GitHub's runners refuse \`unshare(CLONE_NEWUSER | CLONE_NEWNET)\`"
+            echo "under the AppArmor unprivileged-userns restriction, so the launch is refused here."
+            echo "Those $host_skips tests are covered by the manual procedure in"
+            echo "\`docs/content/reference/resource-limits-manual-verification.md\`, which must be run by"
+            echo "hand on a real uncontainerised Linux host."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   wit-versions:
     name: wit-versions

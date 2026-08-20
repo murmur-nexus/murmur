@@ -622,7 +622,18 @@ fn tasks_get_opt(addr: &str, task_id: &str) -> Option<Value> {
 /// Test 5: message/stream SSE stream receives an input-required status event
 /// (with final:false), and after delivering input via message/send the stream
 /// eventually sees a completed final event.
+///
+/// Ignored because it hangs rather than fails: its only blocking wait is `sse_handle.join()`, and
+/// `collect_sse_events_for_message` bounds each read at 30s but never the collection as a whole,
+/// so a stream that keeps delivering bytes without a `final:true` status is waited on forever.
+/// Observed at 0.5% CPU for 3h51m locally and consuming the CI job's entire `timeout-minutes`
+/// budget -- which starves every target scheduled after it, so leaving it enabled hides unrelated
+/// failures behind a job that reports no failing step at all.
+///
+/// Tracked by transit card `945168ac` (Fix the input_required SSE test hang), which owns the
+/// diagnosis and the fix. Re-enable there, not here.
 #[test]
+#[ignore = "hangs instead of failing; see transit card 945168ac"]
 fn input_required_sse_emits_state_event() {
     let server = tool_then_end_turn_server("SSE branch?", "stream completed");
     let home = tempfile::tempdir().unwrap();

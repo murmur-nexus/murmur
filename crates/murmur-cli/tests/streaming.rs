@@ -319,6 +319,9 @@ fn http_get(addr: &str, path: &str) -> String {
 
 #[test]
 fn streaming_basic_events_received() {
+    if common::skip_without_host_support("streaming_basic_events_received") {
+        return;
+    }
     let server = end_turn_server("streaming task complete");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
@@ -366,6 +369,9 @@ fn streaming_basic_events_received() {
 
 #[test]
 fn streaming_tool_artifact_event() {
+    if common::skip_without_host_support("streaming_tool_artifact_event") {
+        return;
+    }
     let server = tool_then_end_turn_server("bash", "echo hello_from_tool", "tool done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
@@ -423,6 +429,9 @@ fn streaming_tool_artifact_event() {
 
 #[test]
 fn streaming_reconnect_replays_missed_events() {
+    if common::skip_without_host_support("streaming_reconnect_replays_missed_events") {
+        return;
+    }
     // Use a 2-turn server so there are multiple events to replay
     let server = tool_then_end_turn_server("bash", "echo reconnect_test", "reconnect done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
@@ -505,6 +514,9 @@ fn streaming_reconnect_replays_missed_events() {
 
 #[test]
 fn streaming_agent_card_has_streaming_capability() {
+    if common::skip_without_host_support("streaming_agent_card_has_streaming_capability") {
+        return;
+    }
     let server = end_turn_server("agent card test done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
@@ -698,6 +710,9 @@ fn streaming_text_chunks_received() {
 /// full turn text and final:true, then the completed status event.
 #[test]
 fn streaming_non_streaming_driver_fallback() {
+    if common::skip_without_host_support("streaming_non_streaming_driver_fallback") {
+        return;
+    }
     let server = end_turn_server("the full response text");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);

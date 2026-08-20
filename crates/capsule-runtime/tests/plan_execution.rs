@@ -20,6 +20,9 @@ use capsule_runtime::{
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+/// The `shell_allow` grant below is what makes every test built on this context need a delegated
+/// cgroup v2 scope: `plan::execute` bounds the plan's whole subprocess tree before running a step,
+/// and fails closed when it cannot.
 fn ctx<'a>(
     workdir: PathBuf,
     invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
@@ -70,6 +73,11 @@ fn find<'a>(report: &'a plan::ExecutionReport, step_id: &str) -> &'a plan::StepR
 
 #[test]
 fn test_parallel_tool_steps_run_concurrently() {
+    if capsule_runtime::skip_without_host_support(
+        "test_parallel_tool_steps_run_concurrently",
+    ) {
+        return;
+    }
     let dir = tempdir().unwrap();
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
@@ -101,6 +109,11 @@ fn test_parallel_tool_steps_run_concurrently() {
 
 #[test]
 fn test_dependent_step_receives_upstream_output() {
+    if capsule_runtime::skip_without_host_support(
+        "test_dependent_step_receives_upstream_output",
+    ) {
+        return;
+    }
     let dir = tempdir().unwrap();
     let inputs = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&inputs);
@@ -137,6 +150,9 @@ fn test_dependent_step_receives_upstream_output() {
 
 #[test]
 fn test_shell_step_executes() {
+    if capsule_runtime::skip_without_host_support("test_shell_step_executes") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let invoke = move |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -185,6 +201,11 @@ fn test_capsule_step_spawns_and_reads_result() {
 /// so wrapping the objective in one would only hand the child JSON to decode before it can start.
 #[test]
 fn test_capsule_step_sends_objective_as_plain_text() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_sends_objective_as_plain_text",
+    ) {
+        return;
+    }
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
@@ -224,6 +245,11 @@ fn test_capsule_step_sends_objective_as_plain_text() {
 /// flattened into one field, so nothing they wrote is dropped on the way to the child.
 #[test]
 fn test_capsule_step_passes_unmodelled_input_through_as_json() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_passes_unmodelled_input_through_as_json",
+    ) {
+        return;
+    }
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
@@ -252,6 +278,9 @@ fn test_capsule_step_passes_unmodelled_input_through_as_json() {
 
 #[test]
 fn test_if_condition_skips_step_on_false() {
+    if capsule_runtime::skip_without_host_support("test_if_condition_skips_step_on_false") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -305,6 +334,9 @@ fn test_validation_rejects_unresolvable_tool() {
 
 #[test]
 fn test_on_error_continue_completes_plan() {
+    if capsule_runtime::skip_without_host_support("test_on_error_continue_completes_plan") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let invoke = |name: &str, _input: ToolInput| {
         if name == "fail" {
@@ -341,6 +373,9 @@ fn test_on_error_continue_completes_plan() {
 
 #[test]
 fn test_on_error_fail_aborts_plan() {
+    if capsule_runtime::skip_without_host_support("test_on_error_fail_aborts_plan") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -369,6 +404,9 @@ fn test_on_error_fail_aborts_plan() {
 
 #[test]
 fn test_retries_before_error_policy() {
+    if capsule_runtime::skip_without_host_support("test_retries_before_error_policy") {
+        return;
+    }
     let dir = tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);
@@ -402,6 +440,11 @@ fn test_retries_before_error_policy() {
 
 #[test]
 fn test_join_point_waits_for_multiple_upstreams() {
+    if capsule_runtime::skip_without_host_support(
+        "test_join_point_waits_for_multiple_upstreams",
+    ) {
+        return;
+    }
     let dir = tempdir().unwrap();
     let invoke = |_name: &str, input: ToolInput| {
         let data = input.data.unwrap_or_default();
@@ -623,6 +666,11 @@ fn write_http_json(stream: &mut TcpStream, body: &Value) {
 
 #[test]
 fn test_cycle_is_reported_without_running_steps() {
+    if capsule_runtime::skip_without_host_support(
+        "test_cycle_is_reported_without_running_steps",
+    ) {
+        return;
+    }
     let dir = tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&calls);

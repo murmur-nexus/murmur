@@ -148,6 +148,9 @@ fn murmur_md_written_after_staging() {
 /// Test 2: MURMUR.md reflects model name, context budget, and shell capabilities.
 #[test]
 fn murmur_md_reflects_capsule_config() {
+    if capsule_runtime::skip_without_egress_namespace("murmur_md_reflects_capsule_config") {
+        return;
+    }
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
@@ -297,6 +300,11 @@ fn native_artifact_binary_staged_to_workdir() {
 #[cfg(unix)]
 #[test]
 fn native_tool_dispatch_executes_binary_and_returns_result() {
+    if common::skip_without_host_support(
+        "native_tool_dispatch_executes_binary_and_returns_result",
+    ) {
+        return;
+    }
     let server = ScriptedServer::start(two_turn_responses_with_tool("test-native"));
 
     let home = TempDir::new().unwrap();
@@ -357,6 +365,9 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
 #[cfg(unix)]
 #[test]
 fn scaffold_creates_tool_directory() {
+    if common::skip_without_host_support("scaffold_creates_tool_directory") {
+        return;
+    }
     let scaffold_zip_path = std::env::var("HOME")
         .map(|h| {
             PathBuf::from(h)

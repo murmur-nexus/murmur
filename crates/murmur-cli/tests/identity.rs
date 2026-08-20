@@ -112,6 +112,11 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
 
 #[test]
 fn murmur_md_has_identity_section_with_correct_values() {
+    if common::skip_without_host_support(
+        "murmur_md_has_identity_section_with_correct_values",
+    ) {
+        return;
+    }
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);
@@ -149,6 +154,9 @@ fn murmur_md_has_identity_section_with_correct_values() {
 
 #[test]
 fn identity_env_vars_are_visible_to_shell_tool() {
+    if common::skip_without_host_support("identity_env_vars_are_visible_to_shell_tool") {
+        return;
+    }
     let server = common::ScriptedServer::start(vec![
         serde_json::json!({
             "id": "msg_1",
@@ -199,6 +207,9 @@ fn identity_env_vars_are_visible_to_shell_tool() {
 
 #[test]
 fn agent_card_served_at_well_known_path() {
+    if common::skip_without_host_support("agent_card_served_at_well_known_path") {
+        return;
+    }
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
@@ -246,6 +257,9 @@ fn agent_card_served_at_well_known_path() {
 
 #[test]
 fn agent_card_returns_404_for_unknown_path() {
+    if common::skip_without_host_support("agent_card_returns_404_for_unknown_path") {
+        return;
+    }
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
 
@@ -271,6 +285,11 @@ fn agent_card_returns_404_for_unknown_path() {
 
 #[test]
 fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
+    if common::skip_without_host_support(
+        "two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids",
+    ) {
+        return;
+    }
     let server1 = end_turn_server("session 1");
     let server2 = end_turn_server("session 2");
 
@@ -318,6 +337,9 @@ fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
 
 #[test]
 fn http_server_not_reachable_after_session_ends() {
+    if common::skip_without_host_support("http_server_not_reachable_after_session_ends") {
+        return;
+    }
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
     let staged = stage_agent(&home, &manifest_path);

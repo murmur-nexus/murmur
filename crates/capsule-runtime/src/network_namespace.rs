@@ -220,6 +220,26 @@ pub fn detect_egress_namespace_blocker() -> Option<EgressNamespaceBlocker> {
     egress_namespace_blocker(false, EgressNamespaceSupport::default())
 }
 
+/// Whether a test that needs a capsule network namespace must stand down on this host, printing
+/// the blocker when it must.
+///
+/// Test support, not a runtime code path. Asked through [`detect_egress_namespace_blocker`], the
+/// same probe `stage_session` consults, so the gate and the staging refusal cannot reach different
+/// conclusions about the host.
+///
+/// Narrower than [`crate::skip_without_host_support`], which also requires a delegated cgroup
+/// scope: a test driving `execute_shell` directly needs the namespace and nothing else, and
+/// standing down on the cgroup half would skip it on hosts where it runs perfectly well.
+pub fn skip_without_egress_namespace(test_name: &str) -> bool {
+    match detect_egress_namespace_blocker() {
+        Some(blocker) => {
+            eprintln!("[SKIP-HOST] {test_name}: {}", blocker.reason());
+            true
+        }
+        None => false,
+    }
+}
+
 /// Refuses the launch when a capsule that can spawn native subprocesses is on a host that cannot
 /// give them a network namespace.
 ///

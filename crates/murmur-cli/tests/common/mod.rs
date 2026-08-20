@@ -68,6 +68,33 @@ pub fn run_capsule_with_env(
     .assert()
 }
 
+/// Whether this host can hand `mur` a delegated cgroup v2 scope.
+///
+/// A capsule that declares `capabilities.shell.allow` or `capabilities.resources` refuses to
+/// launch without one (`E-RUN-012`), so a test that launches such a capsule has nothing to observe
+/// on a host that cannot delegate — a containerised CI runner, notably. Pair it with
+/// [`skip_without_host_support`], which prints the line CI counts.
+///
+/// The probe itself lives in `capsule-runtime` beside the code it describes, so these tests and
+/// the runtime's own answer the question the same way.
+pub fn cgroup_delegation_available() -> bool {
+    capsule_runtime::cgroup_delegation_available()
+}
+
+/// Skip guard for a test that launches a subprocess-capable capsule, written as
+/// `if common::skip_without_host_support("test_name") { return; }`.
+///
+/// Covers both fail-closed launch gates, not just [`cgroup_delegation_available`]: such a capsule
+/// also needs its own network namespace, and a runner under AppArmor's unprivileged-userns
+/// restriction refuses that while delegating a cgroup scope perfectly well.
+///
+/// Prints one `[SKIP-HOST]`-prefixed line per skipped test, which the CI job's summary step
+/// counts to report how much of the suite the runner could not exercise. Cargo swallows a passing
+/// test's output, so the line only reaches the log under `--nocapture`.
+pub fn skip_without_host_support(test_name: &str) -> bool {
+    capsule_runtime::skip_without_host_support(test_name)
+}
+
 pub fn fixture_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

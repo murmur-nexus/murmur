@@ -17,6 +17,9 @@ const DRIVER_VERSION: &str = "0.1.4";
 
 #[test]
 fn inline_system_prompt_appears_in_every_api_call() {
+    if common::skip_without_host_support("inline_system_prompt_appears_in_every_api_call") {
+        return;
+    }
     let server = ScriptedServer::start(two_turn_responses());
 
     let home = tempfile::tempdir().unwrap();
@@ -59,6 +62,11 @@ fn inline_system_prompt_appears_in_every_api_call() {
 
 #[test]
 fn system_prompt_file_contents_injected_as_system_param() {
+    if common::skip_without_host_support(
+        "system_prompt_file_contents_injected_as_system_param",
+    ) {
+        return;
+    }
     let server = ScriptedServer::start(vec![one_turn_response()]);
 
     let home = tempfile::tempdir().unwrap();
@@ -102,6 +110,9 @@ fn system_prompt_file_contents_injected_as_system_param() {
 
 #[test]
 fn missing_system_prompt_file_fails_at_launch() {
+    if common::skip_without_host_support("missing_system_prompt_file_fails_at_launch") {
+        return;
+    }
     let server = ScriptedServer::start(Vec::new());
 
     let home = tempfile::tempdir().unwrap();
@@ -143,6 +154,9 @@ fn missing_system_prompt_file_fails_at_launch() {
 
 #[test]
 fn no_system_prompt_field_sends_no_system_param() {
+    if common::skip_without_host_support("no_system_prompt_field_sends_no_system_param") {
+        return;
+    }
     let server = ScriptedServer::start(two_turn_responses());
 
     let home = tempfile::tempdir().unwrap();
