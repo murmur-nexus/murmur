@@ -783,7 +783,10 @@ mod tests {
         make_writer_with_opts(dir, false).await
     }
 
-    async fn make_writer_with_opts(dir: &std::path::Path, include_tool_output: bool) -> TraceWriter {
+    async fn make_writer_with_opts(
+        dir: &std::path::Path,
+        include_tool_output: bool,
+    ) -> TraceWriter {
         make_writer_with_prompt(dir, include_tool_output, None, false).await
     }
 
@@ -1412,9 +1415,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, vec![]).await.unwrap();
-        w.write_inference(0, 50, 25, "tool_call".to_string(), Some("bash".to_string()), None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            50,
+            25,
+            "tool_call".to_string(),
+            Some("bash".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -1429,9 +1439,18 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_shell(0, "/bin/echo".to_string(), "echo".to_string(), 0, 4, 0, 1, None)
-            .await
-            .unwrap();
+        w.write_shell(
+            0,
+            "/bin/echo".to_string(),
+            "echo".to_string(),
+            0,
+            4,
+            0,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
         w.write_inference(1, 60, 30, "end_turn".to_string(), None, None)
             .await
             .unwrap();
@@ -1568,8 +1587,14 @@ mod tests {
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
-        let se = events.iter().find(|e| e["event_type"] == "session_end").unwrap();
-        assert_eq!(se["total_tool_calls"], 1, "skill_call must not inflate total_tool_calls");
+        let se = events
+            .iter()
+            .find(|e| e["event_type"] == "session_end")
+            .unwrap();
+        assert_eq!(
+            se["total_tool_calls"], 1,
+            "skill_call must not inflate total_tool_calls"
+        );
     }
 
     #[tokio::test]
@@ -1606,12 +1631,17 @@ mod tests {
     async fn task_end_carries_reopen_count() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
         w.write_task_end("tsk_1", "ok", 2).await.unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
-        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        let end = events
+            .iter()
+            .find(|e| e["event_type"] == "task_end")
+            .unwrap();
         assert_eq!(end["task_id"], "tsk_1");
         assert_eq!(end["exit_status"], "ok");
         assert_eq!(end["reopen_count"], 2);
@@ -1621,7 +1651,9 @@ mod tests {
     async fn task_reopened_names_hook_reason_and_ordinal() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
         w.write_task_reopened("tsk_1", "gatekeeper", "tests still fail", 1)
             .await
             .unwrap();
@@ -1646,7 +1678,9 @@ mod tests {
     async fn task_turns_accessor_tracks_and_resets() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
         assert_eq!(w.task_turns(), 0);
         w.write_inference(0, 10, 5, "end_turn".to_string(), None, None)
             .await
@@ -1656,7 +1690,9 @@ mod tests {
             .unwrap();
         assert_eq!(w.task_turns(), 2);
         // A new task resets the per-task counter.
-        w.write_task_start("tsk_2", "ctx_2", "a2a", 3).await.unwrap();
+        w.write_task_start("tsk_2", "ctx_2", "a2a", 3)
+            .await
+            .unwrap();
         assert_eq!(w.task_turns(), 0);
     }
 }

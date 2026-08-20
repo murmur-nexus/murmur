@@ -225,7 +225,10 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
 /// `root.join(scope)` as `"."` once a grant declares a scope, and both must fail the same way
 /// (hard error naming the scope) rather than silently falling back to an unscoped preopen,
 /// which would widen the grant.
-pub(crate) fn resolve_scoped_dir(root: &Path, scope: &str) -> Result<std::path::PathBuf, RuntimeError> {
+pub(crate) fn resolve_scoped_dir(
+    root: &Path,
+    scope: &str,
+) -> Result<std::path::PathBuf, RuntimeError> {
     let scoped_dir = root.join(scope);
     std::fs::create_dir_all(&scoped_dir).map_err(|err| {
         RuntimeError::wasi(
@@ -618,7 +621,10 @@ mod tests {
 
         assert_eq!(grant.filesystem_scope.as_deref(), Some("cache"));
         assert!(grant.network_allow_rules.is_none());
-        assert_eq!(effective_tool_network_rules(Some(&grant), &ceiling), ceiling.as_slice());
+        assert_eq!(
+            effective_tool_network_rules(Some(&grant), &ceiling),
+            ceiling.as_slice()
+        );
     }
 
     #[test]

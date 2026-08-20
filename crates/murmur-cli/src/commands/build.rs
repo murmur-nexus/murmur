@@ -26,7 +26,10 @@ pub(crate) fn run_build(
         None => run_build_standard(source, output_arg),
         Some(skill_arg) => {
             let cwd = std::env::current_dir().map_err(|e| {
-                CliError::new(E_IO_003, format!("failed to determine working directory: {e}"))
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to determine working directory: {e}"),
+                )
             })?;
             let (name, input_path) = resolve_skill_args(skill_arg.as_deref(), source);
             let out = build_skill_artifact(
@@ -137,7 +140,13 @@ fn infer_name_from_path(path: &Path) -> String {
     // Replace non-ASCII-alphanumeric-non-hyphen chars with underscores
     let stem: String = stem
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     // Collapse consecutive underscores
@@ -158,7 +167,11 @@ fn infer_name_from_path(path: &Path) -> String {
     // Strip leading/trailing underscores and hyphens
     let name = result.trim_matches(|c| c == '_' || c == '-').to_string();
     // Degenerate input (e.g. "---/") can produce an empty name — fall back to "skill"
-    if name.is_empty() { "skill".to_string() } else { name }
+    if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    }
 }
 
 // (original_filename, bytes, manifest_bytes_opt, extra_files)
@@ -170,12 +183,15 @@ fn read_skill_from_dir(dir: &Path) -> Result<SkillContents, CliError> {
     let mut extra: Vec<(String, Vec<u8>)> = Vec::new();
 
     let entries = fs::read_dir(dir).map_err(|e| {
-        CliError::new(E_IO_001, format!("cannot read directory {}: {e}", dir.display()))
+        CliError::new(
+            E_IO_001,
+            format!("cannot read directory {}: {e}", dir.display()),
+        )
     })?;
 
     for entry in entries {
-        let entry = entry
-            .map_err(|e| CliError::new(E_IO_003, format!("directory read error: {e}")))?;
+        let entry =
+            entry.map_err(|e| CliError::new(E_IO_003, format!("directory read error: {e}")))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -184,16 +200,19 @@ fn read_skill_from_dir(dir: &Path) -> Result<SkillContents, CliError> {
         let lower = fname.to_lowercase();
 
         if lower == "skill.md" {
-            let bytes = fs::read(&path)
-                .map_err(|e| CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display())))?;
+            let bytes = fs::read(&path).map_err(|e| {
+                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
+            })?;
             skill_md = Some((fname, bytes));
         } else if lower == "murmur.yaml" {
-            let bytes = fs::read(&path)
-                .map_err(|e| CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display())))?;
+            let bytes = fs::read(&path).map_err(|e| {
+                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
+            })?;
             manifest = Some(bytes);
         } else {
-            let bytes = fs::read(&path)
-                .map_err(|e| CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display())))?;
+            let bytes = fs::read(&path).map_err(|e| {
+                CliError::new(E_IO_003, format!("cannot read {}: {e}", path.display()))
+            })?;
             extra.push((fname, bytes));
         }
     }
@@ -201,7 +220,10 @@ fn read_skill_from_dir(dir: &Path) -> Result<SkillContents, CliError> {
     let (name, bytes) = skill_md.ok_or_else(|| {
         CliError::new(
             E_IO_001,
-            format!("SKILL.md not found in {} (case-insensitive search found no match)", dir.display()),
+            format!(
+                "SKILL.md not found in {} (case-insensitive search found no match)",
+                dir.display()
+            ),
         )
     })?;
 
@@ -209,11 +231,13 @@ fn read_skill_from_dir(dir: &Path) -> Result<SkillContents, CliError> {
 }
 
 fn read_skill_from_zip(zip_path: &Path) -> Result<SkillContents, CliError> {
-    let file = fs::File::open(zip_path).map_err(|e| {
-        CliError::new(E_IO_001, format!("cannot open {}: {e}", zip_path.display()))
-    })?;
+    let file = fs::File::open(zip_path)
+        .map_err(|e| CliError::new(E_IO_001, format!("cannot open {}: {e}", zip_path.display())))?;
     let mut archive = ZipArchive::new(file).map_err(|e| {
-        CliError::new(E_IO_003, format!("cannot read zip {}: {e}", zip_path.display()))
+        CliError::new(
+            E_IO_003,
+            format!("cannot read zip {}: {e}", zip_path.display()),
+        )
     })?;
 
     let mut skill_md: Option<(String, Vec<u8>)> = None;
@@ -277,10 +301,7 @@ pub(crate) fn build_skill_artifact(
     output_dir: &Path,
     summary: Option<&str>,
 ) -> Result<PathBuf, CliError> {
-    let is_zip = input
-        .to_string_lossy()
-        .to_lowercase()
-        .ends_with(".zip");
+    let is_zip = input.to_string_lossy().to_lowercase().ends_with(".zip");
 
     let (_, skill_md_bytes, manifest_bytes_opt, extra_files) = if is_zip {
         read_skill_from_zip(input)?
@@ -298,10 +319,9 @@ pub(crate) fn build_skill_artifact(
         Some(bytes) => {
             // Always validate runtime: skill.
             let runtime = {
-                let yaml: serde_yaml::Value =
-                    serde_yaml::from_slice(&bytes).map_err(|e| {
-                        CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
-                    })?;
+                let yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
+                    CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
+                })?;
                 yaml.get("runtime")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -318,10 +338,9 @@ pub(crate) fn build_skill_artifact(
             // Only re-serialize when summary is being added; otherwise keep the file verbatim
             // so original YAML formatting (quoting, ordering) is preserved.
             if let Some(desc) = summary {
-                let mut yaml: serde_yaml::Value =
-                    serde_yaml::from_slice(&bytes).map_err(|e| {
-                        CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
-                    })?;
+                let mut yaml: serde_yaml::Value = serde_yaml::from_slice(&bytes).map_err(|e| {
+                    CliError::new(E_MAN_002, format!("murmur.yaml: YAML parse error: {e}"))
+                })?;
                 if let Some(mapping) = yaml.as_mapping_mut() {
                     mapping.insert(
                         serde_yaml::Value::String("description".to_string()),
@@ -351,12 +370,7 @@ pub(crate) fn build_skill_artifact(
     // Write to a temp file first, then rename — prevents a partial zip on failure.
     let tmp_path = output_dir.join(format!(".{output_name}.tmp"));
 
-    let write_result = write_skill_zip(
-        &tmp_path,
-        &manifest_bytes,
-        &skill_md_bytes,
-        &extra_files,
-    );
+    let write_result = write_skill_zip(&tmp_path, &manifest_bytes, &skill_md_bytes, &extra_files);
 
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp_path);
@@ -381,7 +395,10 @@ fn write_skill_zip(
     extra_files: &[(String, Vec<u8>)],
 ) -> Result<(), CliError> {
     let output_file = fs::File::create(path).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to create {}: {e}", path.display()))
+        CliError::new(
+            E_IO_003,
+            format!("failed to create {}: {e}", path.display()),
+        )
     })?;
     let mut zip = ZipWriter::new(output_file);
     let options: SimpleFileOptions =
@@ -443,7 +460,11 @@ mod tests {
         let file = fs::File::open(path).unwrap();
         let mut archive = ZipArchive::new(file).unwrap();
         let mut s = String::new();
-        archive.by_name(entry).unwrap().read_to_string(&mut s).unwrap();
+        archive
+            .by_name(entry)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         s
     }
 
@@ -453,7 +474,8 @@ mod tests {
         let out = tempdir().unwrap();
         make_skill_dir(src.path(), "SKILL.md");
 
-        let result = build_skill_artifact(src.path(), Some("test-skill"), "0.1.0", out.path(), None);
+        let result =
+            build_skill_artifact(src.path(), Some("test-skill"), "0.1.0", out.path(), None);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
 
         let zip_path = result.unwrap();
@@ -476,7 +498,12 @@ mod tests {
         let zip_path = result.unwrap();
         let manifest = zip_entry_content(&zip_path, "murmur.yaml");
         assert!(manifest.contains("name: my-test-skill"), "got: {manifest}");
-        assert!(zip_path.file_name().unwrap().to_str().unwrap().starts_with("my-test-skill-"));
+        assert!(zip_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("my-test-skill-"));
     }
 
     #[test]
@@ -507,7 +534,10 @@ mod tests {
         let zip_path = result.unwrap();
         let manifest = zip_entry_content(&zip_path, "murmur.yaml");
         assert!(manifest.contains("version: '2.3.4'"), "got: {manifest}");
-        assert!(zip_path.to_str().unwrap().contains("my-skill-2.3.4.mur.zip"));
+        assert!(zip_path
+            .to_str()
+            .unwrap()
+            .contains("my-skill-2.3.4.mur.zip"));
     }
 
     #[test]
@@ -603,7 +633,10 @@ mod tests {
         fs::write(src.path().join("skill.md"), "# lowercase skill\n").unwrap();
 
         let result = build_skill_artifact(src.path(), Some("ci-skill"), "0.1.0", out.path(), None);
-        assert!(result.is_ok(), "lowercase skill.md should be found; got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "lowercase skill.md should be found; got: {result:?}"
+        );
 
         let zip_path = result.unwrap();
         let entries = zip_entries(&zip_path);

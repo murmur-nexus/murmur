@@ -10,13 +10,15 @@ use capsule_runtime::{
     StageRequest,
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
-use murmur_artifact::{current_platform, resolve_manifest_path, ArtifactRuntime, LocalRegistry, Registry, RegistryError, RuntimeManifest, MANIFEST_FILENAME};
+use murmur_artifact::{
+    current_platform, resolve_manifest_path, ArtifactRuntime, LocalRegistry, Registry,
+    RegistryError, RuntimeManifest, MANIFEST_FILENAME,
+};
 
 use crate::{
     config::{load_mur_config, save_mur_config, InferenceConfig},
     error::{CliError, E_CFG_001, E_IO_003, E_MAN_002, E_RUN_008},
 };
-
 
 // Temporary directory that cleans itself up on drop.
 struct TempDir {
@@ -94,12 +96,8 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
     let manifest_dir = temp_dir.path().to_path_buf();
 
     // stage_session expects manifest_dir/murmur.yaml for system_prompt_file resolution.
-    fs::write(manifest_dir.join(MANIFEST_FILENAME), &meta_yaml).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to write generator manifest: {e}"),
-        )
-    })?;
+    fs::write(manifest_dir.join(MANIFEST_FILENAME), &meta_yaml)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to write generator manifest: {e}")))?;
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
     let mut allowlisted_tools = HashSet::new();
@@ -146,9 +144,8 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
 
     // Write the task prompt as task.md. The runtime reads this as the initial task when
     // task_acceptance: single and task.md exists — no A2A handshake needed.
-    fs::write(session_workdir.join("task.md"), &task_prompt).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to write task prompt: {e}"))
-    })?;
+    fs::write(session_workdir.join("task.md"), &task_prompt)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to write task prompt: {e}")))?;
 
     eprintln!("mur new: generating manifest...");
 
@@ -169,12 +166,8 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             ),
         ));
     }
-    let manifest_yaml = fs::read_to_string(&manifest_path).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to read out/murmur.yaml: {e}"),
-        )
-    })?;
+    let manifest_yaml = fs::read_to_string(&manifest_path)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to read out/murmur.yaml: {e}")))?;
 
     // Validate structure before touching CWD.
     if std::env::var("MUR_DEBUG_MANIFEST").is_ok() {
@@ -271,7 +264,7 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
 
     let provider_idx = Select::with_theme(&theme)
         .with_prompt("Provider")
-        .items(&["Anthropic", "OpenAI"])
+        .items(["Anthropic", "OpenAI"])
         .default(0)
         .interact()
         .map_err(|_| non_tty_err())?;
@@ -403,13 +396,20 @@ fn check_artifacts_installed(
     artifacts: &[ArtifactRequest],
 ) -> Result<(), CliError> {
     for artifact in artifacts {
-        match local_registry.resolve_with_platform(&artifact.name, &artifact.version, Some(current_platform())) {
+        match local_registry.resolve_with_platform(
+            &artifact.name,
+            &artifact.version,
+            Some(current_platform()),
+        ) {
             Ok(_) => {}
             Err(RegistryError::NotFound { .. }) => {
                 return Err(CliError::with_hint(
                     E_RUN_008,
                     format!("generator artifact '{}' is not installed", artifact.name),
-                    format!("run `mur install {}@{}` to install it", artifact.name, artifact.version),
+                    format!(
+                        "run `mur install {}@{}` to install it",
+                        artifact.name, artifact.version
+                    ),
                 ));
             }
             Err(error) => return Err(CliError::from(error)),
@@ -452,7 +452,6 @@ Output only the word DONE when finished.
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,10 +471,22 @@ mod tests {
             endpoint: String::new(),
         };
         let yaml = build_meta_manifest(&config);
-        assert!(yaml.contains("murmur-driver-anthropic"), "should use anthropic driver");
-        assert!(yaml.contains("api.anthropic.com"), "should use anthropic endpoint");
-        assert!(yaml.contains("claude-haiku-4-5-20251001"), "should use model");
-        assert!(!yaml.contains("murmur-driver-openai"), "should not reference openai driver");
+        assert!(
+            yaml.contains("murmur-driver-anthropic"),
+            "should use anthropic driver"
+        );
+        assert!(
+            yaml.contains("api.anthropic.com"),
+            "should use anthropic endpoint"
+        );
+        assert!(
+            yaml.contains("claude-haiku-4-5-20251001"),
+            "should use model"
+        );
+        assert!(
+            !yaml.contains("murmur-driver-openai"),
+            "should not reference openai driver"
+        );
     }
 
     #[test]
@@ -487,10 +498,19 @@ mod tests {
             endpoint: String::new(),
         };
         let yaml = build_meta_manifest(&config);
-        assert!(yaml.contains("murmur-driver-openai"), "should use openai driver");
-        assert!(yaml.contains("api.openai.com"), "should use openai endpoint");
+        assert!(
+            yaml.contains("murmur-driver-openai"),
+            "should use openai driver"
+        );
+        assert!(
+            yaml.contains("api.openai.com"),
+            "should use openai endpoint"
+        );
         assert!(yaml.contains("gpt-4o-mini"), "should use model");
-        assert!(!yaml.contains("murmur-driver-anthropic"), "should not reference anthropic driver");
+        assert!(
+            !yaml.contains("murmur-driver-anthropic"),
+            "should not reference anthropic driver"
+        );
     }
 
     #[test]
@@ -502,8 +522,14 @@ mod tests {
             endpoint: "https://custom.proxy.example.com".to_string(),
         };
         let yaml = build_meta_manifest(&config);
-        assert!(yaml.contains("custom.proxy.example.com"), "should use custom endpoint");
-        assert!(!yaml.contains("api.anthropic.com"), "should not use default endpoint");
+        assert!(
+            yaml.contains("custom.proxy.example.com"),
+            "should use custom endpoint"
+        );
+        assert!(
+            !yaml.contains("api.anthropic.com"),
+            "should not use default endpoint"
+        );
     }
 
     #[test]
@@ -519,11 +545,26 @@ mod tests {
             yaml.contains("api_key: \"\""),
             "api_key field must be a neutral empty-string placeholder"
         );
-        assert!(!yaml.contains("${"), "manifest must not contain any ${{...}} env-reference token");
-        assert!(!yaml.contains("MUR_INFERENCE_API_KEY"), "must not reference MUR_INFERENCE_API_KEY");
-        assert!(!yaml.contains(&config.api_key), "must not embed the raw api key literal");
-        assert!(!yaml.contains("ANTHROPIC_API_KEY"), "must not reference ANTHROPIC_API_KEY");
-        assert!(!yaml.contains("OPENAI_API_KEY"), "must not reference OPENAI_API_KEY");
+        assert!(
+            !yaml.contains("${"),
+            "manifest must not contain any ${{...}} env-reference token"
+        );
+        assert!(
+            !yaml.contains("MUR_INFERENCE_API_KEY"),
+            "must not reference MUR_INFERENCE_API_KEY"
+        );
+        assert!(
+            !yaml.contains(&config.api_key),
+            "must not embed the raw api key literal"
+        );
+        assert!(
+            !yaml.contains("ANTHROPIC_API_KEY"),
+            "must not reference ANTHROPIC_API_KEY"
+        );
+        assert!(
+            !yaml.contains("OPENAI_API_KEY"),
+            "must not reference OPENAI_API_KEY"
+        );
     }
 
     #[test]
@@ -562,7 +603,10 @@ mod tests {
         let saved_oai = std::env::var("OPENAI_API_KEY").ok();
         let saved_mur = std::env::var("MUR_INFERENCE_API_KEY").ok();
         unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", fake_key(&["sk-", "ant-", "regression-test"]));
+            std::env::set_var(
+                "ANTHROPIC_API_KEY",
+                fake_key(&["sk-", "ant-", "regression-test"]),
+            );
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("MUR_INFERENCE_API_KEY");
         }
@@ -573,7 +617,10 @@ mod tests {
             let inf = resolve_inference_config()?;
             let meta_yaml = build_meta_manifest(&inf);
             let mut runtime_manifest = RuntimeManifest::from_yaml_str(&meta_yaml).map_err(|e| {
-                CliError::new(E_MAN_002, format!("internal: generator meta-manifest is invalid: {e}"))
+                CliError::new(
+                    E_MAN_002,
+                    format!("internal: generator meta-manifest is invalid: {e}"),
+                )
             })?;
             if let Some(inference) = runtime_manifest.inference.as_mut() {
                 inference.api_key = Some(inf.api_key.clone());
@@ -654,7 +701,10 @@ mod tests {
         let saved_ant = std::env::var("ANTHROPIC_API_KEY").ok();
         let saved_oai = std::env::var("OPENAI_API_KEY").ok();
         unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", fake_key(&["sk-", "ant-", "test-resolve"]));
+            std::env::set_var(
+                "ANTHROPIC_API_KEY",
+                fake_key(&["sk-", "ant-", "test-resolve"]),
+            );
             std::env::remove_var("OPENAI_API_KEY");
         }
 
@@ -672,7 +722,8 @@ mod tests {
         }
 
         // Config file (if complete) takes precedence over env var — either source is acceptable.
-        let inf = result.expect("resolve_inference_config should succeed with ANTHROPIC_API_KEY set");
+        let inf =
+            result.expect("resolve_inference_config should succeed with ANTHROPIC_API_KEY set");
         assert!(inf.is_complete(), "resolved config must be complete");
     }
 
@@ -683,7 +734,10 @@ mod tests {
         let saved_oai = std::env::var("OPENAI_API_KEY").ok();
         unsafe {
             std::env::remove_var("ANTHROPIC_API_KEY");
-            std::env::set_var("OPENAI_API_KEY", fake_key(&["sk-", "openai-", "test-resolve"]));
+            std::env::set_var(
+                "OPENAI_API_KEY",
+                fake_key(&["sk-", "openai-", "test-resolve"]),
+            );
         }
 
         let result = resolve_inference_config();
@@ -785,22 +839,36 @@ mod tests {
     fn build_meta_manifest_anthropic_uses_fixed_driver_version() {
         let yaml = build_meta_manifest(&anthropic_inf());
         assert!(yaml.contains("0.3.33"), "anthropic driver must be 0.3.33");
-        assert!(!yaml.contains("0.3.32"), "must not reference old anthropic driver 0.3.32");
+        assert!(
+            !yaml.contains("0.3.32"),
+            "must not reference old anthropic driver 0.3.32"
+        );
     }
 
     #[test]
     fn build_meta_manifest_openai_uses_fixed_driver_version() {
         let yaml = build_meta_manifest(&openai_inf());
         assert!(yaml.contains("0.3.34"), "openai driver must be 0.3.34");
-        assert!(!yaml.contains("0.3.33"), "must not reference old openai driver 0.3.33");
+        assert!(
+            !yaml.contains("0.3.33"),
+            "must not reference old openai driver 0.3.33"
+        );
     }
 
     #[test]
     fn build_meta_manifest_includes_tool_editor() {
         for config in [anthropic_inf(), openai_inf()] {
             let yaml = build_meta_manifest(&config);
-            assert!(yaml.contains("murmur-tool-editor"), "must include murmur-tool-editor ({} provider)", config.provider);
-            assert!(yaml.contains("0.4.4"), "must include murmur-tool-editor@0.4.4 ({} provider)", config.provider);
+            assert!(
+                yaml.contains("murmur-tool-editor"),
+                "must include murmur-tool-editor ({} provider)",
+                config.provider
+            );
+            assert!(
+                yaml.contains("0.4.4"),
+                "must include murmur-tool-editor@0.4.4 ({} provider)",
+                config.provider
+            );
         }
     }
 
@@ -808,9 +876,21 @@ mod tests {
     fn build_meta_manifest_includes_skill_create_manifest() {
         for config in [anthropic_inf(), openai_inf()] {
             let yaml = build_meta_manifest(&config);
-            assert!(yaml.contains("murmur-skill-create-manifest"), "must include murmur-skill-create-manifest ({} provider)", config.provider);
-            assert!(yaml.contains("0.1.1"), "must include murmur-skill-create-manifest@0.1.1 ({} provider)", config.provider);
-            assert!(yaml.contains("runtime: skill"), "must have runtime: skill entry ({} provider)", config.provider);
+            assert!(
+                yaml.contains("murmur-skill-create-manifest"),
+                "must include murmur-skill-create-manifest ({} provider)",
+                config.provider
+            );
+            assert!(
+                yaml.contains("0.1.1"),
+                "must include murmur-skill-create-manifest@0.1.1 ({} provider)",
+                config.provider
+            );
+            assert!(
+                yaml.contains("runtime: skill"),
+                "must have runtime: skill entry ({} provider)",
+                config.provider
+            );
         }
     }
 
@@ -818,23 +898,47 @@ mod tests {
     fn build_task_prompt_does_not_contain_inline_schema() {
         for config in [anthropic_inf(), openai_inf()] {
             let prompt = build_task_prompt("summarise a document", None, &config);
-            assert!(!prompt.contains("api_key:"), "prompt must not embed api_key inline schema field ({} provider)", config.provider);
-            assert!(!prompt.contains("ANTHROPIC_API_KEY"), "prompt must not embed provider key vars ({} provider)", config.provider);
-            assert!(!prompt.contains("OPENAI_API_KEY"), "prompt must not embed provider key vars ({} provider)", config.provider);
+            assert!(
+                !prompt.contains("api_key:"),
+                "prompt must not embed api_key inline schema field ({} provider)",
+                config.provider
+            );
+            assert!(
+                !prompt.contains("ANTHROPIC_API_KEY"),
+                "prompt must not embed provider key vars ({} provider)",
+                config.provider
+            );
+            assert!(
+                !prompt.contains("OPENAI_API_KEY"),
+                "prompt must not embed provider key vars ({} provider)",
+                config.provider
+            );
         }
     }
 
     #[test]
     fn build_task_prompt_instructs_read_file() {
         let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
-        assert!(prompt.contains("read_file"), "prompt must instruct agent to call read_file");
-        assert!(prompt.contains("tools/murmur-skill-create-manifest/skill.md"), "prompt must reference skill.md path");
+        assert!(
+            prompt.contains("read_file"),
+            "prompt must instruct agent to call read_file"
+        );
+        assert!(
+            prompt.contains("tools/murmur-skill-create-manifest/skill.md"),
+            "prompt must reference skill.md path"
+        );
     }
 
     #[test]
     fn build_task_prompt_instructs_write_file() {
         let prompt = build_task_prompt("summarise a document", None, &anthropic_inf());
-        assert!(prompt.contains("write_file"), "prompt must instruct agent to call write_file");
-        assert!(prompt.contains("out/murmur.yaml"), "prompt must reference out/murmur.yaml");
+        assert!(
+            prompt.contains("write_file"),
+            "prompt must instruct agent to call write_file"
+        );
+        assert!(
+            prompt.contains("out/murmur.yaml"),
+            "prompt must reference out/murmur.yaml"
+        );
     }
 }

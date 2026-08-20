@@ -944,11 +944,20 @@ pub enum RuntimeManifestError {
     YamlSyntax(String),
     #[error("{}: missing required field '{field}'", MANIFEST_FILENAME)]
     MissingField { field: String },
-    #[error("{}: invalid artifact declaration at index {index}: {message}", MANIFEST_FILENAME)]
+    #[error(
+        "{}: invalid artifact declaration at index {index}: {message}",
+        MANIFEST_FILENAME
+    )]
     InvalidArtifact { index: usize, message: String },
-    #[error("{}: invalid inference config for '{field}': {message}", MANIFEST_FILENAME)]
+    #[error(
+        "{}: invalid inference config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
     InvalidInferenceConfig { field: String, message: String },
-    #[error("{}: invalid capability config for '{field}': {message}", MANIFEST_FILENAME)]
+    #[error(
+        "{}: invalid capability config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
     InvalidCapabilities { field: String, message: String },
     #[error(
         "{}: inference.api_key references {reference} but the environment variable is not set",
@@ -1452,17 +1461,16 @@ impl RuntimeManifest {
 
         // Validate system_prompt_artifact: must name a declared artifact whose payload may be
         // bound as the system prompt (`prompt_payload`, defaulted from the role when absent).
-        if let Some(ref sp_art) = inference.as_ref().and_then(|i| i.system_prompt_artifact.clone()) {
-            let matching = artifacts
-                .iter()
-                .find(|a| &a.name == sp_art);
+        if let Some(ref sp_art) = inference
+            .as_ref()
+            .and_then(|i| i.system_prompt_artifact.clone())
+        {
+            let matching = artifacts.iter().find(|a| &a.name == sp_art);
             match matching {
                 None => {
                     return Err(RuntimeManifestError::InvalidInferenceConfig {
                         field: "inference.system_prompt_artifact".to_string(),
-                        message: format!(
-                            "artifact '{sp_art}' is not declared in artifacts:"
-                        ),
+                        message: format!("artifact '{sp_art}' is not declared in artifacts:"),
                     });
                 }
                 Some(a) if !a.prompt_payload => {
@@ -1569,9 +1577,9 @@ fn parse_capabilities(
         })
         .transpose()?;
 
-    let spawn = raw_caps
-        .spawn
-        .map(|raw_spawn| SpawnCapabilities { allow: raw_spawn.allow });
+    let spawn = raw_caps.spawn.map(|raw_spawn| SpawnCapabilities {
+        allow: raw_spawn.allow,
+    });
 
     let env = raw_caps.env.map(|raw_env| EnvCapabilities {
         allow: raw_env.allow,
@@ -1590,12 +1598,12 @@ fn parse_capabilities(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|value| {
-            value
-                .parse::<ContainmentClass>()
-                .map_err(|error| RuntimeManifestError::InvalidCapabilities {
+            value.parse::<ContainmentClass>().map_err(|error| {
+                RuntimeManifestError::InvalidCapabilities {
                     field: "capabilities.containment".to_string(),
                     message: error.to_string(),
-                })
+                }
+            })
         })
         .transpose()?;
 
@@ -1624,12 +1632,13 @@ fn parse_interpreter_runtime(
     for (index, raw_grant) in raw_grants.into_iter().enumerate() {
         let base = format!("capabilities.shell.interpreter_runtime[{index}]");
 
-        let binary = raw_grant.binary.filter(|b| !b.trim().is_empty()).ok_or_else(|| {
-            RuntimeManifestError::InvalidCapabilities {
+        let binary = raw_grant
+            .binary
+            .filter(|b| !b.trim().is_empty())
+            .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
                 field: format!("{base}.binary"),
                 message: "must name a binary".to_string(),
-            }
-        })?;
+            })?;
 
         // The whole point of this mechanism: it narrows filesystem access alongside an exec
         // grant that already exists. It can never itself grant exec, so the binary must already
@@ -1656,12 +1665,13 @@ fn parse_interpreter_runtime(
         for (dir_index, raw_dir) in raw_grant.dirs.into_iter().enumerate() {
             let dir_base = format!("{base}.dirs[{dir_index}]");
 
-            let path = raw_dir.path.filter(|p| !p.trim().is_empty()).ok_or_else(|| {
-                RuntimeManifestError::InvalidCapabilities {
+            let path = raw_dir
+                .path
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
                     field: format!("{dir_base}.path"),
                     message: "must name a host directory".to_string(),
-                }
-            })?;
+                })?;
             if !path.starts_with('/') {
                 return Err(RuntimeManifestError::InvalidCapabilities {
                     field: format!("{dir_base}.path"),
@@ -1672,15 +1682,16 @@ fn parse_interpreter_runtime(
                 });
             }
 
-            let list_dir = raw_dir.list_dir.ok_or_else(|| {
-                RuntimeManifestError::InvalidCapabilities {
-                    field: format!("{dir_base}.list_dir"),
-                    message: format!(
-                        "'{path}' must set list_dir explicitly to true or false — \
+            let list_dir =
+                raw_dir
+                    .list_dir
+                    .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                        field: format!("{dir_base}.list_dir"),
+                        message: format!(
+                            "'{path}' must set list_dir explicitly to true or false — \
                          enumerability is never inferred"
-                    ),
-                }
-            })?;
+                        ),
+                    })?;
 
             dirs.push(InterpreterRuntimeDir { path, list_dir });
         }
@@ -1981,13 +1992,23 @@ fn parse_inference(
                     message: "is not valid with transport: process".to_string(),
                 });
             }
-            if raw.endpoint.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            if raw
+                .endpoint
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.endpoint".to_string(),
                     message: "is not valid with transport: process".to_string(),
                 });
             }
-            if raw.api_key.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+            if raw
+                .api_key
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
                 return Err(RuntimeManifestError::InvalidInferenceConfig {
                     field: "inference.api_key".to_string(),
                     message: "is not valid with transport: process".to_string(),
@@ -2383,11 +2404,10 @@ capabilities:
             "cgroup_io_bytes_per_sec",
             "workdir_max_bytes",
         ] {
-            let yaml = format!(
-                "name: cap\nversion: 0.0.1\ncapabilities:\n  resources:\n    {field}: 0\n"
-            );
-            let error = RuntimeManifest::from_yaml_str(&yaml)
-                .expect_err("a zero {field} must not parse");
+            let yaml =
+                format!("name: cap\nversion: 0.0.1\ncapabilities:\n  resources:\n    {field}: 0\n");
+            let error =
+                RuntimeManifest::from_yaml_str(&yaml).expect_err("a zero {field} must not parse");
 
             match error {
                 RuntimeManifestError::InvalidCapabilities {
@@ -2783,12 +2803,14 @@ capabilities:
         )
         .unwrap();
 
-        assert!(!manifest
-            .capabilities
-            .unwrap()
-            .filesystem
-            .unwrap()
-            .workdir_exec);
+        assert!(
+            !manifest
+                .capabilities
+                .unwrap()
+                .filesystem
+                .unwrap()
+                .workdir_exec
+        );
     }
 
     #[test]
@@ -2988,7 +3010,10 @@ capabilities:
         let msg = interpreter_runtime_reject(
             "      - binary: ruby\n        dirs:\n          - path: /usr/lib/ruby\n            list_dir: true\n",
         );
-        assert!(msg.contains("capabilities.shell.interpreter_runtime[0].binary"), "{msg}");
+        assert!(
+            msg.contains("capabilities.shell.interpreter_runtime[0].binary"),
+            "{msg}"
+        );
         assert!(msg.contains("ruby"), "{msg}");
         assert!(msg.contains("capabilities.shell.allow"), "{msg}");
     }
@@ -3019,9 +3044,7 @@ capabilities:
 
     #[test]
     fn interpreter_runtime_rejects_empty_dirs() {
-        let msg = interpreter_runtime_reject(
-            "      - binary: python3\n        dirs: []\n",
-        );
+        let msg = interpreter_runtime_reject("      - binary: python3\n        dirs: []\n");
         assert!(
             msg.contains("capabilities.shell.interpreter_runtime[0].dirs"),
             "{msg}"
@@ -3111,7 +3134,10 @@ capabilities:
             "      - binary: ruby\n        source_path: /opt/ruby\n        pin: ruby-3.2.2\n",
             "",
         );
-        assert!(msg.contains("capabilities.shell.staged_runtime[0].binary"), "{msg}");
+        assert!(
+            msg.contains("capabilities.shell.staged_runtime[0].binary"),
+            "{msg}"
+        );
         assert!(msg.contains("ruby"), "{msg}");
         assert!(msg.contains("capabilities.shell.allow"), "{msg}");
     }
@@ -3122,7 +3148,10 @@ capabilities:
             "      - binary: python3\n        source_path: /opt/py\n        pin: cpython-3.9.19\n",
             "    interpreter_runtime:\n      - binary: python3\n        dirs:\n          - path: /usr/lib/python3.9\n            list_dir: true\n",
         );
-        assert!(msg.contains("capabilities.shell.staged_runtime[0].binary"), "{msg}");
+        assert!(
+            msg.contains("capabilities.shell.staged_runtime[0].binary"),
+            "{msg}"
+        );
         assert!(msg.contains("python3"), "{msg}");
         assert!(msg.contains("interpreter_runtime"), "{msg}");
         assert!(msg.contains("mutually exclusive"), "{msg}");
@@ -3182,7 +3211,10 @@ inference:
 
         let inference = manifest.inference.expect("inference should exist");
         assert_eq!(inference.transport, "http");
-        assert_eq!(inference.endpoint, Some("http://127.0.0.1:8080".to_string()));
+        assert_eq!(
+            inference.endpoint,
+            Some("http://127.0.0.1:8080".to_string())
+        );
         assert_eq!(inference.model, "test-model");
         assert_eq!(inference.api_key, Some("literal-key".to_string()));
         let driver = inference.driver.as_ref().expect("driver should be present");
@@ -3779,7 +3811,13 @@ inference:
         .unwrap();
 
         assert_eq!(
-            manifest.inference.unwrap().driver.as_ref().unwrap().artifact,
+            manifest
+                .inference
+                .unwrap()
+                .driver
+                .as_ref()
+                .unwrap()
+                .artifact,
             "murmur-driver-openai"
         );
     }
@@ -3804,7 +3842,13 @@ inference:
         .unwrap();
 
         assert_eq!(
-            manifest.inference.unwrap().driver.as_ref().unwrap().artifact,
+            manifest
+                .inference
+                .unwrap()
+                .driver
+                .as_ref()
+                .unwrap()
+                .artifact,
             "murmur-driver-anthropic"
         );
     }
@@ -3897,7 +3941,10 @@ artifacts:
         assert_eq!(manifest.artifacts.len(), 1);
         let artifact = &manifest.artifacts[0];
         assert_eq!(artifact.runtime, ArtifactRuntime::Skill);
-        assert_eq!(artifact.source.as_deref(), Some("./skills/my-skill/skill.md"));
+        assert_eq!(
+            artifact.source.as_deref(),
+            Some("./skills/my-skill/skill.md")
+        );
         assert_eq!(artifact.version, "local");
     }
 
@@ -3915,7 +3962,10 @@ artifacts:
         )
         .unwrap();
 
-        assert_eq!(manifest.artifacts[0].source.as_deref(), Some("./skills/my-skill/"));
+        assert_eq!(
+            manifest.artifacts[0].source.as_deref(),
+            Some("./skills/my-skill/")
+        );
         assert_eq!(manifest.artifacts[0].version, "local");
     }
 
@@ -4209,7 +4259,10 @@ inference:
         let inference = manifest.inference.expect("inference present");
         assert_eq!(inference.transport, "process");
         assert_eq!(inference.command.as_deref(), Some("codex"));
-        assert_eq!(inference.model, "", "absent model resolves to empty (provider default)");
+        assert_eq!(
+            inference.model, "",
+            "absent model resolves to empty (provider default)"
+        );
     }
 
     #[test]
@@ -4230,8 +4283,14 @@ inference:
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains("inference.driver.artifact"), "error was: {msg}");
-        assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+        assert!(
+            msg.contains("inference.driver.artifact"),
+            "error was: {msg}"
+        );
+        assert!(
+            msg.contains("not valid with transport: process"),
+            "error was: {msg}"
+        );
     }
 
     #[test]
@@ -4252,7 +4311,10 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("inference.endpoint"), "error was: {msg}");
-        assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+        assert!(
+            msg.contains("not valid with transport: process"),
+            "error was: {msg}"
+        );
     }
 
     #[test]
@@ -4276,7 +4338,10 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("inference.api_key"), "error was: {msg}");
-        assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+        assert!(
+            msg.contains("not valid with transport: process"),
+            "error was: {msg}"
+        );
     }
 
     #[test]
@@ -4299,7 +4364,10 @@ inference:
 
         let msg = err.to_string();
         assert!(msg.contains("inference.max_tokens"), "error was: {msg}");
-        assert!(msg.contains("not valid with transport: process"), "error was: {msg}");
+        assert!(
+            msg.contains("not valid with transport: process"),
+            "error was: {msg}"
+        );
     }
 
     #[test]
@@ -4500,8 +4568,7 @@ context:
     /// `commit_policy: reopen-task` combined with `execution_mode: async`.
     #[test]
     fn hook_config_async_reopen_task_is_rejected() {
-        let yaml =
-            "name: gate\nruntime: hook\nexecution_mode: async\ncommit_policy: reopen-task\n";
+        let yaml = "name: gate\nruntime: hook\nexecution_mode: async\ncommit_policy: reopen-task\n";
         let err = parse_hook_config_from_yaml(yaml).unwrap_err();
         assert!(err.contains("async-with-commit"), "error was: {err}");
         assert!(err.contains("reopen-task"), "error was: {err}");
@@ -4773,10 +4840,8 @@ context:
 
     #[test]
     fn mur_version_absent_is_none() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.1.0\nartifacts: []\n",
-        )
-        .unwrap();
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.1.0\nartifacts: []\n").unwrap();
         assert_eq!(manifest.mur_version, None);
     }
 
@@ -4935,10 +5000,7 @@ inference:
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("system_prompt_artifact"),
-            "error was: {msg}"
-        );
+        assert!(msg.contains("system_prompt_artifact"), "error was: {msg}");
         assert!(msg.contains("'prompt_payload: true'"), "error was: {msg}");
     }
 
@@ -4960,10 +5022,7 @@ inference:
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("system_prompt_artifact"),
-            "error was: {msg}"
-        );
+        assert!(msg.contains("system_prompt_artifact"), "error was: {msg}");
         assert!(msg.contains("not declared"), "error was: {msg}");
     }
 
@@ -5156,10 +5215,7 @@ artifacts:
         )
         .unwrap();
 
-        assert_eq!(
-            manifest.artifacts[0].on_overflow,
-            HookOverflowPolicy::Block
-        );
+        assert_eq!(manifest.artifacts[0].on_overflow, HookOverflowPolicy::Block);
     }
 
     /// Omitting the key means `drop`: an operator who says nothing gets the loop kept moving,
@@ -5395,12 +5451,30 @@ capabilities:
         use ContainmentClass::{Advisory, Scoped, Sealed};
 
         // Exactly one source present: that source wins outright.
-        assert_eq!(effective_containment_floor(Some(Scoped), None, None), Scoped);
-        assert_eq!(effective_containment_floor(None, Some(Scoped), None), Scoped);
-        assert_eq!(effective_containment_floor(None, None, Some(Scoped)), Scoped);
-        assert_eq!(effective_containment_floor(Some(Sealed), None, None), Sealed);
-        assert_eq!(effective_containment_floor(None, Some(Sealed), None), Sealed);
-        assert_eq!(effective_containment_floor(None, None, Some(Sealed)), Sealed);
+        assert_eq!(
+            effective_containment_floor(Some(Scoped), None, None),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(None, Some(Scoped), None),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(None, None, Some(Scoped)),
+            Scoped
+        );
+        assert_eq!(
+            effective_containment_floor(Some(Sealed), None, None),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(None, Some(Sealed), None),
+            Sealed
+        );
+        assert_eq!(
+            effective_containment_floor(None, None, Some(Sealed)),
+            Sealed
+        );
 
         // Two sources present: the stronger wins regardless of which slot holds it, and a
         // weaker source can never pull the stronger one down.

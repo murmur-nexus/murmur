@@ -168,7 +168,10 @@ fn token_accounting_is_identical_with_and_without_continuation() {
         "both runs should record the same number of inference turns (active: {cont_tokens:?}, \
          inactive: {full_tokens:?})"
     );
-    assert!(cont_tokens.len() >= 2, "expected at least two inference turns");
+    assert!(
+        cont_tokens.len() >= 2,
+        "expected at least two inference turns"
+    );
 
     let cont_growth: Vec<i64> = cont_tokens
         .iter()

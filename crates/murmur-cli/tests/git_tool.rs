@@ -457,9 +457,7 @@ fn native_tool_dispatch_creates_directory() {
 /// `summary` as the tool result text.
 #[test]
 fn native_tool_dispatch_reports_failure_for_existing_path() {
-    if common::skip_without_host_support(
-        "native_tool_dispatch_reports_failure_for_existing_path",
-    ) {
+    if common::skip_without_host_support("native_tool_dispatch_reports_failure_for_existing_path") {
         return;
     }
     let home = TempDir::new().unwrap();

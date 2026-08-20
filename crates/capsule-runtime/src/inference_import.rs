@@ -408,8 +408,9 @@ mod tests {
     /// `input_tokens` against it proves the resolved model really went onto the
     /// wire, not just into `model-used`.
     fn expected_input_tokens(model: &str) -> u64 {
-        let messages =
-            vec![serde_json::json!({"role":"user","content":[{"type":"text","text":"summarize this"}]})];
+        let messages = vec![
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"summarize this"}]}),
+        ];
         let payload =
             build_driver_payload(model, DEFAULT_MAX_OUTPUT_TOKENS, &messages, &[], "", None);
         u64::from(count_tokens(&serde_json::to_string(&payload).unwrap()))

@@ -634,9 +634,6 @@ where
             return Err(failure.message(&format!("hook '{hook_name}' on-stage"), &err));
         }
     };
-    f.post_return_async(&mut *store)
-        .await
-        .map_err(|e| e.to_string())?;
     result
 }
 
@@ -1235,9 +1232,6 @@ where
             return Err(failure.message(&subject, &err));
         }
     };
-    f.post_return_async(&mut hook.store)
-        .await
-        .map_err(|e| e.to_string())?;
     result
 }
 
@@ -1721,10 +1715,14 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut hooks =
-                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged_double(component)])
-                    .await
-                    .expect("a hook lacking on-task-start/on-task-end must still instantiate");
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double(component)],
+            )
+            .await
+            .expect("a hook lacking on-task-start/on-task-end must still instantiate");
 
             assert_eq!(hooks.blocking_hooks.len(), 1);
             let funcs = &hooks.blocking_hooks[0].funcs;
@@ -1759,7 +1757,11 @@ mod tests {
         });
 
         assert!(
-            !session.path().join("logs").join("hook-test-hook.log").exists(),
+            !session
+                .path()
+                .join("logs")
+                .join("hook-test-hook.log")
+                .exists(),
             "a hook that lacks the task exports must not log an error when task events fire"
         );
     }
@@ -1777,10 +1779,14 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let hooks =
-                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged_double(component)])
-                    .await
-                    .expect("component exporting task fns instantiates");
+            let hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double(component)],
+            )
+            .await
+            .expect("component exporting task fns instantiates");
             let funcs = &hooks.blocking_hooks[0].funcs;
             assert!(funcs.contains_key("on-task-start"));
             assert!(funcs.contains_key("on-task-end"));
@@ -1890,7 +1896,10 @@ mod tests {
             }
             // once after the loop, carrying the whole-launch turn aggregate
             let total_turns = hooks.total_turns();
-            assert_eq!(total_turns, 3, "one turn accumulated per inference across tasks");
+            assert_eq!(
+                total_turns, 3,
+                "one turn accumulated per inference across tasks"
+            );
             hooks
                 .emit(
                     session.path(),
@@ -1902,10 +1911,26 @@ mod tests {
                 .await;
         });
 
-        assert_eq!(hook_log_lines(session.path(), "sess-start"), 1, "on-session-start fires once");
-        assert_eq!(hook_log_lines(session.path(), "sess-end"), 1, "on-session-end fires once");
-        assert_eq!(hook_log_lines(session.path(), "task-start"), 3, "on-task-start fires per task");
-        assert_eq!(hook_log_lines(session.path(), "task-end"), 3, "on-task-end fires per task");
+        assert_eq!(
+            hook_log_lines(session.path(), "sess-start"),
+            1,
+            "on-session-start fires once"
+        );
+        assert_eq!(
+            hook_log_lines(session.path(), "sess-end"),
+            1,
+            "on-session-end fires once"
+        );
+        assert_eq!(
+            hook_log_lines(session.path(), "task-start"),
+            3,
+            "on-task-start fires per task"
+        );
+        assert_eq!(
+            hook_log_lines(session.path(), "task-end"),
+            3,
+            "on-task-end fires per task"
+        );
     }
 
     /// Invariant 6: a component missing one of the six original functions still fails
@@ -2862,7 +2887,9 @@ mod tests {
 
         assert_eq!(artifacts.len(), 1);
         assert!(
-            artifacts[0].payload.contains("inference driver is not configured")
+            artifacts[0]
+                .payload
+                .contains("inference driver is not configured")
                 && artifacts[0].payload.contains("inference.driver.artifact"),
             "got: {}",
             artifacts[0].payload
@@ -3372,9 +3399,10 @@ mod tests {
         );
 
         run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("a granted async hook instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("a granted async hook instantiates");
             hooks.drain_async_hooks().await;
         });
 
@@ -3611,7 +3639,11 @@ artifacts:
                 &engine,
                 session.path(),
                 accessible.path(),
-                vec![staged_double_named("gatekeeper", HookBinding::OnTaskEnd, component)],
+                vec![staged_double_named(
+                    "gatekeeper",
+                    HookBinding::OnTaskEnd,
+                    component,
+                )],
             )
             .await
             .expect("task-end double instantiates");
@@ -3650,7 +3682,11 @@ artifacts:
                 &engine,
                 session.path(),
                 accessible.path(),
-                vec![staged_double_named("observer", HookBinding::OnTaskEnd, component)],
+                vec![staged_double_named(
+                    "observer",
+                    HookBinding::OnTaskEnd,
+                    component,
+                )],
             )
             .await
             .expect("task-end double instantiates");
@@ -3658,7 +3694,10 @@ artifacts:
             let reopen = hooks
                 .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
                 .await;
-            assert!(reopen.is_none(), "none from on-task-end must not request a reopen");
+            assert!(
+                reopen.is_none(),
+                "none from on-task-end must not request a reopen"
+            );
             assert!(hooks.drain_dispatch_faults().is_empty());
         });
     }
@@ -3800,10 +3839,8 @@ artifacts:
             1,
             "exactly one fault line is written to the per-hook log"
         );
-        let log = std::fs::read_to_string(
-            session.path().join("logs").join("hook-toolhook.log"),
-        )
-        .unwrap();
+        let log =
+            std::fs::read_to_string(session.path().join("logs").join("hook-toolhook.log")).unwrap();
         assert!(log.contains("on-tool-call"), "log names the event: {log}");
         assert!(log.contains("write-manifests"), "log names the arm: {log}");
         assert!(log.contains("toolhook"), "log names the hook: {log}");
@@ -3946,7 +3983,11 @@ artifacts:
         let workdir = TempDir::new().unwrap();
         let engine = hook_test_engine();
         // arm 1 = replace-context, unsupported for on-stage.
-        let staged = staged_double_named("stager", HookBinding::OnStage, hook_stage_arm_double(&engine, 1));
+        let staged = staged_double_named(
+            "stager",
+            HookBinding::OnStage,
+            hook_stage_arm_double(&engine, 1),
+        );
 
         dispatch_stage(
             &engine,
@@ -3981,7 +4022,11 @@ artifacts:
         let engine = hook_test_engine();
         // arm 2 = write-manifests (honored) — but with an empty list, so nothing is
         // written; the point is that no fault is logged for the honored arm.
-        let staged = staged_double_named("stager", HookBinding::OnStage, hook_stage_arm_double(&engine, 2));
+        let staged = staged_double_named(
+            "stager",
+            HookBinding::OnStage,
+            hook_stage_arm_double(&engine, 2),
+        );
 
         dispatch_stage(
             &engine,
@@ -4018,9 +4063,10 @@ artifacts:
         );
 
         let faults = run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             hooks.emit(session.path(), tool_call_event()).await;
             hooks.drain_async_hooks().await;
             hooks.drain_dispatch_faults()
@@ -4302,9 +4348,10 @@ artifacts:
         let staged = staged_async("stateful", HookBinding::All, hook_marker_double(&engine));
 
         run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates once, at new");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates once, at new");
             hooks.emit(session.path(), HookEvent::SessionStart).await;
             hooks.emit(session.path(), tool_call_event()).await;
             hooks
@@ -4337,9 +4384,10 @@ artifacts:
         let staged = staged_async("ordered", HookBinding::All, hook_marker_double(&engine));
 
         run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             hooks.emit(session.path(), tool_call_event()).await;
             hooks.emit(session.path(), HookEvent::SessionStart).await;
             hooks.emit(session.path(), tool_call_event()).await;
@@ -4595,9 +4643,9 @@ artifacts:
         });
 
         assert!(
-            faults
-                .iter()
-                .any(|f| f.hook_name == "wedged" && f.event == FAULT_EVENT_DRAIN && f.arm == FAULT_ARM_TIMEOUT),
+            faults.iter().any(|f| f.hook_name == "wedged"
+                && f.event == FAULT_EVENT_DRAIN
+                && f.arm == FAULT_ARM_TIMEOUT),
             "the abandoned hook must reach the trace path: {faults:?}"
         );
         let log = std::fs::read_to_string(session.path().join("logs").join("hook-wedged.log"))
@@ -4625,9 +4673,10 @@ artifacts:
         );
 
         let (dropped, faults) = run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
                 hooks.emit(session.path(), tool_call_event()).await;
             }
@@ -4670,9 +4719,10 @@ artifacts:
         );
 
         let dropped = run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             for _ in 0..(ASYNC_HOOK_QUEUE_DEPTH + surplus) {
                 hooks.emit(session.path(), tool_call_event()).await;
             }
@@ -4716,9 +4766,10 @@ artifacts:
         );
 
         let faults = run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             hooks
                 .emit(
                     session.path(),
@@ -4759,9 +4810,10 @@ artifacts:
         );
 
         let (result, faults) = run_local(async {
-            let mut hooks = new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
-                .await
-                .expect("async double instantiates");
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("async double instantiates");
             let result = hooks
                 .dispatch_compaction(
                     vec![Message {

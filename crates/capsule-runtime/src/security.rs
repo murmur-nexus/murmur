@@ -68,7 +68,10 @@ mod tests {
         // SAFETY: PR_GET_DUMPABLE takes no further arguments; reading back our own
         // process's flag is side-effect-free.
         let flag = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
-        assert_eq!(flag, 0, "process should report non-dumpable after hardening");
+        assert_eq!(
+            flag, 0,
+            "process should report non-dumpable after hardening"
+        );
     }
 }
 

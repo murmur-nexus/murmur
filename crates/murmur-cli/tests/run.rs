@@ -484,11 +484,7 @@ fn run_filesystem_escape_attempt_fails_and_does_not_write_outside_workdir() {
 /// `mur run` fails fast with E-RUN-008 rather than starting an HTTP server and
 /// blocking forever.
 fn create_dotenv_project(project_dir: &Path, env_var: &str) -> PathBuf {
-    fs::write(
-        project_dir.join(".env"),
-        format!("{env_var}=from-dotenv\n"),
-    )
-    .unwrap();
+    fs::write(project_dir.join(".env"), format!("{env_var}=from-dotenv\n")).unwrap();
 
     fs::write(
         project_dir.join("murmur.yaml"),

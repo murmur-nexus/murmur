@@ -178,7 +178,9 @@ pub(crate) fn requires_process_bounding(
 
 impl CgroupScope {
     /// Absolute path of this scope's directory.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // The scope's own path is read only by this module's tests, which assert the limit files
+    // systemd wrote under it; the launch path carries the descriptors it needs instead.
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -309,7 +311,10 @@ fn parse_event_counter(contents: &str, key: &str) -> u64 {
     for line in contents.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() == Some(key) {
-            return parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+            return parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
         }
     }
     0
@@ -374,7 +379,8 @@ fn parse_unified_cgroup_path(contents: &str) -> Option<String> {
 fn parse_cgroup2_mount(contents: &str) -> String {
     for line in contents.lines() {
         let mut parts = line.split_whitespace();
-        let (Some(_source), Some(target), Some(fstype)) = (parts.next(), parts.next(), parts.next())
+        let (Some(_source), Some(target), Some(fstype)) =
+            (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -469,13 +475,8 @@ impl CgroupScope {
 
     fn write_limit(&self, file: &str, value: &str) -> Result<(), String> {
         let path = self.path.join(file);
-        std::fs::write(&path, format!("{value}\n")).map_err(|error| {
-            format!(
-                "could not write {} to {}: {error}",
-                value,
-                path.display()
-            )
-        })
+        std::fs::write(&path, format!("{value}\n"))
+            .map_err(|error| format!("could not write {} to {}: {error}", value, path.display()))
     }
 
     /// Best-effort `io.max` on the workdir's backing block device.
@@ -610,7 +611,10 @@ fn start_transient_scope(unit: &str) -> Result<(), String> {
         .map_err(|error| format!("no systemd session bus: {error}"))?;
 
     let properties: Vec<(&str, Value<'_>)> = vec![
-        ("Description", Value::from("Murmur capsule subprocess scope")),
+        (
+            "Description",
+            Value::from("Murmur capsule subprocess scope"),
+        ),
         ("PIDs", Value::from(vec![std::process::id()])),
         ("Delegate", Value::from(true)),
         ("CollectMode", Value::from("inactive-or-failed")),
@@ -683,7 +687,9 @@ fn probe_delegation() -> Result<PathBuf, String> {
         .map(|contents| parse_cgroup2_mount(&contents))
         .unwrap_or_else(|_| DEFAULT_CGROUP2_MOUNT.to_string());
 
-    let base = ascend_out_of_supervisor_leaves(PathBuf::from(mount).join(relative.trim_start_matches('/')));
+    let base = ascend_out_of_supervisor_leaves(
+        PathBuf::from(mount).join(relative.trim_start_matches('/')),
+    );
     if !base.is_dir() {
         return Err(format!(
             "delegated cgroup directory {} does not exist",
@@ -691,12 +697,13 @@ fn probe_delegation() -> Result<PathBuf, String> {
         ));
     }
 
-    let controllers = std::fs::read_to_string(base.join("cgroup.controllers")).map_err(|error| {
-        format!(
-            "could not read {}/cgroup.controllers: {error}",
-            base.display()
-        )
-    })?;
+    let controllers =
+        std::fs::read_to_string(base.join("cgroup.controllers")).map_err(|error| {
+            format!(
+                "could not read {}/cgroup.controllers: {error}",
+                base.display()
+            )
+        })?;
     let unavailable = missing_controllers(&controllers, REQUIRED_CONTROLLERS);
     if !unavailable.is_empty() {
         return Err(format!(
@@ -770,7 +777,9 @@ fn enable_controllers(base: &Path) -> Result<(), String> {
     // Bounded, because a task that never leaves is a genuine misconfiguration and has to surface
     // as one rather than hang the launch.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut last_error = None;
+    // Left uninitialised: every path that reaches the deadline check has just gone through the
+    // write's `Err` arm, so the fallback below only ever describes a real failure.
+    let mut last_error;
     loop {
         let current = std::fs::read_to_string(&subtree_control).unwrap_or_default();
         if missing_controllers(&current, &wanted).is_empty() {
@@ -825,14 +834,16 @@ fn move_self_to_supervisor_leaf(base: &Path) -> Result<(), String> {
             ));
         }
     }
-    std::fs::write(leaf.join("cgroup.procs"), format!("{}\n", std::process::id())).map_err(
-        |error| {
-            format!(
-                "could not move this process into {} to vacate the delegated cgroup: {error}",
-                leaf.display()
-            )
-        },
+    std::fs::write(
+        leaf.join("cgroup.procs"),
+        format!("{}\n", std::process::id()),
     )
+    .map_err(|error| {
+        format!(
+            "could not move this process into {} to vacate the delegated cgroup: {error}",
+            leaf.display()
+        )
+    })
 }
 
 /// `open(path, O_WRONLY | O_CLOEXEC)`.
@@ -925,7 +936,10 @@ mod tests {
 
         assert!(requires_process_bounding(&shell, false));
         assert!(requires_process_bounding(&spawn, false));
-        assert!(requires_process_bounding(&bare, true), "a native artifact alone is enough");
+        assert!(
+            requires_process_bounding(&bare, true),
+            "a native artifact alone is enough"
+        );
         assert!(
             !requires_process_bounding(&bare, false),
             "a WASM-only capsule has no process tree to bound and must not be blocked"
@@ -954,8 +968,13 @@ mod tests {
     #[test]
     fn prepare_scope_is_never_an_error_off_linux() {
         let temp = tempfile::tempdir().unwrap();
-        let scope = prepare_scope(true, &HostResourceLimits::default(), "ses_test", temp.path())
-            .expect("a non-Linux host must not refuse to launch for a missing cgroup");
+        let scope = prepare_scope(
+            true,
+            &HostResourceLimits::default(),
+            "ses_test",
+            temp.path(),
+        )
+        .expect("a non-Linux host must not refuse to launch for a missing cgroup");
         assert!(scope.is_none());
     }
 
@@ -972,9 +991,14 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let scope = prepare_scope(true, &HostResourceLimits::default(), "ses_selftest", temp.path())
-            .expect("a Linux host with a systemd user session must be able to bound a subprocess tree")
-            .expect("a required scope on Linux is never `None`");
+        let scope = prepare_scope(
+            true,
+            &HostResourceLimits::default(),
+            "ses_selftest",
+            temp.path(),
+        )
+        .expect("a Linux host with a systemd user session must be able to bound a subprocess tree")
+        .expect("a required scope on Linux is never `None`");
 
         for file in ["memory.max", "pids.max", "cpu.max"] {
             let contents = std::fs::read_to_string(scope.path().join(file))
@@ -1018,7 +1042,10 @@ mod tests {
     fn cgroup2_mount_falls_back_to_the_conventional_path() {
         let mounts = "cgroup2 /custom/cgroup cgroup2 rw,nsdelegate 0 0\n";
         assert_eq!(parse_cgroup2_mount(mounts), "/custom/cgroup");
-        assert_eq!(parse_cgroup2_mount("proc /proc proc rw 0 0\n"), "/sys/fs/cgroup");
+        assert_eq!(
+            parse_cgroup2_mount("proc /proc proc rw 0 0\n"),
+            "/sys/fs/cgroup"
+        );
     }
 
     #[test]
@@ -1105,7 +1132,10 @@ mod tests {
     fn scope_dir_name_is_unique_per_call_for_one_id() {
         let first = scope_dir_name("p");
         let second = scope_dir_name("p");
-        assert_ne!(first, second, "same plan id must not reuse a scope directory");
+        assert_ne!(
+            first, second,
+            "same plan id must not reuse a scope directory"
+        );
     }
 
     #[test]

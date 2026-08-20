@@ -143,9 +143,7 @@ fn compaction_fires_when_threshold_reached() {
 /// Test 2: threshold reached but murmur-compact not declared → warning logged, loop continues.
 #[test]
 fn compact_not_declared_threshold_reached_warning_logged() {
-    if common::skip_without_host_support(
-        "compact_not_declared_threshold_reached_warning_logged",
-    ) {
+    if common::skip_without_host_support("compact_not_declared_threshold_reached_warning_logged") {
         return;
     }
     let server = ScriptedServer::start(two_turn_responses());
@@ -260,7 +258,7 @@ fn create_compaction_manifest(
     .unwrap();
 
     let context_section = if with_context {
-        format!("context:\n  max_tokens: 200\n")
+        "context:\n  max_tokens: 200\n".to_string()
     } else {
         String::new()
     };

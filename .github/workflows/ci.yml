@@ -85,6 +85,27 @@ jobs:
             echo "hand on a real uncontainerised Linux host."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  lint:
+    name: cargo-clippy + cargo-fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        # `--all-features` is not redundant with `--all-targets`: `topology_cmd` and `deploy_cmd`
+        # are `#![cfg(feature = ...)]` files and are not linted at all without it.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   wit-versions:
     name: wit-versions
     runs-on: ubuntu-latest

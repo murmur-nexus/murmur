@@ -48,7 +48,9 @@ fn inline_system_prompt_appears_in_every_api_call() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "expected two inference requests");
     for request in requests {
-        let system_field = request["system"].as_str().expect("system field should be present");
+        let system_field = request["system"]
+            .as_str()
+            .expect("system field should be present");
         assert!(
             system_field.starts_with("[Capsule]\nName:"),
             "system field should start with [Capsule] block; got:\n{system_field}"
@@ -62,9 +64,7 @@ fn inline_system_prompt_appears_in_every_api_call() {
 
 #[test]
 fn system_prompt_file_contents_injected_as_system_param() {
-    if common::skip_without_host_support(
-        "system_prompt_file_contents_injected_as_system_param",
-    ) {
+    if common::skip_without_host_support("system_prompt_file_contents_injected_as_system_param") {
         return;
     }
     let server = ScriptedServer::start(vec![one_turn_response()]);
@@ -97,7 +97,9 @@ fn system_prompt_file_contents_injected_as_system_param() {
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "expected one inference request");
-    let system_field = requests[0]["system"].as_str().expect("system field should be present");
+    let system_field = requests[0]["system"]
+        .as_str()
+        .expect("system field should be present");
     assert!(
         system_field.starts_with("[Capsule]\nName:"),
         "system field should start with [Capsule] block; got:\n{system_field}"
@@ -180,7 +182,9 @@ fn no_system_prompt_field_sends_no_system_param() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "expected two inference requests");
     for request in requests {
-        let system_field = request["system"].as_str().expect("system field should be present");
+        let system_field = request["system"]
+            .as_str()
+            .expect("system field should be present");
         assert!(
             system_field.starts_with("[Capsule]\nName:"),
             "system field should contain [Capsule] identity block even with no manifest system prompt; got:\n{system_field}"
@@ -235,7 +239,10 @@ fn without_the_flag_the_trace_attributes_the_prompt_to_the_manifest() {
     assert!(fixture.only_system_field().contains("Manifest prompt"));
     let start = session_start(&workdir);
     assert_eq!(start["system_prompt_source"], "manifest");
-    assert_eq!(start["system_prompt_sha256"], sha256_hex_of("Manifest prompt"));
+    assert_eq!(
+        start["system_prompt_sha256"],
+        sha256_hex_of("Manifest prompt")
+    );
 }
 
 /// A manifest that declares no prompt at all records `"none"` — the negative case is written,
@@ -356,7 +363,10 @@ fn cli_system_prompt_is_trimmed_before_use() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("");
 
-    let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "  \n CLI prompt \n\n "]);
+    let workdir = fixture.run_ok(
+        &manifest_path,
+        &["--system-prompt", "  \n CLI prompt \n\n "],
+    );
 
     assert_eq!(
         session_start(&workdir)["system_prompt_sha256"],
@@ -405,8 +415,14 @@ fn cli_system_prompt_is_rejected_for_a_capsule_without_inference() {
     .failure();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
 
-    assert!(stderr.contains("E-IO-003"), "expected E-IO-003; got: {stderr}");
-    assert!(stderr.contains("--system-prompt"), "error should name the flag; got: {stderr}");
+    assert!(
+        stderr.contains("E-IO-003"),
+        "expected E-IO-003; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--system-prompt"),
+        "error should name the flag; got: {stderr}"
+    );
     assert!(
         stderr.contains("inference:"),
         "error should name the missing block; got: {stderr}"
@@ -443,11 +459,15 @@ fn explain_scope_output_is_unchanged_by_system_prompt() {
         String::from_utf8(with_flag).unwrap()
     );
 
-    let plain_json = mur_run(&fixture.home, &manifest_path, &["--explain-scope", "--json"])
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+    let plain_json = mur_run(
+        &fixture.home,
+        &manifest_path,
+        &["--explain-scope", "--json"],
+    )
+    .success()
+    .get_output()
+    .stdout
+    .clone();
     let with_flag_json = mur_run(
         &fixture.home,
         &manifest_path,
@@ -570,7 +590,11 @@ impl CliFixture {
     }
 }
 
-fn mur_run(home: &TempDir, manifest_path: &Path, extra_args: &[&str]) -> assert_cmd::assert::Assert {
+fn mur_run(
+    home: &TempDir,
+    manifest_path: &Path,
+    extra_args: &[&str],
+) -> assert_cmd::assert::Assert {
     let mut cmd = assert_cmd::Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())
         .env_remove("NEXUS_API_KEY")
@@ -634,7 +658,14 @@ fn create_driver_artifact(dir: &Path, name: &str, wasm_path: &Path) -> PathBuf {
 }
 
 fn create_agent_manifest(project_dir: &Path, endpoint: &str, inference_extra: &str) -> PathBuf {
-    create_agent_manifest_full(project_dir, endpoint, "", SHELL_CAPABILITY, inference_extra, "")
+    create_agent_manifest_full(
+        project_dir,
+        endpoint,
+        "",
+        SHELL_CAPABILITY,
+        inference_extra,
+        "",
+    )
 }
 
 /// `capabilities.shell.allow: [bash]`, for the tests whose scripted turns include a bash tool

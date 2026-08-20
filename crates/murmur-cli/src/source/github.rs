@@ -146,15 +146,20 @@ impl GitHubSource {
             // does not silently shadow the correct version from the latest release.
             let primary = match self.fetch_release_by_version_hint(version) {
                 Ok(release) => {
-                    match select_versioned_asset(&release.assets, artifact_name, version, current_platform()) {
+                    match select_versioned_asset(
+                        &release.assets,
+                        artifact_name,
+                        version,
+                        current_platform(),
+                    ) {
                         Some(asset) => {
                             let bytes = self.download_asset(&asset)?;
                             return Ok((bytes, release.tag_name));
                         }
-                        None => Some(release.tag_name.clone()),  // release found, artifact absent
+                        None => Some(release.tag_name.clone()), // release found, artifact absent
                     }
                 }
-                Err(SourceError::NotFound(_)) => None,  // no release with this tag
+                Err(SourceError::NotFound(_)) => None, // no release with this tag
                 Err(e) => return Err(e),
             };
 
@@ -163,17 +168,20 @@ impl GitHubSource {
             // latest release for an asset whose name pins the requested version exactly:
             //   {name}-{version}.mur.zip  or  {name}-{version}-{platform}.mur.zip
             let latest = self.fetch_latest_release()?;
-            match select_versioned_asset(&latest.assets, artifact_name, version, current_platform()) {
+            match select_versioned_asset(&latest.assets, artifact_name, version, current_platform())
+            {
                 Some(asset) => {
                     let bytes = self.download_asset(&asset)?;
                     Ok((bytes, latest.tag_name))
                 }
-                None => Err(SourceError::NotFound(format!(
+                None => {
+                    Err(SourceError::NotFound(format!(
                     "asset '{artifact_name}.mur.zip' not found in release '{}'{} or latest '{}'",
                     primary.as_deref().unwrap_or(version),
                     if primary.is_none() { " (no such release)" } else { "" },
                     latest.tag_name,
-                ))),
+                )))
+                }
             }
         } else {
             let release = self.fetch_latest_release()?;
@@ -253,9 +261,12 @@ impl GitHubSource {
             });
         }
 
-        response.body_mut().read_json::<GitHubRelease>().map_err(|error| {
-            SourceError::Other(format!("invalid github release response: {error}"))
-        })
+        response
+            .body_mut()
+            .read_json::<GitHubRelease>()
+            .map_err(|error| {
+                SourceError::Other(format!("invalid github release response: {error}"))
+            })
     }
 
     fn download_asset(&self, asset: &GitHubReleaseAsset) -> Result<Bytes, SourceError> {
@@ -363,8 +374,8 @@ impl ArtifactSource for GitHubSource {
     ) -> Result<Vec<u8>, SourceError> {
         if version == "latest" {
             let release = self.fetch_latest_release()?;
-            let asset = select_asset_for_artifact(&release.assets, name, platform)
-                .ok_or_else(|| {
+            let asset =
+                select_asset_for_artifact(&release.assets, name, platform).ok_or_else(|| {
                     SourceError::NotFound(format!(
                         "no asset for '{name}' (platform: {platform}) in latest release '{}'",
                         release.tag_name
@@ -376,10 +387,12 @@ impl ArtifactSource for GitHubSource {
         // Primary: release tagged with the artifact version.
         let primary_tag = match self.fetch_release_by_version_hint(version) {
             Ok(release) => {
-                if let Some(asset) = select_versioned_asset(&release.assets, name, version, platform) {
+                if let Some(asset) =
+                    select_versioned_asset(&release.assets, name, version, platform)
+                {
                     return self.download_asset(&asset).map(|b| b.to_vec());
                 }
-                Some(release.tag_name)  // release found, artifact absent
+                Some(release.tag_name) // release found, artifact absent
             }
             Err(SourceError::NotFound(_)) => None,
             Err(e) => return Err(e),
@@ -422,7 +435,8 @@ fn select_asset_for_artifact(
     // Pattern: <name>-<version>-<platform>.mur.zip  (e.g. murmur-tool-git-0.3.20-darwin-aarch64.mur.zip)
     let platform_suffix = format!("-{platform}.mur.zip");
     if let Some(asset) = assets.iter().find(|asset| {
-        asset.name.starts_with(&format!("{artifact_name}-")) && asset.name.ends_with(&platform_suffix)
+        asset.name.starts_with(&format!("{artifact_name}-"))
+            && asset.name.ends_with(&platform_suffix)
     }) {
         return Some(asset.clone());
     }

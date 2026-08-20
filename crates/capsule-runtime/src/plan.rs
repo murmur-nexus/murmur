@@ -724,12 +724,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
                     .to_string();
                 return failed(&step.id, msg);
             }
-            other => {
-                return failed(
-                    &step.id,
-                    format!("unknown A2A task state: {other:?}"),
-                )
-            }
+            other => return failed(&step.id, format!("unknown A2A task state: {other:?}")),
         }
     }
 }
@@ -748,14 +743,11 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
 /// the worker reads from — is still unbuilt; see
 /// `.nexus/roadmap/dag-capsule-step-workdir-and-input-routing-gap.md`.
 fn capsule_step_input_text(input: Value) -> String {
-    let bare_objective = input
-        .get("objective")
-        .and_then(Value::as_str)
-        .filter(|_| {
-            ["instructions", "context", "output_format"]
-                .iter()
-                .all(|key| input.get(key).map_or(true, Value::is_null))
-        });
+    let bare_objective = input.get("objective").and_then(Value::as_str).filter(|_| {
+        ["instructions", "context", "output_format"]
+            .iter()
+            .all(|key| input.get(key).is_none_or(Value::is_null))
+    });
 
     match bare_objective {
         Some(objective) => objective.to_string(),
@@ -1019,9 +1011,8 @@ mod tests {
 
     #[test]
     fn on_error_and_retries_are_applied() {
-        if crate::cgroup::skip_without_host_support(
-            "plan::tests::on_error_and_retries_are_applied",
-        ) {
+        if crate::cgroup::skip_without_host_support("plan::tests::on_error_and_retries_are_applied")
+        {
             return;
         }
         let dir = tempdir().unwrap();
@@ -1053,9 +1044,7 @@ mod tests {
 
     #[test]
     fn condition_false_skips_step() {
-        if crate::cgroup::skip_without_host_support(
-            "plan::tests::condition_false_skips_step",
-        ) {
+        if crate::cgroup::skip_without_host_support("plan::tests::condition_false_skips_step") {
             return;
         }
         let dir = tempdir().unwrap();

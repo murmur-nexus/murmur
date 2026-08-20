@@ -4,9 +4,9 @@ use std::{
 };
 
 use murmur_artifact::{
-    is_reserved_version, load_manifest, load_manifest_from_artifact,
+    current_platform, is_reserved_version, load_manifest, load_manifest_from_artifact,
     load_manifest_yaml_from_artifact, parse_tool_implementation_from_yaml, resolve_manifest_path,
-    ArtifactImplementation, current_platform, ArtifactMeta, RuntimeType,
+    ArtifactImplementation, ArtifactMeta, RuntimeType,
 };
 
 use crate::{
@@ -62,15 +62,16 @@ pub(crate) fn run_publish(
 
         // WASM or native — inspect implementation field to determine platform handling.
         (None, _) => {
-            let manifest_yaml = load_manifest_yaml_from_artifact(&artifact_path).map_err(|error| {
-                CliError::new(
-                    E_IO_003,
-                    format!(
-                        "failed to read murmur.yaml from {}: {error}",
-                        artifact_path.display()
-                    ),
-                )
-            })?;
+            let manifest_yaml =
+                load_manifest_yaml_from_artifact(&artifact_path).map_err(|error| {
+                    CliError::new(
+                        E_IO_003,
+                        format!(
+                            "failed to read murmur.yaml from {}: {error}",
+                            artifact_path.display()
+                        ),
+                    )
+                })?;
             match parse_tool_implementation_from_yaml(&manifest_yaml) {
                 // Native artifact with no explicit platform → auto-detect current build host.
                 ArtifactImplementation::Native => {

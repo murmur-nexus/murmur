@@ -161,7 +161,14 @@ fn http_get(addr: &str, path: &str) -> (u16, String) {
 }
 
 /// Build the same JSON string that `mur run --json` emits, using the provided values.
-fn build_json_line(url: &str, pid: u32, session_id: &str, name: &str, version: &str, workdir: &Path) -> String {
+fn build_json_line(
+    url: &str,
+    pid: u32,
+    session_id: &str,
+    name: &str,
+    version: &str,
+    workdir: &Path,
+) -> String {
     serde_json::json!({
         "url": url,
         "pid": pid,
@@ -190,7 +197,14 @@ fn json_launch_emits_parseable_json() {
 
     let handle = std::thread::spawn(move || {
         launch_session(staged, move |url| {
-            let line = build_json_line(url, expected_pid, &expected_session_id, CAPSULE_NAME, CAPSULE_VERSION, &expected_workdir);
+            let line = build_json_line(
+                url,
+                expected_pid,
+                &expected_session_id,
+                CAPSULE_NAME,
+                CAPSULE_VERSION,
+                &expected_workdir,
+            );
             let _ = json_tx.send(line);
         })
         .expect("launch should succeed")
@@ -216,7 +230,10 @@ fn json_launch_emits_parseable_json() {
     );
 
     let pid = parsed["pid"].as_u64().unwrap_or(0);
-    assert!(pid > 0, "pid field should be a positive integer; got: {parsed}");
+    assert!(
+        pid > 0,
+        "pid field should be a positive integer; got: {parsed}"
+    );
 
     let sid = parsed["session_id"].as_str().unwrap_or("");
     assert!(
@@ -264,7 +281,14 @@ fn json_launch_url_is_reachable() {
 
     let handle = std::thread::spawn(move || {
         launch_session(staged, move |url| {
-            let line = build_json_line(url, expected_pid, &expected_session_id, CAPSULE_NAME, CAPSULE_VERSION, &expected_workdir);
+            let line = build_json_line(
+                url,
+                expected_pid,
+                &expected_session_id,
+                CAPSULE_NAME,
+                CAPSULE_VERSION,
+                &expected_workdir,
+            );
             let _ = json_tx.send(line);
         })
         .expect("launch should succeed")
@@ -276,7 +300,9 @@ fn json_launch_url_is_reachable() {
 
     let parsed: Value =
         serde_json::from_str(&json_line).expect("JSON line should parse as valid JSON");
-    let url = parsed["url"].as_str().expect("url field should be a string");
+    let url = parsed["url"]
+        .as_str()
+        .expect("url field should be a string");
 
     let (status, body) = http_get(url, "/.well-known/agent-card.json");
     assert_eq!(
@@ -284,8 +310,7 @@ fn json_launch_url_is_reachable() {
         "agent card endpoint should return HTTP 200; got {status}"
     );
 
-    let card: Value =
-        serde_json::from_str(&body).expect("agent card body should be valid JSON");
+    let card: Value = serde_json::from_str(&body).expect("agent card body should be valid JSON");
     assert!(
         card.get("name").is_some(),
         "agent card should have a 'name' field; got: {card}"
@@ -316,7 +341,14 @@ fn json_launch_session_id_matches_trace() {
 
     let handle = std::thread::spawn(move || {
         launch_session(staged, move |url| {
-            let line = build_json_line(url, expected_pid, &expected_session_id, CAPSULE_NAME, CAPSULE_VERSION, &expected_workdir);
+            let line = build_json_line(
+                url,
+                expected_pid,
+                &expected_session_id,
+                CAPSULE_NAME,
+                CAPSULE_VERSION,
+                &expected_workdir,
+            );
             let _ = json_tx.send(line);
         })
         .expect("launch should succeed")
@@ -469,7 +501,9 @@ fn json_launch_workdir_flag_is_reflected() {
     let parsed: Value =
         serde_json::from_str(json_line).expect("JSON line should parse as valid JSON");
 
-    let wd = parsed["workdir"].as_str().expect("workdir field should be a string");
+    let wd = parsed["workdir"]
+        .as_str()
+        .expect("workdir field should be a string");
     let expected = user_workdir.path().to_str().unwrap();
     assert_eq!(
         wd, expected,

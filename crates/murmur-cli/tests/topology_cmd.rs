@@ -253,7 +253,13 @@ fn topology_node_color_by_exit_status() {
         buildinfo_response(),
         search_response(&[trace_ok, trace_failed]),
         otlp_trace(trace_ok, "aa01000000000001", "", "ok", "capsule-ok"),
-        otlp_trace(trace_failed, "bb01000000000001", "", "failed", "capsule-fail"),
+        otlp_trace(
+            trace_failed,
+            "bb01000000000001",
+            "",
+            "failed",
+            "capsule-fail",
+        ),
     ]);
 
     let tmp = TempDir::new().unwrap();
@@ -334,7 +340,10 @@ fn topology_empty_search_result_renders_empty_graph_message() {
         html.contains("No capsule sessions found"),
         "empty result must show no-sessions message"
     );
-    assert!(html.contains("vis-network"), "HTML must load vis.js from CDN");
+    assert!(
+        html.contains("vis-network"),
+        "HTML must load vis.js from CDN"
+    );
     assert!(
         html.contains("window.TOPOLOGY_DATA"),
         "HTML must embed TOPOLOGY_DATA"

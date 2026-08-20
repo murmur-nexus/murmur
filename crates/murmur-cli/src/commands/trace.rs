@@ -665,7 +665,10 @@ fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
     }
     let mut entries = Vec::new();
     for entry_res in fs::read_dir(workdir).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to read {}: {e}", workdir.display()))
+        CliError::new(
+            E_IO_003,
+            format!("failed to read {}: {e}", workdir.display()),
+        )
     })? {
         let entry = entry_res.map_err(|e| {
             CliError::new(
@@ -681,7 +684,10 @@ fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
     Ok(entries)
 }
 
-pub(crate) fn resolve_session(session: Option<String>, workdir: &Path) -> Result<PathBuf, CliError> {
+pub(crate) fn resolve_session(
+    session: Option<String>,
+    workdir: &Path,
+) -> Result<PathBuf, CliError> {
     match session {
         None => {
             let mut entries = ses_entries(workdir)?;
@@ -1056,7 +1062,10 @@ fn print_show(m: &TraceMetrics) {
     }
 }
 
-pub(crate) fn run_trace_show(session: Option<String>, workdir_arg: Option<PathBuf>) -> Result<(), CliError> {
+pub(crate) fn run_trace_show(
+    session: Option<String>,
+    workdir_arg: Option<PathBuf>,
+) -> Result<(), CliError> {
     let workdir = workdir_arg.unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -1168,7 +1177,13 @@ pub(crate) fn run_trace_steps(
             } else {
                 String::new()
             };
-            (*turn, decision.clone(), tool_display, dur_str, input_summary)
+            (
+                *turn,
+                decision.clone(),
+                tool_display,
+                dur_str,
+                input_summary,
+            )
         })
         .collect();
 
@@ -1182,7 +1197,10 @@ pub(crate) fn run_trace_steps(
     for (turn, decision, tool_display, dur_str, input_summary) in &rows {
         let tool_padded = format!("{:<width$}", tool_display, width = max_tool_width);
         if verbose && !input_summary.is_empty() {
-            println!("  {:<3}{:<13}{}{:<5}   {}", turn, decision, tool_padded, dur_str, input_summary);
+            println!(
+                "  {:<3}{:<13}{}{:<5}   {}",
+                turn, decision, tool_padded, dur_str, input_summary
+            );
         } else {
             println!("  {:<3}{:<13}{}{}", turn, decision, tool_padded, dur_str);
         }
@@ -1233,7 +1251,12 @@ fn print_session_block(m: &TraceMetrics) {
     }
 
     if m.total_shell_calls > 0 {
-        println!("  {:<14} {}  exit codes: {}", "Shell calls:", m.total_shell_calls, fmt_exit_codes(&m.shell_exit_codes));
+        println!(
+            "  {:<14} {}  exit codes: {}",
+            "Shell calls:",
+            m.total_shell_calls,
+            fmt_exit_codes(&m.shell_exit_codes)
+        );
     }
 
     if !m.redundant_calls.is_empty() {
@@ -1245,7 +1268,12 @@ fn print_session_block(m: &TraceMetrics) {
             .avg_shell_latency_ms()
             .map(|v| format!("  shell {}", fmt_dur(v as u64)))
             .unwrap_or_default();
-        println!("  {:<14} tool {}{}", "Avg latency:", fmt_dur(avg_tool as u64), shell_part);
+        println!(
+            "  {:<14} tool {}{}",
+            "Avg latency:",
+            fmt_dur(avg_tool as u64),
+            shell_part
+        );
     }
 
     println!();
@@ -1410,7 +1438,11 @@ fn print_diff(a: &TraceMetrics, b: &TraceMetrics) {
         "skill calls",
         a.total_skill_calls(),
         b.total_skill_calls(),
-        delta_u64(a.total_skill_calls() as u64, b.total_skill_calls() as u64, true)
+        delta_u64(
+            a.total_skill_calls() as u64,
+            b.total_skill_calls() as u64,
+            true
+        )
     );
 
     row!(

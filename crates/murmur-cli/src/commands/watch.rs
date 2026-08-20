@@ -84,7 +84,10 @@ pub(crate) fn run_watch(capsule_url: &str) -> Result<(), CliError> {
             Ok(_) => {}
         }
 
-        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        let line = line
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string();
 
         if line.is_empty() {
             // Dispatch the accumulated event
@@ -153,10 +156,15 @@ fn dispatch_sse_event(
     match event_type {
         "status" => {
             if let Ok(event) = serde_json::from_str::<Value>(data) {
-                let task_id =
-                    event.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let context_id_opt =
-                    event.get("context_id").and_then(Value::as_str).map(str::to_string);
+                let task_id = event
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let context_id_opt = event
+                    .get("context_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let state = event
                     .get("status")
                     .and_then(|s| s.get("state"))
@@ -186,8 +194,7 @@ fn dispatch_sse_event(
                         .unwrap_or_else(|| task_id.clone());
 
                     let turn = *context_turns.entry(cid.clone()).or_insert(1);
-                    let prefix =
-                        format!("[{} / turn {turn} / {state}]", truncate_context_id(&cid));
+                    let prefix = format!("[{} / turn {turn} / {state}]", truncate_context_id(&cid));
 
                     if is_final {
                         println!("{prefix}");

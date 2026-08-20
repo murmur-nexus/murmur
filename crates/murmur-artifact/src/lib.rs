@@ -20,7 +20,6 @@ pub use artifact::{
     load_manifest_from_artifact, load_manifest_from_artifact_bytes,
     load_manifest_yaml_from_artifact, load_manifest_yaml_from_artifact_bytes, ArtifactError,
 };
-pub use platform::current_platform;
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY};
 pub use build_lints::{
@@ -39,6 +38,7 @@ pub use payload_shape::{
     select_root_wasm_from_entries, select_root_wasm_in_archive, PayloadShapeError,
     CAPSULE_WASM_ENTRY, NATIVE_BIN_DIR, SKILL_MD_ENTRY, WASM_EXTENSION,
 };
+pub use platform::current_platform;
 pub use registry::{
     is_reserved_version, sha256_hex, verify_sha256, ArtifactMeta, LocalRegistry, Platform,
     PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
@@ -46,15 +46,14 @@ pub use registry::{
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest,
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_hook_config,
-    read_tool_implementation, AfterTask,
-    ArtifactImplementation, ArtifactRuntime, Capabilities, CompactionConfig, ContainmentClass,
-    ContextConfig, ConversationMode, EnvCapabilities, EvalConfig, FilesystemCapabilities,
-    HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
-    InferenceConfig, InferenceDriver,
-    InterpreterRuntimeDir, InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride,
-    NetworkCapabilities, NetworkConfig, ObservabilityConfig, ParseContainmentClassError,
-    ResourceCapabilities, ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError,
-    ScorerConfig, ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TraceConfig,
+    read_tool_implementation, AfterTask, ArtifactImplementation, ArtifactRuntime, Capabilities,
+    CompactionConfig, ContainmentClass, ContextConfig, ConversationMode, EnvCapabilities,
+    EvalConfig, FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig,
+    HookExecutionMode, HookOverflowPolicy, InferenceConfig, InferenceDriver, InterpreterRuntimeDir,
+    InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
+    NetworkConfig, ObservabilityConfig, ParseContainmentClassError, ResourceCapabilities,
+    ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
+    ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TraceConfig,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{

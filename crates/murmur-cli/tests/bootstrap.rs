@@ -369,7 +369,9 @@ fn bootstrap_missing_driver_artifact_fails_before_launch() {
 
     common::run_capsule(&home, &manifest_path)
         .failure()
-        .stderr(predicate::str::contains("missing artifacts: murmur-driver-anthropic@"))
+        .stderr(predicate::str::contains(
+            "missing artifacts: murmur-driver-anthropic@",
+        ))
         .stderr(predicate::str::contains("run `mur install`"))
         .stderr(predicate::str::contains("error[E-RUN-008]"));
 }
@@ -437,7 +439,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
         "wasm artifact should appear in tools list"
     );
     assert!(
-        !tool_names.iter().any(|&n| n == DRIVER_ANTHROPIC_NAME),
+        !tool_names.contains(&DRIVER_ANTHROPIC_NAME),
         "driver artifact should not appear in tools list"
     );
 }
@@ -507,14 +509,16 @@ fn agent_system_prompt_includes_capsule_context() {
     )
     .unwrap();
 
-    let staged =
-        stage_agent_session(&home, project.path(), &project.path().join("murmur.yaml"));
+    let staged = stage_agent_session(&home, project.path(), &project.path().join("murmur.yaml"));
     fs::write(staged.workdir.join("task.md"), "hello").unwrap();
 
     launch_session(staged, |_| {}).expect("agent launch should succeed");
 
     let requests = server.requests();
-    assert!(!requests.is_empty(), "expected at least one inference request");
+    assert!(
+        !requests.is_empty(),
+        "expected at least one inference request"
+    );
 
     let system_field = requests[0]["system"]
         .as_str()

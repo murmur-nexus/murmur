@@ -31,7 +31,8 @@ pub trait ArtifactSource: Send + Sync {
         platform: &str,
     ) -> Result<Vec<u8>, SourceError> {
         let _ = platform;
-        self.resolve_bare_with_version(name, version).map(|(bytes, _)| bytes.to_vec())
+        self.resolve_bare_with_version(name, version)
+            .map(|(bytes, _)| bytes.to_vec())
     }
 }
 
@@ -329,9 +330,7 @@ mod tests {
             Vec::new(),
         );
 
-        let resolved = chain
-            .resolve_bare("murmur-driver-anthropic", None)
-            .unwrap();
+        let resolved = chain.resolve_bare("murmur-driver-anthropic", None).unwrap();
 
         assert_eq!(resolved.bytes, Bytes::from_static(b"artifact"));
         assert_eq!(resolved.resolved_version.as_deref(), Some("0.1.0"));

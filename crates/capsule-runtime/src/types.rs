@@ -412,9 +412,7 @@ pub fn capability_policy_from_runtime_manifest(
         env_allow,
         limits,
         resources,
-        containment_floor: caps
-            .and_then(|c| c.containment)
-            .unwrap_or_default(),
+        containment_floor: caps.and_then(|c| c.containment).unwrap_or_default(),
         declared_deadline_seconds,
     }
 }

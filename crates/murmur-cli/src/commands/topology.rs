@@ -16,8 +16,10 @@ const E_TOP_001: &str = "E-TOP-001"; // endpoint unreachable or invalid window
 const E_TOP_002: &str = "E-TOP-002"; // Tempo query failed
 const E_TOP_003: &str = "E-TOP-003"; // response parse error
 
-const VIS_JS_CDN: &str = "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js";
-const VIS_CSS_CDN: &str = "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/dist/vis-network.min.css";
+const VIS_JS_CDN: &str =
+    "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js";
+const VIS_CSS_CDN: &str =
+    "https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/dist/vis-network.min.css";
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -172,7 +174,12 @@ impl TempoClient {
         info.version
     }
 
-    fn search_capsule_sessions(&self, start: i64, end: i64, limit: u32) -> Result<Vec<String>, CliError> {
+    fn search_capsule_sessions(
+        &self,
+        start: i64,
+        end: i64,
+        limit: u32,
+    ) -> Result<Vec<String>, CliError> {
         let url = format!("{}/api/search", self.base_url);
         let mut resp = self
             .client
@@ -186,21 +193,26 @@ impl TempoClient {
             .call()
             .map_err(|e| CliError::new(E_TOP_002, format!("Tempo search query failed: {e}")))?;
 
-        let body: TempoSearchResponse = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| CliError::new(E_TOP_003, format!("failed to parse Tempo search response: {e}")))?;
+        let body: TempoSearchResponse = resp.body_mut().read_json().map_err(|e| {
+            CliError::new(
+                E_TOP_003,
+                format!("failed to parse Tempo search response: {e}"),
+            )
+        })?;
 
-        Ok(body.traces.unwrap_or_default().into_iter().map(|t| t.trace_id).collect())
+        Ok(body
+            .traces
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.trace_id)
+            .collect())
     }
 
     fn get_trace(&self, trace_id: &str) -> Result<OtlpTraceResponse, CliError> {
         let url = format!("{}/api/traces/{}", self.base_url, trace_id);
-        let mut resp = self
-            .client
-            .get(&url)
-            .call()
-            .map_err(|e| CliError::new(E_TOP_002, format!("failed to fetch trace {trace_id}: {e}")))?;
+        let mut resp = self.client.get(&url).call().map_err(|e| {
+            CliError::new(E_TOP_002, format!("failed to fetch trace {trace_id}: {e}"))
+        })?;
 
         resp.body_mut()
             .read_json()
@@ -211,7 +223,12 @@ impl TempoClient {
 // ── Window parsing ────────────────────────────────────────────────────────────
 
 fn parse_window_to_seconds(window: &str) -> Result<i64, CliError> {
-    let invalid = || CliError::new(E_TOP_001, format!("invalid window '{window}'; accepted: 30m, 1h, 6h, 24h, 7d"));
+    let invalid = || {
+        CliError::new(
+            E_TOP_001,
+            format!("invalid window '{window}'; accepted: 30m, 1h, 6h, 24h, 7d"),
+        )
+    };
 
     if let Some(n) = window.strip_suffix('d') {
         return n.parse::<i64>().map(|d| d * 86400).map_err(|_| invalid());
@@ -228,7 +245,12 @@ fn parse_window_to_seconds(window: &str) -> Result<i64, CliError> {
 // ── Graph reconstruction ──────────────────────────────────────────────────────
 
 fn get_attr_str(attrs: &[OtlpAttribute], key: &str) -> Option<String> {
-    attrs.iter().find(|a| a.key == key)?.value.string_value.clone()
+    attrs
+        .iter()
+        .find(|a| a.key == key)?
+        .value
+        .string_value
+        .clone()
 }
 
 fn nanos_to_ms(s: &str) -> u64 {
@@ -346,7 +368,8 @@ fn build_graph(traces: &[(String, OtlpTraceResponse)]) -> (Vec<CapsuleNode>, Vec
 
 fn generate_html(nodes: &[CapsuleNode], edges: &[CapsuleEdge], window: &str) -> String {
     let data = TopologyData { nodes, edges };
-    let json_data = serde_json::to_string(&data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string());
+    let json_data =
+        serde_json::to_string(&data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string());
 
     let empty_msg = if nodes.is_empty() {
         "<div id=\"empty-msg\">No capsule sessions found in the selected time window.</div>"
@@ -514,8 +537,12 @@ fn open_browser(target: &str) {
 }
 
 fn write_html_file(path: &PathBuf, html: &str) -> Result<(), CliError> {
-    fs::write(path, html)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to write HTML to {}: {e}", path.display())))
+    fs::write(path, html).map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to write HTML to {}: {e}", path.display()),
+        )
+    })
 }
 
 fn serve_on_port(html: &str, port: u16) -> Result<(), CliError> {
@@ -532,7 +559,9 @@ fn serve_on_port(html: &str, port: u16) -> Result<(), CliError> {
     open_browser(&url);
 
     while let Ok((mut stream, _)) = listener.accept() {
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok();
         let mut buf = [0u8; 4096];
         let _ = stream.read(&mut buf);
         let resp = format!(
@@ -567,7 +596,10 @@ pub(crate) fn run_topology(args: &TopologyArgs) -> Result<(), CliError> {
     let trace_ids = tempo.search_capsule_sessions(start, end, 500)?;
 
     if trace_ids.is_empty() {
-        let is_v3 = tempo_version.as_deref().map(|v| v.starts_with('3')).unwrap_or(false);
+        let is_v3 = tempo_version
+            .as_deref()
+            .map(|v| v.starts_with('3'))
+            .unwrap_or(false);
         if is_v3 {
             eprintln!(
                 "murmur: hint: Tempo v3 requires 'block: version: vParquet4' under \

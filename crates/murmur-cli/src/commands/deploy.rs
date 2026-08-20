@@ -1,6 +1,9 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -49,8 +52,8 @@ pub(crate) fn ensure_artifact_for_deploy(
     local_registry: &LocalRegistry,
     chain: &crate::source::SourceChain,
 ) -> Result<StagedArtifact, crate::error::CliError> {
-    use murmur_artifact::{current_platform, Registry, RegistryError, RuntimeType};
     use crate::error::{E_IO_003, E_REG_001};
+    use murmur_artifact::{current_platform, Registry, RegistryError, RuntimeType};
 
     let platform_specific_path =
         local_registry.artifact_path_for_platform(name, version, target_platform);
@@ -83,23 +86,37 @@ pub(crate) fn ensure_artifact_for_deploy(
             let artifact_dir = platform_specific_path.parent().ok_or_else(|| {
                 crate::error::CliError::new(
                     E_IO_003,
-                    format!("unexpected artifact path (no parent): {}", platform_specific_path.display()),
+                    format!(
+                        "unexpected artifact path (no parent): {}",
+                        platform_specific_path.display()
+                    ),
                 )
             })?;
             let sha256_path =
                 artifact_dir.join(format!("{name}-{version}-{target_platform}.sha256"));
 
             std::fs::create_dir_all(artifact_dir).map_err(|e| {
-                crate::error::CliError::new(E_IO_003, format!("failed to create artifact cache dir: {e}"))
+                crate::error::CliError::new(
+                    E_IO_003,
+                    format!("failed to create artifact cache dir: {e}"),
+                )
             })?;
             std::fs::write(&platform_specific_path, &bytes).map_err(|e| {
                 crate::error::CliError::new(E_IO_003, format!("failed to cache artifact: {e}"))
             })?;
             std::fs::write(&sha256_path, sha256.as_bytes()).map_err(|e| {
-                crate::error::CliError::new(E_IO_003, format!("failed to cache artifact sha256: {e}"))
+                crate::error::CliError::new(
+                    E_IO_003,
+                    format!("failed to cache artifact sha256: {e}"),
+                )
             })?;
 
-            Ok(StagedArtifact { name: name.to_string(), version: version.to_string(), bytes, sha256 })
+            Ok(StagedArtifact {
+                name: name.to_string(),
+                version: version.to_string(),
+                bytes,
+                sha256,
+            })
         }
         Err(chain_err) => Err(crate::error::CliError::new(
             E_REG_001,
@@ -135,9 +152,8 @@ fn format_bytes(n: u64) -> String {
 }
 
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let second = *chunk.get(1).unwrap_or(&0);
         let third = *chunk.get(2).unwrap_or(&0);
@@ -207,7 +223,12 @@ fn wait_for_ssh(
     }
 }
 
-fn ssh_exec(ip: &str, key_path: Option<&str>, user: &str, command: &str) -> Result<String, CliError> {
+fn ssh_exec(
+    ip: &str,
+    key_path: Option<&str>,
+    user: &str,
+    command: &str,
+) -> Result<String, CliError> {
     let mut args = ssh_args_base(key_path, user, ip);
     args.push(command.to_string());
 
@@ -265,14 +286,21 @@ fn scp_upload(
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(CliError::new(
             E_DEPLOY_003,
-            format!("scp upload to {user}@{ip}:{remote} failed: {}", stderr.trim()),
+            format!(
+                "scp upload to {user}@{ip}:{remote} failed: {}",
+                stderr.trim()
+            ),
         ));
     }
     Ok(())
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
 }
 
 // ─── artifact helpers ─────────────────────────────────────────────────────────
@@ -472,7 +500,10 @@ fn resolve_mur_binary_impl(
     }
 
     let release_json: serde_json::Value = release_resp.body_mut().read_json().map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to parse GitHub release JSON: {e}"))
+        CliError::new(
+            E_IO_003,
+            format!("failed to parse GitHub release JSON: {e}"),
+        )
     })?;
 
     let asset_id = release_json["assets"]
@@ -533,9 +564,15 @@ fn resolve_mur_binary_impl(
         let mut reader = pb.wrap_read(asset_resp.into_body().into_reader());
         let mut buf = Vec::with_capacity(content_length.unwrap_or(0) as usize);
         use std::io::Read;
-        reader.read_to_end(&mut buf).map(|_| bytes::Bytes::from(buf)).map_err(|e| {
-            CliError::new(E_IO_003, format!("failed to read downloaded mur binary: {e}"))
-        })?
+        reader
+            .read_to_end(&mut buf)
+            .map(|_| bytes::Bytes::from(buf))
+            .map_err(|e| {
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to read downloaded mur binary: {e}"),
+                )
+            })?
     } else {
         asset_resp
             .body_mut()
@@ -544,7 +581,10 @@ fn resolve_mur_binary_impl(
             .read_to_vec()
             .map(bytes::Bytes::from)
             .map_err(|e| {
-                CliError::new(E_IO_003, format!("failed to read downloaded mur binary: {e}"))
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to read downloaded mur binary: {e}"),
+                )
             })?
     };
 
@@ -559,21 +599,28 @@ fn resolve_mur_binary_impl(
     }
 
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to create binary cache directory: {e}"))
+        CliError::new(
+            E_IO_003,
+            format!("failed to create binary cache directory: {e}"),
+        )
     })?;
-    std::fs::write(&cache_path, &bytes).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to write cached mur binary: {e}"))
-    })?;
+    std::fs::write(&cache_path, &bytes)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to write cached mur binary: {e}")))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&cache_path)
-            .map_err(|e| CliError::new(E_IO_003, format!("failed to read binary permissions: {e}")))?
+            .map_err(|e| {
+                CliError::new(E_IO_003, format!("failed to read binary permissions: {e}"))
+            })?
             .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&cache_path, perms).map_err(|e| {
-            CliError::new(E_IO_003, format!("failed to set binary executable permission: {e}"))
+            CliError::new(
+                E_IO_003,
+                format!("failed to set binary executable permission: {e}"),
+            )
         })?;
     }
 
@@ -585,7 +632,12 @@ fn resolve_mur_binary_impl(
 fn parse_env_var(s: &str) -> Result<(&str, &str), CliError> {
     s.split_once('=')
         .filter(|(k, _)| !k.is_empty())
-        .ok_or_else(|| CliError::new("E-DEPLOY-001", format!("--env value {s:?} must be KEY=VALUE")))
+        .ok_or_else(|| {
+            CliError::new(
+                "E-DEPLOY-001",
+                format!("--env value {s:?} must be KEY=VALUE"),
+            )
+        })
 }
 
 /// Load a .env file and return lines as KEY=VALUE strings.
@@ -593,13 +645,21 @@ fn parse_env_var(s: &str) -> Result<(&str, &str), CliError> {
 /// Blank lines and lines starting with `#` are skipped.
 fn load_env_file(path: &Path) -> Result<Vec<String>, CliError> {
     let content = std::fs::read_to_string(path).map_err(|e| {
-        CliError::new(E_IO_001, format!("cannot read env file {}: {e}", path.display()))
+        CliError::new(
+            E_IO_001,
+            format!("cannot read env file {}: {e}", path.display()),
+        )
     })?;
     let entries = content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| line.strip_prefix("export ").unwrap_or(line).trim().to_string())
+        .map(|line| {
+            line.strip_prefix("export ")
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
         .collect();
     Ok(entries)
 }
@@ -752,16 +812,21 @@ pub(crate) fn run_deploy(
     let home_os = std::env::var_os("HOME")
         .ok_or_else(|| CliError::new(E_IO_001, "could not determine home directory"))?;
     let home = std::path::PathBuf::from(home_os);
-    let staging_dir = home.join(".murmur").join("deploy_staging").join(&deployment_id);
+    let staging_dir = home
+        .join(".murmur")
+        .join("deploy_staging")
+        .join(&deployment_id);
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to create staging dir: {e}")))?;
     let _staging_guard = StagingGuard(staging_dir.clone());
 
     // ── 0.4. Load manifest, artifacts, sources ────────────────────────────────
-    let runtime_manifest =
-        load_runtime_manifest(&manifest_path).map_err(|e| {
-            CliError::new(E_IO_003, format!("failed to parse manifest for staging: {e}"))
-        })?;
+    let runtime_manifest = load_runtime_manifest(&manifest_path).map_err(|e| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to parse manifest for staging: {e}"),
+        )
+    })?;
     let artifact_refs = collect_deploy_artifacts(&runtime_manifest);
     let local_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
     let mur_config = load_mur_config()?;
@@ -774,7 +839,9 @@ pub(crate) fn run_deploy(
     let cached_flags: Vec<bool> = artifact_refs
         .iter()
         .map(|(name, version)| {
-            local_registry.artifact_path_for_platform(name, version, target_platform).exists()
+            local_registry
+                .artifact_path_for_platform(name, version, target_platform)
+                .exists()
                 || local_registry.artifact_path_for(name, version).exists()
         })
         .collect();
@@ -784,7 +851,8 @@ pub(crate) fn run_deploy(
         .mur_version
         .as_deref()
         .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let is_mur_cached = check_mur_binary_cached(mur_binary_arg, mur_version, target_platform, &home);
+    let is_mur_cached =
+        check_mur_binary_cached(mur_binary_arg, mur_version, target_platform, &home);
     let is_mur_explicit = mur_binary_arg.is_some();
 
     // ── Progress styles ───────────────────────────────────────────────────────
@@ -792,17 +860,14 @@ pub(crate) fn run_deploy(
     let tick_chars = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", " "];
 
     // Level-1 styles (main steps, 2-space indent)
-    let pending_style = ProgressStyle::with_template("  {msg}")
-        .expect("valid pending style");
+    let pending_style = ProgressStyle::with_template("  {msg}").expect("valid pending style");
     let spinner_style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
         .expect("valid spinner style")
         .tick_strings(tick_chars);
-    let done_style = ProgressStyle::with_template("  {msg}")
-        .expect("valid done style");
+    let done_style = ProgressStyle::with_template("  {msg}").expect("valid done style");
 
     // Level-2 styles (sub-items, 6-space indent for visual hierarchy)
-    let pending_l2 = ProgressStyle::with_template("      {msg}")
-        .expect("valid l2 pending style");
+    let pending_l2 = ProgressStyle::with_template("      {msg}").expect("valid l2 pending style");
     let spinner_l2 = ProgressStyle::with_template("      {spinner:.cyan} {msg}")
         .expect("valid l2 spinner style")
         .tick_strings(tick_chars);
@@ -819,8 +884,7 @@ pub(crate) fn run_deploy(
     .expect("valid l1 download style")
     .tick_strings(tick_chars)
     .progress_chars("█▒░");
-    let done_l2 = ProgressStyle::with_template("      {msg}")
-        .expect("valid l2 done style");
+    let done_l2 = ProgressStyle::with_template("      {msg}").expect("valid l2 done style");
 
     // ── Create ALL spinners upfront (pending) ─────────────────────────────────
     // Two-level hierarchy:
@@ -831,7 +895,7 @@ pub(crate) fn run_deploy(
     // steps even while downloads are running.
 
     let n_arts = artifact_refs.len();
-    let s = |n: usize| if n == 1 { "" } else { "s" };  // plural suffix
+    let s = |n: usize| if n == 1 { "" } else { "s" }; // plural suffix
 
     // ─ Download group ─────────────────────────────────────────────────────────
     let cached_count_pre = cached_flags.iter().filter(|&&c| c).count();
@@ -844,40 +908,91 @@ pub(crate) fn run_deploy(
         format!("  {}↓  {} cached", fetch_count_pre, cached_count_pre)
     };
     let dl_header_pb: Option<ProgressBar> = if n_arts > 0 {
-        Some(add_pending(&multi, &pending_style,
-            format!("{} ↓ {} artifact{}{}", style("·").dim(), n_arts, s(n_arts), style(&dl_hint).dim())))
-    } else { None };
+        Some(add_pending(
+            &multi,
+            &pending_style,
+            format!(
+                "{} ↓ {} artifact{}{}",
+                style("·").dim(),
+                n_arts,
+                s(n_arts),
+                style(&dl_hint).dim()
+            ),
+        ))
+    } else {
+        None
+    };
 
-    let dl_spinners: Vec<ProgressBar> = artifact_refs.iter().map(|(name, version)|
-        add_pending(&multi, &pending_l2, format!("{} ↓ {name}@{version}", style("·").dim()))
-    ).collect();
+    let dl_spinners: Vec<ProgressBar> = artifact_refs
+        .iter()
+        .map(|(name, version)| {
+            add_pending(
+                &multi,
+                &pending_l2,
+                format!("{} ↓ {name}@{version}", style("·").dim()),
+            )
+        })
+        .collect();
 
     // ─ Single step spinners ───────────────────────────────────────────────────
-    let mur_bin_pb = add_pending(&multi, &pending_style,
-        if is_mur_explicit { format!("{} ↑ mur binary", style("·").dim()) }
-        else               { format!("{} ↓ mur v{mur_version}", style("·").dim()) });
-    let ssh_pb     = add_pending(&multi, &pending_style, format!("{} SSH", style("·").dim()));
-    let binary_pb  = add_pending(&multi, &pending_style, format!("{} ↑ mur binary", style("·").dim()));
-    let files_pb   = add_pending(&multi, &pending_style, format!("{} ↑ files", style("·").dim()));
+    let mur_bin_pb = add_pending(
+        &multi,
+        &pending_style,
+        if is_mur_explicit {
+            format!("{} ↑ mur binary", style("·").dim())
+        } else {
+            format!("{} ↓ mur v{mur_version}", style("·").dim())
+        },
+    );
+    let ssh_pb = add_pending(&multi, &pending_style, format!("{} SSH", style("·").dim()));
+    let binary_pb = add_pending(
+        &multi,
+        &pending_style,
+        format!("{} ↑ mur binary", style("·").dim()),
+    );
+    let files_pb = add_pending(
+        &multi,
+        &pending_style,
+        format!("{} ↑ files", style("·").dim()),
+    );
 
     // ─ Upload group ───────────────────────────────────────────────────────────
     let ul_header_pb: Option<ProgressBar> = if n_arts > 0 {
-        Some(add_pending(&multi, &pending_style,
-            format!("{} ↑ {} artifact{}", style("·").dim(), n_arts, s(n_arts))))
-    } else { None };
+        Some(add_pending(
+            &multi,
+            &pending_style,
+            format!("{} ↑ {} artifact{}", style("·").dim(), n_arts, s(n_arts)),
+        ))
+    } else {
+        None
+    };
 
-    let ul_spinners: Vec<ProgressBar> = artifact_refs.iter().map(|(name, version)|
-        add_pending(&multi, &pending_l2, format!("{} ↑ {name}@{version}", style("·").dim()))
-    ).collect();
+    let ul_spinners: Vec<ProgressBar> = artifact_refs
+        .iter()
+        .map(|(name, version)| {
+            add_pending(
+                &multi,
+                &pending_l2,
+                format!("{} ↑ {name}@{version}", style("·").dim()),
+            )
+        })
+        .collect();
 
     // ─ Start capsule ─────────────────────────────────────────────────────────
-    let start_pb = add_pending(&multi, &pending_style, format!("{} → start capsule", style("·").dim()));
+    let start_pb = add_pending(
+        &multi,
+        &pending_style,
+        format!("{} → start capsule", style("·").dim()),
+    );
 
     // ── 1. Parallel artifact downloads ───────────────────────────────────────
     // Activate the download group header.
     if let Some(ref pb) = dl_header_pb {
-        activate_step(pb, &spinner_style,
-            format!("↓ {} artifact{}", n_arts, s(n_arts)));
+        activate_step(
+            pb,
+            &spinner_style,
+            format!("↓ {} artifact{}", n_arts, s(n_arts)),
+        );
     }
 
     // LocalRegistry and SourceChain are Send + Sync; rayon par_iter collects
@@ -907,13 +1022,23 @@ pub(crate) fn run_deploy(
 
             match &result {
                 Ok(sa) => {
-                    let info = if is_cached { "cached".to_string() } else { format_bytes(sa.bytes.len() as u64) };
-                    finish_step(pb, &done_l2,
-                        format!("{} ↓ {name}@{version}  {info}", style("✓").green().bold()));
+                    let info = if is_cached {
+                        "cached".to_string()
+                    } else {
+                        format_bytes(sa.bytes.len() as u64)
+                    };
+                    finish_step(
+                        pb,
+                        &done_l2,
+                        format!("{} ↓ {name}@{version}  {info}", style("✓").green().bold()),
+                    );
                 }
                 Err(_) => {
-                    abandon_step(pb, &done_l2,
-                        format!("{} ↓ {name}@{version}  failed", style("✗").red().bold()));
+                    abandon_step(
+                        pb,
+                        &done_l2,
+                        format!("{} ↓ {name}@{version}  failed", style("✗").red().bold()),
+                    );
                 }
             }
             result
@@ -921,23 +1046,41 @@ pub(crate) fn run_deploy(
         .collect();
 
     // Collapse level-2 download bars, then finish the group header with summary.
-    for pb in &dl_spinners { multi.remove(pb); }
+    for pb in &dl_spinners {
+        multi.remove(pb);
+    }
 
     let staged: Vec<StagedArtifact> = match dl_raw.into_iter().collect::<Result<Vec<_>, _>>() {
         Ok(staged) => {
             if let Some(ref pb) = dl_header_pb {
-                let fetched_bytes: u64 = staged.iter().zip(cached_flags.iter())
+                let fetched_bytes: u64 = staged
+                    .iter()
+                    .zip(cached_flags.iter())
                     .filter(|(_, &c)| !c)
                     .map(|(sa, _)| sa.bytes.len() as u64)
                     .sum();
                 let cached_n = cached_flags.iter().filter(|&&c| c).count();
                 let summary = if cached_n == n_arts {
-                    format!("{} ↓ {} artifact{}  all cached",
-                        style("✓").green().bold(), n_arts, s(n_arts))
+                    format!(
+                        "{} ↓ {} artifact{}  all cached",
+                        style("✓").green().bold(),
+                        n_arts,
+                        s(n_arts)
+                    )
                 } else {
-                    let note = if cached_n > 0 { format!("  {} cached", cached_n) } else { String::new() };
-                    format!("{} ↓ {} artifact{}  {}{}",
-                        style("✓").green().bold(), n_arts, s(n_arts), format_bytes(fetched_bytes), note)
+                    let note = if cached_n > 0 {
+                        format!("  {} cached", cached_n)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{} ↓ {} artifact{}  {}{}",
+                        style("✓").green().bold(),
+                        n_arts,
+                        s(n_arts),
+                        format_bytes(fetched_bytes),
+                        note
+                    )
                 };
                 finish_step(pb, &done_style, summary);
             }
@@ -945,7 +1088,11 @@ pub(crate) fn run_deploy(
         }
         Err(e) => {
             if let Some(ref pb) = dl_header_pb {
-                abandon_step(pb, &done_style, format!("{} ↓ artifacts  failed", style("✗").red().bold()));
+                abandon_step(
+                    pb,
+                    &done_style,
+                    format!("{} ↓ artifacts  failed", style("✗").red().bold()),
+                );
             }
             return Err(e);
         }
@@ -962,7 +1109,11 @@ pub(crate) fn run_deploy(
         )?;
         let done_label = if is_mur_explicit {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            format!("{} ↑ mur binary  {}  (explicit)", style("✓").green().bold(), format_bytes(size))
+            format!(
+                "{} ↑ mur binary  {}  (explicit)",
+                style("✓").green().bold(),
+                format_bytes(size)
+            )
         } else {
             format!("{} ↓ mur v{mur_version}  cached", style("✓").green().bold())
         };
@@ -984,7 +1135,11 @@ pub(crate) fn run_deploy(
         finish_step(
             &mur_bin_pb,
             &done_style,
-            format!("{} ↓ mur v{mur_version}  {}", style("✓").green().bold(), format_bytes(size)),
+            format!(
+                "{} ↓ mur v{mur_version}  {}",
+                style("✓").green().bold(),
+                format_bytes(size)
+            ),
         );
         path
     };
@@ -992,14 +1147,20 @@ pub(crate) fn run_deploy(
     // ── 3. Wait for SSH ───────────────────────────────────────────────────────
     activate_step(&ssh_pb, &spinner_style, "SSH  connecting...");
     wait_for_ssh(host, key_ref, ssh_user, Duration::from_secs(30))?;
-    finish_step(&ssh_pb, &done_style, format!("{} SSH  ready", style("✓").green().bold()));
+    finish_step(
+        &ssh_pb,
+        &done_style,
+        format!("{} SSH  ready", style("✓").green().bold()),
+    );
     multi.remove(&ssh_pb); // collapse SSH once ready — next step appears in its place
 
     // ── 4. Upload mur binary ──────────────────────────────────────────────────
     // Upload to /tmp first; then move into /usr/local/bin.
     // Direct scp to /usr/local/bin/mur fails on some VPS with "dest open: Failure"
     // because SFTP-mode scp has restricted access to system dirs even as root.
-    let binary_size = std::fs::metadata(&local_mur_binary).map(|m| m.len()).unwrap_or(0);
+    let binary_size = std::fs::metadata(&local_mur_binary)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
     // Level-1 upload bar with fake ticker (same pattern as artifact uploads).
     binary_pb.set_style(download_l1.clone());
@@ -1014,14 +1175,25 @@ pub(crate) fn run_deploy(
         let chunk = (target / 50).max(1024);
         loop {
             std::thread::sleep(Duration::from_millis(200));
-            if !bin_running2.load(Ordering::Relaxed) { break; }
+            if !bin_running2.load(Ordering::Relaxed) {
+                break;
+            }
             let pos = bin_pb_tick.position();
-            if pos < target { bin_pb_tick.set_position((pos + chunk).min(target)); }
+            if pos < target {
+                bin_pb_tick.set_position((pos + chunk).min(target));
+            }
         }
     });
 
     let bin_result = (|| -> Result<(), CliError> {
-        scp_upload(host, key_ref, ssh_user, &local_mur_binary.to_string_lossy(), "/tmp/mur-upload", false)?;
+        scp_upload(
+            host,
+            key_ref,
+            ssh_user,
+            &local_mur_binary.to_string_lossy(),
+            "/tmp/mur-upload",
+            false,
+        )?;
         ssh_exec(host, key_ref, ssh_user,
             "mkdir -p /usr/local/bin && mv /tmp/mur-upload /usr/local/bin/mur && chmod +x /usr/local/bin/mur")?;
         Ok(())
@@ -1033,19 +1205,34 @@ pub(crate) fn run_deploy(
     match bin_result {
         Ok(()) => {
             binary_pb.set_position(binary_size);
-            finish_step(&binary_pb, &done_style,
-                format!("{} ↑ mur binary  {}", style("✓").green().bold(), format_bytes(binary_size)));
+            finish_step(
+                &binary_pb,
+                &done_style,
+                format!(
+                    "{} ↑ mur binary  {}",
+                    style("✓").green().bold(),
+                    format_bytes(binary_size)
+                ),
+            );
         }
         Err(e) => {
-            abandon_step(&binary_pb, &done_style,
-                format!("{} ↑ mur binary  failed", style("✗").red().bold()));
+            abandon_step(
+                &binary_pb,
+                &done_style,
+                format!("{} ↑ mur binary  failed", style("✗").red().bold()),
+            );
             return Err(e);
         }
     }
 
     // ── 5. Upload capsule manifest and workdir ────────────────────────────────
     let remote_deploy_dir = format!("/root/mur-{short_id}");
-    ssh_exec(host, key_ref, ssh_user, &format!("mkdir -p {remote_deploy_dir}"))?;
+    ssh_exec(
+        host,
+        key_ref,
+        ssh_user,
+        &format!("mkdir -p {remote_deploy_dir}"),
+    )?;
 
     let manifest_filename = manifest_path
         .file_name()
@@ -1053,9 +1240,20 @@ pub(crate) fn run_deploy(
         .unwrap_or(MANIFEST_FILENAME);
     let remote_manifest = format!("{remote_deploy_dir}/{manifest_filename}");
 
-    activate_step(&files_pb, &spinner_style, format!("↑ {manifest_filename}  uploading..."));
+    activate_step(
+        &files_pb,
+        &spinner_style,
+        format!("↑ {manifest_filename}  uploading..."),
+    );
 
-    scp_upload(host, key_ref, ssh_user, &manifest_path.to_string_lossy(), &remote_manifest, false)?;
+    scp_upload(
+        host,
+        key_ref,
+        ssh_user,
+        &manifest_path.to_string_lossy(),
+        &remote_manifest,
+        false,
+    )?;
 
     for (local_path, remote_name) in &manifest_files {
         scp_upload(
@@ -1086,7 +1284,11 @@ pub(crate) fn run_deploy(
     finish_step(
         &files_pb,
         &done_style,
-        format!("{} ↑ {}", style("✓").green().bold(), capsule_file_names.join(" · ")),
+        format!(
+            "{} ↑ {}",
+            style("✓").green().bold(),
+            capsule_file_names.join(" · ")
+        ),
     );
 
     // ── 6. Upload pre-staged artifacts (parallel) ─────────────────────────────
@@ -1094,8 +1296,11 @@ pub(crate) fn run_deploy(
     // the level-2 bars when all uploads finish, leaving only the header summary.
     if !staged.is_empty() {
         if let Some(ref pb) = ul_header_pb {
-            activate_step(pb, &spinner_style,
-                format!("↑ {} artifact{}", staged.len(), s(staged.len())));
+            activate_step(
+                pb,
+                &spinner_style,
+                format!("↑ {} artifact{}", staged.len(), s(staged.len())),
+            );
         }
 
         // Write all staging files to disk first (fast, sequential).
@@ -1103,8 +1308,13 @@ pub(crate) fn run_deploy(
             let stem = format!("{}-{}", artifact.name, artifact.version);
             std::fs::write(staging_dir.join(format!("{stem}.mur.zip")), &artifact.bytes)
                 .map_err(|e| CliError::new(E_IO_003, format!("staging {}: {e}", artifact.name)))?;
-            std::fs::write(staging_dir.join(format!("{stem}.sha256")), artifact.sha256.as_bytes())
-                .map_err(|e| CliError::new(E_IO_003, format!("staging sha256 {}: {e}", artifact.name)))?;
+            std::fs::write(
+                staging_dir.join(format!("{stem}.sha256")),
+                artifact.sha256.as_bytes(),
+            )
+            .map_err(|e| {
+                CliError::new(E_IO_003, format!("staging sha256 {}: {e}", artifact.name))
+            })?;
         }
 
         // Parallel scp uploads — each artifact drives its own level-2 progress bar.
@@ -1133,7 +1343,9 @@ pub(crate) fn run_deploy(
                     let chunk = (target / 50).max(1024); // ~50 ticks × 200ms = 10s to reach target
                     loop {
                         std::thread::sleep(Duration::from_millis(200));
-                        if !running2.load(Ordering::Relaxed) { break; }
+                        if !running2.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let pos = pb_tick.position();
                         if pos < target {
                             pb_tick.set_position((pos + chunk).min(target));
@@ -1145,12 +1357,27 @@ pub(crate) fn run_deploy(
                     let stem = format!("{}-{}", artifact.name, artifact.version);
                     let staged_zip = staging_dir.join(format!("{stem}.mur.zip"));
                     let staged_sha = staging_dir.join(format!("{stem}.sha256"));
-                    let remote_dir = format!("/root/.murmur/artifacts/{}/{}", artifact.name, artifact.version);
+                    let remote_dir = format!(
+                        "/root/.murmur/artifacts/{}/{}",
+                        artifact.name, artifact.version
+                    );
                     ssh_exec(host, key_ref, ssh_user, &format!("mkdir -p {remote_dir}"))?;
-                    scp_upload(host, key_ref, ssh_user, &staged_zip.to_string_lossy(),
-                        &format!("{remote_dir}/{stem}.mur.zip"), false)?;
-                    scp_upload(host, key_ref, ssh_user, &staged_sha.to_string_lossy(),
-                        &format!("{remote_dir}/{stem}.sha256"), false)?;
+                    scp_upload(
+                        host,
+                        key_ref,
+                        ssh_user,
+                        &staged_zip.to_string_lossy(),
+                        &format!("{remote_dir}/{stem}.mur.zip"),
+                        false,
+                    )?;
+                    scp_upload(
+                        host,
+                        key_ref,
+                        ssh_user,
+                        &staged_sha.to_string_lossy(),
+                        &format!("{remote_dir}/{stem}.sha256"),
+                        false,
+                    )?;
                     Ok(())
                 })();
 
@@ -1161,15 +1388,30 @@ pub(crate) fn run_deploy(
                 match result {
                     Ok(()) => {
                         pb.set_position(size); // fill bar to 100%
-                        finish_step(pb, &done_l2,
-                            format!("{} ↑ {}@{}  {}",
-                                style("✓").green().bold(), artifact.name, artifact.version, format_bytes(size)));
+                        finish_step(
+                            pb,
+                            &done_l2,
+                            format!(
+                                "{} ↑ {}@{}  {}",
+                                style("✓").green().bold(),
+                                artifact.name,
+                                artifact.version,
+                                format_bytes(size)
+                            ),
+                        );
                         Ok(size)
                     }
                     Err(e) => {
-                        abandon_step(pb, &done_l2,
-                            format!("{} ↑ {}@{}  failed",
-                                style("✗").red().bold(), artifact.name, artifact.version));
+                        abandon_step(
+                            pb,
+                            &done_l2,
+                            format!(
+                                "{} ↑ {}@{}  failed",
+                                style("✗").red().bold(),
+                                artifact.name,
+                                artifact.version
+                            ),
+                        );
                         Err(e)
                     }
                 }
@@ -1177,21 +1419,34 @@ pub(crate) fn run_deploy(
             .collect();
 
         // Collapse level-2 upload bars regardless of success/failure.
-        for pb in &ul_spinners { multi.remove(pb); }
+        for pb in &ul_spinners {
+            multi.remove(pb);
+        }
 
         match ul_raw.into_iter().collect::<Result<Vec<u64>, _>>() {
             Ok(sizes) => {
                 if let Some(ref pb) = ul_header_pb {
                     let total: u64 = sizes.iter().sum();
-                    finish_step(pb, &done_style,
-                        format!("{} ↑ {} artifact{}  {}",
-                            style("✓").green().bold(), staged.len(), s(staged.len()), format_bytes(total)));
+                    finish_step(
+                        pb,
+                        &done_style,
+                        format!(
+                            "{} ↑ {} artifact{}  {}",
+                            style("✓").green().bold(),
+                            staged.len(),
+                            s(staged.len()),
+                            format_bytes(total)
+                        ),
+                    );
                 }
             }
             Err(e) => {
                 if let Some(ref pb) = ul_header_pb {
-                    abandon_step(pb, &done_style,
-                        format!("{} ↑ artifacts  upload failed", style("✗").red().bold()));
+                    abandon_step(
+                        pb,
+                        &done_style,
+                        format!("{} ↑ artifacts  upload failed", style("✗").red().bold()),
+                    );
                 }
                 return Err(e);
             }
@@ -1219,9 +1474,13 @@ pub(crate) fn run_deploy(
     let json_line = raw_output.trim().to_string();
 
     if json_line.is_empty() {
-        let stderr =
-            ssh_exec(host, key_ref, ssh_user, "cat /tmp/mur-start.err 2>/dev/null || true")
-                .unwrap_or_default();
+        let stderr = ssh_exec(
+            host,
+            key_ref,
+            ssh_user,
+            "cat /tmp/mur-start.err 2>/dev/null || true",
+        )
+        .unwrap_or_default();
         let still_running = ssh_exec(
             host,
             key_ref,
@@ -1239,14 +1498,21 @@ pub(crate) fn run_deploy(
                 } else {
                     " (mur process has exited)"
                 },
-                if stderr.trim().is_empty() { "(empty)" } else { truncate(stderr.trim(), 500) }
+                if stderr.trim().is_empty() {
+                    "(empty)"
+                } else {
+                    truncate(stderr.trim(), 500)
+                }
             ),
         ));
     }
 
     // ── 9. Parse JSON and construct public URL ────────────────────────────────
     let start_info: serde_json::Value = serde_json::from_str(&json_line).map_err(|e| {
-        CliError::new(E_DEPLOY_004, format!("could not parse capsule startup JSON '{json_line}': {e}"))
+        CliError::new(
+            E_DEPLOY_004,
+            format!("could not parse capsule startup JSON '{json_line}': {e}"),
+        )
     })?;
 
     let url_field = start_info["url"]
@@ -1273,7 +1539,10 @@ pub(crate) fn run_deploy(
     finish_step(
         &start_pb,
         &done_style,
-        format!("{} → capsule  started · port {port}", style("✓").green().bold()),
+        format!(
+            "{} → capsule  started · port {port}",
+            style("✓").green().bold()
+        ),
     );
 
     // ── 10. Persist deployment record ─────────────────────────────────────────
@@ -1296,17 +1565,27 @@ pub(crate) fn run_deploy(
     let capsule_name = &runtime_manifest.name;
 
     // Build content lines; measure_text_width strips ANSI codes for accurate width.
-    let title = format!("{}  {}",
+    let title = format!(
+        "{}  {}",
         style("∞").green().bold(),
-        style(capsule_name).cyan().bold());
+        style(capsule_name).cyan().bold()
+    );
     let blank = String::new();
-    let row_url  = format!("{}  {}", style("url ").dim(), style(&public_url).underlined());
+    let row_url = format!(
+        "{}  {}",
+        style("url ").dim(),
+        style(&public_url).underlined()
+    );
     // Show "dep_" prefix + first 8 hex chars: "dep_01954a3b" (12 chars, self-describing)
-    let row_job  = format!("{}  {}", style("dep ").dim(), &deployment_id[..12]);
+    let row_job = format!("{}  {}", style("dep ").dim(), &deployment_id[..12]);
     let row_time = format!("{}  {}s", style("time").dim(), elapsed);
     let rows: &[&str] = &[&title, &blank, &row_url, &row_job, &row_time];
 
-    let max_vis = rows.iter().map(|l| measure_text_width(l)).max().unwrap_or(30);
+    let max_vis = rows
+        .iter()
+        .map(|l| measure_text_width(l))
+        .max()
+        .unwrap_or(30);
     let h_bar = "─".repeat(max_vis + 4); // 2-space padding each side
     multi.println(format!("\n  ┌{h_bar}┐"))?;
     for row in rows {
@@ -1357,7 +1636,10 @@ mod tests {
     #[test]
     fn start_script_uses_only_flags_mur_run_accepts() {
         let script = build_start_script("/root/mur-abc123", "/root/mur-abc123/murmur.yaml");
-        assert!(script.contains("mur run --manifest /root/mur-abc123/murmur.yaml"), "{script}");
+        assert!(
+            script.contains("mur run --manifest /root/mur-abc123/murmur.yaml"),
+            "{script}"
+        );
         assert!(script.contains("--workdir /root/mur-abc123"), "{script}");
         assert!(script.contains("--json"), "{script}");
     }
@@ -1399,13 +1681,14 @@ mod tests {
 
     #[test]
     fn collect_manifest_files_returns_empty_for_no_file_path_fields() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.1.0\nartifacts: []\n",
-        )
-        .unwrap();
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.1.0\nartifacts: []\n").unwrap();
         let dir = tempdir().unwrap();
         let files = collect_manifest_files(&manifest, dir.path()).unwrap();
-        assert!(files.is_empty(), "expected no files for a manifest with no file-path fields");
+        assert!(
+            files.is_empty(),
+            "expected no files for a manifest with no file-path fields"
+        );
     }
 
     #[test]
@@ -1414,12 +1697,11 @@ mod tests {
         let instructions = dir.path().join("instructions.md");
         fs::write(&instructions, "You are an assistant.").unwrap();
 
-        let yaml = format!(
-            "name: cap\nversion: 0.1.0\nartifacts: []\n\
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
              inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
              system_prompt_file: instructions.md\n  \
              driver:\n    artifact: murmur-driver-anthropic\n"
-        );
+            .to_string();
         let manifest = RuntimeManifest::from_yaml_str(&yaml).unwrap();
 
         let files = collect_manifest_files(&manifest, dir.path()).unwrap();
@@ -1481,7 +1763,9 @@ mod tests {
         let err = collect_manifest_files(&manifest, dir.path()).unwrap_err();
         assert!(
             err.message.contains("compaction-instructions.md")
-                && err.message.contains("inference.compaction.system_prompt_file"),
+                && err
+                    .message
+                    .contains("inference.compaction.system_prompt_file"),
             "error should name the field and the missing path, got: {}",
             err.message
         );
@@ -1516,8 +1800,7 @@ mod tests {
         fs::write(&binary, b"fake-binary").unwrap();
 
         let result =
-            resolve_mur_binary_impl(Some(&binary), None, "linux-x86_64", dir.path(), None)
-                .unwrap();
+            resolve_mur_binary_impl(Some(&binary), None, "linux-x86_64", dir.path(), None).unwrap();
         assert_eq!(result, binary);
     }
 
@@ -1526,9 +1809,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("nonexistent-mur");
 
-        let err =
-            resolve_mur_binary_impl(Some(&missing), None, "linux-x86_64", dir.path(), None)
-                .unwrap_err();
+        let err = resolve_mur_binary_impl(Some(&missing), None, "linux-x86_64", dir.path(), None)
+            .unwrap_err();
         assert!(
             err.message.contains("--mur-binary not found"),
             "expected mur-binary-not-found error, got: {}",
@@ -1545,9 +1827,11 @@ mod tests {
         fs::write(&cached, b"fake-cached-binary").unwrap();
 
         let result =
-            resolve_mur_binary_impl(None, Some("0.4.5"), "linux-x86_64", dir.path(), None)
-                .unwrap();
-        assert_eq!(result, cached, "should return cached path for manifest version 0.4.5");
+            resolve_mur_binary_impl(None, Some("0.4.5"), "linux-x86_64", dir.path(), None).unwrap();
+        assert_eq!(
+            result, cached,
+            "should return cached path for manifest version 0.4.5"
+        );
     }
 
     #[test]
@@ -1559,9 +1843,11 @@ mod tests {
         let cached = cache_dir.join(format!("mur-{running_version}-linux-x86_64"));
         fs::write(&cached, b"fake-cached-binary").unwrap();
 
-        let result =
-            resolve_mur_binary_impl(None, None, "linux-x86_64", dir.path(), None).unwrap();
-        assert_eq!(result, cached, "should return cached path for running version");
+        let result = resolve_mur_binary_impl(None, None, "linux-x86_64", dir.path(), None).unwrap();
+        assert_eq!(
+            result, cached,
+            "should return cached path for running version"
+        );
     }
 
     // ─── staging path ─────────────────────────────────────────────────────────
@@ -1570,8 +1856,11 @@ mod tests {
     fn staging_path_uses_deployment_dir_with_clean_filename() {
         let home = tempdir().unwrap();
         let deployment_id = "abc123-test-deployment-id";
-        let staging_dir =
-            home.path().join(".murmur").join("deploy_staging").join(deployment_id);
+        let staging_dir = home
+            .path()
+            .join(".murmur")
+            .join("deploy_staging")
+            .join(deployment_id);
 
         let stem = "murmur-driver-openai-0.3.33";
         let zip_path = staging_dir.join(format!("{stem}.mur.zip"));
@@ -1582,8 +1871,14 @@ mod tests {
 
         assert_eq!(zip_name, "murmur-driver-openai-0.3.33.mur.zip");
         assert_eq!(sha_name, "murmur-driver-openai-0.3.33.sha256");
-        assert!(!zip_name.contains(deployment_id), "filename must not contain deployment UUID: {zip_name}");
-        assert!(!sha_name.contains(deployment_id), "filename must not contain deployment UUID: {sha_name}");
+        assert!(
+            !zip_name.contains(deployment_id),
+            "filename must not contain deployment UUID: {zip_name}"
+        );
+        assert!(
+            !sha_name.contains(deployment_id),
+            "filename must not contain deployment UUID: {sha_name}"
+        );
     }
 
     #[test]
@@ -1598,19 +1893,25 @@ mod tests {
             let _guard = StagingGuard(staging_dir.clone());
         }
 
-        assert!(!staging_dir.exists(), "StagingGuard must remove the dir on drop");
+        assert!(
+            !staging_dir.exists(),
+            "StagingGuard must remove the dir on drop"
+        );
     }
 
     // ─── parallel artifact resolution ─────────────────────────────────────────
 
     #[test]
     fn parallel_resolution_returns_all_six_artifacts() {
-        use std::io::Write;
-        use murmur_artifact::{ArtifactMeta, LocalRegistry, RuntimeType, sha256_hex};
-        use zip::{write::{FileOptions, SimpleFileOptions}, CompressionMethod, ZipWriter};
-        use crate::source::{ArtifactSource, SourceChain, SourceError};
         use crate::config::SourceConfig;
+        use crate::source::{ArtifactSource, SourceChain, SourceError};
         use bytes::Bytes;
+        use murmur_artifact::{sha256_hex, ArtifactMeta, LocalRegistry, RuntimeType};
+        use std::io::Write;
+        use zip::{
+            write::{FileOptions, SimpleFileOptions},
+            CompressionMethod, ZipWriter,
+        };
 
         fn make_zip_bytes(name: &str, version: &str) -> Vec<u8> {
             let mut cursor = std::io::Cursor::new(Vec::new());
@@ -1628,7 +1929,9 @@ mod tests {
 
         struct NeverCalled;
         impl ArtifactSource for NeverCalled {
-            fn name(&self) -> &str { "never-called" }
+            fn name(&self) -> &str {
+                "never-called"
+            }
             fn resolve_bare(&self, _: &str) -> Result<(Bytes, String), SourceError> {
                 panic!("source chain must not be called when all artifacts are cached")
             }
@@ -1684,7 +1987,9 @@ mod tests {
         assert_eq!(staged.len(), 6, "all 6 artifacts must be returned");
         for artifact in &staged {
             assert!(
-                pairs.iter().any(|(n, v)| *n == artifact.name && *v == artifact.version),
+                pairs
+                    .iter()
+                    .any(|(n, v)| *n == artifact.name && *v == artifact.version),
                 "unexpected artifact in results: {}@{}",
                 artifact.name,
                 artifact.version
@@ -1716,7 +2021,11 @@ mod tests {
     fn load_env_file_strips_export_prefix() {
         let dir = tempdir().unwrap();
         let file = dir.path().join(".env");
-        fs::write(&file, "export OPENAI_API_KEY=sk-xxx\nexport DB_URL=postgres://\n").unwrap();
+        fs::write(
+            &file,
+            "export OPENAI_API_KEY=sk-xxx\nexport DB_URL=postgres://\n",
+        )
+        .unwrap();
         let entries = load_env_file(&file).unwrap();
         assert_eq!(entries, vec!["OPENAI_API_KEY=sk-xxx", "DB_URL=postgres://"]);
     }
@@ -1744,14 +2053,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let binary = dir.path().join("mur");
         fs::write(&binary, b"fake").unwrap();
-        assert!(check_mur_binary_cached(Some(&binary), "0.4.9", "linux-x86_64", dir.path()));
+        assert!(check_mur_binary_cached(
+            Some(&binary),
+            "0.4.9",
+            "linux-x86_64",
+            dir.path()
+        ));
     }
 
     #[test]
     fn check_mur_binary_cached_returns_false_for_missing_explicit_path() {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("no-mur");
-        assert!(!check_mur_binary_cached(Some(&missing), "0.4.9", "linux-x86_64", dir.path()));
+        assert!(!check_mur_binary_cached(
+            Some(&missing),
+            "0.4.9",
+            "linux-x86_64",
+            dir.path()
+        ));
     }
 
     #[test]
@@ -1760,13 +2079,23 @@ mod tests {
         let bin_dir = dir.path().join(".murmur").join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join("mur-0.4.9-linux-x86_64"), b"fake").unwrap();
-        assert!(check_mur_binary_cached(None, "0.4.9", "linux-x86_64", dir.path()));
+        assert!(check_mur_binary_cached(
+            None,
+            "0.4.9",
+            "linux-x86_64",
+            dir.path()
+        ));
     }
 
     #[test]
     fn check_mur_binary_cached_returns_false_for_uncached_version() {
         let dir = tempdir().unwrap();
-        assert!(!check_mur_binary_cached(None, "0.4.9", "linux-x86_64", dir.path()));
+        assert!(!check_mur_binary_cached(
+            None,
+            "0.4.9",
+            "linux-x86_64",
+            dir.path()
+        ));
     }
 
     // ─── remote deploy dir name ───────────────────────────────────────────────
@@ -1779,10 +2108,15 @@ mod tests {
         let short_id: String = deployment_id[4..].chars().take(6).collect();
         assert_eq!(short_id, "018f4b");
         assert_eq!(short_id.len(), 6);
-        assert!(short_id.chars().all(|c| c.is_ascii_alphanumeric() && (c.is_ascii_lowercase() || c.is_ascii_digit())));
+        assert!(short_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() && (c.is_ascii_lowercase() || c.is_ascii_digit())));
         let remote_dir = format!("/root/mur-{short_id}");
         assert_eq!(remote_dir, "/root/mur-018f4b");
-        assert!(!remote_dir.contains("deploy"), "dir must not contain 'deploy': {remote_dir}");
+        assert!(
+            !remote_dir.contains("deploy"),
+            "dir must not contain 'deploy': {remote_dir}"
+        );
     }
 
     // ─── scp stderr capture ───────────────────────────────────────────────────
@@ -1858,7 +2192,7 @@ mod tests {
             source::{ArtifactSource, SourceChain, SourceError},
         };
 
-        use super::super::{ensure_artifact_for_deploy, StagedArtifact};
+        use super::super::ensure_artifact_for_deploy;
         use murmur_artifact::sha256_hex;
 
         fn make_zip(name: &str, version: &str) -> Vec<u8> {
@@ -1967,7 +2301,9 @@ mod tests {
 
             fn resolve_bare(&self, _name: &str) -> Result<(Bytes, String), SourceError> {
                 self.called.store(true, Ordering::SeqCst);
-                self.result.clone().map(|v| (Bytes::from(v), "0.0.0".to_string()))
+                self.result
+                    .clone()
+                    .map(|v| (Bytes::from(v), "0.0.0".to_string()))
             }
 
             fn resolve_bare_with_version_for_platform(
@@ -1984,7 +2320,10 @@ mod tests {
         fn mock_chain(result: Result<Vec<u8>, SourceError>) -> (SourceChain, Arc<AtomicBool>) {
             let called = Arc::new(AtomicBool::new(false));
             let chain = SourceChain::from_sources_for_test(
-                vec![Box::new(MockSource { result, called: called.clone() })],
+                vec![Box::new(MockSource {
+                    result,
+                    called: called.clone(),
+                })],
                 Vec::<SourceConfig>::new(),
             );
             (chain, called)
@@ -1997,8 +2336,9 @@ mod tests {
             let bytes = make_zip("my-tool", "1.0.0");
             store_wasm(&registry, "my-tool", "1.0.0", &bytes);
 
-            let (chain, called) =
-                mock_chain(Err(SourceError::NotFound("should not be called".to_string())));
+            let (chain, called) = mock_chain(Err(SourceError::NotFound(
+                "should not be called".to_string(),
+            )));
 
             let staged =
                 ensure_artifact_for_deploy("my-tool", "1.0.0", "linux-x86_64", &registry, &chain)
@@ -2059,8 +2399,7 @@ mod tests {
                 "chain must be called to fetch the linux variant"
             );
 
-            let cached =
-                registry.artifact_path_for_platform("my-tool", "1.0.0", "linux-x86_64");
+            let cached = registry.artifact_path_for_platform("my-tool", "1.0.0", "linux-x86_64");
             assert!(cached.exists(), "linux binary should be cached locally");
         }
 
@@ -2072,13 +2411,13 @@ mod tests {
             let bytes = b"native-binary";
             store_native_at_generic_path(&registry, "my-tool", "1.0.0", bytes);
 
-            let (chain, called) =
-                mock_chain(Err(SourceError::NotFound("should not be called".to_string())));
+            let (chain, called) = mock_chain(Err(SourceError::NotFound(
+                "should not be called".to_string(),
+            )));
 
             let target = current_platform();
             let staged =
-                ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain)
-                    .unwrap();
+                ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain).unwrap();
 
             assert_eq!(&staged.bytes[..], bytes);
             assert!(
@@ -2094,9 +2433,14 @@ mod tests {
 
             let (chain, _) = mock_chain(Err(SourceError::NotFound("404".to_string())));
 
-            let err =
-                ensure_artifact_for_deploy("missing-tool", "9.9.9", "linux-x86_64", &registry, &chain)
-                    .unwrap_err();
+            let err = ensure_artifact_for_deploy(
+                "missing-tool",
+                "9.9.9",
+                "linux-x86_64",
+                &registry,
+                &chain,
+            )
+            .unwrap_err();
 
             assert!(
                 err.message.contains("missing-tool"),

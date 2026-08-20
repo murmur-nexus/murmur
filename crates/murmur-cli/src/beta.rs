@@ -16,6 +16,11 @@ pub struct BetaFeature {
 ///     description: "Blueprint file support in taskflow stage slots (Fleet v1.1 preview)",
 /// });
 /// ```
+// Each entry below is `#[cfg]`-gated on its own feature, so the list cannot be written as a
+// `vec![]` literal; with every feature enabled at once clippy sees only the resulting run of
+// unconditional pushes. The push-per-feature shape is also what this module's doc comment tells
+// the next author to follow when registering a beta feature.
+#[allow(clippy::vec_init_then_push)]
 pub fn compiled_beta_features() -> Vec<BetaFeature> {
     #[allow(unused_mut)]
     let mut features: Vec<BetaFeature> = Vec::new();

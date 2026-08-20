@@ -82,10 +82,16 @@ fn resolve_index_url() -> Result<String, CliError> {
 
 fn read_local_file(path: &str) -> Result<Vec<ArtifactIndexEntry>, CliError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to read artifact index from {path}: {e}"))
+        CliError::new(
+            E_IO_003,
+            format!("failed to read artifact index from {path}: {e}"),
+        )
     })?;
     let index: ArtifactIndex = serde_json::from_str(&raw).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to parse artifact index from {path}: {e}"))
+        CliError::new(
+            E_IO_003,
+            format!("failed to parse artifact index from {path}: {e}"),
+        )
     })?;
     if index.schema_version != "1" {
         return Err(CliError::new(
@@ -206,10 +212,7 @@ fn print_results(entries: &[&ArtifactIndexEntry]) {
     println!("{H_NAME:<nw$}  {H_VERSION:<vw$}  {H_RUNTIME:<rw$}  {H_DESC}");
 
     for entry in entries {
-        let desc = entry
-            .description
-            .as_deref()
-            .unwrap_or("\u{2014}"); // em dash for missing
+        let desc = entry.description.as_deref().unwrap_or("\u{2014}"); // em dash for missing
         let name = &entry.name;
         let version = &entry.version;
         let runtime = &entry.runtime;

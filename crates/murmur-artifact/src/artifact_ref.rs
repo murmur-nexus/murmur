@@ -60,7 +60,6 @@ fn parse_github(rest: &str) -> Result<ArtifactRef, ArtifactRefError> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -107,11 +107,11 @@ impl ShellExecError {
     pub(crate) fn session_fatal(&self) -> Option<crate::errors::RuntimeError> {
         match self {
             Self::Failed(_) => None,
-            Self::SealedRootConstructionFailed { detail } => Some(
-                crate::errors::RuntimeError::SealedRootConstructionFailed {
+            Self::SealedRootConstructionFailed { detail } => {
+                Some(crate::errors::RuntimeError::SealedRootConstructionFailed {
                     detail: detail.clone(),
-                },
-            ),
+                })
+            }
         }
     }
 }
@@ -354,7 +354,10 @@ fn classify_resource_limit(
 ) -> Option<String> {
     use std::os::unix::process::ExitStatusExt;
 
-    if let Some(limit) = status.signal().and_then(crate::resources::limit_from_signal) {
+    if let Some(limit) = status
+        .signal()
+        .and_then(crate::resources::limit_from_signal)
+    {
         return Some(limit.to_string());
     }
 
@@ -889,8 +892,7 @@ mod tests {
     #[test]
     fn shell_tool_manifest_yaml_is_valid_yaml_for_interpreter() {
         let yaml = shell_tool_manifest_yaml("bash");
-        serde_yaml::from_str::<serde_yaml::Value>(&yaml)
-            .expect("bash manifest must be valid YAML");
+        serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("bash manifest must be valid YAML");
     }
 
     #[test]

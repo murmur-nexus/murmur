@@ -14,7 +14,9 @@ use murmur_artifact::{
 use rayon::prelude::*;
 
 use crate::{
-    config::{load_effective_mur_config, load_effective_mur_config_if_any_exists, resolve_registry},
+    config::{
+        load_effective_mur_config, load_effective_mur_config_if_any_exists, resolve_registry,
+    },
     error::{CliError, E_IO_001, E_IO_003, E_REG_001, E_REG_005},
     source::{SourceChain, SourceChainError},
 };
@@ -131,7 +133,10 @@ pub(crate) fn install_resolved(
     if let Some(lock_path) = lock_path {
         upsert_lock_entry(lock_path, &manifest.name, &installed_version, &sha256)?;
     }
-    println!("Installed {}@{} from {}", manifest.name, installed_version, resolved.source);
+    println!(
+        "Installed {}@{} from {}",
+        manifest.name, installed_version, resolved.source
+    );
     Ok(())
 }
 
@@ -153,7 +158,11 @@ const ALL_PLATFORMS: &[&str] = &["linux-x86_64", "darwin-aarch64"];
 
 // ─── spinner helpers (mirrors deploy.rs) ─────────────────────────────────────
 
-fn add_pending(multi: &MultiProgress, style: &ProgressStyle, msg: impl Into<String>) -> ProgressBar {
+fn add_pending(
+    multi: &MultiProgress,
+    style: &ProgressStyle,
+    msg: impl Into<String>,
+) -> ProgressBar {
     let pb = multi.add(ProgressBar::new_spinner());
     pb.set_style(style.clone());
     pb.set_message(msg.into());
@@ -209,7 +218,10 @@ pub(crate) fn run_install(
 /// Walk up from CWD to find the directory containing murmur.yaml.
 pub(crate) fn find_project_root() -> Result<PathBuf, CliError> {
     let cwd = std::env::current_dir().map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to determine current directory: {e}"))
+        CliError::new(
+            E_IO_003,
+            format!("failed to determine current directory: {e}"),
+        )
     })?;
     let mut current = cwd;
     loop {
@@ -240,7 +252,13 @@ fn determine_store(global: bool) -> Result<(LocalRegistry, Option<PathBuf>), Cli
         let project_root = find_project_root()?;
         let store_path = project_root.join(".murmur").join("artifacts");
         std::fs::create_dir_all(&store_path).map_err(|e| {
-            CliError::new(E_IO_003, format!("failed to create project store at {}: {e}", store_path.display()))
+            CliError::new(
+                E_IO_003,
+                format!(
+                    "failed to create project store at {}: {e}",
+                    store_path.display()
+                ),
+            )
         })?;
         Ok((LocalRegistry::new(store_path), Some(project_root)))
     }
@@ -259,8 +277,8 @@ fn install_single(
     if is_source_chain_ref(artifact_ref) {
         let config = load_effective_mur_config()?;
         let chain = SourceChain::from_config(&config);
-        let parsed = ArtifactRef::parse(artifact_ref)
-            .map_err(|e| CliError::new(E_IO_003, e.to_string()))?;
+        let parsed =
+            ArtifactRef::parse(artifact_ref).map_err(|e| CliError::new(E_IO_003, e.to_string()))?;
         let resolved_list = match &parsed {
             ArtifactRef::BareName(name) => vec![chain
                 .resolve_bare(name, None)
@@ -297,7 +315,11 @@ fn install_single(
             let source_chain = match load_effective_mur_config_if_any_exists()? {
                 Some(config) => {
                     let chain = SourceChain::from_config(&config);
-                    if chain.is_empty() { None } else { Some(chain) }
+                    if chain.is_empty() {
+                        None
+                    } else {
+                        Some(chain)
+                    }
                 }
                 None => None,
             };
@@ -339,9 +361,8 @@ fn install_manifest_deps(
     let lock_path = root.join("murmur.lock");
 
     let manifest_path = resolve_manifest_path(&root);
-    let runtime_manifest = load_runtime_manifest(&manifest_path).map_err(|err| {
-        CliError::new(E_IO_003, format!("failed to load manifest: {err:?}"))
-    })?;
+    let runtime_manifest = load_runtime_manifest(&manifest_path)
+        .map_err(|err| CliError::new(E_IO_003, format!("failed to load manifest: {err:?}")))?;
 
     // Collect only the artifacts we need to install (skip inline-source ones).
     let artifacts: Vec<_> = runtime_manifest
@@ -359,7 +380,11 @@ fn install_manifest_deps(
     let source_chain = match load_effective_mur_config_if_any_exists()? {
         Some(config) => {
             let chain = SourceChain::from_config(&config);
-            if chain.is_empty() { None } else { Some(chain) }
+            if chain.is_empty() {
+                None
+            } else {
+                Some(chain)
+            }
         }
         None => None,
     };
@@ -408,7 +433,13 @@ fn install_manifest_deps(
     let header_pb = add_pending(
         &multi,
         &pending_style,
-        format!("{} ↓ {} artifact{}{}", style("·").dim(), n, s(n), style(&dl_hint).dim()),
+        format!(
+            "{} ↓ {} artifact{}{}",
+            style("·").dim(),
+            n,
+            s(n),
+            style(&dl_hint).dim()
+        ),
     );
 
     let spinners: Vec<ProgressBar> = artifacts
@@ -423,7 +454,11 @@ fn install_manifest_deps(
         .collect();
 
     // ── Activate header, then parallel-install all artifacts ─────────────────
-    activate_step(&header_pb, &spinner_style, format!("↓ {} artifact{}", n, s(n)));
+    activate_step(
+        &header_pb,
+        &spinner_style,
+        format!("↓ {} artifact{}", n, s(n)),
+    );
 
     let results: Vec<Result<FetchOutcome, CliError>> = artifacts
         .par_iter()
@@ -680,13 +715,11 @@ fn fetch_and_store(
 }
 
 fn install_from_local_file(path_str: &str, store: &LocalRegistry) -> Result<(), CliError> {
-    let bytes = std::fs::read(path_str).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to read {path_str}: {e}"))
-    })?;
+    let bytes = std::fs::read(path_str)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to read {path_str}: {e}")))?;
 
-    let manifest = load_manifest_from_artifact_bytes(&bytes).map_err(|e| {
-        CliError::new(E_IO_003, format!("{path_str} is not a valid .mur.zip: {e}"))
-    })?;
+    let manifest = load_manifest_from_artifact_bytes(&bytes)
+        .map_err(|e| CliError::new(E_IO_003, format!("{path_str} is not a valid .mur.zip: {e}")))?;
 
     let sha256 = sha256_hex(&bytes);
     store
@@ -705,7 +738,10 @@ fn install_from_local_file(path_str: &str, store: &LocalRegistry) -> Result<(), 
         )
         .map_err(CliError::from)?;
 
-    println!("Installed {}@{} from {}", manifest.name, manifest.version, path_str);
+    println!(
+        "Installed {}@{} from {}",
+        manifest.name, manifest.version, path_str
+    );
     Ok(())
 }
 
@@ -746,11 +782,9 @@ fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError>
                 std::fs::write(&artifact_path, &bytes).map_err(|e| {
                     CliError::new(E_IO_003, format!("failed to write artifact: {e}"))
                 })?;
-                let sha256_path =
-                    artifact_dir.join(format!("{name}-{version}-{platform}.sha256"));
-                std::fs::write(&sha256_path, sha256.as_bytes()).map_err(|e| {
-                    CliError::new(E_IO_003, format!("failed to write sha256: {e}"))
-                })?;
+                let sha256_path = artifact_dir.join(format!("{name}-{version}-{platform}.sha256"));
+                std::fs::write(&sha256_path, sha256.as_bytes())
+                    .map_err(|e| CliError::new(E_IO_003, format!("failed to write sha256: {e}")))?;
                 println!(
                     "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{name}/{version}/{name}-{version}-{platform}.mur.zip"
                 );
@@ -781,7 +815,9 @@ fn source_chain_err_display(e: &SourceChainError) -> String {
 }
 
 fn is_local_path(s: &str) -> bool {
-    s.starts_with("./") || s.starts_with("../") || s.starts_with('/')
+    s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with('/')
         || (s.contains('/') && s.ends_with(".mur.zip"))
 }
 

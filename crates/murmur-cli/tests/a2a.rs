@@ -148,9 +148,8 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
 
 #[test]
 fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
-    if common::skip_without_host_support(
-        "a2a_message_send_starts_agent_loop_and_returns_submitted",
-    ) {
+    if common::skip_without_host_support("a2a_message_send_starts_agent_loop_and_returns_submitted")
+    {
         return;
     }
     let server = end_turn_server("A2A task complete");

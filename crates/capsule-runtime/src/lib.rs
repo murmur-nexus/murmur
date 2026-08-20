@@ -8,8 +8,8 @@ pub(crate) mod agent;
 pub mod artifact;
 pub mod bindings;
 pub(crate) mod cgroup;
-pub(crate) mod egress_proxy;
 pub mod containment;
+pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;
@@ -27,8 +27,8 @@ pub mod runtime;
 pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
-pub mod staged_runtime;
 pub(crate) mod shell;
+pub mod staged_runtime;
 pub(crate) mod streaming;
 pub(crate) mod trace;
 pub mod types;
@@ -50,13 +50,13 @@ pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the
 // same facade shape `check_staged_runtime_floor` has, without making the module's internals
 // (`shebang_interpreter_name`, the probe, the prefix helpers) part of any crate's API.
+pub use errors::{RuntimeError, UnreachableEntrypoint};
+pub use limits::ExecutionLimits;
+pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 pub use reachability::{
     check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
     ToolchainHelperWarning,
 };
-pub use errors::{RuntimeError, UnreachableEntrypoint};
-pub use limits::ExecutionLimits;
-pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 pub use resources::HostResourceLimits;
 pub use runtime::{
     launch_session, stage_session, warn_on_interpreter_runtime_grants, warn_on_workdir_exec,

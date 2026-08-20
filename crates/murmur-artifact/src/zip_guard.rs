@@ -237,8 +237,7 @@ mod tests {
         let bytes = archive_with_files(&[("murmur.yaml", b"name: demo\nversion: 0.1.0\n")]);
         let mut archive = ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
 
-        let content =
-            read_zip_entry_to_string_capped(&mut archive, "murmur.yaml", 1024).unwrap();
+        let content = read_zip_entry_to_string_capped(&mut archive, "murmur.yaml", 1024).unwrap();
         assert!(content.contains("name: demo"));
     }
 
