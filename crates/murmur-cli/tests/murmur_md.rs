@@ -148,6 +148,9 @@ fn murmur_md_written_after_staging() {
 /// Test 2: MURMUR.md reflects model name, context budget, and shell capabilities.
 #[test]
 fn murmur_md_reflects_capsule_config() {
+    if capsule_runtime::skip_without_egress_namespace("murmur_md_reflects_capsule_config") {
+        return;
+    }
     let home = TempDir::new().unwrap();
     let artifact_dir = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();

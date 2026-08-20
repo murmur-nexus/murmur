@@ -260,8 +260,7 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
     // Only the namespace half of the host check is asked here: the cgroup half is answered by the
     // delegated-scope retry, which can succeed on a host where this test harness's own cgroup
     // cannot delegate.
-    if let Some(blocker) = capsule_runtime::detect_egress_namespace_blocker() {
-        eprintln!("[SKIP-HOST] {test_name}: {}", blocker.reason());
+    if capsule_runtime::skip_without_egress_namespace(test_name) {
         return;
     }
 

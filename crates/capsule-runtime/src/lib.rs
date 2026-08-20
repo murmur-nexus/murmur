@@ -38,7 +38,8 @@ pub use containment::{
     detect_sealed_blocker, explain_scope, ScopeReport,
 };
 pub use network_namespace::{
-    check_egress_namespace, detect_egress_namespace_blocker, EgressNamespaceBlocker,
+    check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
+    EgressNamespaceBlocker,
 };
 pub use sealed::SealedBlocker;
 // `cgroup` is a private module, but the two test-support entry points below are consumed from

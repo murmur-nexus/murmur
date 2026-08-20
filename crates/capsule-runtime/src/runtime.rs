@@ -4770,6 +4770,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call() {
+        if crate::network_namespace::skip_without_egress_namespace("a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call") {
+            return;
+        }
         let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],

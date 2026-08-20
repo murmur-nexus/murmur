@@ -5777,6 +5777,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_allows_exec_within_shell_allowlist() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_allows_exec_within_shell_allowlist") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier == EnforcementTier::EnvironmentOnly {
             eprintln!(
@@ -5820,6 +5823,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_allows_nested_exec_of_second_allowlisted_binary() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_allows_nested_exec_of_second_allowlisted_binary") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier == EnforcementTier::EnvironmentOnly {
             eprintln!(
@@ -5867,6 +5873,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_denies_network_connect_outside_allowlist() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_denies_network_connect_outside_allowlist") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier == EnforcementTier::EnvironmentOnly {
             eprintln!(
@@ -5934,6 +5943,9 @@ mod linux_integration_tests {
     /// asserts only that the permitted path still functions.
     #[test]
     fn kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier == EnforcementTier::EnvironmentOnly {
             eprintln!(
@@ -6008,6 +6020,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_denies_filesystem_access_outside_workdir() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_denies_filesystem_access_outside_workdir") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier != EnforcementTier::KernelFull {
             eprintln!(
@@ -6057,6 +6072,9 @@ mod linux_integration_tests {
     #[test]
     fn kernel_full_runs_nontrivial_shell_allowlist_but_a_pass_here_does_not_prove_the_landlock_fix()
     {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_runs_nontrivial_shell_allowlist_but_a_pass_here_does_not_prove_the_landlock_fix") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier != EnforcementTier::KernelFull {
             eprintln!(
@@ -6118,6 +6136,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_denies_write_outside_workdir_but_a_pass_here_does_not_prove_the_landlock_fix") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier != EnforcementTier::KernelFull {
             eprintln!(
@@ -6199,6 +6220,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier != EnforcementTier::KernelFull {
             eprintln!(
@@ -6267,6 +6291,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent") {
+            return;
+        }
         let tier = detect_enforcement_tier();
         if tier != EnforcementTier::KernelFull {
             eprintln!(
@@ -6346,6 +6373,9 @@ mod linux_integration_tests {
     /// pinned in the enforcement literal, so only the ABI has to be real. Skips loudly elsewhere.
     #[test]
     fn kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it") {
+            return;
+        }
         let host_tier = detect_enforcement_tier();
         if !matches!(
             host_tier,
@@ -6445,6 +6475,9 @@ mod linux_integration_tests {
     /// Runs on any host with a usable Landlock ABI; skips loudly elsewhere.
     #[test]
     fn kernel_full_non_executable_file_grant_is_readable_and_survives_a_bad_list_dir_claim() {
+        if crate::network_namespace::skip_without_egress_namespace("kernel_full_non_executable_file_grant_is_readable_and_survives_a_bad_list_dir_claim") {
+            return;
+        }
         let host_tier = detect_enforcement_tier();
         if !matches!(
             host_tier,
@@ -6646,6 +6679,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_no_new_privs_failure_is_distinct_and_fails_closed() {
+        if crate::network_namespace::skip_without_egress_namespace("pre_exec_no_new_privs_failure_is_distinct_and_fails_closed") {
+            return;
+        }
         let error = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
         assert!(
             error.contains("no_new_privs"),
@@ -6659,6 +6695,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_landlock_failure_is_distinct_and_fails_closed() {
+        if crate::network_namespace::skip_without_egress_namespace("pre_exec_landlock_failure_is_distinct_and_fails_closed") {
+            return;
+        }
         let error = child_setup_failure_error(ForceLandlockFailureGuard::new);
         assert!(
             error.contains("landlock"),
@@ -6672,6 +6711,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_setup_failures_produce_pairwise_distinct_messages() {
+        if crate::network_namespace::skip_without_egress_namespace("pre_exec_setup_failures_produce_pairwise_distinct_messages") {
+            return;
+        }
         let workdir_msg = workdir_resolution_error();
         let no_new_privs_msg = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
         let landlock_msg = child_setup_failure_error(ForceLandlockFailureGuard::new);
@@ -6703,6 +6745,9 @@ mod linux_integration_tests {
     /// does with it) and `murmur-cli`'s error test covers the third (`E-RUN-014`).
     #[test]
     fn a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message() {
+        if crate::network_namespace::skip_without_egress_namespace("a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message") {
+            return;
+        }
         let error =
             child_setup_failure_typed(&sealed_test_enforcement(), ForceSealedRootFailureGuard::new);
 

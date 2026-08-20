@@ -891,11 +891,7 @@ pub fn cgroup_delegation_available() -> bool {
 /// the launch cannot reach different conclusions about the host. A containerised CI runner
 /// typically clears the first and fails the second.
 pub fn skip_without_host_support(test_name: &str) -> bool {
-    if let Some(blocker) = crate::network_namespace::detect_egress_namespace_blocker() {
-        eprintln!(
-            "[SKIP-HOST] {test_name}: {}",
-            blocker.reason()
-        );
+    if crate::network_namespace::skip_without_egress_namespace(test_name) {
         return true;
     }
     if !cgroup_delegation_available() {
