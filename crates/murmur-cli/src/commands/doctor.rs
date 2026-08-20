@@ -185,10 +185,9 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         .and_then(|caps| caps.spawn.as_ref())
         .is_some_and(|spawn| !spawn.allow.is_empty());
     let can_spawn_subprocess = shell_allows || spawn_allows;
-    if let Err(error) = check_egress_namespace(
-        can_spawn_subprocess,
-        detect_egress_namespace_blocker(),
-    ) {
+    if let Err(error) =
+        check_egress_namespace(can_spawn_subprocess, detect_egress_namespace_blocker())
+    {
         eprintln!(
             "[mur doctor] warning[{E_CAP_005}]: {error}\n  \
              `mur run` will refuse this capsule on this host until that is resolved. Nothing in \

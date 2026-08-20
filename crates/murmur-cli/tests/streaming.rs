@@ -47,7 +47,11 @@ fn end_turn_server(text: &str) -> common::ScriptedServer {
     .to_string()])
 }
 
-fn tool_then_end_turn_server(tool_name: &str, command: &str, final_text: &str) -> common::ScriptedServer {
+fn tool_then_end_turn_server(
+    tool_name: &str,
+    command: &str,
+    final_text: &str,
+) -> common::ScriptedServer {
     // Use the real Anthropic API format: "tool_use" stop_reason and "tool_use" block type.
     // The murmur-driver-anthropic translates these to the capsule runtime's "tool_call" format.
     common::ScriptedServer::start(vec![
@@ -164,11 +168,7 @@ struct SseEvent {
 
 /// Open a message/stream connection, optionally with Last-Event-ID, and collect all
 /// SSE events until a final=true event or timeout. Returns the collected events.
-fn collect_sse_events(
-    addr: &str,
-    last_event_id: Option<u64>,
-    timeout: Duration,
-) -> Vec<SseEvent> {
+fn collect_sse_events(addr: &str, last_event_id: Option<u64>, timeout: Duration) -> Vec<SseEvent> {
     let msg_id = format!(
         "stream_{}",
         std::time::SystemTime::now()
@@ -252,14 +252,17 @@ fn collect_sse_events(
             Ok(_) => {}
         }
 
-        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        let line = line
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string();
 
         if line.is_empty() {
             if !current_event_type.is_empty() && !current_data.is_empty() {
                 // Only stop on status events with final:true — text events with final:true
                 // (cursor-removal / non-streaming fallback) are NOT terminal.
-                let is_terminal = current_event_type == "status"
-                    && current_data.contains("\"final\":true");
+                let is_terminal =
+                    current_event_type == "status" && current_data.contains("\"final\":true");
                 events.push(SseEvent {
                     id: current_id,
                     event_type: current_event_type.clone(),
@@ -287,11 +290,8 @@ fn collect_sse_events(
 
 /// Make a blocking HTTP GET request and return the response body.
 fn http_get(addr: &str, path: &str) -> String {
-    let mut stream =
-        TcpStream::connect(addr).expect("should connect to agent-card server");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok();
+    let mut stream = TcpStream::connect(addr).expect("should connect to agent-card server");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let request = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\n\r\n");
     stream.write_all(request.as_bytes()).unwrap();
 
@@ -342,7 +342,10 @@ fn streaming_basic_events_received() {
 
     handle.join().expect("launch thread should not panic");
 
-    assert!(!events.is_empty(), "should have received SSE events; got none");
+    assert!(
+        !events.is_empty(),
+        "should have received SSE events; got none"
+    );
 
     let working_events: Vec<_> = events
         .iter()
@@ -417,9 +420,7 @@ fn streaming_tool_artifact_event() {
     let first_artifact = &artifact_events[0];
     let parsed: Value = serde_json::from_str(&first_artifact.data)
         .expect("artifact event data should be valid JSON");
-    let tool_name = parsed["artifact"]["tool_name"]
-        .as_str()
-        .unwrap_or("");
+    let tool_name = parsed["artifact"]["tool_name"].as_str().unwrap_or("");
     assert!(
         !tool_name.is_empty(),
         "artifact event should have non-empty tool_name; got: {}",
@@ -457,10 +458,7 @@ fn streaming_reconnect_replays_missed_events() {
     );
 
     // Find the ID of the first event received
-    let first_event_id = first_events
-        .iter()
-        .find_map(|e| e.id)
-        .unwrap_or(0);
+    let first_event_id = first_events.iter().find_map(|e| e.id).unwrap_or(0);
 
     // Check if the final event is among first_events (session may already be complete)
     let session_complete = first_events
@@ -536,8 +534,7 @@ fn streaming_agent_card_has_streaming_capability() {
         .expect("timed out waiting for capsule_url");
 
     let card_json = http_get(&capsule_url, "/.well-known/agent-card.json");
-    let card: Value = serde_json::from_str(&card_json)
-        .expect("agent card should be valid JSON");
+    let card: Value = serde_json::from_str(&card_json).expect("agent card should be valid JSON");
 
     assert_eq!(
         card["capabilities"]["streaming"], true,
@@ -554,8 +551,9 @@ fn streaming_driver_wasm_path() -> PathBuf {
 }
 
 fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
-    let artifact_path =
-        dir.join(format!("{STREAMING_DRIVER_NAME}-{STREAMING_DRIVER_VERSION}.mur.zip"));
+    let artifact_path = dir.join(format!(
+        "{STREAMING_DRIVER_NAME}-{STREAMING_DRIVER_VERSION}.mur.zip"
+    ));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
     let opts: SimpleFileOptions =
@@ -567,7 +565,8 @@ fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
     writeln!(zip, "runtime: driver").unwrap();
 
     zip.start_file("tool.wasm", opts).unwrap();
-    zip.write_all(&fs::read(streaming_driver_wasm_path()).unwrap()).unwrap();
+    zip.write_all(&fs::read(streaming_driver_wasm_path()).unwrap())
+        .unwrap();
 
     zip.finish().unwrap();
     artifact_path

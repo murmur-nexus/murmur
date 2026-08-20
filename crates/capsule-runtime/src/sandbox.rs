@@ -165,9 +165,7 @@ pub(crate) fn applied_tier(
     declared: murmur_artifact::ContainmentClass,
 ) -> EnforcementTier {
     match host_tier {
-        EnforcementTier::KernelSealed
-            if declared < murmur_artifact::ContainmentClass::Sealed =>
-        {
+        EnforcementTier::KernelSealed if declared < murmur_artifact::ContainmentClass::Sealed => {
             EnforcementTier::KernelFull
         }
         other => other,
@@ -247,7 +245,9 @@ pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
 /// calls are gated separately by `network_policy::NetworkAllowRule::matches`, a host-pattern
 /// match that never consults DNS. Malformed host *syntax* is still a hard error — it is caught by
 /// `parse_network_allow_rules` above, before this loop.
-pub(crate) fn resolve_network_allowlist_ips(network_allow: &[String]) -> Result<Vec<IpAddr>, String> {
+pub(crate) fn resolve_network_allowlist_ips(
+    network_allow: &[String],
+) -> Result<Vec<IpAddr>, String> {
     let rules = crate::network_policy::parse_network_allow_rules(network_allow)
         .map_err(|error| error.to_string())?;
 
@@ -421,17 +421,29 @@ pub(crate) struct ElfDependencies {
 
 fn read_u16(bytes: &[u8], off: usize, le: bool) -> Option<u16> {
     let raw: [u8; 2] = bytes.get(off..off + 2)?.try_into().ok()?;
-    Some(if le { u16::from_le_bytes(raw) } else { u16::from_be_bytes(raw) })
+    Some(if le {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
 }
 
 fn read_u32(bytes: &[u8], off: usize, le: bool) -> Option<u32> {
     let raw: [u8; 4] = bytes.get(off..off + 4)?.try_into().ok()?;
-    Some(if le { u32::from_le_bytes(raw) } else { u32::from_be_bytes(raw) })
+    Some(if le {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
 }
 
 fn read_u64(bytes: &[u8], off: usize, le: bool) -> Option<u64> {
     let raw: [u8; 8] = bytes.get(off..off + 8)?.try_into().ok()?;
-    Some(if le { u64::from_le_bytes(raw) } else { u64::from_be_bytes(raw) })
+    Some(if le {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
 }
 
 /// Reads a NUL-terminated string starting at the beginning of `region` (used for both the
@@ -508,7 +520,11 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
 
     // A static binary (no PT_DYNAMIC) contributes only itself — no interp, no needed libs.
     let Some((dyn_off, dyn_size)) = dynamic_region else {
-        return Some(ElfDependencies { interp, needed: Vec::new(), runpaths: Vec::new() });
+        return Some(ElfDependencies {
+            interp,
+            needed: Vec::new(),
+            runpaths: Vec::new(),
+        });
     };
 
     let mut needed_offsets: Vec<u64> = Vec::new();
@@ -562,7 +578,11 @@ pub(crate) fn parse_elf_dependencies(bytes: &[u8]) -> Option<ElfDependencies> {
         }
     }
 
-    Some(ElfDependencies { interp, needed, runpaths })
+    Some(ElfDependencies {
+        interp,
+        needed,
+        runpaths,
+    })
 }
 
 /// Expands a leading/embedded `$ORIGIN` (or `${ORIGIN}`) in an rpath entry to the directory of the
@@ -678,7 +698,8 @@ fn resolve_landlock_grants_in(
             }
         }
         for soname in &deps.needed {
-            if let Some(resolved) = resolve_soname(soname, origin_dir, &deps.runpaths, search_dirs) {
+            if let Some(resolved) = resolve_soname(soname, origin_dir, &deps.runpaths, search_dirs)
+            {
                 queue.push_back(resolved);
             }
         }
@@ -743,7 +764,11 @@ impl LandlockGrant {
     fn non_listable_files(paths: Vec<PathBuf>) -> Vec<LandlockGrant> {
         paths
             .into_iter()
-            .map(|path| LandlockGrant { path, list_dir: false, executable: true })
+            .map(|path| LandlockGrant {
+                path,
+                list_dir: false,
+                executable: true,
+            })
             .collect()
     }
 }
@@ -1745,8 +1770,9 @@ impl ShellEnforcement {
         // directory not named in the manifest never receives a rule, regardless of what it holds.
         let mut landlock_grants =
             LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
-        landlock_grants
-            .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
+        landlock_grants.extend(resolve_interpreter_runtime_grants(
+            &policy.shell_interpreter_runtime,
+        ));
         // Plus one per staged runtime tree. Without this the tree is bind-mounted into the
         // composed root and then denied by the Landlock ruleset installed inside it — see
         // `resolve_staged_runtime_landlock_grants`.
@@ -1801,9 +1827,7 @@ impl ShellEnforcement {
 
     /// The latched workdir-size breach, if the guard has seen one.
     pub(crate) fn workdir_breach(&self) -> Option<crate::resources::WorkdirBreach> {
-        self.workdir_guard
-            .as_ref()
-            .and_then(|guard| guard.breach())
+        self.workdir_guard.as_ref().and_then(|guard| guard.breach())
     }
 
     /// Refuse to spawn once the workdir ceiling has been crossed.
@@ -1975,7 +1999,8 @@ pub(crate) fn warn_for_missing_aggregate_bounding(
     has_scope: bool,
 ) {
     let is_linux = cfg!(target_os = "linux");
-    if let Some((code, message)) = aggregate_bounding_warning(is_linux, requires_bounding, has_scope)
+    if let Some((code, message)) =
+        aggregate_bounding_warning(is_linux, requires_bounding, has_scope)
     {
         let link = security_warning_link(code);
         eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
@@ -1987,7 +2012,11 @@ pub(crate) fn warn_for_missing_aggregate_bounding(
 }
 
 /// Fires at every launch, not just once.
-pub(crate) fn warn_for_enforcement_tier(tier: EnforcementTier, workdir: &Path, policy: &CapabilityPolicy) {
+pub(crate) fn warn_for_enforcement_tier(
+    tier: EnforcementTier,
+    workdir: &Path,
+    policy: &CapabilityPolicy,
+) {
     if let Some((code, message)) = tier_warning(tier, policy.shell_allow.is_empty()) {
         let link = security_warning_link(code);
         eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
@@ -2096,9 +2125,7 @@ thread_local! {
 #[cfg(test)]
 fn forced_prepare_failure() -> Result<(), String> {
     if FORCE_PREPARE_FAILURE.with(|flag| flag.get()) {
-        return Err(
-            "sandbox: kernel enforcement setup failed (forced by test seam)".to_string(),
-        );
+        return Err("sandbox: kernel enforcement setup failed (forced by test seam)".to_string());
     }
     Ok(())
 }
@@ -2365,12 +2392,8 @@ pub(crate) fn prepare_enforcement(
     }
     // SAFETY: both fds were just returned by the successful socketpair() call above; nothing
     // else has taken ownership of them yet, so wrapping them in OwnedFd is exclusive/sound.
-    let (parent_sock, child_sock) = unsafe {
-        (
-            OwnedFd::from_raw_fd(fds[0]),
-            OwnedFd::from_raw_fd(fds[1]),
-        )
-    };
+    let (parent_sock, child_sock) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
 
     // Dedicated CLOEXEC pipe carrying failure detail out of the child. The write end is moved
     // into the `pre_exec` closure; because it is CLOEXEC, a successful `execve` closes it with
@@ -2400,7 +2423,8 @@ pub(crate) fn prepare_enforcement(
     // `pre_exec` window permits no allocation, and `getuid()` in particular has to be read
     // *before* the `unshare` — inside a fresh user namespace with no map written yet it reports
     // the overflow id, and writing that back is refused on every host.
-    let netns_plan = crate::network_namespace::CapsuleNetnsPlan::resolve(enforcement.egress_tcp_ports.clone());
+    let netns_plan =
+        crate::network_namespace::CapsuleNetnsPlan::resolve(enforcement.egress_tcp_ports.clone());
     let expected_namespace_sockets = netns_plan.socket_count();
     let egress_policy = crate::egress_proxy::EgressPolicy::new(
         enforcement.network_allow_rules.clone(),
@@ -2438,7 +2462,8 @@ pub(crate) fn prepare_enforcement(
             // Ordered first, before any seccomp filter is installed: these are the bounds that
             // must hold even if a later step in this closure fails, and `prlimit64`/`setrlimit`
             // plus `write` are all already in `SECCOMP_SYSCALL_ALLOWLIST` either way.
-            if let Err(error) = crate::resources::apply_hard_rlimits(&resource_limits, nproc_baseline)
+            if let Err(error) =
+                crate::resources::apply_hard_rlimits(&resource_limits, nproc_baseline)
             {
                 linux_enforce::write_diagnostic(diag_write.as_raw_fd(), &error.to_string());
                 return Err(error);
@@ -2839,7 +2864,7 @@ mod linux_enforce {
     /// the fork down to a `prctl` and one syscall.
     pub(super) fn probe_landlock_full_access() -> Option<bool> {
         use landlock::{
-            Access, AccessFs, Compatible, CompatLevel, PathBeneath, PathFd, Ruleset, RulesetAttr,
+            Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
             RulesetCreatedAttr, RulesetStatus, ABI,
         };
 
@@ -3500,13 +3525,11 @@ mod linux_enforce {
     fn apply_landlock_scope(fds: &LandlockChildFds) -> Result<(), String> {
         #[cfg(test)]
         if super::FORCE_LANDLOCK_FAILURE.with(|flag| flag.get()) {
-            return Err(
-                "landlock: ruleset construction failed (forced by test seam)".to_string(),
-            );
+            return Err("landlock: ruleset construction failed (forced by test seam)".to_string());
         }
 
         use landlock::{
-            Access, AccessFs, Compatible, CompatLevel, PathBeneath, Ruleset, RulesetAttr,
+            Access, AccessFs, CompatLevel, Compatible, PathBeneath, Ruleset, RulesetAttr,
             RulesetCreatedAttr, ABI,
         };
 
@@ -3790,9 +3813,7 @@ mod linux_enforce {
         loop {
             // SAFETY: `fd` is the valid, open read end of the diagnostic pipe; `chunk` is a live
             // stack buffer of exactly the length passed.
-            let n = unsafe {
-                libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-            };
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
             if n < 0 {
                 if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
@@ -3895,7 +3916,6 @@ mod linux_enforce {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -3986,7 +4006,10 @@ mod tests {
             tier_from_probe(
                 true,
                 Some(true),
-                SealedProbe { apparmor_permits_userns: false, namespace: NamespaceProbe::Ok }
+                SealedProbe {
+                    apparmor_permits_userns: false,
+                    namespace: NamespaceProbe::Ok
+                }
             ),
             EnforcementTier::KernelFull
         );
@@ -4002,7 +4025,10 @@ mod tests {
                 tier_from_probe(
                     true,
                     Some(true),
-                    SealedProbe { apparmor_permits_userns: true, namespace }
+                    SealedProbe {
+                        apparmor_permits_userns: true,
+                        namespace
+                    }
                 ),
                 EnforcementTier::KernelFull,
                 "namespace probe {namespace:?} must fall back to KernelFull, never below it"
@@ -4072,11 +4098,23 @@ mod tests {
                 binary: "python3".to_string(),
                 dirs: vec![
                     // Already inside /usr, which the fixed list binds wholesale.
-                    InterpreterRuntimeDir { path: "/usr/lib/python3.11".to_string(), list_dir: true },
-                    InterpreterRuntimeDir { path: "/opt/py/lib".to_string(), list_dir: true },
+                    InterpreterRuntimeDir {
+                        path: "/usr/lib/python3.11".to_string(),
+                        list_dir: true,
+                    },
+                    InterpreterRuntimeDir {
+                        path: "/opt/py/lib".to_string(),
+                        list_dir: true,
+                    },
                     // A duplicate, and a relative path that names nothing absolute.
-                    InterpreterRuntimeDir { path: "/opt/py/lib".to_string(), list_dir: false },
-                    InterpreterRuntimeDir { path: "relative/lib".to_string(), list_dir: false },
+                    InterpreterRuntimeDir {
+                        path: "/opt/py/lib".to_string(),
+                        list_dir: false,
+                    },
+                    InterpreterRuntimeDir {
+                        path: "relative/lib".to_string(),
+                        list_dir: false,
+                    },
                 ],
             }],
             ..CapabilityPolicy::default()
@@ -4088,7 +4126,10 @@ mod tests {
 
         assert_eq!(
             resolve_sealed_bind_dirs(&exec_allow, &policy),
-            vec![PathBuf::from("/opt/toolchain/bin"), PathBuf::from("/opt/py/lib")]
+            vec![
+                PathBuf::from("/opt/toolchain/bin"),
+                PathBuf::from("/opt/py/lib")
+            ]
         );
     }
 
@@ -4153,7 +4194,10 @@ mod tests {
             "a staged tree is walked by the runtime that uses it, so it must be listable",
         );
         assert_eq!(
-            grants.iter().map(|grant| grant.path.clone()).collect::<Vec<_>>(),
+            grants
+                .iter()
+                .map(|grant| grant.path.clone())
+                .collect::<Vec<_>>(),
             dirs,
             "the bound set and the granted set must not drift apart",
         );
@@ -4361,7 +4405,10 @@ mod tests {
     #[test]
     fn resolve_network_allowlist_ips_resolves_localhost_to_loopback() {
         let ips = resolve_network_allowlist_ips(&["localhost".to_string()]).unwrap();
-        assert!(!ips.is_empty(), "localhost should resolve to at least one address");
+        assert!(
+            !ips.is_empty(),
+            "localhost should resolve to at least one address"
+        );
         assert!(
             ips.iter().all(|ip| ip.is_loopback()),
             "every resolved localhost address should be loopback, got {ips:?}"
@@ -4380,8 +4427,9 @@ mod tests {
     /// to resolve, which keeps this test independent of the host's DNS.
     #[test]
     fn resolve_network_allowlist_ips_skips_unresolvable_host_without_failing() {
-        let ips = resolve_network_allowlist_ips(&["definitely-not-a-real-host.invalid".to_string()])
-            .expect("an unresolvable host must not be a hard error");
+        let ips =
+            resolve_network_allowlist_ips(&["definitely-not-a-real-host.invalid".to_string()])
+                .expect("an unresolvable host must not be a hard error");
         assert!(
             ips.is_empty(),
             "an unresolvable host should contribute no IPs, got {ips:?}"
@@ -4412,15 +4460,17 @@ mod tests {
     fn resolve_network_allowlist_ips_dedupes_across_hosts() {
         // Two entries that both resolve to loopback should not produce duplicate IPs beyond
         // what's actually distinct.
-        let ips = resolve_network_allowlist_ips(&[
-            "localhost".to_string(),
-            "localhost:8080".to_string(),
-        ])
-        .unwrap();
+        let ips =
+            resolve_network_allowlist_ips(&["localhost".to_string(), "localhost:8080".to_string()])
+                .unwrap();
         let mut sorted = ips.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(ips.len(), sorted.len(), "resolved IPs should already be deduplicated");
+        assert_eq!(
+            ips.len(),
+            sorted.len(),
+            "resolved IPs should already be deduplicated"
+        );
     }
 
     #[test]
@@ -4486,8 +4536,7 @@ mod tests {
         let link = temp.path().join("link-tool");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let resolved =
-            resolve_exec_allowlist_in(&[link.to_string_lossy().into_owned()], &[]);
+        let resolved = resolve_exec_allowlist_in(&[link.to_string_lossy().into_owned()], &[]);
         assert_eq!(resolved, vec![std::fs::canonicalize(&real).unwrap()]);
     }
 
@@ -4660,7 +4709,12 @@ mod tests {
         let mut phdrs: Vec<(u32, u64, u64, u64)> = Vec::new(); // (p_type, p_offset, p_vaddr, p_filesz)
         phdrs.push((1, 0, 0, total_len as u64)); // PT_LOAD identity-maps the whole file
         if let Some(i) = interp {
-            phdrs.push((3, interp_offset as u64, interp_offset as u64, i.len() as u64 + 1));
+            phdrs.push((
+                3,
+                interp_offset as u64,
+                interp_offset as u64,
+                i.len() as u64 + 1,
+            ));
         }
         if has_dynamic {
             phdrs.push((2, dyn_offset as u64, dyn_offset as u64, dyn_size as u64));
@@ -4686,7 +4740,10 @@ mod tests {
         );
         let deps = parse_elf_dependencies(&bytes).expect("well-formed ELF64 must parse");
         assert_eq!(deps.interp.as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
-        assert_eq!(deps.needed, vec!["libc.so.6".to_string(), "libm.so.6".to_string()]);
+        assert_eq!(
+            deps.needed,
+            vec!["libc.so.6".to_string(), "libm.so.6".to_string()]
+        );
         assert_eq!(
             deps.runpaths,
             vec!["$ORIGIN/../lib".to_string(), "/opt/custom/lib".to_string()],
@@ -4763,19 +4820,21 @@ mod tests {
 
         // A synthetic dynamically-linked binary naming that interp + that soname.
         let prog = bin_dir.join("prog");
-        let elf = build_elf64(
-            Some(interp.to_str().unwrap()),
-            &["libfake.so.1"],
-            None,
-        );
+        let elf = build_elf64(Some(interp.to_str().unwrap()), &["libfake.so.1"], None);
         std::fs::write(&prog, &elf).unwrap();
 
         let grants =
             resolve_landlock_grants_in(std::slice::from_ref(&prog), std::slice::from_ref(&lib_dir));
 
         let expect = |p: PathBuf| std::fs::canonicalize(p).unwrap();
-        assert!(grants.contains(&expect(prog)), "the binary itself must be granted: {grants:?}");
-        assert!(grants.contains(&expect(interp)), "the ELF interpreter must be granted: {grants:?}");
+        assert!(
+            grants.contains(&expect(prog)),
+            "the binary itself must be granted: {grants:?}"
+        );
+        assert!(
+            grants.contains(&expect(interp)),
+            "the ELF interpreter must be granted: {grants:?}"
+        );
         assert!(
             grants.contains(&expect(lib_dir.join("libfake.so.1"))),
             "each resolved DT_NEEDED library must be granted: {grants:?}"
@@ -5149,8 +5208,20 @@ mod tests {
     #[test]
     fn allowlist_covers_the_syscalls_no_process_can_run_without() {
         for name in [
-            "read", "write", "openat", "close", "mmap", "munmap", "brk", "exit_group", "futex",
-            "rt_sigreturn", "clone", "wait4", "getpid", "getdents64",
+            "read",
+            "write",
+            "openat",
+            "close",
+            "mmap",
+            "munmap",
+            "brk",
+            "exit_group",
+            "futex",
+            "rt_sigreturn",
+            "clone",
+            "wait4",
+            "getpid",
+            "getdents64",
         ] {
             assert!(
                 SECCOMP_SYSCALL_ALLOWLIST.contains(&name),
@@ -5250,7 +5321,10 @@ mod tests {
             );
         } else {
             assert!(log.contains(W_SEC_010), "log was: {log}");
-            assert!(log.contains(&security_warning_link(W_SEC_010)), "log was: {log}");
+            assert!(
+                log.contains(&security_warning_link(W_SEC_010)),
+                "log was: {log}"
+            );
         }
     }
 
@@ -5265,7 +5339,11 @@ mod tests {
     #[test]
     fn warn_for_enforcement_tier_kernel_full_logs_scope_when_shell_declared() {
         let temp = tempfile::tempdir().unwrap();
-        warn_for_enforcement_tier(EnforcementTier::KernelFull, temp.path(), &warning_test_policy());
+        warn_for_enforcement_tier(
+            EnforcementTier::KernelFull,
+            temp.path(),
+            &warning_test_policy(),
+        );
         let log = bootstrap_log_contents(temp.path());
         assert!(
             log.contains(W_SEC_005),
@@ -5311,9 +5389,18 @@ mod tests {
             &warning_test_policy(),
         );
         let log = bootstrap_log_contents(temp.path());
-        assert!(log.contains("Landlock"), "must name the missing primitive: {log}");
-        assert!(log.contains("filesystem"), "must name what is not enforced: {log}");
-        assert!(log.contains(W_SEC_002), "must carry its warning code: {log}");
+        assert!(
+            log.contains("Landlock"),
+            "must name the missing primitive: {log}"
+        );
+        assert!(
+            log.contains("filesystem"),
+            "must name what is not enforced: {log}"
+        );
+        assert!(
+            log.contains(W_SEC_002),
+            "must carry its warning code: {log}"
+        );
         assert!(
             log.contains(&security_warning_link(W_SEC_002)),
             "must link to the diagnostics doc page: {log}"
@@ -5337,7 +5424,10 @@ mod tests {
             log.contains("bash"),
             "the still-accurate bash/network bypass warning must also fire: {log}"
         );
-        assert!(log.contains(W_SEC_001), "must carry the tier warning code: {log}");
+        assert!(
+            log.contains(W_SEC_001),
+            "must carry the tier warning code: {log}"
+        );
         assert!(
             log.contains(W_SEC_003),
             "must carry the bash/network bypass warning code: {log}"
@@ -5777,7 +5867,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_allows_exec_within_shell_allowlist() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_allows_exec_within_shell_allowlist") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_tier_allows_exec_within_shell_allowlist",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -5823,7 +5915,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_allows_nested_exec_of_second_allowlisted_binary() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_allows_nested_exec_of_second_allowlisted_binary") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_tier_allows_nested_exec_of_second_allowlisted_binary",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -5873,7 +5967,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_tier_denies_network_connect_outside_allowlist() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_denies_network_connect_outside_allowlist") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_tier_denies_network_connect_outside_allowlist",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -5943,7 +6039,9 @@ mod linux_integration_tests {
     /// asserts only that the permitted path still functions.
     #[test]
     fn kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_tier_reaches_an_allowlisted_destination_through_the_egress_proxy",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -5990,7 +6088,8 @@ mod linux_integration_tests {
 
         // Builtins only — `/dev/tcp` and `read` are bash itself — so no second binary is exec'd
         // and this measures the network path alone.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{port} && read -r reply <&3 && echo \"$reply\"");
+        let script =
+            format!("exec 3<>/dev/tcp/127.0.0.1/{port} && read -r reply <&3 && echo \"$reply\"");
         let result = crate::shell::execute_shell(
             "bash",
             &["-c", &script],
@@ -6020,7 +6119,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_denies_filesystem_access_outside_workdir() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_full_denies_filesystem_access_outside_workdir") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_full_denies_filesystem_access_outside_workdir",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -6200,12 +6301,16 @@ mod linux_integration_tests {
     /// Builds a KernelFull enforcement for `policy`, combining the derived `DT_NEEDED`-closure
     /// file grants with the policy's `interpreter_runtime` directory grants — exactly what
     /// `ShellEnforcement::resolve` does, spelled out so the test controls the tier explicitly.
-    fn kernel_full_enforcement(tier: EnforcementTier, policy: &CapabilityPolicy) -> ShellEnforcement {
+    fn kernel_full_enforcement(
+        tier: EnforcementTier,
+        policy: &CapabilityPolicy,
+    ) -> ShellEnforcement {
         let exec_allow_paths = resolve_exec_allowlist(&policy.shell_allow);
         let mut landlock_grants =
             LandlockGrant::non_listable_files(resolve_landlock_grants(&exec_allow_paths));
-        landlock_grants
-            .extend(resolve_interpreter_runtime_grants(&policy.shell_interpreter_runtime));
+        landlock_grants.extend(resolve_interpreter_runtime_grants(
+            &policy.shell_interpreter_runtime,
+        ));
         ShellEnforcement {
             tier,
             network_allow_ips: Vec::new(),
@@ -6220,7 +6325,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_full_interpreter_runtime_list_dir_false_opens_file_but_denies_listing",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -6291,7 +6398,9 @@ mod linux_integration_tests {
 
     #[test]
     fn kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_full_interpreter_runtime_list_dir_true_lists_dir_but_not_its_parent",
+        ) {
             return;
         }
         let tier = detect_enforcement_tier();
@@ -6373,7 +6482,9 @@ mod linux_integration_tests {
     /// pinned in the enforcement literal, so only the ABI has to be real. Skips loudly elsewhere.
     #[test]
     fn kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_full_non_executable_grant_lists_its_tree_but_refuses_to_run_from_it",
+        ) {
             return;
         }
         let host_tier = detect_enforcement_tier();
@@ -6475,7 +6586,9 @@ mod linux_integration_tests {
     /// Runs on any host with a usable Landlock ABI; skips loudly elsewhere.
     #[test]
     fn kernel_full_non_executable_file_grant_is_readable_and_survives_a_bad_list_dir_claim() {
-        if crate::network_namespace::skip_without_egress_namespace("kernel_full_non_executable_file_grant_is_readable_and_survives_a_bad_list_dir_claim") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "kernel_full_non_executable_file_grant_is_readable_and_survives_a_bad_list_dir_claim",
+        ) {
             return;
         }
         let host_tier = detect_enforcement_tier();
@@ -6679,7 +6792,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_no_new_privs_failure_is_distinct_and_fails_closed() {
-        if crate::network_namespace::skip_without_egress_namespace("pre_exec_no_new_privs_failure_is_distinct_and_fails_closed") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "pre_exec_no_new_privs_failure_is_distinct_and_fails_closed",
+        ) {
             return;
         }
         let error = child_setup_failure_error(ForceNoNewPrivsFailureGuard::new);
@@ -6695,7 +6810,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_landlock_failure_is_distinct_and_fails_closed() {
-        if crate::network_namespace::skip_without_egress_namespace("pre_exec_landlock_failure_is_distinct_and_fails_closed") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "pre_exec_landlock_failure_is_distinct_and_fails_closed",
+        ) {
             return;
         }
         let error = child_setup_failure_error(ForceLandlockFailureGuard::new);
@@ -6711,7 +6828,9 @@ mod linux_integration_tests {
 
     #[test]
     fn pre_exec_setup_failures_produce_pairwise_distinct_messages() {
-        if crate::network_namespace::skip_without_egress_namespace("pre_exec_setup_failures_produce_pairwise_distinct_messages") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "pre_exec_setup_failures_produce_pairwise_distinct_messages",
+        ) {
             return;
         }
         let workdir_msg = workdir_resolution_error();
@@ -6745,7 +6864,9 @@ mod linux_integration_tests {
     /// does with it) and `murmur-cli`'s error test covers the third (`E-RUN-014`).
     #[test]
     fn a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message() {
-        if crate::network_namespace::skip_without_egress_namespace("a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_composed_root_failure_is_typed_and_session_fatal_not_just_another_message",
+        ) {
             return;
         }
         let error =
@@ -6801,5 +6922,4 @@ mod linux_integration_tests {
             "a no_new_privs failure is the tool call's problem, not the session's: {no_new_privs}"
         );
     }
-
 }

@@ -87,10 +87,7 @@ fn inventory_to_mcp_tools(inventory: &[Value]) -> Vec<Value> {
 
 /// Bind the bridge on loopback (ephemeral port) and precompute its config. Returns `None`
 /// when the capsule declares no tools — the process loop then keeps its plain inference path.
-pub(super) async fn bind_bridge(
-    bind_addr: &str,
-    inventory: &[Value],
-) -> Option<BridgeHandle> {
+pub(super) async fn bind_bridge(bind_addr: &str, inventory: &[Value]) -> Option<BridgeHandle> {
     let mcp_tools = inventory_to_mcp_tools(inventory);
     if mcp_tools.is_empty() {
         return None;
@@ -99,7 +96,11 @@ pub(super) async fn bind_bridge(
     // Port 0 = let the OS pick a free ephemeral port.
     let listener = TcpListener::bind(format!("{bind_addr}:0")).await.ok()?;
     let port = listener.local_addr().ok()?.port();
-    let host = if bind_addr.is_empty() { "127.0.0.1" } else { bind_addr };
+    let host = if bind_addr.is_empty() {
+        "127.0.0.1"
+    } else {
+        bind_addr
+    };
 
     let allowed_tool_names = mcp_tools
         .iter()
@@ -143,7 +144,10 @@ impl BridgeHandle {
             "-c".into(),
             format!("mcp_servers.{key}.url=\"{}\"", self.url),
             "-c".into(),
-            format!("mcp_servers.{key}.http_headers.Authorization=\"Bearer {}\"", self.token),
+            format!(
+                "mcp_servers.{key}.http_headers.Authorization=\"Bearer {}\"",
+                self.token
+            ),
             "-c".into(),
             format!("mcp_servers.{key}.default_tools_approval_mode=\"approve\""),
         ]
@@ -296,7 +300,10 @@ impl BridgeHandle {
         match store
             .dispatch_agent_tool_async(
                 &name,
-                ToolInput { data: Some(input_json), log_path: None },
+                ToolInput {
+                    data: Some(input_json),
+                    log_path: None,
+                },
             )
             .await
         {
@@ -332,8 +339,14 @@ async fn write_json_rpc(
     extra_header: Option<&str>,
 ) {
     let payload = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
-    write_response_with_header(writer, "200 OK", Some("application/json"), Some(&payload), extra_header)
-        .await;
+    write_response_with_header(
+        writer,
+        "200 OK",
+        Some("application/json"),
+        Some(&payload),
+        extra_header,
+    )
+    .await;
 }
 
 async fn write_response(
@@ -409,7 +422,10 @@ mod tests {
         let handle = bind_bridge("127.0.0.1", &inventory)
             .await
             .expect("bridge should bind when tools are declared");
-        assert_eq!(handle.allowed_tool_names, vec!["mcp__claude_bridge__editor"]);
+        assert_eq!(
+            handle.allowed_tool_names,
+            vec!["mcp__claude_bridge__editor"]
+        );
         let cfg = handle.mcp_config_json();
         assert!(cfg.contains("\"type\":\"http\""));
         assert!(cfg.contains(&handle.url));

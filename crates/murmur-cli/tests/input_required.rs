@@ -89,11 +89,7 @@ fn create_tool_artifact(dir: &Path) -> PathBuf {
     artifact_path
 }
 
-fn setup_project(
-    home: &TempDir,
-    endpoint: &str,
-    extra_lifecycle_yaml: &str,
-) -> (TempDir, PathBuf) {
+fn setup_project(home: &TempDir, endpoint: &str, extra_lifecycle_yaml: &str) -> (TempDir, PathBuf) {
     let artifacts = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
@@ -144,7 +140,11 @@ fn setup_project(
     (artifacts, project.keep().join("murmur.yaml"))
 }
 
-fn stage_agent(home: &TempDir, manifest_path: &Path, lifecycle: Option<LifecycleConfig>) -> capsule_runtime::StagedSession {
+fn stage_agent(
+    home: &TempDir,
+    manifest_path: &Path,
+    lifecycle: Option<LifecycleConfig>,
+) -> capsule_runtime::StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
     let mut allowlisted_tools = std::collections::HashSet::new();
     let mut requested_artifacts = Vec::new();
@@ -196,12 +196,8 @@ fn stage_agent(home: &TempDir, manifest_path: &Path, lifecycle: Option<Lifecycle
 
 fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .ok();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -225,8 +221,7 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
         }
         body_str.push_str(&line);
     }
-    serde_json::from_str(&body_str)
-        .unwrap_or_else(|_| serde_json::json!({"_raw": body_str}))
+    serde_json::from_str(&body_str).unwrap_or_else(|_| serde_json::json!({"_raw": body_str}))
 }
 
 fn send_message(addr: &str, msg_id: &str, text: &str) -> Value {
@@ -288,14 +283,15 @@ fn poll_until_state(addr: &str, task_id: &str, expected_state: &str, timeout: Du
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let resp = tasks_get(addr, task_id);
-        let state = resp["result"]["status"]["state"].as_str().unwrap_or("").to_string();
+        let state = resp["result"]["status"]["state"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         if state == expected_state {
             return resp;
         }
         if std::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for state '{expected_state}'; last response: {resp}"
-            );
+            panic!("timed out waiting for state '{expected_state}'; last response: {resp}");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -340,7 +336,12 @@ fn read_line_before(
 /// Subscribe to `message/stream` for a new task and collect SSE events until a terminal
 /// `status` event arrives or `timeout` elapses. `timeout` bounds the whole collection,
 /// not each read; on expiry the events gathered so far are returned rather than panicking.
-fn collect_sse_events_for_message(addr: &str, msg_id: &str, text: &str, timeout: Duration) -> Vec<SseEvent> {
+fn collect_sse_events_for_message(
+    addr: &str,
+    msg_id: &str,
+    text: &str,
+    timeout: Duration,
+) -> Vec<SseEvent> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -387,7 +388,10 @@ fn collect_sse_events_for_message(addr: &str, msg_id: &str, text: &str, timeout:
     let mut cur_data = String::new();
 
     while let Some(line) = read_line_before(&mut reader, &stream, deadline) {
-        let line = line.trim_end_matches('\n').trim_end_matches('\r').to_string();
+        let line = line
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+            .to_string();
 
         if line.is_empty() {
             if !cur_type.is_empty() && !cur_data.is_empty() {
@@ -492,7 +496,12 @@ fn input_required_resumes_on_message_send() {
     let task_id = resp["result"]["id"].as_str().unwrap().to_string();
 
     // Wait for input-required
-    poll_until_state(&capsule_url, &task_id, "input-required", Duration::from_secs(30));
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "input-required",
+        Duration::from_secs(30),
+    );
 
     // Deliver input: the second message/send should be routed to the waiting task
     let resume_resp = send_message(&capsule_url, "msg-2", "option A");
@@ -512,18 +521,16 @@ fn input_required_resumes_on_message_send() {
 #[test]
 fn input_required_working_state_rejects_message() {
     // Use a slow server with two turns so the agent stays in working state long enough
-    let server = common::ScriptedServer::start(vec![
-        serde_json::json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{"type": "text", "text": "done quickly"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string(),
-    ]);
+    let server = common::ScriptedServer::start(vec![serde_json::json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "done quickly"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()]);
     let home = tempfile::tempdir().unwrap();
     let (_artifacts, manifest_path) = setup_project(&home, &server.endpoint, "");
     let staged = stage_agent(&home, &manifest_path, None);
@@ -589,7 +596,12 @@ fn input_required_timeout_transitions_to_failed() {
     let task_id = resp["result"]["id"].as_str().unwrap().to_string();
 
     // Wait for input-required
-    poll_until_state(&capsule_url, &task_id, "input-required", Duration::from_secs(30));
+    poll_until_state(
+        &capsule_url,
+        &task_id,
+        "input-required",
+        Duration::from_secs(30),
+    );
 
     // Do NOT send a response — poll until the task reaches "failed" state.
     // The 2-second timeout will fire, finish_task(Failed) is called, then the
@@ -719,12 +731,17 @@ fn input_required_sse_emits_state_event() {
         "delivering input should return working or completed; got: '{resume_state}' in {resume_resp}"
     );
 
-    let events = sse_handle.join().expect("SSE collection thread should not panic");
+    let events = sse_handle
+        .join()
+        .expect("SSE collection thread should not panic");
     for event in &events {
         eprintln!("event: {}\ndata: {}\n", event.event_type, event.data);
     }
 
-    assert!(!events.is_empty(), "should have received SSE events; got none");
+    assert!(
+        !events.is_empty(),
+        "should have received SSE events; got none"
+    );
 
     let input_required_events: Vec<_> = events
         .iter()

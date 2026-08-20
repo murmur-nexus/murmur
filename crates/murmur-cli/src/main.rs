@@ -9,8 +9,17 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
+#[cfg(feature = "beta-mur-deploy")]
+use commands::deploy::run_deploy;
+#[cfg(feature = "beta-mur-deploy")]
+use commands::destroy::run_destroy;
+#[cfg(feature = "beta-mur-new")]
+use commands::new::run_new;
+#[cfg(feature = "beta-mur-deploy")]
+use commands::ps::run_ps;
+#[cfg(feature = "beta-mur-topology")]
+use commands::topology::{run_topology, TopologyArgs};
 use commands::{
-    watch::run_watch,
     beta::{run_beta, BetaCommand},
     build::run_build,
     config_cmd::{run_config, ConfigCommand},
@@ -22,17 +31,8 @@ use commands::{
     run::run_run,
     search::run_search,
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
+    watch::run_watch,
 };
-#[cfg(feature = "beta-mur-new")]
-use commands::new::run_new;
-#[cfg(feature = "beta-mur-deploy")]
-use commands::deploy::run_deploy;
-#[cfg(feature = "beta-mur-deploy")]
-use commands::destroy::run_destroy;
-#[cfg(feature = "beta-mur-deploy")]
-use commands::ps::run_ps;
-#[cfg(feature = "beta-mur-topology")]
-use commands::topology::{run_topology, TopologyArgs};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -362,7 +362,13 @@ fn main() {
             skill,
             version,
             summary,
-        } => run_build(&source, output.as_deref(), skill, version.as_deref(), summary.as_deref()),
+        } => run_build(
+            &source,
+            output.as_deref(),
+            skill,
+            version.as_deref(),
+            summary.as_deref(),
+        ),
         Commands::Publish {
             artifact_path,
             registry,
@@ -372,7 +378,12 @@ fn main() {
             registry.as_deref(),
             platform.as_deref(),
         ),
-        Commands::Install { artifact, registry, global, all_platforms } => run_install(
+        Commands::Install {
+            artifact,
+            registry,
+            global,
+            all_platforms,
+        } => run_install(
             artifact.as_deref(),
             registry.as_deref(),
             global,
@@ -407,18 +418,33 @@ fn main() {
         ),
         Commands::Trace { command } => match command {
             TraceCommand::Show { session, workdir } => run_trace_show(session, workdir),
-            TraceCommand::Steps { session, verbose, workdir } => {
-                run_trace_steps(session, workdir, verbose)
-            }
-            TraceCommand::Diff { before, after, workdir } => run_trace_diff(before, after, workdir),
-            TraceCommand::Report { sessions, last, since, workdir } => {
-                run_trace_report(sessions, last, since, workdir)
-            }
+            TraceCommand::Steps {
+                session,
+                verbose,
+                workdir,
+            } => run_trace_steps(session, workdir, verbose),
+            TraceCommand::Diff {
+                before,
+                after,
+                workdir,
+            } => run_trace_diff(before, after, workdir),
+            TraceCommand::Report {
+                sessions,
+                last,
+                since,
+                workdir,
+            } => run_trace_report(sessions, last, since, workdir),
         },
         Commands::Eval { command } => match command {
-            EvalCommand::Show { session, workdir, json } => run_eval_show(session, workdir, json),
+            EvalCommand::Show {
+                session,
+                workdir,
+                json,
+            } => run_eval_show(session, workdir, json),
             EvalCommand::Diff { a, b, workdir } => run_eval_diff(Some(a), Some(b), workdir),
-            EvalCommand::Run { capsule, dataset } => run_eval_run(capsule.as_deref(), dataset.as_deref()),
+            EvalCommand::Run { capsule, dataset } => {
+                run_eval_run(capsule.as_deref(), dataset.as_deref())
+            }
         },
         #[cfg(feature = "beta-mur-topology")]
         Commands::Topology(args) => {

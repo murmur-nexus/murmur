@@ -31,7 +31,6 @@
 /// events appear in the stream for observability but murmur does not intercept them. Murmur
 /// capsule artifacts (WASM tools, native tools) are not exposed to the claude subprocess in this
 /// transport — use `transport: http` for murmur-managed tool dispatch.
-
 use std::{
     collections::HashMap,
     path::Path,
@@ -72,8 +71,12 @@ const BRIDGE_BIND_ADDR: &str = "127.0.0.1";
 /// list must be revisited when the supported codex version changes. `-s read-only` is layered on
 /// top as defence-in-depth (blocks file mutation from anything not covered here). Codex dialect
 /// only; has no bearing on the Claude path.
-const CODEX_DISABLED_FEATURES: &[&str] =
-    &["shell_tool", "unified_exec", "shell_snapshot", "code_mode_host"];
+const CODEX_DISABLED_FEATURES: &[&str] = &[
+    "shell_tool",
+    "unified_exec",
+    "shell_snapshot",
+    "code_mode_host",
+];
 
 /// Prepended to the codex prompt when the Claude Bridge is active. Codex, unlike Claude, is
 /// reluctant to use MCP tools for work it associates with its (now-disabled) native tools — with
@@ -317,7 +320,9 @@ pub(crate) async fn run_process_inference_loop(
     };
     let install_hint = match dialect {
         ProcessDialect::Claude => "install the claude CLI from https://claude.ai/download",
-        ProcessDialect::Codex => "install the codex CLI from https://developers.openai.com/codex/cli",
+        ProcessDialect::Codex => {
+            "install the codex CLI from https://developers.openai.com/codex/cli"
+        }
     };
     let mut child = Command::new(command_name)
         .args(&args)
@@ -332,9 +337,7 @@ pub(crate) async fn run_process_inference_loop(
                      hint: {install_hint}"
                 ))
             } else {
-                RuntimeError::AgentLoopFailed(format!(
-                    "failed to spawn '{command_name}': {e}"
-                ))
+                RuntimeError::AgentLoopFailed(format!("failed to spawn '{command_name}': {e}"))
             }
         })?;
 
@@ -376,10 +379,9 @@ pub(crate) async fn run_process_inference_loop(
         });
         let mut stdin = child.stdin.take().expect("stdin should be piped");
         let line = format!("{}\n", serde_json::to_string(&user_msg).unwrap_or_default());
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to write to subprocess stdin: {e}")))?;
+        stdin.write_all(line.as_bytes()).await.map_err(|e| {
+            RuntimeError::AgentLoopFailed(format!("failed to write to subprocess stdin: {e}"))
+        })?;
         // drop closes stdin → signals EOF to the subprocess
     }
 
@@ -389,33 +391,50 @@ pub(crate) async fn run_process_inference_loop(
     // `&CapsuleStoreState` is all the bridge needs. `select!` drops the never-completing bridge
     // future the moment the CLI produces its result. Each dialect parses its own stdout stream
     // but both drive the same bridge and share the timeout/kill/session-end plumbing below.
-    let result = tokio::time::timeout(
-        Duration::from_secs(PROCESS_TIMEOUT_SECS),
-        async {
-            // The reader future depends on the dialect; the bridge future is identical.
-            let read = async {
-                match dialect {
-                    ProcessDialect::Claude => {
-                        read_process_output(&mut child, workdir, inference, max_turns, task_id.as_deref(), hooks, trace, otel, &stderr_buf).await
-                    }
-                    ProcessDialect::Codex => {
-                        read_codex_output(&mut child, workdir, max_turns, hooks, trace, otel, &stderr_buf).await
-                    }
+    let result = tokio::time::timeout(Duration::from_secs(PROCESS_TIMEOUT_SECS), async {
+        // The reader future depends on the dialect; the bridge future is identical.
+        let read = async {
+            match dialect {
+                ProcessDialect::Claude => {
+                    read_process_output(
+                        &mut child,
+                        workdir,
+                        inference,
+                        max_turns,
+                        task_id.as_deref(),
+                        hooks,
+                        trace,
+                        otel,
+                        &stderr_buf,
+                    )
+                    .await
                 }
-            };
-            match &bridge {
-                Some(b) => {
-                    tokio::select! {
-                        r = read => r,
-                        () = b.serve(store_state) => Err(RuntimeError::AgentLoopFailed(
-                            "Claude Bridge server exited unexpectedly".into(),
-                        )),
-                    }
+                ProcessDialect::Codex => {
+                    read_codex_output(
+                        &mut child,
+                        workdir,
+                        max_turns,
+                        hooks,
+                        trace,
+                        otel,
+                        &stderr_buf,
+                    )
+                    .await
                 }
-                None => read.await,
             }
-        },
-    )
+        };
+        match &bridge {
+            Some(b) => {
+                tokio::select! {
+                    r = read => r,
+                    () = b.serve(store_state) => Err(RuntimeError::AgentLoopFailed(
+                        "Claude Bridge server exited unexpectedly".into(),
+                    )),
+                }
+            }
+            None => read.await,
+        }
+    })
     .await;
 
     // Kill the subprocess regardless of how we exit.
@@ -509,11 +528,9 @@ async fn read_process_output(
     // tool_use id. Process transport only.
     let mut pending_tool_calls: HashMap<String, PendingToolCall> = HashMap::new();
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to read subprocess stdout: {e}")))?
-    {
+    while let Some(line) = lines.next_line().await.map_err(|e| {
+        RuntimeError::AgentLoopFailed(format!("failed to read subprocess stdout: {e}"))
+    })? {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -557,11 +574,14 @@ async fn read_process_output(
                 }
 
                 let turn_idx = turns - 1;
-                let decision = if content.and_then(Value::as_array).map(|arr| {
-                    arr.iter().any(|b| {
-                        b.get("type").and_then(Value::as_str) == Some("tool_use")
+                let decision = if content
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
                     })
-                }).unwrap_or(false) {
+                    .unwrap_or(false)
+                {
                     "tool_call"
                 } else {
                     "end_turn"
@@ -571,19 +591,23 @@ async fn read_process_output(
                     .write_inference(turn_idx, 0, 0, decision.to_string(), None, None)
                     .await;
 
-                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None).await;
+                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None)
+                    .await;
 
                 hooks
-                    .emit(workdir, HookEvent::Inference {
-                        turn: turn_idx,
-                        input_tokens: 0,
-                        output_tokens: 0,
-                        decision: decision.to_string(),
-                        tool_name: None,
-                        prompt: None,
-                        output: content.map(|c| c.to_string()),
-                        tools: None,
-                    })
+                    .emit(
+                        workdir,
+                        HookEvent::Inference {
+                            turn: turn_idx,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            decision: decision.to_string(),
+                            tool_name: None,
+                            prompt: None,
+                            output: content.map(|c| c.to_string()),
+                            tools: None,
+                        },
+                    )
                     .await;
 
                 // Record any tool_use blocks so the matching tool_result can be traced as a
@@ -598,7 +622,10 @@ async fn read_process_output(
                             continue;
                         };
                         let name = strip_bridge_prefix(
-                            block.get("name").and_then(Value::as_str).unwrap_or("<unknown>"),
+                            block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("<unknown>"),
                         )
                         .to_string();
                         let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
@@ -607,7 +634,13 @@ async fn read_process_output(
                             .unwrap_or(0);
                         pending_tool_calls.insert(
                             id.to_string(),
-                            PendingToolCall { name, input, input_bytes, turn: turn_idx, started: Instant::now() },
+                            PendingToolCall {
+                                name,
+                                input,
+                                input_bytes,
+                                turn: turn_idx,
+                                started: Instant::now(),
+                            },
                         );
                     }
                 }
@@ -622,7 +655,10 @@ async fn read_process_output(
                 // Tool result event. Pair it with the pending tool_use to emit a `tool_call`
                 // trace event (what `mur trace show` counts) plus the ToolCall hook, with the
                 // real tool name, byte sizes, duration, and status. Process transport only.
-                let content = event.get("message").and_then(|m| m.get("content")).and_then(Value::as_array);
+                let content = event
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array);
                 if let Some(blocks) = content {
                     for block in blocks {
                         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
@@ -635,12 +671,19 @@ async fn read_process_output(
                             continue; // result for a tool we didn't record (e.g. no id) — skip
                         };
 
-                        let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         let status = if is_error { "error" } else { "ok" };
                         let output = tool_result_text(block);
                         let output_bytes = output.len() as u64;
-                        let duration_ms =
-                            pending.started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+                        let duration_ms = pending
+                            .started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
 
                         let _ = trace
                             .write_tool_call(
@@ -658,14 +701,17 @@ async fn read_process_output(
                             .await;
 
                         hooks
-                            .emit(workdir, HookEvent::ToolCall {
-                                turn: pending.turn,
-                                tool_name: pending.name,
-                                input_bytes: pending.input_bytes,
-                                output_bytes,
-                                duration_ms,
-                                status: status.to_string(),
-                            })
+                            .emit(
+                                workdir,
+                                HookEvent::ToolCall {
+                                    turn: pending.turn,
+                                    tool_name: pending.name,
+                                    input_bytes: pending.input_bytes,
+                                    output_bytes,
+                                    duration_ms,
+                                    status: status.to_string(),
+                                },
+                            )
                             .await;
                     }
                 }
@@ -741,11 +787,9 @@ async fn read_codex_output(
     let mut result_text = String::new();
     let mut found_result = false;
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to read subprocess stdout: {e}")))?
-    {
+    while let Some(line) = lines.next_line().await.map_err(|e| {
+        RuntimeError::AgentLoopFailed(format!("failed to read subprocess stdout: {e}"))
+    })? {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;
@@ -759,7 +803,9 @@ async fn read_codex_output(
 
         match event_type {
             "item.completed" => {
-                let Some(item) = event.get("item") else { continue };
+                let Some(item) = event.get("item") else {
+                    continue;
+                };
                 match item.get("type").and_then(Value::as_str).unwrap_or("") {
                     // Model reasoning — not a logical turn (mirrors the Claude thinking-skip).
                     "reasoning" => {}
@@ -768,29 +814,56 @@ async fn read_codex_output(
                         if turns > max_turns {
                             return codex_max_turns_error(max_turns, trace, otel).await;
                         }
-                        result_text = item.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                        let _ = trace.write_inference(turns - 1, 0, 0, "end_turn".into(), None, None).await;
-                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None).await;
+                        result_text = item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = trace
+                            .write_inference(turns - 1, 0, 0, "end_turn".into(), None, None)
+                            .await;
+                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None)
+                            .await;
                     }
                     "mcp_tool_call" => {
                         turns += 1;
                         if turns > max_turns {
                             return codex_max_turns_error(max_turns, trace, otel).await;
                         }
-                        let tool_name =
-                            item.get("tool").and_then(Value::as_str).unwrap_or("<unknown>").to_string();
+                        let tool_name = item
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                        let input_bytes =
-                            serde_json::to_string(&input).map(|s| s.len() as u64).unwrap_or(0);
+                        let input_bytes = serde_json::to_string(&input)
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0);
                         let is_error = item.get("error").map(|e| !e.is_null()).unwrap_or(false);
                         let status = if is_error { "error" } else { "ok" };
                         let output = tool_result_text(item.get("result").unwrap_or(&Value::Null));
                         let output_bytes = output.len() as u64;
 
                         let _ = trace
-                            .write_inference(turns - 1, 0, 0, "tool_call".into(), Some(tool_name.clone()), None)
+                            .write_inference(
+                                turns - 1,
+                                0,
+                                0,
+                                "tool_call".into(),
+                                Some(tool_name.clone()),
+                                None,
+                            )
                             .await;
-                        otel.emit_inference(turns - 1, 0, 0, "tool_call", Some(tool_name.as_str()), 0, None).await;
+                        otel.emit_inference(
+                            turns - 1,
+                            0,
+                            0,
+                            "tool_call",
+                            Some(tool_name.as_str()),
+                            0,
+                            None,
+                        )
+                        .await;
                         let _ = trace
                             .write_tool_call(
                                 turns - 1,
@@ -806,14 +879,17 @@ async fn read_codex_output(
                             )
                             .await;
                         hooks
-                            .emit(workdir, HookEvent::ToolCall {
-                                turn: turns - 1,
-                                tool_name,
-                                input_bytes,
-                                output_bytes,
-                                duration_ms: 0,
-                                status: status.to_string(),
-                            })
+                            .emit(
+                                workdir,
+                                HookEvent::ToolCall {
+                                    turn: turns - 1,
+                                    tool_name,
+                                    input_bytes,
+                                    output_bytes,
+                                    duration_ms: 0,
+                                    status: status.to_string(),
+                                },
+                            )
                             .await;
                     }
                     // A host command executed despite the disable set (see CODEX_DISABLED_FEATURES).
@@ -821,8 +897,11 @@ async fn read_codex_output(
                     // executor rather than hiding the leak.
                     "command_execution" => {
                         let cmd = item.get("command").and_then(Value::as_str).unwrap_or("");
-                        let status =
-                            if item.get("exit_code").and_then(Value::as_i64) == Some(0) { "ok" } else { "error" };
+                        let status = if item.get("exit_code").and_then(Value::as_i64) == Some(0) {
+                            "ok"
+                        } else {
+                            "error"
+                        };
                         let _ = trace
                             .write_tool_call(
                                 turns.saturating_sub(1),
@@ -886,7 +965,9 @@ async fn codex_max_turns_error(
 ) -> Result<(), RuntimeError> {
     let _ = trace.write_session_end("failed").await;
     otel.emit_session_end("failed").await;
-    Err(RuntimeError::AgentLoopFailed(format!("max_turns ({max_turns}) exceeded")))
+    Err(RuntimeError::AgentLoopFailed(format!(
+        "max_turns ({max_turns}) exceeded"
+    )))
 }
 
 #[cfg(test)]
@@ -953,7 +1034,10 @@ mod tests {
         assert!(args.iter().any(|a| a == "--json"));
         // host-execution tools disabled + apply_patch off → murmur is the sole executor
         for f in CODEX_DISABLED_FEATURES {
-            assert!(args.windows(2).any(|w| w[0] == "--disable" && w[1] == *f), "missing --disable {f}");
+            assert!(
+                args.windows(2).any(|w| w[0] == "--disable" && w[1] == *f),
+                "missing --disable {f}"
+            );
         }
         assert!(args.iter().any(|a| a == "include_apply_patch_tool=false"));
         // model passed via -m; task is the final positional arg
@@ -965,7 +1049,10 @@ mod tests {
     fn codex_args_omit_model_when_empty() {
         let inf = test_inference("codex", "");
         let args = build_process_args(ProcessDialect::Codex, &inf, &None, None, "t");
-        assert!(!args.iter().any(|a| a == "-m"), "empty model must not pass -m (uses account default)");
+        assert!(
+            !args.iter().any(|a| a == "-m"),
+            "empty model must not pass -m (uses account default)"
+        );
     }
 
     #[test]
@@ -973,9 +1060,13 @@ mod tests {
         let inf = test_inference("claude", "claude-opus-4-8");
         let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, "t");
         assert_eq!(args[0], "--print");
-        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "claude-opus-4-8"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "claude-opus-4-8"));
         // no-tools claude still disables built-ins via empty --tools
-        assert!(args.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1].is_empty()));
         assert!(args.iter().any(|a| a == "--system-prompt"));
     }
 
@@ -984,12 +1075,18 @@ mod tests {
         let inf = test_inference("claude", "");
         let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, "t");
         // `--model ""` is a hard 400; empty model must omit the flag so claude uses its default.
-        assert!(!args.iter().any(|a| a == "--model"), "empty model must not pass --model");
+        assert!(
+            !args.iter().any(|a| a == "--model"),
+            "empty model must not pass --model"
+        );
     }
 
     #[test]
     fn strips_bridge_prefix_to_bare_tool_name() {
-        assert_eq!(strip_bridge_prefix("mcp__claude_bridge__murmur-tool-editor"), "murmur-tool-editor");
+        assert_eq!(
+            strip_bridge_prefix("mcp__claude_bridge__murmur-tool-editor"),
+            "murmur-tool-editor"
+        );
         // Non-bridge names pass through unchanged.
         assert_eq!(strip_bridge_prefix("some-other-tool"), "some-other-tool");
         assert_eq!(strip_bridge_prefix("mcp__other__t"), "mcp__other__t");
@@ -1000,7 +1097,9 @@ mod tests {
         use serde_json::json;
         assert_eq!(tool_result_text(&json!({"content": "hi"})), "hi");
         assert_eq!(
-            tool_result_text(&json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]})),
+            tool_result_text(
+                &json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]})
+            ),
             "ab"
         );
         assert_eq!(tool_result_text(&json!({})), "");
@@ -1010,14 +1109,22 @@ mod tests {
     fn thinking_only_events_are_skipped_but_actions_count() {
         use serde_json::json;
         // thinking-only → skipped
-        assert!(is_thinking_only(Some(&json!([{"type": "thinking", "thinking": "…"}]))));
-        assert!(is_thinking_only(Some(&json!([{"type": "redacted_thinking"}]))));
+        assert!(is_thinking_only(Some(
+            &json!([{"type": "thinking", "thinking": "…"}])
+        )));
+        assert!(is_thinking_only(Some(
+            &json!([{"type": "redacted_thinking"}])
+        )));
         // empty / absent → nothing actionable → skipped
         assert!(is_thinking_only(Some(&json!([]))));
         assert!(is_thinking_only(None));
         // any actionable block → counted (not thinking-only)
-        assert!(!is_thinking_only(Some(&json!([{"type": "text", "text": "hi"}]))));
-        assert!(!is_thinking_only(Some(&json!([{"type": "tool_use", "name": "editor"}]))));
+        assert!(!is_thinking_only(Some(
+            &json!([{"type": "text", "text": "hi"}])
+        )));
+        assert!(!is_thinking_only(Some(
+            &json!([{"type": "tool_use", "name": "editor"}])
+        )));
         // thinking + action in the same event → counted
         assert!(!is_thinking_only(Some(&json!([
             {"type": "thinking"}, {"type": "tool_use", "name": "editor"}

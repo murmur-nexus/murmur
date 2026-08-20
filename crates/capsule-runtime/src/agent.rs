@@ -2,8 +2,8 @@ mod claude_bridge;
 mod inventory;
 mod process;
 
-use std::{fs, io::Write, path::Path, sync::LazyLock, time::Instant};
 use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::{fs, io::Write, path::Path, sync::LazyLock, time::Instant};
 
 use murmur_artifact::{ConversationMode, InferenceConfig};
 use serde_json::{json, Value};
@@ -16,8 +16,8 @@ use crate::{
     otel::OtelEmitter,
     runtime::CapsuleStoreState,
     streaming::{
-        emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact,
-        StreamStatus, TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
+        emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
+        TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
     trace::TraceWriter,
 };
@@ -86,7 +86,10 @@ pub(crate) async fn run_agent_loop(
     }
 
     // ── WASM driver transport (http) ──────────────────────────────────────────
-    let driver = inference.driver.as_ref().ok_or(RuntimeError::DriverNotConfigured)?;
+    let driver = inference
+        .driver
+        .as_ref()
+        .ok_or(RuntimeError::DriverNotConfigured)?;
     let driver_name = &driver.artifact;
     if driver_name.is_empty() {
         return Err(RuntimeError::DriverNotConfigured);
@@ -116,12 +119,8 @@ pub(crate) async fn run_agent_loop(
     // workdir here silently yields an empty task, producing an empty user message.
     let task = read_task(accessible_workdir);
 
-    let augmented_system = build_augmented_system_prompt(
-        name,
-        version,
-        accessible_workdir,
-        system_prompt.as_deref(),
-    );
+    let augmented_system =
+        build_augmented_system_prompt(name, version, accessible_workdir, system_prompt.as_deref());
 
     // In threaded mode, prepend prior history for this contextId before the new user message.
     // TODO: cross-session history persistence
@@ -237,9 +236,13 @@ pub(crate) async fn run_agent_loop(
         }
 
         // Reset per-turn streaming flag before each driver dispatch.
-        store_state.a2a_chunks_emitted.store(false, Ordering::Relaxed);
+        store_state
+            .a2a_chunks_emitted
+            .store(false, Ordering::Relaxed);
         // Sync chunk ID counter with current sse_event_id so all events share one monotonic sequence.
-        store_state.a2a_chunk_event_id.store(sse_event_id, Ordering::Relaxed);
+        store_state
+            .a2a_chunk_event_id
+            .store(sse_event_id, Ordering::Relaxed);
 
         let inference_started = Instant::now();
         let driver_result = match store_state
@@ -929,8 +932,11 @@ pub(crate) async fn run_agent_loop(
         }
     }
 
-    write_result(workdir, &format!("error: inference loop exceeded {max_turns} turns"))
-        .map_err(RuntimeError::AgentLoopFailed)?;
+    write_result(
+        workdir,
+        &format!("error: inference loop exceeded {max_turns} turns"),
+    )
+    .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
     trace
         .write_session_end("max_turns_reached")
@@ -1480,12 +1486,8 @@ mod tests {
 
     #[test]
     fn augmented_system_prompt_carries_trust_notice_with_no_custom_prompt() {
-        let prompt = build_augmented_system_prompt(
-            "my-capsule",
-            "1.0.0",
-            Path::new("/workdir"),
-            None,
-        );
+        let prompt =
+            build_augmented_system_prompt("my-capsule", "1.0.0", Path::new("/workdir"), None);
         assert!(
             prompt.contains(MURMUR_MD_TRUST_NOTICE),
             "notice missing from: {prompt}"
@@ -1702,7 +1704,11 @@ mod tests {
             build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("cont-abc123", 1)));
 
         let wire = payload["messages"].as_array().unwrap();
-        assert_eq!(wire.len(), 2, "should send only the tail appended since ack");
+        assert_eq!(
+            wire.len(),
+            2,
+            "should send only the tail appended since ack"
+        );
         assert_eq!(payload["messages"], json!(msgs[1..]));
         assert_eq!(payload["continuation_id"], json!("cont-abc123"));
     }

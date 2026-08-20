@@ -139,7 +139,10 @@ fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
     }
     let mut entries = Vec::new();
     for entry_res in fs::read_dir(workdir).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to read {}: {e}", workdir.display()))
+        CliError::new(
+            E_IO_003,
+            format!("failed to read {}: {e}", workdir.display()),
+        )
     })? {
         let entry = entry_res.map_err(|e| {
             CliError::new(
@@ -552,7 +555,8 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 if dataset_explicit {
                     format!("dataset not found at {}", resolved_dataset.display())
                 } else {
-                    "no dataset found. Expected ./eval.jsonl or specify with --dataset <path>".to_string()
+                    "no dataset found. Expected ./eval.jsonl or specify with --dataset <path>"
+                        .to_string()
                 },
             ),
         ),
@@ -589,7 +593,10 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         return Err(fail_run(
             &session_id,
             &workdir,
-            CliError::new(E_IO_003, format!("dataset is empty: {}", resolved_dataset.display())),
+            CliError::new(
+                E_IO_003,
+                format!("dataset is empty: {}", resolved_dataset.display()),
+            ),
         ));
     }
 
@@ -701,7 +708,10 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             trace: runtime_manifest.trace.clone(),
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
-            internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
+            internal_port: runtime_manifest
+                .network
+                .as_ref()
+                .and_then(|n| n.internal_port),
             // `mur eval` has no --containment flag and reads no workspace config, so the
             // manifest is the only source of a floor here.
             declared_containment_floor: runtime_manifest

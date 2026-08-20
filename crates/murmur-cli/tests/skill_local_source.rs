@@ -107,7 +107,11 @@ fn local_source_file_path_installs_skill_md() {
     )
     .unwrap();
 
-    let installed = staged.workdir.join("tools").join("my-skill").join("skill.md");
+    let installed = staged
+        .workdir
+        .join("tools")
+        .join("my-skill")
+        .join("skill.md");
     assert!(installed.exists(), "skill.md not installed");
     assert_eq!(
         fs::read_to_string(&installed).unwrap(),
@@ -178,7 +182,12 @@ fn local_source_coexists_with_registry_skill() {
     fs::write(src.path().join("SKILL.md"), "# Registry Skill\n").unwrap();
     Command::cargo_bin("mur")
         .unwrap()
-        .args(["build", "--skill", "reg-skill", src.path().to_str().unwrap()])
+        .args([
+            "build",
+            "--skill",
+            "reg-skill",
+            src.path().to_str().unwrap(),
+        ])
         .current_dir(build_out.path())
         .assert()
         .success();
@@ -297,8 +306,7 @@ fn source_directory_without_skill_md_fails() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("contains no skill.md")
-                .and(predicate::str::contains("empty")),
+            predicate::str::contains("contains no skill.md").and(predicate::str::contains("empty")),
         );
 
     assert!(!capsule_dir.path().join("workdir").exists());

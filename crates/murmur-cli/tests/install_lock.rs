@@ -5,7 +5,9 @@ use std::{
 };
 
 use assert_cmd::Command;
-use murmur_artifact::{read_lockfile, sha256_hex, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION};
+use murmur_artifact::{
+    read_lockfile, sha256_hex, LockedArtifact, LockedSha256, MurmurLock, LOCK_VERSION,
+};
 use predicates::prelude::*;
 use tempfile::TempDir;
 use zip::{
@@ -67,7 +69,11 @@ fn run_install_manifest_deps(home: &TempDir, project_dir: &Path) -> assert_cmd::
 }
 
 fn init_project(dir: &Path) {
-    fs::write(dir.join("murmur.yaml"), "name: test-project\nversion: 0.0.1\n").unwrap();
+    fs::write(
+        dir.join("murmur.yaml"),
+        "name: test-project\nversion: 0.0.1\n",
+    )
+    .unwrap();
 }
 
 /// `mur install` with no artifact argument installs every registry-resolved artifact
@@ -129,7 +135,9 @@ fn publish_fixture(work: &TempDir, home: &TempDir, name: &str, version: &str) ->
 fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256: &str) {
     assert!(
         project
-            .join(format!(".murmur/artifacts/{name}/{version}/{name}-{version}.mur.zip"))
+            .join(format!(
+                ".murmur/artifacts/{name}/{version}/{name}-{version}.mur.zip"
+            ))
             .exists(),
         "{name}@{version} should have been stored despite other artifacts failing"
     );
@@ -168,7 +176,10 @@ fn install_partial_failure_pins_successes_and_names_failure() {
     assert_installed_and_pinned(project.path(), "partial-a", "1.0.0", &sha_a);
     assert_installed_and_pinned(project.path(), "partial-c", "3.0.0", &sha_c);
     assert!(
-        !project.path().join(".murmur/artifacts/partial-missing").exists(),
+        !project
+            .path()
+            .join(".murmur/artifacts/partial-missing")
+            .exists(),
         "the unpublished artifact must not be stored"
     );
 }
@@ -225,7 +236,9 @@ fn install_total_failure_writes_no_lock_and_names_every_failure() {
         .failure()
         .stdout(predicate::str::contains("total-gone-a@1.0.0"))
         .stdout(predicate::str::contains("total-gone-b@2.0.0"))
-        .stdout(predicate::str::contains("2 of 2 artifacts failed to install:"))
+        .stdout(predicate::str::contains(
+            "2 of 2 artifacts failed to install:",
+        ))
         .stdout(predicate::str::contains("installed ").not());
 
     assert!(

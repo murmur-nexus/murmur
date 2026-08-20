@@ -121,7 +121,10 @@ mod tests {
         cfg.beta.enabled = vec!["foo".to_string(), "bar".to_string()];
         let s = serde_yaml::to_string(&cfg).unwrap();
         assert!(s.contains("beta:"), "expected beta: key in YAML output");
-        assert!(s.contains("foo") && s.contains("bar"), "expected enabled list");
+        assert!(
+            s.contains("foo") && s.contains("bar"),
+            "expected enabled list"
+        );
         let back: MurConfig = serde_yaml::from_str(&s).unwrap();
         assert_eq!(back.beta.enabled, vec!["foo", "bar"]);
     }
@@ -144,7 +147,10 @@ inference:
 "#;
         let cfg: MurConfig = serde_yaml::from_str(yaml_str).unwrap();
         assert!(cfg.beta.enabled.is_empty());
-        assert_eq!(cfg.inference.as_ref().map(|i| i.provider.as_str()), Some("anthropic"));
+        assert_eq!(
+            cfg.inference.as_ref().map(|i| i.provider.as_str()),
+            Some("anthropic")
+        );
     }
 
     #[cfg(not(any(
@@ -201,7 +207,10 @@ inference:
     #[test]
     fn beta_mur_topology_registered_with_feature() {
         let features = compiled_beta_features();
-        let entries: Vec<_> = features.iter().filter(|f| f.name == "mur-topology").collect();
+        let entries: Vec<_> = features
+            .iter()
+            .filter(|f| f.name == "mur-topology")
+            .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "mur-topology");
     }

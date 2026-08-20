@@ -367,7 +367,6 @@ fn enforcement_tier_name(tier: EnforcementTier) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,7 +395,10 @@ mod tests {
             achieved_class_for_tier(EnforcementTier::KernelSealed),
             ContainmentClass::Sealed
         );
-        for tier in ALL_TIERS.iter().filter(|t| **t != EnforcementTier::KernelSealed) {
+        for tier in ALL_TIERS
+            .iter()
+            .filter(|t| **t != EnforcementTier::KernelSealed)
+        {
             assert_ne!(achieved_class_for_tier(*tier), ContainmentClass::Sealed);
         }
     }
@@ -525,7 +527,9 @@ mod tests {
     fn advisory_floor_is_met_on_every_tier() {
         for tier in ALL_TIERS {
             let achieved = achieved_class_for_tier(*tier);
-            assert!(check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok());
+            assert!(
+                check_containment_floor(ContainmentClass::Advisory, achieved, None, false).is_ok()
+            );
         }
     }
 
@@ -533,7 +537,9 @@ mod tests {
     fn scoped_floor_is_met_on_every_landlock_capable_tier() {
         for tier in [EnforcementTier::KernelFull, EnforcementTier::KernelSealed] {
             let achieved = achieved_class_for_tier(tier);
-            assert!(check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok());
+            assert!(
+                check_containment_floor(ContainmentClass::Scoped, achieved, None, false).is_ok()
+            );
         }
 
         for tier in [
@@ -588,7 +594,10 @@ mod tests {
         )
         .is_ok());
 
-        for tier in ALL_TIERS.iter().filter(|t| **t != EnforcementTier::KernelSealed) {
+        for tier in ALL_TIERS
+            .iter()
+            .filter(|t| **t != EnforcementTier::KernelSealed)
+        {
             let achieved = achieved_class_for_tier(*tier);
             let error = check_containment_floor(
                 ContainmentClass::Sealed,
@@ -649,15 +658,17 @@ mod tests {
             SealedBlocker::KernelUnsupported,
             SealedBlocker::LandlockUnavailable,
         ] {
-            let reason =
-                containment_shortfall_reason(
-                    ContainmentClass::Sealed,
-                    achieved,
-                    Some(blocker),
-                    false,
-                )
-                .expect("refusal");
-            assert!(!reason.contains("no host can provide it today"), "got: {reason}");
+            let reason = containment_shortfall_reason(
+                ContainmentClass::Sealed,
+                achieved,
+                Some(blocker),
+                false,
+            )
+            .expect("refusal");
+            assert!(
+                !reason.contains("no host can provide it today"),
+                "got: {reason}"
+            );
         }
     }
 
@@ -898,7 +909,10 @@ mod tests {
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
-        assert_eq!(report.enforcement_tier, "mountns+pivot_root+landlock+seccomp");
+        assert_eq!(
+            report.enforcement_tier,
+            "mountns+pivot_root+landlock+seccomp"
+        );
     }
 
     #[test]

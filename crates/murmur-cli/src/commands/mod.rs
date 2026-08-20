@@ -1,4 +1,3 @@
-pub(crate) mod watch;
 pub(crate) mod beta;
 pub(crate) mod build;
 pub(crate) mod config_cmd;
@@ -22,6 +21,7 @@ pub(crate) mod search;
 #[cfg(feature = "beta-mur-topology")]
 pub(crate) mod topology;
 pub(crate) mod trace;
+pub(crate) mod watch;
 
 use std::path::Path;
 

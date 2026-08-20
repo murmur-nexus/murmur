@@ -197,7 +197,9 @@ pub(crate) fn egress_namespace_blocker(
         EgressNamespaceProbe::Ok => None,
         EgressNamespaceProbe::Denied
         | EgressNamespaceProbe::MapDenied
-        | EgressNamespaceProbe::ConfigDenied => Some(EgressNamespaceBlocker::CapabilityGrantMissing),
+        | EgressNamespaceProbe::ConfigDenied => {
+            Some(EgressNamespaceBlocker::CapabilityGrantMissing)
+        }
         EgressNamespaceProbe::Unsupported => Some(EgressNamespaceBlocker::KernelSupportMissing),
     }
 }
@@ -489,7 +491,9 @@ mod linux {
             let sent = send_fds(sock_fd, &fds[..count]);
             close_all(&fds[..count]);
             sent.map_err(|()| {
-                io::Error::other("egress-netns: handing the namespace sockets to the runtime failed")
+                io::Error::other(
+                    "egress-netns: handing the namespace sockets to the runtime failed",
+                )
             })
         }
     }
@@ -511,10 +515,9 @@ mod linux {
         unsafe {
             let previous = crate::sealed::make_dumpable_for_map_writes();
             let _ = crate::sealed::write_decimal_map(c"/proc/self/setgroups", None, 0);
-            let mapped =
-                crate::sealed::write_decimal_map(c"/proc/self/uid_map", Some(uid), uid).is_ok()
-                    && crate::sealed::write_decimal_map(c"/proc/self/gid_map", Some(gid), gid)
-                        .is_ok();
+            let mapped = crate::sealed::write_decimal_map(c"/proc/self/uid_map", Some(uid), uid)
+                .is_ok()
+                && crate::sealed::write_decimal_map(c"/proc/self/gid_map", Some(gid), gid).is_ok();
             crate::sealed::restore_dumpable(previous);
             if mapped {
                 Ok(())

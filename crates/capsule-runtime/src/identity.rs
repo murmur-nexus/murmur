@@ -5,11 +5,11 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::errors::RuntimeError;
 use crate::a2a::{
     A2aMessage, A2aTask, IncomingTask, JsonRpcRequest, JsonRpcResponse, TaskRegistry, TaskState,
     TaskStatus,
 };
+use crate::errors::RuntimeError;
 use crate::streaming::{
     format_gap_event, format_sse_event, is_final_sse_event, ReplayResult, SseBroadcast,
     SseEventBuffer, StreamStatus, TaskStatusUpdateEvent,
@@ -212,7 +212,14 @@ async fn handle_connection(
                 return;
             }
             if req.method == "stream/watch" {
-                handle_stream_watch(writer_half, last_event_id, sse_tx, sse_buffer, conversation_mode_str).await;
+                handle_stream_watch(
+                    writer_half,
+                    last_event_id,
+                    sse_tx,
+                    sse_buffer,
+                    conversation_mode_str,
+                )
+                .await;
                 return;
             }
         }
@@ -270,7 +277,10 @@ async fn handle_message_stream(
         let replay = sse_buffer.lock().unwrap().replay_from(last_id);
         let replay_events = match replay {
             ReplayResult::Complete(events) => events,
-            ReplayResult::WithGap { first_available_id, events } => {
+            ReplayResult::WithGap {
+                first_available_id,
+                events,
+            } => {
                 let gap = format_gap_event(first_available_id);
                 if writer.write_all(gap.as_bytes()).await.is_err() {
                     return;
@@ -345,7 +355,8 @@ async fn handle_message_stream(
             reg.pending_count -= 1;
             reg.history.remove(&task_id);
         } // lock dropped before await
-        let event_text = "event: error\ndata: {\"error\":\"internal error: queue send failed\"}\n\n";
+        let event_text =
+            "event: error\ndata: {\"error\":\"internal error: queue send failed\"}\n\n";
         let _ = writer.write_all(event_text.as_bytes()).await;
         return;
     }
@@ -419,7 +430,10 @@ async fn handle_stream_watch(
     let replay = sse_buffer.lock().unwrap().replay_from(last_id);
     let replay_events = match replay {
         ReplayResult::Complete(events) => events,
-        ReplayResult::WithGap { first_available_id, events } => {
+        ReplayResult::WithGap {
+            first_available_id,
+            events,
+        } => {
             let gap = format_gap_event(first_available_id);
             if writer.write_all(gap.as_bytes()).await.is_err() {
                 return;
@@ -442,7 +456,9 @@ async fn handle_stream_watch(
                 // Do NOT exit on is_final_sse_event — final ends one task turn, not the capsule.
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                let _ = writer.write_all(b"event: capsule-closed\ndata: {}\n\n").await;
+                let _ = writer
+                    .write_all(b"event: capsule-closed\ndata: {}\n\n")
+                    .await;
                 return;
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

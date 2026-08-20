@@ -121,7 +121,11 @@ mod tests {
                 std::env::set_var("HOME", home);
             }
             std::env::set_current_dir(cwd).expect("set cwd");
-            Self { _lock: lock, saved_home, saved_cwd }
+            Self {
+                _lock: lock,
+                saved_home,
+                saved_cwd,
+            }
         }
     }
 
@@ -191,6 +195,9 @@ mod tests {
             .expect("load")
             .expect("project config should exist");
         assert_eq!(cfg.registry.default.as_deref(), Some("local"));
-        assert_eq!(cfg.inference.as_ref().map(|i| i.model.as_str()), Some("claude-3-5-sonnet"));
+        assert_eq!(
+            cfg.inference.as_ref().map(|i| i.model.as_str()),
+            Some("claude-3-5-sonnet")
+        );
     }
 }

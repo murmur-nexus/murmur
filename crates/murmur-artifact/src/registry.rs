@@ -272,10 +272,16 @@ impl LocalRegistry {
             if plat_artifact.exists() && plat_hash.exists() {
                 (plat_artifact, plat_hash)
             } else {
-                (self.artifact_path_for(name, version), self.sha256_path_for(name, version))
+                (
+                    self.artifact_path_for(name, version),
+                    self.sha256_path_for(name, version),
+                )
             }
         } else {
-            (self.artifact_path_for(name, version), self.sha256_path_for(name, version))
+            (
+                self.artifact_path_for(name, version),
+                self.sha256_path_for(name, version),
+            )
         };
 
         if !artifact_path.exists() || !hash_path.exists() {
@@ -402,11 +408,14 @@ impl Registry for LocalRegistry {
                     fs::read_dir(&version_path)
                         .ok()
                         .and_then(|entries| {
-                            entries.flatten().any(|e| {
-                                let fname = e.file_name();
-                                let s = fname.to_string_lossy();
-                                s.starts_with(&prefix) && s.ends_with(".mur.zip")
-                            }).then_some(())
+                            entries
+                                .flatten()
+                                .any(|e| {
+                                    let fname = e.file_name();
+                                    let s = fname.to_string_lossy();
+                                    s.starts_with(&prefix) && s.ends_with(".mur.zip")
+                                })
+                                .then_some(())
                         })
                         .is_some()
                 };

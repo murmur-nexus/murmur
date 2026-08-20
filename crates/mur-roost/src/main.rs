@@ -8,9 +8,8 @@ use std::time::Duration;
 
 use capsule_runtime::{
     artifact::{extract_manifest_yaml, extract_root_wasm},
-    capability_policy_from_runtime_manifest,
-    launch_session, stage_session,
-    ArtifactRequest, CapabilityPolicy, StageRequest,
+    capability_policy_from_runtime_manifest, launch_session, stage_session, ArtifactRequest,
+    CapabilityPolicy, StageRequest,
 };
 use murmur_artifact::{current_platform, ArtifactRuntime, LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
@@ -33,12 +32,17 @@ fn parse_args() -> Result<Args, String> {
         match raw[i].as_str() {
             "--port" => {
                 i += 1;
-                port = raw.get(i).ok_or("--port requires a value")?.parse::<u16>()
+                port = raw
+                    .get(i)
+                    .ok_or("--port requires a value")?
+                    .parse::<u16>()
                     .map_err(|e| format!("invalid --port: {e}"))?;
             }
             "--registry-path" => {
                 i += 1;
-                registry_path = Some(PathBuf::from(raw.get(i).ok_or("--registry-path requires a value")?));
+                registry_path = Some(PathBuf::from(
+                    raw.get(i).ok_or("--registry-path requires a value")?,
+                ));
             }
             "--spawn-allow" => {
                 i += 1;
@@ -53,9 +57,17 @@ fn parse_args() -> Result<Args, String> {
         i += 1;
     }
     let registry_path = registry_path
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".murmur").join("artifacts")))
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".murmur").join("artifacts"))
+        })
         .ok_or("--registry-path is required")?;
-    Ok(Args { port, registry_path, spawn_allow })
+    Ok(Args {
+        port,
+        registry_path,
+        spawn_allow,
+    })
 }
 
 // ── Job store ─────────────────────────────────────────────────────────────────
@@ -210,7 +222,11 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         // Parent capsule is spawning — check parent's spawn_allow
         let jobs = state.jobs.lock().unwrap();
         let Some(parent) = jobs.get(parent_session_id) else {
-            return err(403, "Forbidden", &format!("unknown parent session '{parent_session_id}'"));
+            return err(
+                403,
+                "Forbidden",
+                &format!("unknown parent session '{parent_session_id}'"),
+            );
         };
         if !parent.capability_policy.spawn_allow.contains(&req.name) {
             return err(
@@ -247,14 +263,26 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
 
     let manifest_yaml = match extract_manifest_yaml(&req.name, &req.version, &resolved.bytes) {
         Ok(y) => y,
-        Err(e) => return err(500, "Internal Server Error", &format!("manifest extraction failed: {e}")),
+        Err(e) => {
+            return err(
+                500,
+                "Internal Server Error",
+                &format!("manifest extraction failed: {e}"),
+            )
+        }
     };
 
     // Parse RuntimeManifest from an in-memory temp file (load_runtime_manifest reads from disk;
     // use from_yaml_str directly from murmur-artifact's public API).
     let manifest = match murmur_artifact::RuntimeManifest::from_yaml_str(&manifest_yaml) {
         Ok(m) => m,
-        Err(e) => return err(500, "Internal Server Error", &format!("manifest parse error: {e}")),
+        Err(e) => {
+            return err(
+                500,
+                "Internal Server Error",
+                &format!("manifest parse error: {e}"),
+            )
+        }
     };
 
     let child_policy = capability_policy_from_runtime_manifest(&manifest);
@@ -266,7 +294,13 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
     } else {
         match extract_root_wasm(&req.name, &req.version, &resolved.bytes) {
             Ok(bytes) => bytes,
-            Err(e) => return err(500, "Internal Server Error", &format!("WASM extraction failed: {e}")),
+            Err(e) => {
+                return err(
+                    500,
+                    "Internal Server Error",
+                    &format!("WASM extraction failed: {e}"),
+                )
+            }
         }
     };
 
@@ -333,7 +367,9 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         let staged = match stage_session(Arc::new(registry), stage_request) {
             Ok(staged) => staged,
             Err(e) => {
-                ready_tx.send(Err(format!("stage_session failed: {e}"))).ok();
+                ready_tx
+                    .send(Err(format!("stage_session failed: {e}")))
+                    .ok();
                 return;
             }
         };
@@ -371,7 +407,11 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
     let (session_id, capsule_url) = match ready_rx.recv_timeout(Duration::from_secs(60)) {
         Ok(Ok(ready)) => ready,
         Ok(Err(e)) => {
-            return err(500, "Internal Server Error", &format!("capsule launch failed: {e}"))
+            return err(
+                500,
+                "Internal Server Error",
+                &format!("capsule launch failed: {e}"),
+            )
         }
         Err(_) => {
             return err(
@@ -382,8 +422,12 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         }
     };
 
-    let response = SpawnResponse { session_id, capsule_url };
-    ok(&serde_json::to_string(&response).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+    let response = SpawnResponse {
+        session_id,
+        capsule_url,
+    };
+    ok(&serde_json::to_string(&response)
+        .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
 }
 
 // ── GET /status/:session_id ───────────────────────────────────────────────────

@@ -179,7 +179,10 @@ fn an_undeclared_manifest_is_not_gated() {
     }
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - echo\n",
+    );
 
     // Fails later, at the deliberately-invalid component — proving the containment gate let it
     // through rather than refusing a manifest that declared nothing.
@@ -193,7 +196,10 @@ fn an_undeclared_manifest_is_not_gated() {
 fn the_cli_flag_can_raise_a_floor_the_manifest_never_declared() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - echo\n",
+    );
 
     let assertion = mur_run(&home, project.path(), &["--containment", "sealed"]).failure();
     if host_achieved_containment() != "sealed" {
@@ -205,7 +211,10 @@ fn the_cli_flag_can_raise_a_floor_the_manifest_never_declared() {
 fn the_workspace_config_can_raise_a_floor_the_manifest_never_declared() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - echo\n",
+    );
     // `project_mur_config_path()` is cwd-relative, and `mur_run` runs in the project dir.
     fs::create_dir_all(project.path().join(".murmur")).unwrap();
     fs::write(
@@ -223,7 +232,10 @@ fn the_workspace_config_can_raise_a_floor_the_manifest_never_declared() {
 fn an_unknown_containment_flag_value_names_the_accepted_set() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
-    write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - echo\n",
+    );
 
     mur_run(&home, project.path(), &["--containment", "paranoid"])
         .failure()

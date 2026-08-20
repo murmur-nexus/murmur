@@ -268,27 +268,33 @@ mod tests {
 
     #[test]
     fn registry_runtime_skill_returns_static_type() {
-        let manifest = Manifest::from_yaml_str("name: my-skill\nversion: 0.1.0\nruntime: skill\n").unwrap();
+        let manifest =
+            Manifest::from_yaml_str("name: my-skill\nversion: 0.1.0\nruntime: skill\n").unwrap();
         assert_eq!(manifest.registry_runtime(), RuntimeType::Static);
     }
 
     #[test]
     fn registry_runtime_tool_native_returns_native() {
-        let manifest = Manifest::from_yaml_str("name: my-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n").unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: my-tool\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
+        )
+        .unwrap();
         assert_eq!(manifest.registry_runtime(), RuntimeType::Native);
     }
 
     #[test]
     fn registry_runtime_wasm_returns_wasm() {
-        let manifest = Manifest::from_yaml_str("name: my-wasm\nversion: 0.1.0\nruntime: wasm\n").unwrap();
+        let manifest =
+            Manifest::from_yaml_str("name: my-wasm\nversion: 0.1.0\nruntime: wasm\n").unwrap();
         assert_eq!(manifest.registry_runtime(), RuntimeType::Wasm);
     }
 
     #[test]
     fn execution_field_overrides_derived_registry_runtime() {
-        let manifest =
-            Manifest::from_yaml_str("name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: static\n")
-                .unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: static\n",
+        )
+        .unwrap();
         assert_eq!(manifest.execution, Some(RuntimeType::Static));
         // Role-based derivation would have said Wasm for a plain tool.
         assert_eq!(manifest.registry_runtime(), RuntimeType::Static);
@@ -296,26 +302,29 @@ mod tests {
 
     #[test]
     fn execution_field_overrides_skill_static_default() {
-        let manifest =
-            Manifest::from_yaml_str("name: my-skill\nversion: 0.1.0\nruntime: skill\nexecution: wasm\n")
-                .unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: my-skill\nversion: 0.1.0\nruntime: skill\nexecution: wasm\n",
+        )
+        .unwrap();
         assert_eq!(manifest.registry_runtime(), RuntimeType::Wasm);
     }
 
     #[test]
     fn execution_is_parsed_case_insensitively() {
-        let manifest =
-            Manifest::from_yaml_str("name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: STATIC\n")
-                .unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: STATIC\n",
+        )
+        .unwrap();
         assert_eq!(manifest.registry_runtime(), RuntimeType::Static);
     }
 
     #[test]
     fn execution_absent_preserves_all_derived_branches() {
         let skill = Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\n").unwrap();
-        let native =
-            Manifest::from_yaml_str("name: n\nversion: 0.1.0\nruntime: tool\nimplementation: native\n")
-                .unwrap();
+        let native = Manifest::from_yaml_str(
+            "name: n\nversion: 0.1.0\nruntime: tool\nimplementation: native\n",
+        )
+        .unwrap();
         let wasm = Manifest::from_yaml_str("name: w\nversion: 0.1.0\nruntime: tool\n").unwrap();
 
         assert_eq!(skill.execution, None);
@@ -326,9 +335,10 @@ mod tests {
 
     #[test]
     fn invalid_execution_value_is_rejected() {
-        let err =
-            Manifest::from_yaml_str("name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: banana\n")
-                .unwrap_err();
+        let err = Manifest::from_yaml_str(
+            "name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: banana\n",
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("field 'execution'"), "error was: {msg}");
         assert!(msg.contains("wasm, native, static"), "error was: {msg}");
@@ -337,15 +347,17 @@ mod tests {
 
     #[test]
     fn non_string_execution_value_is_rejected() {
-        let err =
-            Manifest::from_yaml_str("name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: 42\n")
-                .unwrap_err();
+        let err = Manifest::from_yaml_str(
+            "name: my-tool\nversion: 0.1.0\nruntime: tool\nexecution: 42\n",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("field 'execution'"));
     }
 
     #[test]
     fn requires_files_defaults_to_skill_md_for_skill_role() {
-        let manifest = Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\n").unwrap();
+        let manifest =
+            Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\n").unwrap();
         assert_eq!(manifest.requires_files, vec!["skill.md".to_string()]);
     }
 
@@ -366,17 +378,19 @@ mod tests {
 
     #[test]
     fn explicit_empty_requires_files_overrides_skill_default() {
-        let manifest =
-            Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n")
-                .unwrap();
+        let manifest = Manifest::from_yaml_str(
+            "name: s\nversion: 0.1.0\nruntime: skill\nrequires_files: []\n",
+        )
+        .unwrap();
         assert!(manifest.requires_files.is_empty());
     }
 
     #[test]
     fn non_sequence_requires_files_is_rejected() {
-        let err =
-            Manifest::from_yaml_str("name: s\nversion: 0.1.0\nruntime: skill\nrequires_files: nope\n")
-                .unwrap_err();
+        let err = Manifest::from_yaml_str(
+            "name: s\nversion: 0.1.0\nruntime: skill\nrequires_files: nope\n",
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("field 'requires_files'"), "error was: {msg}");
         assert!(msg.contains("sequence of strings"), "error was: {msg}");

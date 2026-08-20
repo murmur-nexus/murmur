@@ -13,7 +13,10 @@ static DEFAULT_SCHEMA: LazyLock<Value> =
 /// `system_prompt_artifact`: when set, the skill with this name is excluded from the inventory
 /// because it is already injected as the system prompt — listing it as a callable tool would
 /// cause double-injection and waste context.
-pub(super) fn build_tool_inventory(workdir: &Path, system_prompt_artifact: Option<&str>) -> Vec<Value> {
+pub(super) fn build_tool_inventory(
+    workdir: &Path,
+    system_prompt_artifact: Option<&str>,
+) -> Vec<Value> {
     let tools_dir = workdir.join("tools");
     let mut tools = Vec::new();
 

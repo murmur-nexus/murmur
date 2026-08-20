@@ -79,10 +79,7 @@ pub fn check_staged_runtime_floor(
     Err(RuntimeError::StagedRuntimeRequiresSealed {
         // Every offending binary, not just the first: an operator fixing this should not have to
         // re-run to discover the second grant.
-        binaries: grants
-            .iter()
-            .map(|grant| grant.binary.clone())
-            .collect(),
+        binaries: grants.iter().map(|grant| grant.binary.clone()).collect(),
         declared,
     })
 }

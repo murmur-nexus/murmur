@@ -135,10 +135,12 @@ impl SealedBlocker {
     #[must_use]
     pub fn reason(self) -> String {
         match self {
-            SealedBlocker::NotLinux => "sealed requires a Linux mount namespace + pivot_root; this \
+            SealedBlocker::NotLinux => {
+                "sealed requires a Linux mount namespace + pivot_root; this \
                  platform has no such primitive and never will (macOS and every non-Linux target \
                  stay at advisory permanently)"
-                .to_string(),
+                    .to_string()
+            }
             SealedBlocker::AppArmorProfileMissing => format!(
                 "sealed requires an unprivileged user+mount namespace, and AppArmor's \
                  unprivileged-userns restriction is active on this host while the '{name}' profile \
@@ -450,22 +452,86 @@ impl SyntheticEtcFile {
 /// needs its rule taken on the file actually bound — see `sandbox::LandlockChildFds`'s
 /// `sealed_identity_fds`, which does that for the two synthetic entries.
 pub const SEALED_ETC_PATHS: &[SealedEtcPath] = &[
-    SealedEtcPath { path: "/etc/ld.so.cache", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/ld.so.conf", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/ld.so.conf.d", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/alternatives", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/ssl", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/pki", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/ca-certificates", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/ca-certificates.conf", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/resolv.conf", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/hosts", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/nsswitch.conf", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/localtime", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/timezone", directory: false, synthetic: None },
-    SealedEtcPath { path: "/etc/terminfo", directory: true, synthetic: None },
-    SealedEtcPath { path: "/etc/passwd", directory: false, synthetic: Some(SyntheticEtcFile::Passwd) },
-    SealedEtcPath { path: "/etc/group", directory: false, synthetic: Some(SyntheticEtcFile::Group) },
+    SealedEtcPath {
+        path: "/etc/ld.so.cache",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/ld.so.conf",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/ld.so.conf.d",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/alternatives",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/ssl",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/pki",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/ca-certificates",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/ca-certificates.conf",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/resolv.conf",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/hosts",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/nsswitch.conf",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/localtime",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/timezone",
+        directory: false,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/terminfo",
+        directory: true,
+        synthetic: None,
+    },
+    SealedEtcPath {
+        path: "/etc/passwd",
+        directory: false,
+        synthetic: Some(SyntheticEtcFile::Passwd),
+    },
+    SealedEtcPath {
+        path: "/etc/group",
+        directory: false,
+        synthetic: Some(SyntheticEtcFile::Group),
+    },
 ];
 
 /// One entry of the private `/dev` tmpfs.
@@ -512,12 +578,54 @@ pub struct SealedDevice {
 /// from a `devpts` mount rather than from this list, and `/dev/shm` is omitted deliberately: it is
 /// writable, and the session workdir is the only writable path in a composed root.
 pub const SEALED_DEVICE_NODES: &[SealedDevice] = &[
-    SealedDevice { name: "null", path: "/dev/null", major: 1, minor: 3, mode: 0o666, writable: true },
-    SealedDevice { name: "zero", path: "/dev/zero", major: 1, minor: 5, mode: 0o666, writable: true },
-    SealedDevice { name: "full", path: "/dev/full", major: 1, minor: 7, mode: 0o666, writable: true },
-    SealedDevice { name: "random", path: "/dev/random", major: 1, minor: 8, mode: 0o666, writable: false },
-    SealedDevice { name: "urandom", path: "/dev/urandom", major: 1, minor: 9, mode: 0o666, writable: false },
-    SealedDevice { name: "tty", path: "/dev/tty", major: 5, minor: 0, mode: 0o666, writable: true },
+    SealedDevice {
+        name: "null",
+        path: "/dev/null",
+        major: 1,
+        minor: 3,
+        mode: 0o666,
+        writable: true,
+    },
+    SealedDevice {
+        name: "zero",
+        path: "/dev/zero",
+        major: 1,
+        minor: 5,
+        mode: 0o666,
+        writable: true,
+    },
+    SealedDevice {
+        name: "full",
+        path: "/dev/full",
+        major: 1,
+        minor: 7,
+        mode: 0o666,
+        writable: true,
+    },
+    SealedDevice {
+        name: "random",
+        path: "/dev/random",
+        major: 1,
+        minor: 8,
+        mode: 0o666,
+        writable: false,
+    },
+    SealedDevice {
+        name: "urandom",
+        path: "/dev/urandom",
+        major: 1,
+        minor: 9,
+        mode: 0o666,
+        writable: false,
+    },
+    SealedDevice {
+        name: "tty",
+        path: "/dev/tty",
+        major: 5,
+        minor: 0,
+        mode: 0o666,
+        writable: true,
+    },
 ];
 
 /// The OCI default `/dev` symlinks, `(link name under /dev, target)`.
@@ -650,9 +758,16 @@ pub(crate) enum RootOp {
     /// `mount(source, target, MS_BIND | MS_REC)`, followed by a second
     /// `MS_REMOUNT | MS_BIND | MS_RDONLY` call when `read_only`. The second call is required: a
     /// single `MS_BIND | MS_RDONLY` mount does *not* produce a read-only bind.
-    Bind { source: PathBuf, target: PathBuf, read_only: bool },
+    Bind {
+        source: PathBuf,
+        target: PathBuf,
+        read_only: bool,
+    },
     /// A fresh `tmpfs`.
-    Tmpfs { target: PathBuf, options: &'static str },
+    Tmpfs {
+        target: PathBuf,
+        options: &'static str,
+    },
     /// A `/proc`: a fresh `procfs` masked with `hidepid` where the kernel permits one, a bind of
     /// the host's where it does not. Which of the two a host gets is decided at execution time, not
     /// here — see [`PROC_HIDEPID_OPTIONS`].
@@ -779,7 +894,10 @@ pub(crate) fn plan_composed_root(
     let dev = base.join("dev");
     builder.mkdir_p(&dev);
     builder.push(
-        RootOp::Tmpfs { target: dev.clone(), options: "mode=0755,size=1m" },
+        RootOp::Tmpfs {
+            target: dev.clone(),
+            options: "mode=0755,size=1m",
+        },
         true,
     );
     for device in SEALED_DEVICE_NODES {
@@ -789,14 +907,24 @@ pub(crate) fn plan_composed_root(
         }
         let target = dev.join(device.name);
         builder.push(RootOp::MkFile(target.clone()), false);
-        builder.push(RootOp::Bind { source, target, read_only: false }, false);
+        builder.push(
+            RootOp::Bind {
+                source,
+                target,
+                read_only: false,
+            },
+            false,
+        );
     }
     let pts = dev.join("pts");
     builder.push(RootOp::MkDir(pts.clone()), false);
     builder.push(RootOp::DevPts { target: pts }, false);
     for (link, target) in SEALED_DEVICE_SYMLINKS {
         builder.push(
-            RootOp::Symlink { target: PathBuf::from(*target), link: dev.join(link) },
+            RootOp::Symlink {
+                target: PathBuf::from(*target),
+                link: dev.join(link),
+            },
             false,
         );
     }
@@ -870,7 +998,11 @@ impl PlanBuilder {
     fn new(base: &Path) -> Self {
         let mut made = std::collections::HashSet::new();
         made.insert(base.to_path_buf());
-        Self { base: base.to_path_buf(), steps: Vec::new(), made }
+        Self {
+            base: base.to_path_buf(),
+            steps: Vec::new(),
+            made,
+        }
     }
 
     fn push(&mut self, op: RootOp, required: bool) {
@@ -886,7 +1018,10 @@ impl PlanBuilder {
         for component in relative.components() {
             current = current.join(component);
             if self.made.insert(current.clone()) {
-                self.steps.push(RootStep { op: RootOp::MkDir(current.clone()), required: true });
+                self.steps.push(RootStep {
+                    op: RootOp::MkDir(current.clone()),
+                    required: true,
+                });
             }
         }
     }
@@ -919,7 +1054,11 @@ impl PlanBuilder {
         }
         self.mkdir_p(&target);
         self.push(
-            RootOp::Bind { source: source.to_path_buf(), target, read_only: true },
+            RootOp::Bind {
+                source: source.to_path_buf(),
+                target,
+                read_only: true,
+            },
             /* required */ true,
         );
     }
@@ -940,12 +1079,22 @@ impl PlanBuilder {
                     self.mkdir_p(parent);
                 }
                 self.made.insert(target.clone());
-                self.push(RootOp::Symlink { target: link_target, link: target }, required);
+                self.push(
+                    RootOp::Symlink {
+                        target: link_target,
+                        link: target,
+                    },
+                    required,
+                );
             }
             PathKind::Dir => {
                 self.mkdir_p(&target);
                 self.push(
-                    RootOp::Bind { source: source.to_path_buf(), target, read_only: true },
+                    RootOp::Bind {
+                        source: source.to_path_buf(),
+                        target,
+                        read_only: true,
+                    },
                     required,
                 );
             }
@@ -970,7 +1119,14 @@ impl PlanBuilder {
         }
         self.made.insert(target.clone());
         self.push(RootOp::MkFile(target.clone()), required);
-        self.push(RootOp::Bind { source, target, read_only: true }, required);
+        self.push(
+            RootOp::Bind {
+                source,
+                target,
+                read_only: true,
+            },
+            required,
+        );
     }
 }
 
@@ -1052,8 +1208,9 @@ mod linux {
             return true;
         }
 
-        let restricted = read_trimmed("/sys/module/apparmor/parameters/restrict_unprivileged_userns")
-            .or_else(|| read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"));
+        let restricted =
+            read_trimmed("/sys/module/apparmor/parameters/restrict_unprivileged_userns")
+                .or_else(|| read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"));
         if !matches!(restricted.as_deref(), Some("Y") | Some("1")) {
             return true;
         }
@@ -1192,7 +1349,11 @@ mod linux {
                     libc::MS_REC | libc::MS_PRIVATE,
                     std::ptr::null(),
                 );
-                libc::_exit(if rc == 0 { PROBE_OK } else { PROBE_MOUNT_DENIED });
+                libc::_exit(if rc == 0 {
+                    PROBE_OK
+                } else {
+                    PROBE_MOUNT_DENIED
+                });
             }
         }
 
@@ -1288,11 +1449,25 @@ mod linux {
     enum CStepKind {
         MkDir(CString),
         MkFile(CString),
-        Symlink { target: CString, link: CString },
-        Bind { source: CString, target: CString, read_only: bool },
-        Tmpfs { target: CString, options: CString },
-        Proc { target: CString },
-        DevPts { target: CString },
+        Symlink {
+            target: CString,
+            link: CString,
+        },
+        Bind {
+            source: CString,
+            target: CString,
+            read_only: bool,
+        },
+        Tmpfs {
+            target: CString,
+            options: CString,
+        },
+        Proc {
+            target: CString,
+        },
+        DevPts {
+            target: CString,
+        },
         RemountReadOnly(CString),
     }
 
@@ -1381,10 +1556,17 @@ mod linux {
                     format!("create {}", path.display()),
                 ),
                 RootOp::Symlink { target, link } => (
-                    CStepKind::Symlink { target: cstr(target)?, link: cstr(link)? },
+                    CStepKind::Symlink {
+                        target: cstr(target)?,
+                        link: cstr(link)?,
+                    },
                     format!("symlink {} -> {}", link.display(), target.display()),
                 ),
-                RootOp::Bind { source, target, read_only } => (
+                RootOp::Bind {
+                    source,
+                    target,
+                    read_only,
+                } => (
                     CStepKind::Bind {
                         source: cstr(source)?,
                         target: cstr(target)?,
@@ -1405,11 +1587,15 @@ mod linux {
                     format!("tmpfs on {}", target.display()),
                 ),
                 RootOp::Proc { target } => (
-                    CStepKind::Proc { target: cstr(target)? },
+                    CStepKind::Proc {
+                        target: cstr(target)?,
+                    },
                     format!("proc on {}", target.display()),
                 ),
                 RootOp::DevPts { target } => (
-                    CStepKind::DevPts { target: cstr(target)? },
+                    CStepKind::DevPts {
+                        target: cstr(target)?,
+                    },
                     format!("devpts on {}", target.display()),
                 ),
                 RootOp::RemountReadOnly(path) => (
@@ -1417,7 +1603,11 @@ mod linux {
                     format!("remount read-only {}", path.display()),
                 ),
             };
-            steps.push(CStep { kind, required: *required, label });
+            steps.push(CStep {
+                kind,
+                required: *required,
+                label,
+            });
         }
 
         Ok(SealedRootSpec {
@@ -1449,9 +1639,7 @@ mod linux {
     ///
     /// Allocation-free on the success path: every path was turned into a `CString` by
     /// [`build_sealed_root_spec`] before `fork()`.
-    pub(crate) fn construct_composed_root(
-        spec: &SealedRootSpec,
-    ) -> Result<(), SealedRootFailure> {
+    pub(crate) fn construct_composed_root(spec: &SealedRootSpec) -> Result<(), SealedRootFailure> {
         // SAFETY: every call below is a bare syscall over pointers into `spec`, which outlives
         // this function. No allocation, no locks, no reentrancy — the constraints of the
         // post-fork/pre-exec window.
@@ -1460,7 +1648,9 @@ mod linux {
             //    host root; asking for both in one call means the mount namespace is created with
             //    the new user namespace's credentials already in force.
             if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
-                return Err(SealedRootFailure::stage("unshare(CLONE_NEWUSER|CLONE_NEWNS)"));
+                return Err(SealedRootFailure::stage(
+                    "unshare(CLONE_NEWUSER|CLONE_NEWNS)",
+                ));
             }
 
             // 2. Identity uid/gid maps. `setgroups=deny` first, which the kernel requires before
@@ -1506,7 +1696,9 @@ mod linux {
                 c"mode=0755".as_ptr() as *const libc::c_void,
             ) != 0
             {
-                return Err(SealedRootFailure::stage("mount tmpfs for the composed root"));
+                return Err(SealedRootFailure::stage(
+                    "mount tmpfs for the composed root",
+                ));
             }
 
             // 5. The plan.
@@ -1519,7 +1711,9 @@ mod linux {
             // 6. Pivot. `chdir` into the new root first so `pivot_root` can be handed the pair of
             //    relative paths the syscall is happiest with.
             if libc::mkdir(spec.old_root_full.as_ptr(), 0o700) != 0 {
-                return Err(SealedRootFailure::stage("mkdir the old-root parking directory"));
+                return Err(SealedRootFailure::stage(
+                    "mkdir the old-root parking directory",
+                ));
             }
             if libc::chdir(spec.base.as_ptr()) != 0 {
                 return Err(SealedRootFailure::stage("chdir into the composed root"));
@@ -1553,18 +1747,25 @@ mod linux {
                 std::ptr::null(),
                 c"/".as_ptr(),
                 std::ptr::null(),
-                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | libc::MS_NOSUID
+                libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
                     | libc::MS_NODEV,
                 std::ptr::null(),
             ) != 0
             {
-                return Err(SealedRootFailure::stage("remount the composed root read-only"));
+                return Err(SealedRootFailure::stage(
+                    "remount the composed root read-only",
+                ));
             }
 
             // 9. Back into the workdir, at the same absolute path it had on the host. `Command`
             //    already `chdir`ed here before this closure ran, but that was in the old root.
             if libc::chdir(spec.workdir_in_root.as_ptr()) != 0 {
-                return Err(SealedRootFailure::stage("chdir into the workdir inside the root"));
+                return Err(SealedRootFailure::stage(
+                    "chdir into the workdir inside the root",
+                ));
             }
         }
 
@@ -1604,7 +1805,11 @@ mod linux {
                     return Err(());
                 }
             }
-            CStepKind::Bind { source, target, read_only } => {
+            CStepKind::Bind {
+                source,
+                target,
+                read_only,
+            } => {
                 if libc::mount(
                     source.as_ptr(),
                     target.as_ptr(),
@@ -1778,10 +1983,22 @@ mod tests {
         fn usrmerge() -> Self {
             let mut map = HashMap::new();
             map.insert(PathBuf::from("/usr"), PathKind::Dir);
-            map.insert(PathBuf::from("/bin"), PathKind::Symlink(PathBuf::from("usr/bin")));
-            map.insert(PathBuf::from("/sbin"), PathKind::Symlink(PathBuf::from("usr/sbin")));
-            map.insert(PathBuf::from("/lib"), PathKind::Symlink(PathBuf::from("usr/lib")));
-            map.insert(PathBuf::from("/lib64"), PathKind::Symlink(PathBuf::from("usr/lib64")));
+            map.insert(
+                PathBuf::from("/bin"),
+                PathKind::Symlink(PathBuf::from("usr/bin")),
+            );
+            map.insert(
+                PathBuf::from("/sbin"),
+                PathKind::Symlink(PathBuf::from("usr/sbin")),
+            );
+            map.insert(
+                PathBuf::from("/lib"),
+                PathKind::Symlink(PathBuf::from("usr/lib")),
+            );
+            map.insert(
+                PathBuf::from("/lib64"),
+                PathKind::Symlink(PathBuf::from("usr/lib64")),
+            );
             map.insert(PathBuf::from("/etc/ld.so.cache"), PathKind::File);
             map.insert(PathBuf::from("/etc/ssl"), PathKind::Dir);
             // Present on the fake host precisely so the synthesis tests below can show that having
@@ -1819,23 +2036,33 @@ mod tests {
     fn base_selection_skips_any_ancestor_of_the_workdir() {
         // The default case: a workdir under the user's home, so `/tmp` is free.
         assert_eq!(
-            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| true),
+            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| {
+                true
+            }),
             Some(PathBuf::from("/tmp"))
         );
         // A workdir under /tmp — overmounting /tmp would hide the workdir before it can be bound.
         assert_eq!(
-            choose_root_base(Path::new("/tmp/session/w"), SEALED_ROOT_BASE_CANDIDATES, |_| true),
+            choose_root_base(
+                Path::new("/tmp/session/w"),
+                SEALED_ROOT_BASE_CANDIDATES,
+                |_| true
+            ),
             Some(PathBuf::from("/run"))
         );
         // A host missing the first two candidates falls through to the third.
         assert_eq!(
-            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |path| {
-                path != Path::new("/tmp") && path != Path::new("/run")
-            }),
+            choose_root_base(
+                Path::new("/home/u/w"),
+                SEALED_ROOT_BASE_CANDIDATES,
+                |path| { path != Path::new("/tmp") && path != Path::new("/run") }
+            ),
             Some(PathBuf::from("/var/tmp"))
         );
         assert_eq!(
-            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| false),
+            choose_root_base(Path::new("/home/u/w"), SEALED_ROOT_BASE_CANDIDATES, |_| {
+                false
+            }),
             None
         );
     }
@@ -1865,7 +2092,11 @@ mod tests {
             .steps
             .iter()
             .filter_map(|step| match &step.op {
-                RootOp::Bind { source, read_only: false, .. } => Some(source),
+                RootOp::Bind {
+                    source,
+                    read_only: false,
+                    ..
+                } => Some(source),
                 _ => None,
             })
             .collect();
@@ -1954,7 +2185,11 @@ mod tests {
     /// observes as `pwd.getpwuid(os.getuid()).pw_dir == os.environ["HOME"]`.
     #[test]
     fn the_synthetic_databases_name_root_and_the_capsules_own_id_and_nothing_else() {
-        let identity = SealedAccountIdentity { uid: 1000, gid: 1000, home: "/w/.capsule-home" };
+        let identity = SealedAccountIdentity {
+            uid: 1000,
+            gid: 1000,
+            home: "/w/.capsule-home",
+        };
 
         let passwd = SyntheticEtcFile::Passwd.render(&identity).unwrap();
         assert_eq!(
@@ -1965,11 +2200,19 @@ mod tests {
         let group = SyntheticEtcFile::Group.render(&identity).unwrap();
         assert_eq!(group, "root:x:0:\ncapsule:x:1000:\n");
 
-        for (file, contents) in
-            [(SyntheticEtcFile::Passwd, &passwd), (SyntheticEtcFile::Group, &group)]
-        {
-            assert_eq!(contents.lines().count(), 2, "{file:?} must stay a two-line database");
-            assert!(contents.ends_with('\n'), "{file:?} must end its last record with a newline");
+        for (file, contents) in [
+            (SyntheticEtcFile::Passwd, &passwd),
+            (SyntheticEtcFile::Group, &group),
+        ] {
+            assert_eq!(
+                contents.lines().count(),
+                2,
+                "{file:?} must stay a two-line database"
+            );
+            assert!(
+                contents.ends_with('\n'),
+                "{file:?} must end its last record with a newline"
+            );
         }
     }
 
@@ -1977,13 +2220,20 @@ mod tests {
     /// for uid 0 would leave `getpwuid(0)` resolving to whichever the parser saw first.
     #[test]
     fn a_root_capsule_gets_a_single_passwd_line_carrying_its_own_home() {
-        let identity = SealedAccountIdentity { uid: 0, gid: 0, home: "/w/.capsule-home" };
+        let identity = SealedAccountIdentity {
+            uid: 0,
+            gid: 0,
+            home: "/w/.capsule-home",
+        };
 
         assert_eq!(
             SyntheticEtcFile::Passwd.render(&identity).unwrap(),
             "root:x:0:0:root:/w/.capsule-home:/bin/sh\n"
         );
-        assert_eq!(SyntheticEtcFile::Group.render(&identity).unwrap(), "root:x:0:\n");
+        assert_eq!(
+            SyntheticEtcFile::Group.render(&identity).unwrap(),
+            "root:x:0:\n"
+        );
     }
 
     /// `passwd(5)` has no escaping, so a home path containing the field separator would silently
@@ -1991,16 +2241,26 @@ mod tests {
     #[test]
     fn a_home_path_that_cannot_be_spelled_in_a_passwd_field_is_refused() {
         for home in ["/w/od:d", "/w/two\nlines"] {
-            let identity = SealedAccountIdentity { uid: 1000, gid: 1000, home };
+            let identity = SealedAccountIdentity {
+                uid: 1000,
+                gid: 1000,
+                home,
+            };
             let error = SyntheticEtcFile::Passwd.render(&identity).unwrap_err();
-            assert!(error.contains(home), "the message must name the offending path: {error}");
+            assert!(
+                error.contains(home),
+                "the message must name the offending path: {error}"
+            );
         }
     }
 
     #[test]
     fn the_workdir_keeps_its_absolute_path_inside_the_root() {
         let plan = plan_for("/home/u/.murmur/sessions/abc");
-        assert_eq!(plan.workdir_in_root, PathBuf::from("/home/u/.murmur/sessions/abc"));
+        assert_eq!(
+            plan.workdir_in_root,
+            PathBuf::from("/home/u/.murmur/sessions/abc")
+        );
         assert!(ops(&plan).contains(&RootOp::Bind {
             source: PathBuf::from("/home/u/.murmur/sessions/abc"),
             target: PathBuf::from("/tmp/home/u/.murmur/sessions/abc"),
@@ -2047,15 +2307,15 @@ mod tests {
 
         let tmp_index = operations
             .iter()
-            .position(|op| {
-                matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp"))
-            })
+            .position(
+                |op| matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp")),
+            )
             .expect("the composed /tmp is bound");
         let workdir_index = operations
             .iter()
-            .position(|op| {
-                matches!(op, RootOp::Bind { source, .. } if source == Path::new(workdir))
-            })
+            .position(
+                |op| matches!(op, RootOp::Bind { source, .. } if source == Path::new(workdir)),
+            )
             .expect("the workdir is bound");
         assert!(
             tmp_index < workdir_index,
@@ -2081,19 +2341,26 @@ mod tests {
             );
         }
         // No block device, and nothing outside the OCI default set.
-        assert!(!operations
-            .iter()
-            .any(|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/dev/sda"))));
+        assert!(!operations.iter().any(
+            |op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/dev/sda"))
+        ));
 
         let tmpfs_index = operations
             .iter()
-            .position(|op| matches!(op, RootOp::Tmpfs { target, .. } if target == Path::new("/tmp/dev")))
+            .position(
+                |op| matches!(op, RootOp::Tmpfs { target, .. } if target == Path::new("/tmp/dev")),
+            )
             .expect("/dev tmpfs");
         let sealed_index = operations
             .iter()
-            .position(|op| matches!(op, RootOp::RemountReadOnly(path) if path == Path::new("/tmp/dev")))
+            .position(
+                |op| matches!(op, RootOp::RemountReadOnly(path) if path == Path::new("/tmp/dev")),
+            )
             .expect("/dev sealed read-only");
-        assert!(tmpfs_index < sealed_index, "the device nodes must be bound before /dev is sealed");
+        assert!(
+            tmpfs_index < sealed_index,
+            "the device nodes must be bound before /dev is sealed"
+        );
     }
 
     /// The plan always asks for a masked `/proc`; whether the kernel grants one is a runtime
@@ -2105,7 +2372,9 @@ mod tests {
     #[test]
     fn proc_is_planned_and_masking_is_preferred_over_an_unmasked_mount() {
         let plan = plan_for("/home/u/w");
-        assert!(ops(&plan).contains(&RootOp::Proc { target: PathBuf::from("/tmp/proc") }));
+        assert!(ops(&plan).contains(&RootOp::Proc {
+            target: PathBuf::from("/tmp/proc")
+        }));
         assert_eq!(PROC_HIDEPID_OPTIONS[0], "hidepid=2");
         assert_eq!(
             PROC_HIDEPID_OPTIONS.last(),
@@ -2117,7 +2386,8 @@ mod tests {
     #[test]
     fn manifest_derived_directories_are_whole_directory_binds_and_deduped() {
         let mut host = FakeHost::usrmerge();
-        host.0.insert(PathBuf::from("/opt/python3.12"), PathKind::Dir);
+        host.0
+            .insert(PathBuf::from("/opt/python3.12"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
             Path::new("/tmp"),
@@ -2136,7 +2406,9 @@ mod tests {
         assert_eq!(
             operations
                 .iter()
-                .filter(|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/usr")))
+                .filter(
+                    |op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/usr"))
+                )
                 .count(),
             1
         );
@@ -2172,10 +2444,12 @@ mod tests {
         let staged = plan
             .steps
             .iter()
-            .find(|step| matches!(
-                &step.op,
-                RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree")
-            ))
+            .find(|step| {
+                matches!(
+                    &step.op,
+                    RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree")
+                )
+            })
             .expect("an absent staged_runtime path must still plan a bind");
         assert_eq!(
             staged.op,
@@ -2198,7 +2472,8 @@ mod tests {
     #[test]
     fn staged_runtime_binds_are_planned_before_every_other_step() {
         let mut host = FakeHost::usrmerge();
-        host.0.insert(PathBuf::from("/opt/staged-tree"), PathKind::Dir);
+        host.0
+            .insert(PathBuf::from("/opt/staged-tree"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
             Path::new("/tmp"),
@@ -2214,27 +2489,32 @@ mod tests {
                 .expect("step must be planned")
         };
 
-        let staged = position(&|op| {
-            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree"))
-        });
-        let fixed_runtime_tree = position(&|op| {
-            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/usr"))
-        });
-        let etc = position(&|op| {
-            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/etc/ssl"))
-        });
-        let dev = position(&|op| matches!(op, RootOp::Tmpfs { target, .. } if target == Path::new("/tmp/dev")));
+        let staged = position(
+            &|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/opt/staged-tree")),
+        );
+        let fixed_runtime_tree = position(
+            &|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/usr")),
+        );
+        let etc = position(
+            &|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/etc/ssl")),
+        );
+        let dev = position(
+            &|op| matches!(op, RootOp::Tmpfs { target, .. } if target == Path::new("/tmp/dev")),
+        );
         let proc = position(&|op| matches!(op, RootOp::Proc { .. }));
-        let tmp = position(&|op| {
-            matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp"))
-        });
-        let workdir = position(&|op| {
-            matches!(op, RootOp::Bind { source, .. } if source == Path::new("/home/u/w"))
-        });
+        let tmp = position(
+            &|op| matches!(op, RootOp::Bind { target, .. } if target == Path::new("/tmp/tmp")),
+        );
+        let workdir = position(
+            &|op| matches!(op, RootOp::Bind { source, .. } if source == Path::new("/home/u/w")),
+        );
 
         // Ahead of the fixed runtime tree / `extra_read_only` loop, so a coincidental target
         // collision is won by the required registration rather than the optional one.
-        assert!(staged < fixed_runtime_tree, "staged binds precede the fixed runtime tree");
+        assert!(
+            staged < fixed_runtime_tree,
+            "staged binds precede the fixed runtime tree"
+        );
         assert!(staged < etc, "staged binds precede /etc");
         assert!(staged < dev, "staged binds precede /dev");
         assert!(staged < proc, "staged binds precede /proc");
@@ -2259,13 +2539,22 @@ mod tests {
         let binds: Vec<&RootStep> = plan
             .steps
             .iter()
-            .filter(|step| matches!(
-                &step.op,
-                RootOp::Bind { source, .. } if source == Path::new("/opt/shared")
-            ))
+            .filter(|step| {
+                matches!(
+                    &step.op,
+                    RootOp::Bind { source, .. } if source == Path::new("/opt/shared")
+                )
+            })
             .collect();
-        assert_eq!(binds.len(), 1, "the shared target is registered exactly once");
-        assert!(binds[0].required, "and the required registration is the one that won");
+        assert_eq!(
+            binds.len(),
+            1,
+            "the shared target is registered exactly once"
+        );
+        assert!(
+            binds[0].required,
+            "and the required registration is the one that won"
+        );
     }
 
     #[test]
@@ -2307,10 +2596,16 @@ mod tests {
             apparmor_permits_userns: true,
             namespace: NamespaceProbe::MapDenied,
         };
-        assert_eq!(sealed_blocker(true, true, probe), Some(SealedBlocker::IdMapDenied));
+        assert_eq!(
+            sealed_blocker(true, true, probe),
+            Some(SealedBlocker::IdMapDenied)
+        );
 
         let reason = SealedBlocker::IdMapDenied.reason();
-        assert!(reason.contains("uid_map"), "must name the step that failed: {reason}");
+        assert!(
+            reason.contains("uid_map"),
+            "must name the step that failed: {reason}"
+        );
         assert!(
             !reason.contains("CAP_SYS_ADMIN") && !reason.contains("--cap-add"),
             "must not send the operator after a capability that isn't the problem: {reason}",
@@ -2384,7 +2679,10 @@ mod tests {
             namespace: NamespaceProbe::Ok,
         };
         assert_eq!(sealed_blocker(true, true, ok), None);
-        assert_eq!(sealed_blocker(false, true, ok), Some(SealedBlocker::NotLinux));
+        assert_eq!(
+            sealed_blocker(false, true, ok),
+            Some(SealedBlocker::NotLinux)
+        );
         assert_eq!(
             sealed_blocker(true, false, ok),
             Some(SealedBlocker::LandlockUnavailable)
@@ -2393,7 +2691,10 @@ mod tests {
             sealed_blocker(
                 true,
                 true,
-                SealedProbe { apparmor_permits_userns: true, namespace: NamespaceProbe::MountDenied }
+                SealedProbe {
+                    apparmor_permits_userns: true,
+                    namespace: NamespaceProbe::MountDenied
+                }
             ),
             Some(SealedBlocker::MountDenied)
         );
@@ -2401,7 +2702,10 @@ mod tests {
             sealed_blocker(
                 true,
                 true,
-                SealedProbe { apparmor_permits_userns: true, namespace: NamespaceProbe::Unsupported }
+                SealedProbe {
+                    apparmor_permits_userns: true,
+                    namespace: NamespaceProbe::Unsupported
+                }
             ),
             Some(SealedBlocker::KernelUnsupported)
         );

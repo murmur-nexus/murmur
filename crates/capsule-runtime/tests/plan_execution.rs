@@ -73,9 +73,7 @@ fn find<'a>(report: &'a plan::ExecutionReport, step_id: &str) -> &'a plan::StepR
 
 #[test]
 fn test_parallel_tool_steps_run_concurrently() {
-    if capsule_runtime::skip_without_host_support(
-        "test_parallel_tool_steps_run_concurrently",
-    ) {
+    if capsule_runtime::skip_without_host_support("test_parallel_tool_steps_run_concurrently") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -109,9 +107,7 @@ fn test_parallel_tool_steps_run_concurrently() {
 
 #[test]
 fn test_dependent_step_receives_upstream_output() {
-    if capsule_runtime::skip_without_host_support(
-        "test_dependent_step_receives_upstream_output",
-    ) {
+    if capsule_runtime::skip_without_host_support("test_dependent_step_receives_upstream_output") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -201,9 +197,8 @@ fn test_capsule_step_spawns_and_reads_result() {
 /// so wrapping the objective in one would only hand the child JSON to decode before it can start.
 #[test]
 fn test_capsule_step_sends_objective_as_plain_text() {
-    if capsule_runtime::skip_without_host_support(
-        "test_capsule_step_sends_objective_as_plain_text",
-    ) {
+    if capsule_runtime::skip_without_host_support("test_capsule_step_sends_objective_as_plain_text")
+    {
         return;
     }
     let _guard = roost_env_lock().lock().unwrap();
@@ -440,9 +435,7 @@ fn test_retries_before_error_policy() {
 
 #[test]
 fn test_join_point_waits_for_multiple_upstreams() {
-    if capsule_runtime::skip_without_host_support(
-        "test_join_point_waits_for_multiple_upstreams",
-    ) {
+    if capsule_runtime::skip_without_host_support("test_join_point_waits_for_multiple_upstreams") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -666,9 +659,7 @@ fn write_http_json(stream: &mut TcpStream, body: &Value) {
 
 #[test]
 fn test_cycle_is_reported_without_running_steps() {
-    if capsule_runtime::skip_without_host_support(
-        "test_cycle_is_reported_without_running_steps",
-    ) {
+    if capsule_runtime::skip_without_host_support("test_cycle_is_reported_without_running_steps") {
         return;
     }
     let dir = tempdir().unwrap();

@@ -224,12 +224,7 @@ fn show_no_arg_single_session_resolves_correctly() {
     );
 
     mur()
-        .args([
-            "trace",
-            "show",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "show", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("test-capsule"))
@@ -252,12 +247,7 @@ fn show_no_arg_multiple_sessions_picks_lexicographically_largest() {
     );
 
     mur()
-        .args([
-            "trace",
-            "show",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "show", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         // FIXTURE_B has 1700ms duration and max_turns_reached
@@ -270,12 +260,7 @@ fn show_no_arg_empty_workdir_gives_clear_error() {
     let tmp = TempDir::new().unwrap();
 
     mur()
-        .args([
-            "trace",
-            "show",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "show", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no sessions found in workdir"));
@@ -773,12 +758,7 @@ fn diff_no_args_defaults_to_two_most_recent_sessions() {
 
     // No positional args → before=@2 (A, 500ms/ok), after=@1 (B, 1.7s/max_turns_reached)
     mur()
-        .args([
-            "trace",
-            "diff",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "diff", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("500ms"))
@@ -859,12 +839,7 @@ fn report_exits_zero_and_shows_session_count() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Sessions: 3"));
@@ -890,12 +865,7 @@ fn report_shows_aggregate_statistics() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Mean"))
@@ -926,12 +896,7 @@ fn report_shows_exit_status_distribution() {
 
     // A and C are "ok", B is "max_turns_reached"
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Exit status"))
@@ -949,12 +914,7 @@ fn report_works_with_single_session() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Sessions: 1"));
@@ -982,12 +942,7 @@ fn report_no_args_includes_all_sessions() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Sessions: 3"));
@@ -1403,12 +1358,7 @@ fn trace_report_per_task_averages_section() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Per-task averages"))
@@ -1432,12 +1382,7 @@ fn trace_report_no_per_task_section_when_all_single_task() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Per-task averages").not());
@@ -1448,12 +1393,7 @@ fn report_empty_workdir_gives_clear_error() {
     let tmp = TempDir::new().unwrap();
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("no sessions found"));
@@ -1477,12 +1417,7 @@ fn report_skips_incomplete_sessions_and_reports_complete_ones() {
     write_session(tmp.path(), "ses_cccccccccccc4ccc8ccc000000000003", "");
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         // Only the 2 complete sessions are counted
@@ -1498,12 +1433,7 @@ fn report_all_incomplete_sessions_is_an_error() {
     write_session(tmp.path(), "ses_bbbbbbbbbbbb4bbb8bbb000000000002", "");
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("incomplete"));
@@ -1534,12 +1464,7 @@ fn report_session_block_header_shows_id_duration_turns() {
 
     // session ID truncated to ses_ + 8 hex chars + ..., duration 500ms, 2 turns
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Session ses_aaaaaaaa..."))
@@ -1558,12 +1483,7 @@ fn report_session_block_no_error_no_parenthetical() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Tool calls:"))
@@ -1581,12 +1501,7 @@ fn report_session_block_error_shows_parenthetical() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("(4 ok, 1 error)"));
@@ -1603,15 +1518,12 @@ fn report_session_block_exit_codes_sorted_by_frequency() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("exit codes: 4 ok, 1 failed (exit 1)"));
+        .stdout(predicate::str::contains(
+            "exit codes: 4 ok, 1 failed (exit 1)",
+        ));
 }
 
 #[test]
@@ -1625,12 +1537,7 @@ fn report_session_block_no_shell_calls_omits_shell_line() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Shell calls:").not());
@@ -1647,12 +1554,7 @@ fn report_session_block_latency_shown_with_correct_averages() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Avg latency:"))
@@ -1672,12 +1574,7 @@ fn report_session_block_multi_tool_latency_average() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("tool 188ms"))
@@ -1695,12 +1592,7 @@ fn report_session_block_latency_omitted_when_no_tool_calls() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("Avg latency:").not());
@@ -1775,12 +1667,7 @@ fn steps_no_arg_resolves_to_last_session() {
     );
 
     mur()
-        .args([
-            "trace",
-            "steps",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "steps", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         // Header should contain B's session ID
@@ -1830,7 +1717,9 @@ fn steps_default_output_format() {
         .assert()
         .success()
         // header
-        .stdout(predicate::str::contains("Session ses_aaaaaaaaaaaa4aaa8aaa000000000001"))
+        .stdout(predicate::str::contains(
+            "Session ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        ))
         .stdout(predicate::str::contains("(2 turns)"))
         // row format: decision column left-padded to 13, then tool name
         .stdout(predicate::str::contains("tool_call    bash"))
@@ -1862,10 +1751,7 @@ fn steps_verbose_truncates_long_input_at_60_chars() {
         .assert()
         .success()
         // First 60 chars + ellipsis, inside quotes
-        .stdout(predicate::str::contains(format!(
-            "\"{}…\"",
-            "x".repeat(60)
-        )))
+        .stdout(predicate::str::contains(format!("\"{}…\"", "x".repeat(60))))
         // The 61st character must NOT appear (confirms truncation at 60)
         .stdout(predicate::str::contains("x".repeat(61)).not());
 }
@@ -2349,12 +2235,7 @@ fn report_shows_redundant_calls_row_and_per_session_line() {
     );
 
     mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success()
         // aggregate row is always present
@@ -2379,12 +2260,7 @@ fn report_redundant_row_stats_are_correct() {
     );
 
     let out = mur()
-        .args([
-            "trace",
-            "report",
-            "--workdir",
-            tmp.path().to_str().unwrap(),
-        ])
+        .args(["trace", "report", "--workdir", tmp.path().to_str().unwrap()])
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
@@ -2454,7 +2330,11 @@ fn show_flags_symbol_addressed_tool_via_declared_resource_id() {
     // The litmus case: no path-like field exists in `input`, so the fallback heuristic yields
     // nothing. Declaring `resource_id` is the only thing making this detectable.
     let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "resource-symbol.jsonl", FIXTURE_RESOURCE_ID_SYMBOL);
+    let path = write_fixture(
+        tmp.path(),
+        "resource-symbol.jsonl",
+        FIXTURE_RESOURCE_ID_SYMBOL,
+    );
 
     mur()
         .args(["trace", "show", path.to_str().unwrap()])
@@ -2503,7 +2383,11 @@ fn show_declared_resource_id_takes_precedence_over_path_field() {
 fn show_empty_resource_id_falls_back_to_path_field() {
     // Empty string = undeclared, matching the `state_effect`/`continuation_id` convention.
     let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "resource-empty.jsonl", FIXTURE_RESOURCE_ID_EMPTY);
+    let path = write_fixture(
+        tmp.path(),
+        "resource-empty.jsonl",
+        FIXTURE_RESOURCE_ID_EMPTY,
+    );
 
     mur()
         .args(["trace", "show", path.to_str().unwrap()])
@@ -2518,7 +2402,11 @@ fn show_empty_resource_id_falls_back_to_path_field() {
 #[test]
 fn show_declared_mutate_clears_redundancy_for_declared_resource_id() {
     let tmp = TempDir::new().unwrap();
-    let path = write_fixture(tmp.path(), "resource-mutate.jsonl", FIXTURE_RESOURCE_ID_MUTATE);
+    let path = write_fixture(
+        tmp.path(),
+        "resource-mutate.jsonl",
+        FIXTURE_RESOURCE_ID_MUTATE,
+    );
 
     mur()
         .args(["trace", "show", path.to_str().unwrap()])

@@ -354,7 +354,10 @@ fn pick_non_empty(project: Option<String>, global: Option<String>) -> Option<Str
 fn merge_sources(global: Vec<SourceConfig>, project: Vec<SourceConfig>) -> Vec<SourceConfig> {
     let mut merged = global;
     for source in project {
-        match merged.iter_mut().find(|existing| existing.name == source.name) {
+        match merged
+            .iter_mut()
+            .find(|existing| existing.name == source.name)
+        {
             Some(existing) => *existing = source,
             None => merged.push(source),
         }
@@ -387,10 +390,22 @@ fn merge_inference(
         (global, Some(project)) => {
             let global = global.unwrap_or_default();
             Some(InferenceConfig {
-                provider: if !project.provider.is_empty() { project.provider } else { global.provider },
-                model: if !project.model.is_empty() { project.model } else { global.model },
+                provider: if !project.provider.is_empty() {
+                    project.provider
+                } else {
+                    global.provider
+                },
+                model: if !project.model.is_empty() {
+                    project.model
+                } else {
+                    global.model
+                },
                 api_key: global.api_key,
-                endpoint: if !project.endpoint.is_empty() { project.endpoint } else { global.endpoint },
+                endpoint: if !project.endpoint.is_empty() {
+                    project.endpoint
+                } else {
+                    global.endpoint
+                },
             })
         }
     }
@@ -592,7 +607,10 @@ mod tests {
         let source = &config.registry.sources[0];
         assert_eq!(source.name, "official");
         assert_eq!(source.r#type, SourceType::GitHub);
-        assert_eq!(source.repo.as_deref(), Some("murmur-nexus/default-artifacts"));
+        assert_eq!(
+            source.repo.as_deref(),
+            Some("murmur-nexus/default-artifacts")
+        );
         assert_eq!(source.url, None);
         assert_eq!(source.token, None);
     }
@@ -770,7 +788,10 @@ registry:
 
     #[test]
     fn merge_inference_api_key_empty_when_no_global_inference_block() {
-        let global = MurConfig { inference: None, ..MurConfig::default() };
+        let global = MurConfig {
+            inference: None,
+            ..MurConfig::default()
+        };
         let project = MurConfig {
             inference: Some(InferenceConfig {
                 provider: "anthropic".to_string(),
@@ -783,8 +804,14 @@ registry:
 
         let merged = merge_mur_configs(global, Some(project));
 
-        assert_eq!(merged.inference.as_ref().map(|i| i.api_key.as_str()), Some(""));
-        assert_eq!(merged.inference.as_ref().map(|i| i.model.as_str()), Some("claude"));
+        assert_eq!(
+            merged.inference.as_ref().map(|i| i.api_key.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            merged.inference.as_ref().map(|i| i.model.as_str()),
+            Some("claude")
+        );
     }
 
     #[test]
@@ -800,10 +827,22 @@ registry:
 
         // Both sides: the stronger wins regardless of which file holds it — the project file
         // may raise the global floor but must never lower it.
-        assert_eq!(merge_containment(Some(Advisory), Some(Sealed)), Some(Sealed));
-        assert_eq!(merge_containment(Some(Sealed), Some(Advisory)), Some(Sealed));
-        assert_eq!(merge_containment(Some(Advisory), Some(Scoped)), Some(Scoped));
-        assert_eq!(merge_containment(Some(Scoped), Some(Advisory)), Some(Scoped));
+        assert_eq!(
+            merge_containment(Some(Advisory), Some(Sealed)),
+            Some(Sealed)
+        );
+        assert_eq!(
+            merge_containment(Some(Sealed), Some(Advisory)),
+            Some(Sealed)
+        );
+        assert_eq!(
+            merge_containment(Some(Advisory), Some(Scoped)),
+            Some(Scoped)
+        );
+        assert_eq!(
+            merge_containment(Some(Scoped), Some(Advisory)),
+            Some(Scoped)
+        );
         assert_eq!(merge_containment(Some(Scoped), Some(Scoped)), Some(Scoped));
     }
 
@@ -838,12 +877,16 @@ registry:
         // silently pins a floor the operator did not ask for.
         let bare: MurConfig = serde_yaml::from_str("registry:\n  default: official\n").unwrap();
         assert_eq!(bare.containment, None);
-        assert!(!serde_yaml::to_string(&bare).unwrap().contains("containment"));
+        assert!(!serde_yaml::to_string(&bare)
+            .unwrap()
+            .contains("containment"));
     }
 
     #[test]
     fn is_literal_inference_api_key_detects_literal_vs_env_ref() {
-        assert!(is_literal_inference_api_key(&fake_key(&["sk-", "live-", "abc123"])));
+        assert!(is_literal_inference_api_key(&fake_key(&[
+            "sk-", "live-", "abc123"
+        ])));
         assert!(!is_literal_inference_api_key("${SOME_VAR}"));
         assert!(!is_literal_inference_api_key(""));
     }
@@ -886,7 +929,10 @@ registry:
         let baseline = baseline.expect("load_mur_config should succeed");
         let effective = effective.expect("load_effective_mur_config should succeed");
         assert_eq!(baseline.registry.default, effective.registry.default);
-        assert_eq!(baseline.registry.sources.len(), effective.registry.sources.len());
+        assert_eq!(
+            baseline.registry.sources.len(),
+            effective.registry.sources.len()
+        );
         assert_eq!(baseline.beta.enabled, effective.beta.enabled);
     }
 }

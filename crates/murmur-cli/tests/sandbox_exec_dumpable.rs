@@ -333,7 +333,11 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
 
     // The `tool_call` event is where the defect showed up as `status: "error"`.
     let tool_calls = events_of_type(&events, "tool_call");
-    assert_eq!(tool_calls.len(), 1, "expected one tool_call event: {tool_calls:?}");
+    assert_eq!(
+        tool_calls.len(),
+        1,
+        "expected one tool_call event: {tool_calls:?}"
+    );
     assert_eq!(
         tool_calls[0]["status"], "ok",
         "trace.jsonl must record the tool call as ok: {}",
@@ -343,7 +347,11 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
     // And the `shell` event proves the subprocess itself ran to completion, rather than the tool
     // call merely reporting an error string as a successful result.
     let shell_events = events_of_type(&events, "shell");
-    assert_eq!(shell_events.len(), 1, "expected one shell event: {shell_events:?}");
+    assert_eq!(
+        shell_events.len(),
+        1,
+        "expected one shell event: {shell_events:?}"
+    );
     assert_eq!(
         shell_events[0]["exit_code"], 0,
         "the allowlisted binary must exit 0: {}",

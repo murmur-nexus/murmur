@@ -12,10 +12,10 @@ use murmur_artifact::{
     current_platform, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
     read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
     ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
-    InferenceConfig, LifecycleConfig, LockedArtifact,
-    LockedSha256, LockfileError, MurmurLock, Registry, RegistryError, RuntimeType,
-    InterpreterRuntimeGrant, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
-    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
+    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
+    LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
+    MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
+    W_SEC_009, W_SEC_011,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -68,8 +68,8 @@ use crate::{
     },
     trace::TraceWriter,
     types::{
-        ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary,
-        LaunchResult, ResolvedLockArtifact, StageRequest, StagedHookArtifact, StagedSession,
+        ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
+        ResolvedLockArtifact, StageRequest, StagedHookArtifact, StagedSession,
     },
 };
 
@@ -268,9 +268,12 @@ const SSE_REPLAY_CAPACITY: usize = 512;
 /// binding match the runtime uses when it actually dispatches compaction, so MURMUR.md's
 /// "compaction configured" status reflects the real dispatch path rather than an artifact name.
 fn has_compaction_hook(hooks: &[StagedHookArtifact]) -> bool {
-    hooks
-        .iter()
-        .any(|h| matches!(h.config.binding, HookBinding::OnCompaction | HookBinding::All))
+    hooks.iter().any(|h| {
+        matches!(
+            h.config.binding,
+            HookBinding::OnCompaction | HookBinding::All
+        )
+    })
 }
 
 /// Resolves and verifies all artifacts, compiles components, and prepares session state.
@@ -523,11 +526,7 @@ pub fn stage_session(
                 // staged into `tool_components` and dispatched through
                 // `invoke_tool_component` like any tool, so narrowing needs no
                 // driver-specific enforcement anywhere downstream.
-                stage_artifact_grant(
-                    artifact,
-                    &ceiling_network_allow_rules,
-                    &mut artifact_grants,
-                )?;
+                stage_artifact_grant(artifact, &ceiling_network_allow_rules, &mut artifact_grants)?;
                 let tool_wasm =
                     extract_root_wasm(&artifact.name, &resolved_version, &resolved.bytes)?;
                 let tool_component = Component::new(&engine, tool_wasm).map_err(|err| {
@@ -785,7 +784,7 @@ pub fn launch_session(
         staged.declared_containment_floor,
     )
     .map_err(RuntimeError::Runtime)?
-        .with_host_bounding(cgroup_scope, workdir_guard);
+    .with_host_bounding(cgroup_scope, workdir_guard);
     let inference_env = staged
         .inference
         .as_ref()
@@ -827,8 +826,10 @@ pub fn launch_session(
             .build()
             .map_err(|e| RuntimeError::Runtime(format!("failed to create tokio runtime: {e}")))?;
 
-        let (tcp_listener, external_port) = rt
-            .block_on(identity::bind_local_port(&staged.bind_addr, staged.internal_port))?;
+        let (tcp_listener, external_port) = rt.block_on(identity::bind_local_port(
+            &staged.bind_addr,
+            staged.internal_port,
+        ))?;
 
         let capsule_url = format!("localhost:{external_port}");
         staged.capsule_url = capsule_url.clone();
@@ -863,7 +864,11 @@ pub fn launch_session(
             &capsule_identity,
         );
 
-        sandbox::warn_for_enforcement_tier(shell_enforcement.tier, &workdir, &staged.capability_policy);
+        sandbox::warn_for_enforcement_tier(
+            shell_enforcement.tier,
+            &workdir,
+            &staged.capability_policy,
+        );
         sandbox::warn_for_missing_aggregate_bounding(
             &workdir,
             requires_process_bounding,
@@ -895,7 +900,8 @@ pub fn launch_session(
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // SSE broadcast channel and replay buffer for SSE clients
-        let (sse_tx, _) = tokio::sync::broadcast::channel::<std::sync::Arc<String>>(SSE_BROADCAST_CAPACITY);
+        let (sse_tx, _) =
+            tokio::sync::broadcast::channel::<std::sync::Arc<String>>(SSE_BROADCAST_CAPACITY);
         let sse_buffer = std::sync::Arc::new(Mutex::new(SseEventBuffer::new(SSE_REPLAY_CAPACITY)));
 
         let capsule_name = staged.capsule_name.clone();
@@ -1633,12 +1639,12 @@ fn resolve_system_prompt(
 
     if let Some(art_name) = inference.system_prompt_artifact.as_ref() {
         let skill_path = workdir.join("tools").join(art_name).join("skill.md");
-        return fs::read_to_string(&skill_path)
-            .map(Some)
-            .map_err(|source| RuntimeError::SystemPromptArtifactRead {
+        return fs::read_to_string(&skill_path).map(Some).map_err(|source| {
+            RuntimeError::SystemPromptArtifactRead {
                 name: art_name.clone(),
                 source,
-            });
+            }
+        });
     }
 
     Ok(None)
@@ -1665,12 +1671,14 @@ fn resolve_compaction_system_prompt(
     }
 
     if let Some(path) = compaction.system_prompt_file.as_ref() {
-        return read_prompt_file(manifest_dir, path).map(Some).map_err(
-            |(prompt_path, source)| RuntimeError::CompactionSystemPromptFileRead {
-                path: prompt_path.display().to_string(),
-                source,
-            },
-        );
+        return read_prompt_file(manifest_dir, path)
+            .map(Some)
+            .map_err(
+                |(prompt_path, source)| RuntimeError::CompactionSystemPromptFileRead {
+                    path: prompt_path.display().to_string(),
+                    source,
+                },
+            );
     }
 
     Ok(None)
@@ -1709,7 +1717,9 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
         eprintln!("[capsule-runtime] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})");
         agent::append_bootstrap_log(
             workdir,
-            &format!("[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"),
+            &format!(
+                "[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"
+            ),
         );
     }
 }
@@ -2007,7 +2017,11 @@ fn inference_env_pairs(inference: &murmur_artifact::InferenceConfig) -> Vec<(Str
         ),
         (
             "MURMUR_INFERENCE_DRIVER".to_string(),
-            inference.driver.as_ref().map(|d| d.artifact.clone()).unwrap_or_default(),
+            inference
+                .driver
+                .as_ref()
+                .map(|d| d.artifact.clone())
+                .unwrap_or_default(),
         ),
     ];
 
@@ -2052,7 +2066,11 @@ pub(crate) async fn request_input_impl(
         &TaskStatusUpdateEvent {
             id: task_id.clone(),
             context_id: None,
-            status: StreamStatus { state: "input-required".into(), message: prompt.clone(), response: None },
+            status: StreamStatus {
+                state: "input-required".into(),
+                message: prompt.clone(),
+                response: None,
+            },
             r#final: false,
         },
     )
@@ -2075,7 +2093,11 @@ pub(crate) async fn request_input_impl(
                 &TaskStatusUpdateEvent {
                     id: task_id.clone(),
                     context_id: None,
-                    status: StreamStatus { state: "working".into(), message: "resumed".into(), response: None },
+                    status: StreamStatus {
+                        state: "working".into(),
+                        message: "resumed".into(),
+                        response: None,
+                    },
                     r#final: false,
                 },
             )
@@ -2398,7 +2420,12 @@ impl manage::Host for CapsuleStoreState {
             .find(|artifact| artifact.name == name)
         {
             s
-        } else if self.capability_policy.shell_allow.iter().any(|b| b == &name) {
+        } else if self
+            .capability_policy
+            .shell_allow
+            .iter()
+            .any(|b| b == &name)
+        {
             fallback_summary = InstalledArtifactSummary {
                 name: name.clone(),
                 version: "0.0.0".to_string(),
@@ -2458,14 +2485,14 @@ impl manage::Host for CapsuleStoreState {
 
         // 3. Extract murmur.yaml, dispatch extraction by runtime type, and write files under
         // <workdir>/tools/<name>/ — no disk writes happen before steps 1-2 succeed.
-        let manifest_yaml =
-            extract_manifest_yaml(&name, &version, &resolved.bytes).map_err(|err| err.to_string())?;
+        let manifest_yaml = extract_manifest_yaml(&name, &version, &resolved.bytes)
+            .map_err(|err| err.to_string())?;
         write_tool_manifest(&self.workdir, &name, &manifest_yaml).map_err(|err| err.to_string())?;
 
         let (artifact_runtime, implementation, wasm_component) = match resolved.meta.runtime {
             RuntimeType::Wasm => {
-                let wasm_bytes =
-                    extract_root_wasm(&name, &version, &resolved.bytes).map_err(|err| err.to_string())?;
+                let wasm_bytes = extract_root_wasm(&name, &version, &resolved.bytes)
+                    .map_err(|err| err.to_string())?;
                 let component = Component::new(&self.engine, &wasm_bytes)
                     .map_err(|err| format!("failed to compile pulled component '{name}': {err}"))?;
                 (
@@ -2479,7 +2506,11 @@ impl manage::Host for CapsuleStoreState {
                     .map_err(|err| err.to_string())?;
                 install_native_binaries(&self.workdir, vec![(name.clone(), binary)])
                     .map_err(|err| err.to_string())?;
-                (ArtifactRuntime::Tool, Some(ArtifactImplementation::Native), None)
+                (
+                    ArtifactRuntime::Tool,
+                    Some(ArtifactImplementation::Native),
+                    None,
+                )
             }
             RuntimeType::Static => {
                 let skill_md = extract_skill_md(&name, &version, &resolved.bytes)
@@ -2545,8 +2576,7 @@ impl manage::Host for CapsuleStoreState {
         Ok(manage::RuntimeState {
             capsule_id: self.session_id.clone(),
             installed: self.list(),
-            capabilities: "artifact-manager/search and remove are not implemented"
-                .to_string(),
+            capabilities: "artifact-manager/search and remove are not implemented".to_string(),
         })
     }
 }
@@ -2659,8 +2689,7 @@ pub(crate) async fn invoke_tool_component(
 
         inst.func_wrap(
             "emit-chunk",
-            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
-                  (chunk,): (String,)| {
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
                 chunks_emitted_flag.store(true, Ordering::Relaxed);
                 if let (Some((ref tx, ref buf)), Some(ref tid)) =
                     (&sse_for_chunk, &task_id_for_chunk)
@@ -2670,14 +2699,11 @@ pub(crate) async fn invoke_tool_component(
                 Ok(())
             },
         )
-        .map_err(|err| {
-            format!("failed to register emit-chunk for tool '{name}': {err}")
-        })?;
+        .map_err(|err| format!("failed to register emit-chunk for tool '{name}': {err}"))?;
 
         inst.func_wrap(
             "emit-thinking-chunk",
-            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
-                  (chunk,): (String,)| {
+            move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>, (chunk,): (String,)| {
                 if let (Some((ref tx, ref buf)), Some(ref tid)) =
                     (&sse_for_thinking, &task_id_for_thinking)
                 {
@@ -2702,9 +2728,7 @@ pub(crate) async fn invoke_tool_component(
         let ri_timeout = input_timeout_secs;
         linker
             .instance(task_iface)
-            .map_err(|err| {
-                format!("failed to define {task_iface} instance for '{name}': {err}")
-            })?
+            .map_err(|err| format!("failed to define {task_iface} instance for '{name}': {err}"))?
             .func_wrap_async(
                 "request-input",
                 move |_store: wasmtime::StoreContextMut<'_, ToolStoreState>,
@@ -2713,10 +2737,7 @@ pub(crate) async fn invoke_tool_component(
                     let sse = ri_sse.clone();
                     let tid = ri_task_id.clone();
                     let fut: std::pin::Pin<
-                        Box<
-                            dyn std::future::Future<Output = wasmtime::Result<(String,)>>
-                                + Send,
-                        >,
+                        Box<dyn std::future::Future<Output = wasmtime::Result<(String,)>> + Send>,
                     > = Box::pin(async move {
                         let result = match (reg, tid) {
                             (Some(reg), Some(tid)) => {
@@ -2736,9 +2757,7 @@ pub(crate) async fn invoke_tool_component(
                         >
                 },
             )
-            .map_err(|err| {
-                format!("failed to register request-input for tool '{name}': {err}")
-            })?;
+            .map_err(|err| format!("failed to register request-input for tool '{name}': {err}"))?;
     }
 
     let tool_limits = capability_policy.limits;
@@ -2774,11 +2793,11 @@ pub(crate) async fn invoke_tool_component(
 
     let tool_iface = resolve_versioned_iface(&instance, &mut store, WIT_TOOL_IFACE_VERSIONED)
         .ok_or_else(|| {
-        RuntimeError::ToolExportMissing {
-            name: name.to_string(),
-        }
-        .to_string()
-    })?;
+            RuntimeError::ToolExportMissing {
+                name: name.to_string(),
+            }
+            .to_string()
+        })?;
     let tool_run = instance
         .get_export_index(&mut store, Some(&tool_iface), "run")
         .and_then(|idx| instance.get_func(&mut store, idx))
@@ -2886,7 +2905,14 @@ impl CapsuleStoreState {
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
             return tokio::task::spawn_blocking(move || {
-                dispatch_shell_tool(&name, input, &workdir, &env_overrides, &policy, &enforcement)
+                dispatch_shell_tool(
+                    &name,
+                    input,
+                    &workdir,
+                    &env_overrides,
+                    &policy,
+                    &enforcement,
+                )
             })
             .await
             .map_err(|e| format!("shell tool panicked: {e}"));
@@ -3024,7 +3050,11 @@ impl WasiHttpView for ToolStoreState {
 ///
 /// Used both by `stage_session` (for every artifact declared in the manifest) and by
 /// `manage.pull()` (for the single artifact it just fetched at runtime).
-fn write_tool_manifest(workdir: &Path, name: &str, manifest_yaml: &str) -> Result<(), RuntimeError> {
+fn write_tool_manifest(
+    workdir: &Path,
+    name: &str,
+    manifest_yaml: &str,
+) -> Result<(), RuntimeError> {
     let manifest_path = workdir.join("tools").join(name).join(PACKED_MANIFEST_ENTRY);
     let Some(parent) = manifest_path.parent() else {
         return Err(RuntimeError::Runtime(format!(
@@ -3424,7 +3454,10 @@ fn extract_shell_command(input: &murmur::tool::run::ToolInput) -> Result<String,
     Ok(command.to_string())
 }
 
-fn shell_result_to_tool_result(command: &str, result: ShellResult) -> murmur::tool::run::ToolResult {
+fn shell_result_to_tool_result(
+    command: &str,
+    result: ShellResult,
+) -> murmur::tool::run::ToolResult {
     let mut data = format!(
         "$ {}\nExit code: {}\nStdout:\n{}\nStderr:\n{}",
         command, result.exit_code, result.stdout, result.stderr
@@ -3651,7 +3684,10 @@ mod tests {
         let log = bootstrap_log_contents(tmp.path());
         assert!(log.contains("bash"), "log should mention bash: {log}");
         assert!(log.contains("network"), "log should mention network: {log}");
-        assert!(log.contains(W_SEC_003), "log should carry its warning code: {log}");
+        assert!(
+            log.contains(W_SEC_003),
+            "log should carry its warning code: {log}"
+        );
         assert!(
             log.contains(&security_warning_link(W_SEC_003)),
             "log should link to the diagnostics doc page: {log}"
@@ -4285,8 +4321,7 @@ mod tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let skill = elsewhere.path().join("skill.md");
         fs::write(&skill, b"# absolute").unwrap();
-        let bytes =
-            load_local_skill_md(manifest_dir.path(), &skill.to_string_lossy()).unwrap();
+        let bytes = load_local_skill_md(manifest_dir.path(), &skill.to_string_lossy()).unwrap();
         assert_eq!(bytes, b"# absolute");
     }
 
@@ -4369,8 +4404,16 @@ mod tests {
         };
 
         let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();
-        let installed = staged.workdir.join("tools").join("my-skill").join("skill.md");
-        assert!(installed.exists(), "skill.md not installed at {}", installed.display());
+        let installed = staged
+            .workdir
+            .join("tools")
+            .join("my-skill")
+            .join("skill.md");
+        assert!(
+            installed.exists(),
+            "skill.md not installed at {}",
+            installed.display()
+        );
         assert_eq!(fs::read(&installed).unwrap(), b"# my local skill");
         // No lock artifact recorded for a local-source skill.
         assert!(staged.resolved_lock_artifacts.is_empty());
@@ -4516,7 +4559,10 @@ mod tests {
         );
 
         state.advance_continuation_acked_len(Some("ctx-a"), 2);
-        assert_eq!(state.active_continuation(Some("ctx-a")), Some(("cont-1", 2)));
+        assert_eq!(
+            state.active_continuation(Some("ctx-a")),
+            Some(("cont-1", 2))
+        );
 
         state.clear_continuation();
         state.advance_continuation_acked_len(Some("ctx-a"), 7);
@@ -4571,7 +4617,10 @@ mod tests {
     #[test]
     fn pull_happy_path_installs_artifact_and_updates_lock() {
         let artifact_bytes = zip_with_files(&[
-            (PACKED_MANIFEST_ENTRY, b"name: my-skill\nversion: 1.0.0\nruntime: skill\n"),
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: my-skill\nversion: 1.0.0\nruntime: skill\n",
+            ),
             ("skill.md", b"# guidance"),
         ]);
         let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
@@ -4599,7 +4648,9 @@ mod tests {
             .any(|a| a.name == "my-skill" && a.version == "1.0.0"));
 
         let lock = read_lockfile(&lock_path).expect("murmur.lock should have been written");
-        let entry = lock.artifact_for("my-skill").expect("lock entry for my-skill");
+        let entry = lock
+            .artifact_for("my-skill")
+            .expect("lock entry for my-skill");
         assert_eq!(entry.resolved_version, "1.0.0");
         assert_eq!(entry.sha256.wasm, expected_sha256);
     }
@@ -4646,7 +4697,11 @@ mod tests {
         fs::create_dir_all(&workdir).unwrap();
         let lock_path = project.path().join("murmur.lock");
 
-        let mut state = build_test_state(Arc::new(TamperedRegistry), workdir.clone(), lock_path.clone());
+        let mut state = build_test_state(
+            Arc::new(TamperedRegistry),
+            workdir.clone(),
+            lock_path.clone(),
+        );
 
         let err = manage::Host::pull(&mut state, "evil-tool".to_string(), "1.0.0".to_string())
             .expect_err("tampered bytes must be rejected");
@@ -4660,7 +4715,10 @@ mod tests {
     #[test]
     fn pull_rejects_lock_conflict_and_writes_nothing() {
         let artifact_bytes = zip_with_files(&[
-            (PACKED_MANIFEST_ENTRY, b"name: my-skill\nversion: 2.0.0\nruntime: skill\n"),
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: my-skill\nversion: 2.0.0\nruntime: skill\n",
+            ),
             ("skill.md", b"# guidance v2"),
         ]);
         let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
@@ -4690,9 +4748,16 @@ mod tests {
 
         let err = manage::Host::pull(&mut state, "my-skill".to_string(), "2.0.0".to_string())
             .expect_err("lock conflict must be rejected");
-        assert!(err.contains("murmur.lock conflict"), "unexpected error message: {err}");
+        assert!(
+            err.contains("murmur.lock conflict"),
+            "unexpected error message: {err}"
+        );
 
-        assert!(!workdir.join("tools").join("my-skill").join("skill.md").exists());
+        assert!(!workdir
+            .join("tools")
+            .join("my-skill")
+            .join("skill.md")
+            .exists());
         assert!(state.installed_artifacts.is_empty());
 
         // Lock must be left exactly as it was.
@@ -4746,7 +4811,9 @@ mod tests {
             &sandbox::ShellEnforcement::environment_only(),
         );
 
-        let shell = outcome.shell.expect("a successful shell call reports itself");
+        let shell = outcome
+            .shell
+            .expect("a successful shell call reports itself");
         assert!(
             Path::new(&shell.binary).is_absolute() && shell.binary.ends_with("bash"),
             "binary must be the resolved path of what ran, got {:?}",
@@ -4770,7 +4837,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call() {
-        if crate::network_namespace::skip_without_egress_namespace("a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call") {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_sealed_composed_root_failure_ends_the_session_not_just_the_tool_call",
+        ) {
             return;
         }
         let tmp = TempDir::new().unwrap();
@@ -5132,8 +5201,16 @@ mod tests {
         let ceiling = narrowing_ceiling();
         let rules = effective_tool_network_rules(None, &ceiling);
 
-        assert!(send_through_tool_hooks(rules, "http://127.0.0.1:1/x", false));
-        assert!(send_through_tool_hooks(rules, "http://127.0.0.1:2/x", false));
+        assert!(send_through_tool_hooks(
+            rules,
+            "http://127.0.0.1:1/x",
+            false
+        ));
+        assert!(send_through_tool_hooks(
+            rules,
+            "http://127.0.0.1:2/x",
+            false
+        ));
     }
 
     /// A narrowed tool reaches only its declared host; the ceiling's other host is gone for
@@ -5154,7 +5231,11 @@ mod tests {
         );
         // The sibling with no entry is unaffected by its neighbour's narrowing.
         let sibling = effective_tool_network_rules(None, &ceiling);
-        assert!(send_through_tool_hooks(sibling, "http://127.0.0.1:2/x", false));
+        assert!(send_through_tool_hooks(
+            sibling,
+            "http://127.0.0.1:2/x",
+            false
+        ));
     }
 
     /// An entry outside the ceiling is dropped rather than granted, and reported so staging
@@ -5162,7 +5243,10 @@ mod tests {
     #[test]
     fn out_of_ceiling_entry_is_dropped_and_reported() {
         let ceiling = narrowing_ceiling();
-        let grant = grant_of(Some(vec!["http://127.0.0.1:1", "https://evil.example.com"]), None);
+        let grant = grant_of(
+            Some(vec!["http://127.0.0.1:1", "https://evil.example.com"]),
+            None,
+        );
         let narrowed = effective_tool_network_rules(Some(&grant), &ceiling);
 
         assert!(!send_through_tool_hooks(
@@ -5202,8 +5286,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("secret.txt"), b"capsule state").unwrap();
 
-        build_wasi_ctx(root.path(), Some("cache"), &[], &CapabilityPolicy::default())
-            .expect("a granted scope is created and preopened");
+        build_wasi_ctx(
+            root.path(),
+            Some("cache"),
+            &[],
+            &CapabilityPolicy::default(),
+        )
+        .expect("a granted scope is created and preopened");
 
         let scoped = root.path().join("cache");
         assert!(scoped.is_dir(), "the granted scope is created if missing");
@@ -5313,7 +5402,10 @@ mod tests {
             .await
         });
 
-        assert!(result.is_ok(), "an ungranted tool runs as before: {result:?}");
+        assert!(
+            result.is_ok(),
+            "an ungranted tool runs as before: {result:?}"
+        );
         assert_eq!(
             std::fs::read_dir(workdir.path()).unwrap().count(),
             0,
@@ -5681,14 +5773,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reopen_once_then_satisfied_end_to_end() {
         let (result, events) = run_reopen_scenario(1, 5, 10).await;
-        assert!(result.is_ok(), "a satisfied hook ends the task Ok: {result:?}");
-        assert_eq!(count_type(&events, "inference"), 2, "agent loop ran exactly twice");
+        assert!(
+            result.is_ok(),
+            "a satisfied hook ends the task Ok: {result:?}"
+        );
+        assert_eq!(
+            count_type(&events, "inference"),
+            2,
+            "agent loop ran exactly twice"
+        );
         assert_eq!(count_type(&events, "task_reopened"), 1);
-        let re = events.iter().find(|e| e["event_type"] == "task_reopened").unwrap();
+        let re = events
+            .iter()
+            .find(|e| e["event_type"] == "task_reopened")
+            .unwrap();
         assert_eq!(re["hook_name"], "gatekeeper");
         assert_eq!(re["reason"], "tests still fail");
         assert_eq!(re["reopen_number"], 1);
-        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        let end = events
+            .iter()
+            .find(|e| e["event_type"] == "task_end")
+            .unwrap();
         assert_eq!(end["reopen_count"], 1);
         assert_eq!(end["exit_status"], "ok");
     }
@@ -5699,10 +5804,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn reopen_budget_exhausted_end_to_end() {
         let (result, events) = run_reopen_scenario(99, 1, 10).await;
-        assert!(result.is_err(), "an exhausted reopen budget is a task failure");
+        assert!(
+            result.is_err(),
+            "an exhausted reopen budget is a task failure"
+        );
         assert_eq!(count_type(&events, "inference"), 2, "1 original + 1 reopen");
         assert_eq!(count_type(&events, "task_reopened"), 1);
-        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        let end = events
+            .iter()
+            .find(|e| e["event_type"] == "task_end")
+            .unwrap();
         assert_eq!(end["reopen_count"], 1);
         assert_eq!(end["exit_status"], "reopen_budget_exhausted");
     }
@@ -5720,8 +5831,15 @@ mod tests {
             3,
             "cumulative turns must never exceed max_turns"
         );
-        assert_eq!(count_type(&events, "task_reopened"), 2, "3 attempts ⇒ 2 reopens");
-        let end = events.iter().find(|e| e["event_type"] == "task_end").unwrap();
+        assert_eq!(
+            count_type(&events, "task_reopened"),
+            2,
+            "3 attempts ⇒ 2 reopens"
+        );
+        let end = events
+            .iter()
+            .find(|e| e["event_type"] == "task_end")
+            .unwrap();
         assert_eq!(end["reopen_count"], 2);
         assert_eq!(end["exit_status"], "reopen_budget_exhausted");
     }

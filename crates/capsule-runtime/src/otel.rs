@@ -611,7 +611,9 @@ mod tests {
             "v".to_string(),
         );
         emitter.begin_session(None);
-        let tp = emitter.outgoing_traceparent().expect("should produce traceparent");
+        let tp = emitter
+            .outgoing_traceparent()
+            .expect("should produce traceparent");
         let parts: Vec<&str> = tp.splitn(4, '-').collect();
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[0], "00");

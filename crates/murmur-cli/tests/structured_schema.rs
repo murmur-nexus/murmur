@@ -81,7 +81,8 @@ fn result_txt_written_on_clean_completion() {
     let session_id = run_mur(&home, &manifest_path, &["--task", "Finish cleanly"]);
 
     assert_eq!(
-        fs::read_to_string(session_dir(&manifest_path, &session_id).join("out/result.txt")).unwrap(),
+        fs::read_to_string(session_dir(&manifest_path, &session_id).join("out/result.txt"))
+            .unwrap(),
         "structured output"
     );
 }

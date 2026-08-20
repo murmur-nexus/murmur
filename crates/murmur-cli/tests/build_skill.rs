@@ -28,7 +28,11 @@ fn zip_entry_content(path: &Path, entry: &str) -> String {
     let file = fs::File::open(path).unwrap();
     let mut archive = ZipArchive::new(file).unwrap();
     let mut s = String::new();
-    archive.by_name(entry).unwrap().read_to_string(&mut s).unwrap();
+    archive
+        .by_name(entry)
+        .unwrap()
+        .read_to_string(&mut s)
+        .unwrap();
     s
 }
 
@@ -40,7 +44,10 @@ fn find_zip_in(dir: &Path, prefix: &str) -> PathBuf {
             return e.path();
         }
     }
-    panic!("no .mur.zip with prefix {prefix} found in {}", dir.display())
+    panic!(
+        "no .mur.zip with prefix {prefix} found in {}",
+        dir.display()
+    )
 }
 
 // ── CLI-level tests ───────────────────────────────────────────────────────────
@@ -55,11 +62,7 @@ fn skill_build_flag_folder_infers_name() {
 
     Command::cargo_bin("mur")
         .unwrap()
-        .args([
-            "build",
-            "--skill",
-            skill_dir.to_str().unwrap(),
-        ])
+        .args(["build", "--skill", skill_dir.to_str().unwrap()])
         .current_dir(outdir.path())
         .assert()
         .success()
@@ -95,7 +98,10 @@ fn skill_build_flag_explicit_name() {
 
     let zip = find_zip_in(outdir.path(), "explicit-wrapped");
     let manifest = zip_entry_content(&zip, "murmur.yaml");
-    assert!(manifest.contains("name: explicit-wrapped"), "got: {manifest}");
+    assert!(
+        manifest.contains("name: explicit-wrapped"),
+        "got: {manifest}"
+    );
 }
 
 #[test]
@@ -139,10 +145,16 @@ fn skill_build_missing_skill_md_exits_nonzero() {
         .stderr(predicate::str::is_match("(?i)skill.md").unwrap());
 
     // No zip produced
-    let has_zip = fs::read_dir(outdir.path())
-        .unwrap()
-        .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".mur.zip"));
-    assert!(!has_zip, "no zip should be produced when SKILL.md is absent");
+    let has_zip = fs::read_dir(outdir.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".mur.zip")
+    });
+    assert!(
+        !has_zip,
+        "no zip should be produced when SKILL.md is absent"
+    );
 }
 
 #[test]
@@ -242,17 +254,16 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     let build_out: TempDir = tempdir().unwrap();
 
     // 1. Create a minimal skill folder with SKILL.md
-    fs::write(src.path().join("SKILL.md"), "# Roundtrip Skill\nDo things.\n").unwrap();
+    fs::write(
+        src.path().join("SKILL.md"),
+        "# Roundtrip Skill\nDo things.\n",
+    )
+    .unwrap();
 
     // 2. Build via `mur build --skill`
     Command::cargo_bin("mur")
         .unwrap()
-        .args([
-            "build",
-            "--skill",
-            "rt-skill",
-            src.path().to_str().unwrap(),
-        ])
+        .args(["build", "--skill", "rt-skill", src.path().to_str().unwrap()])
         .current_dir(build_out.path())
         .assert()
         .success();
@@ -266,7 +277,10 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         .stdout(predicate::str::contains("Published rt-skill@0.1.0"));
 
     // 4. Verify it's in the registry
-    assert!(home.path().join(".murmur/artifacts/rt-skill/0.1.0").exists());
+    assert!(home
+        .path()
+        .join(".murmur/artifacts/rt-skill/0.1.0")
+        .exists());
 
     // 5. Stage a capsule that declares the skill artifact.
     // We supply a minimal InferenceConfig so stage_session treats this as an agent
@@ -344,12 +358,19 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     .unwrap();
 
     // 6. Verify tools/rt-skill/skill.md is present in the workdir
-    let skill_path = staged.workdir.join("tools").join("rt-skill").join("skill.md");
+    let skill_path = staged
+        .workdir
+        .join("tools")
+        .join("rt-skill")
+        .join("skill.md");
     assert!(
         skill_path.exists(),
         "tools/rt-skill/skill.md should be present after staging; workdir: {}",
         staged.workdir.display()
     );
     let content = fs::read_to_string(&skill_path).unwrap();
-    assert!(content.contains("Roundtrip Skill"), "skill.md content mismatch: {content}");
+    assert!(
+        content.contains("Roundtrip Skill"),
+        "skill.md content mismatch: {content}"
+    );
 }

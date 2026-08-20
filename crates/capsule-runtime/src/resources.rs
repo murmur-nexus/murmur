@@ -724,6 +724,9 @@ mod tests {
             0
         );
         assert_eq!(current.rlim_cur, 0);
-        assert_eq!(current.rlim_max, 0, "the hard slot must be set, not only the soft one");
+        assert_eq!(
+            current.rlim_max, 0,
+            "the hard slot must be set, not only the soft one"
+        );
     }
 }

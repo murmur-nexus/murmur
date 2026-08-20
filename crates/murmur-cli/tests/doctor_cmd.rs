@@ -179,7 +179,9 @@ fn doctor_checklist_follows_the_manifest_version_pin() {
     mur_doctor(&home, project.path())
         .failure()
         .stdout(predicate::str::contains("\u{2717}  pinned-skill@0.2.0"))
-        .stdout(predicate::str::contains("Fix: mur install pinned-skill@0.2.0"));
+        .stdout(predicate::str::contains(
+            "Fix: mur install pinned-skill@0.2.0",
+        ));
 }
 
 #[test]
@@ -340,7 +342,10 @@ fn doctor_fails_when_the_lock_sha256_does_not_match_the_installed_bytes() {
         "expected E-REG-002 wording on the failing line, got:\n{stdout}"
     );
     assert!(
-        stdout.contains(&format!("expected sha256 (murmur.lock): {}", "0".repeat(64))),
+        stdout.contains(&format!(
+            "expected sha256 (murmur.lock): {}",
+            "0".repeat(64)
+        )),
         "expected the pinned hash to be shown, got:\n{stdout}"
     );
     assert!(
@@ -463,11 +468,9 @@ fn doctor_exempts_local_source_skills_from_lock_checks() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains('\u{2713}')
-                && line.contains("local-skill")
-                && line.contains("local source")),
+        stdout.lines().any(|line| line.contains('\u{2713}')
+            && line.contains("local-skill")
+            && line.contains("local source")),
         "expected a passing local-source line, got:\n{stdout}"
     );
     assert!(
@@ -510,7 +513,11 @@ fn doctor_surfaces_a_malformed_manifest_before_any_checklist() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    fs::write(project.path().join("murmur.yaml"), "name: broken\nversion: [\n").unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: broken\nversion: [\n",
+    )
+    .unwrap();
 
     mur_doctor(&home, project.path())
         .failure()

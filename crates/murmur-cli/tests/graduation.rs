@@ -111,7 +111,9 @@ fn graduation_bad_artifact_version_surfaces_error() {
     common::run_capsule(&home, &project.path().join("murmur.yaml"))
         .failure()
         .stderr(predicate::str::contains("error[E-RUN-008]:"))
-        .stderr(predicate::str::contains("missing artifacts: jsonl-line-count@9.9.9"))
+        .stderr(predicate::str::contains(
+            "missing artifacts: jsonl-line-count@9.9.9",
+        ))
         .stderr(predicate::str::contains("run `mur install`"));
 
     assert!(!project.path().join("workdir").exists());

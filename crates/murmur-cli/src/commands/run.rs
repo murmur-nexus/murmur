@@ -11,10 +11,10 @@ use capsule_runtime::{
     TaskAcceptance,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, load_dotenv_non_override,
-    load_runtime_manifest, read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    InferenceConfig, LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
-    Registry, ResolvedArtifact, LOCK_VERSION,
+    current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
+    read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass, InferenceConfig,
+    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, Registry,
+    ResolvedArtifact, LOCK_VERSION,
 };
 
 use crate::{
@@ -23,7 +23,9 @@ use crate::{
     registry_client::FallbackRegistry,
 };
 
-use super::{fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus};
+use super::{
+    fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus,
+};
 
 /// In --json mode errors must not produce any stdout output — return the error as-is.
 /// In human mode, delegate to fail_run which prints the status line.
@@ -97,8 +99,14 @@ pub(crate) fn run_run(
         })?;
     }
 
-    let runtime_manifest = load_runtime_manifest(&manifest_path)
-        .map_err(|err| fail(&session_id, &workdir, runtime_manifest_error_to_cli(err), json))?;
+    let runtime_manifest = load_runtime_manifest(&manifest_path).map_err(|err| {
+        fail(
+            &session_id,
+            &workdir,
+            runtime_manifest_error_to_cli(err),
+            json,
+        )
+    })?;
 
     // Warn if the manifest pins a different mur version than is currently running.
     // Do not abort — local development routinely runs ahead of a pinned version.
@@ -323,11 +331,18 @@ pub(crate) fn run_run(
         lifecycle: runtime_manifest.lifecycle.clone(),
         lifecycle_override,
         trace: runtime_manifest.trace.clone(),
-        workdir: workdir_arg.clone().map(|w| if w.is_absolute() { w } else {
-            std::env::current_dir().unwrap_or_default().join(w)
+        workdir: workdir_arg.clone().map(|w| {
+            if w.is_absolute() {
+                w
+            } else {
+                std::env::current_dir().unwrap_or_default().join(w)
+            }
         }),
         bind_addr: bind_addr.to_string(),
-        internal_port: runtime_manifest.network.as_ref().and_then(|n| n.internal_port),
+        internal_port: runtime_manifest
+            .network
+            .as_ref()
+            .and_then(|n| n.internal_port),
         declared_containment_floor,
     };
 
@@ -342,7 +357,7 @@ pub(crate) fn run_run(
         }),
         stage_request,
     )
-        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+    .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
 
     session_id = staged.session_id.clone();
     workdir = staged.workdir.clone();
@@ -394,8 +409,11 @@ pub(crate) fn run_run(
         // Compute accessible_workdir for JSON output (mirrors stage_session logic).
         let accessible_workdir_for_json = match &workdir_arg {
             Some(wd) => {
-                if wd.is_absolute() { wd.clone() }
-                else { std::env::current_dir().unwrap_or_default().join(wd) }
+                if wd.is_absolute() {
+                    wd.clone()
+                } else {
+                    std::env::current_dir().unwrap_or_default().join(wd)
+                }
             }
             None => staged.workdir.clone(),
         };
@@ -559,14 +577,17 @@ fn parse_containment_flag(
         return Ok(None);
     };
 
-    value.parse::<ContainmentClass>().map(Some).map_err(|error| {
-        fail(
-            session_id,
-            workdir,
-            CliError::new(E_IO_003, format!("--containment {error}")),
-            json,
-        )
-    })
+    value
+        .parse::<ContainmentClass>()
+        .map(Some)
+        .map_err(|error| {
+            fail(
+                session_id,
+                workdir,
+                CliError::new(E_IO_003, format!("--containment {error}")),
+                json,
+            )
+        })
 }
 
 /// Applies `--system-prompt` to the manifest's inference config, returning the config to stage

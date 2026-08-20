@@ -215,7 +215,9 @@ impl TaskRegistry {
         tx: oneshot::Sender<String>,
     ) -> Result<(), &'static str> {
         match &self.active_slot {
-            TaskSlotState::Running { task_id: active_id, .. } if active_id == task_id => {}
+            TaskSlotState::Running {
+                task_id: active_id, ..
+            } if active_id == task_id => {}
             _ => return Err("task is not the active running task"),
         }
         let state = self.history.get(task_id).map(|(s, _)| s);
@@ -223,7 +225,8 @@ impl TaskRegistry {
             return Err("task is not in working state");
         }
         if let Some((_, ctx)) = self.history.get(task_id).cloned() {
-            self.history.insert(task_id.to_string(), (TaskState::InputRequired, ctx));
+            self.history
+                .insert(task_id.to_string(), (TaskState::InputRequired, ctx));
         }
         self.input_waiters.insert(task_id.to_string(), (prompt, tx));
         Ok(())
@@ -243,7 +246,8 @@ impl TaskRegistry {
             return Err("no input waiter found for task");
         };
         if let Some((_, ctx)) = self.history.get(task_id).cloned() {
-            self.history.insert(task_id.to_string(), (TaskState::Working, ctx));
+            self.history
+                .insert(task_id.to_string(), (TaskState::Working, ctx));
         }
         // Sending may fail if the receiver was dropped (timeout path), which is fine.
         let _ = tx.send(text);
@@ -264,32 +268,34 @@ impl TaskRegistry {
     /// Return the prompt stored for an input-required task.
     #[allow(dead_code)] // used in unit tests
     pub(crate) fn get_input_prompt(&self, task_id: &str) -> Option<&str> {
-        self.input_waiters.get(task_id).map(|(prompt, _)| prompt.as_str())
+        self.input_waiters
+            .get(task_id)
+            .map(|(prompt, _)| prompt.as_str())
     }
 
     pub(crate) fn get_task(&self, task_id: &str) -> Option<A2aTask> {
-        self.history
-            .get(task_id)
-            .map(|(state, context_id)| {
-                let artifacts = if matches!(state, TaskState::InputRequired) {
-                    self.input_waiters.get(task_id).map(|(prompt, _)| {
-                        vec![A2aArtifact {
-                            name: "prompt".to_string(),
-                            parts: vec![ArtifactPart { text: prompt.clone() }],
-                        }]
-                    })
-                } else {
-                    None
-                };
-                A2aTask {
-                    id: task_id.to_string(),
-                    context_id: context_id.clone(),
-                    status: TaskStatus {
-                        state: state.clone(),
-                    },
-                    artifacts,
-                }
-            })
+        self.history.get(task_id).map(|(state, context_id)| {
+            let artifacts = if matches!(state, TaskState::InputRequired) {
+                self.input_waiters.get(task_id).map(|(prompt, _)| {
+                    vec![A2aArtifact {
+                        name: "prompt".to_string(),
+                        parts: vec![ArtifactPart {
+                            text: prompt.clone(),
+                        }],
+                    }]
+                })
+            } else {
+                None
+            };
+            A2aTask {
+                id: task_id.to_string(),
+                context_id: context_id.clone(),
+                status: TaskStatus {
+                    state: state.clone(),
+                },
+                artifacts,
+            }
+        })
     }
 }
 
@@ -325,7 +331,9 @@ mod tests {
     fn set_input_required_transitions_state() {
         let mut r = running_registry("tsk_001");
         let (tx, _rx) = oneshot::channel();
-        assert!(r.set_input_required("tsk_001", "which branch?".into(), tx).is_ok());
+        assert!(r
+            .set_input_required("tsk_001", "which branch?".into(), tx)
+            .is_ok());
         let task = r.get_task("tsk_001").unwrap();
         assert_eq!(task.status.state, TaskState::InputRequired);
         let artifacts = task.artifacts.unwrap();
@@ -337,14 +345,17 @@ mod tests {
     fn set_input_required_fails_for_wrong_task() {
         let mut r = running_registry("tsk_001");
         let (tx, _rx) = oneshot::channel();
-        assert!(r.set_input_required("tsk_other", "prompt".into(), tx).is_err());
+        assert!(r
+            .set_input_required("tsk_other", "prompt".into(), tx)
+            .is_err());
     }
 
     #[test]
     fn deliver_input_transitions_back_to_working() {
         let mut r = running_registry("tsk_001");
         let (tx, mut rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "which branch?".into(), tx).unwrap();
+        r.set_input_required("tsk_001", "which branch?".into(), tx)
+            .unwrap();
         r.deliver_input("tsk_001", "main".to_string()).unwrap();
         // Oneshot should have received the value
         assert_eq!(rx.try_recv().unwrap(), "main");
@@ -364,8 +375,12 @@ mod tests {
         let mut r = running_registry("tsk_001");
         assert_eq!(r.active_input_required_task_id(), None);
         let (tx, _rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "prompt".into(), tx).unwrap();
-        assert_eq!(r.active_input_required_task_id(), Some("tsk_001".to_string()));
+        r.set_input_required("tsk_001", "prompt".into(), tx)
+            .unwrap();
+        assert_eq!(
+            r.active_input_required_task_id(),
+            Some("tsk_001".to_string())
+        );
         r.deliver_input("tsk_001", "answer".into()).unwrap();
         assert_eq!(r.active_input_required_task_id(), None);
     }
@@ -374,10 +389,14 @@ mod tests {
     fn get_task_includes_artifacts_only_for_input_required() {
         let mut r = running_registry("tsk_001");
         let task = r.get_task("tsk_001").unwrap();
-        assert!(task.artifacts.is_none(), "working task should have no artifacts");
+        assert!(
+            task.artifacts.is_none(),
+            "working task should have no artifacts"
+        );
 
         let (tx, _rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "my prompt".into(), tx).unwrap();
+        r.set_input_required("tsk_001", "my prompt".into(), tx)
+            .unwrap();
         let task = r.get_task("tsk_001").unwrap();
         let artifacts = task.artifacts.unwrap();
         assert_eq!(artifacts.len(), 1);
@@ -388,7 +407,8 @@ mod tests {
     fn finish_task_cleans_up_input_waiters() {
         let mut r = running_registry("tsk_001");
         let (tx, _rx) = oneshot::channel();
-        r.set_input_required("tsk_001", "prompt".into(), tx).unwrap();
+        r.set_input_required("tsk_001", "prompt".into(), tx)
+            .unwrap();
         r.finish_task(TaskState::Failed);
         // input_waiters should be cleaned up
         assert!(r.get_input_prompt("tsk_001").is_none());

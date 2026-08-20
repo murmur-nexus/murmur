@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use murmur_artifact::{
-    ArtifactMeta, LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
+    ArtifactMeta, LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact,
+    RuntimeType,
 };
 use serde::Deserialize;
 use ureq::http::StatusCode;
@@ -52,7 +53,10 @@ impl RemoteRegistry {
         // Platform strings are assumed to be URL-safe (canonical form: os-arch, e.g.
         // "darwin-aarch64"). Do not pass arbitrary user strings without encoding.
         let url = match platform {
-            Some(p) => format!("{}/v1/artifacts/{}/{}?platform={}", self.base_url, name, version, p),
+            Some(p) => format!(
+                "{}/v1/artifacts/{}/{}?platform={}",
+                self.base_url, name, version, p
+            ),
             None => self.artifact_url(name, version),
         };
 
@@ -113,9 +117,7 @@ impl RemoteRegistry {
                 name: name.to_string(),
                 version: version.to_string(),
             }),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(auth_error(&self.base_url))
-            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(auth_error(&self.base_url)),
             status => Err(RegistryError::InvalidInput(format!(
                 "download failed with HTTP {}: {}",
                 status,
@@ -148,10 +150,7 @@ impl Registry for RemoteRegistry {
         let mut query: Vec<(String, String)> = vec![
             ("name".to_string(), meta.name.clone()),
             ("version".to_string(), meta.version.clone()),
-            (
-                "runtime".to_string(),
-                meta.runtime.as_str().to_string(),
-            ),
+            ("runtime".to_string(), meta.runtime.as_str().to_string()),
         ];
 
         for (os, arch) in &meta.platforms {
@@ -179,15 +178,16 @@ impl Registry for RemoteRegistry {
                     sha256: String,
                 }
 
-                let published = response
-                    .body_mut()
-                    .read_json::<PublishBody>()
-                    .map_err(|error| {
-                        RegistryError::InvalidInput(format!(
-                            "invalid publish response from {}: {}",
-                            self.base_url, error
-                        ))
-                    })?;
+                let published =
+                    response
+                        .body_mut()
+                        .read_json::<PublishBody>()
+                        .map_err(|error| {
+                            RegistryError::InvalidInput(format!(
+                                "invalid publish response from {}: {}",
+                                self.base_url, error
+                            ))
+                        })?;
 
                 Ok(murmur_artifact::PublishResult {
                     artifact_id: published.artifact_id,
@@ -207,9 +207,7 @@ impl Registry for RemoteRegistry {
                     Err(RegistryError::InvalidInput(server_message))
                 }
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(auth_error(&self.base_url))
-            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(auth_error(&self.base_url)),
             status => Err(RegistryError::InvalidInput(format!(
                 "publish failed with HTTP {}: {}",
                 status,
@@ -239,9 +237,7 @@ impl Registry for RemoteRegistry {
                     self.base_url, error
                 ))
             }),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                Err(auth_error(&self.base_url))
-            }
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(auth_error(&self.base_url)),
             status => Err(RegistryError::InvalidInput(format!(
                 "list failed with HTTP {}: {}",
                 status,
@@ -312,9 +308,9 @@ impl Registry for FallbackRegistry {
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
         match self.primary.resolve_with_platform(name, version, platform) {
-            Err(RegistryError::NotFound { .. }) => {
-                self.secondary.resolve_with_platform(name, version, platform)
-            }
+            Err(RegistryError::NotFound { .. }) => self
+                .secondary
+                .resolve_with_platform(name, version, platform),
             other => other,
         }
     }

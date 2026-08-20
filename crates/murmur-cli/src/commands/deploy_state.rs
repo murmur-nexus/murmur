@@ -55,12 +55,10 @@ pub(crate) fn load_deployments() -> Result<Vec<DeploymentRecord>, CliError> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(&path).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to read {}: {e}", path.display()))
-    })?;
-    serde_json::from_str(&raw).map_err(|e| {
-        CliError::new(E_IO_003, format!("deployments.json is malformed: {e}"))
-    })
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to read {}: {e}", path.display())))?;
+    serde_json::from_str(&raw)
+        .map_err(|e| CliError::new(E_IO_003, format!("deployments.json is malformed: {e}")))
 }
 
 #[cfg(feature = "beta-mur-deploy")]
@@ -68,7 +66,10 @@ pub(crate) fn save_deployments(records: &[DeploymentRecord]) -> Result<(), CliEr
     let path = deployments_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            CliError::new(E_IO_003, format!("failed to create {}: {e}", parent.display()))
+            CliError::new(
+                E_IO_003,
+                format!("failed to create {}: {e}", parent.display()),
+            )
         })?;
     }
     let json = serde_json::to_string_pretty(records)
@@ -79,14 +80,17 @@ pub(crate) fn save_deployments(records: &[DeploymentRecord]) -> Result<(), CliEr
     // partial write takes out `mur ps` and `mur destroy` for *every* deployment at once, leaving
     // running VMs with no record of how to reach them. The rename is atomic within the directory.
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json).map_err(|e| {
-        CliError::new(E_IO_003, format!("failed to write {}: {e}", tmp.display()))
-    })?;
+    fs::write(&tmp, json)
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to write {}: {e}", tmp.display())))?;
     fs::rename(&tmp, &path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         CliError::new(
             E_IO_003,
-            format!("failed to replace {} with {}: {e}", path.display(), tmp.display()),
+            format!(
+                "failed to replace {} with {}: {e}",
+                path.display(),
+                tmp.display()
+            ),
         )
     })
 }
@@ -103,7 +107,10 @@ pub(crate) fn remove_deployment(deployment_id: &str) -> Result<Option<Deployment
     let mut records = load_deployments()?;
 
     // Exact match first.
-    if let Some(pos) = records.iter().position(|r| r.deployment_id == deployment_id) {
+    if let Some(pos) = records
+        .iter()
+        .position(|r| r.deployment_id == deployment_id)
+    {
         let removed = records.remove(pos);
         save_deployments(&records)?;
         return Ok(Some(removed));
@@ -132,7 +139,9 @@ pub(crate) fn remove_deployment(deployment_id: &str) -> Result<Option<Deployment
                 .join(", ");
             Err(CliError::new(
                 E_IO_003,
-                format!("ambiguous prefix '{deployment_id}' matches multiple deployments: {candidates}"),
+                format!(
+                    "ambiguous prefix '{deployment_id}' matches multiple deployments: {candidates}"
+                ),
             ))
         }
     }
@@ -181,7 +190,10 @@ mod tests {
             .collect();
 
         assert_eq!(hit.len(), 1);
-        assert_ne!(hit[0].deployment_id, prefix, "the record must carry the full id, not the prefix");
+        assert_ne!(
+            hit[0].deployment_id, prefix,
+            "the record must carry the full id, not the prefix"
+        );
         assert_eq!(hit[0].deployment_id, full);
     }
 }

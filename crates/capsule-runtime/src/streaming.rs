@@ -224,10 +224,13 @@ mod tests {
         buf.push(1, Arc::new("a".to_string()));
         buf.push(2, Arc::new("b".to_string()));
         buf.push(3, Arc::new("c".to_string())); // evicts id=1
-        // Requesting from id=0 asks for events that were evicted → WithGap
+                                                // Requesting from id=0 asks for events that were evicted → WithGap
         let result = buf.replay_from(0);
         let (first_id, events) = match result {
-            ReplayResult::WithGap { first_available_id, events } => (first_available_id, events),
+            ReplayResult::WithGap {
+                first_available_id,
+                events,
+            } => (first_available_id, events),
             ReplayResult::Complete(_) => panic!("expected WithGap"),
         };
         assert_eq!(first_id, 2);
@@ -278,11 +281,21 @@ mod tests {
     #[test]
     fn is_final_detects_status_final_only() {
         let status_final = "id: 5\nevent: status\ndata: {\"id\":\"x\",\"final\":true}\n\n";
-        let text_final = "id: 3\nevent: text\ndata: {\"id\":\"x\",\"text\":\"\",\"final\":true}\n\n";
+        let text_final =
+            "id: 3\nevent: text\ndata: {\"id\":\"x\",\"text\":\"\",\"final\":true}\n\n";
         let status_nonfinal = "id: 1\nevent: status\ndata: {\"id\":\"x\",\"final\":false}\n\n";
 
-        assert!(is_final_sse_event(status_final), "status:final:true should be terminal");
-        assert!(!is_final_sse_event(text_final), "text:final:true should NOT be terminal");
-        assert!(!is_final_sse_event(status_nonfinal), "status:final:false should NOT be terminal");
+        assert!(
+            is_final_sse_event(status_final),
+            "status:final:true should be terminal"
+        );
+        assert!(
+            !is_final_sse_event(text_final),
+            "text:final:true should NOT be terminal"
+        );
+        assert!(
+            !is_final_sse_event(status_nonfinal),
+            "status:final:false should NOT be terminal"
+        );
     }
 }

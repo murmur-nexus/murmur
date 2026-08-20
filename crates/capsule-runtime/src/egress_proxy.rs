@@ -470,7 +470,9 @@ pub(crate) fn resolve_upstream(name: &str) -> Vec<IpAddr> {
         // just this thread finishing after nobody is left waiting.
         let _ = result_tx.send(looked_up);
     });
-    result_rx.recv_timeout(DNS_UPSTREAM_TIMEOUT).unwrap_or_default()
+    result_rx
+        .recv_timeout(DNS_UPSTREAM_TIMEOUT)
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- the running proxy
@@ -660,7 +662,8 @@ mod linux {
             return;
         }
 
-        let Ok(upstream) = TcpStream::connect_timeout(&SocketAddr::V4(destination), CONNECT_TIMEOUT)
+        let Ok(upstream) =
+            TcpStream::connect_timeout(&SocketAddr::V4(destination), CONNECT_TIMEOUT)
         else {
             return;
         };
@@ -868,23 +871,35 @@ mod tests {
 
     #[test]
     fn an_https_entry_opens_only_443() {
-        assert_eq!(egress_listen_ports(&rules(&["https://api.example.com"])), vec![443]);
+        assert_eq!(
+            egress_listen_ports(&rules(&["https://api.example.com"])),
+            vec![443]
+        );
     }
 
     #[test]
     fn an_http_entry_opens_only_80() {
-        assert_eq!(egress_listen_ports(&rules(&["http://api.example.com"])), vec![80]);
+        assert_eq!(
+            egress_listen_ports(&rules(&["http://api.example.com"])),
+            vec![80]
+        );
     }
 
     #[test]
     fn a_bare_host_entry_opens_both_scheme_defaults() {
         // The manifest schema defines a bare host as spanning both schemes, so both are dialled.
-        assert_eq!(egress_listen_ports(&rules(&["api.example.com"])), vec![80, 443]);
+        assert_eq!(
+            egress_listen_ports(&rules(&["api.example.com"])),
+            vec![80, 443]
+        );
     }
 
     #[test]
     fn an_explicit_port_opens_exactly_that_port() {
-        assert_eq!(egress_listen_ports(&rules(&["api.example.com:8443"])), vec![8443]);
+        assert_eq!(
+            egress_listen_ports(&rules(&["api.example.com:8443"])),
+            vec![8443]
+        );
     }
 
     #[test]
@@ -958,7 +973,10 @@ mod tests {
         // listener exists but whose connections are all refused is a capability that does not work.
         let policy = policy(&["https://api.example.com:8443"], &[]);
         let names = vec!["api.example.com".to_string()];
-        assert_eq!(egress_listen_ports(&rules(&["https://api.example.com:8443"])), vec![8443]);
+        assert_eq!(
+            egress_listen_ports(&rules(&["https://api.example.com:8443"])),
+            vec![8443]
+        );
         assert!(policy.allows_connection(&names, ADDRESS, 8443));
         // The pinned port is still the only one permitted, scheme default included.
         assert!(!policy.allows_connection(&names, ADDRESS, 443));
@@ -981,7 +999,10 @@ mod tests {
         // only one of them permitted. Every name in the list got there by passing `allows_name`
         // first, so accepting on any of them is not a widening.
         let policy = policy(&["https://api.example.com"], &[]);
-        let both = vec!["api.example.com".to_string(), "other.example.com".to_string()];
+        let both = vec![
+            "api.example.com".to_string(),
+            "other.example.com".to_string(),
+        ];
         assert!(policy.allows_connection(&both, ADDRESS, 443));
         assert!(!policy.allows_connection(&["other.example.com".to_string()], ADDRESS, 443));
     }

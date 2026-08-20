@@ -76,8 +76,18 @@ pub(crate) fn print_artifact_table(index: &[ArtifactMeta]) {
     const H_RUNTIME: &str = "RUNTIME";
     const H_PLATFORMS: &str = "PLATFORMS";
 
-    let nw = index.iter().map(|m| m.name.len()).max().unwrap_or(0).max(H_NAME.len());
-    let vw = index.iter().map(|m| m.version.len()).max().unwrap_or(0).max(H_VERSION.len());
+    let nw = index
+        .iter()
+        .map(|m| m.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_NAME.len());
+    let vw = index
+        .iter()
+        .map(|m| m.version.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_VERSION.len());
     let rw = index
         .iter()
         .map(|m| m.artifact_runtime.len())
@@ -104,9 +114,24 @@ fn print_artifact_table_scoped(entries: &[(String, ArtifactMeta)]) {
     const H_RUNTIME: &str = "RUNTIME";
     const H_PLATFORMS: &str = "PLATFORMS";
 
-    let sw = entries.iter().map(|(s, _)| s.len()).max().unwrap_or(0).max(H_SCOPE.len());
-    let nw = entries.iter().map(|(_, m)| m.name.len()).max().unwrap_or(0).max(H_NAME.len());
-    let vw = entries.iter().map(|(_, m)| m.version.len()).max().unwrap_or(0).max(H_VERSION.len());
+    let sw = entries
+        .iter()
+        .map(|(s, _)| s.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_SCOPE.len());
+    let nw = entries
+        .iter()
+        .map(|(_, m)| m.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_NAME.len());
+    let vw = entries
+        .iter()
+        .map(|(_, m)| m.version.len())
+        .max()
+        .unwrap_or(0)
+        .max(H_VERSION.len());
     let rw = entries
         .iter()
         .map(|(_, m)| m.artifact_runtime.len())
@@ -130,5 +155,9 @@ fn format_platforms(platforms: &[(String, String)]) -> String {
     if platforms.is_empty() {
         return String::from("\u{2014}"); // em dash
     }
-    platforms.iter().map(|(os, arch)| format!("{os}-{arch}")).collect::<Vec<_>>().join(", ")
+    platforms
+        .iter()
+        .map(|(os, arch)| format!("{os}-{arch}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

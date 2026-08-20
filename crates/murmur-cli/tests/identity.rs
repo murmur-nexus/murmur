@@ -112,9 +112,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
 
 #[test]
 fn murmur_md_has_identity_section_with_correct_values() {
-    if common::skip_without_host_support(
-        "murmur_md_has_identity_section_with_correct_values",
-    ) {
+    if common::skip_without_host_support("murmur_md_has_identity_section_with_correct_values") {
         return;
     }
     let server = end_turn_server("done");
