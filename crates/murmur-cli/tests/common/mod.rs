@@ -81,8 +81,12 @@ pub fn cgroup_delegation_available() -> bool {
     capsule_runtime::cgroup_delegation_available()
 }
 
-/// Skip guard for a test that needs [`cgroup_delegation_available`], written as
+/// Skip guard for a test that launches a subprocess-capable capsule, written as
 /// `if common::skip_without_host_support("test_name") { return; }`.
+///
+/// Covers both fail-closed launch gates, not just [`cgroup_delegation_available`]: such a capsule
+/// also needs its own network namespace, and a runner under AppArmor's unprivileged-userns
+/// restriction refuses that while delegating a cgroup scope perfectly well.
 ///
 /// Prints one `[SKIP-HOST]`-prefixed line per skipped test, which the CI job's summary step
 /// counts to report how much of the suite the runner could not exercise. Cargo swallows a passing

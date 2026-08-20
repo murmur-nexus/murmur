@@ -362,6 +362,9 @@ fn native_tool_dispatch_executes_binary_and_returns_result() {
 #[cfg(unix)]
 #[test]
 fn scaffold_creates_tool_directory() {
+    if common::skip_without_host_support("scaffold_creates_tool_directory") {
+        return;
+    }
     let scaffold_zip_path = std::env::var("HOME")
         .map(|h| {
             PathBuf::from(h)

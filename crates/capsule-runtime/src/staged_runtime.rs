@@ -432,9 +432,9 @@ mod tests {
                    - that the staged tree is READ-ONLY through the target root\n\
                    - that the source tree's contents are readable through the target root\n\
                  The pure re-basing and floor-check tests above still ran. Re-run this suite on\n\
-                 a Linux host with unprivileged user namespaces enabled\n\
-                 (/proc/sys/kernel/unprivileged_userns_clone = 1, or run as root) before\n\
-                 treating the mount behaviour as verified.\n\
+                 a Linux host that permits the unshare -- `unshare -Ur true` succeeding is the\n\
+                 whole test -- before treating the mount behaviour as verified. Where AppArmor\n\
+                 refuses it, `kernel.apparmor_restrict_unprivileged_userns` is the sysctl.\n\
                  ============================================================================\n"
             );
             return;
@@ -468,18 +468,21 @@ mod tests {
     }
 
     /// True when this host lets an unprivileged process create a user namespace.
+    ///
+    /// Answered by `detect_egress_namespace_blocker`, which forks and attempts the `unshare` for
+    /// real rather than reading a knob. Reading knobs gets this wrong on Ubuntu 23.10 and later:
+    /// `/proc/sys/kernel/unprivileged_userns_clone` no longer exists there, and the fallback
+    /// question -- whether `/proc/self/ns/user` exists -- is yes on every kernel built with
+    /// `CONFIG_USER_NS` regardless of whether the `unshare` is permitted. AppArmor's
+    /// `kernel.apparmor_restrict_unprivileged_userns` is what actually refuses it, so the knobs
+    /// report available on precisely the hosts where the inner run then dies at step 10.
+    ///
+    /// The probe unshares `CLONE_NEWUSER | CLONE_NEWNET` where the inner run wants
+    /// `CLONE_NEWUSER | CLONE_NEWNS`. `CLONE_NEWUSER` is the half that gets refused and is common
+    /// to both, so the probe answers the question this guard is asking.
     #[cfg(target_os = "linux")]
-    #[allow(unsafe_code)]
     fn unprivileged_userns_available() -> bool {
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        if unsafe { libc::geteuid() } == 0 {
-            return true;
-        }
-        // Debian/Ubuntu's knob. Absent on kernels that always allow it, so absence is not a "no".
-        match std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-            Ok(value) => value.trim() == "1",
-            Err(_) => std::path::Path::new("/proc/self/ns/user").exists(),
-        }
+        crate::network_namespace::detect_egress_namespace_blocker().is_none()
     }
 
     /// What the forked child reports back through its exit status. `Ok` is 0; every other value

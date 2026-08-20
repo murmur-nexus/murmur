@@ -254,6 +254,17 @@ fn events_of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
 /// `test_name` names the caller in the skip line below, since the cgroup gate is reached from more
 /// than one test and the CI summary counts one line per skipped test.
 fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
+    // The other fail-closed launch gate, asked first because no retry can get past it. `mur run`
+    // refuses a subprocess-capable capsule that cannot have its own network namespace, and that
+    // refusal is not `E-RUN-012` -- so the cgroup retry below neither recognises it nor helps.
+    // Only the namespace half of the host check is asked here: the cgroup half is answered by the
+    // delegated-scope retry, which can succeed on a host where this test harness's own cgroup
+    // cannot delegate.
+    if let Some(blocker) = capsule_runtime::detect_egress_namespace_blocker() {
+        eprintln!("[SKIP-HOST] {test_name}: {}", blocker.reason());
+        return;
+    }
+
     let server = common::ScriptedServer::start(vec![
         tool_call_response(&format!("echo {PROBE_SENTINEL}")),
         end_turn_response(),
