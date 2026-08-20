@@ -94,3 +94,18 @@ request. Tests that need a delegated cgroup v2 scope skip themselves with a
 `[SKIP-CGROUP]`-prefixed line instead of failing, since a CI runner cannot provide one; the job's
 step summary reports how many tests were skipped for that reason and points at
 `docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
+
+## Formatting and lints
+
+CI also runs a `lint` job on every push and pull request:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Run both locally before submitting a PR. `--all-features` includes the beta CLI surfaces
+(`topology_cmd`, `deploy_cmd`) in the clippy pass, so a change gated behind a beta feature is
+still checked. An `#[allow(...)]` is acceptable when the lint's default judgment is wrong at that
+specific site, but it needs a comment saying why — a bare `#[allow(...)]` with no justification,
+or a crate-level `#![allow(...)]`, will not pass review.
