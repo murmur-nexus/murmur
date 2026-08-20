@@ -439,7 +439,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
         "wasm artifact should appear in tools list"
     );
     assert!(
-        !tool_names.iter().any(|&n| n == DRIVER_ANTHROPIC_NAME),
+        !tool_names.contains(&DRIVER_ANTHROPIC_NAME),
         "driver artifact should not appear in tools list"
     );
 }

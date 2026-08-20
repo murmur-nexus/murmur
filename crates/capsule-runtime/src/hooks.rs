@@ -634,9 +634,6 @@ where
             return Err(failure.message(&format!("hook '{hook_name}' on-stage"), &err));
         }
     };
-    f.post_return_async(&mut *store)
-        .await
-        .map_err(|e| e.to_string())?;
     result
 }
 
@@ -1235,9 +1232,6 @@ where
             return Err(failure.message(&subject, &err));
         }
     };
-    f.post_return_async(&mut hook.store)
-        .await
-        .map_err(|e| e.to_string())?;
     result
 }
 

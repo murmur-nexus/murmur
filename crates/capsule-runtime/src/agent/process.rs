@@ -1,36 +1,37 @@
-/// Process transport for `transport: process` inference config.
-///
-/// # Protocol (determined by direct inspection of `claude --help` and live testing)
-///
-/// **Model:** Single-process-per-agent-run. Claude is spawned once; a single user message is
-/// written as a JSON-line to stdin; stdin is closed; stdout is read line-by-line until the
-/// `{"type":"result"}` event; the process exits naturally.
-///
-/// **Flags used:**
-///   `--print`                    — non-interactive output mode
-///   `--output-format stream-json` — one JSON event per line on stdout
-///   `--verbose`                  — include system/metadata events
-///   `--input-format stream-json` — accept JSON-line messages on stdin
-///   `--model <model>`            — target model
-///   `--tools ""`                 — disable claude's built-in tools (capsule tools live in murmur)
-///   `--system-prompt <text>`     — inject system prompt when configured
-///
-/// **Stdin message format:**
-///   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task>"}]}}`
-///
-/// **Stdout event stream:**
-///   `{"type":"system","subtype":"init",...}`      — session header (ignored)
-///   `{"type":"assistant","message":{...}}`        — LLM response; content may include tool_use
-///   `{"type":"user","message":{...}}`             — tool result (claude executed internally)
-///   `{"type":"result","subtype":"success","result":"..."}`  — final result; signals end-of-turn
-///   `{"type":"result","subtype":"error_during_execution",...}` — terminal error
-///
-/// **Turn counting:** each `{"type":"assistant"}` event = one LLM inference call = one turn.
-///
-/// **Tool calls:** Claude dispatches its own built-in tools internally. Tool_use and tool_result
-/// events appear in the stream for observability but murmur does not intercept them. Murmur
-/// capsule artifacts (WASM tools, native tools) are not exposed to the claude subprocess in this
-/// transport — use `transport: http` for murmur-managed tool dispatch.
+//! Process transport for `transport: process` inference config.
+//!
+//! # Protocol (determined by direct inspection of `claude --help` and live testing)
+//!
+//! **Model:** Single-process-per-agent-run. Claude is spawned once; a single user message is
+//! written as a JSON-line to stdin; stdin is closed; stdout is read line-by-line until the
+//! `{"type":"result"}` event; the process exits naturally.
+//!
+//! **Flags used:**
+//!   `--print`                    — non-interactive output mode
+//!   `--output-format stream-json` — one JSON event per line on stdout
+//!   `--verbose`                  — include system/metadata events
+//!   `--input-format stream-json` — accept JSON-line messages on stdin
+//!   `--model <model>`            — target model
+//!   `--tools ""`                 — disable claude's built-in tools (capsule tools live in murmur)
+//!   `--system-prompt <text>`     — inject system prompt when configured
+//!
+//! **Stdin message format:**
+//!   `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task>"}]}}`
+//!
+//! **Stdout event stream:**
+//!   `{"type":"system","subtype":"init",...}`      — session header (ignored)
+//!   `{"type":"assistant","message":{...}}`        — LLM response; content may include tool_use
+//!   `{"type":"user","message":{...}}`             — tool result (claude executed internally)
+//!   `{"type":"result","subtype":"success","result":"..."}`  — final result; signals end-of-turn
+//!   `{"type":"result","subtype":"error_during_execution",...}` — terminal error
+//!
+//! **Turn counting:** each `{"type":"assistant"}` event = one LLM inference call = one turn.
+//!
+//! **Tool calls:** Claude dispatches its own built-in tools internally. Tool_use and tool_result
+//! events appear in the stream for observability but murmur does not intercept them. Murmur
+//! capsule artifacts (WASM tools, native tools) are not exposed to the claude subprocess in this
+//! transport — use `transport: http` for murmur-managed tool dispatch.
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -506,6 +507,10 @@ fn is_thinking_only(content: Option<&Value>) -> bool {
 }
 
 /// Read and process JSON-line events from the subprocess stdout.
+// Decoding the stdout stream is what feeds every session-wide sink, so this takes the same set
+// its caller `run_process_inference_loop` was handed — hooks, trace, otel, stderr tail — rather
+// than a struct that exists only to carry them one level down.
+#[allow(clippy::too_many_arguments)]
 async fn read_process_output(
     child: &mut tokio::process::Child,
     workdir: &Path,

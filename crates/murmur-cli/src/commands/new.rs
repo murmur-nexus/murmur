@@ -264,7 +264,7 @@ fn run_wizard() -> Result<InferenceConfig, CliError> {
 
     let provider_idx = Select::with_theme(&theme)
         .with_prompt("Provider")
-        .items(&["Anthropic", "OpenAI"])
+        .items(["Anthropic", "OpenAI"])
         .default(0)
         .interact()
         .map_err(|_| non_tty_err())?;

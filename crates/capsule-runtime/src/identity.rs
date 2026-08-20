@@ -82,6 +82,10 @@ pub(crate) fn build_agent_card(
 ///
 /// Runs as a tokio task. Each accepted connection is handled in its own spawned task.
 /// Shuts down cleanly when shutdown_rx fires or when accept returns an error.
+// Everything after the listener and the shutdown channel is A2A server state that is cloned
+// once per accepted connection and handed to `handle_connection` unchanged. A wrapper struct
+// would name the argument count rather than a concept.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_http(
     listener: TcpListener,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -124,6 +128,9 @@ pub(crate) async fn serve_http(
     }
 }
 
+// Receives `serve_http`'s state verbatim and splits it across the three request handlers; see
+// the note on `serve_http` for why it is not bundled.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     card_json: String,

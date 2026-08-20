@@ -1562,11 +1562,7 @@ pub fn launch_session(
             return Err(capsule_guest_error(&err, &store.data().limits));
         }
 
-        let returned = run.post_return_async(&mut store).await;
-        match returned {
-            Ok(()) => Ok(()),
-            Err(err) => Err(capsule_guest_error(&err, &store.data().limits)),
-        }
+        Ok(())
     })?;
 
     // Drain any buffered a2a_send trace events from the capsule run.
@@ -1933,7 +1929,6 @@ fn warn_on_unenforceable_native_capabilities(
 fn build_engine() -> Result<Engine, RuntimeError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.async_support(true);
     config.epoch_interruption(true);
     Engine::new(&config).map_err(|err| RuntimeError::Runtime(err.to_string()))
 }
@@ -2826,9 +2821,6 @@ pub(crate) async fn invoke_tool_component(
             return Err(failure.message(&format!("tool '{name}'"), &err));
         }
     };
-    run.post_return_async(&mut store)
-        .await
-        .map_err(|err| format!("tool '{name}' post-return failed: {err}"))?;
     Ok(result)
 }
 

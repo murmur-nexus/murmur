@@ -506,6 +506,9 @@ fn workspace_config_path() -> Result<PathBuf, CliError> {
 
 /// Build a `RemoteRegistry` pointing at the URL from `murmur.yaml` (or the
 /// built-in default) using `NEXUS_API_KEY` from the environment.
+// Remote-registry mode has no command wired to it yet; this is the single place that resolves
+// the URL and `NEXUS_API_KEY` for when one is, and deleting it would scatter that resolution.
+#[allow(dead_code)]
 pub(crate) fn build_remote_registry() -> Result<RemoteRegistry, CliError> {
     let config = load_workspace_config()?;
     let url = config

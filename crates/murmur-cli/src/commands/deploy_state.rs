@@ -182,7 +182,7 @@ mod tests {
         r.deployment_id = full.to_string();
 
         // Mirrors the prefix branch of `remove_deployment` without touching $HOME.
-        let records = vec![r];
+        let records = [r];
         let prefix = "dep_018f4b2c";
         let hit: Vec<_> = records
             .iter()

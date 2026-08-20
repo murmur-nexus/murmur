@@ -178,7 +178,9 @@ pub(crate) fn requires_process_bounding(
 
 impl CgroupScope {
     /// Absolute path of this scope's directory.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // The scope's own path is read only by this module's tests, which assert the limit files
+    // systemd wrote under it; the launch path carries the descriptors it needs instead.
+    #[allow(dead_code)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -775,7 +777,9 @@ fn enable_controllers(base: &Path) -> Result<(), String> {
     // Bounded, because a task that never leaves is a genuine misconfiguration and has to surface
     // as one rather than hang the launch.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut last_error = None;
+    // Left uninitialised: every path that reaches the deadline check has just gone through the
+    // write's `Err` arm, so the fallback below only ever describes a real failure.
+    let mut last_error;
     loop {
         let current = std::fs::read_to_string(&subtree_control).unwrap_or_default();
         if missing_controllers(&current, &wanted).is_empty() {

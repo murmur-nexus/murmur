@@ -746,7 +746,7 @@ fn capsule_step_input_text(input: Value) -> String {
     let bare_objective = input.get("objective").and_then(Value::as_str).filter(|_| {
         ["instructions", "context", "output_format"]
             .iter()
-            .all(|key| input.get(key).map_or(true, Value::is_null))
+            .all(|key| input.get(key).is_none_or(Value::is_null))
     });
 
     match bare_objective {

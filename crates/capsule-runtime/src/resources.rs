@@ -248,6 +248,11 @@ pub(crate) fn limit_from_signal(signal: i32) -> Option<&'static str> {
 /// processes.
 #[cfg(unix)]
 #[allow(unsafe_code)]
+// The `as u32` on each `RLIMIT_*` below is redundant on Linux, where the constants are already
+// `__rlimit_resource_t` (`c_uint`), and load-bearing on macOS, where they are `c_int`. Clippy only
+// ever sees one of the two platforms at a time, so on Linux it reads the portability cast as a
+// no-op.
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn apply_hard_rlimits(
     limits: &HostResourceLimits,
     nproc_baseline: u64,
@@ -711,6 +716,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
+    // Same portability cast as `apply_hard_rlimits`: `RLIMIT_CORE` is `c_uint` on Linux and
+    // `c_int` on macOS, so the cast only looks redundant from whichever platform clippy runs on.
+    #[allow(clippy::unnecessary_cast)]
     fn set_hard_rlimit_writes_both_the_soft_and_hard_slot() {
         set_hard_rlimit(libc::RLIMIT_CORE as u32, 0).unwrap();
 

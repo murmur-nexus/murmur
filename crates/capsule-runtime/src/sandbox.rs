@@ -1559,7 +1559,10 @@ pub(crate) const SECCOMP_SYSCALL_ALLOWLIST: &[&str] = &[
 ///      Omitting them outright costs nothing, because nothing in bash, coreutils, git, or a
 ///      standard compiler/interpreter toolchain needs them: `personality`, `kcmp`, `seccomp`
 ///      itself (a nested filter cannot loosen this one, but it can slow it down for no benefit).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+// The list is a specification, not an input to the filter build: its one consumer is the
+// regression test asserting no entry ever reappears in the allowlist. Deleting it would delete
+// the thing that test checks against.
+#[allow(dead_code)]
 pub(crate) const SECCOMP_MUST_STAY_DENIED: &[&str] = &[
     // 1. demonstrated reachable on bare metal
     "io_uring_setup",

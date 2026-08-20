@@ -153,7 +153,7 @@ fn format_bytes(n: u64) -> String {
 
 fn base64_encode(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let second = *chunk.get(1).unwrap_or(&0);
         let third = *chunk.get(2).unwrap_or(&0);
@@ -1697,12 +1697,11 @@ mod tests {
         let instructions = dir.path().join("instructions.md");
         fs::write(&instructions, "You are an assistant.").unwrap();
 
-        let yaml = format!(
-            "name: cap\nversion: 0.1.0\nartifacts: []\n\
+        let yaml = "name: cap\nversion: 0.1.0\nartifacts: []\n\
              inference:\n  endpoint: http://localhost:8080\n  model: test\n  \
              system_prompt_file: instructions.md\n  \
              driver:\n    artifact: murmur-driver-anthropic\n"
-        );
+            .to_string();
         let manifest = RuntimeManifest::from_yaml_str(&yaml).unwrap();
 
         let files = collect_manifest_files(&manifest, dir.path()).unwrap();
@@ -2193,7 +2192,7 @@ mod tests {
             source::{ArtifactSource, SourceChain, SourceError},
         };
 
-        use super::super::{ensure_artifact_for_deploy, StagedArtifact};
+        use super::super::ensure_artifact_for_deploy;
         use murmur_artifact::sha256_hex;
 
         fn make_zip(name: &str, version: &str) -> Vec<u8> {

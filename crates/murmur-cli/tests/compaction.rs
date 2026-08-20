@@ -258,7 +258,7 @@ fn create_compaction_manifest(
     .unwrap();
 
     let context_section = if with_context {
-        format!("context:\n  max_tokens: 200\n")
+        "context:\n  max_tokens: 200\n".to_string()
     } else {
         String::new()
     };

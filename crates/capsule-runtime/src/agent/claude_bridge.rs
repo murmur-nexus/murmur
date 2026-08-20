@@ -159,15 +159,10 @@ impl BridgeHandle {
     /// sequentially), so no locking or `&mut` is needed. Never returns on its own; the process
     /// loop drops this future once the CLI produces its result.
     pub(super) async fn serve(&self, store: &CapsuleStoreState) {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, _)) => {
-                    // Serve inline (not spawned): keeps the borrow of `store` non-'static and
-                    // serializes tool execution, which is what we want for a single CLI client.
-                    self.handle_connection(stream, store).await;
-                }
-                Err(_) => break,
-            }
+        // Serve inline (not spawned): keeps the borrow of `store` non-'static and serializes
+        // tool execution, which is what we want for a single CLI client.
+        while let Ok((stream, _)) = self.listener.accept().await {
+            self.handle_connection(stream, store).await;
         }
     }
 
