@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn dependent_step_receives_upstream_output() {
-        if crate::cgroup::skip_without_cgroup_delegation(
+        if crate::cgroup::skip_without_host_support(
             "plan::tests::dependent_step_receives_upstream_output",
         ) {
             return;
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn parallel_tool_steps_run_concurrently() {
-        if crate::cgroup::skip_without_cgroup_delegation(
+        if crate::cgroup::skip_without_host_support(
             "plan::tests::parallel_tool_steps_run_concurrently",
         ) {
             return;
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn on_error_and_retries_are_applied() {
-        if crate::cgroup::skip_without_cgroup_delegation(
+        if crate::cgroup::skip_without_host_support(
             "plan::tests::on_error_and_retries_are_applied",
         ) {
             return;
@@ -1053,7 +1053,7 @@ mod tests {
 
     #[test]
     fn condition_false_skips_step() {
-        if crate::cgroup::skip_without_cgroup_delegation(
+        if crate::cgroup::skip_without_host_support(
             "plan::tests::condition_false_skips_step",
         ) {
             return;

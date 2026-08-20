@@ -883,23 +883,31 @@ pub fn cgroup_delegation_available() -> bool {
     }
 }
 
-/// Skip guard for a test that cannot run without [`cgroup_delegation_available`], written as
-/// `if skip_without_cgroup_delegation("test_name") { return; }`.
+/// Whether a test that launches a subprocess-capable capsule must stand down on this host,
+/// printing the blocker when it must.
 ///
-/// Prints exactly one `[SKIP-CGROUP]`-prefixed line per skipped test, on stderr, so the CI job's
-/// summary step can report the size of the skipped set as a count of matching lines. Cargo
-/// swallows a passing test's output, so the line only reaches the log under `--nocapture`.
-pub fn skip_without_cgroup_delegation(test_name: &str) -> bool {
-    if cgroup_delegation_available() {
-        return false;
+/// Both blockers are asked through the same calls a launch makes -- `delegated_base` for the
+/// cgroup scope, `detect_egress_namespace_blocker` for the network namespace -- so the gate and
+/// the launch cannot reach different conclusions about the host. A containerised CI runner
+/// typically clears the first and fails the second.
+pub fn skip_without_host_support(test_name: &str) -> bool {
+    if let Some(blocker) = crate::network_namespace::detect_egress_namespace_blocker() {
+        eprintln!(
+            "[SKIP-HOST] {test_name}: {}",
+            blocker.reason()
+        );
+        return true;
     }
-    eprintln!(
-        "[SKIP-CGROUP] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
-         that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
-         this test observes happens — see \
-         docs/content/reference/resource-limits-manual-verification.md"
-    );
-    true
+    if !cgroup_delegation_available() {
+        eprintln!(
+            "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope, so a capsule \
+             that can spawn native subprocesses refuses to launch with E-RUN-012 before anything \
+             this test observes happens -- see \
+             docs/content/reference/resource-limits-manual-verification.md"
+        );
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -962,7 +970,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_required_scope_is_created_whatever_cgroup_this_process_inherited() {
-        if skip_without_cgroup_delegation(
+        if skip_without_host_support(
             "a_required_scope_is_created_whatever_cgroup_this_process_inherited",
         ) {
             return;

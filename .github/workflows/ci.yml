@@ -65,21 +65,22 @@ jobs:
             exit 0
           fi
           # `--nocapture` interleaves the output of concurrently running tests, so two markers can
-          # share a line: the count is of matches, not of lines. `[SKIP-CGROUP]` never matches the
+          # share a line: the count is of matches, not of lines. `[SKIP-HOST]` never matches the
           # `[SKIP]` pattern -- the `]` is literal -- so the two counts stay disjoint.
-          cgroup_skips=$(grep -o '\[SKIP-CGROUP\]' test-output.log | wc -l)
+          host_skips=$(grep -o '\[SKIP-HOST\]' test-output.log | wc -l)
           other_skips=$(grep -o '\[SKIP\]' test-output.log | wc -l)
           {
             echo "## Tests this runner did not execute"
             echo
             echo "| Skipped for | Tests |"
             echo "| --- | ---: |"
-            echo "| No delegated cgroup v2 scope (\`[SKIP-CGROUP]\`) | $cgroup_skips |"
+            echo "| Host cannot isolate a capsule (\`[SKIP-HOST]\`) | $host_skips |"
             echo "| A local fixture or checkout this runner does not have (\`[SKIP]\`) | $other_skips |"
             echo
-            echo "GitHub's runners are containerised and cannot delegate cgroup v2 controllers, so a"
-            echo "capsule that spawns native subprocesses refuses to launch here with \`E-RUN-012\`."
-            echo "Those $cgroup_skips tests are covered by the manual procedure in"
+            echo "A capsule that spawns native subprocesses needs both a delegated cgroup v2 scope and"
+            echo "its own network namespace. GitHub's runners refuse \`unshare(CLONE_NEWUSER | CLONE_NEWNET)\`"
+            echo "under the AppArmor unprivileged-userns restriction, so the launch is refused here."
+            echo "Those $host_skips tests are covered by the manual procedure in"
             echo "\`docs/content/reference/resource-limits-manual-verification.md\`, which must be run by"
             echo "hand on a real uncontainerised Linux host."
           } >> "$GITHUB_STEP_SUMMARY"

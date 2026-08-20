@@ -294,7 +294,7 @@ fn assert_allowlisted_exec_succeeds(test_name: &str, containment_yaml: &str) {
 
     if !output.status.success() && stderr.contains(CGROUP_REFUSAL) {
         eprintln!(
-            "[SKIP-CGROUP] {test_name}: this host cannot delegate a cgroup v2 scope to `mur`, so \
+            "[SKIP-HOST] {test_name}: this host cannot delegate a cgroup v2 scope to `mur`, so \
              `mur run` refuses with {CGROUP_REFUSAL} before spawning any subprocess — no execve \
              happens and this slice's behaviour is unobservable here"
         );

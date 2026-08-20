@@ -73,7 +73,7 @@ fn find<'a>(report: &'a plan::ExecutionReport, step_id: &str) -> &'a plan::StepR
 
 #[test]
 fn test_parallel_tool_steps_run_concurrently() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_parallel_tool_steps_run_concurrently",
     ) {
         return;
@@ -109,7 +109,7 @@ fn test_parallel_tool_steps_run_concurrently() {
 
 #[test]
 fn test_dependent_step_receives_upstream_output() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_dependent_step_receives_upstream_output",
     ) {
         return;
@@ -150,7 +150,7 @@ fn test_dependent_step_receives_upstream_output() {
 
 #[test]
 fn test_shell_step_executes() {
-    if capsule_runtime::skip_without_cgroup_delegation("test_shell_step_executes") {
+    if capsule_runtime::skip_without_host_support("test_shell_step_executes") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -201,7 +201,7 @@ fn test_capsule_step_spawns_and_reads_result() {
 /// so wrapping the objective in one would only hand the child JSON to decode before it can start.
 #[test]
 fn test_capsule_step_sends_objective_as_plain_text() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_capsule_step_sends_objective_as_plain_text",
     ) {
         return;
@@ -245,7 +245,7 @@ fn test_capsule_step_sends_objective_as_plain_text() {
 /// flattened into one field, so nothing they wrote is dropped on the way to the child.
 #[test]
 fn test_capsule_step_passes_unmodelled_input_through_as_json() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_capsule_step_passes_unmodelled_input_through_as_json",
     ) {
         return;
@@ -278,7 +278,7 @@ fn test_capsule_step_passes_unmodelled_input_through_as_json() {
 
 #[test]
 fn test_if_condition_skips_step_on_false() {
-    if capsule_runtime::skip_without_cgroup_delegation("test_if_condition_skips_step_on_false") {
+    if capsule_runtime::skip_without_host_support("test_if_condition_skips_step_on_false") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -334,7 +334,7 @@ fn test_validation_rejects_unresolvable_tool() {
 
 #[test]
 fn test_on_error_continue_completes_plan() {
-    if capsule_runtime::skip_without_cgroup_delegation("test_on_error_continue_completes_plan") {
+    if capsule_runtime::skip_without_host_support("test_on_error_continue_completes_plan") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -373,7 +373,7 @@ fn test_on_error_continue_completes_plan() {
 
 #[test]
 fn test_on_error_fail_aborts_plan() {
-    if capsule_runtime::skip_without_cgroup_delegation("test_on_error_fail_aborts_plan") {
+    if capsule_runtime::skip_without_host_support("test_on_error_fail_aborts_plan") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -404,7 +404,7 @@ fn test_on_error_fail_aborts_plan() {
 
 #[test]
 fn test_retries_before_error_policy() {
-    if capsule_runtime::skip_without_cgroup_delegation("test_retries_before_error_policy") {
+    if capsule_runtime::skip_without_host_support("test_retries_before_error_policy") {
         return;
     }
     let dir = tempdir().unwrap();
@@ -440,7 +440,7 @@ fn test_retries_before_error_policy() {
 
 #[test]
 fn test_join_point_waits_for_multiple_upstreams() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_join_point_waits_for_multiple_upstreams",
     ) {
         return;
@@ -666,7 +666,7 @@ fn write_http_json(stream: &mut TcpStream, body: &Value) {
 
 #[test]
 fn test_cycle_is_reported_without_running_steps() {
-    if capsule_runtime::skip_without_cgroup_delegation(
+    if capsule_runtime::skip_without_host_support(
         "test_cycle_is_reported_without_running_steps",
     ) {
         return;

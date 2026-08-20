@@ -319,7 +319,7 @@ fn http_get(addr: &str, path: &str) -> String {
 
 #[test]
 fn streaming_basic_events_received() {
-    if common::skip_without_cgroup_delegation("streaming_basic_events_received") {
+    if common::skip_without_host_support("streaming_basic_events_received") {
         return;
     }
     let server = end_turn_server("streaming task complete");
@@ -369,7 +369,7 @@ fn streaming_basic_events_received() {
 
 #[test]
 fn streaming_tool_artifact_event() {
-    if common::skip_without_cgroup_delegation("streaming_tool_artifact_event") {
+    if common::skip_without_host_support("streaming_tool_artifact_event") {
         return;
     }
     let server = tool_then_end_turn_server("bash", "echo hello_from_tool", "tool done");
@@ -429,7 +429,7 @@ fn streaming_tool_artifact_event() {
 
 #[test]
 fn streaming_reconnect_replays_missed_events() {
-    if common::skip_without_cgroup_delegation("streaming_reconnect_replays_missed_events") {
+    if common::skip_without_host_support("streaming_reconnect_replays_missed_events") {
         return;
     }
     // Use a 2-turn server so there are multiple events to replay
@@ -514,7 +514,7 @@ fn streaming_reconnect_replays_missed_events() {
 
 #[test]
 fn streaming_agent_card_has_streaming_capability() {
-    if common::skip_without_cgroup_delegation("streaming_agent_card_has_streaming_capability") {
+    if common::skip_without_host_support("streaming_agent_card_has_streaming_capability") {
         return;
     }
     let server = end_turn_server("agent card test done");
@@ -710,7 +710,7 @@ fn streaming_text_chunks_received() {
 /// full turn text and final:true, then the completed status event.
 #[test]
 fn streaming_non_streaming_driver_fallback() {
-    if common::skip_without_cgroup_delegation("streaming_non_streaming_driver_fallback") {
+    if common::skip_without_host_support("streaming_non_streaming_driver_fallback") {
         return;
     }
     let server = end_turn_server("the full response text");

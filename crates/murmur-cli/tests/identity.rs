@@ -112,7 +112,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
 
 #[test]
 fn murmur_md_has_identity_section_with_correct_values() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "murmur_md_has_identity_section_with_correct_values",
     ) {
         return;
@@ -154,7 +154,7 @@ fn murmur_md_has_identity_section_with_correct_values() {
 
 #[test]
 fn identity_env_vars_are_visible_to_shell_tool() {
-    if common::skip_without_cgroup_delegation("identity_env_vars_are_visible_to_shell_tool") {
+    if common::skip_without_host_support("identity_env_vars_are_visible_to_shell_tool") {
         return;
     }
     let server = common::ScriptedServer::start(vec![
@@ -207,7 +207,7 @@ fn identity_env_vars_are_visible_to_shell_tool() {
 
 #[test]
 fn agent_card_served_at_well_known_path() {
-    if common::skip_without_cgroup_delegation("agent_card_served_at_well_known_path") {
+    if common::skip_without_host_support("agent_card_served_at_well_known_path") {
         return;
     }
     let server = end_turn_server("done");
@@ -257,7 +257,7 @@ fn agent_card_served_at_well_known_path() {
 
 #[test]
 fn agent_card_returns_404_for_unknown_path() {
-    if common::skip_without_cgroup_delegation("agent_card_returns_404_for_unknown_path") {
+    if common::skip_without_host_support("agent_card_returns_404_for_unknown_path") {
         return;
     }
     let server = end_turn_server("done");
@@ -285,7 +285,7 @@ fn agent_card_returns_404_for_unknown_path() {
 
 #[test]
 fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids",
     ) {
         return;
@@ -337,7 +337,7 @@ fn two_concurrent_sessions_have_distinct_capsule_urls_and_session_ids() {
 
 #[test]
 fn http_server_not_reachable_after_session_ends() {
-    if common::skip_without_cgroup_delegation("http_server_not_reachable_after_session_ends") {
+    if common::skip_without_host_support("http_server_not_reachable_after_session_ends") {
         return;
     }
     let server = end_turn_server("done");

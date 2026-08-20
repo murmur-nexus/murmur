@@ -110,7 +110,7 @@ fn inference_input_tokens(trace: &str) -> Vec<u64> {
 /// assistant + tool-result messages appended since Turn 0) and carries the continuation id.
 #[test]
 fn continuation_active_sends_incremental_second_turn() {
-    if common::skip_without_cgroup_delegation("continuation_active_sends_incremental_second_turn") {
+    if common::skip_without_host_support("continuation_active_sends_incremental_second_turn") {
         return;
     }
     let (result, _trace) = run_session(None);
@@ -126,7 +126,7 @@ fn continuation_active_sends_incremental_second_turn() {
 /// Turn resends the full `messages` array and no continuation id is ever attached.
 #[test]
 fn no_continuation_key_resends_full_history() {
-    if common::skip_without_cgroup_delegation("no_continuation_key_resends_full_history") {
+    if common::skip_without_host_support("no_continuation_key_resends_full_history") {
         return;
     }
     let (result, _trace) = run_session(Some("NOCONT"));
@@ -148,7 +148,7 @@ fn no_continuation_key_resends_full_history() {
 /// run's growth would collapse and this equality would fail.)
 #[test]
 fn token_accounting_is_identical_with_and_without_continuation() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "token_accounting_is_identical_with_and_without_continuation",
     ) {
         return;

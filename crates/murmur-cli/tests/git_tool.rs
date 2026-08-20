@@ -389,7 +389,7 @@ fn invoke_native_tool_directly(binary: &Path, data: Value, extra_env: &[(&str, &
 /// The binary's CWD is the session workdir, so the relative `path` resolves there.
 #[test]
 fn native_tool_dispatch_creates_directory() {
-    if common::skip_without_cgroup_delegation("native_tool_dispatch_creates_directory") {
+    if common::skip_without_host_support("native_tool_dispatch_creates_directory") {
         return;
     }
     let home = TempDir::new().unwrap();
@@ -457,7 +457,7 @@ fn native_tool_dispatch_creates_directory() {
 /// `summary` as the tool result text.
 #[test]
 fn native_tool_dispatch_reports_failure_for_existing_path() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "native_tool_dispatch_reports_failure_for_existing_path",
     ) {
         return;
@@ -524,7 +524,7 @@ fn native_tool_dispatch_reports_failure_for_existing_path() {
 /// dispatch, addressed by a `path` relative to the tool's CWD (the session workdir).
 #[test]
 fn native_tool_dispatch_lists_entries() {
-    if common::skip_without_cgroup_delegation("native_tool_dispatch_lists_entries") {
+    if common::skip_without_host_support("native_tool_dispatch_lists_entries") {
         return;
     }
     let home = TempDir::new().unwrap();
@@ -577,7 +577,7 @@ fn native_tool_dispatch_lists_entries() {
 /// keeps a dispatch case that actually travels through it rather than through `path`.
 #[test]
 fn native_tool_dispatch_lists_entries_with_repo_base() {
-    if common::skip_without_cgroup_delegation("native_tool_dispatch_lists_entries_with_repo_base") {
+    if common::skip_without_host_support("native_tool_dispatch_lists_entries_with_repo_base") {
         return;
     }
     let home = TempDir::new().unwrap();
@@ -631,7 +631,7 @@ fn native_tool_dispatch_lists_entries_with_repo_base() {
 /// the effect can only land there if `repo` was honoured.
 #[test]
 fn native_tool_dispatch_with_explicit_repo() {
-    if common::skip_without_cgroup_delegation("native_tool_dispatch_with_explicit_repo") {
+    if common::skip_without_host_support("native_tool_dispatch_with_explicit_repo") {
         return;
     }
     let home = TempDir::new().unwrap();
@@ -790,7 +790,7 @@ fn native_tool_repo_in_allow_list() {
 /// with no schema reads back as an empty object, which satisfies any softer assertion.
 #[test]
 fn native_tool_schema_includes_repo_field() {
-    if common::skip_without_cgroup_delegation("native_tool_schema_includes_repo_field") {
+    if common::skip_without_host_support("native_tool_schema_includes_repo_field") {
         return;
     }
     let home = TempDir::new().unwrap();

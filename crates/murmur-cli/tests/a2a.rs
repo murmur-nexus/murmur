@@ -148,7 +148,7 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
 
 #[test]
 fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "a2a_message_send_starts_agent_loop_and_returns_submitted",
     ) {
         return;
@@ -235,7 +235,7 @@ fn a2a_message_send_starts_agent_loop_and_returns_submitted() {
 
 #[test]
 fn a2a_second_message_send_is_rejected() {
-    if common::skip_without_cgroup_delegation("a2a_second_message_send_is_rejected") {
+    if common::skip_without_host_support("a2a_second_message_send_is_rejected") {
         return;
     }
     // Use a two-response server so the session takes at least two round-trips,
@@ -311,7 +311,7 @@ fn a2a_second_message_send_is_rejected() {
 
 #[test]
 fn a2a_task_md_fallback_not_regressed() {
-    if common::skip_without_cgroup_delegation("a2a_task_md_fallback_not_regressed") {
+    if common::skip_without_host_support("a2a_task_md_fallback_not_regressed") {
         return;
     }
     // When task.md exists, the capsule should run normally without waiting for A2A.
@@ -333,7 +333,7 @@ fn a2a_task_md_fallback_not_regressed() {
 
 #[test]
 fn a2a_tasks_get_unknown_method_returns_error() {
-    if common::skip_without_cgroup_delegation("a2a_tasks_get_unknown_method_returns_error") {
+    if common::skip_without_host_support("a2a_tasks_get_unknown_method_returns_error") {
         return;
     }
     let server = end_turn_server("done");

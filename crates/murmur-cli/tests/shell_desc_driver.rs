@@ -145,6 +145,9 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
 
 #[test]
 fn shell_desc_driver_not_declared_falls_back_to_generic() {
+    if common::skip_without_host_support("shell_desc_driver_not_declared_falls_back_to_generic") {
+        return;
+    }
     // No driver in artifacts — behavior must be identical to pre-feature baseline.
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

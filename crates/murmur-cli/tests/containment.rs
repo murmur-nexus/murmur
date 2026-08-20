@@ -174,6 +174,9 @@ fn explain_scope_json_emits_one_machine_readable_line() {
 
 #[test]
 fn an_undeclared_manifest_is_not_gated() {
+    if capsule_runtime::skip_without_host_support("an_undeclared_manifest_is_not_gated") {
+        return;
+    }
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     write_project(project.path(), "capabilities:\n  shell:\n    allow:\n      - echo\n");

@@ -143,7 +143,7 @@ fn compaction_fires_when_threshold_reached() {
 /// Test 2: threshold reached but murmur-compact not declared → warning logged, loop continues.
 #[test]
 fn compact_not_declared_threshold_reached_warning_logged() {
-    if common::skip_without_cgroup_delegation(
+    if common::skip_without_host_support(
         "compact_not_declared_threshold_reached_warning_logged",
     ) {
         return;
@@ -199,7 +199,7 @@ fn compact_not_declared_threshold_reached_warning_logged() {
 /// Test 3: context.max_tokens absent → compaction disabled even if murmur-compact installed.
 #[test]
 fn context_max_tokens_absent_compaction_disabled() {
-    if common::skip_without_cgroup_delegation("context_max_tokens_absent_compaction_disabled") {
+    if common::skip_without_host_support("context_max_tokens_absent_compaction_disabled") {
         return;
     }
     let server = ScriptedServer::start(two_turn_responses());

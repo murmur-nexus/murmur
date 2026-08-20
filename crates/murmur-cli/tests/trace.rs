@@ -108,7 +108,7 @@ fn parse_events(workdir: &std::path::Path) -> Vec<Value> {
 /// Verifies all six event types appear, session_id is consistent, and counts match.
 #[test]
 fn trace_two_turn_session_all_event_types() {
-    if common::skip_without_cgroup_delegation("trace_two_turn_session_all_event_types") {
+    if common::skip_without_host_support("trace_two_turn_session_all_event_types") {
         return;
     }
     let server = common::ScriptedServer::start(vec![
@@ -321,7 +321,7 @@ fn trace_two_turn_session_all_event_types() {
 /// No murmur-hook-debug or any hook declared — only the driver.
 #[test]
 fn trace_written_without_hook_artifacts() {
-    if common::skip_without_cgroup_delegation("trace_written_without_hook_artifacts") {
+    if common::skip_without_host_support("trace_written_without_hook_artifacts") {
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn_response()]);
@@ -357,7 +357,7 @@ fn trace_written_without_hook_artifacts() {
 /// close so the second driver call fails → driver returns non-passed status.
 #[test]
 fn trace_session_end_written_on_failed_exit() {
-    if common::skip_without_cgroup_delegation("trace_session_end_written_on_failed_exit") {
+    if common::skip_without_host_support("trace_session_end_written_on_failed_exit") {
         return;
     }
     // Script one successful response (tool_call turn 0).
@@ -430,7 +430,7 @@ fn trace_session_end_written_on_failed_exit() {
 /// Verify that session_id in trace.jsonl equals the session_id from StagedSession.
 #[test]
 fn trace_session_id_matches_staged_session() {
-    if common::skip_without_cgroup_delegation("trace_session_id_matches_staged_session") {
+    if common::skip_without_host_support("trace_session_id_matches_staged_session") {
         return;
     }
     let server = common::ScriptedServer::start(vec![end_turn_response()]);
