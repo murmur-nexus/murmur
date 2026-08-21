@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/murmur-nexus/murmur"
@@ -17,8 +17,8 @@ readme = "README.md"
 # Internal crates, version-pinned in one place so `cargo publish` has a concrete
 # version to depend on. Bump these in lockstep with `workspace.package.version`.
 [workspace.dependencies]
-murmur-artifact = { path = "crates/murmur-artifact", version = "0.1.0" }
-capsule-runtime = { path = "crates/capsule-runtime", version = "0.1.0" }
+murmur-artifact = { path = "crates/murmur-artifact", version = "0.2.0" }
+capsule-runtime = { path = "crates/capsule-runtime", version = "0.2.0" }
 
 [profile.release]
 strip = true
