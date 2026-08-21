@@ -39,8 +39,9 @@ The exit code is the check result, so an invalid note blocks the PR.
 ### `aggregate` — render a release's changelog
 
 ```bash
-python .github/scripts/release-notes.py aggregate --from v0.1.0 --to v0.2.0 \
-  --version 0.2.0 --previous-version 0.1.0 --file CHANGELOG/v0.2.0.md
+python .github/scripts/release-notes.py aggregate --from <previous-tag> --to <release-tag> \
+  --version <release-version> --previous-version <previous-version> \
+  --file CHANGELOG/<release-tag>.md
 ```
 
 **Used by:** `release.yml` on a release tag, and `generate-changelog.yml` on

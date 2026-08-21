@@ -39,8 +39,8 @@ Write a release note if your PR:
   [When a fix is not a fix](#when-a-fix-is-not-a-fix)
 
 Nothing outside that list is a `NONE`. **When you are torn, write the note**: a redundant line is cut
-when the changelog is read before publishing, a missing one is never noticed — which is how v0.2.0
-shipped with four unmentioned breaking changes.
+when the changelog is read before publishing, a missing one is never noticed — which is how a release
+ships with unmentioned breaking changes.
 
 Example:
 ```release-note
@@ -60,7 +60,7 @@ Keep release notes:
 ### Breaking changes before 1.0
 
 Murmur is pre-1.0. Breaking changes are ordinary here, expected by anyone tracking the project, and
-land in most releases — v0.2.0 shipped six. The `Breaking:` prefix is routine labelling, not an
+land in most releases, often several at a time. The `Breaking:` prefix is routine labelling, not an
 alarm, and **under-using it is by far the more expensive mistake**: it is the only signal a reader
 gets that an upgrade costs them work, and it is what floats the note to the top of its section.
 
@@ -152,7 +152,10 @@ Updated dependencies
 6. **Generate changelog** as Markdown or JSON
 7. **Review and edit** for consistency and clarity
 8. **Commit the edited file** as `CHANGELOG/vX.Y.Z.md` and add an index entry in `CHANGELOG.md`
-9. **Publish GitHub release** with the generated notes
+
+The GitHub Release itself is created by `release.yml` when the tag is pushed — steps 1–7 describe
+what that workflow does, not work to be repeated by hand. Do them manually only when regenerating a
+changelog for a release that already exists.
 
 ### Release Note Labels
 
@@ -185,7 +188,7 @@ tag. See [`scripts/README.md`](scripts/README.md) for its options.
 ```markdown
 # Changelog
 
-## Changes since v0.1.0
+## Changes since vX.Y.Z
 
 ### Features
 - `mur run --system-prompt` overrides a capsule's system prompt for a single run.

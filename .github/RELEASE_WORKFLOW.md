@@ -111,9 +111,9 @@ regenerating a changelog outside a tag push.
 2. Select **Generate Changelog** workflow
 3. Click **Run workflow**
 4. Fill in:
-   - **from_version**: Starting tag (e.g., `v1.0.0`)
+   - **from_version**: the previous release tag
    - **to_version**: Ending tag or `HEAD` (default: `HEAD`)
-   - **release_version**: Version for header (e.g., `v1.1.0`)
+   - **release_version**: the tag the changelog is headed with
    - **release_date**: Release date (optional, defaults to today)
 
 ### Step 2: Review Generated Changelog
@@ -152,28 +152,28 @@ pip install requests
 
 **Basic usage:**
 ```bash
-python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0
+python .github/scripts/release-notes.py aggregate <previous-tag> <release-tag>
 ```
 
 **With options:**
 ```bash
 python .github/scripts/release-notes.py aggregate \
-  --from v1.0.0 \
-  --to v1.1.0 \
-  --version v1.1.0 \
-  --date 2026-03-15 \
+  --from <previous-tag> \
+  --to <release-tag> \
+  --version <release-tag> \
+  --date YYYY-MM-DD \
   --output markdown \
   --file CHANGELOG.new.md
 ```
 
 **Output to file:**
 ```bash
-python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0 --file changelog.md
+python .github/scripts/release-notes.py aggregate <previous-tag> <release-tag> --file changelog.md
 ```
 
 **JSON output:**
 ```bash
-python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0 --output json
+python .github/scripts/release-notes.py aggregate <previous-tag> <release-tag> --output json
 ```
 
 ### Options
