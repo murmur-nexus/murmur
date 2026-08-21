@@ -152,12 +152,12 @@ pip install requests
 
 **Basic usage:**
 ```bash
-python .github/scripts/aggregate-release-notes.py v1.0.0 v1.1.0
+python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0
 ```
 
 **With options:**
 ```bash
-python .github/scripts/aggregate-release-notes.py \
+python .github/scripts/release-notes.py aggregate \
   --from v1.0.0 \
   --to v1.1.0 \
   --version v1.1.0 \
@@ -168,12 +168,12 @@ python .github/scripts/aggregate-release-notes.py \
 
 **Output to file:**
 ```bash
-python .github/scripts/aggregate-release-notes.py v1.0.0 v1.1.0 --file changelog.md
+python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0 --file changelog.md
 ```
 
 **JSON output:**
 ```bash
-python .github/scripts/aggregate-release-notes.py v1.0.0 v1.1.0 --output json
+python .github/scripts/release-notes.py aggregate v1.0.0 v1.1.0 --output json
 ```
 
 ### Options

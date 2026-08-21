@@ -90,6 +90,11 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The previous release tag is resolved from the local tag list and
+          # the changelog range is walked with `git log`; a shallow checkout
+          # carrying only the triggering tag makes both silently wrong.
+          fetch-depth: 0
       - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
@@ -142,11 +147,17 @@ jobs:
           PREVIOUS_TAG=$(git tag --sort=-version:refname --merged HEAD | grep -v "^${{ github.ref_name }}$" | head -1)
 
           if [ -z "$PREVIOUS_TAG" ]; then
-            # If no previous tag, use current tag
-            PREVIOUS_TAG="$VERSION"
+            # Fail rather than fall back to the current tag. That fallback
+            # produced a "Changes since v0.2.0" heading on the v0.2.0 release
+            # and an empty range, and looked like a working run.
+            echo "::error::Cannot resolve the tag preceding ${VERSION}." \
+                 "Tags visible here: $(git tag --list | tr '\n' ' ' | sed 's/ $//')." \
+                 "If this is genuinely the first release, pass --previous-version by hand."
+            exit 1
           fi
 
-          python .github/scripts/aggregate-release-notes.py \
+          python .github/scripts/release-notes.py aggregate \
+            --repo "${{ github.repository }}" \
             --from "$PREVIOUS_TAG" \
             --to "${{ github.ref_name }}" \
             --version "${VERSION_NO_V}" \
@@ -167,6 +178,16 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION_NO_V="${VERSION#v}"
 
+          # The release body is the generated changelog with the SHA256 block
+          # appended. Publishing only the checksums left the release page and
+          # the committed CHANGELOG/ file saying different things, and the
+          # changelog readable only by whoever downloaded the workflow artifact.
+          cat "CHANGELOG/v${VERSION_NO_V}.md" > release-body.md
+          printf '\n\n' >> release-body.md
+          cat >> release-body.md <<'CHECKSUMS'
+          ${{ steps.checksums.outputs.notes }}
+          CHECKSUMS
+
           gh release create "${{ github.ref_name }}" \
             mur-${VERSION_NO_V}-darwin-aarch64 \
             mur-${VERSION_NO_V}-darwin-x86_64 \
@@ -174,4 +195,4 @@ jobs:
             checksums.txt \
             --repo "${{ github.repository }}" \
             --title "murmur v${VERSION_NO_V}" \
-            --notes "${{ steps.checksums.outputs.notes }}"
+            --notes-file release-body.md
