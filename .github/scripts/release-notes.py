@@ -42,11 +42,17 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import subprocess
 
+MISSING_REQUESTS = "Error: requests library not found. Install with: pip install requests"
+
 try:
     import requests
 except ImportError:
-    print("Error: requests library not found. Install with: pip install requests")
-    sys.exit(1)
+    # Deferred rather than fatal here. check-workflow-invocations.py imports
+    # this module to build the parser and never makes a request; exiting at
+    # import time failed that check for a missing dependency it does not use.
+    # Every path that does reach the network goes through ReleaseNotes, so the
+    # CLI still fails with this same message, at the point it first matters.
+    requests = None
 
 
 # The fence line carries optional `key=value` attributes; everything up to the
@@ -66,6 +72,8 @@ LABELS = {
     "none": "release-note/none",
     "invalid": "release-note/invalid",
 }
+
+DEFAULT_REPO = "murmur-nexus/murmur"
 
 
 def parse_release_note(body: str) -> Optional[Dict[str, Optional[str]]]:
@@ -89,6 +97,9 @@ class ReleaseNotes:
     """Reads release notes off GitHub PRs."""
 
     def __init__(self, repo: str, token: Optional[str] = None):
+        if requests is None:
+            print(MISSING_REQUESTS)
+            sys.exit(1)
         self.repo = repo
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.owner, self.name = repo.split("/")
@@ -522,17 +533,44 @@ def cmd_aggregate(args) -> int:
     return 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--repo", default="murmur-nexus/murmur", help="GitHub repo (owner/name)")
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI.
+
+    Separate from `main` so `check-workflow-invocations.py` can parse the
+    command lines the workflows actually run without executing them.
+    """
+    # argparse hands every token after the subcommand to the subparser, so a
+    # flag declared only on the main parser is an "unrecognized argument" when
+    # it trails the subcommand. Declaring --repo on a shared parent that both
+    # the main parser and each subparser inherit accepts it on either side.
+    #
+    # The SUPPRESS default is what makes that safe: a subparser parses into its
+    # own namespace and then copies every key it holds onto the main one, so a
+    # default here would overwrite a --repo given *before* the subcommand. With
+    # SUPPRESS the key is absent unless supplied, and the default is applied
+    # once, below, after both parsers have had their say.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--repo",
+        default=argparse.SUPPRESS,
+        help=f"GitHub repo (owner/name) (default: {DEFAULT_REPO})",
+    )
+
+    parser = argparse.ArgumentParser(
+        # Pinned rather than taken from argv[0], so usage and error text name this
+        # script even when the parser is built by check-workflow-invocations.py.
+        prog="release-notes.py",
+        description=__doc__.split("\n")[1],
+        parents=[common],
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    v = sub.add_parser("validate", help="Check and label one PR's release note")
+    v = sub.add_parser("validate", parents=[common], help="Check and label one PR's release note")
     v.add_argument("--pr", type=int, required=True, help="PR number")
     v.add_argument("--no-labels", action="store_true", help="Report only; don't label or comment")
     v.set_defaults(func=cmd_validate)
 
-    a = sub.add_parser("aggregate", help="Render the changelog for a release range")
+    a = sub.add_parser("aggregate", parents=[common], help="Render the changelog for a release range")
     a.add_argument("from_ref", nargs="?", help="Starting ref (tag or commit)")
     a.add_argument("to_ref", nargs="?", help="Ending ref (tag or commit)")
     a.add_argument("--from", dest="from_flag", help="Starting ref (alternative to positional)")
@@ -547,9 +585,13 @@ def main() -> int:
     a.add_argument("--previous-version", help="Previous version for 'Changes since' header")
     a.set_defaults(func=cmd_aggregate)
 
-    args = parser.parse_args()
-    # --repo is declared on the parent parser, so it must precede the
-    # subcommand; accept it after as well by falling back to the default.
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if not getattr(args, "repo", None):
+        args.repo = DEFAULT_REPO
     return args.func(args)
 
 

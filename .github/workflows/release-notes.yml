@@ -31,6 +31,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python .github/scripts/release-notes.py validate \
+          python .github/scripts/release-notes.py \
             --repo "${{ github.repository }}" \
+            validate \
             --pr "${{ github.event.pull_request.number }}"

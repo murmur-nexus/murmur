@@ -156,8 +156,9 @@ jobs:
             exit 1
           fi
 
-          python .github/scripts/release-notes.py aggregate \
+          python .github/scripts/release-notes.py \
             --repo "${{ github.repository }}" \
+            aggregate \
             --from "$PREVIOUS_TAG" \
             --to "${{ github.ref_name }}" \
             --version "${VERSION_NO_V}" \
