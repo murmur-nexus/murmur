@@ -114,6 +114,12 @@ Reads the `release-notes.py` command lines out of `.github/workflows/*.yml` and
 parses each one, stopping at `parse_args` — nothing runs, so it needs no token
 and no network.
 
+It imports `release-notes.py` to build the parser, and uses the standard
+library only. That is why a missing `requests` no longer kills that module at
+import time: the failure now happens in `ReleaseNotes.__init__`, the first
+point that actually needs the network. Keep any new third-party import in this
+job's path deferred the same way, or install it here.
+
 It exists because the workflows are the only callers of `release-notes.py`, and
 its argument wiring has no other cover. `--repo` was once declared on the main
 parser, which in argparse means it must precede the subcommand, while all three

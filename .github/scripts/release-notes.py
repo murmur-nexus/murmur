@@ -42,11 +42,17 @@ from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import subprocess
 
+MISSING_REQUESTS = "Error: requests library not found. Install with: pip install requests"
+
 try:
     import requests
 except ImportError:
-    print("Error: requests library not found. Install with: pip install requests")
-    sys.exit(1)
+    # Deferred rather than fatal here. check-workflow-invocations.py imports
+    # this module to build the parser and never makes a request; exiting at
+    # import time failed that check for a missing dependency it does not use.
+    # Every path that does reach the network goes through ReleaseNotes, so the
+    # CLI still fails with this same message, at the point it first matters.
+    requests = None
 
 
 # The fence line carries optional `key=value` attributes; everything up to the
@@ -91,6 +97,9 @@ class ReleaseNotes:
     """Reads release notes off GitHub PRs."""
 
     def __init__(self, repo: str, token: Optional[str] = None):
+        if requests is None:
+            print(MISSING_REQUESTS)
+            sys.exit(1)
         self.repo = repo
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.owner, self.name = repo.split("/")
