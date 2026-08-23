@@ -417,7 +417,6 @@ model. These fields are read under both transports:
 |---|---|---:|---|
 | `inference.transport` | `http \| process` | no | Default: `http`. `http` routes every call through a WASM driver artifact; `process` spawns a CLI subprocess. See [Inference configuration](#inference-config). |
 | `inference.max_turns` | integer | no | Maximum LLM inference calls per task. Default: `10`. Must be > 0. |
-| `inference.max_task_reopens` | integer | no | Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. Default: `1`. Unlike `max_turns`, `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `inference.system_prompt` | string | no | Text injected verbatim as the `system` parameter on every inference call. At most one of `system_prompt`, `system_prompt_file` and `system_prompt_artifact` may be set. |
 | `inference.system_prompt_file` | string | no | Path to a file whose content is injected as the system prompt, relative to the manifest directory. |
 | `inference.system_prompt_artifact` | string | no | Name of an artifact declared in `artifacts:` whose payload is bound as the system prompt — see [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
@@ -487,6 +486,7 @@ these fields are accepted and inert:
 | `lifecycle.queue_depth` | integer | no | Default: `1`. Maximum number of pending, not-yet-started tasks the capsule holds under `task_acceptance: queue`. Tasks beyond this limit receive `state: "rejected"`. |
 | `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
+| `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 
 ---
 
@@ -752,6 +752,7 @@ lifecycle:
   after_task: exit
   queue_depth: 1
   conversation: stateless
+  max_task_reopens: 1
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }

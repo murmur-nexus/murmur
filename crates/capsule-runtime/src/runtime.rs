@@ -106,8 +106,9 @@ fn resolve_versioned_iface<T>(
 ///
 /// Fires `on-task-end` after every attempt (via [`HookRuntime::dispatch_task_end`]). If
 /// a blocking hook returns `reopen-task(reason)` and both budgets still allow it — fewer
-/// than `inference.max_task_reopens` reopens used AND cumulative task turns still below
-/// `inference.max_turns` — the task's `accessible_workdir/task.md` is rewritten as the
+/// than `max_task_reopens` (the manifest's `lifecycle.max_task_reopens`) reopens used AND
+/// cumulative task turns still below `inference.max_turns` — the task's
+/// `accessible_workdir/task.md` is rewritten as the
 /// original content plus every reopen's feedback so far, a `task_reopened` trace record
 /// is written, and the loop runs again. Reopening shares one cumulative turn budget with
 /// the original attempt: each attempt is handed only `max_turns - task_turns()` turns, so
@@ -130,6 +131,7 @@ async fn run_task_with_reopens(
     state: &mut CapsuleStoreState,
     workdir: &Path,
     inference: &InferenceConfig,
+    max_task_reopens: u32,
     system_prompt: Option<String>,
     run_config: agent::AgentRunConfig,
     hooks: &mut HookRuntime,
@@ -194,7 +196,7 @@ async fn run_task_with_reopens(
                 // A hook wants more. Honor it only if a reopen remains in the budget AND
                 // turns remain under the ceiling; otherwise the request is exhausted and
                 // ends the task non-silently.
-                let budget_ok = reopens_used < inference.max_task_reopens;
+                let budget_ok = reopens_used < max_task_reopens;
                 let turns_ok = trace.task_turns() < inference.max_turns;
                 if budget_ok && turns_ok {
                     reopens_used += 1;
@@ -1150,6 +1152,7 @@ pub fn launch_session(
                                         &mut state,
                                         &workdir,
                                         inference,
+                                        effective_lifecycle.max_task_reopens,
                                         system_prompt,
                                         run_config,
                                         &mut hooks,
@@ -1203,6 +1206,7 @@ pub fn launch_session(
                                         &mut state,
                                         &workdir,
                                         inference,
+                                        effective_lifecycle.max_task_reopens,
                                         system_prompt.clone(),
                                         run_config.clone(),
                                         &mut hooks,
@@ -1338,6 +1342,7 @@ pub fn launch_session(
                             &mut state,
                             &workdir,
                             inference,
+                            effective_lifecycle.max_task_reopens,
                             system_prompt.clone(),
                             run_config.clone(),
                             &mut hooks,
@@ -3556,7 +3561,6 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
-            max_task_reopens: 1,
             max_tokens: None,
         }
     }
@@ -4359,7 +4363,6 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns: 10,
-            max_task_reopens: 1,
             max_tokens: None,
         };
 
@@ -5646,7 +5649,6 @@ mod tests {
             system_prompt_file: None,
             system_prompt_artifact: None,
             max_turns,
-            max_task_reopens,
             max_tokens: None,
         };
 
@@ -5729,6 +5731,7 @@ mod tests {
             &mut state,
             &workdir,
             &inference,
+            max_task_reopens,
             None,
             run_config,
             &mut hooks,
@@ -5790,8 +5793,8 @@ mod tests {
         assert_eq!(end["exit_status"], "ok");
     }
 
-    /// Budget exhausted: a hook that always reopens with `max_task_reopens: 1` runs the
-    /// loop exactly twice, then ends `reopen_budget_exhausted` (an `Err`, so downstream
+    /// Budget exhausted: a hook that always reopens with `lifecycle.max_task_reopens: 1` runs
+    /// the loop exactly twice, then ends `reopen_budget_exhausted` (an `Err`, so downstream
     /// task-failure branches fire) with `reopen_count: 1`.
     #[tokio::test(flavor = "multi_thread")]
     async fn reopen_budget_exhausted_end_to_end() {
@@ -5810,8 +5813,9 @@ mod tests {
         assert_eq!(end["exit_status"], "reopen_budget_exhausted");
     }
 
-    /// Turn ceiling respected: `max_turns: 3`, `max_task_reopens: 5`, a hook that always
-    /// reopens, one turn per attempt. Cumulative `inference` records never exceed 3, and
+    /// Turn ceiling respected: `inference.max_turns: 3`, `lifecycle.max_task_reopens: 5`, a
+    /// hook that always reopens, one turn per attempt. Cumulative `inference` records never
+    /// exceed 3, and
     /// the task ends `reopen_budget_exhausted` once turns run out even though reopens
     /// remain in the budget.
     #[tokio::test(flavor = "multi_thread")]

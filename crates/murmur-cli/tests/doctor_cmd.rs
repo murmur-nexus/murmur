@@ -524,3 +524,31 @@ fn doctor_surfaces_a_malformed_manifest_before_any_checklist() {
         .stderr(predicate::str::contains("error[E-MAN-002]"))
         .stdout(predicate::str::contains("All checks passed.").not());
 }
+
+/// The reopen budget is `lifecycle.max_task_reopens`. A manifest still carrying the key under
+/// `inference:` is refused outright, so it can never silently fall back to the default of 1.
+#[test]
+fn doctor_rejects_inference_max_task_reopens() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: reopen-fixture\nversion: 0.0.1\nartifacts: []\n\
+         inference:\n  transport: process\n  command: claude\n  max_task_reopens: 3\n",
+    )
+    .unwrap();
+
+    let assert = mur_doctor(&home, project.path()).failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert
+        .stderr(predicate::str::contains("error[E-MAN-003]"))
+        .stderr(predicate::str::contains("lifecycle.max_task_reopens"));
+
+    assert!(
+        !stdout.contains('\u{2713}') && !stdout.contains('\u{2717}'),
+        "no checklist line may print, got:\n{stdout}"
+    );
+    assert!(!stdout.contains("All checks passed."), "got:\n{stdout}");
+}

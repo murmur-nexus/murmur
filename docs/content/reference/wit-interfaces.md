@@ -197,7 +197,7 @@ any other non-`none` arm is a loud but non-fatal fault:
   log are the only places it appears, since the agent loop never sees an async hook's return value.
 
 `reopen-task` is a control arm: returning it from `on-task-end` re-runs the task's agent loop
-with the arm's string injected as feedback, subject to `inference.max_task_reopens` and
+with the arm's string injected as feedback, subject to `lifecycle.max_task_reopens` and
 `inference.max_turns`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task).
 

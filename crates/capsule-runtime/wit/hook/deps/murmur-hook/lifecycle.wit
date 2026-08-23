@@ -21,7 +21,7 @@ interface lifecycle {
         /// Control decision honored only at `on-task-end`: do not finalize the
         /// task, re-run its agent loop with `reason` injected into the task
         /// content as feedback, then let this hook re-inspect the result. Bounded
-        /// by the capsule's `inference.max_task_reopens` budget and its
+        /// by the capsule's `lifecycle.max_task_reopens` budget and its
         /// `inference.max_turns` ceiling. Returned from any other lifecycle event
         /// it is a non-fatal dispatch fault (logged and traced, never honored).
         reopen-task(string),

@@ -65,11 +65,11 @@ instead of just observing it. When it returns `reopen-task(reason)`, the runtime
 finalize the task: it re-runs the task's agent loop with `reason` injected into the task
 content as feedback, then fires `on-task-end` again so the hook can re-inspect the new result.
 
-This repeats up to the reopen limit set by `inference.max_task_reopens` (default **1**; `0`
-disables reopening entirely — unlike `max_turns`, an explicit `0` is accepted). Reopening never
-grants extra turns: every attempt of a task shares one cumulative turn count against the
-capsule's `inference.max_turns` limit, so a task cannot out-run its turn budget just because a
-hook keeps asking for another try.
+This repeats up to the reopen limit set by `lifecycle.max_task_reopens` (default **1**; `0`
+disables reopening entirely — unlike `inference.max_turns`, an explicit `0` is accepted).
+Reopening never grants extra turns: every attempt of a task shares one cumulative turn count
+against the capsule's `inference.max_turns` limit, so a task cannot out-run its turn budget just
+because a hook keeps asking for another try.
 
 If the reopen limit or the turn limit is used up while a hook still wants to reopen, the task
 ends with its own exit status — `exit_status: "reopen_budget_exhausted"` rather than an

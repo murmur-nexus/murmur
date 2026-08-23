@@ -45,6 +45,12 @@ pub struct LifecycleConfig {
     /// Stateless (default): each task is fully independent; Threaded: history is loaded
     /// and persisted per contextId within a session.
     pub conversation_mode: ConversationMode,
+    /// Maximum times an `on-task-end` hook may reopen a single task (re-run its agent
+    /// loop with injected feedback). Defaults to 1 when absent. `0` disables reopening
+    /// entirely. Unlike `inference.max_turns`, `0` is a valid explicit value. Reopening
+    /// never grants turns past `inference.max_turns` — the two budgets share one
+    /// cumulative turn count.
+    pub max_task_reopens: u32,
 }
 
 impl Default for LifecycleConfig {
@@ -55,6 +61,7 @@ impl Default for LifecycleConfig {
             queue_depth: 1,
             input_timeout_secs: None,
             conversation_mode: ConversationMode::Stateless,
+            max_task_reopens: 1,
         }
     }
 }
@@ -557,11 +564,6 @@ pub struct InferenceConfig {
     /// Maximum LLM turns per capsule task. Defaults to 10 when absent in the manifest.
     /// Enforced as a hard ceiling by the runtime.
     pub max_turns: u32,
-    /// Maximum times an `on-task-end` hook may reopen a single task (re-run its agent
-    /// loop with injected feedback). Defaults to 1 when absent. `0` disables reopening
-    /// entirely. Unlike `max_turns`, `0` is a valid explicit value. Reopening never
-    /// grants turns past `max_turns` — the two budgets share one cumulative turn count.
-    pub max_task_reopens: u32,
     /// Maximum output tokens the model may generate per turn (`max_tokens` in the driver wire
     /// payload). None means the manifest didn't set it; the runtime applies its own default.
     /// `transport: http` only — rejected at parse time under `transport: process`.
@@ -1012,6 +1014,8 @@ struct RawLifecycleConfig {
     input_timeout_secs: Option<u64>,
     #[serde(default)]
     conversation: Option<ConversationMode>,
+    #[serde(default)]
+    max_task_reopens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1231,6 +1235,8 @@ struct RawInferenceConfig {
     compaction: Option<RawCompactionConfig>,
     #[serde(default)]
     max_turns: Option<u32>,
+    /// The `inference` spelling of the reopen budget is not a live field. It is deserialized
+    /// only so `parse_inference` can refuse it; without it serde would ignore the key.
     #[serde(default)]
     max_task_reopens: Option<u32>,
     #[serde(default)]
@@ -1502,6 +1508,7 @@ impl RuntimeManifest {
                 queue_depth: raw_lc.queue_depth.unwrap_or(defaults.queue_depth),
                 input_timeout_secs: raw_lc.input_timeout_secs,
                 conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
+                max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
             }
         });
 
@@ -1928,9 +1935,16 @@ fn parse_inference(
         Some(n) => n,
     };
 
-    // Unlike `max_turns`, `0` is a valid explicit value here: it disables reopening.
-    // Absent defaults to 1 (one reopen permitted).
-    let max_task_reopens = raw.max_task_reopens.unwrap_or(1);
+    // The reopen budget is a lifecycle knob, read from `lifecycle.max_task_reopens`. Nothing
+    // here consumes the `inference` spelling, so it would be silently inert — reject it rather
+    // than let it look effective.
+    if raw.max_task_reopens.is_some() {
+        return Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: "inference.max_task_reopens".to_string(),
+            message: "is not a valid inference field; set lifecycle.max_task_reopens instead"
+                .to_string(),
+        });
+    }
 
     match transport.as_str() {
         "http" => {
@@ -1980,7 +1994,6 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
-                max_task_reopens,
                 max_tokens: raw.max_tokens,
             }))
         }
@@ -2042,7 +2055,6 @@ fn parse_inference(
                 system_prompt_file,
                 system_prompt_artifact,
                 max_turns,
-                max_task_reopens,
                 max_tokens: None,
             }))
         }
@@ -4880,38 +4892,107 @@ context:
         assert!(msg.contains("greater than 0"), "error was: {msg}");
     }
 
+    /// A `lifecycle:` block that says nothing about the budget still permits one reopen.
     #[test]
-    fn inference_max_task_reopens_defaults_to_1() {
+    fn lifecycle_max_task_reopens_defaults_to_1() {
         let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n",
-        ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_task_reopens, 1);
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  after_task: sleep\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 1);
+    }
+
+    /// No `lifecycle:` block at all lands on the same default through `effective_lifecycle`.
+    #[test]
+    fn lifecycle_max_task_reopens_defaults_to_1_without_lifecycle_block() {
+        let manifest =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert!(manifest.lifecycle.is_none());
+        assert_eq!(manifest.effective_lifecycle().max_task_reopens, 1);
     }
 
     #[test]
-    fn inference_max_task_reopens_explicit_value() {
+    fn lifecycle_max_task_reopens_explicit_value() {
         let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  max_task_reopens: 3\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 3);
+    }
+
+    /// Unlike `inference.max_turns`, `0` is a valid explicit value — it disables reopening.
+    #[test]
+    fn lifecycle_max_task_reopens_zero_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  max_task_reopens: 0\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 0);
+    }
+
+    /// The budget is independent of the inference transport in play.
+    #[test]
+    fn lifecycle_max_task_reopens_with_process_transport() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\nlifecycle:\n  max_task_reopens: 2\n",
+        ).unwrap();
+        assert_eq!(manifest.lifecycle.unwrap().max_task_reopens, 2);
+    }
+
+    #[test]
+    fn inference_max_task_reopens_is_rejected_under_http_transport() {
+        let err = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_task_reopens: 3\n  driver:\n    artifact: murmur-driver-anthropic\n",
-        ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_task_reopens, 3);
+        ).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RuntimeManifestError::InvalidInferenceConfig { field, .. }
+                    if field == "inference.max_task_reopens"
+            ),
+            "error was: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lifecycle.max_task_reopens"),
+            "error was: {msg}"
+        );
     }
 
-    /// Unlike `max_turns`, `0` is a valid explicit value — it disables reopening.
     #[test]
-    fn inference_max_task_reopens_zero_is_accepted() {
-        let manifest = RuntimeManifest::from_yaml_str(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  max_task_reopens: 0\n  driver:\n    artifact: murmur-driver-anthropic\n",
-        ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_task_reopens, 0);
-    }
-
-    /// `max_task_reopens` threads through the `transport: process` construction site too.
-    #[test]
-    fn inference_max_task_reopens_process_transport() {
-        let manifest = RuntimeManifest::from_yaml_str(
+    fn inference_max_task_reopens_is_rejected_under_process_transport() {
+        let err = RuntimeManifest::from_yaml_str(
             "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  max_task_reopens: 2\n",
-        ).unwrap();
-        assert_eq!(manifest.inference.unwrap().max_task_reopens, 2);
+        ).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RuntimeManifestError::InvalidInferenceConfig { field, .. }
+                    if field == "inference.max_task_reopens"
+            ),
+            "error was: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lifecycle.max_task_reopens"),
+            "error was: {msg}"
+        );
+    }
+
+    /// The rejection is unconditional: the new key being present alongside it changes nothing.
+    #[test]
+    fn inference_max_task_reopens_is_rejected_even_alongside_the_lifecycle_key() {
+        let err = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  max_task_reopens: 2\nlifecycle:\n  max_task_reopens: 3\n",
+        ).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                RuntimeManifestError::InvalidInferenceConfig { field, .. }
+                    if field == "inference.max_task_reopens"
+            ),
+            "error was: {err:?}"
+        );
     }
 
     #[test]
