@@ -69,7 +69,6 @@ pub struct StepResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReport {
-    pub plan_id: String,
     pub results: Vec<StepResult>,
     pub completed: bool,
     pub failed_step: Option<String>,
@@ -87,8 +86,7 @@ pub struct SchedulerContext<'a> {
 pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport {
     match execute_inner(plan_path, ctx) {
         Ok(report) => report,
-        Err((plan_id, failed_step, error)) => ExecutionReport {
-            plan_id,
+        Err((failed_step, error)) => ExecutionReport {
             results: vec![StepResult {
                 step_id: failed_step.clone(),
                 status: StepStatus::Failed,
@@ -104,17 +102,15 @@ pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport 
 fn execute_inner(
     plan_path: &Path,
     ctx: &SchedulerContext<'_>,
-) -> Result<ExecutionReport, (String, String, String)> {
+) -> Result<ExecutionReport, (String, String)> {
     let raw = fs::read_to_string(plan_path).map_err(|error| {
         (
-            "unknown".to_string(),
             "plan".to_string(),
             format!("failed to read plan file {}: {error}", plan_path.display()),
         )
     })?;
     let plan: PlanFile = serde_json::from_str(&raw).map_err(|error| {
         (
-            "unknown".to_string(),
             "plan".to_string(),
             format!("failed to parse plan JSON: {error}"),
         )
@@ -122,7 +118,6 @@ fn execute_inner(
 
     if let Err((step_id, error)) = validate_plan(&plan, ctx) {
         return Ok(ExecutionReport {
-            plan_id: plan.id,
             results: vec![StepResult {
                 step_id: step_id.clone(),
                 status: StepStatus::Failed,
@@ -148,7 +143,6 @@ fn execute_inner(
         Ok(scope) => scope,
         Err(reason) => {
             return Ok(ExecutionReport {
-                plan_id: plan.id,
                 results: vec![StepResult {
                     step_id: "plan".to_string(),
                     status: StepStatus::Failed,
@@ -177,7 +171,6 @@ fn execute_inner(
         Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {
             return Ok(ExecutionReport {
-                plan_id: plan.id,
                 results: vec![StepResult {
                     step_id: "plan".to_string(),
                     status: StepStatus::Failed,
@@ -347,7 +340,6 @@ fn execute_inner(
         .collect::<Vec<_>>();
 
     Ok(ExecutionReport {
-        plan_id: plan.id,
         results: ordered_results,
         completed: failed_step.is_none(),
         failed_step,
@@ -744,7 +736,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
 /// `.nexus/roadmap/dag-capsule-step-workdir-and-input-routing-gap.md`.
 fn capsule_step_input_text(input: Value) -> String {
     let bare_objective = input.get("objective").and_then(Value::as_str).filter(|_| {
-        ["instructions", "context", "output_format"]
+        ["instructions", "context"]
             .iter()
             .all(|key| input.get(key).is_none_or(Value::is_null))
     });
