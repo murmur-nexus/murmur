@@ -271,6 +271,87 @@ fn test_capsule_step_passes_unmodelled_input_through_as_json() {
     assert_eq!(fake_roost.sent_text(), "{\"task\":\"fallback task\"}");
 }
 
+/// Only `instructions` and `context` alongside an `objective` force the whole input through as
+/// JSON. Any other companion key leaves the objective delivered as plain text, so a plan author
+/// adding a key this runtime does not model does not silently change how the objective arrives.
+#[test]
+fn test_capsule_step_objective_survives_an_unmodelled_companion_key() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_objective_survives_an_unmodelled_companion_key",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("unused".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id":"p",
+            "steps":[{
+                "id":"worker",
+                "capsule":"worker",
+                "input":{"objective":"Echo this task","render_as":"json"}
+            }]
+        }),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    assert!(report.completed, "{report:?}");
+    assert_eq!(fake_roost.sent_text(), "Echo this task");
+}
+
+/// `instructions` beside an `objective` sends the whole input as JSON.
+#[test]
+fn test_capsule_step_instructions_force_json_passthrough() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_instructions_force_json_passthrough",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("unused".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id":"p",
+            "steps":[{
+                "id":"worker",
+                "capsule":"worker",
+                "input":{"objective":"Echo this task","instructions":"Be brief"}
+            }]
+        }),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    assert!(report.completed, "{report:?}");
+    assert_eq!(
+        fake_roost.sent_text(),
+        "{\"instructions\":\"Be brief\",\"objective\":\"Echo this task\"}"
+    );
+}
+
 #[test]
 fn test_if_condition_skips_step_on_false() {
     if capsule_runtime::skip_without_host_support("test_if_condition_skips_step_on_false") {
