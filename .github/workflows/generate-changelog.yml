@@ -42,8 +42,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python .github/scripts/release-notes.py aggregate \
+          python .github/scripts/release-notes.py \
             --repo "${{ github.repository }}" \
+            aggregate \
             --from "${{ github.event.inputs.from_version }}" \
             --to "${{ github.event.inputs.to_version }}" \
             --version "${{ github.event.inputs.release_version }}" \

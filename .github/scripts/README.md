@@ -99,3 +99,36 @@ from the board to CI.
 
 See [`../RELEASE_NOTES.md`](../RELEASE_NOTES.md) for how to word one, when to
 write `NONE`, and when to prefix `Breaking: `.
+
+---
+
+## `check-workflow-invocations.py`
+
+```bash
+python .github/scripts/check-workflow-invocations.py
+```
+
+**Used by:** `ci.yml`, on every PR and push to `main`.
+
+Reads the `release-notes.py` command lines out of `.github/workflows/*.yml` and
+parses each one, stopping at `parse_args` — nothing runs, so it needs no token
+and no network.
+
+It imports `release-notes.py` to build the parser, and uses the standard
+library only. That is why a missing `requests` no longer kills that module at
+import time: the failure now happens in `ReleaseNotes.__init__`, the first
+point that actually needs the network. Keep any new third-party import in this
+job's path deferred the same way, or install it here.
+
+It exists because the workflows are the only callers of `release-notes.py`, and
+its argument wiring has no other cover. `--repo` was once declared on the main
+parser, which in argparse means it must precede the subcommand, while all three
+workflows passed it after. Every function in the script was correct, so no test
+of its parsing or grouping logic went red: `validate` failed on every PR, and
+`aggregate` was broken the same way but silent, because it only runs on a
+release tag.
+
+It reads the invocations rather than restating them for the same reason — a
+copy would drift from what CI actually runs and prove nothing. If the command
+lines move out of `.github/workflows/`, the check fails rather than reporting
+that zero invocations all passed.

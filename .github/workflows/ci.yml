@@ -114,6 +114,24 @@ jobs:
       - name: WIT package versions are single-valued and documented
         run: ./scripts/check-wit-versions.sh
 
+  release-notes-cli:
+    name: release-notes-cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Workflows invoke release-notes.py with arguments it accepts
+        # The release workflows are the only callers of that script, and nothing
+        # else exercises its command line. When `--repo` moved onto the main
+        # parser it became an error *after* the subcommand, which is where all
+        # three workflows passed it: `validate` broke on every PR and `aggregate`
+        # stayed broken but unnoticed, because it only runs on a release tag.
+        # This parses those command lines without running them, so the release
+        # job's copy fails here rather than during a release.
+        run: python .github/scripts/check-workflow-invocations.py
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
