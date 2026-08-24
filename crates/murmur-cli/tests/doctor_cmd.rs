@@ -550,5 +550,6 @@ fn doctor_rejects_inference_max_task_reopens() {
         !stdout.contains('\u{2713}') && !stdout.contains('\u{2717}'),
         "no checklist line may print, got:\n{stdout}"
     );
+    assert!(!stdout.contains("Checking"), "got:\n{stdout}");
     assert!(!stdout.contains("All checks passed."), "got:\n{stdout}");
 }

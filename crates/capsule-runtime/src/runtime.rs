@@ -108,11 +108,11 @@ fn resolve_versioned_iface<T>(
 /// a blocking hook returns `reopen-task(reason)` and both budgets still allow it — fewer
 /// than `max_task_reopens` (the manifest's `lifecycle.max_task_reopens`) reopens used AND
 /// cumulative task turns still below `inference.max_turns` — the task's
-/// `accessible_workdir/task.md` is rewritten as the
-/// original content plus every reopen's feedback so far, a `task_reopened` trace record
-/// is written, and the loop runs again. Reopening shares one cumulative turn budget with
-/// the original attempt: each attempt is handed only `max_turns - task_turns()` turns, so
-/// the whole task can never exceed the capsule's turn ceiling.
+/// `accessible_workdir/task.md` is rewritten as the original content plus every reopen's
+/// feedback so far, a `task_reopened` trace record is written, and the loop runs again.
+/// Reopening shares one cumulative turn budget with the original attempt: each attempt is
+/// handed only `max_turns - task_turns()` turns, so the whole task can never exceed the
+/// capsule's turn ceiling.
 ///
 /// Writes the terminal `task_end` record (carrying the final `reopen_count`) itself, and
 /// the terminal `on-task-end` dispatch is simply the loop's last one. Returns the task's
@@ -5815,9 +5815,8 @@ mod tests {
 
     /// Turn ceiling respected: `inference.max_turns: 3`, `lifecycle.max_task_reopens: 5`, a
     /// hook that always reopens, one turn per attempt. Cumulative `inference` records never
-    /// exceed 3, and
-    /// the task ends `reopen_budget_exhausted` once turns run out even though reopens
-    /// remain in the budget.
+    /// exceed 3, and the task ends `reopen_budget_exhausted` once turns run out even though
+    /// reopens remain in the budget.
     #[tokio::test(flavor = "multi_thread")]
     async fn reopen_never_exceeds_max_turns_end_to_end() {
         let (result, events) = run_reopen_scenario(99, 5, 3).await;
