@@ -138,6 +138,22 @@ pub enum RuntimeError {
         achieved: murmur_artifact::ContainmentClass,
         reason: String,
     },
+    /// A capsule declares an `exports.files.root` that, once resolved against the session's
+    /// accessible workdir, lands somewhere else — today, because the root already exists as a
+    /// symlink pointing out of it.
+    ///
+    /// Refused at launch rather than per request: an export root outside the workdir is a
+    /// misconfiguration the operator can fix, and discovering it one served file at a time would
+    /// mean the first file had already left.
+    #[error(
+        "exports.files.root '{declared}' resolves to '{resolved}', which is outside the capsule \
+         workdir '{workdir}'"
+    )]
+    ExportRootOutsideWorkdir {
+        declared: String,
+        resolved: String,
+        workdir: String,
+    },
 
     /// A capsule declares `capabilities.shell.staged_runtime` without an effective `sealed`
     /// containment floor.

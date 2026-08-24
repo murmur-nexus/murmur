@@ -264,6 +264,13 @@ pub struct StageRequest {
     /// [`ContainmentClass::Advisory`], an explicit floor every host clears, not an absence.
     /// `stage_session` refuses to stage when the host cannot meet it.
     pub declared_containment_floor: murmur_artifact::ContainmentClass,
+    /// The manifest's top-level `exports:` block. `None` — and `Some` with no `files:` — means
+    /// the resource plane is not declared and every request to it is denied.
+    ///
+    /// Carried beside `capability_policy` rather than inside it: an export is a disclosure the
+    /// operator makes, not a capability the guest holds, and nothing derived from this field ever
+    /// reaches the achieved containment class.
+    pub exports: Option<murmur_artifact::Exports>,
 }
 
 pub struct StagedSession {
@@ -322,6 +329,10 @@ pub struct StagedSession {
     /// is `scope_report.achieved_containment`, and keeping a second copy beside it only created a
     /// way for the two to drift.
     pub(crate) scope_report: crate::containment::ScopeReport,
+    /// The declared read-only file surface, with its root already checked against this session's
+    /// accessible workdir by `stage_session` — a root that resolves outside it refuses the launch
+    /// rather than being served. `None` means no resource plane.
+    pub(crate) exports_files: Option<murmur_artifact::FileExport>,
     /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,

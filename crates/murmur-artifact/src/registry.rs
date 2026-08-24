@@ -730,6 +730,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// SHA-256 of everything `reader` yields, with the byte count hashed alongside it.
+///
+/// The streaming companion to [`sha256_hex`], sharing its one `Sha256`: a caller that must hash a
+/// file it cannot afford to hold in memory — a resource-plane listing walking a subtree it does
+/// not bound — gets the same digest without a second hasher entering the workspace.
+pub fn sha256_hex_of_reader(reader: &mut impl std::io::Read) -> std::io::Result<(u64, String)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total = total.saturating_add(read as u64);
+    }
+    Ok((total, format!("{:x}", hasher.finalize())))
+}
+
 pub fn verify_sha256(
     name: &str,
     version: &str,

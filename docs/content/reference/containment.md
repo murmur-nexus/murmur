@@ -190,6 +190,38 @@ effective floor resolves to `advisory`, which every host satisfies.
 
 ---
 
+## Containment and disclosure { #containment-and-disclosure }
+
+A containment class and an export answer different questions, and only one of them is about the
+guest:
+
+| | Bounds | Declared by | Effect on the achieved class |
+|---|---|---|---|
+| Containment (`capabilities.containment`) | What the capsule reaches outward — which paths, hosts and binaries the guest can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
+| Disclosure (`exports.files`) | What an operator reaches inward — which files an external process may read out of the workdir | The manifest's top-level `exports:` block | None |
+
+Declaring `exports.files` gives the agent no capability whatsoever: the files are served by the
+runtime off the host path it already holds for the workdir, with no WASM instantiated and no
+interaction with a running turn. `mur run --explain-scope` prints the declared export in its
+`Resource plane` section, and `--explain-scope --json` carries it as `exports_files` — `null`
+when nothing is exported. See [Resource plane](resource-plane.md).
+
+### Symlinks under an export root { #export-symlinks }
+
+What a symlink under `exports.files.root` means depends on the class the session *achieved*, which
+every response reports in `x-murmur-containment`:
+
+| Achieved class | Rule | Why |
+|---|---|---|
+| `scoped` | Refuse any symlink on the resolved path with `symlink_refused`, and omit symlinked entries from a listing | Host-path grants are possible and the filesystem's shape stays visible, so a symlink under the export root could target a granted host path |
+| `sealed` | Follow, and serve only when the fully-resolved target is still beneath the export root | The workdir is the only writable path and there is no outside to name, so everything under the root is capsule-authored |
+| `advisory` | Same rule as `sealed` | A convention on top of a convention; every response carries `advisory` so a reader knows what it is trusting |
+
+A symlink whose target leaves the root is refused at every class: `symlink_refused` under `scoped`,
+`outside_root` under the other two.
+
+---
+
 ## The fixed capsule device set { #capsule-device-set }
 
 On the Full tier a capsule gets exactly three device rules, fixed at compile time, with **no

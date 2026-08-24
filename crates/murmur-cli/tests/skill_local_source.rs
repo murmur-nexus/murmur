@@ -102,6 +102,7 @@ fn local_source_file_path_installs_skill_md() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .unwrap();
@@ -161,6 +162,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .unwrap();
@@ -231,6 +233,7 @@ fn local_source_coexists_with_registry_skill() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .unwrap();

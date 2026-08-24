@@ -141,7 +141,14 @@ pub(crate) fn run_run(
     // 0. Placed ahead of every side effect — no PATH pre-flight, no registry, no workdir, no
     // staging — so it stays fast and read-only.
     if explain_scope_only {
-        let report = explain_scope(&capability_policy, declared_containment_floor);
+        let report = explain_scope(
+            &capability_policy,
+            declared_containment_floor,
+            runtime_manifest
+                .exports
+                .as_ref()
+                .and_then(|exports| exports.files.as_ref()),
+        );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
                 CliError::new(
@@ -344,6 +351,7 @@ pub(crate) fn run_run(
             .as_ref()
             .and_then(|n| n.internal_port),
         declared_containment_floor,
+        exports: runtime_manifest.exports.clone(),
     };
 
     // Stage against project-then-global, the same order `check_artifacts_installed` just

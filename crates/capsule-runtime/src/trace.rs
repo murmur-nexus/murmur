@@ -328,6 +328,43 @@ struct HookDispatchErrorEvent {
     arm: String,
 }
 
+#[derive(Serialize)]
+struct ResourceListEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    /// `exports.files.root` verbatim, or `""` when the capsule declares no export — a refusal on
+    /// an undeclared plane is still a complete record of what was asked for.
+    root: String,
+    entry_count: usize,
+    total_bytes: u64,
+    /// Which completed turn the listing is as of.
+    generation: u64,
+    containment_achieved: ContainmentClass,
+    /// `"ok"`, or the wire error code the request was refused with.
+    outcome: String,
+    /// `null` on `ok`, one short sentence otherwise.
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ResourceReadEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    /// The requested path *after* percent-decoding, so `%2e%2e%2f` and `../` read as the same
+    /// attempt rather than as two unrelated findings.
+    path: String,
+    outcome: String,
+    /// `null` on every non-`ok` outcome.
+    bytes: Option<u64>,
+    /// `null` on every non-`ok` outcome.
+    sha256: Option<String>,
+    generation: u64,
+    containment_achieved: ContainmentClass,
+    reason: Option<String>,
+}
+
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
@@ -748,10 +785,120 @@ impl TraceWriter {
         self.writer.flush().await
     }
 
+    /// Writes one event as one line, and flushes.
+    ///
+    /// The flush is not an optimisation choice: [`ResourceTraceAppender`] appends to this same
+    /// `trace.jsonl` while a task runs, so a line left half-buffered here would be split around
+    /// whatever the appender wrote in between and the file would stop parsing as JSONL. The
+    /// two writers agree on one rule — a complete line per write, then flush — and that rule is
+    /// what makes concurrent reads during a running task safe to record.
     async fn write_event(&mut self, event: &impl Serialize) -> std::io::Result<()> {
-        let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+        let mut line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+        line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
-        self.writer.write_all(b"\n").await
+        self.writer.flush().await
+    }
+}
+
+// ── Resource-plane appender ───────────────────────────────────────────────────
+
+/// A second, independent `O_APPEND` handle to the session's `trace.jsonl`, used by the resource
+/// plane.
+///
+/// [`TraceWriter`] is `&mut`-owned by the agent loop and cannot be shared, and the motivating
+/// case for a resource-plane event — a gateway reading a finished-but-alive capsule — happens
+/// after `session_end` has already been written. So the plane gets its own handle rather than a
+/// borrow of the loop's, and every event is written at the moment of the request rather than
+/// deferred to a task boundary: a denied read that only surfaced at the next task end would be a
+/// record of the wrong thing at the wrong time.
+///
+/// Interleaving is safe because both writers emit exactly one complete line per `write_all` and
+/// flush it, and `O_APPEND` makes each such write atomic against the other's.
+pub struct ResourceTraceAppender {
+    /// Async rather than a `std::sync::Mutex`: this is held across an `await` on the write.
+    file: tokio::sync::Mutex<File>,
+    session_id: String,
+}
+
+impl ResourceTraceAppender {
+    pub async fn open(workdir: &Path, session_id: String) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(workdir.join("trace.jsonl"))
+            .await?;
+        Ok(Self {
+            file: tokio::sync::Mutex::new(file),
+            session_id,
+        })
+    }
+
+    /// Records one `list`. Failures are swallowed: a trace that cannot be written must not turn
+    /// a served read into an error, and the alternative — refusing the read — would let anyone
+    /// who can fill the disk take the plane down.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_resource_list(
+        &self,
+        root: &str,
+        entry_count: usize,
+        total_bytes: u64,
+        generation: u64,
+        containment_achieved: ContainmentClass,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = ResourceListEvent {
+            event_type: "resource_list",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            root: root.to_string(),
+            entry_count,
+            total_bytes,
+            generation,
+            containment_achieved,
+            outcome: outcome.to_string(),
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one `read`, served or refused. `bytes` and `sha256` are `None` on every
+    /// non-`ok` outcome — a refusal must not carry a hash of something it did not serve.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_resource_read(
+        &self,
+        path: &str,
+        outcome: &str,
+        bytes: Option<u64>,
+        sha256: Option<String>,
+        generation: u64,
+        containment_achieved: ContainmentClass,
+        reason: Option<String>,
+    ) {
+        let event = ResourceReadEvent {
+            event_type: "resource_read",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            path: path.to_string(),
+            outcome: outcome.to_string(),
+            bytes,
+            sha256,
+            generation,
+            containment_achieved,
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    async fn append(&self, event: &impl Serialize) {
+        let Ok(mut line) = serde_json::to_string(event) else {
+            return;
+        };
+        line.push('\n');
+        let mut file = self.file.lock().await;
+        if file.write_all(line.as_bytes()).await.is_ok() {
+            let _ = file.flush().await;
+        }
     }
 }
 
@@ -789,6 +936,7 @@ mod tests {
             },
             declared,
             tier,
+            None,
             None,
             None,
         )
@@ -1041,6 +1189,7 @@ mod tests {
                 EnforcementTier::KernelSealed,
                 None,
                 Some(grant),
+                None,
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
@@ -1087,6 +1236,7 @@ mod tests {
             EnforcementTier::EnvironmentOnly,
             None,
             None,
+            None,
         );
         assert!(
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
@@ -1123,6 +1273,7 @@ mod tests {
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
             None,
         );

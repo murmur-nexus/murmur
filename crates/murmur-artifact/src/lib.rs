@@ -40,20 +40,23 @@ pub use payload_shape::{
 };
 pub use platform::current_platform;
 pub use registry::{
-    is_reserved_version, sha256_hex, verify_sha256, ArtifactMeta, LocalRegistry, Platform,
-    PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
+    is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
+    LocalRegistry, Platform, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
+    RESERVED_VERSIONS,
 };
 pub use runtime_manifest::{
-    commit_policy_for_binding, effective_containment_floor, load_runtime_manifest,
+    commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_hook_config,
     read_tool_implementation, AfterTask, ArtifactImplementation, ArtifactRuntime, Capabilities,
     CompactionConfig, ContainmentClass, ContextConfig, ConversationMode, EnvCapabilities,
-    EvalConfig, FilesystemCapabilities, HookBinding, HookCommitPolicy, HookConfig,
-    HookExecutionMode, HookOverflowPolicy, InferenceConfig, InferenceDriver, InterpreterRuntimeDir,
-    InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
-    NetworkConfig, ObservabilityConfig, ParseContainmentClassError, ResourceCapabilities,
-    ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
-    ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TaskIoCapabilities, TraceConfig,
+    EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding,
+    HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceConfig,
+    InferenceDriver, InterpreterRuntimeDir, InterpreterRuntimeGrant, LifecycleConfig,
+    LifecycleOverride, NetworkCapabilities, NetworkConfig, ObservabilityConfig,
+    ParseContainmentClassError, ResourceCapabilities, ResourceLimits, RuntimeArtifact,
+    RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant,
+    TaskAcceptance, TaskIoCapabilities, TraceConfig, BYTE_SIZE_ACCEPTED_FORM,
+    DEFAULT_EXPORT_MAX_BYTES,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{

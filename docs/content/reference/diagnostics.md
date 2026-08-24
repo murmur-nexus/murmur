@@ -17,6 +17,7 @@ section that explains it.
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
 | `E-CAP-005` | This host cannot give the capsule's native subprocess tree its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
+| `E-CAP-007` | `exports.files.root` resolves outside the session workdir | [E-CAP-007](#e-cap-007) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -239,6 +240,26 @@ Two neighbouring codes are easy to confuse with this one:
 | [`E-CAP-004`](#e-cap-004) | a grant exists at too low a floor | raise the floor |
 | `E-CAP-006` | the floor is already `sealed` and no grant exists | add a grant |
 | [`W-SEC-012`](#w-sec-012) | an allowlisted compiler driver's helpers have no `Execute` grant | name the helper's directory in a grant |
+
+### E-CAP-007 — export root outside the workdir { #e-cap-007 }
+
+[`exports.files.root`](manifest.md#field-exports) names a subtree of the session workdir. When that
+path already exists and resolves somewhere else — because it is a symlink pointing out of the
+workdir — `mur run` refuses at staging, before the workdir is created and before any session runs:
+
+```text
+error[E-CAP-007]: exports.files.root 'out/' resolves to '/srv/elsewhere', which is outside the capsule workdir '/home/dev/project'
+  hint: point `exports.files.root` at a directory inside the capsule workdir. A root that already exists as a symlink out of the workdir is refused whole rather than followed — see docs/content/reference/resource-plane.md
+```
+
+The root is refused whole rather than followed one file at a time: a per-request check would let
+the first file leave before anyone noticed. A root that does not exist yet is accepted — the agent
+may create it during a task.
+
+This is not a containment shortfall, and no change to `capabilities.containment` affects it. An
+export is a disclosure the operator makes, and the path named simply is not inside the capsule. See
+[Resource plane](resource-plane.md) and
+[Containment and disclosure](containment.md#containment-and-disclosure).
 
 ---
 

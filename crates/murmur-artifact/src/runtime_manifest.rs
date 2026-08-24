@@ -471,6 +471,9 @@ pub struct RuntimeManifest {
     pub trace: Option<TraceConfig>,
     pub network: Option<NetworkConfig>,
     pub lifecycle: Option<LifecycleConfig>,
+    /// Read-only views onto the workdir that the operator opens to processes outside the capsule.
+    /// `None` means nothing is exported and every request to the resource plane is denied.
+    pub exports: Option<Exports>,
     /// Pins the mur runtime version required by this capsule.
     /// Used by `mur deploy` to select the binary version to install on the VM,
     /// and by `mur run` to warn on version mismatch.
@@ -488,6 +491,98 @@ impl RuntimeManifest {
 pub struct NetworkConfig {
     /// Internal port the capsule expects to listen on. Default 14159 when absent.
     pub internal_port: Option<u16>,
+}
+
+// ── Exports ───────────────────────────────────────────────────────────────────
+
+/// Per-file read ceiling applied when `exports.files.max_bytes` is absent: 10Mi.
+pub const DEFAULT_EXPORT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// What the operator discloses to processes *outside* the capsule, declared under the top-level
+/// `exports:` key.
+///
+/// A sibling of `capabilities:` rather than a member of it: a capability is something the guest
+/// holds and an export is a disclosure the operator makes. Declaring one
+/// gives the agent nothing it did not already have — it widens only the operator's reach inward,
+/// which is why it never enters the achieved-containment computation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exports {
+    /// The declared read-only file surface. `None` — an `exports:` block with no `files:` —
+    /// means the resource plane is not declared and every request to it is denied.
+    pub files: Option<FileExport>,
+}
+
+/// The `exports.files` block: one subtree of the workdir, readable and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileExport {
+    /// Subtree of the capsule's accessible workdir this export opens, verbatim as declared
+    /// (`out/`). Relative, non-empty and free of `..`, checked here; resolving it against a real
+    /// directory belongs to the runtime, which is the only component that may decide a path is
+    /// inside the root.
+    ///
+    /// Not required to exist when the capsule launches — the agent may create it during a task.
+    pub root: String,
+    /// Required, with exactly one legal value. A required field with one value is what makes the
+    /// read-only posture an explicit operator statement rather than an unstated default, and
+    /// leaves a future write mode somewhere to be declared rather than somewhere to leak in.
+    pub mode: ExportMode,
+    /// Per-file read ceiling in bytes, defaulting to [`DEFAULT_EXPORT_MAX_BYTES`]. Never an
+    /// aggregate budget: each file is judged on its own size, and a subtree whose total exceeds
+    /// this is still listed in full.
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportMode {
+    #[serde(rename = "read-only")]
+    ReadOnly,
+}
+
+impl ExportMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExportMode::ReadOnly => "read-only",
+        }
+    }
+}
+
+impl std::fmt::Display for ExportMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The accepted spelling of every byte count in the manifest, stated once so the parser and the
+/// error it produces cannot drift apart.
+pub const BYTE_SIZE_ACCEPTED_FORM: &str = "must be a byte count, optionally suffixed Ki/Mi/Gi";
+
+/// Parses `4096`, `1Ki`, `10Mi`, `2Gi` into a byte count.
+///
+/// Binary suffixes only, and case-sensitively: `10MB` is rejected rather than guessed at, because
+/// a manifest that means 10 000 000 and a manifest that means 10 485 760 must not both parse.
+/// Returns the accepted-form sentence as its error so every call site reports the same rule.
+pub fn parse_byte_size(input: &str) -> Result<u64, String> {
+    let trimmed = input.trim();
+    let (digits, multiplier) = match trimmed.strip_suffix("Ki") {
+        Some(digits) => (digits, 1024u64),
+        None => match trimmed.strip_suffix("Mi") {
+            Some(digits) => (digits, 1024 * 1024),
+            None => match trimmed.strip_suffix("Gi") {
+                Some(digits) => (digits, 1024 * 1024 * 1024),
+                None => (trimmed, 1),
+            },
+        },
+    };
+    // Deliberately not trimmed again: the whole input was trimmed above, so any space left here
+    // is *inside* the value (`10 Mi`), which is not a spelling this accepts.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("'{input}' {BYTE_SIZE_ACCEPTED_FORM}"));
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| format!("'{input}' overflows a 64-bit byte count"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -977,6 +1072,11 @@ pub enum RuntimeManifestError {
     )]
     InvalidCapabilities { field: String, message: String },
     #[error(
+        "{}: invalid exports config for '{field}': {message}",
+        MANIFEST_FILENAME
+    )]
+    InvalidExports { field: String, message: String },
+    #[error(
         "{}: inference.api_key references {reference} but the environment variable is not set",
         MANIFEST_FILENAME
     )]
@@ -1014,7 +1114,29 @@ struct RawRuntimeManifest {
     #[serde(default)]
     lifecycle: Option<RawLifecycleConfig>,
     #[serde(default)]
+    exports: Option<RawExports>,
+    #[serde(default)]
     mur_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawExports {
+    #[serde(default)]
+    files: Option<RawFileExport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFileExport {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    /// Deliberately untyped: `max_bytes` accepts both a bare integer and a suffixed string, and
+    /// a wrong-shaped value has to reach [`parse_exports`] to be reported as an
+    /// [`RuntimeManifestError::InvalidExports`] naming the field rather than as a serde type
+    /// error naming a line number.
+    #[serde(default)]
+    max_bytes: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1568,6 +1690,8 @@ impl RuntimeManifest {
             }
         });
 
+        let exports = parse_exports(raw.exports)?;
+
         Ok(Self {
             name,
             version,
@@ -1579,10 +1703,111 @@ impl RuntimeManifest {
             trace,
             network,
             lifecycle,
+            exports,
             mur_version: raw.mur_version.filter(|s| !s.trim().is_empty()),
         })
     }
 }
+
+/// Lowers the top-level `exports:` block, rejecting anything the runtime would otherwise have to
+/// decide about later.
+///
+/// The `root` rules are checked here and never again by a caller: a gateway that "cleans up" a
+/// path is a gateway that has taken over the containment boundary, so the only legal answer to a
+/// root naming somewhere outside the workdir is a refusal.
+fn parse_exports(raw: Option<RawExports>) -> Result<Option<Exports>, RuntimeManifestError> {
+    let Some(raw_exports) = raw else {
+        return Ok(None);
+    };
+    let files = raw_exports.files.map(parse_file_export).transpose()?;
+    Ok(Some(Exports { files }))
+}
+
+fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestError> {
+    let invalid = |field: &str, message: String| RuntimeManifestError::InvalidExports {
+        field: field.to_string(),
+        message,
+    };
+
+    let root = raw
+        .root
+        .map(|root| root.trim().to_string())
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "exports.files.root",
+                format!("is required and {EXPORT_ROOT_ACCEPTED_FORM}"),
+            )
+        })?;
+    for component in Path::new(&root).components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(invalid(
+                    "exports.files.root",
+                    format!("'{root}' contains a '..' component; {EXPORT_ROOT_ACCEPTED_FORM}"),
+                ));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(invalid(
+                    "exports.files.root",
+                    format!("'{root}' is absolute; {EXPORT_ROOT_ACCEPTED_FORM}"),
+                ));
+            }
+        }
+    }
+
+    let mode = match raw.mode.as_deref().map(str::trim) {
+        None | Some("") => {
+            return Err(invalid(
+                "exports.files.mode",
+                "is required and must be 'read-only'".to_string(),
+            ));
+        }
+        Some("read-only") => ExportMode::ReadOnly,
+        Some(other) => {
+            return Err(invalid(
+                "exports.files.mode",
+                format!("'{other}' must be 'read-only'"),
+            ));
+        }
+    };
+
+    let max_bytes = match raw.max_bytes {
+        None => DEFAULT_EXPORT_MAX_BYTES,
+        Some(value) => {
+            let text = match &value {
+                serde_yaml::Value::String(text) => text.clone(),
+                serde_yaml::Value::Number(number) => number.to_string(),
+                other => {
+                    return Err(invalid(
+                        "exports.files.max_bytes",
+                        format!("'{other:?}' {BYTE_SIZE_ACCEPTED_FORM}"),
+                    ));
+                }
+            };
+            let parsed = parse_byte_size(&text)
+                .map_err(|message| invalid("exports.files.max_bytes", message))?;
+            if parsed == 0 {
+                return Err(invalid(
+                    "exports.files.max_bytes",
+                    format!("must be greater than zero; {BYTE_SIZE_ACCEPTED_FORM}"),
+                ));
+            }
+            parsed
+        }
+    };
+
+    Ok(FileExport {
+        root,
+        mode,
+        max_bytes,
+    })
+}
+
+/// The accepted spelling of `exports.files.root`, stated once so every rejection says the same
+/// thing about what a legal root looks like.
+const EXPORT_ROOT_ACCEPTED_FORM: &str = "must be a relative path inside the workdir";
 
 fn parse_capabilities(
     raw: Option<RawCapabilities>,
@@ -5836,5 +6061,161 @@ capabilities:
             }
             other => panic!("expected InvalidCapabilities, got {other:?}"),
         }
+    }
+
+    // ── exports.files ────────────────────────────────────────────────────────
+
+    fn exports_manifest(block: &str) -> Result<RuntimeManifest, RuntimeManifestError> {
+        RuntimeManifest::from_yaml_str(&format!("name: exporter\nversion: 0.0.1\n{block}"))
+    }
+
+    fn export_error(block: &str) -> (String, String) {
+        match exports_manifest(block).expect_err("this exports block must not parse") {
+            RuntimeManifestError::InvalidExports { field, message } => (field, message),
+            other => panic!("expected InvalidExports, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_bare_integers_and_binary_suffixes() {
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_size("1Ki").unwrap(), 1024);
+        assert_eq!(parse_byte_size("10Mi").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_byte_size("2Gi").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_byte_size("  10Mi  ").unwrap(), 10 * 1024 * 1024);
+    }
+
+    /// Decimal suffixes are refused rather than guessed at: a manifest meaning 10 000 000 and one
+    /// meaning 10 485 760 must not both parse.
+    #[test]
+    fn parse_byte_size_rejects_every_other_spelling() {
+        for input in [
+            "", "  ", "10MB", "10mi", "10KB", "10 Mi", "Mi", "-1", "1.5Mi", "10Ti", "0x10", "1e3",
+            "1Ki1",
+        ] {
+            let error = parse_byte_size(input)
+                .expect_err(&format!("'{input}' must not parse as a byte size"));
+            assert!(
+                error.contains(BYTE_SIZE_ACCEPTED_FORM),
+                "'{input}' must be refused with the accepted form; got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_byte_size_refuses_to_overflow() {
+        assert!(parse_byte_size("18446744073709551615Gi")
+            .unwrap_err()
+            .contains("overflows"));
+    }
+
+    #[test]
+    fn exports_files_defaults_max_bytes_to_ten_mebibytes() {
+        let manifest =
+            exports_manifest("exports:\n  files:\n    root: out/\n    mode: read-only\n")
+                .expect("a minimal exports block parses");
+        let files = manifest.exports.unwrap().files.unwrap();
+        assert_eq!(files.root, "out/");
+        assert_eq!(files.mode, ExportMode::ReadOnly);
+        assert_eq!(files.max_bytes, DEFAULT_EXPORT_MAX_BYTES);
+        assert_eq!(files.max_bytes, 10_485_760);
+    }
+
+    #[test]
+    fn exports_files_accepts_both_byte_spellings() {
+        for (declared, expected) in [("1Ki", 1024u64), ("4096", 4096)] {
+            let manifest = exports_manifest(&format!(
+                "exports:\n  files:\n    root: out/\n    mode: read-only\n    max_bytes: {declared}\n"
+            ))
+            .expect("a declared max_bytes parses");
+            assert_eq!(
+                manifest.exports.unwrap().files.unwrap().max_bytes,
+                expected,
+                "max_bytes: {declared}"
+            );
+        }
+    }
+
+    /// An `exports:` block with no `files:` is not a resource plane. It parses, and the plane
+    /// stays undeclared — which is the deny case, not a defaulted-open one.
+    #[test]
+    fn an_exports_block_without_files_declares_no_plane() {
+        let manifest = exports_manifest("exports: {}\n").expect("an empty exports block parses");
+        assert!(manifest.exports.unwrap().files.is_none());
+    }
+
+    #[test]
+    fn an_absent_exports_block_is_absent() {
+        let manifest = exports_manifest("").expect("a manifest without exports parses");
+        assert!(manifest.exports.is_none());
+    }
+
+    #[test]
+    fn exports_files_root_must_be_relative_and_inside_the_workdir() {
+        for root in ["../out", "/etc", "out/../../etc", "''"] {
+            let (field, message) = export_error(&format!(
+                "exports:\n  files:\n    root: {root}\n    mode: read-only\n"
+            ));
+            assert_eq!(field, "exports.files.root", "root: {root}");
+            assert!(
+                message.contains("must be a relative path inside the workdir"),
+                "root: {root}; got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn exports_files_root_is_required() {
+        let (field, message) = export_error("exports:\n  files:\n    mode: read-only\n");
+        assert_eq!(field, "exports.files.root");
+        assert_eq!(
+            message,
+            "is required and must be a relative path inside the workdir"
+        );
+    }
+
+    #[test]
+    fn exports_files_mode_is_required_and_read_only() {
+        let (field, message) = export_error("exports:\n  files:\n    root: out/\n");
+        assert_eq!(field, "exports.files.mode");
+        assert_eq!(message, "is required and must be 'read-only'");
+
+        let (field, message) =
+            export_error("exports:\n  files:\n    root: out/\n    mode: read-write\n");
+        assert_eq!(field, "exports.files.mode");
+        assert_eq!(message, "'read-write' must be 'read-only'");
+    }
+
+    #[test]
+    fn exports_files_max_bytes_states_its_accepted_form() {
+        let (field, message) = export_error(
+            "exports:\n  files:\n    root: out/\n    mode: read-only\n    max_bytes: 10MB\n",
+        );
+        assert_eq!(field, "exports.files.max_bytes");
+        assert_eq!(
+            message,
+            "'10MB' must be a byte count, optionally suffixed Ki/Mi/Gi"
+        );
+    }
+
+    /// A zero ceiling would refuse every read while reading like a declared export, so it is
+    /// refused where it is written rather than at the first request.
+    #[test]
+    fn exports_files_max_bytes_rejects_zero() {
+        let (field, message) = export_error(
+            "exports:\n  files:\n    root: out/\n    mode: read-only\n    max_bytes: 0\n",
+        );
+        assert_eq!(field, "exports.files.max_bytes");
+        assert!(message.contains("must be greater than zero"), "{message}");
+    }
+
+    /// A leading `./` is a relative path like any other and is not an escape.
+    #[test]
+    fn exports_files_root_accepts_a_current_dir_prefix() {
+        let manifest =
+            exports_manifest("exports:\n  files:\n    root: ./out\n    mode: read-only\n")
+                .expect("./out is a legal root");
+        assert_eq!(manifest.exports.unwrap().files.unwrap().root, "./out");
     }
 }
