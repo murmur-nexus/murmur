@@ -71,6 +71,7 @@ section that explains it.
 | `W-SEC-010` | No cgroup on this platform — the subprocess tree has no aggregate memory/pids/cpu bound | [W-SEC-010](#w-sec-010) |
 | `W-SEC-011` | An executable workdir makes `capabilities.shell.allow` advisory | [W-SEC-011](#w-sec-011) |
 | `W-SEC-012` | A compiler driver's helper binaries have no `Execute` grant under `sealed` | [W-SEC-012](#w-sec-012) |
+| `W-SEC-013` | Unprivileged user namespaces are unrestricted host-wide, not granted to `mur` by the shipped AppArmor profile | [W-SEC-013](#w-sec-013) |
 
 ---
 
@@ -124,7 +125,7 @@ a weaker class, whichever one it reports:
 | Reason reported | What to do |
 |---|---|
 | This platform has no mount namespace and never will | Nothing — macOS and every other non-Linux host stay at `advisory` permanently |
-| AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. To turn the restriction off host-wide instead: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` |
+| AppArmor's unprivileged-userns restriction is active while the `mur-sealed` profile is not confining this binary | Install and load the profile shipped with `mur`: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`, or re-run the `mur` installer as root. Running a checkout build out of `./target`, which no shipped profile attaches to: `sudo scripts/install-dev-apparmor.sh`. Last resort, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, which removes unprivileged-userns hardening from every program on the machine and reports [`W-SEC-013`](#w-sec-013) |
 | `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` was refused — the usual answer inside a container, where `CAP_SYS_ADMIN` is absent or the container's own seccomp filter blocks `unshare(2)` | Add `--cap-add SYS_ADMIN` to the container invocation, or establish the mount namespace outside the container and run `mur` inside it |
 | The namespace was created but its identity `uid_map`/`gid_map` could not be written, so the process cannot own it | Check that `/proc/sys/user/max_user_namespaces` is non-zero, that no LSM policy blocks `uid_map` writes for this binary, and that `mur` is not already running inside an unmapped user namespace |
 | The namespace was created but `mount(2)` inside it was refused — a confinement that permits `userns_create` and then withholds `CAP_SYS_ADMIN` | Load the shipped profile with `sudo apparmor_parser -r /etc/apparmor.d/mur-sealed`; inside a container, add `--cap-add SYS_ADMIN`, or establish the mount namespace outside it |
@@ -385,7 +386,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -764,3 +765,71 @@ starts and then cannot finish. They differ in what is known:
 A capsule may compile successfully without every probed helper — a link-only workload never reaches
 `cc1` — and a driver family outside the table is not probed at all, so refusing a launch on this
 evidence would block capsules that would have worked.
+
+---
+
+### W-SEC-013 — Unprivileged user namespaces are unrestricted host-wide { #w-sec-013 }
+
+**Fires when:** AppArmor is enabled on this host and
+`kernel.apparmor_restrict_unprivileged_userns` is `0`. Once, at staging, on stderr — from both
+`mur run` and `mur doctor`.
+
+**Why it matters:** `capabilities.containment: sealed` and the capsule network namespace both need
+an unprivileged user namespace, and on an AppArmor host something has to permit it. This warning is
+about which of the two permitting postures the host is in — they differ enormously in blast radius:
+
+| Grant | What it permits |
+|---|---|
+| `profile_confining` | `mur` alone creates unprivileged user namespaces; every other binary stays restricted |
+| `restriction_disabled_host_wide` | **every** program on the machine creates them |
+
+The other two values, and the line that prints them, are in
+[Where the user namespace comes from](containment.md#userns-grant).
+
+Ubuntu 23.10 and later ship the restriction on precisely because unprivileged user namespaces are a
+recurring local privilege-escalation surface. Switching it off works, and on a host where no profile
+can be loaded it is the right answer — but it is not the configuration murmur ships, and a `sealed`
+result obtained that way is a different security statement from one obtained through the profile.
+
+**What the runtime does about it, beyond this warning:** nothing is refused, and no exit code
+changes — `mur doctor` on a project whose artifacts all check out still exits `0`. The grant is
+*recorded* in the three places it can be read back:
+
+* `mur doctor` prints an `AppArmor / user namespaces` block naming the grant;
+* `mur run --explain-scope` prints `userns grant:` in its Containment block, and
+  `--explain-scope --json` carries `userns_grant`;
+* `trace.jsonl`'s `session_start` event carries `userns_grant` next to `containment_achieved`, so a
+  finished session's record shows which of the two mechanisms was in force.
+
+**What to do:** if the narrow grant is available to you, take it —
+
+```sh
+# 1. restore the hardening, removing any drop-in that disables it
+sudo rm -f /etc/sysctl.d/*-userns.conf
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+
+# 2. install and load the profile shipped with mur
+sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed
+sudo apparmor_parser -r /etc/apparmor.d/mur-sealed
+```
+
+Running a build out of a checkout, where the binary is `./target/debug/mur` or
+`./target/release/mur` and no shipped profile attaches to it, use
+`sudo scripts/install-dev-apparmor.sh` — it generates and loads the same grant for those two paths,
+so a from-source developer never needs the host-wide sysctl. Then re-run `mur doctor` and expect
+`userns grant: profile_confining`.
+
+If the host genuinely cannot load a profile, keep the sysctl and keep this warning: it is a record
+of the posture, not a defect to silence.
+
+#### The installed-profile comparison { #w-sec-013-profile-drift }
+
+`mur doctor` also compares `/etc/apparmor.d/mur-sealed` byte-for-byte against the profile the
+running `mur` build ships, and prints both SHA-256 digests when they differ. That is a **file**
+finding and nothing more: AppArmor loads from the kernel's policy cache, so a file can be edited
+without `apparmor_parser -r` ever running, and a loaded profile can outlive the file it came from.
+The `userns grant` line is the behavioural answer and stays the source of truth — the comparison
+never changes a containment class and never changes an exit code.
+
+Local customisation belongs in `/etc/apparmor.d/local/mur-sealed`, which both shipped profiles
+`include if exists` and which is deliberately not hashed.

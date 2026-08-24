@@ -382,6 +382,12 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 sudo apparmor_parser -r /etc/apparmor.d/mur-sealed
 ```
 
+That second command restores **this host's** pre-test baseline, which is not the posture murmur
+recommends: with the restriction off, unprivileged user namespaces are unrestricted for every
+program on the machine rather than granted to `mur` by the profile. `mur doctor` reports it as
+`userns grant: restriction_disabled_host_wide` and [`W-SEC-013`](diagnostics.md#w-sec-013). On a
+host being set up fresh, leave the restriction at `1` and rely on the loaded profile alone.
+
 Inside a container without `--cap-add SYS_ADMIN`, the same code reports the same class of failure
 with the container remedy foremost. And on a kernel with the mechanism absent entirely
 (`user.max_user_namespaces=0`), the message names the sysctl and `CONFIG_USER_NS` instead — a

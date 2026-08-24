@@ -113,11 +113,18 @@ impl EgressNamespaceBlocker {
                  AppArmor host (Ubuntu 23.10+ and derivatives) this is the unprivileged-userns \
                  restriction: install and load the profile shipped with mur, `sudo install -m 644 \
                  packaging/apparmor/{name} {path} && sudo apparmor_parser -r {path}` (or re-run \
-                 the mur installer as root), then re-run. Inside a container it is a missing \
-                 capability: add `--cap-add SYS_ADMIN` to the container invocation, or create the \
-                 network namespace outside the container and run mur inside it. The runtime will \
-                 not fall back to the retired seccomp connect/sendto interception — that \
-                 mechanism was removed as unsound, not demoted to a fallback.",
+                 the mur installer as root), then re-run. Building out of a checkout, where the \
+                 binary sits at ./target/{{debug,release}}/mur and no shipped profile attaches to \
+                 it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same \
+                 grant for those two paths. Inside a container it is a missing capability \
+                 instead: add `--cap-add SYS_ADMIN` to the container invocation, or create the \
+                 network namespace outside the container and run mur inside it. LAST RESORT, only \
+                 where a profile genuinely cannot be loaded: `sudo sysctl -w \
+                 kernel.apparmor_restrict_unprivileged_userns=0` — this removes \
+                 unprivileged-userns hardening from every program on the machine, not just from \
+                 mur, and is not the configuration murmur ships. The runtime will not fall back \
+                 to the retired seccomp connect/sendto interception — that mechanism was removed \
+                 as unsound, not demoted to a fallback.",
                 name = crate::sealed::SEALED_APPARMOR_PROFILE_NAME,
                 path = crate::sealed::SEALED_APPARMOR_PROFILE_PATH,
             ),
@@ -164,12 +171,12 @@ pub(crate) enum EgressNamespaceProbe {
 /// [`egress_namespace_blocker`] stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct EgressNamespaceSupport {
-    /// AppArmor is not standing between this binary and an unprivileged user namespace.
+    /// Where this host's permission for an unprivileged user namespace comes from.
     ///
     /// Answered by `sealed`'s own probe of exactly the same question: the restriction is on
     /// `CLONE_NEWUSER`, which both mechanisms need, so asking it twice with two implementations
     /// could only ever produce two answers that disagree about one host.
-    pub(crate) apparmor_permits_userns: bool,
+    pub(crate) userns_grant: crate::sealed::UsernsGrant,
     pub(crate) namespace: EgressNamespaceProbe,
 }
 
@@ -190,7 +197,7 @@ pub(crate) fn egress_namespace_blocker(
     // AppArmor before the namespace outcome, for the reason `sealed_blocker` documents: when the
     // restriction is on and our profile is absent, the `unshare` failure is a *consequence*, and
     // blaming the kernel would send an Ubuntu desktop user somewhere useless.
-    if !support.apparmor_permits_userns {
+    if !support.userns_grant.permits_userns() {
         return Some(EgressNamespaceBlocker::CapabilityGrantMissing);
     }
     match support.namespace {
@@ -364,7 +371,7 @@ mod linux {
     /// measures" mistake `sealed::probe_namespace` documents avoiding.
     pub(super) fn probe_egress_namespace() -> EgressNamespaceSupport {
         EgressNamespaceSupport {
-            apparmor_permits_userns: crate::sealed::apparmor_permits_userns(),
+            userns_grant: crate::sealed::userns_grant(),
             namespace: probe_namespace(),
         }
     }
@@ -891,9 +898,62 @@ mod tests {
 
     fn support(apparmor: bool, namespace: EgressNamespaceProbe) -> EgressNamespaceSupport {
         EgressNamespaceSupport {
-            apparmor_permits_userns: apparmor,
+            userns_grant: if apparmor {
+                crate::sealed::UsernsGrant::ProfileConfining
+            } else {
+                crate::sealed::UsernsGrant::Withheld
+            },
             namespace,
         }
+    }
+
+    /// The blocker decision reads only `UsernsGrant::permits_userns()`. Every grant that permits
+    /// the namespace must therefore reach the same verdict — naming the provenance reports a host
+    /// fact and never changes one.
+    #[test]
+    fn every_permitting_userns_grant_reaches_the_same_verdict() {
+        for grant in crate::sealed::UsernsGrant::ALL {
+            let support = EgressNamespaceSupport {
+                userns_grant: *grant,
+                namespace: EgressNamespaceProbe::Ok,
+            };
+            let expected = if grant.permits_userns() {
+                None
+            } else {
+                Some(EgressNamespaceBlocker::CapabilityGrantMissing)
+            };
+            assert_eq!(
+                egress_namespace_blocker(true, support),
+                expected,
+                "grant {grant:?} must decide only through permits_userns()"
+            );
+        }
+    }
+
+    /// Both refusal texts put the profile first and label the sysctl as what it costs. The sysctl
+    /// is a legitimate answer on a host where no profile can be loaded, so the text still carries
+    /// it — but a reader must not be able to take it for a peer alternative to the profile.
+    #[test]
+    fn the_capability_grant_reason_offers_the_profile_before_the_sysctl() {
+        let reason = EgressNamespaceBlocker::CapabilityGrantMissing.reason();
+        let profile = reason
+            .find("apparmor_parser -r")
+            .expect("the profile install command must be named");
+        let sysctl = reason
+            .find("kernel.apparmor_restrict_unprivileged_userns=0")
+            .expect("the fallback must still be named for hosts that cannot load a profile");
+        assert!(
+            profile < sysctl,
+            "the profile install must come first: {reason}"
+        );
+        assert!(
+            reason.contains("LAST RESORT"),
+            "the sysctl must be labelled a fallback, not offered as a peer: {reason}"
+        );
+        assert!(
+            reason.contains("every program on the machine"),
+            "the sysctl's host-wide cost must be stated: {reason}"
+        );
     }
 
     // ---- `egress_namespace_blocker` ------------------------------------------------------

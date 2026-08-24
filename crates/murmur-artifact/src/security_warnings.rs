@@ -96,6 +96,16 @@ pub const W_SEC_011: &str = "W-SEC-011";
 /// once per uncovered helper, at staging, only under a declared `sealed` floor.
 pub const W_SEC_012: &str = "W-SEC-012";
 
+/// AppArmor is enabled on this host and `kernel.apparmor_restrict_unprivileged_userns` is off, so
+/// unprivileged user namespaces are unrestricted for *every* binary on the machine rather than for
+/// `mur` alone. That is what makes `capabilities.containment: sealed` and the capsule network
+/// namespace work here, and it is not the configuration murmur ships: the shipped `mur-sealed`
+/// AppArmor profile grants the same permission to one binary. A legitimate operator choice and on
+/// some hosts the only one, so it never refuses a run and never changes an exit code — but a
+/// `sealed` result obtained this way and one obtained through the profile must not read the same.
+/// Fires once, from the host probe, at staging and from `mur doctor`.
+pub const W_SEC_013: &str = "W-SEC-013";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -107,6 +117,24 @@ pub fn security_warning_link(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every code is distinct and spelled in the `W-SEC-NNN` shape the diagnostics page anchors
+    /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
+    #[test]
+    fn every_code_is_unique_and_well_formed() {
+        let codes = [
+            W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
+            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013,
+        ];
+        for code in codes {
+            assert!(code.starts_with("W-SEC-"), "malformed code: {code}");
+            assert_eq!(code.len(), 9, "malformed code: {code}");
+        }
+        let mut unique = codes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "two W-SEC codes are equal");
+    }
 
     #[test]
     fn link_lowercases_the_code_into_the_anchor() {

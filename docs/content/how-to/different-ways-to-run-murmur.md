@@ -242,6 +242,7 @@ Containment
   achieved:  scoped
   floor met: yes
   mechanism: landlock+seccomp
+  userns grant: profile_confining
 
 Effective grants
   filesystem scope: <none>
@@ -257,6 +258,10 @@ Effective grants
 ```
 
 The report shows *declared* network destinations, not resolved IP addresses — it deliberately skips DNS to stay fast and read-only.
+
+`userns grant:` names where this host's permission to create an unprivileged user namespace comes
+from, and is `n/a` off Linux. See
+[Where the user namespace comes from](../reference/containment.md#userns-grant) for the values.
 
 `mechanism:` is a stable name for the kernel enforcement the host actually provides:
 

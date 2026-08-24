@@ -15,7 +15,7 @@ use murmur_artifact::{
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
     LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
     MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011,
+    W_SEC_009, W_SEC_011, W_SEC_013,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -58,6 +58,7 @@ use crate::{
     },
     otel::OtelEmitter,
     outgoing, resources, sandbox,
+    sealed::UsernsGrant,
     shell::{
         build_shell_env, build_wasi_env_allowlist, execute_shell, is_shell_interpreter,
         shell_tool_manifest_yaml, split_shell_words, ShellResult,
@@ -333,6 +334,7 @@ pub fn stage_session(
         request.declared_containment_floor,
         enforcement_tier,
         sealed_blocker,
+        crate::containment::detect_userns_grant(),
     );
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
@@ -381,6 +383,12 @@ pub fn stage_session(
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
     warn_on_workdir_exec(workdir_exec);
+    // A host posture rather than a manifest declaration, but stated in the same place and for the
+    // same reason: this session is about to record an achieved class that a weakened host and the
+    // shipped profile can both produce, and the operator should be told which one they are on
+    // before reading the result. Never a refusal — see `warn_on_userns_restriction_disabled_host_wide`.
+    // Read off the report rather than re-probed, so the warning and the record cannot disagree.
+    warn_on_userns_restriction_disabled_host_wide(scope_report.userns_grant);
     // The non-fatal half of the reachability check above. A compiler driver's helper binaries
     // (`cc1`, `as`, `ld`, `collect2`) are exec'd by the driver itself and sit outside its own
     // DT_NEEDED closure, inside the fixed sealed tree that is deliberately bound without the
@@ -1793,6 +1801,41 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
          the session workdir keeps its Landlock Execute right, so anything the capsule writes \
          there can run regardless of capabilities.shell.allow; this capsule reports containment \
          class 'advisory' on every host, including a Landlock-capable one ({link})"
+    );
+}
+
+/// Warns (non-fatal, once per session) when this host's unprivileged user namespaces are
+/// unrestricted because `kernel.apparmor_restrict_unprivileged_userns` is off, rather than because
+/// the shipped `mur-sealed` AppArmor profile is confining this binary.
+///
+/// The two hosts back `sealed` and the capsule network namespace equally well, and neither is
+/// refused. They differ in blast radius: the profile grants one binary permission to create a user
+/// namespace, while the sysctl grants it to everything on the machine, which is the hardening
+/// Ubuntu 23.10+ ships on precisely because unprivileged user namespaces are a recurring local
+/// privilege-escalation surface. Both reach the same achieved class, so without this warning a
+/// `sealed` result on a weakened host reads in the record exactly like one obtained through the
+/// mechanism murmur ships.
+///
+/// Takes the probed grant rather than probing, so `mur run`'s staging path and `mur doctor` state
+/// one warning in one wording, and so the decision is testable without a host that has AppArmor.
+/// Every other grant, including [`UsernsGrant::Withheld`], is silent here — `Withheld` is already
+/// carried by `E-CAP-003`/`E-CAP-005` where it actually blocks something.
+pub fn warn_on_userns_restriction_disabled_host_wide(grant: Option<UsernsGrant>) {
+    if grant != Some(UsernsGrant::RestrictionDisabledHostWide) {
+        return;
+    }
+    let link = security_warning_link(W_SEC_013);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_013}]: kernel.apparmor_restrict_unprivileged_userns is \
+         off on this host, so unprivileged user namespaces are unrestricted for every binary on \
+         the machine, not just for mur — this is what makes sealed containment and the capsule \
+         network namespace work here, and it is not the configuration murmur ships. To get the \
+         narrow, mur-only grant instead: restore the knob to 1 (removing any \
+         /etc/sysctl.d/*-userns.conf drop-in that sets it to 0), then install and load the shipped \
+         profile with `sudo install -m 644 packaging/apparmor/{profile} {path} && sudo \
+         apparmor_parser -r {path}`. Nothing is refused because of this ({link})",
+        profile = crate::sealed::SEALED_APPARMOR_PROFILE_NAME,
+        path = crate::sealed::SEALED_APPARMOR_PROFILE_PATH,
     );
 }
 
@@ -4955,6 +4998,7 @@ mod tests {
                     murmur_artifact::ContainmentClass::Advisory,
                     sandbox::EnforcementTier::EnvironmentOnly,
                     None,
+                    None,
                 ),
                 false,
                 None,
@@ -5686,6 +5730,7 @@ mod tests {
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,
                 None,
+                None,
             ),
             false,
             None,
@@ -5877,6 +5922,7 @@ mod tests {
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,
+                None,
                 None,
             ),
             false,

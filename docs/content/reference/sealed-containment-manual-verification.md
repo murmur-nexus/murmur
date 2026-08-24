@@ -22,6 +22,32 @@
     first time the escape-conformance suite's `sealed` column *graded* anything rather than recording
     an intention, and therefore the first `sealed`-class result whose exit code is citable.
 
+    **The steps dated 2026-08-05 to 2026-08-09 above were run with
+    `kernel.apparmor_restrict_unprivileged_userns=0`** — that is, with the host's unprivileged-userns
+    hardening switched off for every binary on the machine rather than granted to `mur` by the
+    profile. The runtime names that provenance (`userns grant: restriction_disabled_host_wide`,
+    [`W-SEC-013`](diagnostics.md#w-sec-013)). So the composed root, its `/etc` allowlist, the
+    negative control and the escape-conformance run are confirmed on a host where **the `mur-sealed`
+    AppArmor profile was not what permitted the user namespace**.
+
+    **Steps 1 and 2 through the profile — 2026-08-24.** With
+    `kernel.apparmor_restrict_unprivileged_userns=1` and `/etc/apparmor.d/mur-sealed` loaded, the
+    same build was run from a path the profile attaches to (`~/.local/bin/mur`) and from a checkout
+    path it does not (`./target/debug/mur`):
+
+    | Binary path | `userns grant:` | `achieved:` |
+    |---|---|---|
+    | `~/.local/bin/mur` (profile attaches) | `profile_confining` | `sealed` |
+    | `./target/debug/mur` (no profile attaches) | `withheld` | `scoped`, refused at a declared `sealed` floor |
+
+    A capsule declaring `capabilities.containment: sealed` ran to completion from the attached path,
+    and its `session_start` event recorded `"containment_achieved": "sealed"` with
+    `"userns_grant": "profile_confining"`. Steps 3, 4 and 6 have not been re-run under that posture.
+    The profile loaded was the host's already-installed `/etc/apparmor.d/mur-sealed`, whose bytes
+    differ from `packaging/apparmor/mur-sealed` in comments and in an added `capability net_admin,`
+    rule; the two attachment specifications and the `userns,` rule that grants the namespace are
+    identical, so the grant observed is the one the shipped profile gives.
+
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See
     [What this deliberately is not](#what-this-deliberately-is-not).
@@ -74,12 +100,28 @@ the intended layout against a synthetic host. None of them touches a kernel.
 | kernel 5.13+ (Landlock ABI) | `uname -r` | `5.13` or newer |
 | unprivileged user namespaces | `cat /proc/sys/user/max_user_namespaces` | a non-zero number |
 | AppArmor userspace tools (AppArmor hosts only) | `command -v apparmor_parser` | a path |
+| the `mur` under test is at a path a profile attaches to | `command -v mur` | an installed path, or a checkout build with `scripts/install-dev-apparmor.sh` loaded |
 | a non-root login shell | `id -u` | non-zero (the mechanism needs no host root) |
 | systemd user session with cgroup delegation | see [resource-limits verification](resource-limits-manual-verification.md) | already required for any capsule that spawns a subprocess |
 
 Steps 1 and 2 assume an Ubuntu 23.10+ host (`kernel.apparmor_restrict_unprivileged_userns=1`). On a
 host without AppArmor (Fedora, Arch, Debian without the restriction), step 1 does not apply — record
 that, skip to step 2, and note in the result which host you used.
+
+The shipped profile attaches to installed paths only, so a `cargo build` binary at
+`./target/debug/mur` gets no grant from it. Rather than switching the restriction off — which grants
+unprivileged user namespaces to every program on the machine and is reported as
+[`W-SEC-013`](diagnostics.md#w-sec-013) — generate and load a profile for this checkout's two target
+paths:
+
+```sh
+scripts/install-dev-apparmor.sh --print     # inspect it; writes nothing, needs no privilege
+sudo scripts/install-dev-apparmor.sh        # parse-check, install to /etc/apparmor.d/mur-sealed-dev, load
+```
+
+`mur doctor` then reports `userns grant: profile_confining`. Which grant is in effect must be
+recorded with every result on this page: an `achieved: sealed` reached through the profile and one
+reached with the restriction off are different results.
 
 `systemd-detect-virt --container` reporting `none` is necessary but **not** sufficient: a sandbox
 built on user namespaces rather than on a container runtime reports `none` and still cannot create
@@ -195,9 +237,15 @@ Containment
              mur: `sudo install -m 644 packaging/apparmor/mur-sealed
              /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r
              /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run.
-             To turn the restriction off host-wide instead: `sudo sysctl -w
-             kernel.apparmor_restrict_unprivileged_userns=0`.
+             Building out of a checkout, where the binary sits at
+             ./target/{debug,release}/mur and no shipped profile attaches to it: run
+             `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for
+             those two paths. LAST RESORT, only where a profile genuinely cannot be loaded:
+             `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes
+             unprivileged-userns hardening from every program on the machine, not just from
+             mur, and is not the configuration murmur ships.
   mechanism: landlock+seccomp
+  userns grant: withheld
 ```
 
 And the real refusal — note it exits non-zero, and that nothing was staged:
@@ -209,7 +257,7 @@ mur run; echo "exit=$?"
 Expected:
 
 ```text
-error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. To turn the restriction off host-wide instead: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+error[E-CAP-003]: declared containment class 'sealed' is not achievable on this host (achieved: 'scoped'): sealed requires an unprivileged user+mount namespace, and AppArmor's unprivileged-userns restriction is active on this host while the 'mur-sealed' profile is not confining this binary. Install and load the profile shipped with mur: `sudo install -m 644 packaging/apparmor/mur-sealed /etc/apparmor.d/mur-sealed && sudo apparmor_parser -r /etc/apparmor.d/mur-sealed` (or re-run the mur installer as root), then re-run. Building out of a checkout, where the binary sits at ./target/{debug,release}/mur and no shipped profile attaches to it: run `scripts/install-dev-apparmor.sh`, which generates and loads the same grant for those two paths. LAST RESORT, only where a profile genuinely cannot be loaded: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — this removes unprivileged-userns hardening from every program on the machine, not just from mur, and is not the configuration murmur ships.
   hint: lower the declared floor to 'scoped' (capabilities.containment in murmur.yaml, containment in .murmur/config.yaml, or --containment), or run on a host that provides 'sealed'
 exit=1
 ```
@@ -236,8 +284,9 @@ command -v mur
 
 Expected: one of `/usr/local/bin/mur`, `/usr/bin/mur`, `/opt/mur/bin/mur`, `~/.local/bin/mur`,
 `~/.cargo/bin/mur`. **If you are running a `cargo build` binary out of `./target`, it is not
-covered** — either install it to one of those paths, or add a third profile as shown in the comment
-header of `packaging/apparmor/mur-sealed`.
+covered** — either install it to one of those paths, or run `sudo scripts/install-dev-apparmor.sh`,
+which generates and loads a profile for this checkout's `target/debug/mur` and
+`target/release/mur`.
 
 Then:
 
@@ -253,7 +302,14 @@ Containment
   achieved:  sealed
   floor met: yes
   mechanism: mountns+pivot_root+landlock+seccomp
+  userns grant: profile_confining
 ```
+
+`userns grant: profile_confining` is the line that makes this step's result meaningful. Reading
+`restriction_disabled_host_wide` here means the namespace came from
+`kernel.apparmor_restrict_unprivileged_userns` being off host-wide and the profile you just loaded
+was not what permitted it — a different, weaker configuration that reaches the same `achieved:
+sealed`. See [`W-SEC-013`](diagnostics.md#w-sec-013).
 
 ## Step 3 — the composed root, from inside
 

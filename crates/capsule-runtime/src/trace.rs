@@ -98,6 +98,18 @@ struct SessionStartEvent {
     /// `session_start` would otherwise say `scoped` — and it is the record that this session's
     /// `capabilities.shell.allow` was advisory too, since anything in the workdir could run.
     workdir_exec: bool,
+    /// Where this host's permission to create an unprivileged user namespace came from, as
+    /// `UsernsGrant::wire_name` — `null` only off Linux, where AppArmor does not exist.
+    ///
+    /// Mirrored to the top level from `effective_grants` for the same reason `workdir_exec` is:
+    /// an auditor should not have to descend into a nested object to answer it. Recorded because
+    /// `containment_achieved: sealed` reached through the shipped AppArmor profile and the same
+    /// class reached on a host whose unprivileged-userns hardening is switched off for every
+    /// binary are two very different records, and this key is the only thing separating them.
+    ///
+    /// Always written, on the same terms as `workdir_exec`: its absence identifies a trace from a
+    /// runtime that predates the key.
+    userns_grant: Option<crate::sealed::UsernsGrant>,
     /// The complete grant set this session ran under — every destination, binary, path and
     /// environment variable the policy actually opened, plus the probed enforcement tier — in the
     /// exact shape `mur run --explain-scope --json` prints for the same policy on the same host.
@@ -395,6 +407,7 @@ impl TraceWriter {
             containment_declared: self.effective_grants.declared_containment,
             containment_achieved: self.effective_grants.achieved_containment,
             workdir_exec: self.effective_grants.workdir_exec,
+            userns_grant: self.effective_grants.userns_grant,
             effective_grants: self.effective_grants.clone(),
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
@@ -755,7 +768,8 @@ fn timestamp_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        containment::scope_report_for_tier, sandbox::EnforcementTier, types::CapabilityPolicy,
+        containment::scope_report_for_tier, sandbox::EnforcementTier, sealed::UsernsGrant,
+        types::CapabilityPolicy,
     };
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
@@ -775,6 +789,7 @@ mod tests {
             },
             declared,
             tier,
+            None,
             None,
         )
     }
@@ -1010,6 +1025,75 @@ mod tests {
         assert_eq!(events[0]["containment_achieved"], "scoped");
     }
 
+    /// The audit property the containment feature exists to provide: two sessions that reached
+    /// the *same* achieved class through *different* host permissions must not produce the same
+    /// record. A `sealed` result obtained through the shipped AppArmor profile and one obtained on
+    /// a host whose unprivileged-userns hardening is switched off for every binary differ in
+    /// nothing else the event carries, so `userns_grant` is what keeps the two apart.
+    ///
+    /// The tier is a literal on both sides, so the only thing that differs is the grant.
+    #[tokio::test]
+    async fn session_start_distinguishes_two_hosts_with_the_same_achieved_class() {
+        async fn event_for(grant: UsernsGrant) -> Value {
+            let report = scope_report_for_tier(
+                &CapabilityPolicy::default(),
+                ContainmentClass::Sealed,
+                EnforcementTier::KernelSealed,
+                None,
+                Some(grant),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = TraceWriter::open(
+                dir.path(),
+                "test-session-id".to_string(),
+                "test-capsule".to_string(),
+                "1.0.0".to_string(),
+                "claude-test".to_string(),
+                Vec::new(),
+                report,
+                false,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            w.write_session_start(1, Vec::new()).await.unwrap();
+            w.flush().await.unwrap();
+            let mut event = read_events(dir.path()).remove(0);
+            // The one field that legitimately differs between two runs, removed so the assertion
+            // below is about the grant and nothing else.
+            event.as_object_mut().unwrap().remove("timestamp");
+            event
+        }
+
+        let through_profile = event_for(UsernsGrant::ProfileConfining).await;
+        let host_wide = event_for(UsernsGrant::RestrictionDisabledHostWide).await;
+
+        assert_eq!(through_profile["containment_achieved"], "sealed");
+        assert_eq!(host_wide["containment_achieved"], "sealed");
+        assert_eq!(through_profile["userns_grant"], "profile_confining");
+        assert_eq!(host_wide["userns_grant"], "restriction_disabled_host_wide");
+        assert_ne!(
+            through_profile, host_wide,
+            "two hosts granting the user namespace by different mechanisms must not write the \
+             same session_start record"
+        );
+
+        // Written for every Linux host, never skipped — its absence identifies a runtime that
+        // predates the key rather than a host that was not asked.
+        let unprobed = scope_report_for_tier(
+            &CapabilityPolicy::default(),
+            ContainmentClass::Advisory,
+            EnforcementTier::EnvironmentOnly,
+            None,
+            None,
+        );
+        assert!(
+            serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
+            "off Linux the key is present and null, not absent"
+        );
+    }
+
     /// Central property: `session_start.effective_grants` is the *whole* `ScopeReport`,
     /// serialized byte-for-byte as `mur run --explain-scope --json` prints it — not a re-derived
     /// summary of it. Asserted by comparing against `serde_json::to_value` of the very report
@@ -1039,6 +1123,7 @@ mod tests {
             &policy,
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
+            None,
             None,
         );
 
