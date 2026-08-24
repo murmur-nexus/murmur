@@ -56,11 +56,13 @@ artifacts:
         scope: hook-state
 ```
 
-With no `capabilities:` block a hook has no network and no directory at all — every outbound
-request is denied, and it cannot read or write any file. A granted hook reaches its declared
-hosts through the same allow-list gate a capsule's or tool's outbound HTTP goes through, and
-sees exactly one directory, `<workdir>/<scope>`, as its current directory. Every hook gets its
-grant the same way, whatever its binding or execution mode. See
+With no `capabilities:` block a hook has no network, no directory, and no sight of the task at
+all — every outbound request is denied, it cannot read or write any file, and asking for the
+task's text or the agent's result returns `not-granted`. A granted hook reaches its declared
+hosts through the same allow-list gate a capsule's or tool's outbound HTTP goes through, sees
+exactly one directory, `<workdir>/<scope>`, as its current directory, and with
+`task_io.read: true` can read the task text and the result the agent produced. Every hook gets
+its grant the same way, whatever its binding or execution mode. See
 [Hook capabilities](../reference/manifest.md#hook-capabilities) for the full rules.
 
 ## Untrusted publisher text

@@ -256,6 +256,10 @@ pub(crate) struct HookCapabilityGrant {
     /// Relative path under the hook's working directory to preopen. `None` = preopen
     /// nothing, so the hook has no `wasi:filesystem` access whatsoever.
     pub(crate) filesystem_scope: Option<String>,
+    /// Whether this hook may read the in-scope task's input and result text through the
+    /// `murmur:task-io/read` host import. `false` = the import still links and every one of
+    /// its functions returns `not-granted`.
+    pub(crate) task_io_read: bool,
 }
 
 impl HookCapabilityGrant {
@@ -264,9 +268,9 @@ impl HookCapabilityGrant {
     /// surfacing as a confusing denial once the hook is already running.
     ///
     /// `None` (no block declared) yields [`HookCapabilityGrant::default`] — full
-    /// default-deny. Only `network` and `filesystem` are read; the other sub-blocks a
-    /// [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that a
-    /// per-hook grant does not reach.
+    /// default-deny. Only `network`, `filesystem` and `task_io` are read; the other
+    /// sub-blocks a [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns
+    /// that a per-hook grant does not reach.
     pub(crate) fn derive(
         capabilities: Option<&murmur_artifact::Capabilities>,
     ) -> Result<Self, RuntimeError> {
@@ -290,6 +294,10 @@ impl HookCapabilityGrant {
         Ok(Self {
             network_allow_rules,
             filesystem_scope,
+            task_io_read: capabilities
+                .task_io
+                .as_ref()
+                .is_some_and(|task_io| task_io.read),
         })
     }
 }
@@ -414,6 +422,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            task_io: None,
             containment: None,
         }
     }
@@ -484,6 +493,22 @@ mod tests {
         assert_eq!(grant.filesystem_scope.as_deref(), Some("hook-state"));
         // A filesystem grant alone never widens the network.
         assert!(grant.network_allow_rules.is_empty());
+    }
+
+    /// `capabilities.task_io.read` lowers into the grant on its own axis: `true` grants it,
+    /// `false` and an absent block do not, and neither ever widens network or filesystem.
+    #[test]
+    fn hook_grant_task_io_read_is_carried_through_independently() {
+        for (declared, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let caps = murmur_artifact::Capabilities {
+                task_io: declared.map(|read| murmur_artifact::TaskIoCapabilities { read }),
+                ..capabilities_block(None, None)
+            };
+            let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+            assert_eq!(grant.task_io_read, expected, "declared: {declared:?}");
+            assert!(grant.network_allow_rules.is_empty());
+            assert!(grant.filesystem_scope.is_none());
+        }
     }
 
     #[test]

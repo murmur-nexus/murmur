@@ -664,6 +664,18 @@ pub struct FilesystemCapabilities {
     pub workdir_exec: bool,
 }
 
+/// The `capabilities.task_io` block on a `runtime: hook` artifact entry — the operator's
+/// grant of the `murmur:task-io/read` host import to that one hook. Recognized nowhere else:
+/// on any other role, and in the capsule-wide block, it is rejected at parse time rather than
+/// accepted and silently inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIoCapabilities {
+    /// Whether this hook may read the in-scope task's input and result text. Never inferred:
+    /// a `task_io:` block that omits `read:` is rejected, on the same terms as
+    /// `capabilities.shell.interpreter_runtime[].dirs[].list_dir`.
+    pub read: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCapabilities {
     pub allow: Vec<String>,
@@ -932,6 +944,9 @@ pub struct Capabilities {
     pub env: Option<EnvCapabilities>,
     pub limits: Option<ResourceLimits>,
     pub resources: Option<ResourceCapabilities>,
+    /// Per-hook grant of the `murmur:task-io/read` host import. Only ever `Some` on a
+    /// `runtime: hook` artifact entry — see [`TaskIoCapabilities`].
+    pub task_io: Option<TaskIoCapabilities>,
     /// Minimum containment class this capsule declares. `None` (the overwhelmingly common
     /// case) means the capsule states no requirement and inherits whatever the workspace
     /// config or `--containment` asks for, defaulting to `advisory`.
@@ -1092,11 +1107,21 @@ struct RawCapabilities {
     limits: Option<RawResourceLimits>,
     #[serde(default)]
     resources: Option<RawResourceCapabilities>,
+    #[serde(default)]
+    task_io: Option<RawTaskIoCapabilities>,
     /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
     /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
     /// "unknown variant" error attributed to the whole `capabilities:` block.
     #[serde(default)]
     containment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTaskIoCapabilities {
+    // `Option` so an omitted `read` is distinguishable from an explicit `false`: the omission
+    // is rejected outright rather than defaulted, because a capability is never inferred.
+    #[serde(default)]
+    read: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1410,6 +1435,22 @@ impl RuntimeManifest {
                                 ),
                             });
                         }
+                        // `task_io` grants the `murmur:task-io/read` host import, which only
+                        // hook components can be handed. On a tool or driver entry nothing
+                        // would enforce it, and a silently-inert grant reads like a scoped
+                        // artifact — the same reason `on_overflow:` below is a parse error off
+                        // a hook.
+                        if raw_caps.task_io.is_some() && runtime != ArtifactRuntime::Hook {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'capabilities.task_io:' but has \
+                                     'runtime: {}'; the key grants the murmur:task-io/read host \
+                                     import and is only recognized on 'runtime: hook' entries",
+                                    runtime.as_str()
+                                ),
+                            });
+                        }
                         parse_capabilities(Some(raw_caps))?
                     }
                 };
@@ -1462,6 +1503,21 @@ impl RuntimeManifest {
             })
             .collect::<Result<Vec<_>, RuntimeManifestError>>()?;
 
+        // The capsule-wide block reaches capsule, tool and driver components, none of which
+        // can be handed the murmur:task-io/read import. Rejected rather than ignored, on the
+        // same terms as declaring it on a non-hook artifact entry.
+        if raw
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.task_io.is_some())
+        {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: "capabilities.task_io".to_string(),
+                message: "is recognized only on 'runtime: hook' artifact entries, not in the \
+                          capsule-wide capabilities block — the grant is per-hook"
+                    .to_string(),
+            });
+        }
         let capabilities = parse_capabilities(raw.capabilities)?;
         let inference = parse_inference(raw.inference)?;
 
@@ -1599,6 +1655,21 @@ fn parse_capabilities(
         .map(parse_resource_capabilities)
         .transpose()?;
 
+    let task_io = raw_caps
+        .task_io
+        .map(|raw_task_io| {
+            raw_task_io
+                .read
+                .map(|read| TaskIoCapabilities { read })
+                .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.task_io.read".to_string(),
+                    message: "must be set explicitly to true or false — a capability is never \
+                              inferred"
+                        .to_string(),
+                })
+        })
+        .transpose()?;
+
     let containment = raw_caps
         .containment
         .as_deref()
@@ -1622,6 +1693,7 @@ fn parse_capabilities(
         env,
         limits,
         resources,
+        task_io,
         containment,
     }))
 }
@@ -3040,6 +3112,92 @@ capabilities:
             "{msg}"
         );
         assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    // ── capabilities.task_io (per-hook, honored only on runtime: hook) ────────
+
+    /// A capsule manifest with one artifact entry carrying `capabilities: task_io: <block>`.
+    fn manifest_with_task_io(runtime: &str, block: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: gate\n    version: 1.2.3\n    \
+             runtime: {runtime}\n    capabilities:\n      task_io:\n{block}"
+        )
+    }
+
+    #[test]
+    fn task_io_read_true_grants_the_hook() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&manifest_with_task_io("hook", "        read: true\n"))
+                .expect("task_io on a hook entry parses");
+        assert_eq!(
+            manifest.artifacts[0].capabilities.as_ref().unwrap().task_io,
+            Some(TaskIoCapabilities { read: true })
+        );
+    }
+
+    /// `read: false` and an absent `task_io:` block both leave the hook ungranted; the
+    /// difference between them is only whether the operator wrote the denial down.
+    #[test]
+    fn task_io_read_false_and_an_absent_block_both_leave_the_hook_ungranted() {
+        let explicit =
+            RuntimeManifest::from_yaml_str(&manifest_with_task_io("hook", "        read: false\n"))
+                .expect("an explicit denial parses");
+        assert_eq!(
+            explicit.artifacts[0].capabilities.as_ref().unwrap().task_io,
+            Some(TaskIoCapabilities { read: false })
+        );
+
+        let absent = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: gate\n    version: 1.2.3\n    \
+             runtime: hook\n",
+        )
+        .expect("no capabilities block parses");
+        assert!(absent.artifacts[0].capabilities.is_none());
+    }
+
+    /// The capability is never inferred: a `task_io:` block that omits `read:` is a parse
+    /// error naming the key, following `interpreter_runtime[].dirs[].list_dir`.
+    #[test]
+    fn task_io_without_read_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(&manifest_with_task_io("hook", "        {}\n"))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("capabilities.task_io.read"),
+            "error was: {msg}"
+        );
+        assert!(msg.contains("explicitly"), "error was: {msg}");
+    }
+
+    /// Nothing outside a hook can be handed the import, so declaring the key there is a parse
+    /// error rather than a silently inert grant.
+    #[test]
+    fn task_io_outside_a_hook_entry_is_rejected() {
+        for runtime in ["tool", "driver", "skill"] {
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_task_io(
+                runtime,
+                "        read: true\n",
+            ))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("capabilities") && msg.contains("runtime: hook"),
+                "{runtime} entry: error was: {msg}"
+            );
+        }
+    }
+
+    /// The capsule-wide block reaches capsule, tool and driver components, none of which can
+    /// receive the import — so it is rejected there too, naming the key.
+    #[test]
+    fn task_io_in_the_capsule_wide_block_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncapabilities:\n  task_io:\n    read: true\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("capabilities.task_io"), "error was: {msg}");
+        assert!(msg.contains("runtime: hook"), "error was: {msg}");
     }
 
     #[test]

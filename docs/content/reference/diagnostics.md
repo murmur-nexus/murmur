@@ -526,8 +526,8 @@ the `CAP_MKNOD` the workdir device-node restriction exists to backstop.
 
 **Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares `shell`,
 `spawn`, `env`, `limits`, `resources` or `containment`. Per-hook grants (see
-[`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network` and
-`filesystem` — the other sub-blocks are structurally accepted but nothing enforces them per-hook.
+[`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network`, `filesystem` and
+`task_io` — the other sub-blocks are structurally accepted but nothing enforces them per-hook.
 
 **Why it matters:** an operator who declares, say, `capabilities.shell.allow` on a hook entry
 expecting it to scope that hook's shell access would otherwise have no signal that the runtime
@@ -568,8 +568,8 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
 
 - a `runtime: tool`/`runtime: driver` entry's `capabilities:` block declares `shell`, `spawn`,
   `env`, `limits`, `resources` or `containment` — per-artifact narrowing only reads `network` and
-  `filesystem`, exactly as per-hook grants do ([`W-SEC-006`](#w-sec-006) is the hook-side twin of
-  this case); or
+  `filesystem` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where `task_io` is
+  honored as well); or
 - a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
   all. A native tool runs as a host subprocess under the capsule-wide shell/sandbox machinery, not
   through the WASI tool path narrowing is applied on, so the whole block is inert.

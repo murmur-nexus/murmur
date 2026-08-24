@@ -21,6 +21,7 @@ version each one carries.
 | [`murmur:text/chunks`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-text/stream.wit) | Imported by tool and driver components | Emit response and thinking chunks to the session's SSE stream |
 | [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
+| [`murmur:task-io/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-task-io/read.wit) | Provided by the runtime to hook components | Read the task's input text and the agent's result text |
 
 ## Worlds
 
@@ -31,7 +32,7 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `tool` | `task/task`, `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `hook` | `runtime/inference` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
+| `hook` | `runtime/inference`, `task-io/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 
 Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
@@ -239,6 +240,69 @@ Every call, success or failure, writes one `inference` record to `trace.jsonl` a
 
 ---
 
+## `murmur:task-io/read`
+
+A runtime-provided import available to any hook component that declares it. It hands a hook the
+text of the task its capsule was given and the result text the agent produced, so an output gate or
+an archiver needs no filesystem grant to see either.
+
+Reading is granted per hook with
+[`capabilities.task_io.read: true`](manifest.md#hook-capabilities) on that hook's entry in the
+capsule manifest. A hook without the key still links and still runs — every function returns
+`not-granted`.
+
+| Function | Returns |
+|---|---|
+| `input-len(form)` | Byte length of the task input |
+| `read-input(form, offset, max-bytes)` | A window of the task input |
+| `output-len()` | Byte length of the agent's result text |
+| `read-output(offset, max-bytes)` | A window of the result text |
+
+Ask for a length first, then read the window you can afford: the runtime imposes no truncation cap
+of its own. A read returns the longest prefix of the value from `offset` that fits in `max-bytes`
+and ends on a character boundary, so a multi-byte character is never split. Advance `offset` by the
+byte length of what you got back. An empty return with `offset` still below the length means
+`max-bytes` was too small for the next character.
+
+`form` picks which rendering of the input to read:
+
+| Form | Text |
+|---|---|
+| `as-given` | Exactly what this attempt's agent loop was handed, including any feedback a previous [reopen](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) appended. What an output gate judges against. |
+| `original` | The task before any reopen feedback was appended. What an archiver or cost-attribution hook wants. |
+
+On a task that has never been reopened the two are identical.
+
+### When a task is readable
+
+A task is in scope from the moment one of its attempts enters the agent loop until the runtime
+finishes with that task, reopens included.
+
+| Lifecycle event | `input-*` | `output-*` |
+|---|---|---|
+| `on-stage` | `no-task` | `no-task` |
+| `on-session-start` | `no-task` | `no-task` |
+| `on-task-start` | `no-task` | `no-task` |
+| `on-inference`, `on-tool-call`, `on-shell`, `on-compaction` | This attempt's input | `no-output` until the loop finishes |
+| `on-task-end` | This attempt's input | This attempt's result text, or `no-output` if it ended without one |
+| `on-session-end` | `no-task` | `no-task` |
+
+`on-task-start` fires before the task enters the loop and `on-session-end` after the last task has
+left it, so an archiver binds to `on-task-end`. On the second attempt of a reopened task the output
+is cleared at attempt start: a hook judging attempt 2 never sees attempt 1's result.
+
+An `execution_mode: async` hook reads whatever is in scope when its worker reaches the call, which
+may be after the task has left scope. Bind a hook that reads the task as `blocking`.
+
+| Error | Meaning |
+|---|---|
+| `not-granted` | The hook's entry does not declare `capabilities.task_io.read: true` |
+| `no-task` | No task is in scope at this lifecycle event |
+| `no-output` | A task is in scope but the loop produced no result text |
+| `out-of-range` | `offset` is past the end of the value, or inside a multi-byte character |
+
+---
+
 ## Package versioning
 
 Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract a compiled
@@ -253,6 +317,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:shell` | `0.1.0` |
 | `murmur:message` | `0.1.0` |
 | `murmur:task` | `0.1.0` |
+| `murmur:task-io` | `0.1.0` |
 | `murmur:text` | `0.1.0` |
 | `murmur:hook` | `0.5.0` |
 | `murmur:runtime` | `0.2.0` |
@@ -271,6 +336,11 @@ Every `murmur:*` package is pre-1.0, so the minor field is the breaking axis: a 
 Adding a field to an existing `record` or a case to an existing `variant` is always breaking,
 never minor: every field and case is positional in the binary encoding, so an addition changes
 the shape of every call that carries the type.
+
+A wholly new interface goes in a **new package at `0.1.0`** when the package that would otherwise
+host it already has published consumers. The package version is part of every instance name in
+that package, so a minor bump renames interfaces the new one has nothing to do with, and every
+artifact importing one of them stops loading until rebuilt.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an

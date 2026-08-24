@@ -206,7 +206,19 @@ artifacts:
           - https://telemetry.example.com
       filesystem:
         scope: hook-state
+
+  # granted the task text and the agent's result, and nothing else
+  - name: murmur-hook-output-gate
+    version: 0.1.0
+    runtime: hook
+    capabilities:
+      task_io:
+        read: true
 ```
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `task_io.read` | bool | yes | Whether this hook may read the task's input text and the agent's result text through [`murmur:task-io/read`](wit-interfaces.md#murmurtask-ioread). Never inferred: a `task_io:` block that omits it fails with `E-MAN-003`. |
 
 Rules:
 
@@ -221,9 +233,16 @@ Rules:
   is mounted as the hook's current directory, and is created if missing. Paths outside that subtree
   are unreachable. An absolute scope, or one that escapes the workdir via `..`, fails at launch with
   [`E-CAP-002`](diagnostics.md#e-cap-002) before any hook component is instantiated.
-- **Only `network` and `filesystem` govern a hook.** `shell`, `spawn`, `env`, `limits`, `resources`
-  and `containment` parse here but are capsule-wide concerns the runtime does not apply per-hook;
-  declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
+- **`task_io.read` grants a host import, not a directory.** A granted hook reads the task text
+  and the result text from the runtime itself, so it needs no `filesystem.scope` for either. An
+  ungranted hook still loads and still runs; every read returns `not-granted`.
+- **`task_io` is recognized only on a `runtime: hook` entry.** Declaring it on a `runtime: tool`,
+  `runtime: driver` or `runtime: skill` entry, or in the capsule-wide
+  [`capabilities`](#field-capabilities) block, fails with `E-MAN-003` — nothing there could
+  enforce it.
+- **Only `network`, `filesystem` and `task_io` govern a hook.** `shell`, `spawn`, `env`, `limits`,
+  `resources` and `containment` parse here but are capsule-wide concerns the runtime does not apply
+  per-hook; declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
 
 ##### Tool and driver capabilities { #tool-capabilities }
 

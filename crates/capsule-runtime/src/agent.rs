@@ -304,7 +304,7 @@ pub(crate) async fn run_agent_loop(
                 .data
                 .or(driver_result.summary)
                 .unwrap_or_else(|| "driver returned error".to_string());
-            write_result(workdir, &format!("error: {error_text}"))
+            record_result(hooks, workdir, &format!("error: {error_text}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
             trace
@@ -423,7 +423,7 @@ pub(crate) async fn run_agent_loop(
                 .unwrap_or("driver returned error")
                 .to_string();
             eprintln!("inference error from driver: {error}");
-            write_result(workdir, &format!("error: {error}"))
+            record_result(hooks, workdir, &format!("error: {error}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
             trace
@@ -487,7 +487,7 @@ pub(crate) async fn run_agent_loop(
                 // context we already know is over budget.
                 if let Err(error) = compacted {
                     eprintln!("compaction failed: {error}");
-                    write_result(workdir, &format!("error: {error}"))
+                    record_result(hooks, workdir, &format!("error: {error}"))
                         .map_err(RuntimeError::AgentLoopFailed)?;
                     flush_hook_dispatch_faults(hooks, trace).await;
                     trace.write_session_end("failed").await.map_err(|e| {
@@ -531,7 +531,8 @@ pub(crate) async fn run_agent_loop(
                     .collect();
 
                 if tool_blocks.is_empty() {
-                    write_result(
+                    record_result(
+                        hooks,
                         workdir,
                         "error: response stop_reason=tool_call but no tool_call blocks were present",
                     )
@@ -818,7 +819,8 @@ pub(crate) async fn run_agent_loop(
             }
             "end_turn" | "max_tokens" => {
                 let final_text = extract_text_content(&content);
-                write_result(workdir, &final_text).map_err(RuntimeError::AgentLoopFailed)?;
+                record_result(hooks, workdir, &final_text)
+                    .map_err(RuntimeError::AgentLoopFailed)?;
 
                 // In threaded mode: write per-task result file so earlier turns aren't overwritten.
                 if matches!(mode, ConversationMode::Threaded) {
@@ -903,7 +905,7 @@ pub(crate) async fn run_agent_loop(
             other => {
                 let error = format!("error: unsupported stop_reason '{other}'");
                 eprintln!("{error}");
-                write_result(workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
+                record_result(hooks, workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
                 flush_hook_dispatch_faults(hooks, trace).await;
                 trace.write_session_end("failed").await.map_err(|e| {
                     RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
@@ -932,7 +934,8 @@ pub(crate) async fn run_agent_loop(
         }
     }
 
-    write_result(
+    record_result(
+        hooks,
         workdir,
         &format!("error: inference loop exceeded {max_turns} turns"),
     )
@@ -1447,6 +1450,19 @@ fn read_task(workdir: &Path) -> String {
     fs::read_to_string(workdir.join("task.md"))
         .or_else(|_| fs::read_to_string(workdir.join("input.txt")))
         .unwrap_or_default()
+}
+
+/// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
+///
+/// The single result-text write funnel for both transports: every terminal arm of
+/// [`run_agent_loop`] and both dialect readers in [`process`] call this, and [`write_result`]
+/// has no other caller. That is what makes `murmur:task-io/read`'s `read-output` serve exactly
+/// what the loop produced. A terminal path that returns `Err` without producing result text
+/// never reaches here, and the output stays unset — the truthful pairing with the
+/// `exit-status: failed` the hook sees.
+fn record_result(hooks: &HookRuntime, workdir: &Path, value: &str) -> Result<(), String> {
+    hooks.record_task_output(value);
+    write_result(workdir, value)
 }
 
 fn write_result(workdir: &Path, value: &str) -> Result<(), String> {

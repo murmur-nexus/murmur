@@ -29,6 +29,7 @@ use crate::{
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
     runtime::NetworkPolicyHooks,
+    task_io_import::{add_task_io_to_linker, TaskIoState},
     types::StagedHookArtifact,
 };
 
@@ -108,6 +109,12 @@ pub(crate) struct HookRuntime {
     /// capsule has no usable inference driver — `run-inference` then returns a
     /// clear `err` instead of the import failing to link.
     inference: Option<Arc<HookInferenceCtx>>,
+    /// Backing for the `murmur:task-io/read` host import: the runtime's single copy of the
+    /// in-scope task's input and result text. Held for the whole launch and shared by `Arc`
+    /// with each *granted* hook's linker, so what [`Self::begin_task_attempt`] and
+    /// [`Self::record_task_output`] put here is what a hook call reads. A hook without
+    /// `capabilities.task_io.read` never receives the `Arc`.
+    task_io: Arc<TaskIoState>,
     /// Unsupported-arm faults produced by blocking hooks since the last drain, in
     /// dispatch order, plus drain-timeout faults. Drained by the agent loop via
     /// [`Self::drain_dispatch_faults`] and written to `trace.jsonl` as `hook_dispatch_error`
@@ -571,6 +578,16 @@ async fn call_stage_once(
     // the import is defined so an inference-importing hook still links, and
     // always errors.
     add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), None)?;
+    // `on-stage` runs before any task exists. A granted hook gets a state of its own so its
+    // reads truthfully report `no-task` rather than `not-granted`; the throwaway store this
+    // instance lives on is discarded with it.
+    add_task_io_to_linker(
+        &mut linker,
+        staged
+            .grant
+            .task_io_read
+            .then(|| Arc::new(TaskIoState::new())),
+    )?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -666,6 +683,7 @@ impl HookRuntime {
         let mut blocking_hooks = Vec::new();
         let mut async_hooks = Vec::new();
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
+        let task_io = Arc::new(TaskIoState::new());
 
         for staged in staged_hooks {
             let instance = instantiate_hook(
@@ -675,6 +693,7 @@ impl HookRuntime {
                 &env_vars,
                 limits,
                 inference.clone(),
+                &task_io,
             )
             .await?;
 
@@ -709,6 +728,7 @@ impl HookRuntime {
             fault_rx,
             context,
             inference,
+            task_io,
             dispatch_faults: Vec::new(),
             started: Instant::now(),
             total_input_tokens: 0,
@@ -736,6 +756,27 @@ impl HookRuntime {
             .as_ref()
             .map(|ctx| ctx.drain_records())
             .unwrap_or_default()
+    }
+
+    /// Put a task in scope for one attempt of the agent loop, with the two input forms the
+    /// `murmur:task-io/read` import distinguishes: `original` is the task before any reopen
+    /// feedback was appended, `as_given` is exactly what this attempt's loop is handed.
+    /// Clears any previous attempt's recorded output.
+    pub(crate) fn begin_task_attempt(&self, original: String, as_given: String) {
+        self.task_io.begin_task_attempt(original, as_given);
+    }
+
+    /// Record the result text the agent loop produced for the attempt in scope. Called from
+    /// each transport's single result-write funnel, so every terminal path that produces
+    /// result text records it and no terminal path can produce one the import cannot see.
+    pub(crate) fn record_task_output(&self, text: &str) {
+        self.task_io.record_output(text);
+    }
+
+    /// Take the task out of scope. Every `murmur:task-io/read` call after this reports
+    /// `no-task` until the next [`Self::begin_task_attempt`].
+    pub(crate) fn end_task(&self) {
+        self.task_io.end_task();
     }
 
     /// Take every dispatch fault produced since the last drain, from both sources: those
@@ -1068,6 +1109,7 @@ async fn instantiate_hook(
     env_vars: &HookEnvVars<'_>,
     limits: ExecutionLimits,
     inference: Option<Arc<HookInferenceCtx>>,
+    task_io: &Arc<TaskIoState>,
 ) -> Result<HookInstance, RuntimeError> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -1076,6 +1118,13 @@ async fn instantiate_hook(
         .map_err(|err| RuntimeError::Runtime(err.to_string()))?;
     add_inference_to_linker(&mut linker, format!("hook:{}", staged.name), inference)
         .map_err(RuntimeError::Runtime)?;
+    // An ungranted hook gets the import defined but backed by nothing, so it links exactly as
+    // a granted one does and every read returns `not-granted`.
+    add_task_io_to_linker(
+        &mut linker,
+        staged.grant.task_io_read.then(|| Arc::clone(task_io)),
+    )
+    .map_err(RuntimeError::Runtime)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -3086,6 +3135,190 @@ mod tests {
         );
     }
 
+    // ── murmur:task-io/read: the per-hook grant and the scope table ───────────
+
+    use crate::task_io_import::test_support::{probe_double, reader_double, REPORT_SEP};
+
+    /// A staged hook with the task-io grant flipped on, everything else default-deny — no
+    /// network rules and no filesystem scope, so anything it reports about the task can only
+    /// have come through the import.
+    fn staged_task_io_hook(
+        name: &str,
+        binding: HookBinding,
+        component: Component,
+        task_io_read: bool,
+    ) -> StagedHookArtifact {
+        StagedHookArtifact {
+            grant: HookCapabilityGrant {
+                network_allow_rules: Vec::new(),
+                filesystem_scope: None,
+                task_io_read,
+            },
+            ..staged_double_named(name, binding, component)
+        }
+    }
+
+    /// Every line the probe double logged, in dispatch order.
+    fn probe_lines(session: &Path, hook_name: &str) -> Vec<String> {
+        let path = session.join("logs").join(format!("hook-{hook_name}.log"));
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// The scope table in `wit/hook/deps/murmur-task-io/read.wit`, driven through the real
+    /// dispatch paths in the order `runtime.rs` uses them: staging, session start, task start,
+    /// the agent loop, task end, session end.
+    ///
+    /// `on-stage` runs on its own linker and its own throwaway state; `on-task-start` fires
+    /// before the task enters scope and `on-session-end` after it leaves, so all three report
+    /// `no-task` (`!1`) even though the hook is granted. Mid-loop the input is readable and the
+    /// output is `no-output` (`!2`); at `on-task-end` both are readable.
+    #[test]
+    fn the_scope_table_holds_at_every_lifecycle_event() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_task_io_hook("probe", HookBinding::All, probe_double(&engine), true);
+
+        // `on-stage` is dispatched on its own linker with its own fresh state.
+        let mut on_stage = staged.clone();
+        on_stage.config.binding = HookBinding::OnStage;
+        dispatch_stage(
+            &engine,
+            session.path(),
+            std::slice::from_ref(&on_stage),
+            Vec::new(),
+            &HookEnvVars::default(),
+            ExecutionLimits::default(),
+        )
+        .expect("on-stage dispatch itself never fails on a hook-returned error");
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("a task-io-importing hook instantiates like any other");
+
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::TaskStart {
+                        task_id: "tsk_1".to_string(),
+                        context_id: "ctx_1".to_string(),
+                        source: "task_md".to_string(),
+                        input_bytes: 4,
+                    },
+                )
+                .await;
+
+            // What `run_task_with_reopens` does around one attempt of the agent loop.
+            hooks.begin_task_attempt("task text".to_string(), "task text".to_string());
+            hooks.emit(session.path(), inference_event()).await;
+            hooks.record_task_output("the result");
+            hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await;
+            hooks.end_task();
+
+            hooks
+                .emit(
+                    session.path(),
+                    HookEvent::SessionEnd {
+                        total_turns: 1,
+                        exit_status: "ok".to_string(),
+                    },
+                )
+                .await;
+        });
+
+        assert_eq!(
+            probe_lines(session.path(), "probe"),
+            vec![
+                "on-stage in=!1,out=!1",
+                "on-session-start in=!1,out=!1",
+                "on-task-start in=!1,out=!1",
+                "on-inference in=9,out=!2",
+                "on-task-end in=9,out=10",
+                "on-session-end in=!1,out=!1",
+            ],
+            "this list is the table in wit/hook/deps/murmur-task-io/read.wit — an edit to \
+             either must move both"
+        );
+    }
+
+    /// A hook without `capabilities.task_io.read` still links and is still dispatched; every
+    /// read returns `not-granted` (`!0`) rather than trapping, and no task text reaches it.
+    #[test]
+    fn an_ungranted_hook_links_and_reads_not_granted() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_task_io_hook("probe", HookBinding::All, probe_double(&engine), false);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect(
+                        "an ungranted importer still links — the import is defined, not backed",
+                    );
+
+            hooks.begin_task_attempt("task text".to_string(), "task text".to_string());
+            hooks.record_task_output("the result");
+            hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await;
+        });
+
+        assert_eq!(
+            probe_lines(session.path(), "probe"),
+            vec!["on-task-end in=!0,out=!0"],
+            "a denied read is a value the hook branches on, and it never leaks the length"
+        );
+    }
+
+    /// The `reopen-task` a granted `on-task-end` hook returns carries exactly what it read —
+    /// both input forms and the output — proving the arm and the import compose.
+    #[test]
+    fn a_granted_reader_returns_what_it_read_as_reopen_task() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged =
+            staged_task_io_hook("gate", HookBinding::OnTaskEnd, reader_double(&engine), true);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks =
+                new_with_hooks(&engine, session.path(), accessible.path(), vec![staged])
+                    .await
+                    .expect("reader double instantiates");
+
+            hooks.begin_task_attempt("pristine".to_string(), "pristine + feedback".to_string());
+            hooks.record_task_output("agent said this");
+            let reopen = hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await
+                .expect("the reader double always returns reopen-task");
+
+            assert_eq!(
+                reopen.reason.split(REPORT_SEP).collect::<Vec<_>>(),
+                [
+                    "A=pristine + feedback",
+                    "O=pristine",
+                    "R=agent said this",
+                    "LI=19",
+                    "LO=15"
+                ]
+            );
+            assert!(hooks.drain_dispatch_faults().is_empty());
+        });
+    }
+
     // ── Per-hook capability grants (default-deny network + filesystem) ────────
 
     use crate::network_policy::RequestTarget;
@@ -3108,6 +3341,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            task_io: None,
             containment: None,
         };
         HookCapabilityGrant::derive(Some(&caps)).expect("grant is valid")

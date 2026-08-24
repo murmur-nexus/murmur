@@ -5,7 +5,10 @@ package murmur:runtime@0.2.0;
 /// `inference` is `murmur:runtime/inference@0.2.0` — the same package this world
 /// is declared in, so it is referenced by its bare interface name (a
 /// fully-qualified self-package reference does not resolve in wit-parser).
+/// `murmur:task-io/read` lives in its own package and is therefore named in
+/// full, the same shape the lifecycle export uses.
 world hook {
   import inference;
+  import murmur:task-io/read@0.1.0;
   export murmur:hook/lifecycle@0.5.0;
 }

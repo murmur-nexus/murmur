@@ -1,0 +1,92 @@
+package murmur:task-io@0.1.0;
+
+/// Host-provided capability available to any hook component.
+///
+/// A hook that imports this interface can read the text of the task its capsule
+/// was handed and the result text the agent loop produced for it, without
+/// holding a `filesystem` grant and without either payload being copied into a
+/// lifecycle record. Nothing is copied into a hook's memory until the hook asks
+/// for a window, so a hook that never imports this interface is never charged
+/// for the bytes.
+///
+/// Reading is gated by `capabilities.task_io.read: true` on that hook's entry in
+/// the capsule operator's own `murmur.yaml`. Default-deny: an ungranted hook
+/// still links and still runs, and every function here returns `not-granted`.
+///
+/// # Timing
+///
+/// A task is *in scope* from the moment one of its attempts enters the agent
+/// loop until the runtime's reopen loop returns for that task. What each
+/// lifecycle event therefore sees:
+///
+/// | Lifecycle event | `input-*` | `output-*` |
+/// |---|---|---|
+/// | `on-stage` | `no-task` | `no-task` |
+/// | `on-session-start` | `no-task` | `no-task` |
+/// | `on-task-start` | `no-task` | `no-task` |
+/// | `on-inference`, `on-tool-call`, `on-shell`, `on-compaction` | this attempt's input | `no-output` until the loop reaches a terminal arm |
+/// | `on-task-end` | this attempt's input | this attempt's result text, or `no-output` if it ended without one |
+/// | `on-session-end` | `no-task` | `no-task` |
+///
+/// `on-task-start` fires immediately *before* the task enters the reopen loop,
+/// so the task is not yet in scope there. `on-session-end` fires once per launch
+/// after the task loop, by which time the last task has left scope — an archiver
+/// binds to `on-task-end`, not `on-session-end`.
+///
+/// On the second attempt of a reopened task the output is cleared at attempt
+/// start, so a hook never sees attempt N-1's result while judging attempt N.
+///
+/// An `execution_mode: async` hook reads whatever is in scope **when its worker
+/// reaches the call**, which may be after the task has left scope. This
+/// interface is meant for blocking hooks; `reopen-task` is only honored from a
+/// blocking hook anyway. Not enforced.
+interface read {
+    /// Which rendering of the task input to read.
+    enum task-input-form {
+        /// The exact text this attempt's agent loop was handed — what the model
+        /// actually saw, including any reopen feedback appended by an earlier
+        /// attempt. What an output gate should judge against.
+        as-given,
+        /// The task text before any reopen feedback was appended. What an
+        /// archiver or cost-attribution hook wants. Byte-identical to `as-given`
+        /// on a task that has never been reopened.
+        original,
+    }
+
+    /// Why a read produced nothing.
+    enum io-error {
+        /// This hook's entry does not declare `capabilities.task_io.read: true`.
+        /// A value to branch on, never a trap: the session continues.
+        not-granted,
+        /// No task is in scope at this lifecycle event — see the timing table.
+        no-task,
+        /// A task is in scope but its agent loop has not produced result text.
+        /// Either the loop has not reached a terminal arm yet, or it ended on a
+        /// path that returned an error without producing any.
+        no-output,
+        /// `offset` is past the end of the value, or lands inside a multi-byte
+        /// UTF-8 character.
+        out-of-range,
+    }
+
+    /// Byte length of the task input in `form`. Ask this first, then read the
+    /// window you can afford — the host guesses no truncation cap.
+    input-len: func(form: task-input-form) -> result<u64, io-error>;
+
+    /// The longest prefix of the input's `[offset..]` that fits in `max-bytes`
+    /// and ends on a UTF-8 character boundary, so a multi-byte character is
+    /// never split.
+    ///
+    /// Advance `offset` by the byte length of what you got back to read the
+    /// next window. An empty return with `offset` still below `input-len` means
+    /// `max-bytes` was too small for the next character. `max-bytes: 0` returns
+    /// an empty string; `offset` equal to the length returns an empty string.
+    read-input: func(form: task-input-form, offset: u64, max-bytes: u64) -> result<string, io-error>;
+
+    /// Byte length of the result text the agent loop produced for this attempt.
+    output-len: func() -> result<u64, io-error>;
+
+    /// The output's counterpart to `read-input`, with the same windowing and
+    /// character-boundary rules.
+    read-output: func(offset: u64, max-bytes: u64) -> result<string, io-error>;
+}

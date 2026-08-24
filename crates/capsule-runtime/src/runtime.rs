@@ -155,8 +155,17 @@ async fn run_task_with_reopens(
     // Every reopen's (hook_name, reason) so far — all re-injected on each reopen.
     let mut feedback: Vec<(String, String)> = Vec::new();
     let mut reopens_used: u32 = 0;
+    // Exactly the bytes the next attempt's agent loop will be handed, tracked alongside the
+    // `task.md` writes below so `murmur:task-io/read`'s `as-given` form is what the model saw
+    // rather than a re-read of a file whose path is a convention.
+    let mut as_given = original_task.clone();
 
     loop {
+        // This function owns the task's scope: nothing else puts a task in scope, which is why
+        // the "no A2A message arrived" bypass path — a direct `run_agent_loop` call that
+        // dispatches no `on-task-end` — correctly reports `no-task` to a hook.
+        hooks.begin_task_attempt(original_task.clone(), as_given.clone());
+
         // Reopening never grants turns past `max_turns`: hand this attempt only the turns
         // still unspent by prior attempts of the same task. On the first attempt
         // `task_turns()` is 0 (reset by the preceding `write_task_start`), so it gets the
@@ -213,6 +222,7 @@ async fn run_task_with_reopens(
                             "[capsule-runtime] failed to inject reopen feedback into task.md: {e}"
                         );
                     }
+                    as_given = rewritten;
                     continue;
                 }
                 // Budget or turn ceiling reached while a hook still wanted to reopen: end
@@ -221,6 +231,7 @@ async fn run_task_with_reopens(
                 let _ = trace
                     .write_task_end(trace_task_id, "reopen_budget_exhausted", reopens_used)
                     .await;
+                hooks.end_task();
                 return Err(RuntimeError::AgentLoopFailed(format!(
                     "task reopen budget exhausted after {reopens_used} reopen(s): hook \
                      '{hook_name}' still requested another reopen"
@@ -231,6 +242,7 @@ async fn run_task_with_reopens(
                 let _ = trace
                     .write_task_end(trace_task_id, exit_str, reopens_used)
                     .await;
+                hooks.end_task();
                 return result;
             }
         }
@@ -1785,10 +1797,10 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 }
 
 /// A per-hook `capabilities:` block reuses the whole [`murmur_artifact::Capabilities`]
-/// vocabulary, but only `network` and `filesystem` govern a hook — the rest are capsule-wide
-/// concerns nothing reads per-artifact. Warn rather than reject (the block is structurally
-/// valid) so an operator who declared, say, `shell.allow` on a hook entry learns it is inert
-/// instead of assuming it was applied. Infallible and non-fatal, like
+/// vocabulary, but only `network`, `filesystem` and `task_io` govern a hook — the rest are
+/// capsule-wide concerns nothing reads per-artifact. Warn rather than reject (the block is
+/// structurally valid) so an operator who declared, say, `shell.allow` on a hook entry learns
+/// it is inert instead of assuming it was applied. Infallible and non-fatal, like
 /// [`warn_if_bash_network_bypass`], and carries the same `W-SEC-*` registry code + doc link
 /// convention as every other non-fatal capability warning (see `security_warnings.rs`).
 ///
@@ -1804,8 +1816,8 @@ fn warn_on_inert_hook_capabilities(
         let link = security_warning_link(W_SEC_006);
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_006}]: hook '{hook_name}' declares capabilities.{} \
-             which the runtime does not apply per-hook — only capabilities.network and \
-             capabilities.filesystem govern a hook ({link})",
+             which the runtime does not apply per-hook — only capabilities.network, \
+             capabilities.filesystem and capabilities.task_io govern a hook ({link})",
             inert.join(", capabilities.")
         );
     }
@@ -5158,6 +5170,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            task_io: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling()).expect("grant is valid")
@@ -5432,6 +5445,7 @@ mod tests {
                 env: None,
                 limits: None,
                 resources: None,
+                task_io: None,
                 containment: None,
             }),
         };
@@ -5477,6 +5491,7 @@ mod tests {
                 env: None,
                 limits: None,
                 resources: None,
+                task_io: None,
                 containment: None,
             }),
         };
@@ -5511,6 +5526,7 @@ mod tests {
             env: Some(murmur_artifact::EnvCapabilities { allow: Vec::new() }),
             limits: None,
             resources: None,
+            task_io: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 
@@ -5756,6 +5772,339 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         (result, events)
+    }
+
+    // ── murmur:task-io/read end to end ────────────────────────────────────────
+
+    use crate::task_io_import::test_support::{reader_double, REPORT_SEP};
+
+    /// A `claude` CLI double that emits a different result sentinel on each invocation,
+    /// counted through a file next to the script. A reopened task runs the agent loop more
+    /// than once, and telling attempt 2's output from attempt 1's is the whole point of
+    /// clearing the slot at attempt start.
+    fn write_counting_fake_claude_cli(dir: &Path) -> PathBuf {
+        let script = dir.join("claude-counting");
+        let counter = dir.join("attempt-counter");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > /dev/null\nn=$(cat '{c}' 2>/dev/null || echo 0)\n\
+                 n=$((n+1))\necho \"$n\" > '{c}'\n\
+                 printf '%s\\n' \"{{\\\"type\\\":\\\"assistant\\\",\\\"message\\\":\
+                 {{\\\"content\\\":[{{\\\"type\\\":\\\"text\\\",\\\"text\\\":\
+                 \\\"RESULT-$n\\\"}}]}}}}\"\n\
+                 printf '%s\\n' \"{{\\\"type\\\":\\\"result\\\",\\\"subtype\\\":\
+                 \\\"success\\\",\\\"result\\\":\\\"RESULT-$n\\\"}}\"\n",
+                c = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+    }
+
+    /// The task text every task-io scenario starts from — a sentinel a hook can only have
+    /// obtained through the import, since the hook holds no filesystem scope.
+    const TASK_SENTINEL: &str = "TASK-SENTINEL: build the thing.";
+
+    /// Drive `run_task_with_reopens` end to end with the `murmur:task-io/read` reader double
+    /// as the `on-task-end` hook, on either transport.
+    ///
+    /// The hook's grant is task-io only: no network rules, no filesystem scope. Everything it
+    /// reports in its `reopen-task` reason therefore came through the import. Returns the
+    /// task result and the parsed `trace.jsonl`.
+    async fn run_task_io_scenario(
+        transport: &str,
+        task_io_read: bool,
+        max_task_reopens: u32,
+    ) -> (Result<(), RuntimeError>, Vec<serde_json::Value>) {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        fs::create_dir_all(workdir.join("tools")).unwrap();
+        fs::write(workdir.join("task.md"), TASK_SENTINEL).unwrap();
+
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir.clone(),
+            workdir.join("murmur.lock"),
+        );
+
+        let inference = if transport == "process" {
+            let cli = write_counting_fake_claude_cli(dir.path());
+            InferenceConfig {
+                transport: "process".into(),
+                command: Some(cli.to_string_lossy().to_string()),
+                driver: None,
+                ..task_io_inference_config()
+            }
+        } else {
+            // The http transport dispatches a WASM driver component out of `tools/<name>`;
+            // the directory's existence is what `run_agent_loop` checks before instantiating.
+            fs::create_dir_all(workdir.join("tools").join("mock-driver")).unwrap();
+            state.tool_components.insert(
+                "mock-driver".to_string(),
+                crate::inference_import::test_support::driver_double(
+                    &state.engine,
+                    0,
+                    r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-1"}]}"#,
+                ),
+            );
+            InferenceConfig {
+                transport: "http".into(),
+                command: None,
+                driver: Some(murmur_artifact::InferenceDriver {
+                    artifact: "mock-driver".to_string(),
+                    config: None,
+                }),
+                ..task_io_inference_config()
+            }
+        };
+
+        let mut trace = TraceWriter::open(
+            &workdir,
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "0.1.0".to_string(),
+            "test-model".to_string(),
+            Vec::new(),
+            crate::containment::scope_report_for_tier(
+                &CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+            ),
+            false,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut otel = OtelEmitter::new(None, &workdir, "cap".to_string(), "0.1.0".to_string());
+
+        let staged_hook = StagedHookArtifact {
+            name: "gatekeeper".to_string(),
+            version: "0.0.1".to_string(),
+            component: reader_double(&state.engine),
+            config: murmur_artifact::HookConfig {
+                binding: HookBinding::OnTaskEnd,
+                execution_mode: murmur_artifact::HookExecutionMode::Blocking,
+                commit_policy: murmur_artifact::HookCommitPolicy::ReopenTask,
+            },
+            grant: crate::network_policy::HookCapabilityGrant {
+                network_allow_rules: Vec::new(),
+                filesystem_scope: None,
+                task_io_read,
+            },
+            on_overflow: Default::default(),
+        };
+
+        let mut hooks = HookRuntime::new(
+            &state.engine,
+            &workdir,
+            &workdir,
+            vec![staged_hook],
+            SessionContextData {
+                capsule_name: "cap".to_string(),
+                capsule_version: "0.1.0".to_string(),
+                session_id: "ses_test".to_string(),
+                model: "test-model".to_string(),
+                capabilities: Vec::new(),
+            },
+            HookEnvVars::default(),
+            crate::limits::ExecutionLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let run_config = agent::AgentRunConfig {
+            context_window: 0,
+            compaction_threshold: 0.98,
+            compaction_model: None,
+            compaction_system_prompt: None,
+            compaction_dump_summaries: false,
+            max_output_tokens: 1024,
+        };
+
+        trace
+            .write_task_start("tsk_1", "ctx_1", "task_md", 8)
+            .await
+            .unwrap();
+
+        let result = run_task_with_reopens(
+            &mut state,
+            &workdir,
+            &inference,
+            max_task_reopens,
+            None,
+            run_config,
+            &mut hooks,
+            &mut trace,
+            &mut otel,
+            None,
+            None,
+            &workdir,
+            "cap",
+            "0.1.0",
+            ConversationMode::Stateless,
+            Some("ctx_1".to_string()),
+            "tsk_1",
+        )
+        .await;
+
+        trace.flush().await.unwrap();
+        let content = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (result, events)
+    }
+
+    /// The fields both transports share in [`run_task_io_scenario`].
+    fn task_io_inference_config() -> InferenceConfig {
+        InferenceConfig {
+            transport: String::new(),
+            endpoint: None,
+            model: "test-model".into(),
+            api_key: None,
+            driver: None,
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: 10,
+            max_tokens: None,
+        }
+    }
+
+    /// Every `task_reopened` reason in `events`, in order, split into the reader double's
+    /// five fields `[A, O, R, LI, LO]`.
+    ///
+    /// Split from the right: a reopened attempt's `as-given` is the task text plus the
+    /// previous attempt's report injected as feedback, separators and all, so only the four
+    /// trailing fields are positionally fixed. Everything before them is field `A`.
+    fn reopen_reports(events: &[serde_json::Value]) -> Vec<Vec<String>> {
+        events
+            .iter()
+            .filter(|e| e["event_type"] == "task_reopened")
+            .map(|e| {
+                let mut fields: Vec<String> = e["reason"]
+                    .as_str()
+                    .unwrap()
+                    .rsplitn(5, REPORT_SEP)
+                    .map(str::to_string)
+                    .collect();
+                fields.reverse();
+                fields
+            })
+            .collect()
+    }
+
+    /// The shippable outcome: a hook with no filesystem grant and no network grant, granted
+    /// only `task_io.read`, reads the task it was given and the result the agent produced at
+    /// `on-task-end` and returns both in its `reopen-task` reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn granted_hook_reads_task_and_result_over_the_process_transport() {
+        let (_, events) = run_task_io_scenario("process", true, 1).await;
+        assert_eq!(
+            reopen_reports(&events),
+            vec![vec![
+                format!("A={TASK_SENTINEL}"),
+                format!("O={TASK_SENTINEL}"),
+                "R=RESULT-1".to_string(),
+                format!("LI={}", TASK_SENTINEL.len()),
+                "LO=8".to_string(),
+            ]],
+            "the hook holds no filesystem scope, so neither sentinel could have come from disk"
+        );
+    }
+
+    /// Transport parity: the same hook and the same scenario through the WASM-driver loop in
+    /// `agent.rs` rather than the subprocess loop in `agent/process.rs`. Each transport funnels
+    /// its result-text write through its own recorder, so each transport's own result is what
+    /// the hook reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn granted_hook_reads_task_and_result_over_the_http_transport() {
+        let (_, events) = run_task_io_scenario("http", true, 1).await;
+        assert_eq!(
+            reopen_reports(&events),
+            vec![vec![
+                format!("A={TASK_SENTINEL}"),
+                format!("O={TASK_SENTINEL}"),
+                "R=RESULT-1".to_string(),
+                format!("LI={}", TASK_SENTINEL.len()),
+                "LO=8".to_string(),
+            ]]
+        );
+    }
+
+    /// Default-deny end to end: the same double under a grant with `task_io_read: false` still
+    /// instantiates, is still dispatched, and still drives a reopen — its reason just carries
+    /// the `not-granted` marker instead of either sentinel. The session is not aborted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ungranted_hook_reads_nothing_end_to_end() {
+        let (_, events) = run_task_io_scenario("process", false, 1).await;
+        let reports = reopen_reports(&events);
+        assert_eq!(
+            reports,
+            vec![vec!["A=!0", "O=!0", "R=!0", "LI=!0", "LO=!0"]],
+            "every read is not-granted, and no length leaks either"
+        );
+    }
+
+    /// Reopen semantics across three attempts. `original` is byte-identical on every attempt;
+    /// `as-given` picks up the `# Reopen feedback` section `build_reopen_task_md` writes; and
+    /// the output read on attempt N is attempt N's own result, never attempt N-1's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopened_attempts_see_their_own_input_and_their_own_output() {
+        let (result, events) = run_task_io_scenario("process", true, 2).await;
+        assert!(
+            result.is_err(),
+            "the reader double always reopens, so the budget runs out"
+        );
+        let reports = reopen_reports(&events);
+        assert_eq!(reports.len(), 2, "max_task_reopens: 2 ⇒ two reopens");
+
+        for (index, report) in reports.iter().enumerate() {
+            assert_eq!(
+                report[1],
+                format!("O={TASK_SENTINEL}"),
+                "`original` never changes across attempts"
+            );
+            assert_eq!(
+                report[2],
+                format!("R=RESULT-{}", index + 1),
+                "attempt {} must read its own result, never the previous attempt's",
+                index + 1
+            );
+        }
+
+        assert_eq!(
+            reports[0][0],
+            format!("A={TASK_SENTINEL}"),
+            "attempt 1 was handed the pristine task"
+        );
+        let attempt_two_input = &reports[1][0];
+        assert!(
+            attempt_two_input.starts_with(&format!("A={TASK_SENTINEL}"))
+                && attempt_two_input.contains("# Reopen feedback"),
+            "attempt 2's `as-given` is the pristine task plus the injected feedback, got: \
+             {attempt_two_input}"
+        );
+        assert_eq!(
+            reports[1][3],
+            format!("LI={}", attempt_two_input.len() - "A=".len()),
+            "input-len reports the byte length of the very text read back"
+        );
     }
 
     fn count_type(events: &[serde_json::Value], ty: &str) -> usize {

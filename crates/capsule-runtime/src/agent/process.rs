@@ -143,15 +143,6 @@ fn read_task_from_workdir(workdir: &Path) -> String {
     std::fs::read_to_string(workdir.join("task.md")).unwrap_or_default()
 }
 
-/// Write `out/result.txt` in the workdir.
-fn write_result_to_workdir(workdir: &Path, text: &str) -> Result<(), String> {
-    let out_dir = workdir.join("out");
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("failed to create out/ directory: {e}"))?;
-    std::fs::write(out_dir.join("result.txt"), text)
-        .map_err(|e| format!("failed to write out/result.txt: {e}"))
-}
-
 /// Builds the `--system-prompt` argument value for the claude subprocess. Always carries
 /// `MURMUR_MD_TRUST_NOTICE` and `UNTRUSTED_CONTENT_NOTICE`, even when no `inference.system_prompt`
 /// is configured, so the subprocess never receives MURMUR.md-adjacent context or runs tools
@@ -760,7 +751,7 @@ async fn read_process_output(
         )));
     }
 
-    write_result_to_workdir(workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
+    super::record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
 
     let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
@@ -956,7 +947,7 @@ async fn read_codex_output(
         )));
     }
 
-    write_result_to_workdir(workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
+    super::record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
     let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
     Ok(())
