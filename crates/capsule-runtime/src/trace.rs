@@ -104,8 +104,8 @@ struct SessionStartEvent {
     /// Mirrored to the top level from `effective_grants` for the same reason `workdir_exec` is:
     /// an auditor should not have to descend into a nested object to answer it. Recorded because
     /// `containment_achieved: sealed` reached through the shipped AppArmor profile and the same
-    /// class reached on a host whose unprivileged-userns hardening was switched off for every
-    /// binary are two very different records, and until this key they were the same bytes.
+    /// class reached on a host whose unprivileged-userns hardening is switched off for every
+    /// binary are two very different records, and this key is the only thing separating them.
     ///
     /// Always written, on the same terms as `workdir_exec`: its absence identifies a trace from a
     /// runtime that predates the key.
@@ -1027,9 +1027,9 @@ mod tests {
 
     /// The audit property the containment feature exists to provide: two sessions that reached
     /// the *same* achieved class through *different* host permissions must not produce the same
-    /// record. Before `userns_grant`, a `sealed` result obtained through the shipped AppArmor
-    /// profile and one obtained on a host whose unprivileged-userns hardening had been switched
-    /// off for every binary serialized to identical bytes.
+    /// record. A `sealed` result obtained through the shipped AppArmor profile and one obtained on
+    /// a host whose unprivileged-userns hardening is switched off for every binary differ in
+    /// nothing else the event carries, so `userns_grant` is what keeps the two apart.
     ///
     /// The tier is a literal on both sides, so the only thing that differs is the grant.
     #[tokio::test]

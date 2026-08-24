@@ -789,7 +789,6 @@ Ubuntu 23.10 and later ship the restriction on precisely because unprivileged us
 recurring local privilege-escalation surface. Switching it off works, and on a host where no profile
 can be loaded it is the right answer — but it is not the configuration murmur ships, and a `sealed`
 result obtained that way is a different security statement from one obtained through the profile.
-This warning exists so the two are not silently equivalent.
 
 **What the runtime does about it, beyond this warning:** nothing is refused, and no exit code
 changes — `mur doctor` on a project whose artifacts all check out still exits `0`. The grant is

@@ -22,19 +22,27 @@
     first time the escape-conformance suite's `sealed` column *graded* anything rather than recording
     an intention, and therefore the first `sealed`-class result whose exit code is citable.
 
-    **Every result recorded on this page was obtained with
+    **The steps dated 2026-08-05 to 2026-08-09 above were run with
     `kernel.apparmor_restrict_unprivileged_userns=0`** — that is, with the host's unprivileged-userns
-    hardening switched off for every binary on the machine. The runtime now names that provenance
-    (`userns grant: restriction_disabled_host_wide`, [`W-SEC-013`](diagnostics.md#w-sec-013)); until
-    it did, the record could not distinguish it from the mechanism murmur actually ships. So the
-    composed root, its `/etc` allowlist, the negative control and the escape-conformance run are all
-    confirmed — but they were confirmed on a host where **the `mur-sealed` AppArmor profile was not
-    what permitted the user namespace**. Step 1's refusal was observed with the restriction on and
-    the profile absent; step 2's `achieved: sealed` has not been observed with the restriction on and
-    the profile loaded. The profile mechanism has therefore never been executed end to end, and the
-    earlier results should not be read as evidence that it works. The next run of this page must
-    restore the restriction to `1`, load the profile, and record `userns grant: profile_confining`
-    alongside every step.
+    hardening switched off for every binary on the machine rather than granted to `mur` by the
+    profile. The runtime names that provenance (`userns grant: restriction_disabled_host_wide`,
+    [`W-SEC-013`](diagnostics.md#w-sec-013)). So the composed root, its `/etc` allowlist, the
+    negative control and the escape-conformance run are confirmed on a host where **the `mur-sealed`
+    AppArmor profile was not what permitted the user namespace**.
+
+    **Steps 1 and 2 through the profile — 2026-08-24.** With
+    `kernel.apparmor_restrict_unprivileged_userns=1` and `/etc/apparmor.d/mur-sealed` loaded, the
+    same build was run from a path the profile attaches to (`~/.local/bin/mur`) and from a checkout
+    path it does not (`./target/debug/mur`):
+
+    | Binary path | `userns grant:` | `achieved:` |
+    |---|---|---|
+    | `~/.local/bin/mur` (profile attaches) | `profile_confining` | `sealed` |
+    | `./target/debug/mur` (no profile attaches) | `withheld` | `scoped`, refused at a declared `sealed` floor |
+
+    A capsule declaring `capabilities.containment: sealed` ran to completion from the attached path,
+    and its `session_start` event recorded `"containment_achieved": "sealed"` with
+    `"userns_grant": "profile_confining"`. Steps 3, 4 and 6 have not been re-run under that posture.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See

@@ -99,13 +99,12 @@ pub const SEALED_APPARMOR_PROFILE_SHA256: &str =
 /// Three of the four variants permit the namespace, and they are not interchangeable: AppArmor
 /// being absent is a distribution fact nobody chose, the shipped profile confining `mur` is the
 /// configuration murmur ships, and the restriction being switched off host-wide removes the
-/// hardening for *every* binary on the machine. Collapsing them into one `bool` made those three
-/// hosts byte-identical in `mur doctor`, in `--explain-scope` and in the session trace, so a
-/// `sealed` result obtained on a weakened host could not be told apart from one obtained through
-/// the profile.
+/// hardening for *every* binary on the machine. The three reach the same achieved class, so
+/// `mur doctor`, `--explain-scope` and the session trace each report the variant: without it a
+/// `sealed` result obtained on a weakened host cannot be told apart from one obtained through the
+/// profile.
 ///
-/// The grant never decides whether a run is refused — only [`Self::permits_userns`] does, and it
-/// answers exactly what the replaced `bool` answered.
+/// The grant never decides whether a run is refused — only [`Self::permits_userns`] does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsernsGrant {
@@ -183,6 +182,37 @@ impl UsernsGrant {
                 "the restriction is on and no mur-sealed AppArmor profile is confining this \
                  binary, so unprivileged user namespaces are withheld from mur"
             }
+        }
+    }
+
+    /// The whole decision, over the three host readings that produce it: whether AppArmor is
+    /// enabled, whether its `restrict_unprivileged_userns` knob is on, and what profile confines
+    /// this process. Each argument is the file's trimmed contents, or `None` when it is missing or
+    /// empty.
+    ///
+    /// Pure, and separate from the reading for the same reason [`classify_installed_profile`] is:
+    /// every combination is then testable on any OS, with no `/sys` and no `/proc`. `linux::
+    /// userns_grant` is the reader and holds no logic of its own.
+    ///
+    /// A missing or unreadable restriction knob counts as *not restricted*, not as withheld — a
+    /// kernel that does not implement the knob does not restrict anything.
+    #[must_use]
+    pub fn from_readings(
+        enabled: Option<&str>,
+        restricted: Option<&str>,
+        current_profile: Option<&str>,
+    ) -> UsernsGrant {
+        if !matches!(enabled, Some("Y") | Some("1")) {
+            return UsernsGrant::ApparmorAbsent;
+        }
+        if !matches!(restricted, Some("Y") | Some("1")) {
+            return UsernsGrant::RestrictionDisabledHostWide;
+        }
+        match current_profile {
+            Some(profile) if profile.starts_with(SEALED_APPARMOR_PROFILE_NAME) => {
+                UsernsGrant::ProfileConfining
+            }
+            _ => UsernsGrant::Withheld,
         }
     }
 }
@@ -1353,8 +1383,7 @@ mod linux {
 
     use super::{
         ComposedRootPlan, NamespaceProbe, RootOp, RootStep, SealedProbe, UsernsGrant,
-        OLD_ROOT_NAME, PROC_HIDEPID_OPTIONS, SEALED_APPARMOR_PROFILE_NAME,
-        SEALED_ROOT_FAILURE_PREFIX,
+        OLD_ROOT_NAME, PROC_HIDEPID_OPTIONS, SEALED_ROOT_FAILURE_PREFIX,
     };
 
     // ------------------------------------------------------------ probe
@@ -1373,33 +1402,26 @@ mod linux {
         }
     }
 
-    /// Where AppArmor's permission for an unprivileged user namespace comes from on this host.
+    /// Reads the three host files [`UsernsGrant::from_readings`] decides on, which holds the
+    /// whole decision.
     ///
-    /// Three readings in order, each one an answer rather than a step: is AppArmor even enabled;
-    /// is its `restrict_unprivileged_userns` knob on; and — only if both — is this process
-    /// confined by a `mur-sealed` profile. Reading `/proc/self/attr/current` rather than the
-    /// loaded-profile list is deliberate: a profile that is loaded but does not *attach* to the
-    /// path `mur` was installed at helps nobody, and this asks the question that decides the
-    /// outcome.
+    /// The knob is read from `/sys/module/apparmor/parameters` first and from `/proc/sys/kernel`
+    /// only if that is missing: the two are the same value, and the `/sys` path is the one that
+    /// exists on kernels where the `/proc` alias does not. Reading `/proc/self/attr/current`
+    /// rather than the loaded-profile list is deliberate: a profile that is loaded but does not
+    /// *attach* to the path `mur` was installed at helps nobody, and this asks the question that
+    /// decides the outcome.
     pub(crate) fn userns_grant() -> UsernsGrant {
         let enabled = read_trimmed("/sys/module/apparmor/parameters/enabled");
-        if !matches!(enabled.as_deref(), Some("Y") | Some("1")) {
-            return UsernsGrant::ApparmorAbsent;
-        }
-
         let restricted =
             read_trimmed("/sys/module/apparmor/parameters/restrict_unprivileged_userns")
                 .or_else(|| read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"));
-        if !matches!(restricted.as_deref(), Some("Y") | Some("1")) {
-            return UsernsGrant::RestrictionDisabledHostWide;
-        }
-
-        match read_trimmed("/proc/self/attr/current") {
-            Some(current) if current.starts_with(SEALED_APPARMOR_PROFILE_NAME) => {
-                UsernsGrant::ProfileConfining
-            }
-            _ => UsernsGrant::Withheld,
-        }
+        let current = read_trimmed("/proc/self/attr/current");
+        UsernsGrant::from_readings(
+            enabled.as_deref(),
+            restricted.as_deref(),
+            current.as_deref(),
+        )
     }
 
     fn read_trimmed(path: &str) -> Option<String> {
@@ -2742,32 +2764,9 @@ mod tests {
 
     // ---- `UsernsGrant` ---------------------------------------------------------------------
 
-    /// Reproduces `linux::userns_grant`'s three readings as pure data, so the mapping from what
-    /// the host files say to which grant is reported is testable on any OS. The function itself is
-    /// Linux-only and reads `/sys` and `/proc`; this is the same decision written once more, and
-    /// the two are kept in step by the reading order being the only thing either encodes.
-    fn grant_from_readings(
-        enabled: Option<&str>,
-        restricted: Option<&str>,
-        current: Option<&str>,
-    ) -> UsernsGrant {
-        if !matches!(enabled, Some("Y") | Some("1")) {
-            return UsernsGrant::ApparmorAbsent;
-        }
-        if !matches!(restricted, Some("Y") | Some("1")) {
-            return UsernsGrant::RestrictionDisabledHostWide;
-        }
-        match current {
-            Some(profile) if profile.starts_with(SEALED_APPARMOR_PROFILE_NAME) => {
-                UsernsGrant::ProfileConfining
-            }
-            _ => UsernsGrant::Withheld,
-        }
-    }
-
     /// Every variant, produced from the combination of readings that must produce it. The three
-    /// permitting cases are the point: before this enum they were one `true`, and a `sealed`
-    /// result on a host whose hardening had been switched off looked exactly like one obtained
+    /// permitting cases are the point: they reach the same achieved class, so only the variant
+    /// separates a `sealed` result on a host whose hardening is switched off from one obtained
     /// through the shipped profile.
     #[test]
     fn every_userns_grant_comes_from_its_own_combination_of_readings() {
@@ -2816,7 +2815,7 @@ mod tests {
 
         for ((enabled, restricted, current), expected) in cases {
             assert_eq!(
-                grant_from_readings(enabled, restricted, current),
+                UsernsGrant::from_readings(enabled, restricted, current),
                 expected,
                 "enabled={enabled:?} restricted={restricted:?} current={current:?}"
             );
@@ -2826,8 +2825,8 @@ mod tests {
     /// The wire names are what `--explain-scope --json`, `session_start` and `mur doctor` all
     /// print, so two variants sharing one would re-collapse exactly the distinction this enum
     /// exists to make. `permits_userns` is the whole of what the runtime decisions read, and it
-    /// must be false for `Withheld` alone — that is what keeps every previously-running host
-    /// running.
+    /// must be false for `Withheld` alone — any other variant denying would refuse a host the
+    /// runtime is required to keep serving.
     #[test]
     fn every_grant_has_a_distinct_wire_name_and_only_withheld_denies() {
         let names: Vec<&str> = UsernsGrant::ALL

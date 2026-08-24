@@ -1811,9 +1811,9 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 /// refused. They differ in blast radius: the profile grants one binary permission to create a user
 /// namespace, while the sysctl grants it to everything on the machine, which is the hardening
 /// Ubuntu 23.10+ ships on precisely because unprivileged user namespaces are a recurring local
-/// privilege-escalation surface. Until the grant was named, the two produced byte-identical
-/// output, so a `sealed` result on a weakened host was indistinguishable in the record from one
-/// obtained through the mechanism murmur ships.
+/// privilege-escalation surface. Both reach the same achieved class, so without this warning a
+/// `sealed` result on a weakened host reads in the record exactly like one obtained through the
+/// mechanism murmur ships.
 ///
 /// Takes the probed grant rather than probing, so `mur run`'s staging path and `mur doctor` state
 /// one warning in one wording, and so the decision is testable without a host that has AppArmor.
