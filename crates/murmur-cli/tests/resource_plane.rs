@@ -95,7 +95,7 @@ fn http_request(addr: &str, method: &str, path: &str) -> HttpResponse {
     };
     // Checked on every response every test makes, rather than in one test of its own: a body
     // delimited only by the connection closing is one a caller cannot tell apart from a truncated
-    // one, and scenario 13 turns on never seeing a short body.
+    // one, and the torn-read tests below turn on never seeing a short body.
     let declared: usize = response
         .header("content-length")
         .unwrap_or_else(|| panic!("{method} {path}: every response declares a content-length"))
@@ -523,8 +523,6 @@ fn an_escaping_symlink_is_refused_at_whatever_class_this_host_achieves() {
     assert!(!body.contains("escape.txt"), "got {body}");
 }
 
-// ── Scenario 5's unit-test substitute is in capsule-runtime; see the build summary ──
-
 // ── Scenario 6: max_bytes ─────────────────────────────────────────────────────
 
 #[test]
@@ -675,7 +673,7 @@ fn concurrent_reads_leave_every_trace_line_parseable() {
     assert!(!capsule.trace_events("task_end").is_empty());
 }
 
-// ── Scenario 13: a read is never torn, and the etag always describes the body ──
+// ── Scenario 9: a read is never torn, and the etag always describes the body ──
 
 /// Alternates two fixed 1 MiB payloads under `out/churn.bin` while the test reads it, and returns
 /// the payload bytes. `rename_into_place` selects the authoring convention under test.

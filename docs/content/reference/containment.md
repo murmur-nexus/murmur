@@ -193,16 +193,15 @@ effective floor resolves to `advisory`, which every host satisfies.
 ## Containment and disclosure { #containment-and-disclosure }
 
 A containment class and an export answer different questions, and only one of them is about the
-guest:
+capsule:
 
 | | Bounds | Declared by | Effect on the achieved class |
 |---|---|---|---|
-| Containment (`capabilities.containment`) | What the capsule reaches outward — which paths, hosts and binaries the guest can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
+| Containment (`capabilities.containment`) | What the capsule reaches outward — which paths, hosts and binaries it can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
 | Disclosure (`exports.files`) | What an operator reaches inward — which files an external process may read out of the workdir | The manifest's top-level `exports:` block | None |
 
-Declaring `exports.files` gives the agent no capability whatsoever: the files are served by the
-runtime off the host path it already holds for the workdir, with no WASM instantiated and no
-interaction with a running turn. `mur run --explain-scope` prints the declared export in its
+Declaring `exports.files` gives the agent no capability whatsoever: the runtime serves the files
+itself, off the host path it already holds for the workdir, without involving the agent. `mur run --explain-scope` prints the declared export in its
 `Resource plane` section, and `--explain-scope --json` carries it as `exports_files` — `null`
 when nothing is exported. See [Resource plane](resource-plane.md).
 

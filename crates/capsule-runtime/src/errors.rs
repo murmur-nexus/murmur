@@ -139,8 +139,8 @@ pub enum RuntimeError {
         reason: String,
     },
     /// A capsule declares an `exports.files.root` that, once resolved against the session's
-    /// accessible workdir, lands somewhere else — today, because the root already exists as a
-    /// symlink pointing out of it.
+    /// accessible workdir, lands somewhere else — the root already exists as a symlink pointing
+    /// out of it.
     ///
     /// Refused at launch rather than per request: an export root outside the workdir is a
     /// misconfiguration the operator can fix, and discovering it one served file at a time would

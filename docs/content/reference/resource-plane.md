@@ -1,12 +1,13 @@
 # Resource Plane
 
 A capsule that declares [`exports.files`](manifest.md#field-exports) opens a read-only view onto
-part of its session workdir. An external process lists and reads the files under that subtree over
-the capsule's HTTP listener, under the `/resources/` path prefix.
+part of its [accessible workdir](workdir.md) — the directory the agent's own tools see as `.`. An
+external process lists and reads the files under that subtree over the capsule's HTTP listener,
+under the `/resources/` path prefix.
 
-The runtime serves these reads itself, off the host path it already holds for the workdir. No WASM
-is instantiated, no lock is taken and no running turn is consulted, so the plane answers whether
-the capsule is idle or mid-task — and a read costs no inference turn.
+The runtime serves these reads itself, off the host path it already holds for the workdir. The
+agent is not involved, so a read costs no inference turn and is answered whether the capsule is
+idle or in the middle of a task.
 
 A manifest with no `exports.files` has no resource plane: every request to it is refused with
 `no_resource_plane`.
@@ -105,7 +106,7 @@ For every read, in this order and before any byte is served:
 Symlinks are decided by the achieved containment class — see
 [Symlinks under an export root](containment.md#export-symlinks).
 
-An `exports.files.root` that already resolves outside the session workdir, because it exists as a
+An `exports.files.root` that already resolves outside the accessible workdir, because it exists as a
 symlink pointing out of it, refuses the launch with
 [`E-CAP-007`](diagnostics.md#e-cap-007) before any session runs.
 
@@ -151,10 +152,9 @@ either way, because it describes exactly what was served.
 
 ## Reading after the runtime exits { #after-teardown }
 
-The runtime is the only reader. Nothing else may serve these bytes — a second reader would be a
-second authoriser, bypassing the export declaration, the resolve-beneath discipline and the trace
-record alike.
+Read these files through the resource plane rather than off disk. A gateway that opens the workdir
+directly gets no export check, no path checks and no trace record.
 
-Session workdirs persist past teardown, so a later read means relaunching the runtime against the
+Workdirs persist past teardown, so a later read means relaunching the runtime against the
 same workdir and re-requesting. A relaunched process reports `generation: 0`, because no task has
 completed in it; `etag` remains the validator that tracks content.

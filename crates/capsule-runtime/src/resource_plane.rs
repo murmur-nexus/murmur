@@ -190,8 +190,8 @@ impl ResourcePlane {
 
 /// A status, headers and a body — everything a transport needs and nothing about the transport.
 ///
-/// [`handle_resource_request`] returns this rather than writing to a socket so a later card can
-/// bind the same logic on its own listener behind its own authoriser without touching any of it.
+/// [`handle_resource_request`] returns this rather than writing to a socket, so the same logic
+/// can be bound on another listener behind its own authoriser without touching any of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceResponse {
     pub status: u16,
@@ -642,8 +642,8 @@ fn describe_entry(path: &Path, relative: String) -> Option<ListEntry> {
 
 /// Answers one resource-plane request: a method, a raw request path, and nothing else.
 ///
-/// Knows no socket, no framing and no authoriser, so a later card can bind it on a second
-/// listener with its own authentication by calling exactly this function.
+/// Knows no socket, no framing and no authoriser, so binding it on a second listener with its own
+/// authentication is a matter of calling exactly this function and writing out the reply.
 ///
 /// `raw_path` is the request target verbatim, still percent-encoded and possibly carrying a query
 /// string. Decoding is this function's job, never the caller's.

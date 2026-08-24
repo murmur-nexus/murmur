@@ -17,7 +17,7 @@ section that explains it.
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
 | `E-CAP-005` | This host cannot give the capsule's native subprocess tree its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
-| `E-CAP-007` | `exports.files.root` resolves outside the session workdir | [E-CAP-007](#e-cap-007) |
+| `E-CAP-007` | `exports.files.root` resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -243,7 +243,7 @@ Two neighbouring codes are easy to confuse with this one:
 
 ### E-CAP-007 — export root outside the workdir { #e-cap-007 }
 
-[`exports.files.root`](manifest.md#field-exports) names a subtree of the session workdir. When that
+[`exports.files.root`](manifest.md#field-exports) names a subtree of the [accessible workdir](workdir.md). When that
 path already exists and resolves somewhere else — because it is a symlink pointing out of the
 workdir — `mur run` refuses at staging, before the workdir is created and before any session runs:
 
