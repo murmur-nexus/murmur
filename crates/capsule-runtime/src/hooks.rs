@@ -421,7 +421,7 @@ enum HookCallResult {
 /// decision that the task's agent loop should re-run with `reason` injected as
 /// feedback rather than being finalized. Surfaced by [`HookRuntime::dispatch_task_end`]
 /// and acted on by the runtime's per-task reopen loop, subject to the capsule's
-/// `inference.max_task_reopens` budget and `inference.max_turns` ceiling.
+/// `lifecycle.max_task_reopens` budget and `inference.max_turns` ceiling.
 #[derive(Debug, Clone)]
 pub(crate) struct TaskReopen {
     /// Manifest name of the hook that requested the reopen.

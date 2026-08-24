@@ -143,7 +143,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `inference.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
