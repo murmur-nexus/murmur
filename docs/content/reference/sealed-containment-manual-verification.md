@@ -43,6 +43,10 @@
     A capsule declaring `capabilities.containment: sealed` ran to completion from the attached path,
     and its `session_start` event recorded `"containment_achieved": "sealed"` with
     `"userns_grant": "profile_confining"`. Steps 3, 4 and 6 have not been re-run under that posture.
+    The profile loaded was the host's already-installed `/etc/apparmor.d/mur-sealed`, whose bytes
+    differ from `packaging/apparmor/mur-sealed` in comments and in an added `capability net_admin,`
+    rule; the two attachment specifications and the `userns,` rule that grants the namespace are
+    identical, so the grant observed is the one the shipped profile gives.
 
     A green `cargo build` / `cargo test` / `cargo clippy` is **not** evidence about the containment
     boundary and must not be reported as if it were. See

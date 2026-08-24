@@ -44,8 +44,7 @@ pub use network_namespace::{
 };
 pub use sealed::{
     classify_installed_profile, inspect_installed_profile, InstalledProfileState, SealedBlocker,
-    UsernsGrant, SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
-    SEALED_APPARMOR_PROFILE_SHA256,
+    UsernsGrant, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 // `cgroup` is a private module, but the two test-support entry points below are consumed from
 // `murmur-cli`'s integration tests as well as from this crate's own, so they are re-exported here

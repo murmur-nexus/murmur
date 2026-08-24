@@ -387,7 +387,8 @@ pub fn stage_session(
     // same reason: this session is about to record an achieved class that a weakened host and the
     // shipped profile can both produce, and the operator should be told which one they are on
     // before reading the result. Never a refusal — see `warn_on_userns_restriction_disabled_host_wide`.
-    warn_on_userns_restriction_disabled_host_wide(crate::containment::detect_userns_grant());
+    // Read off the report rather than re-probed, so the warning and the record cannot disagree.
+    warn_on_userns_restriction_disabled_host_wide(scope_report.userns_grant);
     // The non-fatal half of the reachability check above. A compiler driver's helper binaries
     // (`cc1`, `as`, `ld`, `collect2`) are exec'd by the driver itself and sit outside its own
     // DT_NEEDED closure, inside the fixed sealed tree that is deliberately bound without the

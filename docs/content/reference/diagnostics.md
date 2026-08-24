@@ -775,15 +775,16 @@ evidence would block capsules that would have worked.
 `mur run` and `mur doctor`.
 
 **Why it matters:** `capabilities.containment: sealed` and the capsule network namespace both need
-an unprivileged user namespace, and on an AppArmor host something has to permit it. There are two
-ways to get that permission, and they differ enormously in blast radius:
+an unprivileged user namespace, and on an AppArmor host something has to permit it. This warning is
+about which of the two permitting postures the host is in — they differ enormously in blast radius:
 
-| Grant | What it permits | Reported as |
-|---|---|---|
-| The shipped `mur-sealed` AppArmor profile | `mur` alone creates unprivileged user namespaces; every other binary stays restricted | `profile_confining` |
-| `kernel.apparmor_restrict_unprivileged_userns=0` | **every** program on the machine creates them | `restriction_disabled_host_wide` |
-| No AppArmor on this host (Fedora, Arch, …) | nothing was ever restricted; no profile is needed or possible | `apparmor_absent` |
-| The restriction is on and no `mur-sealed` profile attaches to this binary | nothing — `sealed` and the network namespace are refused, `E-CAP-003`/`E-CAP-005` | `withheld` |
+| Grant | What it permits |
+|---|---|
+| `profile_confining` | `mur` alone creates unprivileged user namespaces; every other binary stays restricted |
+| `restriction_disabled_host_wide` | **every** program on the machine creates them |
+
+The other two values, and the line that prints them, are in
+[Where the user namespace comes from](containment.md#userns-grant).
 
 Ubuntu 23.10 and later ship the restriction on precisely because unprivileged user namespaces are a
 recurring local privilege-escalation surface. Switching it off works, and on a host where no profile

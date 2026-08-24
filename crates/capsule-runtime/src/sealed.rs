@@ -191,8 +191,8 @@ impl UsernsGrant {
     /// empty.
     ///
     /// Pure, and separate from the reading for the same reason [`classify_installed_profile`] is:
-    /// every combination is then testable on any OS, with no `/sys` and no `/proc`. `linux::
-    /// userns_grant` is the reader and holds no logic of its own.
+    /// every combination is then testable on any OS, with no `/sys` and no `/proc`.
+    /// `linux::userns_grant` is the reader and holds no logic of its own.
     ///
     /// A missing or unreadable restriction knob counts as *not restricted*, not as withheld — a
     /// kernel that does not implement the knob does not restrict anything.
@@ -214,12 +214,6 @@ impl UsernsGrant {
             }
             _ => UsernsGrant::Withheld,
         }
-    }
-}
-
-impl std::fmt::Display for UsernsGrant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.wire_name())
     }
 }
 
@@ -2858,11 +2852,18 @@ mod tests {
                 serde_json::Value::String(grant.wire_name().to_string()),
                 "the serialized form and the wire name must be one string"
             );
-            assert!(
-                grant.summary().len() > 40,
-                "{grant:?} must state what the grant covers, not just name it"
-            );
         }
+
+        // The `mur doctor` line under each wire name has to say something different for each, or
+        // the block repeats the wire name in longer words and tells an operator nothing.
+        let mut summaries: Vec<&str> = UsernsGrant::ALL.iter().map(|g| g.summary()).collect();
+        summaries.sort_unstable();
+        summaries.dedup();
+        assert_eq!(
+            summaries.len(),
+            UsernsGrant::ALL.len(),
+            "two grants share a summary"
+        );
 
         // An unprobed host claims nothing, exactly as the `bool` field's `false` default did.
         assert_eq!(UsernsGrant::default(), UsernsGrant::Withheld);

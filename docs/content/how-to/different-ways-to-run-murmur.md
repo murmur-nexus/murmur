@@ -260,8 +260,8 @@ Effective grants
 The report shows *declared* network destinations, not resolved IP addresses — it deliberately skips DNS to stay fast and read-only.
 
 `userns grant:` names where this host's permission to create an unprivileged user namespace comes
-from — `apparmor_absent`, `profile_confining`, `restriction_disabled_host_wide` or `withheld` (`n/a`
-off Linux). See [Where the user namespace comes from](../reference/containment.md#userns-grant).
+from, and is `n/a` off Linux. See
+[Where the user namespace comes from](../reference/containment.md#userns-grant) for the values.
 
 `mechanism:` is a stable name for the kernel enforcement the host actually provides:
 
