@@ -1799,8 +1799,8 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 /// A per-hook `capabilities:` block reuses the whole [`murmur_artifact::Capabilities`]
 /// vocabulary, but only `network`, `filesystem` and `task_io` govern a hook — the rest are
 /// capsule-wide concerns nothing reads per-artifact. Warn rather than reject (the block is
-/// structurally valid) so an operator who declared, say, `shell.allow` on a hook entry learns it is inert
-/// instead of assuming it was applied. Infallible and non-fatal, like
+/// structurally valid) so an operator who declared, say, `shell.allow` on a hook entry learns
+/// it is inert instead of assuming it was applied. Infallible and non-fatal, like
 /// [`warn_if_bash_network_bypass`], and carries the same `W-SEC-*` registry code + doc link
 /// convention as every other non-fatal capability warning (see `security_warnings.rs`).
 ///

@@ -1454,11 +1454,12 @@ fn read_task(workdir: &Path) -> String {
 
 /// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
 ///
-/// The single result-text write funnel for this transport: every terminal arm of
-/// [`run_agent_loop`] calls this, and [`write_result`] has no other caller. That is what makes
-/// `murmur:task-io/read`'s `read-output` serve exactly what the loop produced. A terminal path
-/// that returns `Err` without producing result text never reaches here, and the output stays
-/// unset — which is the truthful pairing with the `exit-status: failed` the hook sees.
+/// The single result-text write funnel for both transports: every terminal arm of
+/// [`run_agent_loop`] and both dialect readers in [`process`] call this, and [`write_result`]
+/// has no other caller. That is what makes `murmur:task-io/read`'s `read-output` serve exactly
+/// what the loop produced. A terminal path that returns `Err` without producing result text
+/// never reaches here, and the output stays unset — the truthful pairing with the
+/// `exit-status: failed` the hook sees.
 fn record_result(hooks: &HookRuntime, workdir: &Path, value: &str) -> Result<(), String> {
     hooks.record_task_output(value);
     write_result(workdir, value)
