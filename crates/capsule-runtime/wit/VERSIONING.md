@@ -18,6 +18,7 @@ Current versions:
 | `murmur:shell`           | `0.1.0`  |
 | `murmur:message`         | `0.1.0`  |
 | `murmur:task`            | `0.1.0`  |
+| `murmur:task-io`         | `0.1.0`  |
 | `murmur:text`            | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.2.0`  |
@@ -54,6 +55,22 @@ no hook bound to `on-shell` could tell whether an event was `pytest`, `cargo` or
 below; the `0.3.0 → 0.4.0` entry above records what happens if you try to ship
 one additively instead. Hooks built against `@0.4.0` or earlier stopped
 resolving at this bump and had to be rebuilt.
+
+`murmur:task-io` was created at `0.1.0` for the `read` interface — `input-len`
+/ `read-input` / `output-len` / `read-output`, the host-provided window onto a
+task's input and result text. The interface is a hook-side import, so the rule
+below classifies it as a minor bump, which would have taken `murmur:runtime` to
+`0.3.0`. That was not shippable: the package version is part of *every* instance
+name in the package, so `murmur:runtime/inference@0.2.0` would have become
+`@0.3.0`, and the host accepts exactly one version with no fallback — every
+already-published hook importing `inference` would have stopped instantiating
+until rebuilt. Leaving `murmur:runtime` at `0.2.0` while adding an interface to
+it would have made this table untrue instead.
+
+**A wholly new interface added to a package that already has published
+consumers goes in a new package at `0.1.0`.** No existing instance name changes,
+no artifact is rebuilt, and this table simply gains a row. Bump an existing
+package only when the change touches something that package already ships.
 
 ## When to bump
 
@@ -144,8 +161,8 @@ only:
 
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
 `murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
-`murmur:runtime/inference@0.2.0`) are likewise registered under the versioned
-name only.
+`murmur:runtime/inference@0.2.0`, `murmur:task-io/read@0.1.0`) are likewise
+registered under the versioned name only.
 
 An artifact that still exports (or imports) only the unversioned name now
 **fails to instantiate** with a hard error naming the versioned interface the

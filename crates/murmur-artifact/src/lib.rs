@@ -53,7 +53,7 @@ pub use runtime_manifest::{
     InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
     NetworkConfig, ObservabilityConfig, ParseContainmentClassError, ResourceCapabilities,
     ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
-    ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TraceConfig,
+    ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TaskIoCapabilities, TraceConfig,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{

@@ -143,6 +143,17 @@ fn read_task_from_workdir(workdir: &Path) -> String {
     std::fs::read_to_string(workdir.join("task.md")).unwrap_or_default()
 }
 
+/// Record `text` as the in-scope task attempt's result text, then write `out/result.txt`.
+///
+/// The single result-text write funnel for the process transport: both dialect readers call
+/// this, and [`write_result_to_workdir`] has no other caller. `agent::record_result` is the
+/// same arrangement for the WASM-driver transport, so `murmur:task-io/read`'s `read-output`
+/// serves whichever transport ran.
+fn record_result(hooks: &HookRuntime, workdir: &Path, text: &str) -> Result<(), String> {
+    hooks.record_task_output(text);
+    write_result_to_workdir(workdir, text)
+}
+
 /// Write `out/result.txt` in the workdir.
 fn write_result_to_workdir(workdir: &Path, text: &str) -> Result<(), String> {
     let out_dir = workdir.join("out");
@@ -760,7 +771,7 @@ async fn read_process_output(
         )));
     }
 
-    write_result_to_workdir(workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
+    record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
 
     let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
@@ -956,7 +967,7 @@ async fn read_codex_output(
         )));
     }
 
-    write_result_to_workdir(workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
+    record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
     let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
     Ok(())
