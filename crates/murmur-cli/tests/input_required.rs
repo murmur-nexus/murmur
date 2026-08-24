@@ -189,6 +189,7 @@ fn stage_agent(
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .unwrap()

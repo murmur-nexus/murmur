@@ -26,7 +26,7 @@
 //! `sealed`, but they are fixed in completely different places, and a refusal that cannot tell
 //! them apart is a refusal an operator cannot act on.
 
-use murmur_artifact::ContainmentClass;
+use murmur_artifact::{ContainmentClass, ExportMode, FileExport};
 use serde::Serialize;
 
 use crate::{
@@ -185,6 +185,31 @@ pub fn check_containment_floor(
     }
 }
 
+/// The declared `exports.files` block as it appears in a [`ScopeReport`] — and therefore in
+/// `mur run --explain-scope --json` and in `trace.jsonl`'s `session_start.effective_grants`.
+///
+/// A flattened copy rather than [`FileExport`] itself: this is a wire shape with a stable field
+/// order and a `mode` that serializes as `"read-only"`, and it must not move whenever the
+/// manifest type gains a field the report has no business publishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportsFilesReport {
+    /// `exports.files.root` verbatim, as declared.
+    pub root: String,
+    pub mode: ExportMode,
+    /// The effective per-file read ceiling, with the default already applied.
+    pub max_bytes: u64,
+}
+
+impl From<&FileExport> for ExportsFilesReport {
+    fn from(export: &FileExport) -> Self {
+        Self {
+            root: export.root.clone(),
+            mode: export.mode,
+            max_bytes: export.max_bytes,
+        }
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
@@ -237,6 +262,16 @@ pub struct ScopeReport {
     /// `<binary>: <dir>[ (list_dir)]`. These are the paths outside the workdir that stay
     /// reachable even at `scoped`.
     pub interpreter_runtime_grants: Vec<String>,
+    /// The read-only file surface `exports.files` declares, or `null` when the capsule declares
+    /// none. Always serialized (never skipped), so a consumer can tell "this runtime predates
+    /// exports" from "this capsule declined to export anything" by the field's presence rather
+    /// than by its value — the same terms [`Self::workdir_exec`] is reported on.
+    ///
+    /// An export is a *disclosure*, not a grant: it never appears in
+    /// [`Self::achieved_containment`], and declaring one cannot change any other field of this
+    /// report. It is printed beside the grants because it is the other direction of the same
+    /// question — what crosses the capsule boundary, and which way.
+    pub exports_files: Option<ExportsFilesReport>,
     /// Every `capabilities.shell.staged_runtime` grant, rendered as
     /// `<binary>: <source_path> (pin: <pin>)`. These are host runtime trees a `sealed` capsule
     /// asks to have bind-mounted read-only into its composed root.
@@ -289,6 +324,19 @@ impl ScopeReport {
         );
         push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
 
+        out.push_str("\nResource plane\n");
+        match &self.exports_files {
+            None => out.push_str("  exports.files: <none>\n"),
+            Some(export) => {
+                out.push_str(&format!("  exports.files root: {}\n", export.root));
+                out.push_str(&format!("  mode:               {}\n", export.mode));
+                out.push_str(&format!(
+                    "  max bytes:          {} (per file)\n",
+                    export.max_bytes
+                ));
+            }
+        }
+
         if !self.floor_met {
             out.push_str(
                 "\nThis is a report only — `mur run` without --explain-scope would refuse to \
@@ -312,13 +360,18 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
 /// combined floor. Probes the host tier once and reads nothing else.
-pub fn explain_scope(policy: &CapabilityPolicy, declared: ContainmentClass) -> ScopeReport {
+pub fn explain_scope(
+    policy: &CapabilityPolicy,
+    declared: ContainmentClass,
+    exports_files: Option<&FileExport>,
+) -> ScopeReport {
     scope_report_for_tier(
         policy,
         declared,
         detect_enforcement_tier(),
         detect_sealed_blocker(),
         detect_userns_grant(),
+        exports_files,
     )
 }
 
@@ -330,6 +383,7 @@ pub(crate) fn scope_report_for_tier(
     tier: EnforcementTier,
     sealed_blocker: Option<SealedBlocker>,
     userns_grant: Option<UsernsGrant>,
+    exports_files: Option<&FileExport>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -346,6 +400,9 @@ pub(crate) fn scope_report_for_tier(
         shortfall_reason,
         enforcement_tier: enforcement_tier_name(tier),
         userns_grant,
+        // Copied straight through and never consulted above: `achieved` is already computed, and
+        // an export must not be able to reach it.
+        exports_files: exports_files.map(ExportsFilesReport::from),
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
@@ -766,6 +823,7 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
+            None,
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -803,6 +861,7 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
+            None,
         );
 
         assert!(report.workdir_exec);
@@ -835,6 +894,7 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -862,6 +922,7 @@ mod tests {
                 *tier,
                 Some(SealedBlocker::NamespaceCreationDenied),
                 None,
+                None,
             );
             assert_eq!(
                 report.staged_runtime_grants,
@@ -888,6 +949,7 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
+            None,
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -904,6 +966,7 @@ mod tests {
             EnforcementTier::KernelFull,
             Some(SealedBlocker::NamespaceCreationDenied),
             None,
+            None,
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -916,6 +979,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
             Some(SealedBlocker::NotLinux),
+            None,
             None,
         );
 
@@ -934,6 +998,7 @@ mod tests {
             EnforcementTier::KernelSealed,
             None,
             None,
+            None,
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
@@ -949,6 +1014,7 @@ mod tests {
             &CapabilityPolicy::default(),
             ContainmentClass::Advisory,
             EnforcementTier::KernelSeccompOnly,
+            None,
             None,
             None,
         );
@@ -972,6 +1038,7 @@ mod tests {
             EnforcementTier::KernelSealed,
             None,
             None,
+            None,
         );
 
         for grant in UsernsGrant::ALL {
@@ -981,6 +1048,7 @@ mod tests {
                 EnforcementTier::KernelSealed,
                 None,
                 Some(*grant),
+                None,
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
             assert_eq!(report.floor_met, baseline.floor_met);
@@ -1009,6 +1077,7 @@ mod tests {
             EnforcementTier::KernelFull,
             Some(SealedBlocker::AppArmorProfileMissing),
             None,
+            None,
         )
         .render();
 
@@ -1017,5 +1086,140 @@ mod tests {
         assert!(rendered.contains("floor met: no"));
         assert!(rendered.contains("mur-sealed"));
         assert!(rendered.contains("would refuse to launch"));
+    }
+
+    /// The invariant the whole design rests on: an export is a disclosure, not a grant. Declaring
+    /// one must leave the achieved class — and everything else the report says about what the
+    /// guest can reach — byte-identical.
+    #[test]
+    fn an_export_never_changes_what_the_report_says_about_containment() {
+        let export = FileExport {
+            root: "out/".to_string(),
+            mode: ExportMode::ReadOnly,
+            max_bytes: 10 * 1024 * 1024,
+        };
+        for tier in ALL_TIERS {
+            for workdir_exec in [false, true] {
+                let policy = CapabilityPolicy {
+                    workdir_exec_allowed: workdir_exec,
+                    ..sample_policy()
+                };
+                let without = scope_report_for_tier(
+                    &policy,
+                    ContainmentClass::Scoped,
+                    *tier,
+                    None,
+                    None,
+                    None,
+                );
+                let with = scope_report_for_tier(
+                    &policy,
+                    ContainmentClass::Scoped,
+                    *tier,
+                    None,
+                    None,
+                    Some(&export),
+                );
+                assert_eq!(
+                    with.achieved_containment, without.achieved_containment,
+                    "tier {tier:?}, workdir_exec {workdir_exec}"
+                );
+                assert_eq!(with.enforcement_tier, without.enforcement_tier);
+                assert_eq!(with.floor_met, without.floor_met);
+                assert_eq!(with.shortfall_reason, without.shortfall_reason);
+                // Everything but the one new field is identical, which is the strongest form of
+                // "an export changes nothing else" this report can state.
+                assert_eq!(
+                    ScopeReport {
+                        exports_files: None,
+                        ..with.clone()
+                    },
+                    without
+                );
+                assert_eq!(
+                    with.exports_files,
+                    Some(ExportsFilesReport {
+                        root: "out/".to_string(),
+                        mode: ExportMode::ReadOnly,
+                        max_bytes: 10 * 1024 * 1024,
+                    })
+                );
+            }
+        }
+    }
+
+    /// `exports_files` is written whether or not it was declared, on the same terms as
+    /// `workdir_exec`: an absent key identifies an older runtime, a `null` a capsule that
+    /// exported nothing.
+    #[test]
+    fn exports_files_is_always_serialized() {
+        let undeclared = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(undeclared["exports_files"], serde_json::Value::Null);
+
+        let declared = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            Some(&FileExport {
+                root: "out/".to_string(),
+                mode: ExportMode::ReadOnly,
+                max_bytes: 10_485_760,
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            declared["exports_files"],
+            serde_json::json!({"root": "out/", "mode": "read-only", "max_bytes": 10_485_760})
+        );
+    }
+
+    #[test]
+    fn render_names_the_resource_plane_in_both_directions() {
+        let undeclared = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+        )
+        .render();
+        assert!(
+            undeclared.contains("Resource plane") && undeclared.contains("exports.files: <none>"),
+            "{undeclared}"
+        );
+
+        let declared = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            Some(&FileExport {
+                root: "out/".to_string(),
+                mode: ExportMode::ReadOnly,
+                max_bytes: 10_485_760,
+            }),
+        )
+        .render();
+        assert!(declared.contains("exports.files root: out/"), "{declared}");
+        assert!(
+            declared.contains("mode:               read-only"),
+            "{declared}"
+        );
+        assert!(
+            declared.contains("max bytes:          10485760 (per file)"),
+            "{declared}"
+        );
     }
 }

@@ -354,6 +354,7 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
             .as_ref()
             .and_then(|capabilities| capabilities.containment)
             .unwrap_or_default(),
+        exports: manifest.exports.clone(),
     };
     // The job is registered inside the launch thread rather than here, because its key is the
     // session id and `stage_session` is what mints one. A spawn that fails to stage never

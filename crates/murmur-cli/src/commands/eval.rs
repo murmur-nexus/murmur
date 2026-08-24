@@ -719,6 +719,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 .as_ref()
                 .and_then(|capabilities| capabilities.containment)
                 .unwrap_or_default(),
+            exports: runtime_manifest.exports.clone(),
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {

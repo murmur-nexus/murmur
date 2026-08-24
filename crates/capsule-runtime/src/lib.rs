@@ -22,6 +22,7 @@ pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod plan;
 pub(crate) mod reachability;
+pub mod resource_plane;
 pub mod resources;
 pub mod runtime;
 pub(crate) mod sandbox;
@@ -36,7 +37,7 @@ pub mod types;
 
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_sealed_blocker, detect_userns_grant, explain_scope, ScopeReport,
+    detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, ScopeReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
@@ -61,12 +62,18 @@ pub use reachability::{
     check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
     ToolchainHelperWarning,
 };
+pub use resource_plane::{
+    check_export_root, handle_resource_request, reason_phrase, symlink_policy, DeclaredExport,
+    ListEntry, ListResponse, ReadResponse, ResourceError, ResourcePlane, ResourceResponse,
+    SymlinkPolicy, RESOURCE_PATH_PREFIX,
+};
 pub use resources::HostResourceLimits;
 pub use runtime::{
     launch_session, stage_session, warn_on_interpreter_runtime_grants,
     warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
 };
 pub use staged_runtime::check_staged_runtime_floor;
+pub use trace::ResourceTraceAppender;
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, StageRequest,

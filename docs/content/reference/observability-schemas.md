@@ -32,7 +32,7 @@ the session directory) and `timestamp` (Unix milliseconds).
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself |
 | `system_prompt` | string | The resolved prompt verbatim. Written **only** when the manifest sets `trace.include_tool_output: true`; omitted otherwise, on the same terms as tool output text. Omitted regardless when no prompt was in effect |
-| `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants` and `staged_runtime_grants`. Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
+| `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants` and `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)). Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
 
 **`inference`** — written after each driver response is parsed
 
@@ -182,6 +182,34 @@ and for the three failures nothing else can surface. `on-stage` faults never rea
 because staging runs before `trace.jsonl` exists. Every fault is also written to
 `workdir/logs/hook-<name>.log`. Faults are flushed just before the `session_end` they precede, so
 they always appear earlier in the file than the event that flushed them.
+
+**`resource_list`** — written when the [resource plane](resource-plane.md) answers a `list`, served
+or refused
+
+| Field | Type | Notes |
+|---|---|---|
+| `root` | string | `exports.files.root` verbatim. Empty when the capsule declares no export and the request was refused |
+| `entry_count` | u64 | Regular files listed. `0` on any non-`ok` outcome |
+| `total_bytes` | u64 | Sum of the listed files' sizes. `0` on any non-`ok` outcome |
+| `generation` | u64 | Completed tasks in this process at the moment of the request |
+| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the class this session achieved |
+| `outcome` | string | `"ok"`, or the [error code](resource-plane.md#errors) the caller received |
+| `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
+
+**`resource_read`** — written when the resource plane answers a `read`, served or refused
+
+| Field | Type | Notes |
+|---|---|---|
+| `path` | string | The requested path after percent-decoding, before any validation, so `%2e%2e%2f` and `../` read as one attempt |
+| `outcome` | string | `"ok"`, or the [error code](resource-plane.md#errors) the caller received |
+| `bytes` | u64 \| null | Bytes served. `null` on any non-`ok` outcome |
+| `sha256` | string \| null | SHA-256 (lowercase hex) of the bytes served — the same value as the response's `etag`. `null` on any non-`ok` outcome |
+| `generation` | u64 | Completed tasks in this process at the moment of the request |
+| `containment_achieved` | string | `"advisory"` \| `"scoped"` \| `"sealed"` |
+| `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
+
+Both events are written at the moment of the request rather than at a task boundary, so a read of a
+finished-but-alive capsule is recorded after that session's `session_end`.
 
 **Guarantees:**
 

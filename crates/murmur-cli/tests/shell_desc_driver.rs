@@ -104,6 +104,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .expect("stage_session should succeed");
@@ -202,6 +203,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -303,6 +305,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
+            exports: None,
         },
     )
     .expect("stage_session should succeed");

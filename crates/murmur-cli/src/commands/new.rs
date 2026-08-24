@@ -136,6 +136,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             .as_ref()
             .and_then(|capabilities| capabilities.containment)
             .unwrap_or_default(),
+        exports: runtime_manifest.exports.clone(),
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).

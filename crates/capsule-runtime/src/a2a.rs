@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use murmur_artifact::TaskAcceptance;
 use serde::{Deserialize, Serialize};
@@ -150,6 +156,10 @@ pub(crate) struct TaskRegistry {
     pub(crate) task_acceptance: TaskAcceptance,
     /// Pending input waiters: task_id → (prompt, oneshot sender)
     input_waiters: HashMap<String, (String, oneshot::Sender<String>)>,
+    /// Which completed turn the capsule's exported files are as of, shared with the resource
+    /// plane. Lives here because every terminal state passes through this registry, so a third
+    /// [`Self::finish_task`] call site cannot appear with no matching increment beside it.
+    resource_generation: Arc<AtomicU64>,
 }
 
 impl TaskRegistry {
@@ -161,7 +171,27 @@ impl TaskRegistry {
             queue_depth,
             task_acceptance,
             input_waiters: HashMap::new(),
+            resource_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A handle on the generation counter, for a reader that must not take this registry's lock.
+    ///
+    /// The resource plane serves reads while a turn is running, so it holds its own `Arc` and
+    /// loads it atomically. Taking the registry mutex to answer a `GET` would make a read wait on
+    /// the agent loop, which is the one thing this plane promises never to do.
+    pub(crate) fn resource_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.resource_generation)
+    }
+
+    /// Advance the generation by one. Called at each [`Self::finish_task`] call site, immediately
+    /// after the task reaches a terminal state.
+    ///
+    /// Provenance, not a pin: it answers "these bytes are as of turn N" and nothing else. No
+    /// request selects a generation, no response is refused because it moved, and no superseded
+    /// bytes are retained.
+    pub(crate) fn advance_resource_generation(&self) {
+        self.resource_generation.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn can_accept(&self) -> bool {

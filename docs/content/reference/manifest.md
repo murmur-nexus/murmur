@@ -142,6 +142,12 @@ lifecycle:
   queue_depth: 2          # only meaningful for queue mode; default: 1
   input_timeout_secs: 60  # optional; absent = wait indefinitely for request-input reply
   conversation: threaded  # stateless (default) | threaded
+
+exports:
+  files:
+    root: out/            # required; relative to the accessible workdir
+    mode: read-only       # required; the only accepted value
+    max_bytes: 10Mi       # optional; per-file read ceiling, default 10Mi
 ```
 
 ### Field reference
@@ -506,6 +512,24 @@ these fields are accepted and inert:
 | `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
+
+#### `exports` { #field-exports }
+
+Opens a read-only view onto part of the accessible workdir, which an external process reads over the
+capsule's HTTP listener without an inference turn — see
+[Resource plane](resource-plane.md). Absent means nothing is exported and every request to the
+plane is refused with `no_resource_plane`.
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `exports.files` | block | no | The read-only file surface. An `exports:` block without it declares no resource plane. |
+| `exports.files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) the export opens — the directory the agent's tools see as `.`. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir — because it already exists as a symlink pointing out of it — refuses the launch with `E-CAP-007`. |
+| `exports.files.mode` | `read-only` | yes | `read-only` is the only accepted value. |
+| `exports.files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file read ceiling: a file above it is still listed, with its real size, and refused on read with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
+
+Declaring an export leaves the achieved containment class unchanged. Containment bounds what the
+capsule reaches outward; an export widens what an operator reaches inward, and hands the agent no
+capability at all.
 
 ---
 

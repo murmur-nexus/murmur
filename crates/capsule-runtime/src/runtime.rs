@@ -329,12 +329,17 @@ pub fn stage_session(
     // `mur run --explain-scope --json` prints — same builder, same policy, same declared floor,
     // and the same two probes taken above. Computed once here rather than at trace-open time so
     // the record cannot drift from the decision that let the session start.
+    let exports_files = request
+        .exports
+        .as_ref()
+        .and_then(|exports| exports.files.clone());
     let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
         enforcement_tier,
         sealed_blocker,
         crate::containment::detect_userns_grant(),
+        exports_files.as_ref(),
     );
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
@@ -654,6 +659,13 @@ pub fn stage_session(
         let accessible = dir.clone();
         (dir, accessible)
     };
+    // Before the workdir is created and before anything is staged into it: a declared export
+    // whose root already resolves outside the accessible workdir must refuse the launch, not be
+    // discovered one served file at a time.
+    if let Some(ref export) = exports_files {
+        crate::resource_plane::check_export_root(&accessible_workdir, export)?;
+    }
+
     fs::create_dir_all(workdir.join("tools")).map_err(|source| RuntimeError::CreateWorkdir {
         path: workdir.display().to_string(),
         source,
@@ -758,6 +770,7 @@ pub fn stage_session(
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
         scope_report,
+        exports_files,
         registry,
         _epoch_ticker: epoch_ticker,
     })
@@ -933,6 +946,13 @@ pub fn launch_session(
         // It also carries the declared/achieved classes and `workdir_exec` the event's own
         // top-level fields are written from.
         let effective_grants = staged.scope_report.clone();
+        // The resource plane is built from a host path, a declared export, an achieved class, a
+        // counter and a trace handle — nothing the agent loop owns and nothing a completed task
+        // leaves behind. That is what a later reader-only launch mode over an existing workdir
+        // would need, and no more.
+        let exports_files = staged.exports_files.clone();
+        let resource_containment = staged.scope_report.achieved_containment;
+        let resource_accessible_workdir = accessible_workdir.clone();
 
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
@@ -993,6 +1013,25 @@ pub fn launch_session(
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
 
+            // A second handle to the same trace.jsonl, not a borrow of the writer above: the
+            // motivating read happens after `session_end`, when the agent loop's writer is gone.
+            // A trace that cannot be opened must not make the plane unserveable — the read is
+            // still refused or served correctly, it is only unrecorded.
+            let resource_trace = crate::trace::ResourceTraceAppender::open(
+                &workdir,
+                session_id.clone(),
+            )
+            .await
+            .ok()
+            .map(std::sync::Arc::new);
+            let resource_plane = std::sync::Arc::new(crate::resource_plane::ResourcePlane::new(
+                &resource_accessible_workdir,
+                exports_files.as_ref(),
+                resource_containment,
+                task_registry.lock().unwrap().resource_generation(),
+                resource_trace,
+            ));
+
             let mut otel = OtelEmitter::new(
                 otel_endpoint.clone(),
                 &workdir,
@@ -1015,6 +1054,7 @@ pub fn launch_session(
                             sse_tx.clone(),
                             Arc::clone(&sse_buffer),
                             conversation_mode.clone(),
+                            std::sync::Arc::clone(&resource_plane),
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -1392,6 +1432,9 @@ pub fn launch_session(
                         {
                             let mut reg = task_registry.lock().unwrap();
                             reg.finish_task(exit_state);
+                            // Immediately after the terminal state, so a resource-plane read that
+                            // lands next reports the turn these bytes belong to.
+                            reg.advance_resource_generation();
                         }
 
                         // ── DECIDE WHETHER TO CONTINUE ──
@@ -2163,6 +2206,7 @@ pub(crate) async fn request_input_impl(
             {
                 let mut reg = task_registry.lock().unwrap();
                 reg.finish_task(TaskState::Failed);
+                reg.advance_resource_generation();
             }
             emit_sse(
                 &sse,
@@ -4069,6 +4113,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -4155,6 +4200,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -4229,6 +4275,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -4302,6 +4349,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -4451,6 +4499,7 @@ mod tests {
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
         };
 
         let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();
@@ -4997,6 +5046,7 @@ mod tests {
                     &policy,
                     murmur_artifact::ContainmentClass::Advisory,
                     sandbox::EnforcementTier::EnvironmentOnly,
+                    None,
                     None,
                     None,
                 ),
@@ -5731,6 +5781,7 @@ mod tests {
                 sandbox::EnforcementTier::EnvironmentOnly,
                 None,
                 None,
+                None,
             ),
             false,
             None,
@@ -5922,6 +5973,7 @@ mod tests {
                 &CapabilityPolicy::default(),
                 murmur_artifact::ContainmentClass::Advisory,
                 sandbox::EnforcementTier::EnvironmentOnly,
+                None,
                 None,
                 None,
             ),

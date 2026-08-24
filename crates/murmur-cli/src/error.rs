@@ -38,6 +38,7 @@ pub const E_CAP_003: &str = "E-CAP-003"; // host cannot meet the declared contai
 pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a sealed containment floor
 pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree its own network namespace
 pub const E_CAP_006: &str = "E-CAP-006"; // sealed capsule allowlists a script whose interpreter's package tree nothing declared reaches
+pub const E_CAP_007: &str = "E-CAP-007"; // exports.files.root resolves outside the capsule workdir
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -255,6 +256,16 @@ impl From<RuntimeError> for CliError {
                 );
                 CliError::with_hint(E_CAP_003, error.to_string(), hint)
             }
+            // An export is a disclosure, not a grant, so this is not a containment shortfall and
+            // no floor change fixes it: the root itself names somewhere outside the capsule. The
+            // hint therefore points at the path, never at the containment ladder.
+            error @ RuntimeError::ExportRootOutsideWorkdir { .. } => CliError::with_hint(
+                E_CAP_007,
+                error.to_string(),
+                "point `exports.files.root` at a directory inside the capsule workdir. A root \
+                 that already exists as a symlink out of the workdir is refused whole rather than \
+                 followed — see docs/content/reference/resource-plane.md",
+            ),
             // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
             // one means the host is too weak for the declared floor (lower it, or move hosts),
             // this one means the capsule's own declaration is too weak for what it asked for
