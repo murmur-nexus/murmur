@@ -79,6 +79,178 @@ pub const SEALED_APPARMOR_PROFILE_NAME: &str = "mur-sealed";
 /// path the refusal message tells an operator to load.
 pub const SEALED_APPARMOR_PROFILE_PATH: &str = "/etc/apparmor.d/mur-sealed";
 
+/// SHA-256 (lowercase hex) of `packaging/apparmor/mur-sealed` as this build ships it.
+///
+/// A literal rather than an `include_str!` digest: `capsule-runtime` is published to crates.io,
+/// `cargo package` copies only files under the crate's own directory, and a path escaping the
+/// crate root compiles in the workspace and then fails the packaging verification build. The unit
+/// test `shipped_profile_digest_constant_matches_the_file` reads the real file through
+/// `CARGO_MANIFEST_DIR` and fails with the digest to paste in here — that test does not run during
+/// `cargo package`, so publishing stays green while a profile edit that forgot this constant is
+/// caught by `cargo test`.
+///
+/// Compares *file bytes*. It says nothing about what `apparmor_parser` has actually loaded — see
+/// [`classify_installed_profile`].
+pub const SEALED_APPARMOR_PROFILE_SHA256: &str =
+    "1669f6c0038dddea393cfacd95b078ac99ec718a538c8ebb52701f6ba686a892";
+
+/// Where this host's permission to create an unprivileged user namespace comes from.
+///
+/// Three of the four variants permit the namespace, and they are not interchangeable: AppArmor
+/// being absent is a distribution fact nobody chose, the shipped profile confining `mur` is the
+/// configuration murmur ships, and the restriction being switched off host-wide removes the
+/// hardening for *every* binary on the machine. Collapsing them into one `bool` made those three
+/// hosts byte-identical in `mur doctor`, in `--explain-scope` and in the session trace, so a
+/// `sealed` result obtained on a weakened host could not be told apart from one obtained through
+/// the profile.
+///
+/// The grant never decides whether a run is refused — only [`Self::permits_userns`] does, and it
+/// answers exactly what the replaced `bool` answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsernsGrant {
+    /// AppArmor is not enabled on this host (Fedora, Arch, a kernel built without it, …). There is
+    /// no restriction to lift and no profile to install.
+    ApparmorAbsent,
+    /// AppArmor is enabled but `kernel.apparmor_restrict_unprivileged_userns` is `0`, so no binary
+    /// on this host is transitioned into the restricted `unprivileged_userns` profile. Legitimate,
+    /// and on some hosts the only option — but it is not the configuration murmur ships, and it is
+    /// what `W-SEC-013` reports.
+    RestrictionDisabledHostWide,
+    /// The restriction is on and this process is confined by a profile whose name begins with
+    /// [`SEALED_APPARMOR_PROFILE_NAME`] — the shipped profile, or the checkout profile
+    /// `scripts/install-dev-apparmor.sh` generates. The grant is narrow: it applies to this binary
+    /// and nothing else.
+    ProfileConfining,
+    /// The restriction is on and nothing grants this binary anything. The only variant that keeps
+    /// a host below `sealed`, and the default so an unprobed host claims nothing.
+    #[default]
+    Withheld,
+}
+
+impl UsernsGrant {
+    /// Every variant, so a caller reasoning about "which grant did this host give" cannot silently
+    /// miss one. Same convention as [`SealedBlocker::ALL`].
+    pub const ALL: &'static [UsernsGrant] = &[
+        UsernsGrant::ApparmorAbsent,
+        UsernsGrant::RestrictionDisabledHostWide,
+        UsernsGrant::ProfileConfining,
+        UsernsGrant::Withheld,
+    ];
+
+    /// Whether an unprivileged `unshare(CLONE_NEWUSER)` gets through on this host.
+    ///
+    /// The whole of what the runtime decisions read: [`sealed_blocker`],
+    /// [`crate::network_namespace::egress_namespace_blocker`] and `sandbox::tier_from_probe`
+    /// consult this and nothing else about the grant, so provenance is reported without ever
+    /// changing an outcome.
+    #[must_use]
+    pub fn permits_userns(self) -> bool {
+        !matches!(self, UsernsGrant::Withheld)
+    }
+
+    /// Stable wire name, as it appears in `--explain-scope --json`, in `session_start` and in
+    /// `mur doctor`. Distinct per variant, and not a `Debug` rendering, which is free to change.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            UsernsGrant::ApparmorAbsent => "apparmor_absent",
+            UsernsGrant::RestrictionDisabledHostWide => "restriction_disabled_host_wide",
+            UsernsGrant::ProfileConfining => "profile_confining",
+            UsernsGrant::Withheld => "withheld",
+        }
+    }
+
+    /// One line naming the mechanism in words, for the `mur doctor` block. States what the grant
+    /// covers — one binary or the whole host — because that is the difference the wire name alone
+    /// does not spell out.
+    #[must_use]
+    pub fn summary(self) -> &'static str {
+        match self {
+            UsernsGrant::ApparmorAbsent => {
+                "AppArmor is not enabled on this host, so nothing restricts unprivileged user \
+                 namespaces and no profile is needed"
+            }
+            UsernsGrant::RestrictionDisabledHostWide => {
+                "kernel.apparmor_restrict_unprivileged_userns is off, so unprivileged user \
+                 namespaces are unrestricted for every binary on this host, not just for mur"
+            }
+            UsernsGrant::ProfileConfining => {
+                "the restriction is on and the mur-sealed AppArmor profile is confining this \
+                 binary, so the grant covers mur alone — the configuration murmur ships"
+            }
+            UsernsGrant::Withheld => {
+                "the restriction is on and no mur-sealed AppArmor profile is confining this \
+                 binary, so unprivileged user namespaces are withheld from mur"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UsernsGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+/// How `/etc/apparmor.d/mur-sealed` on this host compares to the profile this build ships.
+///
+/// A *file-level* finding and deliberately nothing more. AppArmor loads profiles from the kernel's
+/// own policy cache, not from this path at call time, so a file can be edited without
+/// `apparmor_parser -r` ever running and a profile can be loaded from a file that has since been
+/// deleted. [`UsernsGrant`] is the behavioural answer and stays the source of truth; this only
+/// tells an operator whether the bytes on disk are the bytes murmur ships.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledProfileState {
+    /// The installed file hashes to [`SEALED_APPARMOR_PROFILE_SHA256`].
+    Matches,
+    /// The file is present and hashes to something else — an older revision, or an edited copy.
+    /// Operator customisation belongs in `/etc/apparmor.d/local/mur-sealed`, which both shipped
+    /// profiles `include if exists` and which is not hashed here.
+    Drifted {
+        /// Lowercase hex SHA-256 of the bytes actually on disk.
+        installed_sha256: String,
+    },
+    /// No file at [`SEALED_APPARMOR_PROFILE_PATH`]. Expected on a host without AppArmor, and on a
+    /// checkout build using `scripts/install-dev-apparmor.sh`, which writes its own separate file.
+    Absent,
+    /// The path exists and could not be read — a permission or I/O error, kept apart from
+    /// [`Self::Absent`] so "I could not look" never reads as "it is not there".
+    Unreadable {
+        /// The `std::io::Error`, rendered.
+        error: String,
+    },
+}
+
+/// Classifies a read of [`SEALED_APPARMOR_PROFILE_PATH`] against the shipped digest.
+///
+/// Takes the already-performed read rather than the path, so all four outcomes are unit-testable
+/// with no filesystem mutation and no privilege.
+#[must_use]
+pub fn classify_installed_profile(read: Result<Vec<u8>, std::io::Error>) -> InstalledProfileState {
+    match read {
+        Ok(bytes) => {
+            let installed_sha256 = murmur_artifact::sha256_hex(&bytes);
+            if installed_sha256 == SEALED_APPARMOR_PROFILE_SHA256 {
+                InstalledProfileState::Matches
+            } else {
+                InstalledProfileState::Drifted { installed_sha256 }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => InstalledProfileState::Absent,
+        Err(error) => InstalledProfileState::Unreadable {
+            error: error.to_string(),
+        },
+    }
+}
+
+/// [`classify_installed_profile`] over the real [`SEALED_APPARMOR_PROFILE_PATH`]. Reads one file
+/// and needs no privilege.
+#[must_use]
+pub fn inspect_installed_profile() -> InstalledProfileState {
+    classify_installed_profile(std::fs::read(SEALED_APPARMOR_PROFILE_PATH))
+}
+
 // ---------------------------------------------------------------- blockers
 
 /// The one mechanism that stands between this host and `sealed`, named specifically enough that
@@ -146,9 +318,14 @@ impl SealedBlocker {
                  unprivileged-userns restriction is active on this host while the '{name}' profile \
                  is not confining this binary. Install and load the profile shipped with mur: \
                  `sudo install -m 644 packaging/apparmor/{name} {path} && sudo apparmor_parser -r \
-                 {path}` (or re-run the mur installer as root), then re-run. To turn the \
-                 restriction off host-wide instead: `sudo sysctl -w \
-                 kernel.apparmor_restrict_unprivileged_userns=0`.",
+                 {path}` (or re-run the mur installer as root), then re-run. Building out of a \
+                 checkout, where the binary sits at ./target/{{debug,release}}/mur and no shipped \
+                 profile attaches to it: run `scripts/install-dev-apparmor.sh`, which generates \
+                 and loads the same grant for those two paths. LAST RESORT, only where a profile \
+                 genuinely cannot be loaded: `sudo sysctl -w \
+                 kernel.apparmor_restrict_unprivileged_userns=0` — this removes \
+                 unprivileged-userns hardening from every program on the machine, not just from \
+                 mur, and is not the configuration murmur ships.",
                 name = SEALED_APPARMOR_PROFILE_NAME,
                 path = SEALED_APPARMOR_PROFILE_PATH,
             ),
@@ -225,14 +402,15 @@ pub(crate) enum NamespaceProbe {
 /// so `sandbox::tier_from_probe` stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct SealedProbe {
-    /// AppArmor does not stand between this binary and an unprivileged user namespace: either its
-    /// `restrict_unprivileged_userns` knob is off (or AppArmor is absent entirely), or the shipped
-    /// [`SEALED_APPARMOR_PROFILE_NAME`] profile is confining this process.
+    /// Where this host's permission to create an unprivileged user namespace comes from, or
+    /// [`UsernsGrant::Withheld`] when it gives none.
     ///
     /// Named for the question that actually matters rather than for "is the profile loaded",
     /// because a Fedora or Arch host with no AppArmor at all needs no profile and must not be
-    /// refused for lacking one.
-    pub(crate) apparmor_permits_userns: bool,
+    /// refused for lacking one. Every decision below reads only
+    /// [`UsernsGrant::permits_userns`]; the rest of the value is provenance, reported and never
+    /// acted on.
+    pub(crate) userns_grant: UsernsGrant,
     /// What a real `unshare` + `mount` attempt in a forked child did.
     pub(crate) namespace: NamespaceProbe,
 }
@@ -252,7 +430,7 @@ pub(crate) fn sealed_blocker(
     // Attribute to AppArmor before the namespace outcome: when the restriction is on and the
     // shipped profile is not loaded, the namespace failure is a *consequence*, and naming
     // `--cap-add SYS_ADMIN` on a bare host sends the operator somewhere useless.
-    if !probe.apparmor_permits_userns {
+    if !probe.userns_grant.permits_userns() {
         return Some(SealedBlocker::AppArmorProfileMissing);
     }
     match probe.namespace {
@@ -1151,13 +1329,13 @@ pub(crate) use linux::{
 /// and therefore unopenable by the task itself, and every namespace `mur` creates hits that trap
 /// identically — see [`linux::make_dumpable_for_map_writes`].
 ///
-/// `apparmor_permits_userns` is shared because it answers whether AppArmor stands between this
-/// binary and `unshare(CLONE_NEWUSER)`, which `sealed` and the capsule network namespace both
-/// need. Two implementations of one host question could return two answers, and the operator would
-/// be told to fix two different things.
+/// `userns_grant` is shared because it answers where the permission for `unshare(CLONE_NEWUSER)`
+/// comes from, which `sealed` and the capsule network namespace both need. Two implementations of
+/// one host question could return two answers, and the operator would be told to fix two different
+/// things.
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{
-    apparmor_permits_userns, make_dumpable_for_map_writes, restore_dumpable, write_decimal_map,
+    make_dumpable_for_map_writes, restore_dumpable, userns_grant, write_decimal_map,
 };
 
 /// Non-Linux stub: nothing here can be probed, so nothing is claimed.
@@ -1174,8 +1352,9 @@ mod linux {
     use std::path::Path;
 
     use super::{
-        ComposedRootPlan, NamespaceProbe, RootOp, RootStep, SealedProbe, OLD_ROOT_NAME,
-        PROC_HIDEPID_OPTIONS, SEALED_APPARMOR_PROFILE_NAME, SEALED_ROOT_FAILURE_PREFIX,
+        ComposedRootPlan, NamespaceProbe, RootOp, RootStep, SealedProbe, UsernsGrant,
+        OLD_ROOT_NAME, PROC_HIDEPID_OPTIONS, SEALED_APPARMOR_PROFILE_NAME,
+        SEALED_ROOT_FAILURE_PREFIX,
     };
 
     // ------------------------------------------------------------ probe
@@ -1189,34 +1368,38 @@ mod linux {
     /// the thing it measures" mistake `probe_landlock_full_access` documents avoiding.
     pub(crate) fn probe_sealed_support() -> SealedProbe {
         SealedProbe {
-            apparmor_permits_userns: apparmor_permits_userns(),
+            userns_grant: userns_grant(),
             namespace: probe_namespace(),
         }
     }
 
-    /// `true` when AppArmor is not standing between this binary and an unprivileged user
-    /// namespace.
+    /// Where AppArmor's permission for an unprivileged user namespace comes from on this host.
     ///
-    /// Three questions in order: is AppArmor even enabled; is its `restrict_unprivileged_userns`
-    /// knob on; and — only if both — is this process confined by the shipped `mur-sealed` profile.
-    /// Reading `/proc/self/attr/current` rather than the loaded-profile list is deliberate: a
-    /// profile that is loaded but does not *attach* to the path `mur` was installed at helps
-    /// nobody, and this asks the question that decides the outcome.
-    pub(crate) fn apparmor_permits_userns() -> bool {
+    /// Three readings in order, each one an answer rather than a step: is AppArmor even enabled;
+    /// is its `restrict_unprivileged_userns` knob on; and — only if both — is this process
+    /// confined by a `mur-sealed` profile. Reading `/proc/self/attr/current` rather than the
+    /// loaded-profile list is deliberate: a profile that is loaded but does not *attach* to the
+    /// path `mur` was installed at helps nobody, and this asks the question that decides the
+    /// outcome.
+    pub(crate) fn userns_grant() -> UsernsGrant {
         let enabled = read_trimmed("/sys/module/apparmor/parameters/enabled");
         if !matches!(enabled.as_deref(), Some("Y") | Some("1")) {
-            return true;
+            return UsernsGrant::ApparmorAbsent;
         }
 
         let restricted =
             read_trimmed("/sys/module/apparmor/parameters/restrict_unprivileged_userns")
                 .or_else(|| read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"));
         if !matches!(restricted.as_deref(), Some("Y") | Some("1")) {
-            return true;
+            return UsernsGrant::RestrictionDisabledHostWide;
         }
 
-        read_trimmed("/proc/self/attr/current")
-            .is_some_and(|current| current.starts_with(SEALED_APPARMOR_PROFILE_NAME))
+        match read_trimmed("/proc/self/attr/current") {
+            Some(current) if current.starts_with(SEALED_APPARMOR_PROFILE_NAME) => {
+                UsernsGrant::ProfileConfining
+            }
+            _ => UsernsGrant::Withheld,
+        }
     }
 
     fn read_trimmed(path: &str) -> Option<String> {
@@ -2557,10 +2740,228 @@ mod tests {
         );
     }
 
+    // ---- `UsernsGrant` ---------------------------------------------------------------------
+
+    /// Reproduces `linux::userns_grant`'s three readings as pure data, so the mapping from what
+    /// the host files say to which grant is reported is testable on any OS. The function itself is
+    /// Linux-only and reads `/sys` and `/proc`; this is the same decision written once more, and
+    /// the two are kept in step by the reading order being the only thing either encodes.
+    fn grant_from_readings(
+        enabled: Option<&str>,
+        restricted: Option<&str>,
+        current: Option<&str>,
+    ) -> UsernsGrant {
+        if !matches!(enabled, Some("Y") | Some("1")) {
+            return UsernsGrant::ApparmorAbsent;
+        }
+        if !matches!(restricted, Some("Y") | Some("1")) {
+            return UsernsGrant::RestrictionDisabledHostWide;
+        }
+        match current {
+            Some(profile) if profile.starts_with(SEALED_APPARMOR_PROFILE_NAME) => {
+                UsernsGrant::ProfileConfining
+            }
+            _ => UsernsGrant::Withheld,
+        }
+    }
+
+    /// Every variant, produced from the combination of readings that must produce it. The three
+    /// permitting cases are the point: before this enum they were one `true`, and a `sealed`
+    /// result on a host whose hardening had been switched off looked exactly like one obtained
+    /// through the shipped profile.
+    #[test]
+    fn every_userns_grant_comes_from_its_own_combination_of_readings() {
+        let cases = [
+            // AppArmor off, or the knob file missing entirely: nothing restricts anything.
+            ((None, None, None), UsernsGrant::ApparmorAbsent),
+            (
+                (Some("N"), Some("1"), Some("unconfined")),
+                UsernsGrant::ApparmorAbsent,
+            ),
+            // Enabled, restriction explicitly off host-wide — the `/etc/sysctl.d` drop-in case.
+            (
+                (Some("Y"), Some("0"), Some("unconfined")),
+                UsernsGrant::RestrictionDisabledHostWide,
+            ),
+            // Enabled and the knob unreadable: not restricted, so not withheld.
+            (
+                (Some("1"), None, Some("unconfined")),
+                UsernsGrant::RestrictionDisabledHostWide,
+            ),
+            // Restriction on, and a profile whose name begins with `mur-sealed` is attached —
+            // both the shipped profile and the checkout profile the dev script generates.
+            (
+                (Some("Y"), Some("Y"), Some("mur-sealed (unconfined)")),
+                UsernsGrant::ProfileConfining,
+            ),
+            (
+                (Some("Y"), Some("1"), Some("mur-sealed-home (unconfined)")),
+                UsernsGrant::ProfileConfining,
+            ),
+            (
+                (Some("Y"), Some("1"), Some("mur-sealed-dev (unconfined)")),
+                UsernsGrant::ProfileConfining,
+            ),
+            // Restriction on and nothing attached, or something else attached.
+            (
+                (Some("Y"), Some("Y"), Some("unconfined")),
+                UsernsGrant::Withheld,
+            ),
+            (
+                (Some("Y"), Some("1"), Some("firefox (enforce)")),
+                UsernsGrant::Withheld,
+            ),
+            ((Some("Y"), Some("1"), None), UsernsGrant::Withheld),
+        ];
+
+        for ((enabled, restricted, current), expected) in cases {
+            assert_eq!(
+                grant_from_readings(enabled, restricted, current),
+                expected,
+                "enabled={enabled:?} restricted={restricted:?} current={current:?}"
+            );
+        }
+    }
+
+    /// The wire names are what `--explain-scope --json`, `session_start` and `mur doctor` all
+    /// print, so two variants sharing one would re-collapse exactly the distinction this enum
+    /// exists to make. `permits_userns` is the whole of what the runtime decisions read, and it
+    /// must be false for `Withheld` alone — that is what keeps every previously-running host
+    /// running.
+    #[test]
+    fn every_grant_has_a_distinct_wire_name_and_only_withheld_denies() {
+        let names: Vec<&str> = UsernsGrant::ALL
+            .iter()
+            .map(|grant| grant.wire_name())
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "two grants share a wire name");
+        assert_eq!(
+            names,
+            [
+                "apparmor_absent",
+                "restriction_disabled_host_wide",
+                "profile_confining",
+                "withheld",
+            ]
+        );
+
+        for grant in UsernsGrant::ALL {
+            assert_eq!(
+                grant.permits_userns(),
+                *grant != UsernsGrant::Withheld,
+                "{grant:?} must permit the namespace unless it is Withheld"
+            );
+            assert_eq!(
+                serde_json::to_value(grant).unwrap(),
+                serde_json::Value::String(grant.wire_name().to_string()),
+                "the serialized form and the wire name must be one string"
+            );
+            assert!(
+                grant.summary().len() > 40,
+                "{grant:?} must state what the grant covers, not just name it"
+            );
+        }
+
+        // An unprobed host claims nothing, exactly as the `bool` field's `false` default did.
+        assert_eq!(UsernsGrant::default(), UsernsGrant::Withheld);
+    }
+
+    // ---- the installed profile ------------------------------------------------------------
+
+    /// All four outcomes, driven by a `Result` rather than by the filesystem, so a host with no
+    /// AppArmor and a host with an unreadable `/etc/apparmor.d` are both covered without root and
+    /// without touching a byte of `/etc`.
+    #[test]
+    fn the_installed_profile_classifier_separates_all_four_outcomes() {
+        let shipped = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/apparmor/mur-sealed"
+        ))
+        .expect("the shipped profile is in the workspace");
+        assert_eq!(
+            classify_installed_profile(Ok(shipped)),
+            InstalledProfileState::Matches
+        );
+
+        let drifted = classify_installed_profile(Ok(b"# an older revision\n".to_vec()));
+        match drifted {
+            InstalledProfileState::Drifted { installed_sha256 } => {
+                assert_ne!(installed_sha256, SEALED_APPARMOR_PROFILE_SHA256);
+                assert_eq!(installed_sha256.len(), 64);
+            }
+            other => panic!("edited bytes must read as drift, got {other:?}"),
+        }
+
+        assert_eq!(
+            classify_installed_profile(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            InstalledProfileState::Absent
+        );
+
+        // "I could not look" must never read as "it is not there".
+        match classify_installed_profile(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))) {
+            InstalledProfileState::Unreadable { error } => assert!(!error.is_empty()),
+            other => panic!("a read error must stay distinct from absence, got {other:?}"),
+        }
+    }
+
+    /// The digest constant is a literal because `capsule-runtime` is published to crates.io and
+    /// `cargo package` would not carry a file from outside the crate directory. This test is what
+    /// keeps the literal honest, and it does not run during `cargo package`.
+    #[test]
+    fn shipped_profile_digest_constant_matches_the_file() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/apparmor/mur-sealed"
+        );
+        let bytes = std::fs::read(path).expect("the shipped profile is in the workspace");
+        let actual = murmur_artifact::sha256_hex(&bytes);
+        assert_eq!(
+            actual, SEALED_APPARMOR_PROFILE_SHA256,
+            "packaging/apparmor/mur-sealed changed. Update SEALED_APPARMOR_PROFILE_SHA256 in \
+             crates/capsule-runtime/src/sealed.rs to:\n    {actual}"
+        );
+    }
+
+    /// The profile is the fix and the sysctl is a fallback that costs the whole host its
+    /// unprivileged-userns hardening. Both must be in the text — on a host where no profile can be
+    /// loaded the sysctl is the right answer — but their order and the stated cost are what stop a
+    /// reader taking them for peers.
+    #[test]
+    fn the_apparmor_reason_offers_the_profile_before_the_sysctl() {
+        let reason = SealedBlocker::AppArmorProfileMissing.reason();
+        let profile = reason
+            .find("apparmor_parser -r")
+            .expect("the profile install command must be named");
+        let sysctl = reason
+            .find("kernel.apparmor_restrict_unprivileged_userns=0")
+            .expect("the fallback must still be named for hosts that cannot load a profile");
+        assert!(
+            profile < sysctl,
+            "the profile install must come first: {reason}"
+        );
+        assert!(
+            reason.contains("LAST RESORT"),
+            "the sysctl must be labelled a fallback, not offered as a peer: {reason}"
+        );
+        assert!(
+            reason.contains("every program on the machine"),
+            "the sysctl's host-wide cost must be stated: {reason}"
+        );
+        assert!(
+            reason.contains("scripts/install-dev-apparmor.sh"),
+            "a checkout build must be told how to get the narrow grant: {reason}"
+        );
+    }
+
     #[test]
     fn blocker_blames_apparmor_before_the_namespace_outcome_it_causes() {
         let probe = SealedProbe {
-            apparmor_permits_userns: false,
+            userns_grant: UsernsGrant::Withheld,
             namespace: NamespaceProbe::Denied,
         };
         assert_eq!(
@@ -2575,7 +2976,7 @@ mod tests {
     #[test]
     fn blocker_names_the_container_remediation_verbatim() {
         let probe = SealedProbe {
-            apparmor_permits_userns: true,
+            userns_grant: UsernsGrant::ProfileConfining,
             namespace: NamespaceProbe::Denied,
         };
         assert_eq!(
@@ -2593,7 +2994,7 @@ mod tests {
         // then refuses the id mapping is not the container case, and must not be told to add
         // `--cap-add SYS_ADMIN` to a container it is not running in.
         let probe = SealedProbe {
-            apparmor_permits_userns: true,
+            userns_grant: UsernsGrant::ProfileConfining,
             namespace: NamespaceProbe::MapDenied,
         };
         assert_eq!(
@@ -2613,7 +3014,7 @@ mod tests {
 
         // And the container case must keep its own, different advice.
         let denied = SealedProbe {
-            apparmor_permits_userns: true,
+            userns_grant: UsernsGrant::ProfileConfining,
             namespace: NamespaceProbe::Denied,
         };
         assert_eq!(
@@ -2675,7 +3076,7 @@ mod tests {
     #[test]
     fn blocker_is_none_only_when_every_precondition_holds() {
         let ok = SealedProbe {
-            apparmor_permits_userns: true,
+            userns_grant: UsernsGrant::ProfileConfining,
             namespace: NamespaceProbe::Ok,
         };
         assert_eq!(sealed_blocker(true, true, ok), None);
@@ -2692,7 +3093,7 @@ mod tests {
                 true,
                 true,
                 SealedProbe {
-                    apparmor_permits_userns: true,
+                    userns_grant: UsernsGrant::ProfileConfining,
                     namespace: NamespaceProbe::MountDenied
                 }
             ),
@@ -2703,7 +3104,7 @@ mod tests {
                 true,
                 true,
                 SealedProbe {
-                    apparmor_permits_userns: true,
+                    userns_grant: UsernsGrant::ProfileConfining,
                     namespace: NamespaceProbe::Unsupported
                 }
             ),

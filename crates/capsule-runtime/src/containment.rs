@@ -32,11 +32,11 @@ use serde::Serialize;
 use crate::{
     errors::RuntimeError,
     sandbox::{detect_enforcement_tier, EnforcementTier},
-    sealed::SealedBlocker,
+    sealed::{SealedBlocker, UsernsGrant},
     types::CapabilityPolicy,
 };
 
-pub use crate::sandbox::detect_sealed_blocker;
+pub use crate::sandbox::{detect_sealed_blocker, detect_userns_grant};
 
 /// The class a host in `tier` can actually back, and nothing stronger.
 ///
@@ -203,6 +203,16 @@ pub struct ScopeReport {
     pub shortfall_reason: Option<String>,
     /// The probed host tier, as a stable wire name.
     pub enforcement_tier: &'static str,
+    /// Where this host's permission to create an unprivileged user namespace comes from, as
+    /// [`UsernsGrant::wire_name`], or `null` off Linux, where AppArmor does not exist and the
+    /// question has no answer.
+    ///
+    /// Always serialized, on the same terms as [`Self::workdir_exec`]: the key's absence
+    /// identifies a runtime that predates it, not a host that was not asked. Reported because
+    /// three very different hosts — no AppArmor, hardening switched off host-wide, and the shipped
+    /// profile confining `mur` — otherwise produce byte-identical reports while differing enormously
+    /// in what else on the machine can create a user namespace.
+    pub userns_grant: Option<UsernsGrant>,
     /// `capabilities.filesystem.scope`, verbatim.
     pub filesystem_scope: Option<String>,
     /// `capabilities.filesystem.workdir_exec`. Always present (never skipped when `false`), so a
@@ -253,6 +263,13 @@ impl ScopeReport {
             out.push_str(&format!("  reason:    {reason}\n"));
         }
         out.push_str(&format!("  mechanism: {}\n", self.enforcement_tier));
+        out.push_str(&format!(
+            "  userns grant: {}\n",
+            match self.userns_grant {
+                Some(grant) => grant.wire_name(),
+                None => "n/a",
+            }
+        ));
 
         out.push_str("\nEffective grants\n");
         out.push_str(&format!(
@@ -301,6 +318,7 @@ pub fn explain_scope(policy: &CapabilityPolicy, declared: ContainmentClass) -> S
         declared,
         detect_enforcement_tier(),
         detect_sealed_blocker(),
+        detect_userns_grant(),
     )
 }
 
@@ -311,6 +329,7 @@ pub(crate) fn scope_report_for_tier(
     declared: ContainmentClass,
     tier: EnforcementTier,
     sealed_blocker: Option<SealedBlocker>,
+    userns_grant: Option<UsernsGrant>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -326,6 +345,7 @@ pub(crate) fn scope_report_for_tier(
         floor_met: shortfall_reason.is_none(),
         shortfall_reason,
         enforcement_tier: enforcement_tier_name(tier),
+        userns_grant,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
@@ -745,6 +765,7 @@ mod tests {
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
             None,
+            None,
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -781,6 +802,7 @@ mod tests {
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
             None,
+            None,
         );
 
         assert!(report.workdir_exec);
@@ -812,6 +834,7 @@ mod tests {
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
             None,
+            None,
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -838,6 +861,7 @@ mod tests {
                 ContainmentClass::Sealed,
                 *tier,
                 Some(SealedBlocker::NamespaceCreationDenied),
+                None,
             );
             assert_eq!(
                 report.staged_runtime_grants,
@@ -863,6 +887,7 @@ mod tests {
             ContainmentClass::Scoped,
             EnforcementTier::KernelFull,
             None,
+            None,
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -878,6 +903,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
             Some(SealedBlocker::NamespaceCreationDenied),
+            None,
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -890,6 +916,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::EnvironmentOnly,
             Some(SealedBlocker::NotLinux),
+            None,
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Sealed);
@@ -905,6 +932,7 @@ mod tests {
             &sample_policy(),
             ContainmentClass::Sealed,
             EnforcementTier::KernelSealed,
+            None,
             None,
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
@@ -922,6 +950,7 @@ mod tests {
             ContainmentClass::Advisory,
             EnforcementTier::KernelSeccompOnly,
             None,
+            None,
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
 
@@ -933,6 +962,45 @@ mod tests {
         assert!(value.get("shortfall_reason").is_none());
     }
 
+    /// The grant is reported, and it never moves a class, a floor or a mechanism: the same tier
+    /// with four different grants produces four reports that differ in exactly one field.
+    #[test]
+    fn the_userns_grant_is_reported_without_changing_any_verdict() {
+        let baseline = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+        );
+
+        for grant in UsernsGrant::ALL {
+            let report = scope_report_for_tier(
+                &sample_policy(),
+                ContainmentClass::Advisory,
+                EnforcementTier::KernelSealed,
+                None,
+                Some(*grant),
+            );
+            assert_eq!(report.achieved_containment, baseline.achieved_containment);
+            assert_eq!(report.floor_met, baseline.floor_met);
+            assert_eq!(report.enforcement_tier, baseline.enforcement_tier);
+            assert_eq!(report.userns_grant, Some(*grant));
+
+            let value: serde_json::Value = serde_json::to_value(&report).unwrap();
+            assert_eq!(value["userns_grant"], grant.wire_name());
+            assert!(report
+                .render()
+                .contains(&format!("userns grant: {}", grant.wire_name())));
+        }
+
+        // Off Linux the key is present and null — AppArmor does not exist there, which is not the
+        // same statement as "the grant was withheld".
+        let value: serde_json::Value = serde_json::to_value(&baseline).unwrap();
+        assert!(value["userns_grant"].is_null());
+        assert!(baseline.render().contains("userns grant: n/a"));
+    }
+
     #[test]
     fn rendered_report_names_both_classes_and_the_refusal() {
         let rendered = scope_report_for_tier(
@@ -940,6 +1008,7 @@ mod tests {
             ContainmentClass::Sealed,
             EnforcementTier::KernelFull,
             Some(SealedBlocker::AppArmorProfileMissing),
+            None,
         )
         .render();
 

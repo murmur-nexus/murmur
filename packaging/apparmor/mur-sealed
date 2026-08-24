@@ -89,16 +89,19 @@
 # probe, which reads /proc/self/attr/current and accepts any profile whose name
 # begins with "mur-sealed".
 #
-# Building from source and running out of ./target? Add your own attachment in
-# /etc/apparmor.d/local/mur-sealed — the include below picks it up. For example:
+# Building from source and running out of ./target? Neither attachment above names
+# ./target/debug/mur or ./target/release/mur, so a checkout build gets no grant from
+# this file. Generate and load one for your checkout's two target paths:
 #
-#     # /etc/apparmor.d/local/mur-sealed
-#     # (nothing needed here; instead add a third profile in a file of your own:)
-#     # abi <abi/4.0>,
-#     # include <tunables/global>
-#     # profile mur-sealed-dev @{HOME}/src/murmur/target/{debug,release}/mur flags=(unconfined) {
-#     #   userns,
-#     # }
+#     scripts/install-dev-apparmor.sh --print     # inspect it, writes nothing
+#     sudo scripts/install-dev-apparmor.sh        # install and load it
+#
+# That writes a separate top-level file, /etc/apparmor.d/mur-sealed-dev. It is not
+# written to /etc/apparmor.d/local/mur-sealed, because that path is included *inside*
+# the two profiles below and so cannot declare a third profile of its own.
+#
+# Operator customisation of the profiles below does belong in
+# /etc/apparmor.d/local/mur-sealed, which `mur doctor` deliberately does not hash.
 
 abi <abi/4.0>,
 

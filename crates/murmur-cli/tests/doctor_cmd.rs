@@ -553,3 +553,61 @@ fn doctor_rejects_inference_max_task_reopens() {
     assert!(!stdout.contains("Checking"), "got:\n{stdout}");
     assert!(!stdout.contains("All checks passed."), "got:\n{stdout}");
 }
+
+/// The AppArmor/user-namespace block is printed for every project, and it names exactly one of the
+/// four grants — never a host-dependent phrase and never nothing at all.
+///
+/// Host-independent by construction: which grant is named follows the machine, so this asserts
+/// that one of them is named and that the block never touches the exit code. On a host reporting
+/// `restriction_disabled_host_wide` the `W-SEC-013` warning is on stderr and the run below still
+/// exits `0`, which is the whole point — a weakened host is reported, not refused.
+#[test]
+fn doctor_names_the_userns_grant_and_never_changes_the_exit_code() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), " []\n");
+
+    let assert = mur_doctor(&home, project.path()).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stdout.contains("AppArmor / user namespaces"),
+        "the host block must print for every project, got:\n{stdout}"
+    );
+
+    let named: Vec<&str> = capsule_runtime::UsernsGrant::ALL
+        .iter()
+        .map(|grant| grant.wire_name())
+        .filter(|name| stdout.contains(&format!("userns grant: {name}")))
+        .collect();
+    let off_linux = stdout.contains("userns grant: n/a");
+    assert!(
+        named.len() == 1 || (named.is_empty() && off_linux),
+        "exactly one grant must be named (or n/a off Linux), got {named:?} in:\n{stdout}"
+    );
+
+    // The one grant that warns, and the assertion that warning it is all it does.
+    if stdout.contains("userns grant: restriction_disabled_host_wide") {
+        assert!(
+            stderr.contains("warning[W-SEC-013]"),
+            "a host-wide-disabled restriction must warn, got:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("All checks passed."),
+            "and must not change the verdict, got:\n{stdout}"
+        );
+    } else {
+        assert!(
+            !stderr.contains("W-SEC-013"),
+            "W-SEC-013 must fire only for restriction_disabled_host_wide, got:\n{stderr}"
+        );
+    }
+
+    // The profile comparison is reported next to the grant, in one of its four shapes, and never
+    // as a checklist failure.
+    assert!(
+        stdout.contains("/etc/apparmor.d/mur-sealed:"),
+        "the installed-profile comparison must be reported, got:\n{stdout}"
+    );
+}

@@ -1,8 +1,10 @@
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_staged_runtime_floor,
-    detect_egress_namespace_blocker, warn_on_interpreter_runtime_grants,
-    warn_on_unreachable_toolchain_helpers, warn_on_workdir_exec, ArtifactRequest,
+    detect_egress_namespace_blocker, detect_userns_grant, inspect_installed_profile,
+    warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
+    InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
@@ -61,6 +63,68 @@ fn check_lock_entry(
     }
 
     LockVerdict::Ok
+}
+
+/// Prints the AppArmor/user-namespace block, and emits `W-SEC-013` when this host's user
+/// namespaces are unrestricted host-wide rather than granted to `mur` by the shipped profile.
+///
+/// Two findings, deliberately not merged. The **grant** is behavioural — what the kernel actually
+/// did when this process asked — and it is the source of truth. The **profile file** comparison is
+/// a byte comparison of `/etc/apparmor.d/mur-sealed` against the digest this build ships; it can
+/// never establish what `apparmor_parser` has loaded, because a file can be edited without being
+/// reloaded and a loaded profile can outlive the file it came from. So the file finding is
+/// reported after the grant and never contradicts it, changes no class, and changes no exit code —
+/// `run_doctor`'s exit status is driven by the `fixes` vector alone.
+fn report_userns_grant() {
+    let grant = detect_userns_grant();
+    println!("AppArmor / user namespaces");
+    match grant {
+        Some(grant) => {
+            println!("  userns grant: {}", grant.wire_name());
+            println!("    {}", grant.summary());
+        }
+        None => println!("  userns grant: n/a (AppArmor is a Linux mechanism)"),
+    }
+
+    match inspect_installed_profile() {
+        InstalledProfileState::Matches => {
+            println!("  {SEALED_APPARMOR_PROFILE_PATH}: matches the profile this build ships");
+        }
+        InstalledProfileState::Drifted { installed_sha256 } => {
+            println!(
+                "  {SEALED_APPARMOR_PROFILE_PATH}: does NOT match the profile this build ships"
+            );
+            println!("    installed sha256: {installed_sha256}");
+            println!("    shipped sha256:   {SEALED_APPARMOR_PROFILE_SHA256}");
+            println!(
+                "    This compares file contents only. It does not establish what the kernel has \
+                 loaded — a file can be edited without `apparmor_parser -r` ever running. The \
+                 `userns grant` line above is what the kernel actually did. Local customisation \
+                 belongs in /etc/apparmor.d/local/mur-sealed, which is included inside the shipped \
+                 profiles and is not hashed here."
+            );
+        }
+        InstalledProfileState::Absent => {
+            println!("  {SEALED_APPARMOR_PROFILE_PATH}: not installed");
+            println!(
+                "    Expected on a host without AppArmor, and on a checkout build using \
+                 scripts/install-dev-apparmor.sh, which writes its own separate file. The `userns \
+                 grant` line above is what decides whether sealed containment works here."
+            );
+        }
+        InstalledProfileState::Unreadable { error } => {
+            println!("  {SEALED_APPARMOR_PROFILE_PATH}: present but unreadable ({error})");
+            println!(
+                "    Not the same as absent, and it changes nothing: the `userns grant` line above \
+                 is what the kernel actually did."
+            );
+        }
+    }
+
+    println!();
+
+    // Stderr, in the same words `mur run` uses at staging, so the two cannot state it differently.
+    warn_on_userns_restriction_disabled_host_wide(grant);
 }
 
 /// Check every artifact the current project declares against the stores a session
@@ -194,6 +258,13 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
              murmur.yaml can change it — the refusal is about this machine, not the manifest."
         );
     }
+
+    // Where this host's permission to create an unprivileged user namespace comes from, and how
+    // the installed AppArmor profile compares to the one this build ships. Both are pure host
+    // questions with no manifest input, printed for every project — an operator reading `achieved:
+    // sealed` needs to know whether that came from the profile murmur ships or from the host's
+    // unprivileged-userns hardening being switched off for every binary on the machine.
+    report_userns_grant();
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,

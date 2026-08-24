@@ -36,13 +36,17 @@ pub mod types;
 
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_sealed_blocker, explain_scope, ScopeReport,
+    detect_sealed_blocker, detect_userns_grant, explain_scope, ScopeReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,
 };
-pub use sealed::SealedBlocker;
+pub use sealed::{
+    classify_installed_profile, inspect_installed_profile, InstalledProfileState, SealedBlocker,
+    UsernsGrant, SEALED_APPARMOR_PROFILE_NAME, SEALED_APPARMOR_PROFILE_PATH,
+    SEALED_APPARMOR_PROFILE_SHA256,
+};
 // `cgroup` is a private module, but the two test-support entry points below are consumed from
 // `murmur-cli`'s integration tests as well as from this crate's own, so they are re-exported here
 // rather than duplicating the delegation probe once per crate that has to skip on it.
@@ -60,7 +64,8 @@ pub use reachability::{
 };
 pub use resources::HostResourceLimits;
 pub use runtime::{
-    launch_session, stage_session, warn_on_interpreter_runtime_grants, warn_on_workdir_exec,
+    launch_session, stage_session, warn_on_interpreter_runtime_grants,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
 };
 pub use staged_runtime::check_staged_runtime_floor;
 pub use types::{

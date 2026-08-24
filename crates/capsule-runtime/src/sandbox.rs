@@ -139,7 +139,7 @@ pub(crate) fn tier_from_probe(
     }
     match landlock_fully_enforced {
         Some(true)
-            if sealed.apparmor_permits_userns
+            if sealed.userns_grant.permits_userns()
                 && sealed.namespace == crate::sealed::NamespaceProbe::Ok =>
         {
             EnforcementTier::KernelSealed
@@ -226,6 +226,21 @@ pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
 #[cfg(not(target_os = "linux"))]
 pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
     crate::sealed::sealed_blocker(false, false, crate::sealed::probe_sealed_support())
+}
+
+/// Where this host's unprivileged-user-namespace permission comes from, or `None` off Linux, where
+/// the question has no answer rather than a negative one.
+///
+/// Reads the same cached probe [`detect_sealed_blocker`] does, so the provenance an operator is
+/// shown and the tier the runtime installs describe one host at one moment.
+#[cfg(target_os = "linux")]
+pub fn detect_userns_grant() -> Option<crate::sealed::UsernsGrant> {
+    Some(host_probe().sealed.userns_grant)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn detect_userns_grant() -> Option<crate::sealed::UsernsGrant> {
+    None
 }
 
 /// Resolves every host in `network_allow` (via `crate::network_policy::parse_network_allow_rules`,
@@ -3945,7 +3960,7 @@ mod tests {
     /// that really created one.
     fn sealed_capable() -> crate::sealed::SealedProbe {
         crate::sealed::SealedProbe {
-            apparmor_permits_userns: true,
+            userns_grant: crate::sealed::UsernsGrant::ProfileConfining,
             namespace: crate::sealed::NamespaceProbe::Ok,
         }
     }
@@ -3953,6 +3968,31 @@ mod tests {
     /// A host that cannot: the default, which claims nothing.
     fn sealed_incapable() -> crate::sealed::SealedProbe {
         crate::sealed::SealedProbe::default()
+    }
+
+    /// The tier decision reads only `UsernsGrant::permits_userns()`, so every grant that permits
+    /// the namespace has to reach the same tier — otherwise reporting provenance would have
+    /// changed an outcome, which is exactly what naming the grant set out not to do.
+    #[test]
+    fn tier_from_probe_is_identical_across_every_permitting_userns_grant() {
+        use crate::sealed::{NamespaceProbe, SealedProbe, UsernsGrant};
+
+        for grant in UsernsGrant::ALL {
+            let probe = SealedProbe {
+                userns_grant: *grant,
+                namespace: NamespaceProbe::Ok,
+            };
+            let expected = if grant.permits_userns() {
+                EnforcementTier::KernelSealed
+            } else {
+                EnforcementTier::KernelFull
+            };
+            assert_eq!(
+                tier_from_probe(true, Some(true), probe),
+                expected,
+                "grant {grant:?} must decide the tier only through permits_userns()"
+            );
+        }
     }
 
     #[test]
@@ -4010,7 +4050,7 @@ mod tests {
                 true,
                 Some(true),
                 SealedProbe {
-                    apparmor_permits_userns: false,
+                    userns_grant: crate::sealed::UsernsGrant::Withheld,
                     namespace: NamespaceProbe::Ok
                 }
             ),
@@ -4029,7 +4069,7 @@ mod tests {
                     true,
                     Some(true),
                     SealedProbe {
-                        apparmor_permits_userns: true,
+                        userns_grant: crate::sealed::UsernsGrant::ProfileConfining,
                         namespace
                     }
                 ),

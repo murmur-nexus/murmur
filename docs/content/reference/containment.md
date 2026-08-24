@@ -40,6 +40,39 @@ Treat `capabilities.shell.allow` as advisory on a host below kernel 5.13.
 The `mechanism:` column is what `mur run --explain-scope` prints, and it always reports what the
 *host* can back — never what the session installed.
 
+### Where the user namespace comes from { #userns-grant }
+
+The Sealed tier and the capsule network namespace both need an unprivileged user namespace, and on
+an AppArmor host something has to permit one. `mur run --explain-scope` prints which permission is
+in effect on the line below `mechanism:`, and `--explain-scope --json` carries the same value as
+`userns_grant`:
+
+```text
+Containment
+  declared:  sealed
+  achieved:  sealed
+  floor met: yes
+  mechanism: mountns+pivot_root+landlock+seccomp
+  userns grant: profile_confining
+```
+
+| `userns grant:` | What permits the namespace | Scope of the permission |
+|---|---|---|
+| `apparmor_absent` | AppArmor is not enabled on this host | nothing was ever restricted; no profile is needed |
+| `profile_confining` | the shipped `mur-sealed` AppArmor profile is confining this binary | `mur` alone — the configuration murmur ships |
+| `restriction_disabled_host_wide` | `kernel.apparmor_restrict_unprivileged_userns` is `0` | every program on the machine; reported as [`W-SEC-013`](diagnostics.md#w-sec-013) |
+| `withheld` | nothing | `sealed` is refused with `E-CAP-003`, and a capsule that spawns a subprocess with `E-CAP-005` |
+
+The line is `n/a` off Linux, where AppArmor does not exist. The same value is written to
+`session_start.userns_grant` in
+[`trace.jsonl`](observability-schemas.md#session-trace-tracejsonl), so a finished session's record
+distinguishes a `sealed` result obtained through the shipped profile from one obtained on a host
+whose unprivileged-userns hardening was switched off.
+
+A checkout build runs as `./target/debug/mur` or `./target/release/mur`, which no shipped profile
+attaches to. `sudo scripts/install-dev-apparmor.sh` generates and loads a profile for exactly those
+two paths, so building from source needs no host-wide sysctl.
+
 **What the Full tier grants.** The Landlock scope grants the capsule workdir a near-full access set
 **and** a narrow, *derived* read+execute grant for exactly the `shell.allow` binaries, their ELF
 interpreter (dynamic loader), and the transitive closure of their shared libraries — so an
