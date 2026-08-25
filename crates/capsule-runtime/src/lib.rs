@@ -20,6 +20,7 @@ pub mod network_namespace;
 pub(crate) mod network_policy;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
+pub mod peer_handoff;
 pub mod plan;
 pub(crate) mod reachability;
 pub mod resource_plane;
@@ -58,14 +59,19 @@ pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 pub use errors::{RuntimeError, UnreachableEntrypoint};
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
+pub use peer_handoff::{
+    audience_from_card, handle_id, handle_peer_request, is_peer_path, mint, stored_path_for,
+    verify, HandleError, HandlePayload, MintedHandle, PeerError, PeerMintKey, PeerPlane,
+    AUDIENCE_HEADER, HANDLE_ID_HEADER, PEER_INBOX_DIR, PEER_PATH_PREFIX,
+};
 pub use reachability::{
     check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
     ToolchainHelperWarning,
 };
 pub use resource_plane::{
-    check_export_root, handle_resource_request, reason_phrase, symlink_policy, DeclaredExport,
-    ListEntry, ListResponse, ReadResponse, ResourceError, ResourcePlane, ResourceResponse,
-    SymlinkPolicy, RESOURCE_PATH_PREFIX,
+    check_export_root, check_peer_files_root, handle_resource_request, reason_phrase,
+    symlink_policy, DeclaredExport, ListEntry, ListResponse, ReadResponse, ResourceError,
+    ResourcePlane, ResourceResponse, SymlinkPolicy, RESOURCE_PATH_PREFIX,
 };
 pub use resources::HostResourceLimits;
 pub use runtime::{

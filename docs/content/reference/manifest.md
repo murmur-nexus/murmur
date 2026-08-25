@@ -56,6 +56,9 @@ capabilities:
     allow:
       - https://api.anthropic.com
     unix_sockets: false  # optional, defaults to false: may shell subprocesses create AF_UNIX sockets?
+  peer_fetch:            # optional: peers this capsule may redeem a peer-file handle against
+    allow:
+      - localhost:41234
   filesystem:
     scope: ./workdir
   shell:
@@ -148,6 +151,10 @@ exports:
     root: out/            # required; relative to the accessible workdir
     mode: read-only       # required; the only accepted value
     max_bytes: 10Mi       # optional; per-file read ceiling, default 10Mi
+  peer_files:
+    root: out/handoff/    # required; relative to the accessible workdir
+    max_ttl: 15m          # optional when after_task: exit (default 1h); required, max 15m, when sleep
+    max_bytes: 10Mi       # optional; per-file ceiling on a redeemed read, default 10Mi
 ```
 
 ### Field reference
@@ -382,6 +389,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 |---|---|---:|---|
 | `capabilities.network.allow` | list<string> | no | Host/URL entries the capsule may reach — see [Network allow entries](#network-allow-entries) for the accepted forms. Governs IP destinations only, TCP and UDP alike. It has no effect on unix-domain sockets, which `capabilities.network.unix_sockets` governs separately, and none on `AF_NETLINK`/`AF_PACKET`, which are always refused. An empty or absent list means no IP destination is reachable. |
 | `capabilities.network.unix_sockets` | bool | no | Default: `false`. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`. Set `true` only if a shell tool genuinely needs a local daemon socket — the grant is capsule-wide, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. No effect on non-Linux hosts, which have no kernel enforcement — see [`W-SEC-001`](diagnostics.md#w-sec-001). |
+| `capabilities.peer_fetch.allow` | list<string> | see notes | Peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against — see [`capabilities.peer_fetch`](#field-peer-fetch). Required and non-empty when the `peer_fetch:` block is present. Absent block means no fetching is possible and the `fetch-peer-file` tool does not exist. |
 | `capabilities.filesystem.scope` | string | no | Relative scope under the workdir; see [Filesystem scope](#filesystem-scope). Omitted, the capsule sees the whole workdir. |
 | `capabilities.filesystem.workdir_exec` | bool | no | Default: `false`. When false, nothing the capsule writes into the session workdir can be executed — under any name, including one that appears in `capabilities.shell.allow`. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). |
 | `capabilities.shell.allow` | list<string> | no | Shell binaries the agent may invoke (e.g. `bash`); see [Shell allow](#shell-allow). |
@@ -426,6 +434,25 @@ way to expose a host variable, and even a name declared there is dropped if it i
 (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)
 for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
 is omitted rather than reported.
+
+#### `capabilities.peer_fetch` { #field-peer-fetch }
+
+Names the peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against.
+Declaring it gives the agent one runtime-provided tool, `fetch-peer-file`.
+
+It sits beside `capabilities.network` rather than inside it because fetching a peer's bytes lands a
+file in this capsule's own workdir: that is an ingestion path, and therefore a prompt-injection
+surface, which deserves its own operator control.
+
+`allow` uses the same syntax and the same matcher as
+[`capabilities.network.allow`](#network-allow-entries), and is a **separate list**:
+
+- Declaring a destination here does not widen `capabilities.network.allow`.
+- A destination in `capabilities.network.allow` is not redeemable unless it also appears here.
+
+An empty `allow: []` is a parse error rather than a silent deny — `E-MAN-003`, naming
+`capabilities.peer_fetch.allow`. The check runs before any connection is opened, so a refused peer
+is never contacted.
 
 #### `network` { #field-network }
 
@@ -515,14 +542,15 @@ these fields are accepted and inert:
 
 #### `exports` { #field-exports }
 
-Opens a read-only view onto part of the accessible workdir, which an external process reads over the
-capsule's HTTP listener without an inference turn — see
-[Resource plane](resource-plane.md). Absent means nothing is exported and every request to the
-plane is refused with `no_resource_plane`.
+Opens read-only views onto parts of the accessible workdir, served over the capsule's HTTP listener
+without an inference turn — see [Resource plane](resource-plane.md). The two blocks are separate
+authorisers over separate subtrees: declaring one grants nothing about the other, and a capsule may
+declare either, both or neither.
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `exports.files` | block | no | The read-only file surface. An `exports:` block without it declares no resource plane. |
+| `exports.files` | block | no | The operator-facing file surface, addressed by path. Absent means every request to it is refused with `no_resource_plane`. |
+| `exports.peer_files` | block | no | The peer-facing file surface, addressed by handle — see [`exports.peer_files`](#field-exports-peer-files). Absent means the capsule mints nothing and every redeem is refused with `no_peer_plane`. |
 | `exports.files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) the export opens — the directory the agent's tools see as `.`. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir — because it already exists as a symlink pointing out of it — refuses the launch with `E-CAP-007`. |
 | `exports.files.mode` | `read-only` | yes | `read-only` is the only accepted value. |
 | `exports.files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file read ceiling: a file above it is still listed, with its real size, and refused on read with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
@@ -530,6 +558,21 @@ plane is refused with `no_resource_plane`.
 Declaring an export leaves the achieved containment class unchanged. Containment bounds what the
 capsule reaches outward; an export widens what an operator reaches inward, and hands the agent no
 capability at all.
+
+#### `exports.peer_files` { #field-exports-peer-files }
+
+Names the one subtree a [peer-file handle](resource-plane.md#peer-plane) may address. Declaring it
+gives the agent one runtime-provided tool, `share-file`, and opens
+`GET /resources/peer/<handle>` on the capsule's listener.
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `exports.peer_files.root` | string | yes | Subtree of the [accessible workdir](workdir.md) a handle may name. Must be relative, non-empty and free of `..`. Need not exist when the capsule launches. A root that resolves outside the workdir refuses the launch with `E-CAP-007`. Independent of `exports.files.root`, and neither is derived from the other. |
+| `exports.peer_files.max_ttl` | integer or suffixed string | see notes | Ceiling on a minted handle's lifetime. A bare integer is seconds; `s`, `m` and `h` suffixes are accepted. Must be greater than zero. Optional under `lifecycle.after_task: exit`, where it defaults to `1h`; **required and at most `15m`** under `lifecycle.after_task: sleep`, which otherwise refuses the launch with [`E-CAP-008`](diagnostics.md#e-cap-008). |
+| `exports.peer_files.max_bytes` | integer or suffixed string | no | Default: `10Mi` (10485760). Per-file ceiling on a redeemed read; a larger file is refused with `too_large`. Accepts a bare byte count or one suffixed `Ki`, `Mi` or `Gi`. Must be greater than zero. |
+
+There is no `list` verb and no path addressing on this plane. `share-file` clamps a requested `ttl`
+down to `max_ttl` and never up.
 
 ---
 

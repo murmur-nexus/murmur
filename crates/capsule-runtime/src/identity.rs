@@ -10,8 +10,9 @@ use crate::a2a::{
     TaskStatus,
 };
 use crate::errors::RuntimeError;
+use crate::peer_handoff::{handle_peer_request, is_peer_path, PeerPlane, AUDIENCE_HEADER};
 use crate::resource_plane::{
-    handle_resource_request, reason_phrase, ResourcePlane, RESOURCE_PATH_PREFIX,
+    handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
 };
 use crate::streaming::{
     format_gap_event, format_sse_event, is_final_sse_event, ReplayResult, SseBroadcast,
@@ -100,6 +101,7 @@ pub(crate) async fn serve_http(
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
     conversation_mode: ConversationMode,
     resource_plane: Arc<ResourcePlane>,
+    peer_plane: Arc<PeerPlane>,
 ) {
     let conversation_mode_str = match conversation_mode {
         ConversationMode::Stateless => "stateless",
@@ -119,8 +121,9 @@ pub(crate) async fn serve_http(
                         let buf = Arc::clone(&sse_buffer);
                         let mode_str = conversation_mode_str.to_string();
                         let plane = Arc::clone(&resource_plane);
+                        let peer = Arc::clone(&peer_plane);
                         tokio::task::spawn_local(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane).await;
+                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer).await;
                         });
                     }
                     Err(e) => {
@@ -146,6 +149,7 @@ async fn handle_connection(
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
     conversation_mode_str: String,
     resource_plane: Arc<ResourcePlane>,
+    peer_plane: Arc<PeerPlane>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -167,6 +171,7 @@ async fn handle_connection(
     let mut is_json = false;
     let mut traceparent: Option<String> = None;
     let mut last_event_id: Option<u64> = None;
+    let mut audience: Option<String> = None;
 
     loop {
         let mut line = String::new();
@@ -187,7 +192,21 @@ async fn handle_connection(
             traceparent = Some(rest.trim().to_string());
         } else if let Some(rest) = lower.strip_prefix("last-event-id:") {
             last_event_id = rest.trim().parse().ok();
+        } else if let Some(rest) = lower.strip_prefix(&format!("{AUDIENCE_HEADER}:")) {
+            // Already lowercased with the rest of the line, which is exactly the form an audience
+            // takes: both sides build it with `to_lowercase`.
+            audience = Some(rest.trim().to_string());
         }
+    }
+
+    // Routed ahead of the operator plane on its own segment, and answering every method under it
+    // including the ones it refuses: a `PUT` that fell through would leave no record of somebody
+    // trying to write, and a peer request that fell through to `/resources/` would be answered by
+    // the wrong authoriser.
+    if is_peer_path(&path) {
+        let response = handle_peer_request(&peer_plane, &method, &path, audience.as_deref()).await;
+        let _ = writer_half.write_all(&framed_bytes(&response)).await;
+        return;
     }
 
     // The resource plane is routed on its prefix alone and answers every method under it,
@@ -195,18 +214,7 @@ async fn handle_connection(
     // no trace record of somebody trying to write.
     if path.starts_with(RESOURCE_PATH_PREFIX) {
         let response = handle_resource_request(&resource_plane, &method, &path).await;
-        let mut head = format!(
-            "HTTP/1.1 {} {}\r\n",
-            response.status,
-            reason_phrase(response.status)
-        );
-        for (name, value) in &response.headers {
-            head.push_str(&format!("{name}: {value}\r\n"));
-        }
-        head.push_str("connection: close\r\n\r\n");
-        let mut bytes = head.into_bytes();
-        bytes.extend_from_slice(&response.body);
-        let _ = writer_half.write_all(&bytes).await;
+        let _ = writer_half.write_all(&framed_bytes(&response)).await;
         return;
     }
 
@@ -271,6 +279,24 @@ async fn handle_connection(
     let response =
         "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string();
     let _ = writer_half.write_all(response.as_bytes()).await;
+}
+
+/// One plane response as bytes on the wire. `connection: close` is appended here rather than by
+/// either plane: framing is the transport's business, and both planes already carry their own
+/// `content-length`.
+fn framed_bytes(response: &ResourceResponse) -> Vec<u8> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        response.status,
+        reason_phrase(response.status)
+    );
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("connection: close\r\n\r\n");
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(&response.body);
+    bytes
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -365,6 +365,66 @@ struct ResourceReadEvent {
     reason: Option<String>,
 }
 
+/// One `share-file` call, served or refused, written at the moment of the mint.
+#[derive(Serialize)]
+struct PeerHandleMintEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    /// `null` on every non-`ok` outcome: a mint that was refused produced no token, so there is
+    /// no handle to identify.
+    handle_id: Option<String>,
+    /// The path relative to `exports.peer_files.root`, canonicalised, or the path the agent asked
+    /// for when the mint was refused. Never a host path and never the workdir-relative form.
+    path: String,
+    audience: String,
+    /// `null` on every non-`ok` outcome.
+    expires_at_ms: Option<u64>,
+    outcome: String,
+    reason: Option<String>,
+}
+
+/// One redeem against `/resources/peer/<handle>`, written by the listener concurrently with a
+/// possibly-running task.
+#[derive(Serialize)]
+struct PeerHandleRedeemEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    handle_id: String,
+    /// `null` until the MAC has verified. A payload that failed the MAC is caller-controlled and
+    /// must not be copied into this capsule's own audit record as if it were fact.
+    path: Option<String>,
+    /// The runtime's own current counter, never a value taken from the token — so it is always
+    /// present and always true.
+    generation: u64,
+    /// The `x-murmur-audience` header exactly as asserted, or `null` when none was sent.
+    audience_asserted: Option<String>,
+    /// `null` on every non-`ok` outcome.
+    bytes: Option<u64>,
+    /// `null` on every non-`ok` outcome.
+    sha256: Option<String>,
+    outcome: String,
+    reason: Option<String>,
+}
+
+/// One `fetch-peer-file` call on the ingesting side, served or refused.
+#[derive(Serialize)]
+struct PeerFileFetchEvent {
+    event_type: &'static str,
+    session_id: String,
+    timestamp: u64,
+    peer: String,
+    handle_id: String,
+    /// Where the bytes landed, relative to the accessible workdir. `null` on every non-`ok`
+    /// outcome.
+    stored_path: Option<String>,
+    bytes: Option<u64>,
+    sha256: Option<String>,
+    outcome: String,
+    reason: Option<String>,
+}
+
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
@@ -491,7 +551,7 @@ impl TraceWriter {
         &mut self,
         turn: u32,
         tool_name: String,
-        input: Value,
+        mut input: Value,
         input_bytes: u64,
         output: &str,
         output_bytes: u64,
@@ -500,6 +560,11 @@ impl TraceWriter {
         state_effect: Option<String>,
         resource_id: Option<String>,
     ) -> std::io::Result<()> {
+        // A peer handle reaches this event by an ordinary route — it is an argument the model
+        // passed to `fetch-peer-file`, and every call's arguments are recorded. It is also a
+        // credential, and the trace is durable, so the two must not meet: the `handle_id` goes in
+        // instead, which is what correlates the record with the mint and the redeem anyway.
+        crate::peer_handoff::redact_handles_in_json(&mut input);
         let event = ToolCallEvent {
             event_type: "tool_call",
             session_id: self.session_id.clone(),
@@ -508,7 +573,9 @@ impl TraceWriter {
             tool_name,
             input,
             input_bytes,
-            output: self.include_tool_output.then(|| output.to_string()),
+            output: self
+                .include_tool_output
+                .then(|| crate::peer_handoff::redact_handle_tokens(output).into_owned()),
             output_bytes,
             duration_ms,
             status,
@@ -803,7 +870,7 @@ impl TraceWriter {
 // ── Resource-plane appender ───────────────────────────────────────────────────
 
 /// A second, independent `O_APPEND` handle to the session's `trace.jsonl`, used by the resource
-/// plane.
+/// plane, by the peer plane's listener, and by the peer-handoff tools in the agent loop.
 ///
 /// [`TraceWriter`] is `&mut`-owned by the agent loop and cannot be shared, and the motivating
 /// case for a resource-plane event — a gateway reading a finished-but-alive capsule — happens
@@ -890,6 +957,89 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
+    /// Records one mint. `handle_id` and `expires_at_ms` are `None` on every non-`ok` outcome —
+    /// a refused mint produced no token, and an audit record must not imply one exists.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_peer_handle_mint(
+        &self,
+        handle_id: Option<String>,
+        path: &str,
+        audience: &str,
+        expires_at_ms: Option<u64>,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = PeerHandleMintEvent {
+            event_type: "peer_handle_mint",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            handle_id,
+            path: path.to_string(),
+            audience: audience.to_string(),
+            expires_at_ms,
+            outcome: outcome.to_string(),
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one redeem, served or refused. The token itself is never written — only its
+    /// `handle_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_peer_handle_redeem(
+        &self,
+        handle_id: &str,
+        path: Option<String>,
+        generation: u64,
+        audience_asserted: Option<String>,
+        bytes: Option<u64>,
+        sha256: Option<String>,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = PeerHandleRedeemEvent {
+            event_type: "peer_handle_redeem",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            handle_id: handle_id.to_string(),
+            path,
+            generation,
+            audience_asserted,
+            bytes,
+            sha256,
+            outcome: outcome.to_string(),
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one fetch on the ingesting side, served or refused.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_peer_file_fetch(
+        &self,
+        peer: &str,
+        handle_id: &str,
+        stored_path: Option<String>,
+        bytes: Option<u64>,
+        sha256: Option<String>,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = PeerFileFetchEvent {
+            event_type: "peer_file_fetch",
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            peer: peer.to_string(),
+            handle_id: handle_id.to_string(),
+            stored_path,
+            bytes,
+            sha256,
+            outcome: outcome.to_string(),
+            reason,
+        };
+        self.append(&event).await;
+    }
+
     async fn append(&self, event: &impl Serialize) {
         let Ok(mut line) = serde_json::to_string(event) else {
             return;
@@ -902,7 +1052,7 @@ impl ResourceTraceAppender {
     }
 }
 
-fn timestamp_ms() -> u64 {
+pub(crate) fn timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

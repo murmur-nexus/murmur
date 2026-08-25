@@ -3328,6 +3328,7 @@ mod tests {
     /// going through the same `HookCapabilityGrant::derive` the staging path uses.
     fn grant_of(network: Option<&str>, scope: Option<&str>) -> HookCapabilityGrant {
         let caps = Capabilities {
+            peer_fetch: None,
             network: network.map(|entry| NetworkCapabilities {
                 allow: vec![entry.to_string()],
                 unix_sockets: false,

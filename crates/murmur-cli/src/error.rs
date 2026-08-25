@@ -39,6 +39,7 @@ pub const E_CAP_004: &str = "E-CAP-004"; // staged_runtime declared without a se
 pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree its own network namespace
 pub const E_CAP_006: &str = "E-CAP-006"; // sealed capsule allowlists a script whose interpreter's package tree nothing declared reaches
 pub const E_CAP_007: &str = "E-CAP-007"; // exports.files.root resolves outside the capsule workdir
+pub const E_CAP_008: &str = "E-CAP-008"; // persistent capsule declares exports.peer_files without a short enough max_ttl
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -262,9 +263,21 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ExportRootOutsideWorkdir { .. } => CliError::with_hint(
                 E_CAP_007,
                 error.to_string(),
-                "point `exports.files.root` at a directory inside the capsule workdir. A root \
+                "point the export root at a directory inside the capsule workdir. A root \
                  that already exists as a symlink out of the workdir is refused whole rather than \
                  followed — see docs/content/reference/resource-plane.md",
+            ),
+            // The remedy is never "declare a longer handle lifetime", so the hint does not offer
+            // one: a consumer that needs bytes after teardown wants the workdir read again, not a
+            // credential that outlives the process that could verify it.
+            error @ RuntimeError::PersistentCapsuleNeedsHandleTtl { .. } => CliError::with_hint(
+                E_CAP_008,
+                error.to_string(),
+                "declare `exports.peer_files.max_ttl: 15m` or shorter, or drop \
+                 `lifecycle.after_task: sleep` so teardown bounds every handle instead. A \
+                 consumer that needs these bytes after the capsule is gone should have the \
+                 operator relaunch the runtime against the still-present workdir and request \
+                 again — see docs/content/reference/resource-plane.md",
             ),
             // Distinct from E-CAP-003 above, and the remedies point in opposite directions: that
             // one means the host is too weak for the declared floor (lower it, or move hosts),

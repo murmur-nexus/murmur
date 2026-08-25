@@ -333,14 +333,29 @@ pub fn stage_session(
         .exports
         .as_ref()
         .and_then(|exports| exports.files.clone());
+    let exports_peer_files = request
+        .exports
+        .as_ref()
+        .and_then(|exports| exports.peer_files.clone());
     let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
         enforcement_tier,
         sealed_blocker,
         crate::containment::detect_userns_grant(),
-        exports_files.as_ref(),
+        request.exports.as_ref(),
     );
+    // Asked here, beside the containment floors and before any registry pull or workdir creation:
+    // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
+    // sleep` withdraws that bound on purpose. Once withdrawn, the declared lifetime is the only
+    // one there is, so it has to be declared and it has to be short.
+    check_persistent_handle_ttl(
+        exports_peer_files.as_ref(),
+        &resolve_lifecycle(
+            request.lifecycle.clone(),
+            request.lifecycle_override.as_ref(),
+        ),
+    )?;
     // A second, independent floor question, deliberately asked right here next to the first: not
     // "can this host back what was declared?" but "did the capsule declare enough for what it
     // asks for?". A `staged_runtime` grant needs a composed root to be staged into, and one is
@@ -665,6 +680,9 @@ pub fn stage_session(
     if let Some(ref export) = exports_files {
         crate::resource_plane::check_export_root(&accessible_workdir, export)?;
     }
+    if let Some(ref export) = exports_peer_files {
+        crate::resource_plane::check_peer_files_root(&accessible_workdir, export)?;
+    }
 
     fs::create_dir_all(workdir.join("tools")).map_err(|source| RuntimeError::CreateWorkdir {
         path: workdir.display().to_string(),
@@ -680,6 +698,16 @@ pub fn stage_session(
 
     // Write generic manifests for any shell binary not already covered by a custom manifest.
     write_shell_tool_manifests(&workdir, &request.capability_policy.shell_allow)?;
+
+    // The two peer-handoff tools, written on exactly the terms the shell manifests above are:
+    // a synthetic `tools/<name>/murmur.yaml` that `build_tool_inventory` picks up unchanged,
+    // paired with a dispatch branch in `dispatch_agent_tool_async`. Each is written **only** when
+    // its grant is declared, so an undeclared capsule's model never sees the tool exists.
+    write_peer_handoff_tool_manifests(
+        &workdir,
+        exports_peer_files.is_some(),
+        !request.capability_policy.peer_fetch_allow.is_empty(),
+    )?;
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
     let stage_env = HookEnvVars::default();
@@ -771,6 +799,7 @@ pub fn stage_session(
         declared_containment_floor: request.declared_containment_floor,
         scope_report,
         exports_files,
+        exports_peer_files,
         registry,
         _epoch_ticker: epoch_ticker,
     })
@@ -954,6 +983,24 @@ pub fn launch_session(
         let resource_containment = staged.scope_report.achieved_containment;
         let resource_accessible_workdir = accessible_workdir.clone();
 
+        // The peer plane's minting key: 32 random bytes, generated here and only when
+        // `exports.peer_files` is declared, held in memory for this session and destroyed with it.
+        // Never written to disk and never placed in an environment variable — teardown is the
+        // revocation mechanism, so there must be nothing left to reload.
+        let exports_peer_files = staged.exports_peer_files.clone();
+        let peer_mint_key = match exports_peer_files {
+            Some(_) => Some(std::sync::Arc::new(
+                crate::peer_handoff::PeerMintKey::generate().map_err(RuntimeError::Runtime)?,
+            )),
+            None => None,
+        };
+        // Both sides derive the audience from the fetching capsule's own advertised identity, so
+        // what this capsule asserts on a redeem it issues is the same string a peer would read
+        // off the card it publishes.
+        let own_peer_audience = crate::peer_handoff::own_audience(&capsule_identity);
+        let peer_fetch_rules =
+            parse_network_allow_rules(&staged.capability_policy.peer_fetch_allow)?;
+
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
@@ -1029,7 +1076,21 @@ pub fn launch_session(
                 exports_files.as_ref(),
                 resource_containment,
                 task_registry.lock().unwrap().resource_generation(),
-                resource_trace,
+                resource_trace.clone(),
+            ));
+            // Always built, declared or not: an undeclared capsule still has to record the redeem
+            // it refused, and its declared half is `None` only because there is nothing to serve.
+            // The key exists exactly when the export does — both come from the same declaration.
+            let peer_plane = std::sync::Arc::new(crate::peer_handoff::PeerPlane::new(
+                &resource_accessible_workdir,
+                exports_peer_files
+                    .as_ref()
+                    .zip(peer_mint_key.as_ref())
+                    .map(|(export, key)| (export, std::sync::Arc::clone(key))),
+                session_id.clone(),
+                resource_containment,
+                task_registry.lock().unwrap().resource_generation(),
+                resource_trace.clone(),
             ));
 
             let mut otel = OtelEmitter::new(
@@ -1055,6 +1116,7 @@ pub fn launch_session(
                             Arc::clone(&sse_buffer),
                             conversation_mode.clone(),
                             std::sync::Arc::clone(&resource_plane),
+                            std::sync::Arc::clone(&peer_plane),
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -1084,6 +1146,10 @@ pub fn launch_session(
                             network_allow_rules: network_allow_rules.clone(),
                         },
                         network_allow_rules,
+                        peer_fetch_rules,
+                        peer_plane: Some(std::sync::Arc::clone(&peer_plane)),
+                        peer_own_audience: own_peer_audience,
+                        peer_trace: resource_trace,
                         inference_env: all_env,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
@@ -1562,6 +1628,14 @@ pub fn launch_session(
             network_allow_rules: network_allow_rules.clone(),
         },
         network_allow_rules,
+        // A script capsule has no peer-handoff surface: `share-file` and `fetch-peer-file` are
+        // agent-loop tools, and no WIT import exposes either to a wasm component. These are the
+        // deny values rather than an omission — a future `murmur:peer-file` interface would fill
+        // them here, from `staged.exports_peer_files` and `staged.capability_policy`.
+        peer_fetch_rules: Vec::new(),
+        peer_plane: None,
+        peer_own_audience: String::new(),
+        peer_trace: None,
         inference_env,
         engine: staged.engine.clone(),
         workdir: staged.workdir.clone(),
@@ -2270,6 +2344,20 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) http: WasiHttpCtx,
     pub(crate) http_hooks: NetworkPolicyHooks,
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
+    /// `capabilities.peer_fetch.allow`, parsed. Checked **before** `fetch-peer-file` opens any
+    /// connection, and never merged with `network_allow_rules`.
+    pub(crate) peer_fetch_rules: Vec<NetworkAllowRule>,
+    /// The minting side. `None` — no `exports.peer_files` — means no `share-file` tool manifest
+    /// was written, so this is the belt to that braces: the dispatch branch refuses rather than
+    /// assuming the tool could not have been called.
+    pub(crate) peer_plane: Option<Arc<crate::peer_handoff::PeerPlane>>,
+    /// This capsule's own audience, asserted on every redeem it issues.
+    pub(crate) peer_own_audience: String,
+    /// Where the peer-handoff tools write their records. The concurrent `O_APPEND` sink rather
+    /// than the loop's `TraceWriter`, which is `&mut`-owned by the loop and out of reach here —
+    /// so a mint and a fetch land at the moment of the event rather than at the next task
+    /// boundary.
+    pub(crate) peer_trace: Option<Arc<crate::trace::ResourceTraceAppender>>,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) engine: Engine,
     pub(crate) workdir: PathBuf,
@@ -2421,26 +2509,11 @@ impl send::Host for CapsuleStoreState {
         peer_url: String,
         message: send::Message,
     ) -> Result<send::TaskResult, String> {
-        // Enforce network policy
-        let for_parse = if peer_url.contains("://") {
-            peer_url.clone()
-        } else {
-            format!("http://{peer_url}")
-        };
-        let uri: http::Uri = for_parse
-            .parse()
-            .map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
-        let target = RequestTarget::from_request(&uri, false)
-            .ok_or_else(|| format!("invalid peer URL '{peer_url}'"))?;
-        if !self
-            .network_allow_rules
-            .iter()
-            .any(|rule| rule.matches(&target))
-        {
-            return Err(format!(
-                "network policy: '{peer_url}' not in capabilities.network.allow"
-            ));
-        }
+        check_destination_allowed(
+            &self.network_allow_rules,
+            &peer_url,
+            "capabilities.network.allow",
+        )?;
 
         let message_id = message.message_id.clone();
         let outgoing_msg = outgoing::OutgoingMessage {
@@ -2971,6 +3044,23 @@ impl CapsuleStoreState {
         name: &str,
         input: murmur::tool::run::ToolInput,
     ) -> Result<DispatchOutcome, String> {
+        // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
+        // They have no artifact, no binary and no component: the manifests under
+        // `workdir/tools/` exist so `build_tool_inventory` shows them to the model, and this is
+        // where the call actually lands.
+        if name == SHARE_FILE_TOOL {
+            return self
+                .dispatch_share_file(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == FETCH_PEER_FILE_TOOL {
+            return self
+                .dispatch_fetch_peer_file(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+
         // Native artifact: packaged binary in workdir/tools/<name>/<name>
         let native_bin = self.workdir.join("tools").join(name).join(name);
         if native_bin.exists() && !self.tool_components.contains_key(name) {
@@ -3039,6 +3129,355 @@ impl CapsuleStoreState {
         self.dispatch_tool_async(name, input)
             .await
             .map(DispatchOutcome::tool)
+    }
+
+    /// `share-file`: mint one handle for one file, for one named peer.
+    ///
+    /// The audience is derived from the peer's own agent card, fetched here. That fetch is an
+    /// ordinary outbound request and is enforced against `capabilities.network.allow` — the same
+    /// rule `send::Host::send` applies — so **minting grants no new outbound authority**.
+    ///
+    /// Returns no filesystem path in any field. The agent asked for the path; echoing it back as
+    /// a fact of the handle would make the handle look like an address, which is the one thing it
+    /// is not.
+    async fn dispatch_share_file(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        let args = parse_tool_json_input(SHARE_FILE_TOOL, &input)?;
+        let path = required_string_arg(SHARE_FILE_TOOL, &args, "path")?;
+        let peer = required_string_arg(SHARE_FILE_TOOL, &args, "peer")?;
+        let ttl = args.get("ttl").and_then(serde_json::Value::as_str);
+
+        let Some(plane) = self.peer_plane.as_ref().filter(|plane| plane.is_declared()) else {
+            return Err(format!(
+                "'{SHARE_FILE_TOOL}' needs an exports.peer_files block in murmur.yaml; \
+                 this capsule declares none"
+            ));
+        };
+
+        let ttl_secs =
+            match ttl {
+                None => None,
+                Some(text) => Some(murmur_artifact::parse_duration_secs(text).map_err(
+                    |message| format!("'{SHARE_FILE_TOOL}' was given an unusable ttl: {message}"),
+                )?),
+            };
+
+        let audience = match self.peer_audience_for(&peer).await {
+            Ok(audience) => audience,
+            Err(reason) => {
+                self.trace_mint(
+                    None,
+                    &path,
+                    "",
+                    None,
+                    "peer_unreachable",
+                    Some(reason.clone()),
+                )
+                .await;
+                return Err(reason);
+            }
+        };
+
+        match plane.mint_handle(&path, &audience, ttl_secs) {
+            Ok(minted) => {
+                self.trace_mint(
+                    Some(minted.handle_id.clone()),
+                    &minted.path,
+                    &minted.audience,
+                    Some(minted.expires_at_ms),
+                    "ok",
+                    None,
+                )
+                .await;
+                Ok(json_tool_result(
+                    format!("Minted a handle for '{}' addressed to {}", path, audience),
+                    serde_json::json!({
+                        "handle": minted.handle,
+                        "handle_id": minted.handle_id,
+                        "expires_at_ms": minted.expires_at_ms,
+                        "audience": minted.audience,
+                    }),
+                ))
+            }
+            Err(error) => {
+                let reason = error.message();
+                self.trace_mint(
+                    None,
+                    &path,
+                    &audience,
+                    None,
+                    error.code(),
+                    Some(reason.clone()),
+                )
+                .await;
+                // Names the authoriser and nothing else: not the host path it resolved to, not
+                // what it found there. A refused mint must not become a probe.
+                Err(format!(
+                    "'{SHARE_FILE_TOOL}' refused '{path}': {reason}. Only files under the \
+                     declared exports.peer_files.root may be shared."
+                ))
+            }
+        }
+    }
+
+    /// The audience a handle for `peer` must be minted for, read off that peer's own agent card.
+    async fn peer_audience_for(&self, peer: &str) -> Result<String, String> {
+        check_destination_allowed(
+            &self.network_allow_rules,
+            peer,
+            "capabilities.network.allow",
+        )?;
+        let card = crate::outgoing::fetch_agent_card(peer)
+            .await
+            .map_err(|error| format!("peer_unreachable: {error}"))?;
+        crate::peer_handoff::audience_from_card(&card)
+            .map_err(|error| format!("peer_unreachable: {error}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn trace_mint(
+        &self,
+        handle_id: Option<String>,
+        path: &str,
+        audience: &str,
+        expires_at_ms: Option<u64>,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_peer_handle_mint(handle_id, path, audience, expires_at_ms, outcome, reason)
+                .await;
+        }
+    }
+
+    /// `fetch-peer-file`: redeem a handle a peer sent and land the bytes as a file.
+    ///
+    /// The bytes are never placed in the result and never returned as text. Ingestion is a file
+    /// the agent must decide to read, not context it is handed — a peer that can put arbitrary
+    /// content in front of this model would otherwise have a prompt-injection channel that costs
+    /// it nothing.
+    async fn dispatch_fetch_peer_file(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        let args = parse_tool_json_input(FETCH_PEER_FILE_TOOL, &input)?;
+        let peer = required_string_arg(FETCH_PEER_FILE_TOOL, &args, "peer")?;
+        let handle = required_string_arg(FETCH_PEER_FILE_TOOL, &args, "handle")?;
+        let handle_id = crate::peer_handoff::handle_id(&handle);
+
+        // Before any connection is opened, so a refused destination is never contacted at all.
+        if let Err(reason) = check_destination_allowed(
+            &self.peer_fetch_rules,
+            &peer,
+            "capabilities.peer_fetch.allow",
+        ) {
+            self.trace_fetch(
+                &peer,
+                &handle_id,
+                None,
+                "peer_not_allowed",
+                Some(reason.clone()),
+            )
+            .await;
+            return Err(reason);
+        }
+
+        let response = match crate::outgoing::redeem_peer_handle(
+            &peer,
+            &handle,
+            &self.peer_own_audience,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.trace_fetch(
+                    &peer,
+                    &handle_id,
+                    None,
+                    "peer_unreachable",
+                    Some(error.clone()),
+                )
+                .await;
+                return Err(format!(
+                    "'{FETCH_PEER_FILE_TOOL}' could not reach {peer}: {error}"
+                ));
+            }
+        };
+
+        if response.status != 200 {
+            // The peer's own refusal code, restated rather than flattened: `handle_expired` and
+            // `handle_not_valid` mean different things to whoever reads the trace.
+            let code = serde_json::from_slice::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("http_{}", response.status));
+            let reason = format!("{peer} refused the handle: {code}");
+            self.trace_fetch(&peer, &handle_id, None, &code, Some(reason.clone()))
+                .await;
+            return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
+        }
+
+        let sha256 = murmur_artifact::sha256_hex(&response.body);
+        // The validator the peer served describes the body it accompanies, so disagreeing with it
+        // means the bytes were not the ones that were hashed. Refuse rather than store.
+        if let Some(etag) = response.header("etag") {
+            let expected = format!("\"sha256:{sha256}\"");
+            if etag != expected {
+                let reason = format!("{peer} served an etag that does not describe its own body");
+                self.trace_fetch(
+                    &peer,
+                    &handle_id,
+                    None,
+                    "etag_mismatch",
+                    Some(reason.clone()),
+                )
+                .await;
+                return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
+            }
+        }
+        let generation = response
+            .header("x-murmur-generation")
+            .and_then(|value| value.parse::<u64>().ok());
+
+        // Runtime-chosen, never peer-chosen: the peer discloses no path, and the basename is only
+        // a hint read out of the token's own unverified payload.
+        let basename = crate::peer_handoff::decode_payload_unverified(&handle).map(|p| p.p);
+        let stored_path = crate::peer_handoff::stored_path_for(&handle_id, basename.as_deref());
+        let absolute = self.accessible_workdir.join(&stored_path);
+        if let Some(parent) = absolute.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                let reason = format!("failed to create {}: {error}", parent.display());
+                self.trace_fetch(&peer, &handle_id, None, "io_error", Some(reason.clone()))
+                    .await;
+                return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
+            }
+        }
+        if let Err(error) = fs::write(&absolute, &response.body) {
+            let reason = format!("failed to write {stored_path}: {error}");
+            self.trace_fetch(&peer, &handle_id, None, "io_error", Some(reason.clone()))
+                .await;
+            return Err(format!("'{FETCH_PEER_FILE_TOOL}' failed: {reason}"));
+        }
+
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_peer_file_fetch(
+                    &peer,
+                    &handle_id,
+                    Some(stored_path.clone()),
+                    Some(response.body.len() as u64),
+                    Some(sha256.clone()),
+                    "ok",
+                    None,
+                )
+                .await;
+        }
+
+        let mut data = serde_json::json!({
+            "path": stored_path,
+            "bytes": response.body.len(),
+            "sha256": sha256,
+            "peer": peer,
+        });
+        if let Some(generation) = generation {
+            data["generation"] = serde_json::json!(generation);
+        }
+        Ok(json_tool_result(
+            format!(
+                "Stored {} bytes from {peer} at {stored_path}",
+                response.body.len()
+            ),
+            data,
+        ))
+    }
+
+    async fn trace_fetch(
+        &self,
+        peer: &str,
+        handle_id: &str,
+        stored_path: Option<String>,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_peer_file_fetch(peer, handle_id, stored_path, None, None, outcome, reason)
+                .await;
+        }
+    }
+}
+
+/// Refuses a destination that no rule in `rules` covers, naming the manifest key that would have
+/// to allow it.
+///
+/// The same `RequestTarget`/`NetworkAllowRule` pair `send::Host::send` uses, applied to a second,
+/// separate list — so `capabilities.peer_fetch.allow` and `capabilities.network.allow` are
+/// enforced by one matcher and can never drift into two dialects.
+fn check_destination_allowed(
+    rules: &[NetworkAllowRule],
+    peer_url: &str,
+    field: &str,
+) -> Result<(), String> {
+    let for_parse = if peer_url.contains("://") {
+        peer_url.to_string()
+    } else {
+        format!("http://{peer_url}")
+    };
+    let uri: http::Uri = for_parse
+        .parse()
+        .map_err(|e| format!("invalid peer URL '{peer_url}': {e}"))?;
+    let target = RequestTarget::from_request(&uri, false)
+        .ok_or_else(|| format!("invalid peer URL '{peer_url}'"))?;
+    if rules.iter().any(|rule| rule.matches(&target)) {
+        return Ok(());
+    }
+    Err(format!("network policy: '{peer_url}' not in {field}"))
+}
+
+/// One tool call's `data` field, parsed as a JSON object.
+fn parse_tool_json_input(
+    tool: &str,
+    input: &murmur::tool::run::ToolInput,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let raw = input.data.as_deref().unwrap_or("{}");
+    let raw = if raw.trim().is_empty() { "{}" } else { raw };
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        _ => Err(format!("'{tool}' expects a JSON object as its input")),
+    }
+}
+
+fn required_string_arg(
+    tool: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, String> {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("'{tool}' requires a non-empty '{key}'"))
+}
+
+/// A passing tool result whose `data` is a JSON object. The agent loop sends `data || summary` to
+/// the model, so the object is what the model reads back.
+fn json_tool_result(summary: String, data: serde_json::Value) -> murmur::tool::run::ToolResult {
+    murmur::tool::run::ToolResult {
+        status: murmur::tool::run::Status::Passed,
+        summary: Some(summary),
+        data: Some(data.to_string()),
+        data_path: None,
+        truncated: false,
+        metadata: Vec::new(),
     }
 }
 
@@ -3287,6 +3726,89 @@ fn install_skill_files(
     }
     Ok(())
 }
+
+/// Refuses a persistent capsule that declares `exports.peer_files` without a short enough
+/// `max_ttl`.
+///
+/// The rule keys on `lifecycle.after_task`, which is the manifest's ephemerality axis. `exit` —
+/// the default — is ephemeral: the capsule dies with the task and teardown destroys the minting
+/// key, so every outstanding handle stops verifying at once and the declared lifetime can never
+/// be the real bound. `sleep` is the operator's opt-out: the capsule stays alive, its instance
+/// key stays alive, and a handle sitting in persisted A2A message history stays redeemable — so
+/// there the declared lifetime *is* the bound, and it must be declared and capped.
+fn check_persistent_handle_ttl(
+    peer_files: Option<&murmur_artifact::PeerFilesExport>,
+    lifecycle: &LifecycleConfig,
+) -> Result<(), RuntimeError> {
+    let Some(export) = peer_files else {
+        return Ok(());
+    };
+    if lifecycle.after_task != murmur_artifact::AfterTask::Sleep {
+        return Ok(());
+    }
+    let ceiling = murmur_artifact::PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS;
+    match export.max_ttl_secs {
+        Some(declared) if declared <= ceiling => Ok(()),
+        declared => Err(RuntimeError::PersistentCapsuleNeedsHandleTtl {
+            declared_secs: declared,
+            ceiling_secs: ceiling,
+        }),
+    }
+}
+
+/// Writes the synthetic tool manifests for the two peer-handoff tools, each only when its own
+/// grant is declared.
+fn write_peer_handoff_tool_manifests(
+    workdir: &Path,
+    can_mint: bool,
+    can_fetch: bool,
+) -> Result<(), RuntimeError> {
+    if can_mint {
+        write_tool_manifest(workdir, SHARE_FILE_TOOL, SHARE_FILE_TOOL_MANIFEST)?;
+    }
+    if can_fetch {
+        write_tool_manifest(workdir, FETCH_PEER_FILE_TOOL, FETCH_PEER_FILE_TOOL_MANIFEST)?;
+    }
+    Ok(())
+}
+
+/// Tool the minting side gains from `exports.peer_files`.
+pub(crate) const SHARE_FILE_TOOL: &str = "share-file";
+
+/// Tool the ingesting side gains from `capabilities.peer_fetch`.
+pub(crate) const FETCH_PEER_FILE_TOOL: &str = "fetch-peer-file";
+
+/// `share-file`'s manifest. The description tells the model the two things it cannot work out
+/// from the schema: that the returned handle is what goes into the message, and that the path is
+/// relative to the declared export root rather than to the workdir.
+const SHARE_FILE_TOOL_MANIFEST: &str = concat!(
+    "name: share-file\n",
+    "version: 0.0.0\n",
+    "runtime: tool\n",
+    "implementation: native\n",
+    "description: \"Mint an opaque handle a named peer can use to fetch one file from this ",
+    "capsule's declared peer export. `path` is relative to exports.peer_files.root; `peer` is ",
+    "the peer's address. Returns a handle to put in a message to that peer — it names no ",
+    "filesystem path and is redeemable only by that peer.\"\n",
+    "input_schema: '",
+    r#"{"type":"object","properties":{"path":{"type":"string"},"peer":{"type":"string"},"ttl":{"type":"string"}},"required":["path","peer"]}"#,
+    "'\n",
+);
+
+/// `fetch-peer-file`'s manifest. It states plainly that the bytes arrive as a file, because a
+/// model that expects them inline will otherwise ask for them again.
+const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
+    "name: fetch-peer-file\n",
+    "version: 0.0.0\n",
+    "runtime: tool\n",
+    "implementation: native\n",
+    "description: \"Redeem a handle a peer sent and store the file it names in this capsule's ",
+    "workdir. Returns the stored path, size and SHA-256 — never the file's contents. Read the ",
+    "stored path if you need what is in it.\"\n",
+    "input_schema: '",
+    r#"{"type":"object","properties":{"peer":{"type":"string"},"handle":{"type":"string"}},"required":["peer","handle"]}"#,
+    "'\n",
+);
 
 fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<(), RuntimeError> {
     for binary in shell_allow {
@@ -3636,6 +4158,86 @@ fn resolve_lifecycle(
 
 #[cfg(test)]
 mod tests {
+
+    // ── The persistent-capsule handle-TTL rule ───────────────────────────────
+
+    fn peer_export(max_ttl_secs: Option<u64>) -> murmur_artifact::PeerFilesExport {
+        murmur_artifact::PeerFilesExport {
+            root: "out/".to_string(),
+            max_ttl_secs,
+            max_bytes: 10 * 1024 * 1024,
+        }
+    }
+
+    fn lifecycle_with(after_task: murmur_artifact::AfterTask) -> LifecycleConfig {
+        LifecycleConfig {
+            after_task,
+            ..Default::default()
+        }
+    }
+
+    /// An ephemeral capsule needs no ceiling at all: teardown destroys the key, so the declared
+    /// lifetime can never be the real bound however long it is.
+    #[test]
+    fn an_ephemeral_capsule_may_declare_any_handle_ttl_or_none() {
+        for declared in [None, Some(1), Some(900), Some(86_400), Some(u64::MAX)] {
+            assert!(
+                check_persistent_handle_ttl(
+                    Some(&peer_export(declared)),
+                    &lifecycle_with(murmur_artifact::AfterTask::Exit),
+                )
+                .is_ok(),
+                "exit + max_ttl {declared:?} must launch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_persistent_capsule_must_declare_a_handle_ttl_at_or_under_the_ceiling() {
+        for declared in [Some(1), Some(600), Some(900)] {
+            assert!(
+                check_persistent_handle_ttl(
+                    Some(&peer_export(declared)),
+                    &lifecycle_with(murmur_artifact::AfterTask::Sleep),
+                )
+                .is_ok(),
+                "sleep + max_ttl {declared:?} must launch"
+            );
+        }
+        for declared in [None, Some(901), Some(1800), Some(3600)] {
+            let error = check_persistent_handle_ttl(
+                Some(&peer_export(declared)),
+                &lifecycle_with(murmur_artifact::AfterTask::Sleep),
+            )
+            .expect_err("sleep + max_ttl {declared:?} must refuse");
+            assert!(matches!(
+                error,
+                RuntimeError::PersistentCapsuleNeedsHandleTtl { .. }
+            ));
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("exports.peer_files.max_ttl"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("lifecycle.after_task: sleep"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("900s"), "{rendered}");
+            assert!(rendered.contains("durability"), "{rendered}");
+        }
+    }
+
+    /// The rule is about handles, so a capsule that declares no peer export is never asked.
+    #[test]
+    fn a_capsule_without_peer_files_is_unaffected_by_the_ttl_rule() {
+        for after_task in [
+            murmur_artifact::AfterTask::Exit,
+            murmur_artifact::AfterTask::Sleep,
+        ] {
+            assert!(check_persistent_handle_ttl(None, &lifecycle_with(after_task)).is_ok());
+        }
+    }
     use murmur_artifact::{ArtifactMeta, ArtifactRuntime, Registry, ResolvedArtifact, RuntimeType};
     use tempfile::TempDir;
 
@@ -4563,6 +5165,10 @@ mod tests {
                 network_allow_rules: Vec::new(),
             },
             network_allow_rules: Vec::new(),
+            peer_fetch_rules: Vec::new(),
+            peer_plane: None,
+            peer_own_audience: String::new(),
+            peer_trace: None,
             inference_env: Vec::new(),
             engine,
             workdir: workdir.clone(),
@@ -5251,6 +5857,7 @@ mod tests {
 
     fn grant_of(network: Option<Vec<&str>>, scope: Option<&str>) -> ToolCapabilityGrant {
         let caps = murmur_artifact::Capabilities {
+            peer_fetch: None,
             network: network.map(|allow| murmur_artifact::NetworkCapabilities {
                 allow: allow.into_iter().map(str::to_string).collect(),
                 unix_sockets: false,
@@ -5529,6 +6136,7 @@ mod tests {
             source: None,
             on_overflow: Default::default(),
             capabilities: Some(murmur_artifact::Capabilities {
+                peer_fetch: None,
                 network: Some(murmur_artifact::NetworkCapabilities {
                     allow: vec!["http://127.0.0.1:1".to_string()],
                     unix_sockets: false,
@@ -5575,6 +6183,7 @@ mod tests {
             source: None,
             on_overflow: Default::default(),
             capabilities: Some(murmur_artifact::Capabilities {
+                peer_fetch: None,
                 network: None,
                 filesystem: Some(murmur_artifact::FilesystemCapabilities {
                     scope: Some("../escape".to_string()),
@@ -5601,6 +6210,7 @@ mod tests {
     #[test]
     fn inert_sub_blocks_are_exactly_the_unconsumed_ones() {
         let caps = murmur_artifact::Capabilities {
+            peer_fetch: None,
             network: Some(murmur_artifact::NetworkCapabilities {
                 allow: Vec::new(),
                 unix_sockets: false,

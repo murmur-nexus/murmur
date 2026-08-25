@@ -35,7 +35,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use murmur_artifact::{ContainmentClass, ExportMode, FileExport};
+use murmur_artifact::{ContainmentClass, ExportMode, FileExport, PeerFilesExport};
 use serde::Serialize;
 
 use crate::{errors::RuntimeError, trace::ResourceTraceAppender};
@@ -81,6 +81,31 @@ impl DeclaredExport {
             max_bytes: export.max_bytes,
         }
     }
+
+    /// [`Self::resolve`] for the peer plane's separate subtree.
+    ///
+    /// The same type because it is the same resolution: `exports.peer_files` opens a different
+    /// root under a different authoriser, but a path beneath it is decided by exactly the rules
+    /// that decide one beneath `exports.files`. `mode` is [`ExportMode::ReadOnly`] because there
+    /// is no other kind of peer export and none is declarable — a redeem serves bytes and
+    /// nothing else.
+    pub fn for_peer_files(accessible_workdir: &Path, export: &PeerFilesExport) -> Self {
+        Self {
+            declared_root: export.root.clone(),
+            root: accessible_workdir.join(&export.root),
+            mode: ExportMode::ReadOnly,
+            max_bytes: export.max_bytes,
+        }
+    }
+}
+
+/// Refuses a launch whose declared `exports.peer_files.root` already resolves outside the
+/// accessible workdir — [`check_export_root`] for the peer plane's root, and the same refusal.
+pub fn check_peer_files_root(
+    accessible_workdir: &Path,
+    export: &PeerFilesExport,
+) -> Result<(), RuntimeError> {
+    check_root_within_workdir(accessible_workdir, "exports.peer_files.root", &export.root)
 }
 
 /// Refuses a launch whose declared export root already resolves outside the accessible workdir.
@@ -94,17 +119,26 @@ pub fn check_export_root(
     accessible_workdir: &Path,
     export: &FileExport,
 ) -> Result<(), RuntimeError> {
+    check_root_within_workdir(accessible_workdir, "exports.files.root", &export.root)
+}
+
+fn check_root_within_workdir(
+    accessible_workdir: &Path,
+    field: &str,
+    root: &str,
+) -> Result<(), RuntimeError> {
     let Ok(workdir_canon) = std::fs::canonicalize(accessible_workdir) else {
         // No `--workdir`: the session directory does not exist yet, so nothing under it can
         // already point elsewhere.
         return Ok(());
     };
-    let Ok(resolved) = std::fs::canonicalize(workdir_canon.join(&export.root)) else {
+    let Ok(resolved) = std::fs::canonicalize(workdir_canon.join(root)) else {
         return Ok(());
     };
     if !resolved.starts_with(&workdir_canon) {
         return Err(RuntimeError::ExportRootOutsideWorkdir {
-            declared: export.root.clone(),
+            field: field.to_string(),
+            declared: root.to_string(),
             resolved: resolved.display().to_string(),
             workdir: workdir_canon.display().to_string(),
         });
@@ -206,7 +240,7 @@ impl ResourceResponse {
     /// [`handle_resource_request`] gets a self-delimiting response without having to know it owed
     /// one. A body delimited only by the connection closing is a body a caller cannot tell apart
     /// from a truncated one, which would undo the point of serving a validator alongside it.
-    fn framed(status: u16, mut headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+    pub(crate) fn framed(status: u16, mut headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
         headers.push(("content-length".to_string(), body.len().to_string()));
         Self {
             status,
@@ -501,6 +535,34 @@ fn mtime_ms(metadata: &std::fs::Metadata) -> u64 {
 
 // ── read ──────────────────────────────────────────────────────────────────────
 
+/// Resolves one root-relative request path to a canonical target beneath the export root,
+/// returning that target together with its canonical root-relative form.
+///
+/// The step the reader takes before it opens anything, exposed so the peer plane's *mint* can
+/// name a file without reading it. Sharing it is the point: a path that would be refused on a
+/// read is refused on a mint by the same code, so a handle can never authorise something the
+/// reader would then decline — or, worse, something it would not.
+pub(crate) fn resolve_relpath_beneath_root(
+    export: &DeclaredExport,
+    relpath: &str,
+    policy: SymlinkPolicy,
+) -> Result<(PathBuf, String), ResourceError> {
+    let components = export_relpath_components(relpath)?;
+    let root_canon = std::fs::canonicalize(&export.root).map_err(|e| io_to_resource_error(&e))?;
+    let target = resolve_beneath(&root_canon, &components, policy)?;
+    let relative = target
+        .strip_prefix(&root_canon)
+        .map_err(|_| ResourceError::OutsideRoot)?
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    if relative.is_empty() {
+        return Err(ResourceError::OutsideRoot);
+    }
+    Ok((target, relative))
+}
+
 /// Serves one file's current bytes.
 ///
 /// Atomicity against a concurrent rewrite rests on two rules and no locking: the file is opened
@@ -510,14 +572,12 @@ fn mtime_ms(metadata: &std::fs::Metadata) -> u64 {
 /// therefore holds this reader on the old inode for the whole read; one that truncates and
 /// rewrites in place can still be read mid-write. That is an authoring convention, documented for
 /// capsule authors, not a mechanism enforced here.
-fn read_export_file_with_policy(
+pub(crate) fn read_export_file_with_policy(
     export: &DeclaredExport,
     relpath: &str,
     policy: SymlinkPolicy,
 ) -> Result<ReadResponse, ResourceError> {
-    let components = export_relpath_components(relpath)?;
-    let root_canon = std::fs::canonicalize(&export.root).map_err(|e| io_to_resource_error(&e))?;
-    let target = resolve_beneath(&root_canon, &components, policy)?;
+    let (target, _) = resolve_relpath_beneath_root(export, relpath, policy)?;
 
     let (file, metadata) = open_regular_file(&target)?;
     if metadata.len() > export.max_bytes {
@@ -878,14 +938,16 @@ fn error_response(error: &ResourceError, generation: Option<u64>) -> ResourceRes
     )
 }
 
-/// The reason phrase for a status the plane can return. Only these appear; anything else is a
+/// The reason phrase for a status either plane can return. Only these appear; anything else is a
 /// programming error rather than a response shape callers depend on.
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        410 => "Gone",
         413 => "Payload Too Large",
         _ => "Internal Server Error",
     }

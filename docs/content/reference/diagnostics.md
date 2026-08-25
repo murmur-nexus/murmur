@@ -17,7 +17,8 @@ section that explains it.
 | `E-CAP-004` | `capabilities.shell.staged_runtime` is declared below an effective `sealed` containment floor | [E-CAP-004](#e-cap-004) |
 | `E-CAP-005` | This host cannot give the capsule's native subprocess tree its own network namespace, so `capabilities.network.allow` cannot be enforced for it | [E-CAP-005](#e-cap-005) |
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
-| `E-CAP-007` | `exports.files.root` resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
+| `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
+| `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -243,13 +244,15 @@ Two neighbouring codes are easy to confuse with this one:
 
 ### E-CAP-007 — export root outside the workdir { #e-cap-007 }
 
-[`exports.files.root`](manifest.md#field-exports) names a subtree of the [accessible workdir](workdir.md). When that
-path already exists and resolves somewhere else — because it is a symlink pointing out of the
-workdir — `mur run` refuses at staging, before the workdir is created and before any session runs:
+[`exports.files.root`](manifest.md#field-exports) and
+[`exports.peer_files.root`](manifest.md#field-exports-peer-files) each name a subtree of the
+[accessible workdir](workdir.md). When one of those paths already exists and resolves somewhere
+else — because it is a symlink pointing out of the workdir — `mur run` refuses at staging, before
+the workdir is created and before any session runs:
 
 ```text
 error[E-CAP-007]: exports.files.root 'out/' resolves to '/srv/elsewhere', which is outside the capsule workdir '/home/dev/project'
-  hint: point `exports.files.root` at a directory inside the capsule workdir. A root that already exists as a symlink out of the workdir is refused whole rather than followed — see docs/content/reference/resource-plane.md
+  hint: point the export root at a directory inside the capsule workdir. A root that already exists as a symlink out of the workdir is refused whole rather than followed — see docs/content/reference/resource-plane.md
 ```
 
 The root is refused whole rather than followed one file at a time: a per-request check would let
@@ -260,6 +263,31 @@ This is not a containment shortfall, and no change to `capabilities.containment`
 export is a disclosure the operator makes, and the path named simply is not inside the capsule. See
 [Resource plane](resource-plane.md) and
 [Containment and disclosure](containment.md#containment-and-disclosure).
+
+### E-CAP-008 — a persistent capsule needs a short handle lifetime { #e-cap-008 }
+
+A [peer-file handle](resource-plane.md#peer-plane) is bounded by the minting capsule's own
+lifetime: the key it is verified with is generated in memory at launch and destroyed at teardown,
+so an ephemeral capsule (`lifecycle.after_task: exit`, the default) needs no declared ceiling at
+all.
+
+`lifecycle.after_task: sleep` withdraws that bound deliberately. The capsule stays alive, its
+instance key stays alive, and a handle sitting in persisted A2A message history stays redeemable —
+so the declared lifetime becomes the only one there is. It must therefore be declared, and it must
+be at most `15m`:
+
+```text
+error[E-CAP-008]: exports.peer_files with lifecycle.after_task: sleep requires exports.peer_files.max_ttl to be declared and at most 900s (declared 1800s); a handle's lifetime is not a durability mechanism
+  hint: declare `exports.peer_files.max_ttl: 15m` or shorter, or drop `lifecycle.after_task: sleep` so teardown bounds every handle instead. A consumer that needs these bytes after the capsule is gone should have the operator relaunch the runtime against the still-present workdir and request again — see docs/content/reference/resource-plane.md
+```
+
+`mur run` refuses at staging, before the workdir is created and before any session runs, so no
+`trace.jsonl` appears.
+
+A handle's lifetime is not a durability mechanism, and the remedy is never a longer one. Workdirs
+persist past teardown: a consumer that needs the bytes after the capsule is gone should have the
+operator relaunch the runtime against the same workdir and request again — see
+[The minting key](resource-plane.md#minting-key).
 
 ---
 
