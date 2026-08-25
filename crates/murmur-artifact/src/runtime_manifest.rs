@@ -2009,15 +2009,11 @@ fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestEr
     let max_bytes = match raw.max_bytes {
         None => DEFAULT_EXPORT_MAX_BYTES,
         Some(value) => {
-            let text = match &value {
-                serde_yaml::Value::String(text) => text.clone(),
-                serde_yaml::Value::Number(number) => number.to_string(),
-                other => {
-                    return Err(invalid(
-                        "exports.files.max_bytes",
-                        format!("'{other:?}' {BYTE_SIZE_ACCEPTED_FORM}"),
-                    ));
-                }
+            let Some(text) = scalar_text(&value) else {
+                return Err(invalid(
+                    "exports.files.max_bytes",
+                    format!("'{value:?}' {BYTE_SIZE_ACCEPTED_FORM}"),
+                ));
             };
             let parsed = parse_byte_size(&text)
                 .map_err(|message| invalid("exports.files.max_bytes", message))?;

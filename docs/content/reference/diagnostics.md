@@ -246,8 +246,9 @@ Two neighbouring codes are easy to confuse with this one:
 
 [`exports.files.root`](manifest.md#field-exports) and
 [`exports.peer_files.root`](manifest.md#field-exports-peer-files) each name a subtree of the
-[accessible workdir](workdir.md). When one of those paths already exists and resolves somewhere else — because it is a symlink pointing out of the
-workdir — `mur run` refuses at staging, before the workdir is created and before any session runs:
+[accessible workdir](workdir.md). When one of those paths already exists and resolves somewhere
+else — because it is a symlink pointing out of the workdir — `mur run` refuses at staging, before
+the workdir is created and before any session runs:
 
 ```text
 error[E-CAP-007]: exports.files.root 'out/' resolves to '/srv/elsewhere', which is outside the capsule workdir '/home/dev/project'
@@ -285,12 +286,8 @@ error[E-CAP-008]: exports.peer_files with lifecycle.after_task: sleep requires e
 
 A handle's lifetime is not a durability mechanism, and the remedy is never a longer one. Workdirs
 persist past teardown: a consumer that needs the bytes after the capsule is gone should have the
-operator relaunch the runtime against the same workdir and request again.
-
-| `lifecycle.after_task` | `exports.peer_files.max_ttl` |
-|---|---|
-| `exit` (the default) | Optional. Defaults to `1h`. No ceiling |
-| `sleep` | Required, and at most `15m` |
+operator relaunch the runtime against the same workdir and request again — see
+[The minting key](resource-plane.md#minting-key).
 
 ---
 

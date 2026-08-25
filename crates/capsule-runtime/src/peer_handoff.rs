@@ -39,7 +39,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine as _;
@@ -55,7 +54,7 @@ use crate::{
         read_export_file_with_policy, resolve_relpath_beneath_root, symlink_policy, DeclaredExport,
         ReadResponse, ResourceError, ResourceResponse,
     },
-    trace::ResourceTraceAppender,
+    trace::{timestamp_ms, ResourceTraceAppender},
 };
 
 /// Path prefix the peer plane answers under, alongside the operator plane's `/resources/files/`.
@@ -105,9 +104,9 @@ type HmacSha256 = Hmac<Sha256>;
 /// The 32-byte HMAC key one capsule *instance* mints and verifies with.
 ///
 /// Generated in `launch_session`, and only when `exports.peer_files` is declared. Never written
-/// to disk, never placed in an environment variable, and never copied out of this type — the
-/// deleted checkpoint-signing mechanism persisted its key under `$HOME`, and this deliberately
-/// does not.
+/// to disk, never placed in an environment variable, and never copied out of this type: a key
+/// that reaches durable storage outlives the instance whose lifetime is the only revocation
+/// mechanism there is.
 pub struct PeerMintKey([u8; 32]);
 
 impl PeerMintKey {
@@ -127,8 +126,7 @@ impl PeerMintKey {
     /// Overwrites the key bytes with volatile writes.
     ///
     /// Volatile so the compiler cannot elide a write whose result is provably never read — which
-    /// is the whole of what the write is for. This is the module's only `unsafe`, and it does
-    /// nothing but overwrite a fully-owned, correctly-aligned array.
+    /// is the whole of what the write is for.
     #[allow(unsafe_code)]
     fn zeroize(&mut self) {
         for byte in self.0.iter_mut() {
@@ -295,7 +293,7 @@ pub fn verify(
     if payload.iss != session_id {
         return Err(HandleError::NotValid);
     }
-    if payload.exp <= now_ms() {
+    if payload.exp <= timestamp_ms() {
         return Err(HandleError::Expired);
     }
     Ok(payload)
@@ -392,13 +390,6 @@ pub(crate) fn redact_handles_in_json(value: &mut serde_json::Value) {
         }
         _ => {}
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn random_hex(bytes: usize) -> Result<String, String> {
@@ -612,7 +603,7 @@ pub struct PeerPlane {
 }
 
 impl PeerPlane {
-    /// The five inputs a plane needs, and the complete list of them: a host path, the declared
+    /// Everything a plane needs, and the complete list of it: a host path, the declared
     /// export (`None` = undeclared = deny) paired with the instance key, the session id, the
     /// achieved class, the generation counter and somewhere to write the record.
     pub fn new(
@@ -639,11 +630,6 @@ impl PeerPlane {
     /// Whether this capsule declared `exports.peer_files` at all.
     pub fn is_declared(&self) -> bool {
         self.declared.is_some()
-    }
-
-    /// The declared handle-lifetime ceiling, or `None` when nothing is declared.
-    pub fn max_ttl_secs(&self) -> Option<u64> {
-        self.declared.as_ref().map(|declared| declared.max_ttl_secs)
     }
 
     pub fn generation(&self) -> u64 {
@@ -685,7 +671,7 @@ impl PeerPlane {
             v: PAYLOAD_VERSION,
             iss: self.session_id.clone(),
             p: canonical_relpath.clone(),
-            exp: now_ms().saturating_add(ttl.saturating_mul(1000)),
+            exp: timestamp_ms().saturating_add(ttl.saturating_mul(1000)),
             n: random_hex(NONCE_BYTES).map_err(PeerError::IoError)?,
         };
         let token = mint(&declared.key, &payload, audience).map_err(PeerError::IoError)?;
@@ -764,12 +750,10 @@ pub async fn handle_peer_request(
 
     let path = raw_path.split('?').next().unwrap_or("");
     let rest = path.strip_prefix(PEER_PATH_PREFIX).unwrap_or("");
-    // **There is no `list` verb on the peer plane.** `/resources/peer` and `/resources/peer/`
-    // name no handle, and enumeration is the thing this plane exists to prevent — so they are
-    // `not_found` rather than an empty listing.
+    // **There is no `list` verb on the peer plane.** `/resources/peer` and `/resources/peer/` name
+    // no handle, and enumeration is the thing this plane exists to prevent — so they are
+    // `not_found` rather than an empty listing, and there is no handle to trace them against.
     let Some(token) = rest.strip_prefix('/').filter(|token| !token.is_empty()) else {
-        // No handle to name, so nothing is traced. `not_found` rather than an empty listing:
-        // enumeration is the thing this plane exists to prevent.
         return error_response(&PeerError::NotFound, None, None);
     };
 
@@ -905,7 +889,7 @@ mod tests {
     }
 
     fn in_an_hour() -> u64 {
-        now_ms() + 3_600_000
+        timestamp_ms() + 3_600_000
     }
 
     #[test]
@@ -1079,7 +1063,7 @@ mod tests {
         let key = key();
         let token = mint(
             &key,
-            &payload_for("report.md", "ses_1", now_ms() - 1),
+            &payload_for("report.md", "ses_1", timestamp_ms() - 1),
             "a@b",
         )
         .unwrap();
@@ -1430,25 +1414,25 @@ mod tests {
         // Bracketed by clock readings taken either side of each mint, so the assertion is exact
         // rather than slack-tolerant: a loaded machine makes the mint slower, not the ceiling
         // looser.
-        let before = now_ms();
+        let before = timestamp_ms();
         let clamped = plane.mint_handle("report.md", "a@b", Some(86_400)).unwrap();
-        let after = now_ms();
+        let after = timestamp_ms();
         assert!(
             (before + 60_000..=after + 60_000).contains(&clamped.expires_at_ms),
             "a ttl above max_ttl must be clamped down to it"
         );
 
-        let before = now_ms();
+        let before = timestamp_ms();
         let narrowed = plane.mint_handle("report.md", "a@b", Some(5)).unwrap();
-        let after = now_ms();
+        let after = timestamp_ms();
         assert!(
             (before + 5_000..=after + 5_000).contains(&narrowed.expires_at_ms),
             "a ttl below max_ttl is applied as given"
         );
 
-        let before = now_ms();
+        let before = timestamp_ms();
         let defaulted = plane.mint_handle("report.md", "a@b", None).unwrap();
-        let after = now_ms();
+        let after = timestamp_ms();
         assert!(
             (before + 60_000..=after + 60_000).contains(&defaulted.expires_at_ms),
             "an absent ttl means max_ttl"
@@ -1574,7 +1558,6 @@ mod tests {
     fn an_undeclared_capsule_answers_no_peer_plane_and_mints_nothing() {
         let plane = undeclared_plane();
         assert!(!plane.is_declared());
-        assert_eq!(plane.max_ttl_secs(), None);
 
         let response = respond(&plane, "GET", "/resources/peer/mh1.YWJj.YWJj", Some("a@b"));
         assert_eq!(response.status, 404);

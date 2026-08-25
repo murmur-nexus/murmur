@@ -3151,7 +3151,8 @@ impl CapsuleStoreState {
 
         let Some(plane) = self.peer_plane.as_ref().filter(|plane| plane.is_declared()) else {
             return Err(format!(
-                "'{SHARE_FILE_TOOL}' needs an exports.peer_files block in murmur.yaml; this                  capsule declares none"
+                "'{SHARE_FILE_TOOL}' needs an exports.peer_files block in murmur.yaml; \
+                 this capsule declares none"
             ));
         };
 
@@ -3214,7 +3215,8 @@ impl CapsuleStoreState {
                 // Names the authoriser and nothing else: not the host path it resolved to, not
                 // what it found there. A refused mint must not become a probe.
                 Err(format!(
-                    "'{SHARE_FILE_TOOL}' refused '{path}': {reason}. Only files under the                      declared exports.peer_files.root may be shared."
+                    "'{SHARE_FILE_TOOL}' refused '{path}': {reason}. Only files under the \
+                     declared exports.peer_files.root may be shared."
                 ))
             }
         }

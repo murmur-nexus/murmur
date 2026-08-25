@@ -55,49 +55,9 @@ pub(crate) async fn send_a2a_message(
         .await
         .map_err(|e| format!("failed to write request to {peer_url}: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
+    let raw = read_raw_response(BufReader::new(stream), peer_url).await?;
 
-    // Read and discard status line
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|e| format!("failed to read status from {peer_url}: {e}"))?;
-
-    // Parse headers for Content-Length
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-        if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-            content_length = rest.trim().parse().ok();
-        }
-    }
-
-    // Read body
-    let body_bytes = if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
-        buf
-    } else {
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
-        buf
-    };
-
-    let response: serde_json::Value = serde_json::from_slice(&body_bytes)
+    let response: serde_json::Value = serde_json::from_slice(&raw.body)
         .map_err(|e| format!("failed to parse response from {peer_url}: {e}"))?;
 
     if let Some(error) = response.get("error") {
@@ -205,8 +165,19 @@ async fn raw_get(
         .await
         .map_err(|e| format!("failed to write request to {peer_url}: {e}"))?;
 
-    let mut reader = BufReader::new(stream);
+    read_raw_response(BufReader::new(stream), peer_url).await
+}
 
+/// Reads one complete HTTP/1.1 response off a connection the caller has already written to.
+///
+/// Shared by every outbound request this module makes, so a peer's framing is interpreted one
+/// way rather than several. `content-length` bounds the read but never sizes an allocation up
+/// front: the length is the peer's claim, and a peer that claims a gigabyte must actually send
+/// one before this grows to hold it.
+async fn read_raw_response(
+    mut reader: BufReader<TcpStream>,
+    peer_url: &str,
+) -> Result<RawHttpResponse, String> {
     let mut status_line = String::new();
     reader
         .read_line(&mut status_line)
@@ -240,21 +211,28 @@ async fn raw_get(
         headers.push((name, value));
     }
 
-    let body = if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
-        buf
-    } else {
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
-        buf
-    };
+    let mut body = Vec::new();
+    match content_length {
+        Some(len) => {
+            reader
+                .take(len as u64)
+                .read_to_end(&mut body)
+                .await
+                .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
+            if body.len() != len {
+                return Err(format!(
+                    "peer {peer_url} declared {len} bytes and sent {}",
+                    body.len()
+                ));
+            }
+        }
+        None => {
+            reader
+                .read_to_end(&mut body)
+                .await
+                .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
+        }
+    }
 
     Ok(RawHttpResponse {
         status,

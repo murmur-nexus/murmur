@@ -385,12 +385,10 @@ well as successes. **The token itself never appears in a trace on either side** 
 otherwise reach one, including as a recorded `fetch-peer-file` argument, it is replaced with
 `<handle:<handle_id>>`.
 
-### What this plane does not do { #peer-non-goals }
+### Limits of a handle { #peer-non-goals }
 
-| Not built | Why |
+| Limit | What it means |
 |---|---|
-| Re-delegation | A handle is terminal at the audience it was minted for. A recipient cannot mint a derived handle from one it received, and the redeem path has no notion of a delegation chain |
-| Peer authentication | See [The audience](#audience) |
-| A `list` verb | Enumeration is the thing this plane exists to prevent |
-| A write path | Every method other than `GET` returns `405` |
-| A script-capsule interface | `share-file` and `fetch-peer-file` are agent-loop tools. No WIT import exposes either to a wasm component |
+| A handle is terminal | It is redeemable only at the audience it was minted for. A recipient cannot mint a derived handle from one it received, and the redeem path has no notion of a delegation chain |
+| The audience is not authenticated | See [The audience](#audience) |
+| Only the agent loop can mint or redeem | `share-file` and `fetch-peer-file` are agent-loop tools. No WIT import exposes either to a wasm component |
