@@ -2226,7 +2226,7 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 /// path. `Some(dir)` adds a *second* preopen at the guest path [`STATE_PREOPEN_NAME`], so the
 /// guest reaches it as `state/<file>`; it is a host path outside every workdir, and the only one
 /// a guest can name. `None` — every caller without a `capabilities.state` grant — adds nothing,
-/// which is why an undeclared artifact's behaviour is bit-for-bit what it was.
+/// leaving the workdir preopen as the guest's only filesystem reach.
 fn build_wasi_ctx(
     workdir: &Path,
     filesystem_scope: Option<&str>,
@@ -3032,8 +3032,8 @@ pub(crate) async fn invoke_tool_component(
     // inference driver share, so a driver needs no enforcement code of its own.
     let effective_network_rules = effective_tool_network_rules(artifact_grant, network_allow_rules);
     let filesystem_scope = artifact_grant.and_then(|grant| grant.filesystem_scope.as_deref());
-    // Absent for every artifact that declared no `capabilities.state`, which is why an undeclared
-    // tool gets exactly the single preopen it always got.
+    // Absent for every artifact that declared no `capabilities.state`, so an undeclared tool is
+    // built with the workdir preopen and nothing else.
     let state_dir = artifact_grant.and_then(|grant| grant.state_dir.as_deref());
     let state = ToolStoreState {
         limits: tool_limits.limiter(),

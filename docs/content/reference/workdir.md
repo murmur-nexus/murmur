@@ -96,19 +96,20 @@ defaulting to the capsule name — never from the workdir, the session id or the
 launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactly what the previous
 launch wrote.
 
-**It is outside every workdir, and reachable only by the artifact that declared it.** A subtree of
-the workdir would be readable by anything holding the workdir preopen — `murmur-tool-editor` and
+**It sits outside every workdir, and only the artifact that declared it can reach it.** A subtree
+of the workdir would be readable by anything holding the workdir preopen — `murmur-tool-editor` and
 `shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
-prefix: protecting one subtree would mean narrowing every other artifact. A capsule component
-holds no artifact grant, so it holds no descriptor naming any store.
+prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
+declares no artifact grant and reaches no store.
 
-**It is not shared between capsules.** Two capsules launched in the same directory get two stores
-and cannot see each other's, with or without a declaration on either side. Sharing between capsules
+**Each capsule gets its own store.** Two capsules launched in the same directory get two stores and
+cannot see each other's, with or without a declaration on either side. Sharing between capsules
 goes over A2A, with a grant on both ends. Declaring the same `store:` name in two capsules is the
 one way to point them at one directory, and it has to be written in both manifests.
 
-**It is not bind-mounted into a `sealed` capsule's composed root.** The preopen is opened by the
-runtime in the `mur` host process, so WASM guests reach the store and native subprocesses do not.
+**WASM tools, drivers and hooks reach the store; native subprocesses do not.** Under the `sealed`
+containment class the store is absent from the capsule's composed root, so an allowlisted binary
+spawned through `capabilities.shell.allow` or `capabilities.spawn.allow` cannot open it.
 
 ### What belongs in the workdir instead
 

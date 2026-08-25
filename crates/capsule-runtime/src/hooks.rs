@@ -1553,7 +1553,7 @@ async fn run_async_hook_worker(
 ///   `grant.state_dir` names one — the host store `capabilities.state` granted, already created at
 ///   `0700` by the staging path and outside every workdir. The two filesystem axes do not imply
 ///   each other in either direction: a hook may hold a durable store with no project directory at
-///   all, which is exactly what a hook that only appends to its own log wants.
+///   all, and a project directory with no store.
 ///
 /// `root_dir` is the hook's working directory: the session dir for `on-stage`, the project
 /// directory for blocking and async hooks.
@@ -3470,7 +3470,7 @@ mod tests {
             !missing.exists(),
             "default-deny must not create the working directory either"
         );
-        // Unchanged by the state axis: the default grant names no store, so nothing was added.
+        // The default grant names no store, so there is no second preopen to add.
         assert!(HookCapabilityGrant::default().state_dir.is_none());
     }
 
@@ -3489,7 +3489,7 @@ mod tests {
         build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant)
             .expect("both preopens are built");
 
-        // The scoped subtree is created under the hook's own root, as before.
+        // The scoped subtree is created under the hook's own root.
         assert!(root.path().join("hook-state").is_dir());
         // The store is a separate host tree, untouched and outside that root.
         assert!(!state.path().starts_with(root.path()));

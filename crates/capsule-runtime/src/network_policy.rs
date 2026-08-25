@@ -379,10 +379,9 @@ impl ToolCapabilityGrant {
     /// a [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that a
     /// per-artifact grant does not reach (the caller warns `W-SEC-008` for those).
     ///
-    /// `state` is the one member of that set that widens rather than narrows, which is why the
-    /// type's name is the only thing here still saying "narrowing": it opens one directory outside
-    /// every workdir and touches nothing the ceiling governs. `capsule_name` is what an undeclared
-    /// `capabilities.state.store` defaults to.
+    /// `state` is the one member of that set that widens rather than narrows: it opens one
+    /// directory outside every workdir and touches nothing the ceiling governs. `capsule_name` is
+    /// what an undeclared `capabilities.state.store` defaults to.
     pub(crate) fn derive(
         capabilities: Option<&murmur_artifact::Capabilities>,
         ceiling_network_allow_rules: &[NetworkAllowRule],

@@ -407,11 +407,12 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
         "a diagnostic must create no directory"
     );
 
-    // The launch itself agrees with the diagnostic: same store, same host path. What
-    // `session_start.effective_grants` records is the whole `ScopeReport` verbatim, asserted
-    // against a populated `state_stores` in `capsule-runtime`'s own
-    // `session_start_records_the_whole_scope_report_as_effective_grants` — a WASM capsule with no
-    // inference config runs no agent loop and so opens no `trace.jsonl` to read here.
+    // The launch itself agrees with the diagnostic: same store, same host path. The third place
+    // it is reported is `session_start.effective_grants`, which carries the whole `ScopeReport`
+    // verbatim; that identity is asserted against a populated `state_stores` in
+    // `capsule-runtime`'s `session_start_records_the_whole_scope_report_as_effective_grants`. This
+    // capsule declares no `inference:` block, so it runs no agent loop and opens no `trace.jsonl`
+    // of its own to read here.
     assert_eq!(run_and_read(&home, &manifest), "1");
     assert_eq!(notes_lines(&home, "shey"), 1);
 
@@ -430,6 +431,51 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
             "declaring state moved '{field}'"
         );
     }
+}
+
+/// A home directory that cannot be resolved refuses a launch only when something declared a
+/// store, so the refusal is attributable to the declaration rather than to the environment. Both
+/// halves are asserted together, because either alone would be consistent with the other cause.
+///
+/// A *relative* `HOME` is the reachable form of an unresolvable one: a durable store resolved
+/// against it would depend on the process's working directory, so it is refused, while the config
+/// and artifact-store paths `mur run` needs unconditionally still resolve.
+#[test]
+fn an_unresolvable_home_refuses_only_a_capsule_that_declared_a_store() {
+    let cwd = tempfile::tempdir().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let declared = state_project(project.path(), CAPSULE_NAME, Some(" {}"));
+    install_state_tool(fixture.path(), project.path());
+
+    // Run from a scratch directory: whatever `mur` does resolve against a relative `HOME` lands
+    // there rather than wherever the test binary happens to be invoked from.
+    let mut refused = Command::cargo_bin("mur").unwrap();
+    refused
+        .current_dir(cwd.path())
+        .env("HOME", "relative-home")
+        .env_remove("NEXUS_API_KEY")
+        .args(["run", "--manifest", declared.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("error[E-CAP-009]"))
+        .stderr(predicate::str::contains(CAPSULE_NAME))
+        .stderr(predicate::str::contains(
+            "the home directory could not be resolved",
+        ));
+
+    // Same host, same unresolvable home, no declaration: nothing looks a home directory up on
+    // behalf of a store that was never asked for.
+    let undeclared = state_project(project.path(), CAPSULE_NAME, None);
+    let mut launched = Command::cargo_bin("mur").unwrap();
+    launched
+        .current_dir(cwd.path())
+        .env("HOME", "relative-home")
+        .env_remove("NEXUS_API_KEY")
+        .args(["run", "--manifest", undeclared.to_str().unwrap()])
+        .assert()
+        .success();
 }
 
 /// A capsule-wide `capabilities.state` reaches nothing — the capsule's own guest is built with no

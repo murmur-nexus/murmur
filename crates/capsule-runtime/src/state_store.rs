@@ -86,16 +86,6 @@ pub fn validate_store_name(store: &str) -> Result<(), RuntimeError> {
     }
 }
 
-/// Where `store` lives on this host. Resolves only — nothing is created, nothing is checked for
-/// existence — so `mur run --explain-scope` can print the path it would open without becoming a
-/// command that has side effects.
-///
-/// `store` is validated here rather than assumed, so no caller can turn an unvalidated name into a
-/// path by reaching for this function instead of [`validate_store_name`].
-pub fn state_store_path(store: &str) -> Result<PathBuf, RuntimeError> {
-    state_store_path_in(&murmur_home(store)?, store)
-}
-
 /// Resolve `store`, create both the state root and the store directory at `0700`, and return the
 /// store's host path.
 ///
@@ -166,15 +156,20 @@ pub(crate) fn resolve_store_name(
         .unwrap_or_else(|| capsule_name.to_string())
 }
 
-/// [`state_store_path`] with the murmur home supplied rather than read from the environment — the
-/// seam the unit tests below resolve through, so none of them has to mutate the test process's
-/// `HOME` and race every other test in the binary.
+/// Where `store` lives under a supplied murmur home. Resolves only — nothing is created and
+/// nothing is checked for existence — so `mur run --explain-scope` can print the path a launch
+/// would open without becoming a command that has side effects.
+///
+/// `store` is validated here rather than assumed, so no caller can turn an unvalidated name into
+/// a path by reaching for this function instead of [`validate_store_name`].
 fn state_store_path_in(murmur_home: &Path, store: &str) -> Result<PathBuf, RuntimeError> {
     validate_store_name(store)?;
     Ok(murmur_home.join(STATE_ROOT_DIR).join(store))
 }
 
-/// [`ensure_state_store`] against a supplied murmur home. Same seam, same reason.
+/// [`ensure_state_store`] against a supplied murmur home rather than one read from the
+/// environment — the seam the unit tests resolve through, so none of them has to mutate the test
+/// process's `HOME` and race every other test in the binary.
 fn ensure_state_store_in(murmur_home: &Path, store: &str) -> Result<PathBuf, RuntimeError> {
     let store_path = state_store_path_in(murmur_home, store)?;
     // The root is created (and its mode asserted) before the store beneath it, so a store
@@ -309,19 +304,6 @@ mod tests {
 
         assert_eq!(path, murmur_home.join("state/shey"));
         assert!(!murmur_home.exists());
-    }
-
-    /// The public entry point reads `HOME` — asserted on the shape of what it returns rather than
-    /// on a fixed path, so the test states the layout without mutating the process environment.
-    #[test]
-    fn the_public_path_resolves_under_the_murmur_home() {
-        let path = state_store_path("shey").expect("HOME is set for the test process");
-        assert!(
-            path.ends_with(".murmur/state/shey"),
-            "unexpected layout: {}",
-            path.display()
-        );
-        assert!(path.is_absolute());
     }
 
     #[test]
