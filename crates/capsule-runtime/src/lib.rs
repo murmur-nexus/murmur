@@ -31,6 +31,7 @@ pub mod sealed;
 pub mod security;
 pub(crate) mod shell;
 pub mod staged_runtime;
+pub mod state_store;
 pub(crate) mod streaming;
 pub(crate) mod task_io_import;
 pub(crate) mod trace;
@@ -39,6 +40,7 @@ pub mod types;
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
     detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, ScopeReport,
+    StateStoreReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
@@ -79,6 +81,9 @@ pub use runtime::{
     warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
 };
 pub use staged_runtime::check_staged_runtime_floor;
+pub use state_store::{
+    ensure_state_store, state_store_reports, validate_store_name, STATE_PREOPEN_NAME,
+};
 pub use trace::ResourceTraceAppender;
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,

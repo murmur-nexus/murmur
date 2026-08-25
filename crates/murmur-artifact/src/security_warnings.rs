@@ -106,6 +106,18 @@ pub const W_SEC_012: &str = "W-SEC-012";
 /// Fires once, from the host probe, at staging and from `mur doctor`.
 pub const W_SEC_013: &str = "W-SEC-013";
 
+/// A `capabilities.state` block was declared somewhere nothing reads it, so no durable store was
+/// created and no `state/` preopen exists.
+///
+/// The grant is applied per *artifact*, on the tool, driver or hook entry that will actually run
+/// with the second preopen. A capsule-wide, top-level `capabilities.state` reaches no such entry:
+/// the capsule's own guest is built with no artifact grant at all. Structurally valid and
+/// therefore warned rather than refused, on the same terms as `W-SEC-006`/`W-SEC-008` — but stated
+/// plainly, because an operator who believes their capsule has durable state and finds an empty
+/// directory has no other signal that the declaration went nowhere.
+/// Fires at staging, before any session workdir exists.
+pub const W_SEC_014: &str = "W-SEC-014";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -124,7 +136,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
-            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013,
+            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

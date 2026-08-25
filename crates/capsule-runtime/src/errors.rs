@@ -127,6 +127,23 @@ pub enum RuntimeError {
     #[error("invalid filesystem capability scope '{scope}': {message}")]
     InvalidFilesystemScope { scope: String, message: String },
 
+    /// A `capabilities.state.store` name is not a single usable directory segment under
+    /// `~/.murmur/state/`. Raised at staging (and from `mur run --explain-scope`), before any
+    /// registry pull, workdir creation or component instantiation, so a bad name never gets as far
+    /// as creating something on disk.
+    #[error("invalid state store name '{store}': {message}")]
+    InvalidStateStore { store: String, message: String },
+
+    /// The state store directory a validated name resolves to could not be resolved or created.
+    /// Distinct from [`Self::InvalidStateStore`]: the declaration is well-formed and the failure is
+    /// the host's — an unset `HOME`, or a path that cannot be made a `0700` directory.
+    #[error("state store '{store}' is unavailable at {path}: {message}")]
+    StateStoreUnavailable {
+        store: String,
+        path: String,
+        message: String,
+    },
+
     /// The declared containment floor is stronger than what this host's kernel can back.
     /// Raised in the stage/launch seam, before any registry pull, component compile or workdir
     /// creation — `achieved` always comes from a live host probe, never from the manifest.

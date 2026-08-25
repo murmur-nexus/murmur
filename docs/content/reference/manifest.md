@@ -191,7 +191,7 @@ mur_version: "1.0.0"
 | `artifacts[].source` | string | no | Local path the runtime resolves this artifact from instead of the registry. Requires `local_source: true`. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
-| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). Declaring it on `runtime: skill` fails with `E-MAN-003`. |
+| `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
 | `artifacts[].on_overflow` | `drop \| block` | no | Default: `drop`. Recognized only on `runtime: hook`; declaring it on any other role fails with `E-MAN-003`. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook execution](#hook-overflow). Legal but inert on a hook that turns out to be `execution_mode: blocking`, which has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
@@ -227,11 +227,19 @@ artifacts:
     capabilities:
       task_io:
         read: true
+
+  # granted a durable store and nothing else — no project directory at all
+  - name: murmur-hook-memory
+    version: 0.1.0
+    runtime: hook
+    capabilities:
+      state: {}
 ```
 
 | Key | Type | Required | Description |
 |---|---|---|---|
 | `task_io.read` | bool | yes | Whether this hook may read the task's input text and the agent's result text through [`murmur:task-io/read`](wit-interfaces.md#murmurtask-ioread). Never inferred: a `task_io:` block that omits it fails with `E-MAN-003`. |
+| `state.store` | string | no | Directory name under `~/.murmur/state/`. Omitted, the capsule name is used. See [Durable state](workdir.md#state-store). |
 
 Rules:
 
@@ -246,6 +254,12 @@ Rules:
   is mounted as the hook's current directory, and is created if missing. Paths outside that subtree
   are unreachable. An absolute scope, or one that escapes the workdir via `..`, fails at launch with
   [`E-CAP-002`](diagnostics.md#e-cap-002) before any hook component is instantiated.
+- **`state` is a second, independent directory grant.** A hook holding one reaches
+  `~/.murmur/state/<store>/` as `state/` in its guest, alongside — or instead of — the
+  `filesystem.scope` directory mounted as `.`. The two do not imply each other in either
+  direction, so a hook can hold durable state without being handed the project directory. The
+  store is keyed by capsule, so it survives a launch that gets a fresh session workdir. See
+  [Durable state](workdir.md#state-store).
 - **`task_io.read` grants a host import, not a directory.** A granted hook reads the task text
   and the result text from the runtime itself, so it needs no `filesystem.scope` for either. An
   ungranted hook still loads and still runs; every read returns `not-granted`.
@@ -253,9 +267,9 @@ Rules:
   `runtime: driver` or `runtime: skill` entry, or in the capsule-wide
   [`capabilities`](#field-capabilities) block, fails with `E-MAN-003` — nothing there could
   enforce it.
-- **Only `network`, `filesystem` and `task_io` govern a hook.** `shell`, `spawn`, `env`, `limits`,
-  `resources` and `containment` parse here but are capsule-wide concerns the runtime does not apply
-  per-hook; declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
+- **Only `network`, `filesystem`, `state` and `task_io` govern a hook.** `shell`, `spawn`, `env`,
+  `limits`, `resources` and `containment` parse here but are capsule-wide concerns the runtime does
+  not apply per-hook; declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
 
 ##### Tool and driver capabilities { #tool-capabilities }
 
@@ -287,7 +301,19 @@ artifacts:
           - https://api.example.com
       filesystem:
         scope: cache
+
+  # widened by exactly one directory: a durable store outside every workdir
+  - name: murmur-tool-corpus
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      state:
+        store: shey
 ```
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `state.store` | string | no | Directory name under `~/.murmur/state/`. Omitted, the capsule name is used. See [Durable state](workdir.md#state-store). |
 
 Rules:
 
@@ -309,8 +335,14 @@ Rules:
 - **Drivers narrow identically.** The artifact named by `inference.driver.artifact` dispatches
   through the same path as any WASM tool, so a `capabilities:` block on its entry applies to every
   driver call — including one made by a hook's `run-inference`.
-- **Only `network` and `filesystem` narrow.** `shell`, `spawn`, `env`, `limits`, `resources` and
-  `containment` parse but are inert here and print
+- **`state` is the one sub-block that widens rather than narrows.** It grants a second preopen,
+  `~/.murmur/state/<store>/`, mounted in the guest as `state/` beside the workdir mounted as `.`.
+  It opens exactly that one directory: never a workdir path, and never another capsule's store.
+  Declaring it does not change the capsule's achieved containment class. A store name must be a
+  single path segment — see [State store name](#state-store-name). See
+  [Durable state](workdir.md#state-store).
+- **Only `network`, `filesystem` and `state` apply to a tool or driver.** `shell`, `spawn`, `env`,
+  `limits`, `resources` and `containment` parse but are inert here and print
   [`W-SEC-008`](diagnostics.md#w-sec-008), as does a grant on a tool with a **native** (non-WASM)
   implementation, which never runs through the WASI tool path at all.
 
@@ -420,6 +452,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
 | `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging. |
+| `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.spawn.allow` | list<string> | no | Binaries a capsule component may spawn as native subprocesses. Like `capabilities.shell.allow`, a non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
@@ -817,6 +850,22 @@ Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
 - cannot escape the workdir via `..`
 
 A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002).
+
+### State store name { #state-store-name }
+
+`capabilities.state.store` names one directory under `~/.murmur/state/`, so it is a single path
+segment:
+
+- non-empty
+- contains no `/`
+- is not `.` or `..`, and does not begin with `.`
+- is not absolute
+
+A name that breaks any of these fails with [`E-CAP-009`](diagnostics.md#e-cap-009) at staging,
+before any registry pull, workdir creation or component instantiation, and creates nothing under
+`~/.murmur/state/`. `mur run --explain-scope` refuses the same names with the same code. Omitting
+`store:` uses the capsule name, which is read from your own manifest and never from the artifact's
+bundled one.
 
 ### Shell allow
 

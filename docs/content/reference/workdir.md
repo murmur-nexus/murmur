@@ -10,6 +10,9 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
+A third directory exists only for artifacts that ask for it by name: a
+[durable state store](#state-store), outside both of the above and outliving every session.
+
 ---
 
 ## Task input
@@ -62,6 +65,81 @@ task comes from the queue rather than from a stale file.
 | `checkpoints/` | `summary.md`, `plan.json` and `decisions.json`. `MURMUR.md` directs the agent to write state here to survive compaction; the runtime neither reads nor writes them |
 
 Everything else in this directory belongs to the capsule.
+
+---
+
+## Durable state store { #state-store }
+
+An artifact that declares `capabilities.state` is granted one directory outside both workdirs:
+
+| | Path | Lifetime |
+|---|---|---|
+| Session workdir | `<accessible-workdir>` or `<accessible-workdir>/.murmur/<session-id>` | One session |
+| Accessible workdir | `--workdir`, otherwise `<manifest-dir>/workdir/<session-id>` | One session, unless `--workdir` names a directory you keep |
+| State store | `~/.murmur/state/<store>/` | Every session of that capsule, on that machine |
+
+The store is mounted into the guest as a second WASI preopen named `state`, alongside the workdir
+mounted as `.`. Guest code reaches it with an ordinary relative path:
+
+```rust
+std::fs::write("state/notes.jsonl", contents)?;   // the store
+std::fs::write("out/result.txt", summary)?;       // the workdir
+```
+
+Both `~/.murmur/state/` and each store directory under it are created mode `0700`, and the mode is
+reasserted on every launch.
+
+### What distinguishes it
+
+**It is keyed by capsule, not by directory.** The store name comes from `capabilities.state.store`,
+defaulting to the capsule name — never from the workdir, the session id or the machine's layout. A
+launch that gets a fresh `<manifest-dir>/workdir/<session-id>` reads back exactly what the previous
+launch wrote.
+
+**It sits outside every workdir, and only the artifact that declared it can reach it.** A subtree
+of the workdir would be readable by anything holding the workdir preopen — `murmur-tool-editor` and
+`shell` included — and `capabilities.filesystem.scope` cannot help, because it is a single path
+prefix: protecting one subtree would mean narrowing every other artifact. The capsule's own code
+declares no artifact grant and reaches no store.
+
+**Each capsule gets its own store.** Two capsules launched in the same directory get two stores and
+cannot see each other's, with or without a declaration on either side. Sharing between capsules
+goes over A2A, with a grant on both ends. Declaring the same `store:` name in two capsules is the
+one way to point them at one directory, and it has to be written in both manifests.
+
+**WASM tools, drivers and hooks reach the store; native subprocesses do not.** Under the `sealed`
+containment class the store is absent from the capsule's composed root, so an allowlisted binary
+spawned through `capabilities.shell.allow` or `capabilities.spawn.allow` cannot open it.
+
+### What belongs in the workdir instead
+
+Per-project notes. The accessible workdir already *is* the project: notes about the repository the
+capsule is working in belong beside that work, where they move, get committed and get deleted with
+it. A store keyed by capsule would carry them from one project to the next.
+
+The store is for what transcends workdirs — a corpus, a learned index, an append-only memory log
+that means the same thing whichever directory the capsule was launched from.
+
+### Reporting
+
+`mur run --explain-scope` lists every declared store under `Effective grants`:
+
+```
+  state stores:
+    - murmur-tool-corpus: shey -> /home/dev/.murmur/state/shey
+```
+
+`--json` emits the same list as `state_stores`, and `trace.jsonl`'s `session_start` carries it
+verbatim as `effective_grants.state_stores`. Declaring a store changes no other field of the
+report: it is a directory grant, not a containment property, so `declared_containment`,
+`achieved_containment`, `floor_met` and `enforcement_tier` are unmoved by it.
+
+`--explain-scope` resolves and prints host paths without creating any of them. Only a real launch
+creates a store.
+
+See [Tool and driver capabilities](manifest.md#tool-capabilities),
+[Hook capabilities](manifest.md#hook-capabilities) and
+[State store name](manifest.md#state-store-name).
 
 ---
 

@@ -237,6 +237,23 @@ impl From<&PeerFilesExport> for PeerFilesReport {
     }
 }
 
+/// One artifact's durable state grant as it appears in a [`ScopeReport`].
+///
+/// A grant rather than a disclosure, unlike [`ExportsFilesReport`] beside it — but reported on
+/// exactly the same terms, and for the same reason: it opens a host path outside the workdir that
+/// an operator reading `filesystem scope` alone would never see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StateStoreReport {
+    /// The artifact whose entry declared `capabilities.state`.
+    pub artifact: String,
+    /// The store directory name, with the capsule-name default already applied — so an operator
+    /// reads the directory that will actually be opened, not the absence of a declaration.
+    pub store: String,
+    /// Absolute host path of the store, `~/.murmur/state/<store>` with the home already resolved.
+    /// Reported as a string rather than a path so the JSON shape does not vary by platform.
+    pub host_path: String,
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
@@ -314,6 +331,16 @@ pub struct ScopeReport {
     /// reachable by `send` is not redeemable unless it also appears here, because ingesting a
     /// peer's bytes into this workdir is a different question from being allowed to talk to it.
     pub peer_fetch_allow: Vec<String>,
+    /// Every durable state store this session's artifacts declare, one entry per declaring
+    /// artifact, empty when none does. Always serialized as an array (never skipped), on the same
+    /// terms as [`Self::exports_files`]: an absent key identifies a runtime that predates state
+    /// stores, not a capsule that declined one.
+    ///
+    /// Declaring a store cannot change [`Self::achieved_containment`], [`Self::floor_met`] or
+    /// [`Self::enforcement_tier`] — it is copied through untouched, exactly as the export reports
+    /// beside it are. It is reported because it is the one grant that opens a path *outside* every
+    /// workdir, which nothing else in this block would reveal.
+    pub state_stores: Vec<StateStoreReport>,
     /// Every `capabilities.shell.staged_runtime` grant, rendered as
     /// `<binary>: <source_path> (pin: <pin>)`. These are host runtime trees a `sealed` capsule
     /// asks to have bind-mounted read-only into its composed root.
@@ -365,6 +392,15 @@ impl ScopeReport {
             &self.interpreter_runtime_grants,
         );
         push_list(&mut out, "staged runtime", &self.staged_runtime_grants);
+        push_list(
+            &mut out,
+            "state stores",
+            &self
+                .state_stores
+                .iter()
+                .map(|store| format!("{}: {} -> {}", store.artifact, store.store, store.host_path))
+                .collect::<Vec<_>>(),
+        );
 
         out.push_str("\nResource plane\n");
         match &self.exports_files {
@@ -419,10 +455,16 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
 /// combined floor. Probes the host tier once and reads nothing else.
+///
+/// `state_stores` is resolved by the caller (from the manifest's artifact entries, via
+/// [`crate::state_store::state_store_reports`]) rather than derived here, because it is
+/// per-artifact and `policy` is capsule-wide. Resolution creates no directory, so this stays a
+/// read-only diagnostic.
 pub fn explain_scope(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
     exports: Option<&Exports>,
+    state_stores: Vec<StateStoreReport>,
 ) -> ScopeReport {
     scope_report_for_tier(
         policy,
@@ -431,6 +473,7 @@ pub fn explain_scope(
         detect_sealed_blocker(),
         detect_userns_grant(),
         exports,
+        state_stores,
     )
 }
 
@@ -443,6 +486,7 @@ pub(crate) fn scope_report_for_tier(
     sealed_blocker: Option<SealedBlocker>,
     userns_grant: Option<UsernsGrant>,
     exports: Option<&Exports>,
+    state_stores: Vec<StateStoreReport>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -468,6 +512,10 @@ pub(crate) fn scope_report_for_tier(
             .and_then(|exports| exports.peer_files.as_ref())
             .map(PeerFilesReport::from),
         peer_fetch_allow: policy.peer_fetch_allow.clone(),
+        // Resolved by `state_store::state_store_reports` before this call and copied through on
+        // the same terms as the export reports above: a grant that opens a path outside the
+        // workdir still gets no say in what class this host is reported to back.
+        state_stores,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
@@ -889,6 +937,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -927,6 +976,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
 
         assert!(report.workdir_exec);
@@ -960,6 +1010,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -988,6 +1039,7 @@ mod tests {
                 Some(SealedBlocker::NamespaceCreationDenied),
                 None,
                 None,
+                Vec::new(),
             );
             assert_eq!(
                 report.staged_runtime_grants,
@@ -1015,6 +1067,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -1032,6 +1085,7 @@ mod tests {
             Some(SealedBlocker::NamespaceCreationDenied),
             None,
             None,
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -1046,6 +1100,7 @@ mod tests {
             Some(SealedBlocker::NotLinux),
             None,
             None,
+            Vec::new(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Sealed);
@@ -1064,6 +1119,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
@@ -1082,6 +1138,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
 
@@ -1104,6 +1161,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
 
         for grant in UsernsGrant::ALL {
@@ -1114,6 +1172,7 @@ mod tests {
                 None,
                 Some(*grant),
                 None,
+                Vec::new(),
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
             assert_eq!(report.floor_met, baseline.floor_met);
@@ -1143,6 +1202,7 @@ mod tests {
             Some(SealedBlocker::AppArmorProfileMissing),
             None,
             None,
+            Vec::new(),
         )
         .render();
 
@@ -1176,6 +1236,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &policy,
@@ -1187,6 +1248,7 @@ mod tests {
                         files: Some(export.clone()),
                         peer_files: None,
                     }),
+                    Vec::new(),
                 );
                 assert_eq!(
                     with.achieved_containment, without.achieved_containment,
@@ -1243,6 +1305,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &with_policy,
@@ -1254,6 +1317,7 @@ mod tests {
                         files: None,
                         peer_files: Some(peer_files.clone()),
                     }),
+                    Vec::new(),
                 );
                 assert_eq!(
                     with.achieved_containment, without.achieved_containment,
@@ -1299,6 +1363,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
@@ -1321,6 +1386,7 @@ mod tests {
                     max_bytes: 10 * 1024 * 1024,
                 }),
             }),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(
@@ -1342,6 +1408,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .render();
         assert!(undeclared.contains("Peer handoff"));
@@ -1365,12 +1432,79 @@ mod tests {
                     max_bytes: 4096,
                 }),
             }),
+            Vec::new(),
         )
         .render();
         assert!(declared.contains("exports.peer_files root: out/"));
         assert!(declared.contains("max handle ttl:          900s"));
         assert!(declared.contains("max bytes:               4096 (per file)"));
         assert!(declared.contains("- localhost:41234"));
+    }
+
+    /// A declared state store is reported, and moves nothing else. Same discipline the export
+    /// reports are held to: it is copied through, never consulted, so a durable directory grant
+    /// cannot talk a host into reporting a class it does not back.
+    #[test]
+    fn a_state_store_is_reported_and_moves_no_other_field() {
+        let policy = sample_policy();
+        let stores = vec![StateStoreReport {
+            artifact: "murmur-tool-corpus".to_string(),
+            store: "shey".to_string(),
+            host_path: "/home/dev/.murmur/state/shey".to_string(),
+        }];
+
+        let without = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        let with = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            stores.clone(),
+        );
+
+        assert_eq!(with.state_stores, stores);
+        assert!(without.state_stores.is_empty());
+        assert_eq!(with.achieved_containment, without.achieved_containment);
+        assert_eq!(with.floor_met, without.floor_met);
+        assert_eq!(with.enforcement_tier, without.enforcement_tier);
+        assert_eq!(with.shortfall_reason, without.shortfall_reason);
+        // The only field that moved is its own.
+        assert_eq!(
+            ScopeReport {
+                state_stores: Vec::new(),
+                ..with.clone()
+            },
+            without
+        );
+
+        // Rendered under the grants, one line per declaring artifact; `<none>` when empty.
+        assert!(with
+            .render()
+            .contains("- murmur-tool-corpus: shey -> /home/dev/.murmur/state/shey"));
+        assert!(without.render().contains("state stores: <none>"));
+
+        // Always an array in JSON, never skipped: an absent key means an older runtime, not a
+        // capsule that declined a store.
+        let json = serde_json::to_value(&without).unwrap();
+        assert_eq!(json["state_stores"], serde_json::json!([]));
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["state_stores"],
+            serde_json::json!([{
+                "artifact": "murmur-tool-corpus",
+                "store": "shey",
+                "host_path": "/home/dev/.murmur/state/shey",
+            }])
+        );
     }
 
     /// `exports_files` is written whether or not it was declared, on the same terms as
@@ -1385,6 +1519,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(undeclared["exports_files"], serde_json::Value::Null);
@@ -1403,6 +1538,7 @@ mod tests {
                 }),
                 peer_files: None,
             }),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(
@@ -1420,6 +1556,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
         .render();
         assert!(
@@ -1441,6 +1578,7 @@ mod tests {
                 }),
                 peer_files: None,
             }),
+            Vec::new(),
         )
         .render();
         assert!(declared.contains("exports.files root: out/"), "{declared}");
