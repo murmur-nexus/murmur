@@ -5459,6 +5459,69 @@ mod tests {
         assert_eq!(entry.sha256.wasm, expected_sha256);
     }
 
+    /// A mid-session `manage.pull()` lands on disk but does not reach the wire: the agent loop
+    /// holds one tool inventory for the whole session precisely so a pull cannot reorder or grow
+    /// the tool array that is part of the provider's cached prompt prefix.
+    #[test]
+    fn pull_does_not_refresh_the_held_tool_inventory() {
+        let artifact_bytes = zip_with_files(&[
+            (
+                PACKED_MANIFEST_ENTRY,
+                b"name: aaa-late-skill\nversion: 1.0.0\nruntime: skill\n",
+            ),
+            ("skill.md", b"# guidance"),
+        ]);
+        let registry = Arc::new(FakeSkillRegistry::new(artifact_bytes));
+
+        let project = tempfile::tempdir().unwrap();
+        let workdir = project.path().join("workdir");
+        // One tool already installed at launch. The pulled artifact sorts before it, so a
+        // refreshed inventory would not merely append — it would shift the whole array.
+        let existing = workdir.join("tools").join("zzz-existing-tool");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(
+            existing.join(PACKED_MANIFEST_ENTRY),
+            "name: zzz-existing-tool\nversion: 1.0.0\nruntime: tool\n",
+        )
+        .unwrap();
+        let lock_path = project.path().join("murmur.lock");
+
+        let mut state = build_test_state(registry, workdir.clone(), lock_path);
+
+        // What run_agent_loop does once, before the turn loop.
+        let snapshot = crate::agent::inventory::build_tool_inventory(&workdir, None);
+        assert_eq!(snapshot.len(), 1);
+
+        manage::Host::pull(
+            &mut state,
+            "aaa-late-skill".to_string(),
+            "1.0.0".to_string(),
+        )
+        .expect("pull should succeed");
+
+        // (a) The held snapshot is untouched by the pull.
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0]["name"], "zzz-existing-tool");
+
+        // (b) Every payload built from it still carries exactly that array.
+        let payload = crate::agent::build_driver_payload(
+            "m",
+            8192,
+            &[serde_json::json!({"role": "user", "content": []})],
+            &snapshot,
+            "sys",
+            None,
+            Some("cap:1.0.0"),
+        );
+        assert_eq!(payload["tools"], serde_json::json!(snapshot));
+
+        // (c) The pull really did land: a fresh build sees it, and sorts it first.
+        let fresh = crate::agent::inventory::build_tool_inventory(&workdir, None);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[0]["name"], "aaa-late-skill");
+        assert_eq!(fresh[1]["name"], "zzz-existing-tool");
+    }
+
     #[test]
     fn pull_rejects_tampered_bytes_and_writes_nothing() {
         struct TamperedRegistry;
