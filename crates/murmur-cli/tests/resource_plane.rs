@@ -344,6 +344,7 @@ fn achieved_class_here() -> ContainmentClass {
         &capsule_runtime::CapabilityPolicy::default(),
         ContainmentClass::Advisory,
         None,
+        Vec::new(),
     )
     .achieved_containment
 }

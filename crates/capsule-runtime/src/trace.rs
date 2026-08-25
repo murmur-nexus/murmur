@@ -1089,6 +1089,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -1340,6 +1341,7 @@ mod tests {
                 None,
                 Some(grant),
                 None,
+                Vec::new(),
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
@@ -1387,6 +1389,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
         );
         assert!(
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
@@ -1426,6 +1429,13 @@ mod tests {
             None,
             None,
             None,
+            // Populated rather than empty so the whole-report assertion below really covers this
+            // field: an empty vec would pass whether or not it was written at all.
+            vec![crate::containment::StateStoreReport {
+                artifact: "notes-tool".to_string(),
+                store: "shey".to_string(),
+                host_path: "/home/dev/.murmur/state/shey".to_string(),
+            }],
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -1457,6 +1467,14 @@ mod tests {
         assert_eq!(
             events[0]["capabilities"],
             serde_json::json!(["network", "shell"])
+        );
+        assert_eq!(
+            events[0]["effective_grants"]["state_stores"],
+            serde_json::json!([{
+                "artifact": "notes-tool",
+                "store": "shey",
+                "host_path": "/home/dev/.murmur/state/shey",
+            }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");
         assert_eq!(events[0]["containment_achieved"], "scoped");

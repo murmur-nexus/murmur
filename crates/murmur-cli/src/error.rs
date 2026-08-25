@@ -40,6 +40,7 @@ pub const E_CAP_005: &str = "E-CAP-005"; // host cannot give the subprocess tree
 pub const E_CAP_006: &str = "E-CAP-006"; // sealed capsule allowlists a script whose interpreter's package tree nothing declared reaches
 pub const E_CAP_007: &str = "E-CAP-007"; // exports.files.root resolves outside the capsule workdir
 pub const E_CAP_008: &str = "E-CAP-008"; // persistent capsule declares exports.peer_files without a short enough max_ttl
+pub const E_CAP_009: &str = "E-CAP-009"; // capabilities.state.store does not name a usable durable store
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -243,6 +244,25 @@ impl From<RuntimeError> for CliError {
             RuntimeError::InvalidFilesystemScope { scope, message } => CliError::new(
                 E_CAP_002,
                 format!("invalid filesystem scope '{scope}': {message}"),
+            ),
+            // Both arms are the same operator problem — a declared store that does not resolve to
+            // a usable directory — so they share one code, and both hints point at the store name
+            // and at `~/.murmur/state/`. Never at the containment ladder: a state store is not a
+            // containment shortfall, and no floor change makes one appear.
+            error @ RuntimeError::InvalidStateStore { .. } => CliError::with_hint(
+                E_CAP_009,
+                error.to_string(),
+                "capabilities.state.store names one directory under ~/.murmur/state/, so it must be a \
+                 single path segment: no '/', no '.' or '..', not absolute, and not starting \
+                 with a dot. Omit `store:` to use the capsule name — see \
+                 docs/content/reference/workdir.md",
+            ),
+            error @ RuntimeError::StateStoreUnavailable { .. } => CliError::with_hint(
+                E_CAP_009,
+                error.to_string(),
+                "a capsule declaring capabilities.state needs a resolvable home directory: run with \
+                 HOME set to an absolute path, and make sure ~/.murmur/state/ can be created as \
+                 a 0700 directory — see docs/content/reference/workdir.md",
             ),
             // Delegate the message to the RuntimeError Display text so the declared/achieved
             // pair and the missing-mechanism reason cannot drift from capsule-runtime's

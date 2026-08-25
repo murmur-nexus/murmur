@@ -177,6 +177,13 @@ pub struct CapabilityPolicy {
     /// actually installs a composed root for this session — a capsule that declared `scoped` must
     /// keep getting `scoped`'s mechanism. See `sandbox::applied_tier`.
     pub containment_floor: murmur_artifact::ContainmentClass,
+    /// Whether the capsule's own top-level `capabilities.state` block was declared.
+    ///
+    /// Not a grant, and the only field here that is not: a durable state store is granted per
+    /// *artifact*, so a capsule-wide declaration reaches nothing at all. It is recorded so
+    /// `stage_session` can say that once (`W-SEC-014`) instead of leaving an operator to discover
+    /// an empty directory, and it is read by nothing else.
+    pub state_declared: bool,
     /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
     /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
     /// above purely so hook calls can apply their own, lower default without mistaking an
@@ -384,6 +391,9 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.network.as_ref())
         .is_some_and(|network| network.unix_sockets);
 
+    // Recorded, never applied: see `CapabilityPolicy::state_declared`.
+    let state_declared = caps.is_some_and(|c| c.state.is_some());
+
     let filesystem_scope = caps
         .and_then(|c| c.filesystem.as_ref())
         .and_then(|filesystem| filesystem.scope.clone());
@@ -447,6 +457,7 @@ pub fn capability_policy_from_runtime_manifest(
         limits,
         resources,
         containment_floor: caps.and_then(|c| c.containment).unwrap_or_default(),
+        state_declared,
         declared_deadline_seconds,
     }
 }

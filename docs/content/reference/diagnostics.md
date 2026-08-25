@@ -19,6 +19,7 @@ section that explains it.
 | `E-CAP-006` | Nothing declared makes an allowlisted interpreted entrypoint's package tree reachable inside a `sealed` composed root | [E-CAP-006](#e-cap-006) |
 | `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
+| `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -74,6 +75,7 @@ section that explains it.
 | `W-SEC-011` | An executable workdir makes `capabilities.shell.allow` advisory | [W-SEC-011](#w-sec-011) |
 | `W-SEC-012` | A compiler driver's helper binaries have no `Execute` grant under `sealed` | [W-SEC-012](#w-sec-012) |
 | `W-SEC-013` | Unprivileged user namespaces are unrestricted host-wide, not granted to `mur` by the shipped AppArmor profile | [W-SEC-013](#w-sec-013) |
+| `W-SEC-014` | A capsule-wide `capabilities.state` block grants nothing — a durable store is granted per artifact | [W-SEC-014](#w-sec-014) |
 
 ---
 
@@ -289,6 +291,34 @@ persist past teardown: a consumer that needs the bytes after the capsule is gone
 operator relaunch the runtime against the same workdir and request again — see
 [The minting key](resource-plane.md#minting-key).
 
+### E-CAP-009 — `capabilities.state.store` does not name a usable store { #e-cap-009 }
+
+A [durable state store](workdir.md#state-store) is one directory under `~/.murmur/state/`, so its
+name is one path segment: non-empty, no `/`, not `.` or `..`, not beginning with `.`, and not
+absolute. Anything else names either a directory tree or somewhere outside the state root, and
+neither is a store:
+
+```text
+error[E-CAP-009]: invalid state store name '../escape': a store name is a single path segment and must not contain '/'
+  hint: capabilities.state.store names one directory under ~/.murmur/state/, so it must be a single path segment: no '/', no '.' or '..', not absolute, and not starting with a dot. Omit `store:` to use the capsule name — see docs/content/reference/workdir.md
+```
+
+The same code covers a well-formed name whose directory this host cannot supply — an unresolvable
+home directory, or a `~/.murmur/state/` that cannot be created as a `0700` directory:
+
+```text
+error[E-CAP-009]: state store 'shey' is unavailable at /home/dev/.murmur/state: failed to create the directory: File exists (os error 17)
+  hint: a capsule declaring capabilities.state needs a resolvable home directory: run with HOME set to an absolute path, and make sure ~/.murmur/state/ can be created as a 0700 directory — see docs/content/reference/workdir.md
+```
+
+Both are decided at staging, before any registry pull, workdir creation or component
+instantiation, so nothing is created under `~/.murmur/state/` and no `trace.jsonl` appears.
+`mur run --explain-scope` refuses the same declarations with the same code, so a manifest that
+would not launch does not pass the diagnostic either.
+
+Neither is a containment shortfall, and no floor change fixes one: the remedy is the store name or
+the host's home directory, never `capabilities.containment`.
+
 ---
 
 ## Build lints
@@ -435,7 +465,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013`, `W-SEC-014` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -576,8 +606,9 @@ the `CAP_MKNOD` the workdir device-node restriction exists to backstop.
 
 **Fires when:** a `runtime: hook` artifact entry's `capabilities:` block declares `shell`,
 `spawn`, `env`, `limits`, `resources` or `containment`. Per-hook grants (see
-[`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network`, `filesystem` and
-`task_io` — the other sub-blocks are structurally accepted but nothing enforces them per-hook.
+[`artifacts[].capabilities`](manifest.md#hook-capabilities)) only read `network`, `filesystem`,
+`state` and `task_io` — the other sub-blocks are structurally accepted but nothing enforces them
+per-hook.
 
 **Why it matters:** an operator who declares, say, `capabilities.shell.allow` on a hook entry
 expecting it to scope that hook's shell access would otherwise have no signal that the runtime
@@ -617,9 +648,9 @@ ceiling entry it should sit under, or delete it if the drop was what you actuall
 **Fires when:** either
 
 - a `runtime: tool`/`runtime: driver` entry's `capabilities:` block declares `shell`, `spawn`,
-  `env`, `limits`, `resources` or `containment` — per-artifact narrowing only reads `network` and
-  `filesystem` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where `task_io` is
-  honored as well); or
+  `env`, `limits`, `resources` or `containment` — a per-artifact grant only reads `network`,
+  `filesystem` and `state` ([`W-SEC-006`](#w-sec-006) is the hook-side twin of this case, where
+  `task_io` is honored as well); or
 - a `runtime: tool` entry with a **native** (non-WASM) implementation declares `capabilities:` at
   all. A native tool runs as a host subprocess under the capsule-wide shell/sandbox machinery, not
   through the WASI tool path narrowing is applied on, so the whole block is inert.
@@ -882,3 +913,40 @@ never changes a containment class and never changes an exit code.
 
 Local customisation belongs in `/etc/apparmor.d/local/mur-sealed`, which both shipped profiles
 `include if exists` and which is deliberately not hashed.
+
+---
+
+### W-SEC-014 — a capsule-wide `capabilities.state` block grants nothing { #w-sec-014 }
+
+**Fires when:** the capsule's own top-level `capabilities:` block declares `state`. Once, at
+staging, on stderr.
+
+**Why it matters:** a [durable state store](workdir.md#state-store) is granted per *artifact* — it
+is the `runtime: tool`, `runtime: driver` or `runtime: hook` entry that receives the second preopen.
+The capsule's own guest is built with no artifact grant at all, so a top-level declaration reaches
+nothing: no directory is created and no `state` path exists for anybody. Without this warning the
+only signal is a store that never appears.
+
+```text
+[capsule-runtime] warning[W-SEC-014]: capsule-wide capabilities.state is declared, but a durable state store is granted per artifact — nothing reads a top-level declaration, so no store was created and no 'state' preopen exists. Move the block onto the tool, driver or hook entry that needs it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-014)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The block is
+structurally valid, exactly as an inert `shell` block on a hook entry is
+([`W-SEC-006`](#w-sec-006)), so it is reported rather than rejected.
+
+**What to do:** move the block onto the artifact entry that needs the store —
+
+```yaml
+artifacts:
+  - name: murmur-tool-corpus
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      state:
+        store: shey
+```
+
+Two artifacts that need the same store each declare it, with the same `store:` name. There is no
+capsule-wide form: sharing a store is written once per artifact, so reading any one entry tells you
+what that artifact reaches.

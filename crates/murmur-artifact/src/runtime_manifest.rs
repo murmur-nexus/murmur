@@ -1030,6 +1030,24 @@ pub struct ResourceCapabilities {
     pub workdir_max_bytes: Option<u64>,
 }
 
+/// Durable, capsule-scoped state for one tool, driver or hook: a host directory outside every
+/// session workdir, preopened into the guest as `state/`.
+///
+/// Absent is deny — no declaration means no second preopen and no directory anywhere. The store
+/// is keyed by capsule rather than by workdir precisely so it survives a launch that gets a fresh
+/// session workdir, and so two capsules launched in the same directory never share one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StateCapabilities {
+    /// Directory name under `~/.murmur/state/`. `None` means "use the capsule name", which is
+    /// what the overwhelming majority of declarations want.
+    ///
+    /// Read from the capsule operator's own manifest entry and never from the artifact's bundled
+    /// manifest, so a registry-pulled tool cannot claim a store that already exists. The *shape*
+    /// of the name is not checked here — a store name is a runtime concern, refused as
+    /// `E-CAP-009`, exactly as `capabilities.filesystem.scope`'s shape is refused as `E-CAP-002`.
+    pub store: Option<String>,
+}
+
 // ── Containment class ─────────────────────────────────────────────────────────
 
 /// How strongly the host must contain a capsule's *subprocess* tree, declared as a floor
@@ -1149,6 +1167,9 @@ pub struct Capabilities {
     pub env: Option<EnvCapabilities>,
     pub limits: Option<ResourceLimits>,
     pub resources: Option<ResourceCapabilities>,
+    /// Durable state store for this artifact. `None` — the overwhelmingly common case — is deny:
+    /// no `state/` preopen, and no directory created anywhere. See [`StateCapabilities`].
+    pub state: Option<StateCapabilities>,
     /// Per-hook grant of the `murmur:task-io/read` host import. Only ever `Some` on a
     /// `runtime: hook` artifact entry — see [`TaskIoCapabilities`].
     pub task_io: Option<TaskIoCapabilities>,
@@ -1357,6 +1378,8 @@ struct RawCapabilities {
     #[serde(default)]
     resources: Option<RawResourceCapabilities>,
     #[serde(default)]
+    state: Option<RawStateCapabilities>,
+    #[serde(default)]
     task_io: Option<RawTaskIoCapabilities>,
     /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
     /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
@@ -1395,6 +1418,12 @@ struct RawResourceLimits {
     instances: Option<usize>,
     #[serde(default)]
     deadline_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStateCapabilities {
+    #[serde(default)]
+    store: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2197,6 +2226,8 @@ fn parse_capabilities(
         .map(parse_resource_capabilities)
         .transpose()?;
 
+    let state = raw_caps.state.map(parse_state_capabilities);
+
     let task_io = raw_caps
         .task_io
         .map(|raw_task_io| {
@@ -2236,9 +2267,25 @@ fn parse_capabilities(
         env,
         limits,
         resources,
+        state,
         task_io,
         containment,
     }))
+}
+
+/// Lower `capabilities.state`. Infallible: the only field is a name, and a name's *shape* is a
+/// runtime question (does it resolve to one directory under `~/.murmur/state/`?) rather than a
+/// manifest-parse one — `capsule_runtime::state_store::validate_store_name` answers it and refuses
+/// with `E-CAP-009`.
+///
+/// Surrounding whitespace is trimmed but an emptied value is *kept*, unlike
+/// `capabilities.filesystem.scope`, which normalises empty to absent. `store: ""` is a written
+/// declaration that names nothing, and silently defaulting it to the capsule name would hand a
+/// store to someone who asked for a different one; it reaches the runtime and is refused there.
+fn parse_state_capabilities(raw: RawStateCapabilities) -> StateCapabilities {
+    StateCapabilities {
+        store: raw.store.map(|store| store.trim().to_string()),
+    }
 }
 
 /// Lower and validate `capabilities.shell.interpreter_runtime`. Every rejection is an
@@ -2990,6 +3037,127 @@ capabilities:
         assert_eq!(resources.cgroup_cpu_percent, Some(50));
         assert_eq!(resources.cgroup_io_bytes_per_sec, Some(1_048_576));
         assert_eq!(resources.workdir_max_bytes, Some(2_097_152));
+    }
+
+    #[test]
+    fn state_block_is_optional_and_absent_stays_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: notes-tool
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      filesystem:
+        scope: cache
+"#,
+        )
+        .unwrap();
+
+        // Absent is deny: no store name to default, and nothing downstream creates a directory.
+        let caps = manifest.artifacts[0]
+            .capabilities
+            .as_ref()
+            .expect("filesystem block must parse");
+        assert_eq!(caps.state, None);
+    }
+
+    /// A declared-but-empty `state:` block is a real grant — it means "give me a store, named
+    /// after the capsule" — so it must lower to `Some(..)` with no name, distinguishable from
+    /// the absent block above.
+    #[test]
+    fn state_block_declared_empty_grants_the_capsule_named_store() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: notes-tool
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      state: {}
+"#,
+        )
+        .unwrap();
+
+        let state = manifest.artifacts[0]
+            .capabilities
+            .as_ref()
+            .and_then(|caps| caps.state.as_ref())
+            .expect("state block must parse");
+        assert_eq!(state.store, None);
+    }
+
+    #[test]
+    fn state_store_name_parses_and_stays_independently_optional() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: notes-tool
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      state:
+        store: "  shey  "
+      network:
+        allow: [https://api.example.com]
+"#,
+        )
+        .unwrap();
+
+        let caps = manifest.artifacts[0]
+            .capabilities
+            .as_ref()
+            .expect("capabilities must parse");
+        // Trimmed, but otherwise verbatim: whether the name is a usable directory segment is
+        // decided by the runtime (`E-CAP-009`), not here.
+        assert_eq!(
+            caps.state.as_ref().and_then(|state| state.store.as_deref()),
+            Some("shey")
+        );
+        // Declaring a store never touches any sibling sub-block.
+        assert_eq!(
+            caps.network
+                .as_ref()
+                .map(|network| network.allow.as_slice()),
+            Some(["https://api.example.com".to_string()].as_slice())
+        );
+        assert_eq!(caps.filesystem, None);
+    }
+
+    /// An explicitly empty name is kept rather than normalised to "default to the capsule name":
+    /// the operator wrote a name, and handing them a different store than the one they wrote
+    /// would be worse than the refusal the runtime raises for it.
+    #[test]
+    fn state_store_name_declared_empty_is_kept_for_the_runtime_to_refuse() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: notes-tool
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      state:
+        store: ""
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.artifacts[0]
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.state.as_ref())
+                .and_then(|state| state.store.as_deref()),
+            Some("")
+        );
     }
 
     #[test]

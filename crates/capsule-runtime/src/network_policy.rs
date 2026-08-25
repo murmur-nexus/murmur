@@ -1,4 +1,4 @@
-use std::path::{Component as PathComponent, Path};
+use std::path::{Component as PathComponent, Path, PathBuf};
 
 use crate::errors::RuntimeError;
 
@@ -225,10 +225,7 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
 /// `root.join(scope)` as `"."` once a grant declares a scope, and both must fail the same way
 /// (hard error naming the scope) rather than silently falling back to an unscoped preopen,
 /// which would widen the grant.
-pub(crate) fn resolve_scoped_dir(
-    root: &Path,
-    scope: &str,
-) -> Result<std::path::PathBuf, RuntimeError> {
+pub(crate) fn resolve_scoped_dir(root: &Path, scope: &str) -> Result<PathBuf, RuntimeError> {
     let scoped_dir = root.join(scope);
     std::fs::create_dir_all(&scoped_dir).map_err(|err| {
         RuntimeError::wasi(
@@ -260,6 +257,14 @@ pub(crate) struct HookCapabilityGrant {
     /// `murmur:task-io/read` host import. `false` = the import still links and every one of
     /// its functions returns `not-granted`.
     pub(crate) task_io_read: bool,
+    /// Resolved, validated `capabilities.state.store` name, with the capsule-name default already
+    /// applied. `None` = no `capabilities.state` block, so no durable store of any kind.
+    pub(crate) state_store: Option<String>,
+    /// Host path of the created store directory, filled by the staging path once
+    /// [`crate::state_store::ensure_state_store`] has made it. Left `None` by [`Self::derive`],
+    /// which stays pure — the same division [`ToolCapabilityGrant::dropped_network_entries`]
+    /// already uses, where lowering is unit-testable and only staging touches the filesystem.
+    pub(crate) state_dir: Option<PathBuf>,
 }
 
 impl HookCapabilityGrant {
@@ -268,11 +273,15 @@ impl HookCapabilityGrant {
     /// surfacing as a confusing denial once the hook is already running.
     ///
     /// `None` (no block declared) yields [`HookCapabilityGrant::default`] — full
-    /// default-deny. Only `network`, `filesystem` and `task_io` are read; the other
+    /// default-deny. Only `network`, `filesystem`, `state` and `task_io` are read; the other
     /// sub-blocks a [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns
     /// that a per-hook grant does not reach.
+    ///
+    /// `capsule_name` is what an undeclared `capabilities.state.store` defaults to. It is the
+    /// operator's own capsule name, on the same sourcing rule as the block itself.
     pub(crate) fn derive(
         capabilities: Option<&murmur_artifact::Capabilities>,
+        capsule_name: &str,
     ) -> Result<Self, RuntimeError> {
         let Some(capabilities) = capabilities else {
             return Ok(Self::default());
@@ -298,8 +307,28 @@ impl HookCapabilityGrant {
                 .task_io
                 .as_ref()
                 .is_some_and(|task_io| task_io.read),
+            state_store: derive_state_store(capabilities, capsule_name)?,
+            state_dir: None,
         })
     }
+}
+
+/// Resolve and validate the store name a `capabilities:` block asks for, applying the capsule-name
+/// default. `None` when the block declares no `state`, which is deny.
+///
+/// Shared by both grants because the rule is one rule: the name comes from the capsule operator's
+/// own manifest entry, the default is the operator's capsule name, and a name that is not a single
+/// usable path segment fails staging rather than surfacing later as a confusing denial.
+fn derive_state_store(
+    capabilities: &murmur_artifact::Capabilities,
+    capsule_name: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let Some(state) = capabilities.state.as_ref() else {
+        return Ok(None);
+    };
+    let store = crate::state_store::resolve_store_name(state, capsule_name);
+    crate::state_store::validate_store_name(&store)?;
+    Ok(Some(store))
 }
 
 /// One tool's or driver's capability grant, lowered from the **capsule operator's own**
@@ -326,6 +355,17 @@ pub(crate) struct ToolCapabilityGrant {
     /// (rather than warned about in `derive`) so lowering stays pure and unit-testable; the
     /// staging path turns a non-empty list into a `W-SEC-007` warning.
     pub(crate) dropped_network_entries: Vec<String>,
+    /// Resolved, validated `capabilities.state.store` name, with the capsule-name default already
+    /// applied. `None` = no `capabilities.state` block, so no durable store of any kind.
+    ///
+    /// The one axis on which a per-artifact block *widens* rather than narrows, and it can only
+    /// ever open one directory the capsule ceiling does not otherwise reach — never a workdir
+    /// path, and never another capsule's store.
+    pub(crate) state_store: Option<String>,
+    /// Host path of the created store directory, filled by the staging path once
+    /// [`crate::state_store::ensure_state_store`] has made it. Left `None` by [`Self::derive`],
+    /// which stays pure, on the same terms as `dropped_network_entries` above.
+    pub(crate) state_dir: Option<PathBuf>,
 }
 
 impl ToolCapabilityGrant {
@@ -335,12 +375,18 @@ impl ToolCapabilityGrant {
     /// staging instead of surfacing as a confusing denial mid-run.
     ///
     /// `None` (no block declared) yields [`ToolCapabilityGrant::default`] — inherit the
-    /// ceiling wholesale. Only `network` and `filesystem` are read; the other sub-blocks a
-    /// [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that
-    /// per-artifact narrowing does not reach (the caller warns `W-SEC-008` for those).
+    /// ceiling wholesale. Only `network`, `filesystem` and `state` are read; the other sub-blocks
+    /// a [`murmur_artifact::Capabilities`] can carry govern capsule-wide concerns that a
+    /// per-artifact grant does not reach (the caller warns `W-SEC-008` for those).
+    ///
+    /// `state` is the one member of that set that widens rather than narrows, which is why the
+    /// type's name is the only thing here still saying "narrowing": it opens one directory outside
+    /// every workdir and touches nothing the ceiling governs. `capsule_name` is what an undeclared
+    /// `capabilities.state.store` defaults to.
     pub(crate) fn derive(
         capabilities: Option<&murmur_artifact::Capabilities>,
         ceiling_network_allow_rules: &[NetworkAllowRule],
+        capsule_name: &str,
     ) -> Result<Self, RuntimeError> {
         let Some(capabilities) = capabilities else {
             return Ok(Self::default());
@@ -378,6 +424,8 @@ impl ToolCapabilityGrant {
             network_allow_rules,
             filesystem_scope,
             dropped_network_entries,
+            state_store: derive_state_store(capabilities, capsule_name)?,
+            state_dir: None,
         })
     }
 }
@@ -423,6 +471,7 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            state: None,
             task_io: None,
             containment: None,
         }
@@ -432,7 +481,7 @@ mod tests {
     /// `NetworkPolicyHooks` denies every request) and no scope (so nothing is preopened).
     #[test]
     fn hook_grant_defaults_to_deny_network_and_filesystem() {
-        let grant = HookCapabilityGrant::derive(None).unwrap();
+        let grant = HookCapabilityGrant::derive(None, "test-capsule").unwrap();
 
         assert_eq!(grant, HookCapabilityGrant::default());
         assert!(grant.network_allow_rules.is_empty());
@@ -453,7 +502,9 @@ mod tests {
     /// the key must not, by itself, widen anything.
     #[test]
     fn hook_grant_empty_capabilities_block_grants_nothing() {
-        let grant = HookCapabilityGrant::derive(Some(&capabilities_block(None, None))).unwrap();
+        let grant =
+            HookCapabilityGrant::derive(Some(&capabilities_block(None, None)), "test-capsule")
+                .unwrap();
 
         assert_eq!(grant, HookCapabilityGrant::default());
     }
@@ -461,7 +512,7 @@ mod tests {
     #[test]
     fn hook_grant_network_allows_exactly_the_declared_host() {
         let caps = capabilities_block(Some(vec!["https://telemetry.example.com"]), None);
-        let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+        let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
 
         let allowed = RequestTarget {
             scheme: "https".to_string(),
@@ -489,7 +540,7 @@ mod tests {
     #[test]
     fn hook_grant_filesystem_scope_is_carried_through() {
         let caps = capabilities_block(None, Some("hook-state"));
-        let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+        let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
 
         assert_eq!(grant.filesystem_scope.as_deref(), Some("hook-state"));
         // A filesystem grant alone never widens the network.
@@ -505,18 +556,104 @@ mod tests {
                 task_io: declared.map(|read| murmur_artifact::TaskIoCapabilities { read }),
                 ..capabilities_block(None, None)
             };
-            let grant = HookCapabilityGrant::derive(Some(&caps)).unwrap();
+            let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
             assert_eq!(grant.task_io_read, expected, "declared: {declared:?}");
             assert!(grant.network_allow_rules.is_empty());
             assert!(grant.filesystem_scope.is_none());
         }
     }
 
+    /// The store name defaults to the capsule's, and an explicit `store:` wins. Applied where the
+    /// grant is lowered, so a report and a preopen can never name different directories.
+    #[test]
+    fn state_store_defaults_to_the_capsule_name_and_an_explicit_name_wins() {
+        for (declared, expected) in [(None, "state-capsule"), (Some("shey"), "shey")] {
+            let caps = Capabilities {
+                state: Some(murmur_artifact::StateCapabilities {
+                    store: declared.map(str::to_string),
+                }),
+                ..capabilities_block(None, None)
+            };
+
+            let hook = HookCapabilityGrant::derive(Some(&caps), "state-capsule").unwrap();
+            let tool =
+                ToolCapabilityGrant::derive(Some(&caps), &ceiling(), "state-capsule").unwrap();
+
+            assert_eq!(hook.state_store.as_deref(), Some(expected));
+            assert_eq!(tool.state_store.as_deref(), Some(expected));
+            // `derive` stays pure: the directory is made by the staging path, not here.
+            assert!(hook.state_dir.is_none());
+            assert!(tool.state_dir.is_none());
+            // A state grant alone widens nothing else.
+            assert!(hook.filesystem_scope.is_none());
+            assert!(hook.network_allow_rules.is_empty());
+            assert!(tool.filesystem_scope.is_none());
+            assert!(tool.network_allow_rules.is_none());
+        }
+    }
+
+    /// Absent `capabilities.state` is deny for both roles, including on a block that declares
+    /// other things — declaring the key is what grants a store, never declaring the block.
+    #[test]
+    fn an_absent_state_block_grants_no_store_to_either_role() {
+        let caps = capabilities_block(Some(vec!["https://api.example.com"]), Some("cache"));
+
+        assert!(HookCapabilityGrant::derive(Some(&caps), "state-capsule")
+            .unwrap()
+            .state_store
+            .is_none());
+        assert!(
+            ToolCapabilityGrant::derive(Some(&caps), &ceiling(), "state-capsule")
+                .unwrap()
+                .state_store
+                .is_none()
+        );
+    }
+
+    /// A malformed store name fails lowering, so it fails staging — never a confusing denial once
+    /// a guest is already running. Refused identically for a hook and for a tool.
+    #[test]
+    fn a_malformed_store_name_fails_lowering_for_both_roles() {
+        for store in ["../escape", "/abs/path", "a/b", "", ".hidden"] {
+            let caps = Capabilities {
+                state: Some(murmur_artifact::StateCapabilities {
+                    store: Some(store.to_string()),
+                }),
+                ..capabilities_block(None, None)
+            };
+
+            for err in [
+                HookCapabilityGrant::derive(Some(&caps), "state-capsule").unwrap_err(),
+                ToolCapabilityGrant::derive(Some(&caps), &ceiling(), "state-capsule").unwrap_err(),
+            ] {
+                assert!(
+                    matches!(err, RuntimeError::InvalidStateStore { .. }),
+                    "store '{store}' must refuse as InvalidStateStore, got: {err}"
+                );
+            }
+        }
+    }
+
+    /// An empty capsule name is not a usable store name either, so a capsule that somehow has one
+    /// is refused rather than silently given `~/.murmur/state/`.
+    #[test]
+    fn an_empty_capsule_name_cannot_become_a_store_name() {
+        let caps = Capabilities {
+            state: Some(murmur_artifact::StateCapabilities { store: None }),
+            ..capabilities_block(None, None)
+        };
+
+        assert!(matches!(
+            ToolCapabilityGrant::derive(Some(&caps), &ceiling(), ""),
+            Err(RuntimeError::InvalidStateStore { .. })
+        ));
+    }
+
     #[test]
     fn hook_grant_rejects_escaping_filesystem_scope() {
         for scope in ["../escape", "/etc"] {
             let caps = capabilities_block(None, Some(scope));
-            let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
+            let err = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap_err();
             assert!(
                 matches!(err, RuntimeError::InvalidFilesystemScope { .. }),
                 "scope {scope} should fail staging, got: {err}"
@@ -527,7 +664,7 @@ mod tests {
     #[test]
     fn hook_grant_rejects_malformed_network_entry() {
         let caps = capabilities_block(Some(vec!["ftp://files.example.com"]), None);
-        let err = HookCapabilityGrant::derive(Some(&caps)).unwrap_err();
+        let err = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap_err();
 
         assert!(
             matches!(err, RuntimeError::InvalidNetworkAllowEntry { .. }),
@@ -562,7 +699,7 @@ mod tests {
     #[test]
     fn tool_grant_without_entry_inherits_the_ceiling_unchanged() {
         let ceiling = ceiling();
-        let grant = ToolCapabilityGrant::derive(None, &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(None, &ceiling, "test-capsule").unwrap();
 
         assert_eq!(grant, ToolCapabilityGrant::default());
         assert!(grant.network_allow_rules.is_none());
@@ -580,7 +717,7 @@ mod tests {
     fn tool_grant_subset_of_ceiling_is_kept_and_narrows() {
         let ceiling = ceiling();
         let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         let effective = effective_tool_network_rules(Some(&grant), &ceiling);
         assert!(reaches(effective, "api.example.com"));
@@ -597,7 +734,7 @@ mod tests {
             Some(vec!["https://api.example.com", "https://evil.example.com"]),
             None,
         );
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         let effective = effective_tool_network_rules(Some(&grant), &ceiling);
         assert!(reaches(effective, "api.example.com"));
@@ -614,7 +751,7 @@ mod tests {
     fn tool_grant_entry_broader_than_the_ceiling_rule_is_dropped() {
         let ceiling = ceiling();
         let caps = capabilities_block(Some(vec!["api.example.com"]), None);
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         assert_eq!(grant.network_allow_rules.as_deref(), Some(&[][..]));
         assert_eq!(
@@ -629,7 +766,7 @@ mod tests {
     fn tool_grant_empty_network_allow_denies_all_for_that_artifact() {
         let ceiling = ceiling();
         let caps = capabilities_block(Some(vec![]), None);
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         let effective = effective_tool_network_rules(Some(&grant), &ceiling);
         assert!(effective.is_empty());
@@ -643,7 +780,7 @@ mod tests {
     fn tool_grant_filesystem_scope_is_carried_and_leaves_network_inherited() {
         let ceiling = ceiling();
         let caps = capabilities_block(None, Some("cache"));
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         assert_eq!(grant.filesystem_scope.as_deref(), Some("cache"));
         assert!(grant.network_allow_rules.is_none());
@@ -657,7 +794,8 @@ mod tests {
     fn tool_grant_rejects_escaping_filesystem_scope() {
         for scope in ["../escape", "/etc"] {
             let caps = capabilities_block(None, Some(scope));
-            let err = ToolCapabilityGrant::derive(Some(&caps), &ceiling()).unwrap_err();
+            let err =
+                ToolCapabilityGrant::derive(Some(&caps), &ceiling(), "test-capsule").unwrap_err();
             assert!(
                 matches!(err, RuntimeError::InvalidFilesystemScope { .. }),
                 "scope {scope} should fail staging, got: {err}"
@@ -668,7 +806,7 @@ mod tests {
     #[test]
     fn tool_grant_rejects_malformed_network_entry() {
         let caps = capabilities_block(Some(vec!["ftp://files.example.com"]), None);
-        let err = ToolCapabilityGrant::derive(Some(&caps), &ceiling()).unwrap_err();
+        let err = ToolCapabilityGrant::derive(Some(&caps), &ceiling(), "test-capsule").unwrap_err();
 
         assert!(
             matches!(err, RuntimeError::InvalidNetworkAllowEntry { .. }),
@@ -681,7 +819,7 @@ mod tests {
     #[test]
     fn tool_grant_cannot_widen_an_empty_ceiling() {
         let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &[]).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &[], "test-capsule").unwrap();
 
         assert_eq!(grant.network_allow_rules.as_deref(), Some(&[][..]));
         assert_eq!(
@@ -695,7 +833,7 @@ mod tests {
     fn ceiling_rule_with_wildcard_scheme_covers_a_scheme_bound_rule() {
         let ceiling = parse_network_allow_rules(&["api.example.com".to_string()]).unwrap();
         let caps = capabilities_block(Some(vec!["https://api.example.com"]), None);
-        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling).unwrap();
+        let grant = ToolCapabilityGrant::derive(Some(&caps), &ceiling, "test-capsule").unwrap();
 
         assert!(grant.dropped_network_entries.is_empty());
         assert!(reaches(

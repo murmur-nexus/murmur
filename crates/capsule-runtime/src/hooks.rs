@@ -29,6 +29,7 @@ use crate::{
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
     network_policy::{resolve_scoped_dir, HookCapabilityGrant},
     runtime::NetworkPolicyHooks,
+    state_store::STATE_PREOPEN_NAME,
     task_io_import::{add_task_io_to_linker, TaskIoState},
     types::StagedHookArtifact,
 };
@@ -1548,6 +1549,11 @@ async fn run_async_hook_worker(
 ///   non-escaping) by `HookCapabilityGrant::derive` at staging time; it is created here if it
 ///   does not exist, and a creation failure fails the instantiation rather than silently
 ///   downgrading to no access.
+/// - **Durable state.** A second, independent preopen at [`STATE_PREOPEN_NAME`], added only when
+///   `grant.state_dir` names one — the host store `capabilities.state` granted, already created at
+///   `0700` by the staging path and outside every workdir. The two filesystem axes do not imply
+///   each other in either direction: a hook may hold a durable store with no project directory at
+///   all, which is exactly what a hook that only appends to its own log wants.
 ///
 /// `root_dir` is the hook's working directory: the session dir for `on-stage`, the project
 /// directory for blocking and async hooks.
@@ -1583,6 +1589,17 @@ fn build_wasi_ctx(
         builder
             .preopened_dir(&scoped_dir, ".", DirPerms::all(), FilePerms::all())
             .map_err(|err| RuntimeError::wasi(scoped_dir, err.to_string()))?;
+    }
+
+    if let Some(state_dir) = grant.state_dir.as_deref() {
+        builder
+            .preopened_dir(
+                state_dir,
+                STATE_PREOPEN_NAME,
+                DirPerms::all(),
+                FilePerms::all(),
+            )
+            .map_err(|err| RuntimeError::wasi(state_dir.to_path_buf(), err.to_string()))?;
     }
 
     Ok(builder.build())
@@ -3153,6 +3170,8 @@ mod tests {
                 network_allow_rules: Vec::new(),
                 filesystem_scope: None,
                 task_io_read,
+                state_store: None,
+                state_dir: None,
             },
             ..staged_double_named(name, binding, component)
         }
@@ -3342,10 +3361,11 @@ mod tests {
             env: None,
             limits: None,
             resources: None,
+            state: None,
             task_io: None,
             containment: None,
         };
-        HookCapabilityGrant::derive(Some(&caps)).expect("grant is valid")
+        HookCapabilityGrant::derive(Some(&caps), "test-capsule").expect("grant is valid")
     }
 
     /// A hook store built exactly as the three instantiation sites build one, so the
@@ -3449,6 +3469,85 @@ mod tests {
         assert!(
             !missing.exists(),
             "default-deny must not create the working directory either"
+        );
+        // Unchanged by the state axis: the default grant names no store, so nothing was added.
+        assert!(HookCapabilityGrant::default().state_dir.is_none());
+    }
+
+    /// Both filesystem axes at once: the granted project subtree *and* the durable store. Two
+    /// preopens, mounted at two guest paths, from two host trees that need not be related.
+    #[test]
+    fn a_hook_granted_scope_and_state_preopens_both() {
+        let root = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        std::fs::write(state.path().join("cursor.json"), b"{\"seen\":7}").unwrap();
+
+        let mut grant = grant_of(None, Some("hook-state"));
+        grant.state_store = Some("hook-store".to_string());
+        grant.state_dir = Some(state.path().to_path_buf());
+
+        build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant)
+            .expect("both preopens are built");
+
+        // The scoped subtree is created under the hook's own root, as before.
+        assert!(root.path().join("hook-state").is_dir());
+        // The store is a separate host tree, untouched and outside that root.
+        assert!(!state.path().starts_with(root.path()));
+        assert_eq!(
+            std::fs::read_to_string(state.path().join("cursor.json")).unwrap(),
+            "{\"seen\":7}"
+        );
+    }
+
+    /// A hook may hold durable state without being handed the project directory: exactly one
+    /// preopen, and it is the store. Observable because `preopened_dir` requires its target to
+    /// exist — a context rooted at a path that does not exist can only build if the workdir
+    /// preopen was never attempted.
+    #[test]
+    fn a_hook_granted_state_but_no_scope_preopens_only_the_store() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("does-not-exist");
+        let state = TempDir::new().unwrap();
+
+        let grant = HookCapabilityGrant {
+            state_store: Some("hook-store".to_string()),
+            state_dir: Some(state.path().to_path_buf()),
+            ..HookCapabilityGrant::default()
+        };
+
+        build_wasi_ctx(&missing, &HookEnvVars::default(), &grant)
+            .expect("a state grant alone does not preopen the hook's working directory");
+
+        assert!(
+            !missing.exists(),
+            "a state grant must not create the working directory"
+        );
+    }
+
+    /// The state preopen is really attempted, not merely configured: `preopened_dir` requires its
+    /// target to exist, so a store directory that is missing fails the build. This is what makes
+    /// the two tests above assertions about preopens rather than about `Ok(())`.
+    ///
+    /// The staging path creates the store before building any context, so this state is
+    /// unreachable in a real run — it is here to pin the observation the other tests rest on.
+    #[test]
+    fn a_missing_state_directory_fails_the_build() {
+        let root = TempDir::new().unwrap();
+        let absent = root.path().join("no-such-store");
+
+        let grant = HookCapabilityGrant {
+            state_store: Some("hook-store".to_string()),
+            state_dir: Some(absent.clone()),
+            ..HookCapabilityGrant::default()
+        };
+
+        let err = match build_wasi_ctx(root.path(), &HookEnvVars::default(), &grant) {
+            Ok(_) => panic!("a missing store directory must fail the build"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no-such-store"),
+            "the error must name the path: {err}"
         );
     }
 
@@ -3684,9 +3783,11 @@ artifacts:
 "#,
         )
         .unwrap();
-        let grant =
-            HookCapabilityGrant::derive(operator_manifest.artifacts[0].capabilities.as_ref())
-                .unwrap();
+        let grant = HookCapabilityGrant::derive(
+            operator_manifest.artifacts[0].capabilities.as_ref(),
+            "test-capsule",
+        )
+        .unwrap();
 
         assert_eq!(
             grant,

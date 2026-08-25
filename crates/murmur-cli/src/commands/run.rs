@@ -7,8 +7,8 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, explain_scope, launch_session, stage_session,
-    AfterTask, ArtifactRequest, LifecycleOverride, LockExpectation, RuntimeError, StageRequest,
-    TaskAcceptance,
+    state_store_reports, AfterTask, ArtifactRequest, LifecycleOverride, LockExpectation,
+    RuntimeError, StageRequest, TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
@@ -141,10 +141,24 @@ pub(crate) fn run_run(
     // 0. Placed ahead of every side effect — no PATH pre-flight, no registry, no workdir, no
     // staging — so it stays fast and read-only.
     if explain_scope_only {
+        // Resolved from the manifest's own artifact entries, with `runtime_manifest.name` as the
+        // store default — the same inputs, and the same resolver, `stage_session` uses, so the
+        // report describes the launch rather than offering a second opinion about it. Resolution
+        // creates nothing, so `--explain-scope` stays read-only; a malformed store name still
+        // refuses here, exactly as it would refuse a real run.
+        let state_stores = state_store_reports(
+            runtime_manifest
+                .artifacts
+                .iter()
+                .map(|artifact| (artifact.name.as_str(), artifact.capabilities.as_ref())),
+            &runtime_manifest.name,
+        )
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
             runtime_manifest.exports.as_ref(),
+            state_stores,
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
