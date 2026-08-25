@@ -144,10 +144,7 @@ pub(crate) fn run_run(
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
-            runtime_manifest
-                .exports
-                .as_ref()
-                .and_then(|exports| exports.files.as_ref()),
+            runtime_manifest.exports.as_ref(),
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {

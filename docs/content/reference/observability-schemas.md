@@ -32,7 +32,7 @@ the session directory) and `timestamp` (Unix milliseconds).
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself |
 | `system_prompt` | string | The resolved prompt verbatim. Written **only** when the manifest sets `trace.include_tool_output: true`; omitted otherwise, on the same terms as tool output text. Omitted regardless when no prompt was in effect |
-| `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants` and `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)). Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
+| `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)) and `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)). Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
 
 **`inference`** — written after each driver response is parsed
 
@@ -210,6 +210,53 @@ or refused
 
 Both events are written at the moment of the request rather than at a task boundary, so a read of a
 finished-but-alive capsule is recorded after that session's `session_end`.
+
+**`peer_handle_mint`** — written by the `share-file` tool when a
+[peer-file handle](resource-plane.md#peer-plane) is minted or refused
+
+| Field | Type | Notes |
+|---|---|---|
+| `handle_id` | string \| null | First 16 lowercase hex characters of `sha256(<token>)`. `null` on any non-`ok` outcome — a refused mint produced no token |
+| `path` | string | Relative to `exports.peer_files.root`, canonicalised on `"ok"`, and as the agent asked for it on a refusal. Never a host path |
+| `audience` | string | `<peer name>@<host:port>`, lowercased. Empty when the peer's agent card could not be read |
+| `expires_at_ms` | u64 \| null | Absolute expiry, Unix milliseconds. `null` on any non-`ok` outcome |
+| `outcome` | string | `"ok"`, `"peer_unreachable"`, or the [error code](resource-plane.md#redeem) the mint was refused with |
+| `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
+
+**`peer_handle_redeem`** — written by the listener when `GET /resources/peer/<handle>` is answered,
+served or refused
+
+| Field | Type | Notes |
+|---|---|---|
+| `handle_id` | string | As above. Always present: it is derived from the token as presented, whatever the token turns out to be |
+| `path` | string \| null | The handle's path relative to `exports.peer_files.root`. `null` until the MAC has verified — a payload that failed it is caller-controlled and is not recorded as fact |
+| `generation` | u64 | The runtime's own counter at the moment of the request, never a value taken from the token |
+| `audience_asserted` | string \| null | The `x-murmur-audience` header exactly as asserted. `null` when none was sent |
+| `bytes` | u64 \| null | Bytes served. `null` on any non-`ok` outcome |
+| `sha256` | string \| null | SHA-256 (lowercase hex) of the bytes served — the same value as the response's `etag`. `null` on any non-`ok` outcome |
+| `outcome` | string | `"ok"`, or the [error code](resource-plane.md#redeem) the caller received |
+| `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
+
+**`peer_file_fetch`** — written by the `fetch-peer-file` tool on the ingesting side, served or
+refused
+
+| Field | Type | Notes |
+|---|---|---|
+| `peer` | string | The peer address the tool was given |
+| `handle_id` | string | As above. Equal to the minting capsule's `handle_id` for the same handle |
+| `stored_path` | string \| null | Where the bytes landed, relative to the accessible workdir. `null` on any non-`ok` outcome |
+| `bytes` | u64 \| null | Bytes stored. `null` on any non-`ok` outcome |
+| `sha256` | string \| null | SHA-256 (lowercase hex) of the bytes stored. `null` on any non-`ok` outcome |
+| `outcome` | string | `"ok"`, `"peer_not_allowed"`, `"peer_unreachable"`, `"etag_mismatch"`, `"io_error"`, or the peer's own [error code](resource-plane.md#redeem) |
+| `reason` | string \| null | `null` on `"ok"`; one sentence otherwise |
+
+`peer_handle_mint` and `peer_file_fetch` come from the agent loop; `peer_handle_redeem` is written
+by the listener, concurrently with any running task. All three are written at the moment of the
+event.
+
+**The handle itself never appears in a trace, on either side.** Where a token would otherwise reach
+one — most obviously as the recorded `handle` argument of a `fetch-peer-file` `tool_call` — it is
+replaced with `<handle:<handle_id>>`.
 
 **Guarantees:**
 

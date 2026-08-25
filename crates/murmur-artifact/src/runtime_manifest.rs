@@ -510,6 +510,11 @@ pub struct Exports {
     /// The declared read-only file surface. `None` — an `exports:` block with no `files:` —
     /// means the resource plane is not declared and every request to it is denied.
     pub files: Option<FileExport>,
+    /// The declared peer-handoff surface. A separate authoriser from [`Self::files`], over a
+    /// separate subtree: declaring one grants nothing about the other, and a capsule may declare
+    /// either, both or neither. `None` means the capsule mints no handles and its peer plane
+    /// answers `no_peer_plane`.
+    pub peer_files: Option<PeerFilesExport>,
 }
 
 /// The `exports.files` block: one subtree of the workdir, readable and nothing else.
@@ -530,6 +535,108 @@ pub struct FileExport {
     /// aggregate budget: each file is judged on its own size, and a subtree whose total exceeds
     /// this is still listed in full.
     pub max_bytes: u64,
+}
+
+/// Handle lifetime applied when `exports.peer_files.max_ttl` is absent and the capsule is
+/// ephemeral (`lifecycle.after_task: exit`): 1h.
+pub const DEFAULT_PEER_HANDLE_TTL_SECS: u64 = 3600;
+
+/// The largest `exports.peer_files.max_ttl` a *persistent* capsule
+/// (`lifecycle.after_task: sleep`) may declare: 15m.
+///
+/// An ephemeral capsule needs no ceiling because teardown destroys the minting key and with it
+/// every outstanding handle. A persistent one has withdrawn that bound, so the declared lifetime
+/// becomes the only one — and a handle is not a durability mechanism. Enforced by the runtime,
+/// not here, because the rule reads `lifecycle.after_task` and this parser sees one block at a
+/// time.
+pub const PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS: u64 = 900;
+
+/// Per-file read ceiling applied when `exports.peer_files.max_bytes` is absent: 10Mi.
+pub const DEFAULT_PEER_FILES_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// The `exports.peer_files` block: the one subtree a `share-file` handle may name.
+///
+/// Deliberately not a mode of [`FileExport`]. The operator plane addresses files by path and
+/// enumerates them; this plane has no `list` verb and no path addressing at all, and its audience
+/// is another capsule rather than the operator. Two authorisers over two subtrees, so opening one
+/// never widens the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerFilesExport {
+    /// Subtree of the capsule's accessible workdir a handle may name, verbatim as declared
+    /// (`out/`). Relative, non-empty and free of `..`, checked here; resolving it against a real
+    /// directory belongs to the runtime. Not required to exist when the capsule launches.
+    pub root: String,
+    /// The declared `max_ttl`, in seconds, or `None` when the manifest declared none.
+    ///
+    /// Kept undefaulted because the two ephemerality cases answer an absent value differently:
+    /// an ephemeral capsule falls back to [`DEFAULT_PEER_HANDLE_TTL_SECS`], and a persistent one
+    /// refuses to launch. Substituting the default here would erase the difference before
+    /// anything could act on it. See [`Self::effective_max_ttl_secs`].
+    pub max_ttl_secs: Option<u64>,
+    /// Per-file ceiling on a redeemed read, defaulting to [`DEFAULT_PEER_FILES_MAX_BYTES`].
+    /// Per file, never an aggregate budget — the same terms as [`FileExport::max_bytes`], and a
+    /// separate value from it.
+    pub max_bytes: u64,
+}
+
+impl PeerFilesExport {
+    /// The handle lifetime ceiling this export actually applies: the declared `max_ttl`, or the
+    /// ephemeral default when none was declared.
+    ///
+    /// Correct for a persistent capsule too, because one that declared no `max_ttl` never
+    /// launches — the runtime refuses it before a plane is built.
+    pub fn effective_max_ttl_secs(&self) -> u64 {
+        self.max_ttl_secs.unwrap_or(DEFAULT_PEER_HANDLE_TTL_SECS)
+    }
+}
+
+/// The `capabilities.peer_fetch` block: which peers this capsule may redeem a handle against.
+///
+/// A sibling of [`NetworkCapabilities`] rather than a member of it. Fetching a peer's bytes lands
+/// a file in this capsule's own workdir, so it is an ingestion path and a prompt-injection
+/// surface, and it gets its own operator control. Declaring a destination here does not widen
+/// `capabilities.network.allow`, and a destination allowed there is not redeemable unless it is
+/// also named here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerFetchCapabilities {
+    /// Network destinations a handle may be redeemed against. Required and non-empty when the
+    /// block is present: an empty list is a parse error, never a silent deny. Same syntax as
+    /// `capabilities.network.allow`, and matched by the same runtime rule matcher.
+    pub allow: Vec<String>,
+}
+
+/// The accepted spelling of every duration in the manifest, stated once so the parser and the
+/// error it produces cannot drift apart.
+pub const DURATION_ACCEPTED_FORM: &str =
+    "must be a duration: an integer, optionally suffixed s/m/h";
+
+/// Parses `90`, `30s`, `15m`, `1h` into a whole number of seconds.
+///
+/// A bare integer is seconds. Suffixes are lowercase and single-character; `5 minutes` and `30S`
+/// are rejected rather than guessed at, on the same terms as [`parse_byte_size`]. Returns the
+/// accepted-form sentence as its error so every call site reports the same rule.
+pub fn parse_duration_secs(input: &str) -> Result<u64, String> {
+    let trimmed = input.trim();
+    let (digits, multiplier) = match trimmed.strip_suffix('s') {
+        Some(digits) => (digits, 1u64),
+        None => match trimmed.strip_suffix('m') {
+            Some(digits) => (digits, 60),
+            None => match trimmed.strip_suffix('h') {
+                Some(digits) => (digits, 3600),
+                None => (trimmed, 1),
+            },
+        },
+    };
+    // Not trimmed again: the whole input was trimmed above, so a space surviving here is *inside*
+    // the value (`5 minutes`, `30 m`), which is not a spelling this accepts.
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("'{input}' {DURATION_ACCEPTED_FORM}"));
+    }
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| format!("'{input}' overflows a 64-bit second count"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,6 +1140,9 @@ pub fn effective_containment_floor(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub network: Option<NetworkCapabilities>,
+    /// Which peers this capsule may redeem a peer-file handle against. `None` means no
+    /// `fetch-peer-file` tool exists and nothing can be fetched — absent is deny.
+    pub peer_fetch: Option<PeerFetchCapabilities>,
     pub filesystem: Option<FilesystemCapabilities>,
     pub shell: Option<ShellCapabilities>,
     pub spawn: Option<SpawnCapabilities>,
@@ -1123,6 +1233,21 @@ struct RawRuntimeManifest {
 struct RawExports {
     #[serde(default)]
     files: Option<RawFileExport>,
+    #[serde(default)]
+    peer_files: Option<RawPeerFilesExport>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPeerFilesExport {
+    #[serde(default)]
+    root: Option<String>,
+    /// Untyped for the same reason as [`RawFileExport::max_bytes`]: `30m` is a YAML string and a
+    /// bare `1800` is a YAML integer, and a wrong-shaped value has to reach the parser to be
+    /// reported as an [`RuntimeManifestError::InvalidExports`] naming the field.
+    #[serde(default)]
+    max_ttl: Option<serde_yaml::Value>,
+    #[serde(default)]
+    max_bytes: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1218,6 +1343,8 @@ struct RawCapabilities {
     #[serde(default)]
     network: Option<RawNetworkCapabilities>,
     #[serde(default)]
+    peer_fetch: Option<RawPeerFetchCapabilities>,
+    #[serde(default)]
     filesystem: Option<RawFilesystemCapabilities>,
     #[serde(default)]
     shell: Option<RawShellCapabilities>,
@@ -1300,6 +1427,12 @@ struct RawNetworkCapabilities {
     allow: Vec<String>,
     #[serde(default)]
     unix_sockets: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPeerFetchCapabilities {
+    #[serde(default)]
+    allow: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1720,7 +1853,123 @@ fn parse_exports(raw: Option<RawExports>) -> Result<Option<Exports>, RuntimeMani
         return Ok(None);
     };
     let files = raw_exports.files.map(parse_file_export).transpose()?;
-    Ok(Some(Exports { files }))
+    let peer_files = raw_exports
+        .peer_files
+        .map(parse_peer_files_export)
+        .transpose()?;
+    Ok(Some(Exports { files, peer_files }))
+}
+
+/// Lowers `exports.peer_files`, on exactly the same terms as [`parse_file_export`]: a root that
+/// could name somewhere outside the workdir is refused here and never repaired later.
+///
+/// `max_ttl` is left as the operator declared it, including absent. Whether absent is legal
+/// depends on `lifecycle.after_task`, which is a different block of the same manifest and a
+/// different kind of question — one about what survives teardown rather than about whether a
+/// value is well-formed. The runtime asks it, at launch, and refuses with `E-CAP-008`.
+fn parse_peer_files_export(
+    raw: RawPeerFilesExport,
+) -> Result<PeerFilesExport, RuntimeManifestError> {
+    let invalid = |field: &str, message: String| RuntimeManifestError::InvalidExports {
+        field: field.to_string(),
+        message,
+    };
+
+    let root = raw
+        .root
+        .map(|root| root.trim().to_string())
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| {
+            invalid(
+                "exports.peer_files.root",
+                format!("is required and {EXPORT_ROOT_ACCEPTED_FORM}"),
+            )
+        })?;
+    check_export_root_shape("exports.peer_files.root", &root)?;
+
+    let max_ttl_secs = match raw.max_ttl {
+        None => None,
+        Some(value) => {
+            let text = scalar_text(&value).ok_or_else(|| {
+                invalid(
+                    "exports.peer_files.max_ttl",
+                    format!("'{value:?}' {DURATION_ACCEPTED_FORM}"),
+                )
+            })?;
+            let parsed = parse_duration_secs(&text)
+                .map_err(|message| invalid("exports.peer_files.max_ttl", message))?;
+            if parsed == 0 {
+                return Err(invalid(
+                    "exports.peer_files.max_ttl",
+                    format!("must be greater than zero; {DURATION_ACCEPTED_FORM}"),
+                ));
+            }
+            Some(parsed)
+        }
+    };
+
+    let max_bytes = match raw.max_bytes {
+        None => DEFAULT_PEER_FILES_MAX_BYTES,
+        Some(value) => {
+            let text = scalar_text(&value).ok_or_else(|| {
+                invalid(
+                    "exports.peer_files.max_bytes",
+                    format!("'{value:?}' {BYTE_SIZE_ACCEPTED_FORM}"),
+                )
+            })?;
+            let parsed = parse_byte_size(&text)
+                .map_err(|message| invalid("exports.peer_files.max_bytes", message))?;
+            if parsed == 0 {
+                return Err(invalid(
+                    "exports.peer_files.max_bytes",
+                    format!("must be greater than zero; {BYTE_SIZE_ACCEPTED_FORM}"),
+                ));
+            }
+            parsed
+        }
+    };
+
+    Ok(PeerFilesExport {
+        root,
+        max_ttl_secs,
+        max_bytes,
+    })
+}
+
+/// A YAML scalar as the text the byte-size and duration parsers expect, or `None` for a mapping
+/// or a sequence — a shape neither parser could report on without quoting the whole node.
+fn scalar_text(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(text) => Some(text.clone()),
+        serde_yaml::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// The shared `root` shape rule: relative, no `..`, no absolute prefix. Both export blocks
+/// resolve their root against the same accessible workdir, so both refuse the same shapes with
+/// the same sentence.
+fn check_export_root_shape(field: &str, root: &str) -> Result<(), RuntimeManifestError> {
+    for component in Path::new(root).components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(RuntimeManifestError::InvalidExports {
+                    field: field.to_string(),
+                    message: format!(
+                        "'{root}' contains a '..' component; {EXPORT_ROOT_ACCEPTED_FORM}"
+                    ),
+                });
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(RuntimeManifestError::InvalidExports {
+                    field: field.to_string(),
+                    message: format!("'{root}' is absolute; {EXPORT_ROOT_ACCEPTED_FORM}"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestError> {
@@ -1739,23 +1988,7 @@ fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestEr
                 format!("is required and {EXPORT_ROOT_ACCEPTED_FORM}"),
             )
         })?;
-    for component in Path::new(&root).components() {
-        match component {
-            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                return Err(invalid(
-                    "exports.files.root",
-                    format!("'{root}' contains a '..' component; {EXPORT_ROOT_ACCEPTED_FORM}"),
-                ));
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(invalid(
-                    "exports.files.root",
-                    format!("'{root}' is absolute; {EXPORT_ROOT_ACCEPTED_FORM}"),
-                ));
-            }
-        }
-    }
+    check_export_root_shape("exports.files.root", &root)?;
 
     let mode = match raw.mode.as_deref().map(str::trim) {
         None | Some("") => {
@@ -1809,6 +2042,71 @@ fn parse_file_export(raw: RawFileExport) -> Result<FileExport, RuntimeManifestEr
 /// thing about what a legal root looks like.
 const EXPORT_ROOT_ACCEPTED_FORM: &str = "must be a relative path inside the workdir";
 
+/// The accepted spelling of `capabilities.peer_fetch.allow`, stated once.
+pub const PEER_FETCH_ALLOW_ACCEPTED_FORM: &str = "must be a non-empty list of network destinations";
+
+/// Structural check on one network destination: an `http`/`https` URL with no path, query or
+/// fragment, or a bare `host[:port]`.
+///
+/// Deliberately shape-only. The authoritative matcher is the runtime's network-rule parser, which
+/// this crate cannot see; what this catches is the class of entry that could never become a rule
+/// at all, at the line that wrote it rather than at launch.
+fn check_network_destination_shape(entry: &str) -> Result<(), String> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "'{entry}' is empty; {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+        ));
+    }
+
+    if trimmed.contains("://") {
+        let url = Url::parse(trimmed).map_err(|error| {
+            format!("'{entry}' is not a valid URL ({error}); {PEER_FETCH_ALLOW_ACCEPTED_FORM}")
+        })?;
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return Err(format!(
+                "'{entry}' has unsupported scheme '{scheme}' (expected http or https); \
+                 {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+            ));
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return Err(format!(
+                "'{entry}' names no host; {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() || !matches!(url.path(), "" | "/") {
+            return Err(format!(
+                "'{entry}' must not include a path, query or fragment; \
+                 {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+            ));
+        }
+        return Ok(());
+    }
+
+    if trimmed.contains('/') || trimmed.split_whitespace().count() != 1 {
+        return Err(format!(
+            "'{entry}' is not a host[:port]; {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+        ));
+    }
+    // Split from the right so an IPv6 literal's own colons are not mistaken for a port separator.
+    if let Some((host, port)) = trimmed.rsplit_once(':') {
+        if !host.ends_with(']') {
+            if host.is_empty() {
+                return Err(format!(
+                    "'{entry}' names no host; {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+                ));
+            }
+            if port.parse::<u16>().is_err() {
+                return Err(format!(
+                    "'{entry}' has an unparseable port '{port}'; {PEER_FETCH_ALLOW_ACCEPTED_FORM}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_capabilities(
     raw: Option<RawCapabilities>,
 ) -> Result<Option<Capabilities>, RuntimeManifestError> {
@@ -1820,6 +2118,29 @@ fn parse_capabilities(
         allow: raw_network.allow,
         unix_sockets: raw_network.unix_sockets,
     });
+
+    let peer_fetch = raw_caps
+        .peer_fetch
+        .map(|raw_peer_fetch| {
+            if raw_peer_fetch.allow.is_empty() {
+                return Err(RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.peer_fetch.allow".to_string(),
+                    message: PEER_FETCH_ALLOW_ACCEPTED_FORM.to_string(),
+                });
+            }
+            for entry in &raw_peer_fetch.allow {
+                check_network_destination_shape(entry).map_err(|message| {
+                    RuntimeManifestError::InvalidCapabilities {
+                        field: "capabilities.peer_fetch.allow".to_string(),
+                        message,
+                    }
+                })?;
+            }
+            Ok(PeerFetchCapabilities {
+                allow: raw_peer_fetch.allow,
+            })
+        })
+        .transpose()?;
 
     let filesystem = raw_caps
         .filesystem
@@ -1912,6 +2233,7 @@ fn parse_capabilities(
 
     Ok(Some(Capabilities {
         network,
+        peer_fetch,
         filesystem,
         shell,
         spawn,
@@ -6074,6 +6396,259 @@ capabilities:
             RuntimeManifestError::InvalidExports { field, message } => (field, message),
             other => panic!("expected InvalidExports, got {other:?}"),
         }
+    }
+
+    fn peer_fetch_error(block: &str) -> (String, String) {
+        match exports_manifest(block).expect_err("this capabilities block must not parse") {
+            RuntimeManifestError::InvalidCapabilities { field, message } => (field, message),
+            other => panic!("expected InvalidCapabilities, got {other:?}"),
+        }
+    }
+
+    // ── exports.peer_files ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_secs_accepts_bare_integers_and_single_letter_suffixes() {
+        assert_eq!(parse_duration_secs("90").unwrap(), 90);
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("15m").unwrap(), 900);
+        assert_eq!(parse_duration_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("  2h  ").unwrap(), 7200);
+        assert_eq!(parse_duration_secs("0").unwrap(), 0);
+    }
+
+    /// Every spelling that is not the one accepted form, refused rather than guessed at: a
+    /// manifest meaning 5 seconds and one meaning 5 minutes must not both parse.
+    #[test]
+    fn parse_duration_secs_rejects_every_other_spelling() {
+        for input in [
+            "",
+            "  ",
+            "5 minutes",
+            "30S",
+            "1H",
+            "5min",
+            "1.5h",
+            "-1",
+            "m",
+            "h",
+            "1h30m",
+            "0x10",
+            "30 s",
+        ] {
+            let error = parse_duration_secs(input)
+                .expect_err(&format!("'{input}' must not parse as a duration"));
+            assert!(
+                error.contains(DURATION_ACCEPTED_FORM),
+                "'{input}' must be refused with the accepted form; got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_duration_secs_refuses_to_overflow() {
+        assert!(parse_duration_secs("18446744073709551615h")
+            .unwrap_err()
+            .contains("overflows"));
+    }
+
+    #[test]
+    fn peer_files_defaults_are_an_undeclared_ttl_and_ten_mebibytes() {
+        let manifest = exports_manifest("exports:\n  peer_files:\n    root: out/\n")
+            .expect("a minimal peer_files block parses");
+        let peer = manifest.exports.unwrap().peer_files.unwrap();
+        assert_eq!(peer.root, "out/");
+        assert_eq!(peer.max_bytes, DEFAULT_PEER_FILES_MAX_BYTES);
+        assert_eq!(peer.max_bytes, 10_485_760);
+        // Undeclared, not defaulted: the two ephemerality cases answer an absent value
+        // differently, and substituting here would erase the difference.
+        assert_eq!(peer.max_ttl_secs, None);
+        assert_eq!(peer.effective_max_ttl_secs(), DEFAULT_PEER_HANDLE_TTL_SECS);
+        assert_eq!(peer.effective_max_ttl_secs(), 3600);
+    }
+
+    #[test]
+    fn peer_files_accepts_every_duration_spelling() {
+        for (declared, expected) in [("30m", 1800u64), ("2h", 7200), ("45s", 45), ("90", 90)] {
+            let manifest = exports_manifest(&format!(
+                "exports:\n  peer_files:\n    root: out/\n    max_ttl: {declared}\n"
+            ))
+            .expect("a declared max_ttl parses");
+            let peer = manifest.exports.unwrap().peer_files.unwrap();
+            assert_eq!(peer.max_ttl_secs, Some(expected), "max_ttl: {declared}");
+            assert_eq!(peer.effective_max_ttl_secs(), expected);
+        }
+    }
+
+    /// The two export blocks are separate authorisers: declaring one says nothing about the
+    /// other, and both may be declared side by side over different subtrees.
+    #[test]
+    fn the_two_export_blocks_are_independent() {
+        let both = exports_manifest(
+            "exports:\n  files:\n    root: out/\n    mode: read-only\n  \
+             peer_files:\n    root: out/handoff/\n",
+        )
+        .expect("both blocks parse together")
+        .exports
+        .unwrap();
+        assert_eq!(both.files.unwrap().root, "out/");
+        assert_eq!(both.peer_files.unwrap().root, "out/handoff/");
+
+        let only_files =
+            exports_manifest("exports:\n  files:\n    root: out/\n    mode: read-only\n")
+                .unwrap()
+                .exports
+                .unwrap();
+        assert!(only_files.peer_files.is_none());
+
+        let only_peer = exports_manifest("exports:\n  peer_files:\n    root: out/\n")
+            .unwrap()
+            .exports
+            .unwrap();
+        assert!(only_peer.files.is_none());
+
+        let neither = exports_manifest("exports: {}\n").unwrap().exports.unwrap();
+        assert!(neither.files.is_none() && neither.peer_files.is_none());
+    }
+
+    #[test]
+    fn peer_files_root_must_be_relative_and_inside_the_workdir() {
+        for root in ["../out", "/etc", "out/../../etc"] {
+            let (field, message) =
+                export_error(&format!("exports:\n  peer_files:\n    root: {root}\n"));
+            assert_eq!(field, "exports.peer_files.root", "root: {root}");
+            assert!(
+                message.contains(EXPORT_ROOT_ACCEPTED_FORM),
+                "root: {root}; got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_files_root_is_required() {
+        let (field, message) = export_error("exports:\n  peer_files: {}\n");
+        assert_eq!(field, "exports.peer_files.root");
+        assert!(message.contains("is required"));
+        assert!(message.contains(EXPORT_ROOT_ACCEPTED_FORM));
+    }
+
+    #[test]
+    fn peer_files_max_ttl_states_its_accepted_form() {
+        for declared in ["5 minutes", "30S", "5min", "1.5h", "abc"] {
+            let (field, message) = export_error(&format!(
+                "exports:\n  peer_files:\n    root: out/\n    max_ttl: \"{declared}\"\n"
+            ));
+            assert_eq!(field, "exports.peer_files.max_ttl", "max_ttl: {declared}");
+            assert!(
+                message.contains(DURATION_ACCEPTED_FORM),
+                "max_ttl: {declared}; got: {message}"
+            );
+        }
+    }
+
+    /// A zero ceiling reads like a declared surface and refuses every mint. Better discovered at
+    /// the line that wrote it than at the first `share-file` call.
+    #[test]
+    fn peer_files_max_ttl_rejects_zero() {
+        let (field, message) =
+            export_error("exports:\n  peer_files:\n    root: out/\n    max_ttl: 0\n");
+        assert_eq!(field, "exports.peer_files.max_ttl");
+        assert!(message.contains("greater than zero"));
+    }
+
+    #[test]
+    fn peer_files_max_bytes_states_its_accepted_form() {
+        let (field, message) =
+            export_error("exports:\n  peer_files:\n    root: out/\n    max_bytes: 10MB\n");
+        assert_eq!(field, "exports.peer_files.max_bytes");
+        assert!(message.contains(BYTE_SIZE_ACCEPTED_FORM), "got: {message}");
+    }
+
+    #[test]
+    fn peer_files_max_bytes_rejects_zero() {
+        let (field, message) =
+            export_error("exports:\n  peer_files:\n    root: out/\n    max_bytes: 0\n");
+        assert_eq!(field, "exports.peer_files.max_bytes");
+        assert!(message.contains("greater than zero"));
+    }
+
+    // ── capabilities.peer_fetch ──────────────────────────────────────────────
+
+    #[test]
+    fn peer_fetch_allow_carries_its_declared_destinations() {
+        let manifest = exports_manifest(
+            "capabilities:\n  peer_fetch:\n    allow:\n      - localhost:41234\n      \
+             - reporting.internal\n      - https://gateway.example.com\n",
+        )
+        .expect("a peer_fetch block parses");
+        assert_eq!(
+            manifest.capabilities.unwrap().peer_fetch.unwrap().allow,
+            vec![
+                "localhost:41234".to_string(),
+                "reporting.internal".to_string(),
+                "https://gateway.example.com".to_string(),
+            ]
+        );
+    }
+
+    /// An empty list is a parse error rather than a silent deny: `allow: []` reads as a declared
+    /// grant and would otherwise refuse every fetch with no line to point at.
+    #[test]
+    fn peer_fetch_allow_must_not_be_empty() {
+        let (field, message) = peer_fetch_error("capabilities:\n  peer_fetch:\n    allow: []\n");
+        assert_eq!(field, "capabilities.peer_fetch.allow");
+        assert_eq!(message, PEER_FETCH_ALLOW_ACCEPTED_FORM);
+    }
+
+    #[test]
+    fn peer_fetch_allow_refuses_an_entry_that_could_never_become_a_rule() {
+        for entry in [
+            "http://[not a host",
+            "\"\"",
+            "localhost:notaport",
+            "http://example.com/path",
+            "ftp://example.com",
+        ] {
+            let (field, message) = peer_fetch_error(&format!(
+                "capabilities:\n  peer_fetch:\n    allow:\n      - {entry}\n"
+            ));
+            assert_eq!(field, "capabilities.peer_fetch.allow", "entry: {entry}");
+            assert!(
+                message.contains(PEER_FETCH_ALLOW_ACCEPTED_FORM),
+                "entry: {entry}; got: {message}"
+            );
+        }
+    }
+
+    /// `peer_fetch` is a separate authoriser and never an alias: declaring it leaves
+    /// `network.allow` exactly as the manifest wrote it, and vice versa.
+    #[test]
+    fn peer_fetch_does_not_widen_network_allow() {
+        let capabilities = exports_manifest(
+            "capabilities:\n  network:\n    allow:\n      - api.example.com\n  \
+             peer_fetch:\n    allow:\n      - localhost:41234\n",
+        )
+        .unwrap()
+        .capabilities
+        .unwrap();
+        assert_eq!(
+            capabilities.network.unwrap().allow,
+            vec!["api.example.com".to_string()]
+        );
+        assert_eq!(
+            capabilities.peer_fetch.unwrap().allow,
+            vec!["localhost:41234".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_absent_peer_fetch_block_is_absent() {
+        assert!(exports_manifest("capabilities: {}\n")
+            .unwrap()
+            .capabilities
+            .unwrap()
+            .peer_fetch
+            .is_none());
     }
 
     #[test]

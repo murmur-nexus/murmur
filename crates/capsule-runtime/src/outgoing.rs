@@ -124,3 +124,141 @@ pub(crate) fn parse_host_port(peer_url: &str) -> Result<String, String> {
     }
     Ok(host_port.to_string())
 }
+
+/// One HTTP response, as the hand-rolled client below reads it back.
+pub(crate) struct RawHttpResponse {
+    pub status: u16,
+    /// Header names lowercased; values trimmed and otherwise verbatim.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawHttpResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Fetches a peer's agent card.
+///
+/// The minting side needs the peer's own `name` and `url` to derive the audience a handle is
+/// scoped to; both come from the card the peer already publishes, so neither side has to be told
+/// the audience string by the other. The caller enforces `capabilities.network.allow` *before*
+/// this is reached — **minting grants no new outbound authority**.
+pub(crate) async fn fetch_agent_card(peer_url: &str) -> Result<serde_json::Value, String> {
+    let response = raw_get(peer_url, "/.well-known/agent-card.json", &[]).await?;
+    if response.status != 200 {
+        return Err(format!(
+            "peer {peer_url} answered {} for its agent card",
+            response.status
+        ));
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|error| format!("peer {peer_url} returned an unparseable agent card: {error}"))
+}
+
+/// Redeems a handle against a peer's `/resources/peer/<handle>` endpoint, asserting `audience`.
+///
+/// Returns the response whatever its status: the caller reports the peer's own refusal code
+/// rather than flattening every non-200 into one message.
+pub(crate) async fn redeem_peer_handle(
+    peer_url: &str,
+    token: &str,
+    audience: &str,
+) -> Result<RawHttpResponse, String> {
+    raw_get(
+        peer_url,
+        &format!("{}/{token}", crate::peer_handoff::PEER_PATH_PREFIX),
+        &[(crate::peer_handoff::AUDIENCE_HEADER, audience)],
+    )
+    .await
+}
+
+/// A single `GET` over a fresh connection, in the same hand-rolled HTTP/1.1 style as
+/// [`send_a2a_message`].
+///
+/// `Connection: close` on every request and no keep-alive, so the response is complete when the
+/// socket is: a peer that omits `content-length` still delimits its body, and one that sends it
+/// is read to exactly that length.
+async fn raw_get(
+    peer_url: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<RawHttpResponse, String> {
+    let addr = parse_host_port(peer_url)?;
+
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| format!("failed to connect to {peer_url}: {e}"))?;
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("failed to write request to {peer_url}: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .await
+        .map_err(|e| format!("failed to read status from {peer_url}: {e}"))?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| format!("unparseable status line from {peer_url}: {status_line:?}"))?;
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+        if name == "content-length" {
+            content_length = value.parse().ok();
+        }
+        headers.push((name, value));
+    }
+
+    let body = if let Some(len) = content_length {
+        let mut buf = vec![0u8; len];
+        reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
+        buf
+    } else {
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("failed to read response body from {peer_url}: {e}"))?;
+        buf
+    };
+
+    Ok(RawHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}

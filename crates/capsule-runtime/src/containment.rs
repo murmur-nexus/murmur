@@ -26,7 +26,7 @@
 //! `sealed`, but they are fixed in completely different places, and a refusal that cannot tell
 //! them apart is a refusal an operator cannot act on.
 
-use murmur_artifact::{ContainmentClass, ExportMode, FileExport};
+use murmur_artifact::{ContainmentClass, ExportMode, Exports, FileExport, PeerFilesExport};
 use serde::Serialize;
 
 use crate::{
@@ -210,6 +210,33 @@ impl From<&FileExport> for ExportsFilesReport {
     }
 }
 
+/// The declared `exports.peer_files` block as it appears in a [`ScopeReport`].
+///
+/// A flattened copy rather than [`PeerFilesExport`] itself, on the same terms as
+/// [`ExportsFilesReport`]: a wire shape with a stable field order, which must not move whenever
+/// the manifest type gains a field the report has no business publishing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerFilesReport {
+    /// `exports.peer_files.root` verbatim, as declared.
+    pub root: String,
+    /// The effective handle-lifetime ceiling in seconds, with the ephemeral default already
+    /// applied — so an operator reads the value the runtime will actually clamp to, not the
+    /// absence of a declaration.
+    pub max_ttl_secs: u64,
+    /// The effective per-file ceiling on a redeemed read, with the default already applied.
+    pub max_bytes: u64,
+}
+
+impl From<&PeerFilesExport> for PeerFilesReport {
+    fn from(export: &PeerFilesExport) -> Self {
+        Self {
+            root: export.root.clone(),
+            max_ttl_secs: export.effective_max_ttl_secs(),
+            max_bytes: export.max_bytes,
+        }
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
@@ -272,6 +299,21 @@ pub struct ScopeReport {
     /// report. It is printed beside the grants because it is the other direction of the same
     /// question — what crosses the capsule boundary, and which way.
     pub exports_files: Option<ExportsFilesReport>,
+    /// The peer-handoff surface `exports.peer_files` declares, or `null` when the capsule
+    /// declares none. Always serialized, on the same terms as [`Self::exports_files`].
+    ///
+    /// A separate authoriser from `exports.files`, over a separate subtree: a capsule may declare
+    /// either, both or neither, and this field says nothing about the other. Like every export it
+    /// is a disclosure rather than a grant, and declaring it cannot change
+    /// [`Self::achieved_containment`], [`Self::enforcement_tier`] or [`Self::floor_met`].
+    pub peer_files: Option<PeerFilesReport>,
+    /// `capabilities.peer_fetch.allow`, verbatim — the peers this capsule may redeem a handle
+    /// against. Empty when the block is absent, which is deny.
+    ///
+    /// A separate list from [`Self::network_allow`] and never an alias for it: a destination
+    /// reachable by `send` is not redeemable unless it also appears here, because ingesting a
+    /// peer's bytes into this workdir is a different question from being allowed to talk to it.
+    pub peer_fetch_allow: Vec<String>,
     /// Every `capabilities.shell.staged_runtime` grant, rendered as
     /// `<binary>: <source_path> (pin: <pin>)`. These are host runtime trees a `sealed` capsule
     /// asks to have bind-mounted read-only into its composed root.
@@ -337,6 +379,23 @@ impl ScopeReport {
             }
         }
 
+        out.push_str("\nPeer handoff\n");
+        match &self.peer_files {
+            None => out.push_str("  exports.peer_files: <none>\n"),
+            Some(peer) => {
+                out.push_str(&format!("  exports.peer_files root: {}\n", peer.root));
+                out.push_str(&format!(
+                    "  max handle ttl:          {}s\n",
+                    peer.max_ttl_secs
+                ));
+                out.push_str(&format!(
+                    "  max bytes:               {} (per file)\n",
+                    peer.max_bytes
+                ));
+            }
+        }
+        push_list(&mut out, "peer_fetch allow", &self.peer_fetch_allow);
+
         if !self.floor_met {
             out.push_str(
                 "\nThis is a report only — `mur run` without --explain-scope would refuse to \
@@ -363,7 +422,7 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 pub fn explain_scope(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
-    exports_files: Option<&FileExport>,
+    exports: Option<&Exports>,
 ) -> ScopeReport {
     scope_report_for_tier(
         policy,
@@ -371,7 +430,7 @@ pub fn explain_scope(
         detect_enforcement_tier(),
         detect_sealed_blocker(),
         detect_userns_grant(),
-        exports_files,
+        exports,
     )
 }
 
@@ -383,7 +442,7 @@ pub(crate) fn scope_report_for_tier(
     tier: EnforcementTier,
     sealed_blocker: Option<SealedBlocker>,
     userns_grant: Option<UsernsGrant>,
-    exports_files: Option<&FileExport>,
+    exports: Option<&Exports>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -401,8 +460,14 @@ pub(crate) fn scope_report_for_tier(
         enforcement_tier: enforcement_tier_name(tier),
         userns_grant,
         // Copied straight through and never consulted above: `achieved` is already computed, and
-        // an export must not be able to reach it.
-        exports_files: exports_files.map(ExportsFilesReport::from),
+        // no export or peer grant may reach it.
+        exports_files: exports
+            .and_then(|exports| exports.files.as_ref())
+            .map(ExportsFilesReport::from),
+        peer_files: exports
+            .and_then(|exports| exports.peer_files.as_ref())
+            .map(PeerFilesReport::from),
+        peer_fetch_allow: policy.peer_fetch_allow.clone(),
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
@@ -1118,7 +1183,10 @@ mod tests {
                     *tier,
                     None,
                     None,
-                    Some(&export),
+                    Some(&Exports {
+                        files: Some(export.clone()),
+                        peer_files: None,
+                    }),
                 );
                 assert_eq!(
                     with.achieved_containment, without.achieved_containment,
@@ -1148,6 +1216,163 @@ mod tests {
         }
     }
 
+    /// The same invariant for the peer-handoff grants, and stated separately because they are a
+    /// separate authoriser: declaring either half must leave the achieved class, the tier and the
+    /// floor verdict byte-identical, and must change no field of the report but its own.
+    #[test]
+    fn peer_handoff_never_changes_what_the_report_says_about_containment() {
+        let peer_files = PeerFilesExport {
+            root: "out/".to_string(),
+            max_ttl_secs: Some(900),
+            max_bytes: 10 * 1024 * 1024,
+        };
+        for tier in ALL_TIERS {
+            for workdir_exec in [false, true] {
+                let without_policy = CapabilityPolicy {
+                    workdir_exec_allowed: workdir_exec,
+                    ..sample_policy()
+                };
+                let with_policy = CapabilityPolicy {
+                    peer_fetch_allow: vec!["localhost:41234".to_string()],
+                    ..without_policy.clone()
+                };
+                let without = scope_report_for_tier(
+                    &without_policy,
+                    ContainmentClass::Scoped,
+                    *tier,
+                    None,
+                    None,
+                    None,
+                );
+                let with = scope_report_for_tier(
+                    &with_policy,
+                    ContainmentClass::Scoped,
+                    *tier,
+                    None,
+                    None,
+                    Some(&Exports {
+                        files: None,
+                        peer_files: Some(peer_files.clone()),
+                    }),
+                );
+                assert_eq!(
+                    with.achieved_containment, without.achieved_containment,
+                    "tier {tier:?}, workdir_exec {workdir_exec}"
+                );
+                assert_eq!(with.enforcement_tier, without.enforcement_tier);
+                assert_eq!(with.floor_met, without.floor_met);
+                assert_eq!(with.shortfall_reason, without.shortfall_reason);
+                assert_eq!(
+                    ScopeReport {
+                        peer_files: None,
+                        peer_fetch_allow: Vec::new(),
+                        ..with.clone()
+                    },
+                    without
+                );
+                assert_eq!(
+                    with.peer_files,
+                    Some(PeerFilesReport {
+                        root: "out/".to_string(),
+                        max_ttl_secs: 900,
+                        max_bytes: 10 * 1024 * 1024,
+                    })
+                );
+                assert_eq!(with.peer_fetch_allow, vec!["localhost:41234".to_string()]);
+                // Declaring `peer_fetch` does not widen `network.allow`, on either side of the
+                // report: the two lists are carried separately and neither is derived from the
+                // other.
+                assert_eq!(with.network_allow, without.network_allow);
+            }
+        }
+    }
+
+    /// Both peer fields are written whether or not they were declared, on the same terms as
+    /// `exports_files`: an absent key identifies an older runtime, a `null`/`[]` identifies a
+    /// capsule that declined.
+    #[test]
+    fn the_peer_fields_are_always_serialized() {
+        let undeclared: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
+        assert_eq!(undeclared["peer_fetch_allow"], serde_json::json!([]));
+
+        let declared: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+            &CapabilityPolicy {
+                peer_fetch_allow: vec!["localhost:41234".to_string()],
+                ..sample_policy()
+            },
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            Some(&Exports {
+                files: None,
+                peer_files: Some(PeerFilesExport {
+                    root: "out/".to_string(),
+                    max_ttl_secs: None,
+                    max_bytes: 10 * 1024 * 1024,
+                }),
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            declared["peer_files"],
+            serde_json::json!({"root": "out/", "max_ttl_secs": 3600, "max_bytes": 10_485_760})
+        );
+        assert_eq!(
+            declared["peer_fetch_allow"],
+            serde_json::json!(["localhost:41234"])
+        );
+    }
+
+    #[test]
+    fn render_names_peer_handoff_in_both_directions() {
+        let undeclared = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            None,
+        )
+        .render();
+        assert!(undeclared.contains("Peer handoff"));
+        assert!(undeclared.contains("exports.peer_files: <none>"));
+        assert!(undeclared.contains("peer_fetch allow: <none>"));
+
+        let declared = scope_report_for_tier(
+            &CapabilityPolicy {
+                peer_fetch_allow: vec!["localhost:41234".to_string()],
+                ..sample_policy()
+            },
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            Some(&Exports {
+                files: None,
+                peer_files: Some(PeerFilesExport {
+                    root: "out/".to_string(),
+                    max_ttl_secs: Some(900),
+                    max_bytes: 4096,
+                }),
+            }),
+        )
+        .render();
+        assert!(declared.contains("exports.peer_files root: out/"));
+        assert!(declared.contains("max handle ttl:          900s"));
+        assert!(declared.contains("max bytes:               4096 (per file)"));
+        assert!(declared.contains("- localhost:41234"));
+    }
+
     /// `exports_files` is written whether or not it was declared, on the same terms as
     /// `workdir_exec`: an absent key identifies an older runtime, a `null` a capsule that
     /// exported nothing.
@@ -1170,10 +1395,13 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
-            Some(&FileExport {
-                root: "out/".to_string(),
-                mode: ExportMode::ReadOnly,
-                max_bytes: 10_485_760,
+            Some(&Exports {
+                files: Some(FileExport {
+                    root: "out/".to_string(),
+                    mode: ExportMode::ReadOnly,
+                    max_bytes: 10_485_760,
+                }),
+                peer_files: None,
             }),
         ))
         .unwrap();
@@ -1205,10 +1433,13 @@ mod tests {
             EnforcementTier::KernelFull,
             None,
             None,
-            Some(&FileExport {
-                root: "out/".to_string(),
-                mode: ExportMode::ReadOnly,
-                max_bytes: 10_485_760,
+            Some(&Exports {
+                files: Some(FileExport {
+                    root: "out/".to_string(),
+                    mode: ExportMode::ReadOnly,
+                    max_bytes: 10_485_760,
+                }),
+                peer_files: None,
             }),
         )
         .render();

@@ -46,17 +46,19 @@ pub use registry::{
 };
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
-    parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_hook_config,
-    read_tool_implementation, AfterTask, ArtifactImplementation, ArtifactRuntime, Capabilities,
-    CompactionConfig, ContainmentClass, ContextConfig, ConversationMode, EnvCapabilities,
-    EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities, HookBinding,
-    HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy, InferenceConfig,
-    InferenceDriver, InterpreterRuntimeDir, InterpreterRuntimeGrant, LifecycleConfig,
-    LifecycleOverride, NetworkCapabilities, NetworkConfig, ObservabilityConfig,
-    ParseContainmentClassError, ResourceCapabilities, ResourceLimits, RuntimeArtifact,
-    RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant,
-    TaskAcceptance, TaskIoCapabilities, TraceConfig, BYTE_SIZE_ACCEPTED_FORM,
-    DEFAULT_EXPORT_MAX_BYTES,
+    parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
+    read_hook_config, read_tool_implementation, AfterTask, ArtifactImplementation, ArtifactRuntime,
+    Capabilities, CompactionConfig, ContainmentClass, ContextConfig, ConversationMode,
+    EnvCapabilities, EvalConfig, ExportMode, Exports, FileExport, FilesystemCapabilities,
+    HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
+    InferenceConfig, InferenceDriver, InterpreterRuntimeDir, InterpreterRuntimeGrant,
+    LifecycleConfig, LifecycleOverride, NetworkCapabilities, NetworkConfig, ObservabilityConfig,
+    ParseContainmentClassError, PeerFetchCapabilities, PeerFilesExport, ResourceCapabilities,
+    ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
+    ShellCapabilities, StagedRuntimeGrant, TaskAcceptance, TaskIoCapabilities, TraceConfig,
+    BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES,
+    DEFAULT_PEER_HANDLE_TTL_SECS, DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
+    PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{

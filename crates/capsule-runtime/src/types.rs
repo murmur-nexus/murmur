@@ -99,6 +99,16 @@ pub struct ResolvedLockArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CapabilityPolicy {
     pub network_allow: Vec<String>,
+    /// From `capabilities.peer_fetch.allow`: the peers this capsule may redeem a peer-file handle
+    /// against. Empty by default, which is deny — and which is also why no `fetch-peer-file` tool
+    /// manifest is written and the capsule's model never sees the tool exists.
+    ///
+    /// A separate list from [`Self::network_allow`], enforced with the same rule matcher but
+    /// never merged into it. Ingesting a peer's bytes lands a file in this capsule's own workdir,
+    /// so it is a prompt-injection surface and deserves its own operator control; a destination
+    /// in `network.allow` is not redeemable unless it also appears here, and declaring it here
+    /// does not widen `network.allow`.
+    pub peer_fetch_allow: Vec<String>,
     /// From `capabilities.network.unix_sockets`. `false` by default, which makes the shell
     /// subprocess tree's `socket(AF_UNIX, ...)` calls fail with `EACCES` at the kernel level on
     /// both Linux tiers — `network_allow` above governs IP destinations only and would otherwise
@@ -333,6 +343,11 @@ pub struct StagedSession {
     /// accessible workdir by `stage_session` — a root that resolves outside it refuses the launch
     /// rather than being served. `None` means no resource plane.
     pub(crate) exports_files: Option<murmur_artifact::FileExport>,
+    /// The declared peer-handoff surface, with its root already checked against this session's
+    /// accessible workdir and its `max_ttl` already checked against `lifecycle.after_task` by
+    /// `stage_session`. `None` means no peer plane: nothing mints, and `/resources/peer/` answers
+    /// `no_peer_plane`.
+    pub(crate) exports_peer_files: Option<murmur_artifact::PeerFilesExport>,
     /// Registry used to resolve this session's artifacts, retained so `manage.pull()` can
     /// resolve additional artifacts at runtime after staging has completed.
     pub(crate) registry: Arc<dyn Registry>,
@@ -357,6 +372,13 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.network.as_ref())
         .map(|network| network.allow.clone())
         .unwrap_or_default();
+    // Absent `capabilities.peer_fetch` block means denied, on the same terms — and separately
+    // from `network.allow`, which this deliberately does not read.
+    let peer_fetch_allow = caps
+        .and_then(|c| c.peer_fetch.as_ref())
+        .map(|peer_fetch| peer_fetch.allow.clone())
+        .unwrap_or_default();
+
     // Absent `capabilities.network` block, or absent key within it, both mean denied.
     let unix_sockets_allowed = caps
         .and_then(|c| c.network.as_ref())
@@ -411,6 +433,7 @@ pub fn capability_policy_from_runtime_manifest(
 
     CapabilityPolicy {
         network_allow,
+        peer_fetch_allow,
         unix_sockets_allowed,
         filesystem_scope,
         workdir_exec_allowed,

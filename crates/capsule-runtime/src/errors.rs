@@ -146,13 +146,39 @@ pub enum RuntimeError {
     /// misconfiguration the operator can fix, and discovering it one served file at a time would
     /// mean the first file had already left.
     #[error(
-        "exports.files.root '{declared}' resolves to '{resolved}', which is outside the capsule \
+        "{field} '{declared}' resolves to '{resolved}', which is outside the capsule \
          workdir '{workdir}'"
     )]
     ExportRootOutsideWorkdir {
+        /// The manifest key that declared it — `exports.files.root` or
+        /// `exports.peer_files.root`. Carried rather than hard-coded because the two roots are
+        /// separate authorisers and an operator fixing one must be told which.
+        field: String,
         declared: String,
         resolved: String,
         workdir: String,
+    },
+
+    /// A capsule declares `exports.peer_files` together with `lifecycle.after_task: sleep`, and
+    /// either declared no `max_ttl` or declared one above the persistent ceiling.
+    ///
+    /// An ephemeral capsule needs no ceiling: teardown destroys the minting key, so every
+    /// outstanding handle stops verifying at once and the declared lifetime can never outlive the
+    /// process. `sleep` withdraws that bound deliberately, which makes the declared lifetime the
+    /// only one there is — so it has to be declared, and it has to be short.
+    #[error(
+        "exports.peer_files with lifecycle.after_task: sleep requires exports.peer_files.max_ttl \
+         to be declared and at most {ceiling_secs}s{}; a handle's lifetime is not a durability \
+         mechanism",
+        match declared_secs {
+            Some(secs) => format!(" (declared {secs}s)"),
+            None => String::new(),
+        }
+    )]
+    PersistentCapsuleNeedsHandleTtl {
+        /// The declared `max_ttl` in seconds, or `None` when the manifest declared none.
+        declared_secs: Option<u64>,
+        ceiling_secs: u64,
     },
 
     /// A capsule declares `capabilities.shell.staged_runtime` without an effective `sealed`
