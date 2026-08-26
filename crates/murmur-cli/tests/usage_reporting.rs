@@ -26,8 +26,7 @@ const REPORTED_OUTPUT_TOKENS: u64 = 218;
 const REPORTED_CACHED_TOKENS: u64 = 11780;
 const REPORTED_CACHE_WRITE_TOKENS: u64 = 7;
 
-/// The four keys the driver's own counts land on. Named once here because a later card and
-/// the trace consumers read them by key.
+/// The four keys the driver's own counts land on.
 const ACTUAL_KEYS: [&str; 4] = [
     "input_tokens_actual",
     "output_tokens_actual",
@@ -187,7 +186,7 @@ fn usage_block_is_recorded_verbatim() {
     assert_eq!(session_end["total_output_tokens"], estimated_output);
 }
 
-/// A driver that reports nothing runs exactly as it did before `usage` existed: no key, no
+/// A driver that reports nothing leaves the trace line carrying only the estimate: no key, no
 /// zero, no null, and no complaint anywhere.
 #[test]
 fn absent_usage_is_absent_not_zero() {

@@ -1506,7 +1506,7 @@ pub(crate) struct DriverUsage {
 }
 
 /// Reserved top-level field on the driver response payload carrying the provider's own token
-/// counts (see `wit/tool.wit`).
+/// counts. Optional: a driver that omits it is fully supported.
 pub(crate) const USAGE_KEY: &str = "usage";
 
 /// Read the optional `usage` block out of a driver response.
@@ -1514,8 +1514,8 @@ pub(crate) const USAGE_KEY: &str = "usage";
 /// Absent means absent, at every level: a response with no `usage`, a `usage` that is not an
 /// object, and a `usage` from which no member survives type-checking all yield `None`, and a
 /// single member that fails type-checking is dropped on its own while its siblings are kept.
-/// None of those is an error or a warning — a driver that reports nothing runs exactly as it
-/// did before this field existed, and the trace then carries only the runtime's own estimate.
+/// None of those is an error or a warning — a driver that reports nothing is a supported
+/// driver, and the trace then carries only the runtime's own estimate.
 ///
 /// A member type-checks when it is a JSON number that is a non-negative integer; a string, a
 /// negative, a fraction and `null` are all dropped. Unknown members are ignored.
@@ -1946,8 +1946,8 @@ mod tests {
     }
 
     /// The system prompt and the tool inventory are resent on every request, so they occupy
-    /// the context window too — counting `messages` alone (what the post-compaction recount
-    /// used to do) understates occupancy and overstates the saving a compaction made.
+    /// the context window too: counting `messages` alone understates occupancy, and a
+    /// `tokens_after` counted that way overstates the saving a compaction made.
     #[test]
     fn occupancy_exceeds_the_messages_array_alone() {
         let tools = vec![json!({"name": "bash", "description": "run a command"})];

@@ -123,7 +123,18 @@ for that call:
 | `cache_write_tokens` | Request tokens written into the provider's prompt cache |
 
 Every member is optional and every member is a non-negative integer. A driver reports whichever
-members its provider returned; a provider with no prompt cache reports no cache members.
+members its provider returned; a provider with no prompt cache reports no cache members. Omit a
+member the provider did not report rather than sending `0` — the runtime keeps the two apart, and
+a `0` reads as a genuine cache miss on the trace.
+
+Where the two provider shapes carry each number:
+
+| Member | Anthropic Messages API | OpenAI Chat and Responses APIs |
+|---|---|---|
+| `input_tokens` | `usage.input_tokens` | `usage.prompt_tokens` |
+| `output_tokens` | `usage.output_tokens` | `usage.completion_tokens` |
+| `cached_tokens` | `usage.cache_read_input_tokens` | `usage.prompt_tokens_details.cached_tokens` |
+| `cache_write_tokens` | `usage.cache_creation_input_tokens` | Not reported |
 
 The runtime records the reported numbers on the call's `inference` trace event and its
 `capsule.inference` span, and acts on none of them: the compaction threshold and every budget

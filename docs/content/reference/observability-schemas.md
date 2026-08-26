@@ -52,7 +52,9 @@ the session directory) and `timestamp` (Unix milliseconds).
 
 The four provider-reported fields are written only when the driver reported that member, and are
 absent otherwise — never `0`. They sit beside the runtime's estimates rather than replacing them,
-so estimator drift is a subtraction on one line. Nothing in the runtime reads them back.
+so estimator drift is a subtraction on one line. See
+[Reported token usage](wit-interfaces.md#driver-usage) for what a driver sends and what the
+runtime does with it.
 
 **`tool_call`** — written after each tool invocation returns
 

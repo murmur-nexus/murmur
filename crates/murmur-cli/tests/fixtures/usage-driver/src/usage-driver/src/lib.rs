@@ -11,8 +11,7 @@
 //     the constants below. The values are constants so a test can assert them verbatim, and
 //     `INPUT_TOKENS` is far from any tiktoken count of this payload so the estimate and the
 //     actual are visibly different numbers.
-//   * `NOUSAGE` — no `usage` member at all: the shape every driver shipped before this
-//     existed returns.
+//   * `NOUSAGE` — no `usage` member at all: the shape a driver that reports nothing returns.
 //   * `BADUSAGE` — a `usage` whose members are all ill-typed (a string, a negative, an unknown
 //     member), which the host must degrade to "absent" rather than reject.
 //   * `NONOBJECTUSAGE` — a `usage` that is not an object at all.

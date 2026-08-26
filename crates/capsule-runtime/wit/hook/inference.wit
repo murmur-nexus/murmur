@@ -35,12 +35,12 @@ interface inference {
 
     /// One completion result.
     ///
-    /// The driver wire format carries no usage block and never echoes back a
-    /// confirmed model name (see `docs/murmur-inference-message-format.md`), so
-    /// `model-used` is the model string the host actually sent and the two token
-    /// counts are computed host-side with the same tiktoken convention the agent
-    /// loop uses for its own turns. They are host measurements, not provider
-    /// -reported figures.
+    /// Both token counts are host measurements, not provider-reported figures:
+    /// the host counts the outgoing payload and the raw driver response with the
+    /// same tiktoken convention the agent loop uses for its own turns. A driver
+    /// that reports a `usage` block reaches the session trace with it, never
+    /// these fields. `model-used` is likewise the model string the host sent —
+    /// the driver wire format never echoes back a confirmed model name.
     record inference-response {
         /// Concatenated text content of the driver's response.
         text: string,
