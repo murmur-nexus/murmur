@@ -1,6 +1,6 @@
 use std::fmt;
 
-use capsule_runtime::RuntimeError;
+use capsule_runtime::{RuntimeError, MAX_ARTIFACT_CONFIG_BYTES};
 use murmur_artifact::{BuildError, ManifestError, RegistryError, MANIFEST_FILENAME};
 
 // Manifest parsing
@@ -246,10 +246,6 @@ impl From<RuntimeError> for CliError {
                 E_CAP_002,
                 format!("invalid filesystem scope '{scope}': {message}"),
             ),
-            // Both arms are the same operator problem — a declared store that does not resolve to
-            // a usable directory — so they share one code, and both hints point at the store name
-            // and at `~/.murmur/state/`. Never at the containment ladder: a state store is not a
-            // containment shortfall, and no floor change makes one appear.
             // One code for every shape rule the config channel enforces, because they are one
             // operator problem — a declared block that cannot be delivered — and the message
             // already names the artifact and the rule that was broken. The hint points at the
@@ -258,11 +254,18 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::InvalidArtifactConfig { .. } => CliError::with_hint(
                 E_CAP_010,
                 error.to_string(),
-                "config: on an artifact entry must be a mapping with string keys that serializes \
-                 to at most 65536 bytes of JSON; it is delivered to that artifact alone as \
-                 MURMUR_ARTIFACT_CONFIG. Omit the key entirely to deliver no variable, and keep \
-                 secrets out of it — see docs/content/reference/manifest.md",
+                format!(
+                    "config: on an artifact entry must be a mapping with string keys that \
+                     serializes to at most {MAX_ARTIFACT_CONFIG_BYTES} bytes of JSON; it is \
+                     delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key \
+                     entirely to deliver no variable, and keep secrets out of it — see \
+                     docs/content/reference/manifest.md"
+                ),
             ),
+            // Both arms below are the same operator problem — a declared store that does not
+            // resolve to a usable directory — so they share one code, and both hints point at the
+            // store name and at `~/.murmur/state/`. Never at the containment ladder: a state store
+            // is not a containment shortfall, and no floor change makes one appear.
             error @ RuntimeError::InvalidStateStore { .. } => CliError::with_hint(
                 E_CAP_009,
                 error.to_string(),

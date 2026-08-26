@@ -397,6 +397,18 @@ Rules:
   your manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
 - **Config is per artifact.** A top-level `config:` key fails with `E-MAN-003`.
 
+`mur run --explain-scope` lists the artifacts that declare a block, and never what any of them
+declared:
+
+```
+  artifact config:
+    - murmur-tool-corpus
+```
+
+`--json` emits the same names as `configured_artifacts`, and `trace.jsonl`'s `session_start`
+carries them verbatim as `effective_grants.configured_artifacts`. Both read `artifact config:
+<none>` and `[]` when nothing declares a block.
+
 ###### Secrets do not belong in a `config:` block { #artifact-config-secrets }
 
 `murmur.yaml` is an audit record of what a capsule was allowed to do, and a `config:` block is

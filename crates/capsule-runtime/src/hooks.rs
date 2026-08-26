@@ -4953,7 +4953,7 @@ artifacts:
     }
 
     /// Default-deny, environment half: a hook whose entry declared neither config nor a session
-    /// variable observes an empty environment, exactly as before this channel existed.
+    /// variable observes an empty environment.
     #[test]
     fn an_unconfigured_hook_sees_no_environment_at_all() {
         assert_eq!(
