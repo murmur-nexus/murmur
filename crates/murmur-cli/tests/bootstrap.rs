@@ -378,17 +378,7 @@ fn bootstrap_missing_driver_artifact_fails_before_launch() {
 
 #[test]
 fn bootstrap_driver_excluded_from_tool_list() {
-    let server = ScriptedServer::start(vec![json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": "done"}],
-        "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()]);
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -449,17 +439,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
 /// (c) the manifest system prompt appears after the block.
 #[test]
 fn agent_system_prompt_includes_capsule_context() {
-    let server = ScriptedServer::start(vec![json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": "done"}],
-        "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()]);
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -536,9 +516,11 @@ fn agent_system_prompt_includes_capsule_context() {
         system_field.contains("Version: 2.3.4"),
         "system field should contain capsule version; got:\n{system_field}"
     );
+    // The block names no host path: it is the first text of every prompt, and a per-launch
+    // session workdir there means no request ever matches a cached prompt prefix.
     assert!(
-        system_field.contains("Workdir:"),
-        "system field should contain Workdir; got:\n{system_field}"
+        !system_field.contains("Workdir:"),
+        "system field must not name a host workdir; got:\n{system_field}"
     );
     assert!(
         system_field.contains(manifest_system_prompt),
@@ -550,6 +532,150 @@ fn agent_system_prompt_includes_capsule_context() {
     assert!(
         capsule_block_pos < manifest_prompt_pos,
         "[Capsule] block should appear before the manifest system prompt"
+    );
+}
+
+/// One `end_turn` reply, enough for a session that calls no tool.
+fn one_shot_anthropic_reply() -> String {
+    json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": "done"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": Value::Null,
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+/// True when `key` names a member of `value` or of any object nested anywhere inside it.
+fn contains_key_anywhere(value: &Value, key: &str) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.contains_key(key) || map.values().any(|v| contains_key_anywhere(v, key))
+        }
+        Value::Array(items) => items.iter().any(|v| contains_key_anywhere(v, key)),
+        _ => false,
+    }
+}
+
+/// Two launches of the same capsule, each with its own `<manifest_dir>/workdir/<session_id>`,
+/// send a byte-identical system prompt. Providers match their cache on an exact prefix from the
+/// first token, so a single per-launch value in the `[Capsule]` block would mean no request ever
+/// hits a warm cache.
+#[test]
+fn prompt_prefix_is_identical_across_two_launches() {
+    let server =
+        ScriptedServer::start(vec![one_shot_anthropic_reply(), one_shot_anthropic_reply()]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let manifest_path = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        false,
+    );
+
+    // No --workdir on either launch, so each gets a fresh session directory under the project.
+    let mut session_ids = Vec::new();
+    let mut workdirs = Vec::new();
+    for _ in 0..2 {
+        let staged = stage_agent_session(&home, project.path(), &manifest_path);
+        session_ids.push(staged.session_id.clone());
+        workdirs.push(staged.accessible_workdir.clone());
+        fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+        launch_session(staged, |_| {}).expect("agent launch should succeed");
+    }
+    assert_ne!(
+        session_ids[0], session_ids[1],
+        "the two launches must not share a session directory, or the test proves nothing"
+    );
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected one inference request per launch"
+    );
+
+    let first = requests[0]["system"].as_str().expect("system field");
+    let second = requests[1]["system"].as_str().expect("system field");
+
+    assert_eq!(
+        first, second,
+        "the system prompt must be byte-identical across launches"
+    );
+    for system in [first, second] {
+        assert!(
+            system.starts_with("[Capsule]\nName: "),
+            "[Capsule] block must be first; got:\n{system}"
+        );
+    }
+    for (i, system) in [first, second].iter().enumerate() {
+        assert!(
+            !system.contains(&session_ids[i]),
+            "system prompt leaks this launch's session id; got:\n{system}"
+        );
+        assert!(
+            !system.contains(&workdirs[i].display().to_string()),
+            "system prompt leaks this launch's workdir path; got:\n{system}"
+        );
+    }
+}
+
+/// The host adds `prompt_cache_key` to every driver request payload. It is a reserved top-level
+/// key that no shipped driver reads, so it must reach the provider nowhere at all — and the
+/// session must still complete, proving the provider accepted the body the driver built.
+#[test]
+fn prompt_cache_key_is_not_forwarded_to_the_provider() {
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let manifest_path = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        false,
+    );
+
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+
+    launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one inference request");
+
+    let body = &requests[0];
+    assert!(
+        body.get("prompt_cache_key").is_none(),
+        "provider body carries prompt_cache_key at top level; got:\n{body}"
+    );
+    assert!(
+        !contains_key_anywhere(body, "prompt_cache_key"),
+        "provider body carries prompt_cache_key nested somewhere; got:\n{body}"
     );
 }
 

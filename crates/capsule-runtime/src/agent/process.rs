@@ -156,6 +156,15 @@ fn read_task_from_workdir(workdir: &Path) -> String {
 /// `MURMUR_MD_TRUST_NOTICE` and `UNTRUSTED_CONTENT_NOTICE`, even when no `inference.system_prompt`
 /// is configured, so the subprocess never receives MURMUR.md-adjacent context or runs tools
 /// without the not-instructions / untrusted-content notices.
+///
+/// It carries no `[Capsule]` block, unlike the http transport's
+/// `agent::build_augmented_system_prompt`: on this transport murmur does not render the system
+/// prompt at all — it hands the CLI one argument and the CLI frames everything around it, so
+/// the two unconditional notices are the only part that is murmur's to inject. That is why
+/// `run_process_inference_loop` takes the capsule identity as `_name` / `_version` and ignores
+/// both. The value must nonetheless stay launch-invariant, for the same prompt caching reason
+/// as the http path: the CLI puts it at the head of the prompt, and every provider matches its
+/// cache on an exact prefix, so a per-launch value here would miss the cache on every request.
 fn build_process_system_prompt(system_prompt: Option<&str>) -> String {
     let notices = format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}");
     match system_prompt.filter(|sp| !sp.is_empty()) {
@@ -978,6 +987,32 @@ async fn codex_max_turns_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Launch-invariance: the `--system-prompt` value is a pure function of its argument, with
+    /// no path, session id or other per-launch value anywhere in it, so two launches of the same
+    /// capsule hand the CLI a byte-identical prefix. See the builder's own doc comment.
+    #[test]
+    fn process_system_prompt_is_launch_invariant() {
+        for arg in [None, Some("You are a helpful assistant.")] {
+            let first = build_process_system_prompt(arg);
+            let second = build_process_system_prompt(arg);
+            assert_eq!(first, second, "same input must yield the same string");
+            assert!(first.contains(MURMUR_MD_TRUST_NOTICE));
+            assert!(first.contains(UNTRUSTED_CONTENT_NOTICE));
+            assert!(
+                !first.contains("[Capsule]"),
+                "the process transport injects no [Capsule] block; got:\n{first}"
+            );
+            assert!(
+                !first.split_whitespace().any(|t| t.starts_with('/')),
+                "no host path may appear in the prompt; got:\n{first}"
+            );
+            assert!(
+                !first.contains("ses_"),
+                "no session id may appear in the prompt; got:\n{first}"
+            );
+        }
+    }
 
     #[test]
     fn process_system_prompt_carries_trust_notice_with_no_custom_prompt() {

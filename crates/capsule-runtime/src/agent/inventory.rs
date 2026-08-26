@@ -13,7 +13,7 @@ static DEFAULT_SCHEMA: LazyLock<Value> =
 /// `system_prompt_artifact`: when set, the skill with this name is excluded from the inventory
 /// because it is already injected as the system prompt — listing it as a callable tool would
 /// cause double-injection and waste context.
-pub(super) fn build_tool_inventory(
+pub(crate) fn build_tool_inventory(
     workdir: &Path,
     system_prompt_artifact: Option<&str>,
 ) -> Vec<Value> {
@@ -26,6 +26,11 @@ pub(super) fn build_tool_inventory(
     };
 
     let mut entries: Vec<_> = entries.flatten().collect();
+    // Sorted, not in `read_dir` order, because of prompt caching: the serialized tool array is
+    // part of the prefix every provider matches its cache on, so a reordered array changes the
+    // prefix and invalidates the cache entry for the whole session. Directory order is
+    // filesystem-dependent and unstable across launches; the sort is what makes the same tool
+    // set render the same bytes twice.
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
@@ -127,4 +132,53 @@ pub(super) fn build_tool_inventory(
     }
 
     tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tool(tools_dir: &Path, name: &str) {
+        let dir = tools_dir.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(PACKED_MANIFEST_ENTRY),
+            format!("name: {name}\nversion: 1.0.0\nruntime: tool\n"),
+        )
+        .unwrap();
+    }
+
+    /// Tool order is sorted regardless of the order the directories were created in, because
+    /// the serialized tool array is part of the cached prompt prefix — see the sort's comment.
+    #[test]
+    fn tool_inventory_is_sorted_regardless_of_creation_order() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        for name in ["zeta", "alpha", "mid"] {
+            write_tool(&tools_dir, name);
+        }
+
+        let names: Vec<String> = build_tool_inventory(workdir.path(), None)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    /// Two builds over the same unchanged workdir produce byte-identical JSON: the array a
+    /// session holds for its whole life is reproducible, not a snapshot of directory order.
+    #[test]
+    fn tool_inventory_is_stable_across_repeated_builds() {
+        let workdir = tempfile::tempdir().unwrap();
+        let tools_dir = workdir.path().join("tools");
+        for name in ["zeta", "alpha", "mid"] {
+            write_tool(&tools_dir, name);
+        }
+
+        let first = serde_json::to_string(&build_tool_inventory(workdir.path(), None)).unwrap();
+        let second = serde_json::to_string(&build_tool_inventory(workdir.path(), None)).unwrap();
+
+        assert_eq!(first, second);
+    }
 }

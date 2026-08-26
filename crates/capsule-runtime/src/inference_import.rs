@@ -99,6 +99,10 @@ impl HookInferenceCtx {
             &[],
             request.system_prompt.as_deref().unwrap_or(""),
             None,
+            // A hook's `run-inference` shares no prompt prefix with the agent loop — its own
+            // system prompt, no tools — so there is no prefix for a routing hint to point at,
+            // and `HookInferenceCtx` carries no capsule name or version to build one from.
+            None,
         );
         let payload_json = serde_json::to_string(&payload)
             .map_err(|e| format!("failed to encode driver payload: {e}"))?;
@@ -411,8 +415,15 @@ mod tests {
         let messages = vec![
             serde_json::json!({"role":"user","content":[{"type":"text","text":"summarize this"}]}),
         ];
-        let payload =
-            build_driver_payload(model, DEFAULT_MAX_OUTPUT_TOKENS, &messages, &[], "", None);
+        let payload = build_driver_payload(
+            model,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            &messages,
+            &[],
+            "",
+            None,
+            None,
+        );
         u64::from(count_tokens(&serde_json::to_string(&payload).unwrap()))
     }
 
