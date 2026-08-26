@@ -12,7 +12,13 @@
 //!   `--verbose`                  — include system/metadata events
 //!   `--input-format stream-json` — accept JSON-line messages on stdin
 //!   `--model <model>`            — target model
-//!   `--tools ""`                 — disable claude's built-in tools (capsule tools live in murmur)
+//!   `--tools <names>`            — the bridge's `mcp__claude_bridge__<tool>` names when a bridge
+//!                                  is bound; `--tools ""` when the capsule declares no tools, so
+//!                                  claude's built-in tools are off either way
+//!   `--mcp-config <json>`        — bridge server definition, with `--strict-mcp-config` so the
+//!                                  bridge is the only tool server the CLI loads (bridge only)
+//!   `--permission-mode bypassPermissions` — auto-approve bridge tool calls; `--print` cannot
+//!                                  prompt for approval (bridge only)
 //!   `--system-prompt <text>`     — inject system prompt when configured
 //!
 //! **Stdin message format:**
@@ -27,10 +33,13 @@
 //!
 //! **Turn counting:** each `{"type":"assistant"}` event = one LLM inference call = one turn.
 //!
-//! **Tool calls:** Claude dispatches its own built-in tools internally. Tool_use and tool_result
-//! events appear in the stream for observability but murmur does not intercept them. Murmur
-//! capsule artifacts (WASM tools, native tools) are not exposed to the claude subprocess in this
-//! transport — use `transport: http` for murmur-managed tool dispatch.
+//! **Tool calls:** a capsule that declares tool artifacts gets a `claude_bridge` server bound on
+//! loopback, and the CLI is pointed at it as its only tool server, restricted to the bridge's
+//! `mcp__claude_bridge__<tool>` names with its own built-in tools off. Murmur executes each call
+//! through the same `CapsuleStoreState` dispatch the `transport: http` path uses, under the
+//! capsule's declared capabilities. Tool_use and tool_result events carry the qualified CLI names;
+//! `strip_bridge_prefix` maps them back to the artifact tool names. A capsule that declares no
+//! tools gets plain inference with the CLI's built-in tools disabled.
 
 use std::{
     collections::HashMap,

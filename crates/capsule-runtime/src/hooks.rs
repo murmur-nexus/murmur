@@ -1032,8 +1032,7 @@ impl HookRuntime {
     /// `HookEvent::Compaction` and reads both the `replacement` and `first_error`
     /// halves of the result. An error wins over a replacement produced by some other
     /// hook in the same dispatch — a partially-failed compaction is still a failure.
-    /// An async hook is only handed the event; its output is always discarded. Checkpoint
-    /// signing after a successful replacement happens inside `dispatch`.
+    /// An async hook is only handed the event; its output is always discarded.
     pub(crate) async fn dispatch_compaction(
         &mut self,
         messages: Vec<Message>,
