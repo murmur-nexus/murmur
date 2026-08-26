@@ -496,3 +496,72 @@ fn read_http_request_body(stream: &mut std::net::TcpStream) -> std::io::Result<S
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
+
+/// The `tool_result` block a scripted server saw posted back for one `tool_use` id.
+///
+/// Scans every request in order, so the first post of a given id wins — a session that retries a
+/// call still reports what the tool answered the first time.
+pub fn find_tool_result(requests: &[Value], tool_id: &str) -> Option<Value> {
+    for request in requests {
+        for message in request.get("messages")?.as_array()? {
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            let Some(content) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for block in content {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    && block.get("tool_use_id").and_then(Value::as_str) == Some(tool_id)
+                {
+                    return Some(block.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A `tool_result` block's text.
+///
+/// The runtime sends the tool's `data`, falling back to its `summary`, rather than the whole JSON
+/// envelope. The Anthropic driver writes that as either a plain string or an array of
+/// `{type: "text", text: …}` blocks, so both shapes have to be read here.
+pub fn extract_result_text(tool_result: &Value) -> String {
+    if let Some(text) = tool_result.get("content").and_then(Value::as_str) {
+        return text.to_string();
+    }
+    tool_result
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                (block.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// `mur run --explain-scope --json`, which resolves the capability scope and creates nothing.
+pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
+    let stdout = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--json",
+            "--explain-scope",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&stdout).expect("--explain-scope --json emits one JSON object")
+}

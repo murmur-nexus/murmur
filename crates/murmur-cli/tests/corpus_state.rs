@@ -1,10 +1,9 @@
 //! The corpus tool and the durable-state grant, proved against each other.
 //!
-//! Both halves already had proofs, and neither proof involved the other. `capabilities.state` was
-//! pinned by `tests/state.rs` against a purpose-built fixture capsule that knows the runtime's own
-//! conventions, and the corpus was pinned in its own repository by a Wasmtime test that builds the
-//! two-preopen context itself rather than letting `mur run` build one. Four things have to agree
-//! for a capsule to actually reach the corpus, and nothing checked any of them:
+//! Four things have to agree for a capsule to reach the corpus, and only a real launch exercises
+//! all four at once. `tests/state.rs` covers `capabilities.state` against a fixture capsule that
+//! already knows the runtime's conventions, and the corpus's own repository covers the component
+//! against a Wasmtime context that test builds itself rather than one `mur run` built:
 //!
 //! 1. the guest preopen name — [`capsule_runtime::STATE_PREOPEN_NAME`] against the corpus's own
 //!    `STATE_DIR`, both of which are the bare string `state`;
@@ -60,7 +59,7 @@ const CONFIG_FILE: &str = "corpus.config.json";
 ///
 /// One type, `note`, whose derived three-letter id prefix (`not`) collides with none of the
 /// reserved runtime prefixes, so no `prefix_map` override is needed. `read_recent` and `search`
-/// blocks are deliberately absent — the corpus supplies its own caps for both, and omitting them
+/// blocks are absent — the corpus supplies its own caps for both, and omitting them
 /// keeps this the minimal config that parses.
 const OPERATOR_CONFIG: &str = r#"{"config_version":1,"types":{"note":{"schema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}},"additionalProperties":false}}}}"#;
 
@@ -309,27 +308,6 @@ fn workdir_from(stdout: &str) -> PathBuf {
     )
 }
 
-/// `mur run --explain-scope --json`, which stages nothing and creates nothing.
-fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
-    let stdout = Command::cargo_bin("mur")
-        .unwrap()
-        .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
-        .args([
-            "run",
-            "--manifest",
-            manifest.to_str().unwrap(),
-            "--json",
-            "--explain-scope",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&stdout).expect("--explain-scope --json emits one JSON object")
-}
-
 fn tool_use_response(tool_id: &str, input: Value) -> String {
     json!({
         "id": "msg_1",
@@ -370,52 +348,11 @@ fn end_turn_response(text: &str) -> String {
 /// whole `{ok, operation, …}` envelope in `data`, so this parses back to exactly what the tool
 /// returned.
 fn corpus_response(requests: &[Value], tool_id: &str) -> Value {
-    let block = find_tool_result(requests, tool_id)
+    let block = common::find_tool_result(requests, tool_id)
         .unwrap_or_else(|| panic!("no tool_result posted for {tool_id}"));
-    let text = extract_result_text(&block);
+    let text = common::extract_result_text(&block);
     serde_json::from_str(&text)
         .unwrap_or_else(|err| panic!("{tool_id} returned text that is not JSON ({err}): {text}"))
-}
-
-fn find_tool_result(requests: &[Value], tool_id: &str) -> Option<Value> {
-    for request in requests {
-        for message in request.get("messages")?.as_array()? {
-            if message.get("role").and_then(Value::as_str) != Some("user") {
-                continue;
-            }
-            let Some(content) = message.get("content").and_then(Value::as_array) else {
-                continue;
-            };
-            for block in content {
-                if block.get("type").and_then(Value::as_str) == Some("tool_result")
-                    && block.get("tool_use_id").and_then(Value::as_str) == Some(tool_id)
-                {
-                    return Some(block.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// A `tool_result` block's text, which the driver writes either as a plain string or as an array
-/// of `{type: "text", text: …}` blocks.
-fn extract_result_text(tool_result: &Value) -> String {
-    if let Some(text) = tool_result.get("content").and_then(Value::as_str) {
-        return text.to_string();
-    }
-    tool_result
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|blocks| {
-            blocks.iter().find_map(|block| {
-                (block.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| block.get("text").and_then(Value::as_str))
-                    .flatten()
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_default()
 }
 
 // ── assertions shared by the scenarios ───────────────────────────────────────
@@ -665,7 +602,7 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
     // The same resolution reaches the diagnostic, so an operator can see where their records will
     // land without launching anything.
     assert_eq!(
-        explain_scope_json(&staging.home, &staging.manifest())["state_stores"],
+        common::explain_scope_json(&staging.home, &staging.manifest())["state_stores"],
         json!([{
             "artifact": TOOL_NAME,
             "store": capsule,
@@ -685,9 +622,7 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
 ///
 /// The workdir half of the assertion is the load-bearing one. Without the grant the guest path
 /// `state/` resolves inside the workdir preopen, so a corpus that created its own directory would
-/// work perfectly and be worthless — a store the agent can rewrite at will. This is the first time
-/// that is checked against the real runtime declining to add the preopen rather than against a
-/// hand-built context.
+/// work perfectly and be worthless — a store the agent can rewrite at will.
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn every_operation_refuses_without_the_state_grant() {
