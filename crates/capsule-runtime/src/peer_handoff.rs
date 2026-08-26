@@ -1625,15 +1625,17 @@ mod tests {
             "the peer plane discloses no path structure"
         );
 
-        let flip_last = |text: &str| {
+        // Only a segment's last character carries padding bits, and those must be zero to
+        // decode. Tampering with the first character keeps every substitution canonical, so
+        // the segment still decodes and the refusal comes from the MAC rather than the parse.
+        let flip_first = |text: &str| {
             let mut chars: Vec<char> = text.chars().collect();
-            let last = chars.len() - 1;
-            chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
+            chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
             chars.into_iter().collect::<String>()
         };
         let segments: Vec<&str> = minted.handle.split('.').collect();
-        let bad_payload = format!("mh1.{}.{}", flip_last(segments[1]), segments[2]);
-        let bad_mac = format!("mh1.{}.{}", segments[1], flip_last(segments[2]));
+        let bad_payload = format!("mh1.{}.{}", flip_first(segments[1]), segments[2]);
+        let bad_mac = format!("mh1.{}.{}", segments[1], flip_first(segments[2]));
 
         let refusals = [
             respond(
