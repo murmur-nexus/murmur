@@ -303,52 +303,6 @@ fn end_turn_response(text: &str) -> String {
     .to_string()
 }
 
-fn find_tool_result(requests: &[Value], tool_id: &str) -> Option<Value> {
-    for req in requests {
-        let messages = req.get("messages")?.as_array()?;
-        for msg in messages {
-            if msg.get("role")?.as_str()? != "user" {
-                continue;
-            }
-            let content = msg.get("content")?.as_array()?;
-            for block in content {
-                if block.get("type")?.as_str()? == "tool_result"
-                    && block.get("tool_use_id")?.as_str()? == tool_id
-                {
-                    return Some(block.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract the tool result text from a tool_result block.
-///
-/// The runtime sends `data || summary` as the content text (not the full JSON blob).
-/// The Anthropic driver formats this as either a plain string or an array of text blocks.
-fn extract_result_text(tool_result: &Value) -> String {
-    // content may be a plain string or an array of {type: text, text: ...} blocks
-    if let Some(text) = tool_result.get("content").and_then(|c| c.as_str()) {
-        return text.to_string();
-    }
-    tool_result
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|blocks| {
-            blocks.iter().find_map(|b| {
-                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    b.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_default()
-}
-
 /// Invoke a native tool binary directly (bypassing the capsule runtime) with a JSON
 /// operation as input and optional environment variable overrides.
 ///
@@ -429,9 +383,9 @@ fn native_tool_dispatch_creates_directory() {
         requests.len()
     );
 
-    let tool_result = find_tool_result(&requests, "toolu_create")
+    let tool_result = common::find_tool_result(&requests, "toolu_create")
         .expect("tool_result block should exist in second request");
-    let result_text = extract_result_text(&tool_result);
+    let result_text = common::extract_result_text(&tool_result);
 
     assert!(
         result_text.contains("made/here"),
@@ -499,9 +453,9 @@ fn native_tool_dispatch_reports_failure_for_existing_path() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result =
-        find_tool_result(&requests, "toolu_conflict").expect("tool_result block should exist");
-    let result_text = extract_result_text(&tool_result);
+    let tool_result = common::find_tool_result(&requests, "toolu_conflict")
+        .expect("tool_result block should exist");
+    let result_text = common::extract_result_text(&tool_result);
 
     assert!(
         result_text.contains("already exists"),
@@ -561,8 +515,8 @@ fn native_tool_dispatch_lists_entries() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result = find_tool_result(&requests, "toolu_list").expect("tool_result");
-    let result_text = extract_result_text(&tool_result);
+    let tool_result = common::find_tool_result(&requests, "toolu_list").expect("tool_result");
+    let result_text = common::extract_result_text(&tool_result);
 
     assert!(
         result_text.contains("alpha.txt") && result_text.contains("beta.txt"),
@@ -614,8 +568,8 @@ fn native_tool_dispatch_lists_entries_with_repo_base() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
 
-    let tool_result = find_tool_result(&requests, "toolu_repo_list").expect("tool_result");
-    let result_text = extract_result_text(&tool_result);
+    let tool_result = common::find_tool_result(&requests, "toolu_repo_list").expect("tool_result");
+    let result_text = common::extract_result_text(&tool_result);
 
     assert!(
         result_text.contains("gamma.txt"),
@@ -675,9 +629,9 @@ fn native_tool_dispatch_with_explicit_repo() {
         requests.len()
     );
 
-    let tool_result =
-        find_tool_result(&requests, "toolu_explicit").expect("tool_result block should exist");
-    let result_text = extract_result_text(&tool_result);
+    let tool_result = common::find_tool_result(&requests, "toolu_explicit")
+        .expect("tool_result block should exist");
+    let result_text = common::extract_result_text(&tool_result);
 
     assert!(
         result_text.contains("made-outside"),

@@ -816,22 +816,24 @@ fn the_handle_is_not_a_path_and_an_edited_handle_buys_nothing() {
         assert_eq!(again.header("etag").unwrap(), etag);
     }
 
-    let flip_last = |text: &str| {
+    // Only a segment's last character carries padding bits, and those must be zero to
+    // decode. Tampering with the first character keeps every substitution canonical, so
+    // the segment still decodes and the refusal comes from the MAC rather than the parse.
+    let flip_first = |text: &str| {
         let mut chars: Vec<char> = text.chars().collect();
-        let last = chars.len() - 1;
-        chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
+        chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
         chars.into_iter().collect::<String>()
     };
     let segments: Vec<&str> = handle.split('.').collect();
     let refusals = [
         redeem(
             &minter.url,
-            &format!("mh1.{}.{}", flip_last(segments[1]), segments[2]),
+            &format!("mh1.{}.{}", flip_first(segments[1]), segments[2]),
             &audience,
         ),
         redeem(
             &minter.url,
-            &format!("mh1.{}.{}", segments[1], flip_last(segments[2])),
+            &format!("mh1.{}.{}", segments[1], flip_first(segments[2])),
             &audience,
         ),
         redeem(&minter.url, &handle, "attacker@localhost:1"),

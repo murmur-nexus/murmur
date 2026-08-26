@@ -878,6 +878,20 @@ mod tests {
         PeerMintKey::generate().unwrap()
     }
 
+    /// Substitute the first character of a handle's `nth` dot-separated segment.
+    ///
+    /// The first character, never the last: only a segment's final base64url character carries
+    /// padding bits, and those must be zero to decode. Substituting there can set one, so the
+    /// segment stops decoding and the refusal comes from the parse rather than from the MAC —
+    /// which is a different error than these tests assert.
+    fn tamper_segment(handle: &str, nth: usize) -> String {
+        let mut segments: Vec<String> = handle.split('.').map(str::to_string).collect();
+        let segment = &mut segments[nth];
+        let first = segment.remove(0);
+        segment.insert(0, if first == 'A' { 'B' } else { 'A' });
+        segments.join(".")
+    }
+
     fn payload_for(path: &str, session: &str, exp: u64) -> HandlePayload {
         HandlePayload {
             v: 1,
@@ -933,14 +947,7 @@ mod tests {
             "a@b",
         )
         .unwrap();
-        let mut chars: Vec<char> = token.chars().collect();
-        let payload_end = token.rfind('.').unwrap();
-        chars[payload_end - 1] = if chars[payload_end - 1] == 'A' {
-            'B'
-        } else {
-            'A'
-        };
-        let tampered: String = chars.into_iter().collect();
+        let tampered = tamper_segment(&token, 1);
         assert_eq!(
             verify(&key, &tampered, "a@b", "ses_1"),
             Err(HandleError::NotValid)
@@ -956,10 +963,7 @@ mod tests {
             "a@b",
         )
         .unwrap();
-        let mut chars: Vec<char> = token.chars().collect();
-        let last = chars.len() - 1;
-        chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
-        let tampered: String = chars.into_iter().collect();
+        let tampered = tamper_segment(&token, 2);
         assert_eq!(
             verify(&key, &tampered, "a@b", "ses_1"),
             Err(HandleError::NotValid)
@@ -1625,15 +1629,8 @@ mod tests {
             "the peer plane discloses no path structure"
         );
 
-        let flip_last = |text: &str| {
-            let mut chars: Vec<char> = text.chars().collect();
-            let last = chars.len() - 1;
-            chars[last] = if chars[last] == 'A' { 'B' } else { 'A' };
-            chars.into_iter().collect::<String>()
-        };
-        let segments: Vec<&str> = minted.handle.split('.').collect();
-        let bad_payload = format!("mh1.{}.{}", flip_last(segments[1]), segments[2]);
-        let bad_mac = format!("mh1.{}.{}", segments[1], flip_last(segments[2]));
+        let bad_payload = tamper_segment(&minted.handle, 1);
+        let bad_mac = tamper_segment(&minted.handle, 2);
 
         let refusals = [
             respond(

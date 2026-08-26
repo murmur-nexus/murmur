@@ -17,7 +17,6 @@ use std::{
 
 use assert_cmd::Command;
 use predicates::prelude::*;
-use serde_json::Value;
 use tempfile::TempDir;
 use zip::{
     write::{FileOptions, SimpleFileOptions},
@@ -150,16 +149,6 @@ fn explain_scope(home: &TempDir, manifest: &Path, json: bool) -> Command {
     cmd
 }
 
-fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
-    let stdout = explain_scope(home, manifest, true)
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    serde_json::from_slice(&stdout).expect("--explain-scope --json emits one JSON object")
-}
-
 /// The whole point of the capability: two launches, two different session workdirs, one store.
 ///
 /// Neither run passes `--workdir`, so each gets a fresh `<manifest_dir>/workdir/<session_id>` and
@@ -225,7 +214,7 @@ fn an_undeclared_tool_gets_no_store_and_no_directory_is_created() {
         .success()
         .stdout(predicate::str::contains("state stores: <none>"));
     assert_eq!(
-        explain_scope_json(&home, &manifest)["state_stores"],
+        common::explain_scope_json(&home, &manifest)["state_stores"],
         serde_json::json!([])
     );
 }
@@ -384,7 +373,7 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
     install_state_tool(fixture.path(), project.path());
 
     let expected_path = store_dir(&home, "shey").display().to_string();
-    let declared = explain_scope_json(&home, &manifest);
+    let declared = common::explain_scope_json(&home, &manifest);
     assert_eq!(
         declared["state_stores"],
         serde_json::json!([{
@@ -418,7 +407,8 @@ fn the_grant_is_reported_and_reporting_it_changes_nothing_else() {
 
     // Same manifest with the `state:` block deleted: every containment field is identical, so
     // declaring a store is proven to move nothing but its own key.
-    let undeclared = explain_scope_json(&home, &state_project(project.path(), CAPSULE_NAME, None));
+    let undeclared =
+        common::explain_scope_json(&home, &state_project(project.path(), CAPSULE_NAME, None));
     assert_eq!(undeclared["state_stores"], serde_json::json!([]));
     for field in [
         "declared_containment",
