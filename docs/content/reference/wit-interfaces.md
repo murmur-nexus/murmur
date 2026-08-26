@@ -97,6 +97,50 @@ Forward it only where the provider defines a field of its own for it: the OpenAI
 Responses APIs accept `prompt_cache_key` in the request body, and the Anthropic Messages API
 rejects a body carrying any field it does not define.
 
+### Reported token usage { #driver-usage }
+
+A driver response may carry a top-level `usage` object holding the provider's own token counts
+for that call:
+
+```json
+{
+  "stop_reason": "end_turn",
+  "content": [{"type": "text", "text": "..."}],
+  "usage": {
+    "input_tokens": 12043,
+    "output_tokens": 218,
+    "cached_tokens": 11780,
+    "cache_write_tokens": 0
+  }
+}
+```
+
+| Member | Value |
+|---|---|
+| `input_tokens` | Tokens the provider billed for the request |
+| `output_tokens` | Tokens the provider billed for the completion |
+| `cached_tokens` | Request tokens served from the provider's prompt cache |
+| `cache_write_tokens` | Request tokens written into the provider's prompt cache |
+
+Every member is optional and every member is a non-negative integer. A driver reports whichever
+members its provider returned; a provider with no prompt cache reports no cache members.
+
+The runtime records the reported numbers on the call's `inference` trace event and its
+`capsule.inference` span, and acts on none of them: the compaction threshold and every budget
+decision keep running on the runtime's own pre-flight estimate. See
+[Observability schemas](observability-schemas.md#session-trace-tracejsonl) for the field names.
+
+A malformed report degrades to no report rather than failing the call:
+
+| What the driver returns | What the runtime records |
+|---|---|
+| No `usage` | Nothing |
+| A `usage` that is not an object | Nothing |
+| A member that is not a non-negative integer | Nothing for that member; its well-formed siblings are still recorded |
+| A member the runtime does not define | Nothing for that member |
+
+An omitted number is absent from the trace event, never written as `0`.
+
 ---
 
 ## `murmur:artifact-manager/manage`

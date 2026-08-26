@@ -39,12 +39,20 @@ the session directory) and `timestamp` (Unix milliseconds).
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | Zero-based turn index |
-| `input_tokens` | u64 | |
-| `output_tokens` | u64 | |
+| `input_tokens` | u64 | The runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before the request was sent. This is the number the compaction threshold and the session totals run on |
+| `output_tokens` | u64 | The runtime's own tiktoken estimate of the driver response |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` |
 | `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
+| `input_tokens_actual` | u64 | The provider's own count of the request, from the driver's [`usage`](wit-interfaces.md#driver-usage) block |
+| `output_tokens_actual` | u64 | The provider's own count of the completion |
+| `cached_tokens` | u64 | Request tokens the provider served from its prompt cache |
+| `cache_write_tokens` | u64 | Request tokens the provider wrote into its prompt cache |
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
 | `model` | string | The model this call was sent to. Written only alongside `origin` |
+
+The four provider-reported fields are written only when the driver reported that member, and are
+absent otherwise — never `0`. They sit beside the runtime's estimates rather than replacing them,
+so estimator drift is a subtraction on one line. Nothing in the runtime reads them back.
 
 **`tool_call`** — written after each tool invocation returns
 
@@ -89,11 +97,16 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 
 **`compaction`** — written when context compaction fires
 
-| Field | Type |
-|---|---|
-| `turn` | u32 |
-| `tokens_before` | u64 |
-| `tokens_after` | u64 |
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `tokens_before` | u64 | Context occupancy before the replacement |
+| `tokens_after` | u64 | Context occupancy after it |
+
+Both are the same measurement: occupancy is the tiktoken count of the whole serialized driver
+payload — system prompt, tool inventory and the complete `messages` array — because that is what
+consumes the provider's context window. `tokens_before` is the same number the turn's
+`input_tokens` carries.
 
 **`session_end`** — written on every exit path of an agent-loop attempt
 
@@ -349,7 +362,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 | Span name | Source event | Attributes |
 |---|---|---|
 | `capsule.session` | `session_start` / `session_end` | `exit_status` |
-| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` (when the response asked for one), plus `origin` and `model` for a hook-run completion |
+| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens` and `cache_write_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
 | `capsule.compaction` | `compaction` | `tokens_before`, `tokens_after` |

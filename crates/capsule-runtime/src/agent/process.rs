@@ -602,10 +602,10 @@ async fn read_process_output(
                 };
 
                 let _ = trace
-                    .write_inference(turn_idx, 0, 0, decision.to_string(), None, None)
+                    .write_inference(turn_idx, 0, 0, decision.to_string(), None, None, None)
                     .await;
 
-                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None)
+                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None, None)
                     .await;
 
                 hooks
@@ -834,9 +834,9 @@ async fn read_codex_output(
                             .unwrap_or("")
                             .to_string();
                         let _ = trace
-                            .write_inference(turns - 1, 0, 0, "end_turn".into(), None, None)
+                            .write_inference(turns - 1, 0, 0, "end_turn".into(), None, None, None)
                             .await;
-                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None)
+                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None, None)
                             .await;
                     }
                     "mcp_tool_call" => {
@@ -866,6 +866,7 @@ async fn read_codex_output(
                                 "tool_call".into(),
                                 Some(tool_name.clone()),
                                 None,
+                                None,
                             )
                             .await;
                         otel.emit_inference(
@@ -875,6 +876,7 @@ async fn read_codex_output(
                             "tool_call",
                             Some(tool_name.as_str()),
                             0,
+                            None,
                             None,
                         )
                         .await;

@@ -152,6 +152,16 @@ pub(crate) async fn run_agent_loop(
         "content": [{"type": "text", "text": task}],
     }));
 
+    // The one occupancy counter for this session — used both for the per-turn
+    // compaction-trigger input and for the recount after a replace-context commit.
+    let occupancy = ContextOccupancy {
+        model: &inference.model,
+        max_output_tokens: run_config.max_output_tokens,
+        tools: &tools,
+        system: &augmented_system,
+        prompt_cache_key: Some(prompt_cache_key.as_str()),
+    };
+
     // Current context occupancy, not a running total: every turn assigns its own
     // full-context input count before anything reads it, so there is no initial value.
     let mut session_tokens: u32;
@@ -200,25 +210,10 @@ pub(crate) async fn run_agent_loop(
 
         // Token accounting is ALWAYS computed from the full logical `messages` array, never
         // from the (possibly smaller) incremental wire payload — so the compaction-threshold
-        // check fires at the same point whether or not continuation is active. When no
-        // continuation is active the wire payload already IS the full payload; reuse it.
-        let input_tokens = if active_continuation.is_some() {
-            let full_payload = build_driver_payload(
-                &inference.model,
-                run_config.max_output_tokens,
-                &messages,
-                &tools,
-                &augmented_system,
-                None,
-                Some(prompt_cache_key.as_str()),
-            );
-            let full_json = serde_json::to_string(&full_payload).map_err(|e| {
-                RuntimeError::AgentLoopFailed(format!("failed to encode driver payload: {e}"))
-            })?;
-            count_tokens(&full_json)
-        } else {
-            count_tokens(&payload_json)
-        };
+        // check fires at the same point whether or not continuation is active. That is what
+        // `ContextOccupancy::count` guarantees; when no continuation is active it recomputes
+        // the payload `payload_json` already holds, byte for byte.
+        let input_tokens = occupancy.count(&messages);
         // Assign: `input_tokens` already counts the FULL current context,
         // so `session_tokens` tracks live occupancy rather than lifetime throughput — the
         // same notion `try_compact_via_hooks` resets it to after a replace-context commit.
@@ -355,6 +350,10 @@ pub(crate) async fn run_agent_loop(
             RuntimeError::AgentLoopFailed(format!("failed to parse driver response: {e}"))
         })?;
 
+        // The provider's own counts, when the driver reported them. Recorded alongside the
+        // estimate, never in place of it and never fed back into `session_tokens`.
+        let driver_usage = parse_driver_usage(&response);
+
         let stop_reason = response
             .get("stop_reason")
             .and_then(Value::as_str)
@@ -412,6 +411,7 @@ pub(crate) async fn run_agent_loop(
                 decision.to_string(),
                 hook_tool_name.clone(),
                 None,
+                driver_usage.as_ref(),
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -423,6 +423,7 @@ pub(crate) async fn run_agent_loop(
             hook_tool_name.as_deref(),
             inference_duration_ms,
             None,
+            driver_usage.as_ref(),
         )
         .await;
         if stop_reason == "error" {
@@ -478,6 +479,7 @@ pub(crate) async fn run_agent_loop(
                 let compacted = try_compact_via_hooks(
                     &mut messages,
                     &mut session_tokens,
+                    &occupancy,
                     store_state,
                     turn,
                     run_config.context_window,
@@ -995,6 +997,7 @@ async fn flush_hook_inference_records(
                 record.decision.clone(),
                 None,
                 Some(&record.origin),
+                record.usage.as_ref(),
             )
             .await;
         otel.emit_inference(
@@ -1005,6 +1008,7 @@ async fn flush_hook_inference_records(
             None,
             record.duration_ms,
             Some(&record.origin),
+            record.usage.as_ref(),
         )
         .await;
     }
@@ -1143,6 +1147,7 @@ fn dump_compaction_summary(
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
     session_tokens: &mut u32,
+    occupancy: &ContextOccupancy<'_>,
     store_state: &mut CapsuleStoreState,
     turn: usize,
     context_window: u32,
@@ -1262,8 +1267,10 @@ async fn try_compact_via_hooks(
     // a full cache miss on everything the summary stands in for.
     *messages = candidate_messages;
 
-    let new_json = serde_json::to_string(&*messages).unwrap_or_default();
-    *session_tokens = count_tokens(&new_json);
+    // Recounted through the same `ContextOccupancy` the compaction trigger reads, so
+    // `tokens_before` and `tokens_after` on the `compaction` event are the same measurement
+    // taken twice — the reported drop is the saving the provider actually sees.
+    *session_tokens = occupancy.count(messages);
     store_state.clear_continuation();
     let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
@@ -1439,6 +1446,89 @@ pub(crate) fn build_driver_payload(
         payload[PROMPT_CACHE_KEY_KEY] = json!(key);
     }
     payload
+}
+
+/// The tiktoken count of everything a turn puts in front of the model.
+///
+/// Occupancy is the count of the **whole serialized driver payload** — system prompt, tool
+/// inventory and the complete `messages` array, built with `continuation = None` — because
+/// that is what consumes the provider's context window. Counting `messages` alone
+/// understates it by the system prompt and the tool inventory, which are resent on every
+/// request and are the largest launch-invariant part of the prefix.
+///
+/// Every site that needs an occupancy number goes through [`ContextOccupancy::count`], so the
+/// compaction trigger and the post-commit recount cannot drift apart: a `tokens_before` and a
+/// `tokens_after` produced by different definitions report a saving that was never made.
+///
+/// This is an estimate — an OpenAI tokenizer over a JSON string, for whatever model the
+/// session runs — and it is deliberately the only number that steers the loop, because the
+/// decision it feeds is made before the request is sent. The provider's own counts arrive
+/// afterwards and are recorded, not acted on (see [`DriverUsage`]).
+pub(crate) struct ContextOccupancy<'a> {
+    pub(crate) model: &'a str,
+    pub(crate) max_output_tokens: u32,
+    pub(crate) tools: &'a [Value],
+    pub(crate) system: &'a str,
+    /// The session's real prompt-cache key, so the counted payload is byte-identical to the
+    /// one that goes on the wire when no continuation is active.
+    pub(crate) prompt_cache_key: Option<&'a str>,
+}
+
+impl ContextOccupancy<'_> {
+    /// Count the full payload carrying `messages`, independent of whether a continuation is
+    /// active — a continuation shrinks the wire payload, never the context the provider holds.
+    pub(crate) fn count(&self, messages: &[Value]) -> u32 {
+        let payload = build_driver_payload(
+            self.model,
+            self.max_output_tokens,
+            messages,
+            self.tools,
+            self.system,
+            None,
+            self.prompt_cache_key,
+        );
+        count_tokens(&serde_json::to_string(&payload).unwrap_or_default())
+    }
+}
+
+/// The provider's own token counts for one completion, as reported by the driver.
+///
+/// Recorded into the trace and the OTel span and nothing else: no member of this ever reaches
+/// `session_tokens`, the compaction ratio, or any other decision the loop makes. Every member
+/// is independently optional because a driver reports whatever its provider gave it — a
+/// provider with no prompt cache reports no cache members, and that is not an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DriverUsage {
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) cached_tokens: Option<u64>,
+    pub(crate) cache_write_tokens: Option<u64>,
+}
+
+/// Reserved top-level field on the driver response payload carrying the provider's own token
+/// counts (see `wit/tool.wit`).
+pub(crate) const USAGE_KEY: &str = "usage";
+
+/// Read the optional `usage` block out of a driver response.
+///
+/// Absent means absent, at every level: a response with no `usage`, a `usage` that is not an
+/// object, and a `usage` from which no member survives type-checking all yield `None`, and a
+/// single member that fails type-checking is dropped on its own while its siblings are kept.
+/// None of those is an error or a warning — a driver that reports nothing runs exactly as it
+/// did before this field existed, and the trace then carries only the runtime's own estimate.
+///
+/// A member type-checks when it is a JSON number that is a non-negative integer; a string, a
+/// negative, a fraction and `null` are all dropped. Unknown members are ignored.
+pub(crate) fn parse_driver_usage(response: &Value) -> Option<DriverUsage> {
+    let usage = response.get(USAGE_KEY)?.as_object()?;
+    let member = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let parsed = DriverUsage {
+        input_tokens: member("input_tokens"),
+        output_tokens: member("output_tokens"),
+        cached_tokens: member("cached_tokens"),
+        cache_write_tokens: member("cache_write_tokens"),
+    };
+    (parsed != DriverUsage::default()).then_some(parsed)
 }
 
 /// Untrusted-content notice: covers findings C-4 (prompt injection has no complete structural
@@ -1813,6 +1903,169 @@ mod tests {
             json!({"role": "assistant", "content": [{"type": "text", "text": "yo"}]}),
             json!({"role": "tool", "tool_call_id": "t1", "content": [{"type": "text", "text": "ok"}]}),
         ]
+    }
+
+    fn occupancy_fixture<'a>(tools: &'a [Value], system: &'a str) -> ContextOccupancy<'a> {
+        ContextOccupancy {
+            model: "test-model",
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            tools,
+            system,
+            prompt_cache_key: Some("cap:1.0.0:ctx-1"),
+        }
+    }
+
+    fn occupancy_messages() -> Vec<Value> {
+        vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "count these tokens"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "counting them"}]}),
+        ]
+    }
+
+    /// The definition: occupancy is `count_tokens` of the serialized full driver payload,
+    /// not of some other rendering of the same context.
+    #[test]
+    fn occupancy_equals_count_of_the_serialized_full_payload() {
+        let tools = vec![json!({"name": "bash", "description": "run a command"})];
+        let system = "you are a test capsule";
+        let messages = occupancy_messages();
+        let occupancy = occupancy_fixture(&tools, system);
+
+        let payload = build_driver_payload(
+            "test-model",
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            &messages,
+            &tools,
+            system,
+            None,
+            Some("cap:1.0.0:ctx-1"),
+        );
+        let expected = count_tokens(&serde_json::to_string(&payload).unwrap());
+
+        assert_eq!(occupancy.count(&messages), expected);
+    }
+
+    /// The system prompt and the tool inventory are resent on every request, so they occupy
+    /// the context window too — counting `messages` alone (what the post-compaction recount
+    /// used to do) understates occupancy and overstates the saving a compaction made.
+    #[test]
+    fn occupancy_exceeds_the_messages_array_alone() {
+        let tools = vec![json!({"name": "bash", "description": "run a command"})];
+        let system = "you are a test capsule";
+        let messages = occupancy_messages();
+
+        let messages_only = count_tokens(&serde_json::to_string(&messages).unwrap());
+
+        assert!(
+            occupancy_fixture(&tools, system).count(&messages) > messages_only,
+            "a payload carrying a system prompt and a tool inventory must count above its \
+             messages alone"
+        );
+        assert!(
+            occupancy_fixture(&[], system).count(&messages) > messages_only,
+            "a non-empty system prompt alone must already push occupancy above the messages"
+        );
+        assert!(
+            occupancy_fixture(&tools, "").count(&messages) > messages_only,
+            "a non-empty tool inventory alone must already push occupancy above the messages"
+        );
+    }
+
+    /// A continuation shrinks the wire payload, never the context the provider holds — so the
+    /// same `messages` occupy the same number of tokens whether or not one is active.
+    #[test]
+    fn occupancy_is_independent_of_an_active_continuation() {
+        let tools = vec![json!({"name": "bash", "description": "run a command"})];
+        let system = "you are a test capsule";
+        let messages = occupancy_messages();
+        let occupancy = occupancy_fixture(&tools, system);
+
+        let wire_with_continuation = build_driver_payload(
+            "test-model",
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            &messages,
+            &tools,
+            system,
+            Some(("cont-1", 1)),
+            Some("cap:1.0.0:ctx-1"),
+        );
+        let wire_tokens = count_tokens(&serde_json::to_string(&wire_with_continuation).unwrap());
+
+        assert!(
+            wire_tokens < occupancy.count(&messages),
+            "the incremental wire payload must genuinely be smaller for this test to \
+             discriminate"
+        );
+        assert_eq!(
+            occupancy.count(&messages),
+            occupancy_fixture(&tools, system).count(&messages),
+            "occupancy is a function of the messages, the system prompt and the tools only"
+        );
+    }
+
+    #[test]
+    fn driver_usage_reads_every_member() {
+        let response = json!({
+            "stop_reason": "end_turn",
+            "content": [],
+            "usage": {
+                "input_tokens": 12043,
+                "output_tokens": 218,
+                "cached_tokens": 11780,
+                "cache_write_tokens": 0,
+            },
+        });
+        let usage = parse_driver_usage(&response).expect("a well-formed usage block parses");
+        assert_eq!(usage.input_tokens, Some(12043));
+        assert_eq!(usage.output_tokens, Some(218));
+        assert_eq!(usage.cached_tokens, Some(11780));
+        assert_eq!(
+            usage.cache_write_tokens,
+            Some(0),
+            "a reported zero is a report, not an absence"
+        );
+    }
+
+    #[test]
+    fn driver_usage_absent_forms_all_parse_to_none() {
+        for response in [
+            json!({"stop_reason": "end_turn"}),
+            json!({"stop_reason": "end_turn", "usage": {}}),
+            json!({"stop_reason": "end_turn", "usage": null}),
+            json!({"stop_reason": "end_turn", "usage": 7}),
+            json!({"stop_reason": "end_turn", "usage": "12043"}),
+            json!({"stop_reason": "end_turn", "usage": [1, 2]}),
+            json!({"stop_reason": "end_turn", "usage": {"unknown_member": 7}}),
+            json!({"stop_reason": "end_turn", "usage": {"input_tokens": "12043"}}),
+            json!({"stop_reason": "end_turn", "usage": {"input_tokens": -4}}),
+            json!({"stop_reason": "end_turn", "usage": {"input_tokens": 1.5}}),
+            json!({"stop_reason": "end_turn", "usage": {"input_tokens": null}}),
+        ] {
+            assert_eq!(
+                parse_driver_usage(&response),
+                None,
+                "no member survives type-checking in {response}"
+            );
+        }
+    }
+
+    /// A member that fails type-checking is dropped on its own; its well-formed siblings are
+    /// still recorded, and an unknown member is ignored rather than rejecting the block.
+    #[test]
+    fn driver_usage_drops_bad_members_individually() {
+        let response = json!({
+            "usage": {
+                "input_tokens": "12043",
+                "output_tokens": 218,
+                "cached_tokens": -4,
+                "unknown_member": 7,
+            },
+        });
+        let usage = parse_driver_usage(&response).expect("one surviving member is a report");
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(218));
+        assert_eq!(usage.cached_tokens, None);
+        assert_eq!(usage.cache_write_tokens, None);
     }
 
     #[test]
