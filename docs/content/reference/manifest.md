@@ -192,6 +192,7 @@ mur_version: "1.0.0"
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 | `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
+| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config). |
 | `artifacts[].on_overflow` | `drop \| block` | no | Default: `drop`. Recognized only on `runtime: hook`; declaring it on any other role fails with `E-MAN-003`. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook execution](#hook-overflow). Legal but inert on a hook that turns out to be `execution_mode: blocking`, which has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
@@ -345,6 +346,77 @@ Rules:
   `limits`, `resources` and `containment` parse but are inert here and print
   [`W-SEC-008`](diagnostics.md#w-sec-008), as does a grant on a tool with a **native** (non-WASM)
   implementation, which never runs through the WASI tool path at all.
+
+##### Artifact config { #artifact-config }
+
+`config:` on an artifact entry carries operator-authored settings to that one artifact. The runtime
+serializes the block to compact JSON and sets it as `MURMUR_ARTIFACT_CONFIG` in that artifact's
+environment:
+
+```yaml
+artifacts:
+  - name: murmur-tool-corpus
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      state: {}
+    config:
+      types:
+        utterance:
+          schema: { type: object, required: [text] }
+      read_recent: { default: 20, max: 100 }
+```
+
+The tool reads `MURMUR_ARTIFACT_CONFIG` and gets:
+
+```json
+{"types":{"utterance":{"schema":{"type":"object","required":["text"]}}},"read_recent":{"default":20,"max":100}}
+```
+
+Rules:
+
+- **Scoped to the declaring artifact.** Each entry's block reaches that artifact and no other.
+  An entry with no `config:` key gets no `MURMUR_ARTIFACT_CONFIG` at all, which an artifact reads
+  as an unset variable rather than as an empty object.
+- **`MURMUR_ARTIFACT_CONFIG` is set by the runtime.** Naming it in
+  [`capabilities.env.allow`](#field-capabilities) does not pass the host's value through, and does
+  not override the block.
+- **Types survive the translation.** Numbers stay numbers, sequences stay arrays, nested mappings
+  stay objects, and declaration order is preserved, so the same block always produces the same
+  bytes.
+- **Config grants nothing.** Declaring it opens no directory, reaches no host and leaves the
+  capsule's containment class unchanged.
+- **Shape is validated at launch; meaning is not.** A block that breaks one of the rules under
+  [Artifact config shape](#artifact-config-shape) fails with
+  [`E-CAP-010`](diagnostics.md#e-cap-010). Which keys a given artifact requires is that artifact's
+  own business, and a missing one surfaces as that artifact's error.
+- **A native tool reads no config.** A `runtime: tool` entry whose artifact ships a native
+  (non-WASM) implementation runs as a host subprocess, so a `config:` block there delivers nothing
+  and prints [`W-SEC-015`](diagnostics.md#w-sec-015). The launch continues.
+- **Only the capsule operator can configure**, exactly as for capabilities: the block is read from
+  your manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
+- **Config is per artifact.** A top-level `config:` key fails with `E-MAN-003`.
+
+`mur run --explain-scope` lists the artifacts that declare a block, and never what any of them
+declared:
+
+```
+  artifact config:
+    - murmur-tool-corpus
+```
+
+`--json` emits the same names as `configured_artifacts`, and `trace.jsonl`'s `session_start`
+carries them verbatim as `effective_grants.configured_artifacts`. Both read `artifact config:
+<none>` and `[]` when nothing declares a block.
+
+###### Secrets do not belong in a `config:` block { #artifact-config-secrets }
+
+`murmur.yaml` is an audit record of what a capsule was allowed to do, and a `config:` block is
+plaintext inside it. Pass credentials with a `${VAR}` reference, which resolves from the
+environment at launch and leaves only the variable name in the manifest — see
+[`inference.api_key` resolution](#inference-api-key). Names that look credential-shaped are
+stripped from every environment the runtime builds; a literal in a manifest field is reported as
+[`W-SEC-004`](diagnostics.md#w-sec-004).
 
 ##### Local-source artifacts { #local-source-skills }
 
@@ -866,6 +938,26 @@ before any registry pull, workdir creation or component instantiation, and creat
 `~/.murmur/state/`. `mur run --explain-scope` refuses the same names with the same code. Omitting
 `store:` uses the capsule name, which is read from your own manifest and never from the artifact's
 bundled one.
+
+### Artifact config shape { #artifact-config-shape }
+
+`artifacts[].config` is delivered as one environment variable holding JSON, so the runtime checks
+that the block can travel that way:
+
+| Rule | Refusal |
+|---|---|
+| The block is a mapping | [`E-CAP-010`](diagnostics.md#e-cap-010) |
+| Every key in that mapping is a string | [`E-CAP-010`](diagnostics.md#e-cap-010) |
+| The block serializes to JSON | [`E-CAP-010`](diagnostics.md#e-cap-010) |
+| The serialized JSON is at most 65536 bytes | [`E-CAP-010`](diagnostics.md#e-cap-010) |
+
+A block that breaks any of these fails at staging, before any registry pull, workdir creation or
+component instantiation, and leaves no session workdir behind. `mur run --explain-scope` refuses
+the same blocks with the same code. An oversized block is refused rather than truncated, and the
+message names both the size it serialized to and the limit.
+
+`config:` written with no value under it is an empty block, not an absent key, and is refused on
+the same terms. Omit the key to deliver no variable.
 
 ### Shell allow
 

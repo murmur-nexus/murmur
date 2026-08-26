@@ -319,6 +319,7 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
                 runtime: a.runtime.clone(),
                 source: a.source.clone(),
                 on_overflow: a.on_overflow,
+                config: a.config.clone(),
                 capabilities: a.capabilities.clone(),
             }
         })

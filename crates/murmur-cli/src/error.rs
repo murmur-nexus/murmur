@@ -1,6 +1,6 @@
 use std::fmt;
 
-use capsule_runtime::RuntimeError;
+use capsule_runtime::{RuntimeError, MAX_ARTIFACT_CONFIG_BYTES};
 use murmur_artifact::{BuildError, ManifestError, RegistryError, MANIFEST_FILENAME};
 
 // Manifest parsing
@@ -41,6 +41,7 @@ pub const E_CAP_006: &str = "E-CAP-006"; // sealed capsule allowlists a script w
 pub const E_CAP_007: &str = "E-CAP-007"; // exports.files.root resolves outside the capsule workdir
 pub const E_CAP_008: &str = "E-CAP-008"; // persistent capsule declares exports.peer_files without a short enough max_ttl
 pub const E_CAP_009: &str = "E-CAP-009"; // capabilities.state.store does not name a usable durable store
+pub const E_CAP_010: &str = "E-CAP-010"; // an artifact entry's config: block cannot be delivered as MURMUR_ARTIFACT_CONFIG
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -245,10 +246,26 @@ impl From<RuntimeError> for CliError {
                 E_CAP_002,
                 format!("invalid filesystem scope '{scope}': {message}"),
             ),
-            // Both arms are the same operator problem — a declared store that does not resolve to
-            // a usable directory — so they share one code, and both hints point at the store name
-            // and at `~/.murmur/state/`. Never at the containment ladder: a state store is not a
-            // containment shortfall, and no floor change makes one appear.
+            // One code for every shape rule the config channel enforces, because they are one
+            // operator problem — a declared block that cannot be delivered — and the message
+            // already names the artifact and the rule that was broken. The hint points at the
+            // block, never at the containment ladder: config grants nothing, so no floor change
+            // makes a malformed one launch.
+            error @ RuntimeError::InvalidArtifactConfig { .. } => CliError::with_hint(
+                E_CAP_010,
+                error.to_string(),
+                format!(
+                    "config: on an artifact entry must be a mapping with string keys that \
+                     serializes to at most {MAX_ARTIFACT_CONFIG_BYTES} bytes of JSON; it is \
+                     delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key \
+                     entirely to deliver no variable, and keep secrets out of it — see \
+                     docs/content/reference/manifest.md"
+                ),
+            ),
+            // Both arms below are the same operator problem — a declared store that does not
+            // resolve to a usable directory — so they share one code, and both hints point at the
+            // store name and at `~/.murmur/state/`. Never at the containment ladder: a state store
+            // is not a containment shortfall, and no floor change makes one appear.
             error @ RuntimeError::InvalidStateStore { .. } => CliError::with_hint(
                 E_CAP_009,
                 error.to_string(),

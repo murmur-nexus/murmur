@@ -6,9 +6,9 @@ use std::{
 };
 
 use capsule_runtime::{
-    capability_policy_from_runtime_manifest, explain_scope, launch_session, stage_session,
-    state_store_reports, AfterTask, ArtifactRequest, LifecycleOverride, LockExpectation,
-    RuntimeError, StageRequest, TaskAcceptance,
+    capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
+    launch_session, stage_session, state_store_reports, AfterTask, ArtifactRequest,
+    LifecycleOverride, LockExpectation, RuntimeError, StageRequest, TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
@@ -154,11 +154,22 @@ pub(crate) fn run_run(
             &runtime_manifest.name,
         )
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        // Same inputs and the same resolver `stage_session` uses, so a malformed `config:` block
+        // refuses here exactly as it would refuse a real run: a diagnostic that describes a launch
+        // must not tell an operator their manifest is fine and then refuse it.
+        let configured_artifacts = configured_artifact_names(
+            runtime_manifest
+                .artifacts
+                .iter()
+                .map(|artifact| (artifact.name.as_str(), artifact.config.as_ref())),
+        )
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
             runtime_manifest.exports.as_ref(),
             state_stores,
+            configured_artifacts,
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {
@@ -223,6 +234,7 @@ pub(crate) fn run_run(
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -262,6 +274,7 @@ pub(crate) fn run_run(
                         runtime: artifact.runtime.clone(),
                         source: None,
                         on_overflow: artifact.on_overflow,
+                        config: artifact.config.clone(),
                         capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {

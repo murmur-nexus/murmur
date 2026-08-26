@@ -155,6 +155,7 @@ nothing from the host is inherited.
 |---|---|---|
 | `MURMUR_OTEL_ENDPOINT` | `observability.otel_endpoint` is set | The configured OTLP endpoint URL |
 | `MURMUR_EVAL_CONFIG` | `observability.eval` is set | The eval block as JSON: `dataset_id` and the parsed `scorers` list |
+| `MURMUR_ARTIFACT_CONFIG` | This hook's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
 | `MURMUR_DATASET_ID` | `mur eval run` is driving a dataset and `observability.eval.dataset_id` is set | `observability.eval.dataset_id` |
 | `MURMUR_CASE_ID` | `mur eval run` is driving a dataset | The `case_id` of the case being run |
 | `MURMUR_FORMATION_ID` | `MURMUR_FORMATION_ID` is set in the host environment | Forwarded unchanged |
@@ -176,6 +177,16 @@ into every tool artifact.
 | `MURMUR_CAPSULE_VERSION` | `version` from the manifest | Same |
 | `MURMUR_SESSION_ID` | The session ID | Same |
 | `MURMUR_CAPSULE_URL` | `localhost:<port>`, the address the capsule's HTTP server bound | Same |
+
+One further variable is injected per artifact rather than per session:
+
+| Env var | Injected when | Value |
+|---|---|---|
+| `MURMUR_ARTIFACT_CONFIG` | This artifact's entry in the operator's manifest declares [`config:`](manifest.md#artifact-config) | That entry's `config:` block as compact JSON |
+
+It reaches the declaring artifact and no other, and the runtime sets it whether or not `inference:`
+is configured. A native tool receives no per-artifact environment, so a `config:` block there is
+reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing.
 
 `transport: process` loads no driver component: `inference.endpoint`, `inference.driver` and
 `inference.api_key` are rejected in the manifest, and the agent loop spawns `inference.command`

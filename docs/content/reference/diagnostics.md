@@ -20,6 +20,7 @@ section that explains it.
 | `E-CAP-007` | an export root resolves outside the accessible workdir | [E-CAP-007](#e-cap-007) |
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
 | `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
+| `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -76,6 +77,7 @@ section that explains it.
 | `W-SEC-012` | A compiler driver's helper binaries have no `Execute` grant under `sealed` | [W-SEC-012](#w-sec-012) |
 | `W-SEC-013` | Unprivileged user namespaces are unrestricted host-wide, not granted to `mur` by the shipped AppArmor profile | [W-SEC-013](#w-sec-013) |
 | `W-SEC-014` | A capsule-wide `capabilities.state` block grants nothing — a durable store is granted per artifact | [W-SEC-014](#w-sec-014) |
+| `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
 
 ---
 
@@ -319,6 +321,34 @@ would not launch does not pass the diagnostic either.
 Neither is a containment shortfall, and no floor change fixes one: the remedy is the store name or
 the host's home directory, never `capabilities.containment`.
 
+### E-CAP-010 — an artifact's `config:` block cannot be delivered { #e-cap-010 }
+
+[`config:`](manifest.md#artifact-config) on an artifact entry travels to that artifact as one
+environment variable holding JSON, so the block has to be a string-keyed mapping that serializes to
+JSON within 65536 bytes. Each rule refuses by name, quoting what the entry declared:
+
+```text
+error[E-CAP-010]: invalid config for artifact 'murmur-tool-corpus': 'config:' must be a mapping of keys to values, but this entry declares a sequence
+  hint: config: on an artifact entry must be a mapping with string keys that serializes to at most 65536 bytes of JSON; it is delivered to that artifact alone as MURMUR_ARTIFACT_CONFIG. Omit the key entirely to deliver no variable, and keep secrets out of it — see docs/content/reference/manifest.md
+```
+
+An oversized block is refused rather than truncated, and the message names the size it serialized
+to alongside the limit:
+
+```text
+error[E-CAP-010]: invalid config for artifact 'murmur-tool-corpus': 'config:' serializes to 70011 bytes of JSON, over the 65536-byte limit for MURMUR_ARTIFACT_CONFIG
+```
+
+`config:` written with no value under it is an empty block, refused on the same terms. Omit the key
+to deliver no variable at all.
+
+The refusal is decided at staging, before any registry pull, workdir creation or component
+instantiation, so no session workdir appears and no `trace.jsonl` is written.
+`mur run --explain-scope` refuses the same blocks with the same code.
+
+The runtime checks the shape and not the meaning: which keys a given artifact requires is that
+artifact's own business, and a missing one surfaces as that artifact's error rather than this one.
+
 ---
 
 ## Build lints
@@ -465,7 +495,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013`, `W-SEC-014` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013`, `W-SEC-014`, `W-SEC-015` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -950,3 +980,28 @@ artifacts:
 Two artifacts that need the same store each declare it, with the same `store:` name. There is no
 capsule-wide form: sharing a store is written once per artifact, so reading any one entry tells you
 what that artifact reaches.
+
+---
+
+### W-SEC-015 — a `config:` block on a native tool delivers nothing { #w-sec-015 }
+
+**Fires when:** a `runtime: tool` entry declares [`config:`](manifest.md#artifact-config) and the
+artifact ships a native (non-WASM) implementation. Once per artifact, at staging, on stderr.
+
+**Why it matters:** config arrives in the environment the runtime builds for one WASM component.
+A native tool runs as a host subprocess under the capsule-wide shell environment, which is shared
+rather than per-artifact, so no `MURMUR_ARTIFACT_CONFIG` is delivered anywhere. Without this
+warning the only signal is a tool that behaves as though it were never configured.
+
+```text
+[capsule-runtime] warning[W-SEC-015]: artifact 'murmur-tool-fixture' declares 'config:' but ships a native implementation — a native tool runs as a host subprocess and reads no per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-015)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes, exactly as for a
+`capabilities:` block on the same entry ([`W-SEC-008`](#w-sec-008)). `mur run --explain-scope`
+still lists the artifact under `artifact config:`, because that reports what the manifest declares.
+
+**What to do:** move the settings into whatever the native tool already reads — its command-line
+arguments or a file it is pointed at — or drop the block. `config:` on a `runtime: tool` entry
+backed by a WASM component, on a `runtime: driver` entry, or on a `runtime: hook` entry is
+delivered normally.

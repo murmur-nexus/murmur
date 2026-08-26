@@ -737,6 +737,23 @@ pub struct RuntimeArtifact {
     /// Accepted only on `runtime: hook` entries — every other role is rejected at parse
     /// time, since nothing would ever consult it there.
     pub on_overflow: HookOverflowPolicy,
+    /// Operator-authored configuration for this artifact alone, declared via `config:` on this
+    /// entry. Held as the raw YAML node: this crate accepts any mapping, and the runtime is what
+    /// lowers it to the JSON delivered as `MURMUR_ARTIFACT_CONFIG` and refuses a shape that
+    /// cannot travel that way.
+    ///
+    /// `None` is the key being absent, which means the variable is absent from the guest
+    /// environment. `Some(Value::Null)` is `config:` written with nothing under it — a
+    /// declaration that carries nothing, refused by the runtime rather than treated as absent.
+    ///
+    /// Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver` entries; a
+    /// `runtime: skill` entry carrying the key is rejected at parse time, on the same terms as
+    /// [`Self::capabilities`]. Operator-sourced only, and never read from the artifact's own
+    /// bundled `murmur.yaml` — an artifact pulled from a registry cannot configure itself.
+    ///
+    /// Plaintext in a file that is also an audit record: secrets belong in `${VAR}` references
+    /// and the credential-stripping path, not here.
+    pub config: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1248,6 +1265,11 @@ struct RawRuntimeManifest {
     exports: Option<RawExports>,
     #[serde(default)]
     mur_version: Option<String>,
+    /// Captured only to refuse it. `config:` is delivered to one artifact through that artifact's
+    /// own grant, so a capsule-wide block reaches nothing; without this field it would be one of
+    /// the unrecognized top-level keys this manifest silently ignores.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    config: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1357,6 +1379,25 @@ struct RawArtifact {
     capabilities: Option<RawCapabilities>,
     #[serde(default)]
     on_overflow: Option<String>,
+    /// Untyped, and deserialized through [`deserialize_present`] rather than plain `Option`, so
+    /// `config:` written with nothing under it arrives as `Some(Value::Null)` instead of
+    /// collapsing into the absent case. The two mean different things: absent grants no variable,
+    /// while an empty declaration is a written statement that carries nothing and is refused.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    config: Option<serde_yaml::Value>,
+}
+
+/// Deserialize a present key into `Some(value)` even when its value is YAML null, leaving `None`
+/// to mean the key was absent and `#[serde(default)]` supplied it.
+///
+/// serde's own `Option` impl maps a null value to `None`, which erases exactly the distinction
+/// `config:` rests on.
+fn deserialize_present<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1774,6 +1815,24 @@ impl RuntimeManifest {
                     }
                 };
 
+                // `config:` reaches an artifact through that artifact's own grant, and a skill
+                // holds no grant and runs no component — nothing would ever deliver it. Refused
+                // rather than ignored, for the reason the two gates above are: a key that reads
+                // like configuration and is silently dropped is worse than one that is refused.
+                // The block's *shape* is the runtime's business, not this parser's; only the
+                // role is decided here.
+                if artifact.config.is_some() && runtime == ArtifactRuntime::Skill {
+                    return Err(RuntimeManifestError::InvalidArtifact {
+                        index,
+                        message: format!(
+                            "artifact '{name}' declares 'config:' but has 'runtime: {}'; the key \
+                             is recognized only on 'runtime: hook', 'runtime: tool', and \
+                             'runtime: driver' entries",
+                            runtime.as_str()
+                        ),
+                    });
+                }
+
                 Ok(RuntimeArtifact {
                     name,
                     version,
@@ -1783,6 +1842,7 @@ impl RuntimeManifest {
                     prompt_payload,
                     capabilities,
                     on_overflow,
+                    config: artifact.config,
                 })
             })
             .collect::<Result<Vec<_>, RuntimeManifestError>>()?;
@@ -1799,6 +1859,19 @@ impl RuntimeManifest {
                 field: "capabilities.task_io".to_string(),
                 message: "is recognized only on 'runtime: hook' artifact entries, not in the \
                           capsule-wide capabilities block — the grant is per-hook"
+                    .to_string(),
+            });
+        }
+        // Config is delivered on one artifact's own grant, so there is no capsule-wide form of
+        // it: the capsule's guest holds no artifact grant, and a top-level block would reach no
+        // component at all. Refused rather than ignored, on the same terms as the capsule-wide
+        // `task_io` block above.
+        if raw.config.is_some() {
+            return Err(RuntimeManifestError::InvalidCapabilities {
+                field: "config".to_string(),
+                message: "is declared per artifact, on the 'runtime: hook', 'runtime: tool' or \
+                          'runtime: driver' entry that reads it — there is no capsule-wide \
+                          config block"
                     .to_string(),
             });
         }
@@ -6145,6 +6218,133 @@ artifacts:
             "error was: {msg}"
         );
         assert!(msg.contains("runtime: skill"), "error was: {msg}");
+    }
+
+    // ── Per-artifact `config:` (operator-authored artifact configuration) ────
+
+    /// The block is carried verbatim as YAML. This crate accepts any mapping; the runtime is
+    /// what lowers it to JSON and refuses a shape that cannot travel that way.
+    #[test]
+    fn artifact_config_is_carried_verbatim() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: murmur-tool-corpus
+    version: 0.1.0
+    runtime: tool
+    config:
+      read_recent: { default: 20, max: 100 }
+"#,
+        )
+        .unwrap();
+
+        let config = manifest.artifacts[0]
+            .config
+            .as_ref()
+            .expect("a declared block parses");
+        assert_eq!(
+            config["read_recent"]["max"],
+            serde_yaml::Value::Number(100.into())
+        );
+    }
+
+    /// Absent means absent: no key, no variable, and nothing for the runtime to lower.
+    #[test]
+    fn an_undeclared_config_is_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: git
+    version: 1.0.0
+    runtime: tool
+"#,
+        )
+        .unwrap();
+
+        assert!(manifest.artifacts[0].config.is_none());
+    }
+
+    /// `config:` with nothing under it is a written declaration that carries nothing, and must
+    /// stay distinguishable from the key being absent — the runtime refuses it, and can only do
+    /// so if the parser does not collapse YAML null into `None`.
+    #[test]
+    fn an_empty_config_block_is_distinguishable_from_an_absent_one() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: git
+    version: 1.0.0
+    runtime: tool
+    config:
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.artifacts[0].config,
+            Some(serde_yaml::Value::Null),
+            "an empty block must survive parsing as a declaration, not vanish into None"
+        );
+    }
+
+    /// A skill runs no component and holds no grant, so nothing would ever deliver a config
+    /// block to one — rejected at parse time, with a message naming the roles that do.
+    #[test]
+    fn skill_artifact_config_is_rejected() {
+        let yaml = r#"
+name: cap
+version: 0.0.1
+artifacts:
+  - name: sneaky
+    version: 1.0.0
+    runtime: skill
+    config:
+      who: me
+"#;
+        let err = match RuntimeManifest::from_yaml_str(yaml) {
+            Ok(_) => panic!("config: must be rejected for runtime: skill"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            RuntimeManifestError::InvalidArtifact { index: 0, .. }
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("sneaky"), "error was: {msg}");
+        assert!(msg.contains("runtime: skill"), "error was: {msg}");
+        assert!(
+            msg.contains("only on 'runtime: hook', 'runtime: tool', and 'runtime: driver' entries"),
+            "error was: {msg}"
+        );
+    }
+
+    /// Config is delivered on one artifact's own grant, so a capsule-wide block reaches nothing.
+    /// Refused rather than silently ignored, and the message points at the artifact entry.
+    #[test]
+    fn a_capsule_wide_config_block_is_rejected() {
+        let yaml = r#"
+name: cap
+version: 0.0.1
+config:
+  who: capsule
+artifacts:
+  - name: git
+    version: 1.0.0
+    runtime: tool
+"#;
+        let err = match RuntimeManifest::from_yaml_str(yaml) {
+            Ok(_) => panic!("a capsule-wide config block must be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("config"), "error was: {msg}");
+        assert!(msg.contains("declared per artifact"), "error was: {msg}");
     }
 
     // ── Per-artifact `on_overflow:` (async hook queue policy) ────────────────

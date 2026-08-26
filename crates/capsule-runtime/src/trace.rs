@@ -1090,6 +1090,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -1342,6 +1343,7 @@ mod tests {
                 Some(grant),
                 None,
                 Vec::new(),
+                Vec::new(),
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
@@ -1390,6 +1392,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
         assert!(
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
@@ -1436,6 +1439,8 @@ mod tests {
                 store: "shey".to_string(),
                 host_path: "/home/dev/.murmur/state/shey".to_string(),
             }],
+            // Populated for the same reason as `state_stores` above.
+            vec!["config-echo".to_string()],
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -1475,6 +1480,12 @@ mod tests {
                 "store": "shey",
                 "host_path": "/home/dev/.murmur/state/shey",
             }])
+        );
+        // Names only: what an artifact is configured *with* is operator plaintext and reaches
+        // no trace record.
+        assert_eq!(
+            events[0]["effective_grants"]["configured_artifacts"],
+            serde_json::json!(["config-echo"])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");
         assert_eq!(events[0]["containment_achieved"], "scoped");

@@ -20,6 +20,7 @@ use murmur_artifact::{
 use tokio::sync::mpsc;
 
 use crate::{
+    artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::hook::exports::murmur::hook::lifecycle::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
@@ -1548,6 +1549,10 @@ async fn run_async_hook_worker(
 ///   non-escaping) by `HookCapabilityGrant::derive` at staging time; it is created here if it
 ///   does not exist, and a creation failure fails the instantiation rather than silently
 ///   downgrading to no access.
+/// - **Configuration.** One environment variable, [`ARTIFACT_CONFIG_ENV`], added only when
+///   `grant.config_json` carries one — the `config:` block this hook's own manifest entry
+///   declared, lowered to compact JSON at staging. It rides the grant rather than
+///   [`HookEnvVars`], which is session-wide, so one hook's config never reaches another's.
 /// - **Durable state.** A second, independent preopen at [`STATE_PREOPEN_NAME`], added only when
 ///   `grant.state_dir` names one — the host store `capabilities.state` granted, already created at
 ///   `0700` by the staging path and outside every workdir. The two filesystem axes do not imply
@@ -1561,11 +1566,19 @@ fn build_wasi_ctx(
     env: &HookEnvVars<'_>,
     grant: &HookCapabilityGrant,
 ) -> Result<WasiCtx, RuntimeError> {
-    // No host env inheritance: the explicit `MURMUR_*` injections below are the entire
-    // environment a hook component ever sees. Hooks have no manifest-declared allowlist
-    // because no hook artifact reads an arbitrary host var.
+    // No host env inheritance: the explicit injections below are the entire environment a hook
+    // component ever sees. Hooks have no manifest-declared allowlist because no hook artifact
+    // reads an arbitrary host var, so the only operator-authored value that can reach one is the
+    // `config:` block on its own entry, which arrives here already lowered on the grant.
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
+
+    // First, so the five runtime-owned `MURMUR_*` variables below are applied after it and keep
+    // precedence: a `config:` block can carry any key an operator writes, and none of them may
+    // shadow a value the runtime owns.
+    if let Some(config_json) = grant.config_json.as_deref() {
+        builder.env(ARTIFACT_CONFIG_ENV, config_json);
+    }
 
     if let Some(endpoint) = env.otel_endpoint {
         builder.env("MURMUR_OTEL_ENDPOINT", endpoint);
@@ -3171,6 +3184,7 @@ mod tests {
                 task_io_read,
                 state_store: None,
                 state_dir: None,
+                config_json: None,
             },
             ..staged_double_named(name, binding, component)
         }
@@ -4749,10 +4763,11 @@ artifacts:
     /// host as its `on-session-start` error string, so the test reads the value the *guest*
     /// actually sees rather than a host-side stand-in.
     ///
-    /// [`build_wasi_ctx`] injects `MURMUR_OTEL_ENDPOINT` first, so entry 0 is that endpoint
-    /// whenever the session declares one. An empty environment reports `no-env`, which is why
-    /// a hook that was handed `HookEnvVars::default()` cannot be mistaken for one that was
-    /// handed the real thing.
+    /// [`build_wasi_ctx`] injects the grant's `MURMUR_ARTIFACT_CONFIG` first and
+    /// `MURMUR_OTEL_ENDPOINT` after it, so entry 0 is the config JSON whenever the hook's entry
+    /// declared one, and the otel endpoint otherwise. An empty environment reports `no-env`,
+    /// which is why a hook handed `HookEnvVars::default()` and an ungranted
+    /// `HookCapabilityGrant` cannot be mistaken for one handed the real thing.
     fn hook_env_probe_double(engine: &wasmtime::Engine) -> Component {
         let stubs = REQUIRED_HOOK_FNS
             .iter()
@@ -4886,6 +4901,87 @@ artifacts:
             marker_history(session.path(), "exporter"),
             "http://example.test:4318",
             "the async instance must carry the session's real MURMUR_OTEL_ENDPOINT"
+        );
+    }
+
+    /// The first environment entry [`hook_env_probe_double`] observes, for a hook staged with
+    /// `grant` and a session carrying `env_vars`. `no-env` when the environment is empty.
+    fn first_hook_env_entry(grant: HookCapabilityGrant, env_vars: HookEnvVars<'_>) -> String {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged = staged_async_granted(
+            "probe",
+            HookBinding::OnSessionStart,
+            hook_env_probe_double(&engine),
+            grant,
+            HookOverflowPolicy::Drop,
+        );
+
+        run_local(async {
+            let mut hooks = new_with_hooks_full(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged],
+                ExecutionLimits::default(),
+                env_vars,
+            )
+            .await
+            .expect("env-probe double instantiates");
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+            hooks.drain_async_hooks().await;
+        });
+
+        marker_history(session.path(), "probe")
+    }
+
+    /// A hook's `config:` block reaches its guest as `MURMUR_ARTIFACT_CONFIG`, read off the
+    /// hook's own grant rather than off the session-wide [`HookEnvVars`] — which is what scopes
+    /// it to the declaring hook.
+    #[test]
+    fn a_hook_granted_config_sees_it_in_its_environment() {
+        let grant = HookCapabilityGrant {
+            config_json: Some(r#"{"who":"hook"}"#.to_string()),
+            ..HookCapabilityGrant::default()
+        };
+
+        assert_eq!(
+            first_hook_env_entry(grant, HookEnvVars::default()),
+            r#"{"who":"hook"}"#
+        );
+    }
+
+    /// Default-deny, environment half: a hook whose entry declared neither config nor a session
+    /// variable observes an empty environment.
+    #[test]
+    fn an_unconfigured_hook_sees_no_environment_at_all() {
+        assert_eq!(
+            first_hook_env_entry(HookCapabilityGrant::default(), HookEnvVars::default()),
+            "no-env"
+        );
+    }
+
+    /// Config is injected first, so the runtime-owned `MURMUR_*` variables are applied after it
+    /// and keep precedence: whatever an operator writes in a `config:` block, it cannot shadow a
+    /// value the runtime owns.
+    #[test]
+    fn config_is_injected_before_the_runtime_owned_variables() {
+        let grant = HookCapabilityGrant {
+            config_json: Some(r#"{"who":"hook"}"#.to_string()),
+            ..HookCapabilityGrant::default()
+        };
+
+        assert_eq!(
+            first_hook_env_entry(
+                grant,
+                HookEnvVars {
+                    otel_endpoint: Some("http://example.test:4318"),
+                    ..HookEnvVars::default()
+                },
+            ),
+            r#"{"who":"hook"}"#,
+            "the config must precede MURMUR_OTEL_ENDPOINT in the guest environment"
         );
     }
 

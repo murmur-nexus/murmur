@@ -127,6 +127,14 @@ pub enum RuntimeError {
     #[error("invalid filesystem capability scope '{scope}': {message}")]
     InvalidFilesystemScope { scope: String, message: String },
 
+    /// An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG`: it is
+    /// not a string-keyed mapping, does not serialize to JSON, or exceeds
+    /// [`crate::artifact_config::MAX_ARTIFACT_CONFIG_BYTES`]. Raised at staging (and from `mur run
+    /// --explain-scope`), before any registry pull, workdir creation or component instantiation,
+    /// so a malformed channel is refused once at launch rather than one tool call at a time.
+    #[error("invalid config for artifact '{artifact}': {message}")]
+    InvalidArtifactConfig { artifact: String, message: String },
+
     /// A `capabilities.state.store` name is not a single usable directory segment under
     /// `~/.murmur/state/`. Raised at staging (and from `mur run --explain-scope`), before any
     /// registry pull, workdir creation or component instantiation, so a bad name never gets as far
