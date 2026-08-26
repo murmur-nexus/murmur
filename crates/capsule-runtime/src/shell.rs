@@ -6,7 +6,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::types::CapabilityPolicy;
+use crate::{artifact_config::ARTIFACT_CONFIG_ENV, types::CapabilityPolicy};
 
 const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 
@@ -427,10 +427,18 @@ pub(crate) fn strip_credential_shaped_vars(
 /// Resolve the host variables a WASM guest may observe: only names the manifest declared in
 /// `capabilities.env.allow` and that the host actually has set, minus anything
 /// credential-shaped. A declared name absent from the host is simply omitted, not an error.
+///
+/// [`ARTIFACT_CONFIG_ENV`] is reserved and never resolved from the host, whatever a manifest
+/// allowlists: the name is runtime-owned, and its value comes from the declaring artifact's own
+/// `config:` block or from nowhere. Skipped here rather than relied on being overwritten later,
+/// so a host value cannot reach a guest whose entry declared no config at all.
 pub(crate) fn build_wasi_env_allowlist(policy: &CapabilityPolicy) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
 
     for key in &policy.env_allow {
+        if key == ARTIFACT_CONFIG_ENV {
+            continue;
+        }
         if let Ok(value) = std::env::var(key) {
             env.insert(key.clone(), value);
         }

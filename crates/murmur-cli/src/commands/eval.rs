@@ -627,6 +627,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -645,6 +646,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         runtime: artifact.runtime.clone(),
                         source: None,
                         on_overflow: artifact.on_overflow,
+                        config: artifact.config.clone(),
                         capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {

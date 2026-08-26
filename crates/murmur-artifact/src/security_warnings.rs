@@ -118,6 +118,16 @@ pub const W_SEC_013: &str = "W-SEC-013";
 /// Fires at staging, before any session workdir exists.
 pub const W_SEC_014: &str = "W-SEC-014";
 
+/// A `config:` block was declared on a `runtime: tool` entry whose artifact ships a native
+/// (non-WASM) implementation, so no `MURMUR_ARTIFACT_CONFIG` variable is delivered anywhere.
+///
+/// Config travels in the per-artifact WASI environment the runtime builds for a WASM guest. A
+/// native tool runs as a host subprocess under the capsule-wide shell environment, which is not
+/// per-artifact and which the runtime will not write an operator's config block into. Structurally
+/// valid and therefore warned rather than refused, on the same terms `capabilities:` on a native
+/// tool already warns `W-SEC-008`. Fires at staging, before any session workdir exists.
+pub const W_SEC_015: &str = "W-SEC-015";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -136,7 +146,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
-            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014,
+            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

@@ -300,6 +300,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             runtime: a.runtime.clone(),
             source: a.source.clone(),
             on_overflow: a.on_overflow,
+            config: a.config.clone(),
             capabilities: a.capabilities.clone(),
         });
     }

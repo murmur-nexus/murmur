@@ -265,6 +265,16 @@ pub(crate) struct HookCapabilityGrant {
     /// which stays pure — the same division [`ToolCapabilityGrant::dropped_network_entries`]
     /// already uses, where lowering is unit-testable and only staging touches the filesystem.
     pub(crate) state_dir: Option<PathBuf>,
+    /// This hook's operator-declared `config:` block, already lowered to compact JSON by
+    /// [`crate::artifact_config::lower_artifact_config`]. `Some` adds exactly one variable,
+    /// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`], to the hook's environment; `None` — the
+    /// hook entry declaring no `config:` — adds nothing at all.
+    ///
+    /// Filled by the staging path rather than by [`Self::derive`], because config is declared
+    /// beside `capabilities:` and not inside it: the two are independent, and a hook may carry
+    /// either without the other. Carried on the grant because dispatch already looks a grant up by
+    /// artifact name, which is what scopes the value to the declaring hook alone.
+    pub(crate) config_json: Option<String>,
 }
 
 impl HookCapabilityGrant {
@@ -309,6 +319,7 @@ impl HookCapabilityGrant {
                 .is_some_and(|task_io| task_io.read),
             state_store: derive_state_store(capabilities, capsule_name)?,
             state_dir: None,
+            config_json: None,
         })
     }
 }
@@ -366,6 +377,16 @@ pub(crate) struct ToolCapabilityGrant {
     /// [`crate::state_store::ensure_state_store`] has made it. Left `None` by [`Self::derive`],
     /// which stays pure, on the same terms as `dropped_network_entries` above.
     pub(crate) state_dir: Option<PathBuf>,
+    /// This artifact's operator-declared `config:` block, already lowered to compact JSON by
+    /// [`crate::artifact_config::lower_artifact_config`]. `Some` adds exactly one variable,
+    /// [`crate::artifact_config::ARTIFACT_CONFIG_ENV`], to this artifact's guest environment;
+    /// `None` adds nothing.
+    ///
+    /// The one field here that neither narrows nor widens: it grants no reach the ceiling did not
+    /// already allow, which is why an entry declaring `config:` and nothing else stages a grant
+    /// equal to [`Default`] in every other field. Filled by the staging path rather than by
+    /// [`Self::derive`], because `config:` is declared beside `capabilities:` and not inside it.
+    pub(crate) config_json: Option<String>,
 }
 
 impl ToolCapabilityGrant {
@@ -425,6 +446,7 @@ impl ToolCapabilityGrant {
             dropped_network_entries,
             state_store: derive_state_store(capabilities, capsule_name)?,
             state_dir: None,
+            config_json: None,
         })
     }
 }

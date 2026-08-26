@@ -264,6 +264,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         })
         .collect();
@@ -344,6 +345,7 @@ fn achieved_class_here() -> ContainmentClass {
         &capsule_runtime::CapabilityPolicy::default(),
         ContainmentClass::Advisory,
         None,
+        Vec::new(),
         Vec::new(),
     )
     .achieved_containment

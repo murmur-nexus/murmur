@@ -80,6 +80,18 @@ pub struct ArtifactRequest {
     /// there); inert too for a hook that turns out to be `execution_mode: blocking`, which is
     /// never queued.
     pub on_overflow: murmur_artifact::HookOverflowPolicy,
+    /// This artifact's operator-declared `config:` block, copied verbatim from its entry in the
+    /// capsule operator's own manifest (`murmur_artifact::RuntimeArtifact::config`) — the same
+    /// operator-only sourcing rule `capabilities` above follows, so an artifact pulled from a
+    /// registry cannot configure itself.
+    ///
+    /// Lowered to compact JSON at staging by [`crate::artifact_config::lower_artifact_config`] and
+    /// delivered to this artifact alone as [`crate::artifact_config::ARTIFACT_CONFIG_ENV`]. `None`
+    /// means the variable is absent from the guest environment. Consumed for `runtime: hook`,
+    /// `runtime: tool` and `runtime: driver`; the manifest parser rejects the key on
+    /// `runtime: skill`, and a native tool warns `W-SEC-015` because it reads no per-artifact
+    /// environment at all.
+    pub config: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

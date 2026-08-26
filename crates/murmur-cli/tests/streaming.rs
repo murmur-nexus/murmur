@@ -122,6 +122,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -606,6 +607,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }

@@ -15,7 +15,7 @@ use murmur_artifact::{
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
     LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
     MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014,
+    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -37,6 +37,7 @@ use crate::{
     a2a::{IncomingTask, TaskRegistry, TaskState},
     agent,
     artifact::{extract_manifest_yaml, extract_native_binary, extract_root_wasm, extract_skill_md},
+    artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::host::murmur::{
         self, artifact_manager::manage, message::send, tool_registry::invoke,
     },
@@ -350,6 +351,15 @@ pub fn stage_session(
         &request.capsule_name,
     )?;
     warn_on_inert_capsule_wide_state(request.capability_policy.state_declared);
+    // Resolved here for the same reason `state_stores` above is: a malformed `config:` block
+    // refuses the launch before any registry pull, workdir creation or component instantiation,
+    // and through the identical function `mur run --explain-scope` calls on the identical inputs.
+    let configured_artifacts = crate::artifact_config::configured_artifact_names(
+        request
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.name.as_str(), artifact.config.as_ref())),
+    )?;
     let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
@@ -358,6 +368,7 @@ pub fn stage_session(
         crate::containment::detect_userns_grant(),
         request.exports.as_ref(),
         state_stores,
+        configured_artifacts,
     );
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
@@ -555,6 +566,9 @@ pub fn stage_session(
                             &artifact.name,
                             artifact.capabilities.as_ref(),
                         );
+                        // Same hazard, one layer over: config is delivered in the per-artifact
+                        // WASI environment, which a host subprocess never has.
+                        warn_on_inert_native_config(&artifact.name, artifact.config.as_ref());
                         let binary = extract_native_binary(
                             &artifact.name,
                             &resolved_version,
@@ -633,6 +647,16 @@ pub fn stage_session(
                 if let Some(store) = grant.state_store.as_deref() {
                     grant.state_dir = Some(crate::state_store::ensure_state_store(store)?);
                 }
+                // Operator-sourced like `grant` itself, and lowered onto the grant rather than
+                // into `HookEnvVars`, which is session-wide: the grant is what dispatch already
+                // looks up per hook, so this is what scopes the value to the declaring hook.
+                grant.config_json = artifact
+                    .config
+                    .as_ref()
+                    .map(|config| {
+                        crate::artifact_config::lower_artifact_config(&artifact.name, config)
+                    })
+                    .transpose()?;
                 warn_on_inert_hook_capabilities(&artifact.name, artifact.capabilities.as_ref());
                 hook_components.push(StagedHookArtifact {
                     name: artifact.name.clone(),
@@ -1171,6 +1195,9 @@ pub fn launch_session(
                             // Nor does a state store: it too is granted per artifact, and the
                             // capsule holds no artifact grant.
                             None,
+                            // Nor a config block, for the same reason — `config:` is declared on
+                            // an artifact entry and the capsule is not one.
+                            None,
                             &all_env,
                             &capability_policy,
                         )?,
@@ -1652,9 +1679,10 @@ pub fn launch_session(
         wasi: build_wasi_ctx(
             &staged.accessible_workdir,
             // The capsule component runs on the ceiling, not on any artifact's grant — so it gets
-            // neither a narrowed workdir preopen nor a state preopen. A capsule cannot reach a
-            // tool's store, by construction and not by convention: it holds no descriptor that
-            // names one.
+            // neither a narrowed workdir preopen, nor a state preopen, nor a config block. A
+            // capsule cannot reach a tool's store, by construction and not by convention: it holds
+            // no descriptor that names one.
+            None,
             None,
             None,
             &inference_env,
@@ -2078,17 +2106,23 @@ fn inert_capability_sub_blocks(
 /// operator declared that narrowing will not honor.
 ///
 /// Called from the WASM-tool and driver staging arms only. Inserting nothing when the entry
-/// declares no `capabilities:` block is what makes the absent case a strict no-op: dispatch
-/// looks the artifact up by name and falls back to the session's own policy on a miss.
+/// declares neither `capabilities:` nor `config:` is what makes the absent case a strict no-op:
+/// dispatch looks the artifact up by name and falls back to the session's own policy on a miss.
+///
+/// The two keys are independent, which is why either one alone stages a grant. `config:` on its
+/// own narrows nothing and widens nothing — the staged grant equals [`ToolCapabilityGrant`]'s
+/// [`Default`] in every field but `config_json`, so the artifact keeps inheriting the capsule
+/// ceiling wholesale and simply gains one environment variable.
 fn stage_artifact_grant(
     artifact: &ArtifactRequest,
     ceiling_network_allow_rules: &[NetworkAllowRule],
     capsule_name: &str,
     artifact_grants: &mut HashMap<String, ToolCapabilityGrant>,
 ) -> Result<(), RuntimeError> {
-    let Some(capabilities) = artifact.capabilities.as_ref() else {
+    if artifact.capabilities.is_none() && artifact.config.is_none() {
         return Ok(());
-    };
+    }
+    let capabilities = artifact.capabilities.as_ref();
 
     // Derived from `artifact` — the operator's own manifest entry — and never from the
     // artifact's bundled `murmur.yaml`, so a tool pulled from a registry cannot scope itself
@@ -2096,19 +2130,23 @@ fn stage_artifact_grant(
     // `capabilities.state.store` defaults to, and a registry-pulled tool must not be able to
     // name the store it lands in. Deriving at staging (not at dispatch) means a malformed grant
     // fails the run before any guest starts.
-    let mut grant = ToolCapabilityGrant::derive(
-        Some(capabilities),
-        ceiling_network_allow_rules,
-        capsule_name,
-    )?;
+    let mut grant =
+        ToolCapabilityGrant::derive(capabilities, ceiling_network_allow_rules, capsule_name)?;
     // The one side effect on this path, and it happens only for an entry that declared a store:
     // `derive` validated the name and left the directory to be made here, so lowering stays pure
     // and a run that never reaches staging creates nothing on disk.
     if let Some(store) = grant.state_store.as_deref() {
         grant.state_dir = Some(crate::state_store::ensure_state_store(store)?);
     }
+    // Operator-sourced on the same rule as the grant, and filled here rather than in `derive`
+    // because `config:` sits beside `capabilities:` in the entry, not inside it.
+    grant.config_json = artifact
+        .config
+        .as_ref()
+        .map(|config| crate::artifact_config::lower_artifact_config(&artifact.name, config))
+        .transpose()?;
     warn_on_out_of_ceiling_network_entries(&artifact.name, &grant.dropped_network_entries);
-    warn_on_inert_tool_capabilities(&artifact.name, Some(capabilities));
+    warn_on_inert_tool_capabilities(&artifact.name, capabilities);
     artifact_grants.insert(artifact.name.clone(), grant);
     Ok(())
 }
@@ -2174,6 +2212,24 @@ fn warn_on_unenforceable_native_capabilities(
     );
 }
 
+/// A `runtime: tool` artifact with a native (non-WASM) implementation runs as a host subprocess
+/// under the capsule-wide shell environment, which is not per-artifact — nothing there would
+/// deliver `MURMUR_ARTIFACT_CONFIG`, and the runtime will not write an operator's config block
+/// into a capsule-wide environment to fake it. A declared block is therefore wholly inert, and
+/// gets the `W-SEC-015` treatment its `capabilities:` sibling above gets.
+fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_yaml::Value>) {
+    if config.is_none() {
+        return;
+    }
+
+    let link = security_warning_link(W_SEC_015);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_015}]: artifact '{artifact_name}' declares 'config:' \
+         but ships a native implementation — a native tool runs as a host subprocess and reads no \
+         per-artifact config, so no MURMUR_ARTIFACT_CONFIG is delivered ({link})"
+    );
+}
+
 /// Builds the single `Engine` a session runs every guest on.
 ///
 /// `epoch_interruption` compiles a deadline check into wasm loop back-edges and function
@@ -2227,10 +2283,18 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 /// guest reaches it as `state/<file>`; it is a host path outside every workdir, and the only one
 /// a guest can name. `None` — every caller without a `capabilities.state` grant — adds nothing,
 /// leaving the workdir preopen as the guest's only filesystem reach.
+///
+/// `config_json` is this artifact's `config:` block, already lowered to compact JSON at staging.
+/// `Some` sets exactly one variable, [`ARTIFACT_CONFIG_ENV`]; `None` — every caller whose entry
+/// declared no `config:` — sets none, so the variable is absent from the guest environment rather
+/// than present and empty. It is injected after the host allowlist and before `extra_env`, which
+/// is what makes it runtime-owned: `capabilities.env.allow` cannot supply it (the allowlist skips
+/// the name outright) and cannot shadow it either.
 fn build_wasi_ctx(
     workdir: &Path,
     filesystem_scope: Option<&str>,
     state_dir: Option<&Path>,
+    config_json: Option<&str>,
     extra_env: &[(String, String)],
     policy: &CapabilityPolicy,
 ) -> Result<WasiCtx, RuntimeError> {
@@ -2238,6 +2302,9 @@ fn build_wasi_ctx(
     builder.inherit_stdio();
     for (key, value) in build_wasi_env_allowlist(policy) {
         builder.env(key, value);
+    }
+    if let Some(config_json) = config_json {
+        builder.env(ARTIFACT_CONFIG_ENV, config_json);
     }
     for (key, value) in extra_env {
         builder.env(key, value);
@@ -3035,6 +3102,10 @@ pub(crate) async fn invoke_tool_component(
     // Absent for every artifact that declared no `capabilities.state`, so an undeclared tool is
     // built with the workdir preopen and nothing else.
     let state_dir = artifact_grant.and_then(|grant| grant.state_dir.as_deref());
+    // Absent for every artifact that declared no `config:`, so an unconfigured tool is built with
+    // no `MURMUR_ARTIFACT_CONFIG` in its environment at all. Read off this artifact's own grant,
+    // which is what keeps one artifact's config out of every other artifact's guest.
+    let config_json = artifact_grant.and_then(|grant| grant.config_json.as_deref());
     let state = ToolStoreState {
         limits: tool_limits.limiter(),
         table: ResourceTable::new(),
@@ -3042,6 +3113,7 @@ pub(crate) async fn invoke_tool_component(
             accessible_workdir,
             filesystem_scope,
             state_dir,
+            config_json,
             inference_env,
             capability_policy,
         )
@@ -4796,6 +4868,7 @@ mod tests {
                 source: None,
                 on_overflow: Default::default(),
                 capabilities: None,
+                config: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: None,
@@ -4879,6 +4952,7 @@ mod tests {
                 source: None,
                 on_overflow: Default::default(),
                 capabilities: None,
+                config: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -4954,6 +5028,7 @@ mod tests {
                 source: None,
                 on_overflow: Default::default(),
                 capabilities: None,
+                config: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -5028,6 +5103,7 @@ mod tests {
                 source: None,
                 on_overflow: Default::default(),
                 capabilities: None,
+                config: None,
             }],
             allowlisted_tools: HashSet::from(["echo-tool".to_string()]),
             lock_expectations: Some(vec![crate::types::LockExpectation {
@@ -5182,6 +5258,7 @@ mod tests {
                 source: Some("skills/my-skill".to_string()),
                 on_overflow: Default::default(),
                 capabilities: None,
+                config: None,
             }],
             allowlisted_tools: HashSet::new(),
             lock_expectations: None,
@@ -5254,7 +5331,15 @@ mod tests {
         lock_path: PathBuf,
     ) -> CapsuleStoreState {
         let engine = build_engine().unwrap();
-        let wasi = build_wasi_ctx(&workdir, None, None, &[], &CapabilityPolicy::default()).unwrap();
+        let wasi = build_wasi_ctx(
+            &workdir,
+            None,
+            None,
+            None,
+            &[],
+            &CapabilityPolicy::default(),
+        )
+        .unwrap();
         CapsuleStoreState {
             limits: crate::limits::ExecutionLimits::default().limiter(),
             table: ResourceTable::new(),
@@ -5818,6 +5903,7 @@ mod tests {
                     None,
                     None,
                     Vec::new(),
+                    Vec::new(),
                 ),
                 false,
                 None,
@@ -6142,11 +6228,26 @@ mod tests {
         let missing = root.path().join("does-not-exist");
 
         assert!(
-            build_wasi_ctx(&missing, None, None, &[], &CapabilityPolicy::default()).is_err(),
+            build_wasi_ctx(
+                &missing,
+                None,
+                None,
+                None,
+                &[],
+                &CapabilityPolicy::default()
+            )
+            .is_err(),
             "an unscoped tool preopens the workdir, which must exist"
         );
-        build_wasi_ctx(root.path(), None, None, &[], &CapabilityPolicy::default())
-            .expect("an existing workdir preopens as before");
+        build_wasi_ctx(
+            root.path(),
+            None,
+            None,
+            None,
+            &[],
+            &CapabilityPolicy::default(),
+        )
+        .expect("an existing workdir preopens as before");
         assert!(
             !missing.exists(),
             "the unscoped path must not create anything"
@@ -6163,6 +6264,7 @@ mod tests {
         build_wasi_ctx(
             root.path(),
             Some("cache"),
+            None,
             None,
             &[],
             &CapabilityPolicy::default(),
@@ -6188,7 +6290,7 @@ mod tests {
         std::fs::write(root.path().join("cache"), b"not a directory").unwrap();
 
         let policy = CapabilityPolicy::default();
-        let err = match build_wasi_ctx(root.path(), Some("cache"), None, &[], &policy) {
+        let err = match build_wasi_ctx(root.path(), Some("cache"), None, None, &[], &policy) {
             Ok(_) => panic!("an uncreatable scope must fail loudly"),
             Err(err) => err,
         };
@@ -6301,6 +6403,7 @@ mod tests {
             runtime: ArtifactRuntime::Tool,
             source: None,
             on_overflow: Default::default(),
+            config: None,
             capabilities: Some(murmur_artifact::Capabilities {
                 peer_fetch: None,
                 network: Some(murmur_artifact::NetworkCapabilities {
@@ -6325,6 +6428,7 @@ mod tests {
             source: None,
             on_overflow: Default::default(),
             capabilities: None,
+            config: None,
         };
 
         stage_artifact_grant(&declared, &ceiling, "test-capsule", &mut grants).unwrap();
@@ -6338,6 +6442,66 @@ mod tests {
         );
     }
 
+    /// `config:` alone stages a grant, and that grant narrows nothing and widens nothing: every
+    /// field but `config_json` equals [`ToolCapabilityGrant::default`], so the artifact keeps
+    /// inheriting the capsule ceiling wholesale and simply gains one environment variable.
+    ///
+    /// `capabilities:` and `config:` are independent keys on one entry, so either alone has to
+    /// produce an entry dispatch can find by name.
+    #[test]
+    fn config_alone_stages_a_grant_that_changes_nothing_else() {
+        let ceiling = narrowing_ceiling();
+        let mut grants = HashMap::new();
+
+        let configured = ArtifactRequest {
+            name: "config-echo".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: ArtifactRuntime::Driver,
+            source: None,
+            on_overflow: Default::default(),
+            capabilities: None,
+            config: Some(serde_yaml::from_str("who: a\n").unwrap()),
+        };
+
+        stage_artifact_grant(&configured, &ceiling, "test-capsule", &mut grants).unwrap();
+
+        let grant = grants
+            .get("config-echo")
+            .expect("config alone stages a grant");
+        assert_eq!(grant.config_json.as_deref(), Some(r#"{"who":"a"}"#));
+        assert_eq!(
+            grant,
+            &ToolCapabilityGrant {
+                config_json: grant.config_json.clone(),
+                ..ToolCapabilityGrant::default()
+            },
+            "declaring config must leave every other field at the inherit-everything default"
+        );
+    }
+
+    /// A malformed `config:` block fails staging by artifact name, before any component is
+    /// instantiated — the same treatment a malformed capability grant beside it gets.
+    #[test]
+    fn staging_rejects_a_malformed_config_block() {
+        let mut grants = HashMap::new();
+        let artifact = ArtifactRequest {
+            name: "config-echo".to_string(),
+            version: "1.0.0".to_string(),
+            runtime: ArtifactRuntime::Tool,
+            source: None,
+            on_overflow: Default::default(),
+            capabilities: None,
+            config: Some(serde_yaml::from_str("[a, b]").unwrap()),
+        };
+
+        let err =
+            stage_artifact_grant(&artifact, &narrowing_ceiling(), "test-capsule", &mut grants)
+                .expect_err("a sequence must fail staging");
+        assert!(matches!(err, RuntimeError::InvalidArtifactConfig { .. }));
+        assert!(err.to_string().contains("config-echo"), "{err}");
+        assert!(grants.is_empty());
+    }
+
     /// A malformed grant fails staging rather than surfacing as a confusing denial once the
     /// tool is already running.
     #[test]
@@ -6349,6 +6513,7 @@ mod tests {
             runtime: ArtifactRuntime::Tool,
             source: None,
             on_overflow: Default::default(),
+            config: None,
             capabilities: Some(murmur_artifact::Capabilities {
                 peer_fetch: None,
                 network: None,
@@ -6566,6 +6731,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                Vec::new(),
             ),
             false,
             None,
@@ -6761,6 +6927,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                Vec::new(),
             ),
             false,
             None,
@@ -6785,6 +6952,7 @@ mod tests {
                 task_io_read,
                 state_store: None,
                 state_dir: None,
+                config_json: None,
             },
             on_overflow: Default::default(),
         };

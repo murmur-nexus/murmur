@@ -6,6 +6,7 @@
 pub(crate) mod a2a;
 pub(crate) mod agent;
 pub mod artifact;
+pub mod artifact_config;
 pub mod bindings;
 pub(crate) mod cgroup;
 pub mod containment;
@@ -37,6 +38,10 @@ pub(crate) mod task_io_import;
 pub(crate) mod trace;
 pub mod types;
 
+pub use artifact_config::{
+    configured_artifact_names, lower_artifact_config, ARTIFACT_CONFIG_ENV,
+    MAX_ARTIFACT_CONFIG_BYTES,
+};
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
     detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, ScopeReport,

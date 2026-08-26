@@ -341,6 +341,20 @@ pub struct ScopeReport {
     /// beside it are. It is reported because it is the one grant that opens a path *outside* every
     /// workdir, which nothing else in this block would reveal.
     pub state_stores: Vec<StateStoreReport>,
+    /// Every artifact whose manifest entry declares a `config:` block, in manifest order, empty
+    /// when none does. Always serialized as an array (never skipped), on the same terms as
+    /// [`Self::state_stores`]: an absent key identifies a runtime that predates artifact config,
+    /// not a capsule that declined it.
+    ///
+    /// Names only. What an artifact is configured *with* is operator-authored plaintext that
+    /// belongs in the manifest and in nothing this report — or `trace.jsonl`, which carries this
+    /// report verbatim — writes out.
+    ///
+    /// Declaring config cannot change [`Self::achieved_containment`], [`Self::floor_met`] or
+    /// [`Self::enforcement_tier`]: it adds one environment variable to one guest and reaches no
+    /// grant. Reported because a variable an artifact silently depends on is otherwise invisible
+    /// to an operator reading the capsule's scope.
+    pub configured_artifacts: Vec<String>,
     /// Every `capabilities.shell.staged_runtime` grant, rendered as
     /// `<binary>: <source_path> (pin: <pin>)`. These are host runtime trees a `sealed` capsule
     /// asks to have bind-mounted read-only into its composed root.
@@ -401,6 +415,7 @@ impl ScopeReport {
                 .map(|store| format!("{}: {} -> {}", store.artifact, store.store, store.host_path))
                 .collect::<Vec<_>>(),
         );
+        push_list(&mut out, "artifact config", &self.configured_artifacts);
 
         out.push_str("\nResource plane\n");
         match &self.exports_files {
@@ -456,15 +471,17 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
 /// combined floor. Probes the host tier once and reads nothing else.
 ///
-/// `state_stores` is resolved by the caller (from the manifest's artifact entries, via
-/// [`crate::state_store::state_store_reports`]) rather than derived here, because it is
-/// per-artifact and `policy` is capsule-wide. Resolution creates no directory, so this stays a
-/// read-only diagnostic.
+/// `state_stores` and `configured_artifacts` are resolved by the caller (from the manifest's
+/// artifact entries, via [`crate::state_store::state_store_reports`] and
+/// [`crate::artifact_config::configured_artifact_names`]) rather than derived here, because both
+/// are per-artifact and `policy` is capsule-wide. Neither resolution creates anything, so this
+/// stays a read-only diagnostic.
 pub fn explain_scope(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
     exports: Option<&Exports>,
     state_stores: Vec<StateStoreReport>,
+    configured_artifacts: Vec<String>,
 ) -> ScopeReport {
     scope_report_for_tier(
         policy,
@@ -474,11 +491,13 @@ pub fn explain_scope(
         detect_userns_grant(),
         exports,
         state_stores,
+        configured_artifacts,
     )
 }
 
 /// [`explain_scope`] with the tier and the sealed blocker injected — the seam every test uses so
 /// no test depends on the host it happens to run on.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn scope_report_for_tier(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
@@ -487,6 +506,7 @@ pub(crate) fn scope_report_for_tier(
     userns_grant: Option<UsernsGrant>,
     exports: Option<&Exports>,
     state_stores: Vec<StateStoreReport>,
+    configured_artifacts: Vec<String>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -516,6 +536,10 @@ pub(crate) fn scope_report_for_tier(
         // the same terms as the export reports above: a grant that opens a path outside the
         // workdir still gets no say in what class this host is reported to back.
         state_stores,
+        // Resolved by `artifact_config::configured_artifact_names` before this call and copied
+        // through on the same terms: one environment variable delivered to one guest gets no say
+        // in what class this host is reported to back.
+        configured_artifacts,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
         network_allow: policy.network_allow.clone(),
@@ -938,6 +962,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -977,6 +1002,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
 
         assert!(report.workdir_exec);
@@ -1011,6 +1037,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -1040,6 +1067,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                Vec::new(),
             );
             assert_eq!(
                 report.staged_runtime_grants,
@@ -1068,6 +1096,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -1086,6 +1115,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -1100,6 +1130,7 @@ mod tests {
             Some(SealedBlocker::NotLinux),
             None,
             None,
+            Vec::new(),
             Vec::new(),
         );
 
@@ -1120,6 +1151,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
@@ -1138,6 +1170,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
@@ -1162,6 +1195,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
 
         for grant in UsernsGrant::ALL {
@@ -1172,6 +1206,7 @@ mod tests {
                 None,
                 Some(*grant),
                 None,
+                Vec::new(),
                 Vec::new(),
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
@@ -1202,6 +1237,7 @@ mod tests {
             Some(SealedBlocker::AppArmorProfileMissing),
             None,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .render();
@@ -1237,6 +1273,7 @@ mod tests {
                     None,
                     None,
                     Vec::new(),
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &policy,
@@ -1248,6 +1285,7 @@ mod tests {
                         files: Some(export.clone()),
                         peer_files: None,
                     }),
+                    Vec::new(),
                     Vec::new(),
                 );
                 assert_eq!(
@@ -1306,6 +1344,7 @@ mod tests {
                     None,
                     None,
                     Vec::new(),
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &with_policy,
@@ -1317,6 +1356,7 @@ mod tests {
                         files: None,
                         peer_files: Some(peer_files.clone()),
                     }),
+                    Vec::new(),
                     Vec::new(),
                 );
                 assert_eq!(
@@ -1364,6 +1404,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
@@ -1387,6 +1428,7 @@ mod tests {
                 }),
             }),
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(
@@ -1408,6 +1450,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .render();
@@ -1432,6 +1475,7 @@ mod tests {
                     max_bytes: 4096,
                 }),
             }),
+            Vec::new(),
             Vec::new(),
         )
         .render();
@@ -1461,6 +1505,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         );
         let with = scope_report_for_tier(
             &policy,
@@ -1470,6 +1515,7 @@ mod tests {
             None,
             None,
             stores.clone(),
+            Vec::new(),
         );
 
         assert_eq!(with.state_stores, stores);
@@ -1520,6 +1566,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(undeclared["exports_files"], serde_json::Value::Null);
@@ -1539,6 +1586,7 @@ mod tests {
                 peer_files: None,
             }),
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(
@@ -1556,6 +1604,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
         )
         .render();
@@ -1578,6 +1627,7 @@ mod tests {
                 }),
                 peer_files: None,
             }),
+            Vec::new(),
             Vec::new(),
         )
         .render();

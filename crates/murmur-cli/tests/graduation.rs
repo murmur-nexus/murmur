@@ -156,6 +156,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
             runtime: artifact.runtime.clone(),
             source: artifact.source.clone(),
             on_overflow: artifact.on_overflow,
+            config: artifact.config.clone(),
             capabilities: artifact.capabilities.clone(),
         });
     }
@@ -177,6 +178,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                         runtime: artifact.runtime.clone(),
                         source: artifact.source.clone(),
                         on_overflow: artifact.on_overflow,
+                        config: artifact.config.clone(),
                         capabilities: artifact.capabilities.clone(),
                     });
                     expectations.push(LockExpectation {

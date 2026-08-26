@@ -51,6 +51,7 @@ fn requested_from(manifest: &murmur_artifact::RuntimeManifest) -> Vec<ArtifactRe
             runtime: a.runtime.clone(),
             source: a.source.clone(),
             on_overflow: a.on_overflow,
+            config: a.config.clone(),
             capabilities: a.capabilities.clone(),
         })
         .collect()
