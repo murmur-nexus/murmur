@@ -19,8 +19,12 @@ const FIXTURE_A: &str = concat!(
     "\"capsule_name\":\"test-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-3-5-sonnet\",",
     "\"max_turns\":10,\"capabilities\":[\"shell\"],\"tools_declared\":[\"bash\"]}\n",
 
+    // Carries the provider-reported counts alongside the runtime's own estimates: `mur trace
+    // show` and `mur trace report` must read this line and print the same totals as they do
+    // for the turn-2 line below, which carries none of them.
     "{\"event_type\":\"inference\",\"session_id\":\"ses_aaaaaaaaaaaa4aaa8aaa000000000001\",\"timestamp\":1100,",
-    "\"turn\":1,\"input_tokens\":1000,\"output_tokens\":200,\"decision\":\"tool_call\",\"tool_name\":\"bash\"}\n",
+    "\"turn\":1,\"input_tokens\":1000,\"output_tokens\":200,\"decision\":\"tool_call\",\"tool_name\":\"bash\",",
+    "\"input_tokens_actual\":940,\"output_tokens_actual\":180,\"cached_tokens\":900,\"cache_write_tokens\":0}\n",
 
     "{\"event_type\":\"tool_call\",\"session_id\":\"ses_aaaaaaaaaaaa4aaa8aaa000000000001\",\"timestamp\":1200,",
     "\"turn\":1,\"tool_name\":\"bash\",\"input_bytes\":50,\"output_bytes\":20,\"duration_ms\":100,\"status\":\"ok\"}\n",

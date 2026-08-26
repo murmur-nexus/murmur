@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
 };
 
-use crate::containment::ScopeReport;
+use crate::{agent::DriverUsage, containment::ScopeReport};
 
 pub(crate) struct TraceWriter {
     writer: BufWriter<File>,
@@ -145,10 +145,23 @@ struct InferenceEvent {
     session_id: String,
     timestamp: u64,
     turn: u32,
+    /// The runtime's own tiktoken estimate of the request, counted before the request was
+    /// sent — not the provider's count, which arrives afterwards as `input_tokens_actual`.
     input_tokens: u64,
+    /// The runtime's own tiktoken estimate of the raw driver response.
     output_tokens: u64,
     decision: String,
     tool_name: Option<String>,
+    /// The provider's own counts for this call, each written only when the driver reported
+    /// it. Absent means the driver reported nothing, never zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens_actual: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens_actual: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write_tokens: Option<u64>,
     /// Where this inference came from. Absent for an ordinary agent-loop turn,
     /// so every pre-existing consumer sees a byte-identical record; `"hook:<name>"`
     /// for a completion that hook ran through `murmur:runtime/inference`'s
@@ -515,6 +528,10 @@ impl TraceWriter {
         Ok(())
     }
 
+    /// `input_tokens`/`output_tokens` are the runtime's tiktoken estimates and are what the
+    /// session and task totals accumulate; `usage` is the provider's own report for the same
+    /// call, written verbatim beside them and accumulated into nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_inference(
         &mut self,
         turn: u32,
@@ -523,6 +540,7 @@ impl TraceWriter {
         decision: String,
         tool_name: Option<String>,
         origin: Option<&InferenceOrigin>,
+        usage: Option<&DriverUsage>,
     ) -> std::io::Result<()> {
         let event = InferenceEvent {
             event_type: "inference",
@@ -533,6 +551,10 @@ impl TraceWriter {
             output_tokens,
             decision,
             tool_name,
+            input_tokens_actual: usage.and_then(|u| u.input_tokens),
+            output_tokens_actual: usage.and_then(|u| u.output_tokens),
+            cached_tokens: usage.and_then(|u| u.cached_tokens),
+            cache_write_tokens: usage.and_then(|u| u.cache_write_tokens),
             origin: origin.map(|o| o.source.clone()),
             model: origin.map(|o| o.model.clone()),
         };
@@ -1511,6 +1533,7 @@ mod tests {
             "tool_call".to_string(),
             Some("bash".to_string()),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1527,6 +1550,41 @@ mod tests {
         // Confirm snake_case (not camelCase)
         assert!(e.get("inputTokens").is_none(), "must use snake_case");
         assert!(e.get("toolName").is_none(), "must use snake_case");
+        // No driver reported usage, so no key claims one was reported.
+        for key in [
+            "input_tokens_actual",
+            "output_tokens_actual",
+            "cached_tokens",
+            "cache_write_tokens",
+        ] {
+            assert!(e.get(key).is_none(), "{key} must be omitted, not null or 0");
+        }
+    }
+
+    /// A partially-populated `usage` writes only the members the driver reported: a member it
+    /// left out stays off the line entirely rather than being recorded as a zero.
+    #[tokio::test]
+    async fn inference_writes_only_the_reported_usage_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        let usage = DriverUsage {
+            input_tokens: Some(12043),
+            output_tokens: None,
+            cached_tokens: Some(0),
+            cache_write_tokens: None,
+        };
+        w.write_inference(0, 100, 50, "end_turn".to_string(), None, None, Some(&usage))
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let e = &events[0];
+        assert_eq!(e["input_tokens"], 100, "the estimate is untouched");
+        assert_eq!(e["input_tokens_actual"], 12043);
+        assert_eq!(e["cached_tokens"], 0, "a reported zero is written");
+        assert!(e.get("output_tokens_actual").is_none());
+        assert!(e.get("cache_write_tokens").is_none());
     }
 
     #[tokio::test]
@@ -1716,7 +1774,7 @@ mod tests {
     async fn session_end_fields_and_snake_case() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_inference(0, 100, 50, "tool_call".to_string(), None, None)
+        w.write_inference(0, 100, 50, "tool_call".to_string(), None, None, None)
             .await
             .unwrap();
         w.write_tool_call(
@@ -1813,7 +1871,7 @@ mod tests {
         w.write_session_start(10, vec!["bash".to_string()])
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None)
+        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -1836,6 +1894,7 @@ mod tests {
             25,
             "tool_call".to_string(),
             Some("bash".to_string()),
+            None,
             None,
         )
         .await
@@ -1866,7 +1925,7 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_inference(1, 60, 30, "end_turn".to_string(), None, None)
+        w.write_inference(1, 60, 30, "end_turn".to_string(), None, None, None)
             .await
             .unwrap();
         w.write_session_end("ok").await.unwrap();
@@ -2097,10 +2156,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
-        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None)
+        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None, None)
             .await
             .unwrap();
-        w.write_inference(1, 10, 5, "end_turn".to_string(), None, None)
+        w.write_inference(1, 10, 5, "end_turn".to_string(), None, None, None)
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 2);

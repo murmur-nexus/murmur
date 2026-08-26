@@ -122,6 +122,7 @@ impl OtelEmitter {
         tool_name: Option<&str>,
         duration_ms: u64,
         origin: Option<&crate::trace::InferenceOrigin>,
+        usage: Option<&crate::agent::DriverUsage>,
     ) {
         if self.endpoint.is_none() {
             return;
@@ -137,6 +138,21 @@ impl OtelEmitter {
         ];
         if let Some(tn) = tool_name {
             attrs.push(kv_str("tool_name", tn));
+        }
+        // The provider's own counts, each present only when the driver reported it. They sit
+        // beside `input_tokens`/`output_tokens` (this runtime's tiktoken estimates) rather
+        // than replacing them, so the drift between the two is a subtraction on one span.
+        if let Some(u) = usage {
+            for (name, value) in [
+                ("input_tokens_actual", u.input_tokens),
+                ("output_tokens_actual", u.output_tokens),
+                ("cached_tokens", u.cached_tokens),
+                ("cache_write_tokens", u.cache_write_tokens),
+            ] {
+                if let Some(value) = value {
+                    attrs.push(kv_int(name, value));
+                }
+            }
         }
         // Absent for an ordinary agent-loop turn; `hook:<name>` plus the model
         // actually sent for a completion a hook ran through `run-inference`.

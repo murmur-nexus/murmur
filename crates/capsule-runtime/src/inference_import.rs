@@ -16,7 +16,10 @@ use wasmtime::{
 };
 
 use crate::{
-    agent::{build_driver_payload, count_tokens, DEFAULT_MAX_OUTPUT_TOKENS},
+    agent::{
+        build_driver_payload, count_tokens, parse_driver_usage, DriverUsage,
+        DEFAULT_MAX_OUTPUT_TOKENS,
+    },
     bindings::{
         hook::murmur::runtime::inference::{InferenceRequest, InferenceResponse},
         host::murmur::tool::run::{Status, ToolInput},
@@ -48,6 +51,11 @@ pub(crate) struct HookInferenceRecord {
     /// otherwise.
     pub(crate) decision: String,
     pub(crate) duration_ms: u64,
+    /// The provider's own counts, when the driver reported them. Recorded beside
+    /// `input_tokens`/`output_tokens` — which stay this runtime's tiktoken counts —
+    /// and never substituted for them. `None` for a failed call, which has no response
+    /// to read a `usage` block from.
+    pub(crate) usage: Option<DriverUsage>,
 }
 
 /// Everything the host needs to run one inference-driver call from inside a
@@ -112,13 +120,15 @@ impl HookInferenceCtx {
         let outcome = self.dispatch(payload_json).await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
-        let (output_tokens, result) = match outcome {
-            Ok((raw, text)) => {
-                // Same host-side tiktoken convention the agent loop uses: the
-                // driver wire format carries no usage block to read instead.
+        let (output_tokens, usage, result) = match outcome {
+            Ok((raw, text, usage)) => {
+                // `input-tokens`/`output-tokens` on the WIT response are documented as the
+                // runtime's own tiktoken counts, so a driver-reported `usage` never lands
+                // there — it goes to the trace record below and nowhere else.
                 let output_tokens = u64::from(count_tokens(&raw));
                 (
                     output_tokens,
+                    usage,
                     Ok(InferenceResponse {
                         text,
                         // Echoed, not driver-confirmed — the response never
@@ -129,7 +139,7 @@ impl HookInferenceCtx {
                     }),
                 )
             }
-            Err(err) => (0, Err(err)),
+            Err(err) => (0, None, Err(err)),
         };
 
         self.record(HookInferenceRecord {
@@ -141,14 +151,19 @@ impl HookInferenceCtx {
             output_tokens,
             decision: if result.is_ok() { "end_turn" } else { "error" }.to_string(),
             duration_ms,
+            usage,
         });
 
         result
     }
 
     /// Dispatch the payload through the shared tool-invocation path and pull the
-    /// completion text out of the driver's response. Returns `(raw, text)`.
-    async fn dispatch(&self, payload_json: String) -> Result<(String, String), String> {
+    /// completion text and the optional `usage` block out of the driver's response.
+    /// Returns `(raw, text, usage)`.
+    async fn dispatch(
+        &self,
+        payload_json: String,
+    ) -> Result<(String, String, Option<DriverUsage>), String> {
         let result = invoke_tool_component(
             ToolInvokeEnv {
                 engine: &self.engine,
@@ -190,7 +205,8 @@ impl HookInferenceCtx {
         }
 
         let text = response_text(&response);
-        Ok((raw, text))
+        let usage = parse_driver_usage(&response);
+        Ok((raw, text, usage))
     }
 
     fn record(&self, record: HookInferenceRecord) {
