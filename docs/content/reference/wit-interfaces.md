@@ -77,6 +77,26 @@ conversation state provider-side can opt out by returning a non-empty `continuat
 Token accounting for the compaction threshold is always computed from the full conversation, not
 the smaller payload actually sent, so continuation never changes when compaction fires.
 
+### Prompt cache routing hint { #prompt-cache-key }
+
+Every request the runtime hands a driver carries a top-level `prompt_cache_key` string. Its value
+is fixed for every turn of a task, and it does not change when history is compacted or when a
+held `continuation_id` is dropped:
+
+| Task | `prompt_cache_key` |
+|---|---|
+| Has a context id | `<capsule-name>:<version>:<context-id>` |
+| Has no context id | `<capsule-name>:<version>` |
+
+A provider that routes on the value keeps a task's turns on one machine, so each turn reaches the
+cache entry the previous turn warmed. Two runs of the same capsule get different values, because
+a context id is minted per task.
+
+A driver reads the field only if it declares it, so a driver that ignores it runs unchanged.
+Forward it only where the provider defines a field of its own for it: the OpenAI Chat and
+Responses APIs accept `prompt_cache_key` in the request body, and the Anthropic Messages API
+rejects a body carrying any field it does not define.
+
 ---
 
 ## `murmur:artifact-manager/manage`

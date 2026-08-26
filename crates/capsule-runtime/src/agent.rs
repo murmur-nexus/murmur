@@ -1,5 +1,5 @@
 mod claude_bridge;
-mod inventory;
+pub(crate) mod inventory;
 mod process;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
@@ -101,6 +101,11 @@ pub(crate) async fn run_agent_loop(
     }
 
     let system_prompt_artifact = inference.system_prompt_artifact.as_deref();
+    // Built once, before the turn loop, and held for the session, for prompt caching: the
+    // serialized tool array is part of the prefix the provider matches its cache on, so
+    // re-reading it per turn would let a mid-session `manage.pull()` reorder or grow it and
+    // invalidate the cache entry for every remaining turn. A pulled tool lands on disk and
+    // reaches the model on the next launch.
     let tools = inventory::build_tool_inventory(workdir, system_prompt_artifact);
 
     let tools_json = serde_json::to_string_pretty(&tools).map_err(|e| {
@@ -119,8 +124,10 @@ pub(crate) async fn run_agent_loop(
     // workdir here silently yields an empty task, producing an empty user message.
     let task = read_task(accessible_workdir);
 
-    let augmented_system =
-        build_augmented_system_prompt(name, version, accessible_workdir, system_prompt.as_deref());
+    let augmented_system = build_augmented_system_prompt(name, version, system_prompt.as_deref());
+    // Constant for the whole session: a routing hint that keeps every request sharing this
+    // prompt prefix on one machine, so the provider's cache entry is the one it lands on.
+    let prompt_cache_key = build_prompt_cache_key(name, version, context_id.as_deref());
 
     // In threaded mode, prepend prior history for this contextId before the new user message.
     // TODO: cross-session history persistence
@@ -184,6 +191,7 @@ pub(crate) async fn run_agent_loop(
             &tools,
             &augmented_system,
             active_continuation,
+            Some(prompt_cache_key.as_str()),
         );
 
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
@@ -202,6 +210,7 @@ pub(crate) async fn run_agent_loop(
                 &tools,
                 &augmented_system,
                 None,
+                Some(prompt_cache_key.as_str()),
             );
             let full_json = serde_json::to_string(&full_payload).map_err(|e| {
                 RuntimeError::AgentLoopFailed(format!("failed to encode driver payload: {e}"))
@@ -1248,6 +1257,9 @@ async fn try_compact_via_hooks(
     //   (2) any held driver continuation id (and its bookkeeping) is dropped — the next Turn
     //       is a full resend of whatever `messages` now holds (never the pre-compaction
     //       transcript, never empty).
+    // Compaction is maximal prompt cache loss: replacing the whole message list with one
+    // summary message discards every cached prefix past the system block, so the next turn is
+    // a full cache miss on everything the summary stands in for.
     *messages = candidate_messages;
 
     let new_json = serde_json::to_string(&*messages).unwrap_or_default();
@@ -1316,6 +1328,34 @@ fn extract_continuation_id(metadata: &[(String, String)]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Reserved top-level field on the driver request payload carrying the session's
+/// prompt-cache routing hint. It is a hint, not a cache control: a driver that does not
+/// declare the field drops it when deserializing, and inference proceeds unchanged.
+pub(crate) const PROMPT_CACHE_KEY_KEY: &str = "prompt_cache_key";
+
+/// Build the value of [`PROMPT_CACHE_KEY_KEY`]: `<name>:<version>:<context_id>`, or
+/// `<name>:<version>` when there is no context id.
+///
+/// A provider routing on this value keeps the turns that carry it on one machine, so each
+/// turn lands on the machine already holding the previous turn's cache entry. It must stay
+/// constant across every turn of a task — including across a compaction and across a dropped
+/// continuation id, neither of which changes which prefix the requests share.
+///
+/// The scope is the task, not the capsule: `context_id` is minted per task, so two launches
+/// of the same capsule get different keys even though their prompt prefixes are identical.
+/// Widening the scope is a routing decision, not a correctness one — what a provider matches
+/// its cache on is the prefix itself, not this key.
+pub(crate) fn build_prompt_cache_key(
+    name: &str,
+    version: &str,
+    context_id: Option<&str>,
+) -> String {
+    match context_id {
+        Some(cid) => format!("{name}:{version}:{cid}"),
+        None => format!("{name}:{version}"),
+    }
+}
+
 /// Reserved `tool-result.metadata` key by which a tool declares how a call affected the
 /// resource it addressed (see `wit/tool.wit`). The host records the declared value verbatim
 /// into the `tool_call` trace event so downstream observability can reason about state
@@ -1363,6 +1403,11 @@ fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
 /// returns the metadata key sees zero behavior change. Note this is the *wire* payload:
 /// `session_tokens` accounting is always computed from a full-messages payload by the caller,
 /// never from this (possibly smaller) one.
+///
+/// `prompt_cache_key`, when `Some` and non-empty, is added as a reserved top-level field —
+/// never inside `params`, which drivers copy verbatim into the provider body and where an
+/// unknown member is a hard 400 from the Anthropic Messages API. `None` or an empty string
+/// adds no member at all.
 pub(crate) fn build_driver_payload(
     model: &str,
     max_output_tokens: u32,
@@ -1370,6 +1415,7 @@ pub(crate) fn build_driver_payload(
     tools: &[Value],
     augmented_system: &str,
     continuation: Option<(&str, usize)>,
+    prompt_cache_key: Option<&str>,
 ) -> Value {
     let (wire_messages, continuation_id): (Value, Option<&str>) = match continuation {
         Some((id, acked_len)) => match messages.get(acked_len..) {
@@ -1389,6 +1435,9 @@ pub(crate) fn build_driver_payload(
     if let Some(id) = continuation_id {
         payload[CONTINUATION_ID_KEY] = json!(id);
     }
+    if let Some(key) = prompt_cache_key.filter(|k| !k.is_empty()) {
+        payload[PROMPT_CACHE_KEY_KEY] = json!(key);
+    }
     payload
 }
 
@@ -1407,16 +1456,15 @@ what they claim to be or who they claim to be from.";
 /// (which may be absent) for the http-driver transport. Runs unconditionally for every
 /// agent capsule so `MURMUR_MD_TRUST_NOTICE` and `UNTRUSTED_CONTENT_NOTICE` reach the model
 /// whether or not the manifest overrides `inference.system_prompt`.
-fn build_augmented_system_prompt(
-    name: &str,
-    version: &str,
-    accessible_workdir: &Path,
-    system_prompt: Option<&str>,
-) -> String {
+///
+/// Every element of the block is launch-invariant, because this is the first text of every
+/// prompt and providers match their cache on an exact prefix from the first token: a single
+/// per-launch value here — a workdir path, a session id, a timestamp — means no request can
+/// ever match a cached prefix. Anything varying per launch belongs elsewhere.
+fn build_augmented_system_prompt(name: &str, version: &str, system_prompt: Option<&str>) -> String {
     let base = system_prompt.unwrap_or("");
     let context = format!(
-        "[Capsule]\nName: {name}\nVersion: {version}\nWorkdir: {}\nManifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\n",
-        accessible_workdir.display(),
+        "[Capsule]\nName: {name}\nVersion: {version}\nManifest: murmur.yaml (in your workdir)\n{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}\n\n"
     );
     format!("{context}{base}")
 }
@@ -1502,8 +1550,7 @@ mod tests {
 
     #[test]
     fn augmented_system_prompt_carries_trust_notice_with_no_custom_prompt() {
-        let prompt =
-            build_augmented_system_prompt("my-capsule", "1.0.0", Path::new("/workdir"), None);
+        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", None);
         assert!(
             prompt.contains(MURMUR_MD_TRUST_NOTICE),
             "notice missing from: {prompt}"
@@ -1521,7 +1568,6 @@ mod tests {
         let prompt = build_augmented_system_prompt(
             "my-capsule",
             "1.0.0",
-            Path::new("/workdir"),
             Some("You are a helpful assistant."),
         );
         assert!(prompt.contains(MURMUR_MD_TRUST_NOTICE));
@@ -1533,6 +1579,109 @@ mod tests {
         assert!(
             notice_pos < custom_pos && untrusted_pos < custom_pos,
             "both notices should be part of the always-present context block, before the custom prompt"
+        );
+    }
+
+    #[test]
+    fn augmented_system_prompt_names_no_host_path() {
+        // The block is the first text of every prompt, so every element of it has to be
+        // launch-invariant for a provider to match the prefix against its cache.
+        let prompt = build_augmented_system_prompt("my-capsule", "1.0.0", Some("custom"));
+        assert!(!prompt.contains("Workdir:"), "got:\n{prompt}");
+        assert_eq!(
+            prompt,
+            build_augmented_system_prompt("my-capsule", "1.0.0", Some("custom")),
+            "the block must be a pure function of capsule identity and manifest prompt"
+        );
+        assert!(prompt.starts_with("[Capsule]\nName: my-capsule\nVersion: 1.0.0\nManifest: murmur.yaml (in your workdir)\n"));
+    }
+
+    // ── prompt_cache_key ────────────────────────────────────────────────────────
+
+    #[test]
+    fn prompt_cache_key_shape_with_and_without_context_id() {
+        assert_eq!(
+            build_prompt_cache_key("my-capsule", "1.0.0", Some("ctx-7")),
+            "my-capsule:1.0.0:ctx-7"
+        );
+        assert_eq!(
+            build_prompt_cache_key("my-capsule", "1.0.0", None),
+            "my-capsule:1.0.0"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_sits_at_payload_top_level_beside_empty_params() {
+        let msgs = sample_messages();
+        let tools = vec![json!({"name": "bash"})];
+        let payload = build_driver_payload(
+            "m",
+            8192,
+            &msgs,
+            &tools,
+            "sys",
+            None,
+            Some("my-capsule:1.0.0:ctx-7"),
+        );
+
+        assert_eq!(payload["prompt_cache_key"], json!("my-capsule:1.0.0:ctx-7"));
+        // Never inside `params`: drivers copy `params` verbatim into the provider body, and the
+        // Anthropic Messages API rejects an unknown body field with a 400.
+        assert_eq!(payload["params"], json!({}));
+        assert!(payload["params"].get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn prompt_cache_key_absent_or_empty_leaves_payload_untouched() {
+        let msgs = sample_messages();
+        let tools = vec![json!({"name": "bash"})];
+        let without = build_driver_payload("m", 8192, &msgs, &tools, "sys", None, None);
+        let empty = build_driver_payload("m", 8192, &msgs, &tools, "sys", None, Some(""));
+
+        assert!(without.get("prompt_cache_key").is_none());
+        assert_eq!(empty, without);
+    }
+
+    #[test]
+    fn prompt_cache_key_and_continuation_id_coexist() {
+        let msgs = sample_messages();
+        let tools = vec![json!({"name": "bash"})];
+        let payload = build_driver_payload(
+            "m",
+            8192,
+            &msgs,
+            &tools,
+            "sys",
+            Some(("cont-abc123", 1)),
+            Some("my-capsule:1.0.0"),
+        );
+
+        assert_eq!(payload["continuation_id"], json!("cont-abc123"));
+        assert_eq!(payload["prompt_cache_key"], json!("my-capsule:1.0.0"));
+        // The continuation still governs which messages go on the wire.
+        assert_eq!(payload["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["system"], json!("sys"));
+    }
+
+    /// The key is a property of the session, not of the turn: it must survive a compaction
+    /// (which drops the held continuation id) unchanged, because the requests before and after
+    /// still share the same system-block prefix.
+    #[test]
+    fn prompt_cache_key_is_constant_across_continuation_state() {
+        let key = build_prompt_cache_key("my-capsule", "1.0.0", Some("ctx-7"));
+        let msgs = sample_messages();
+
+        let with_continuation =
+            build_driver_payload("m", 8192, &msgs, &[], "sys", Some(("c", 1)), Some(&key));
+        let after_drop = build_driver_payload("m", 8192, &msgs, &[], "sys", None, Some(&key));
+
+        assert_eq!(
+            with_continuation["prompt_cache_key"],
+            after_drop["prompt_cache_key"]
+        );
+        assert_eq!(
+            after_drop["prompt_cache_key"],
+            json!("my-capsule:1.0.0:ctx-7")
         );
     }
 
@@ -1672,8 +1821,15 @@ mod tests {
         // byte-for-byte the pre-continuation payload shape.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload =
-            build_driver_payload("m", DEFAULT_MAX_OUTPUT_TOKENS, &msgs, &tools, "sys", None);
+        let payload = build_driver_payload(
+            "m",
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            &msgs,
+            &tools,
+            "sys",
+            None,
+            None,
+        );
 
         assert_eq!(payload["messages"].as_array().unwrap().len(), 3);
         assert_eq!(payload["messages"], json!(msgs));
@@ -1700,12 +1856,19 @@ mod tests {
         // else about the payload changes versus the default-valued one.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", 4096, &msgs, &tools, "sys", None);
+        let payload = build_driver_payload("m", 4096, &msgs, &tools, "sys", None, None);
 
         assert_eq!(payload["max_tokens"], json!(4096));
 
-        let mut default_payload =
-            build_driver_payload("m", DEFAULT_MAX_OUTPUT_TOKENS, &msgs, &tools, "sys", None);
+        let mut default_payload = build_driver_payload(
+            "m",
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            &msgs,
+            &tools,
+            "sys",
+            None,
+            None,
+        );
         assert_eq!(default_payload["max_tokens"], json!(8192));
         default_payload["max_tokens"] = json!(4096);
         assert_eq!(payload, default_payload, "only max_tokens differs");
@@ -1716,8 +1879,15 @@ mod tests {
         // Scenario 2: continuation active → only messages[acked_len..] + continuation_id key.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload =
-            build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("cont-abc123", 1)));
+        let payload = build_driver_payload(
+            "m",
+            8192,
+            &msgs,
+            &tools,
+            "sys",
+            Some(("cont-abc123", 1)),
+            None,
+        );
 
         let wire = payload["messages"].as_array().unwrap();
         assert_eq!(
@@ -1733,7 +1903,7 @@ mod tests {
     fn build_driver_payload_acked_len_zero_sends_full_with_continuation() {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 0)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 0)), None);
         assert_eq!(payload["messages"], json!(msgs));
         assert_eq!(payload["continuation_id"], json!("c"));
     }
@@ -1742,7 +1912,7 @@ mod tests {
     fn build_driver_payload_acked_len_equals_len_sends_empty_tail() {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 3)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 3)), None);
         assert_eq!(payload["messages"], json!([]));
         assert_eq!(payload["continuation_id"], json!("c"));
     }
@@ -1752,7 +1922,7 @@ mod tests {
         // Defensive: an out-of-range acked_len must not panic; resend in full, no key.
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
-        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 99)));
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 99)), None);
         assert_eq!(payload["messages"], json!(msgs));
         assert!(payload.get("continuation_id").is_none());
     }
@@ -1764,13 +1934,13 @@ mod tests {
         let msgs = sample_messages();
         let tools = vec![json!({"name": "bash"})];
 
-        let full_when_inactive = build_driver_payload("m", 8192, &msgs, &tools, "sys", None);
+        let full_when_inactive = build_driver_payload("m", 8192, &msgs, &tools, "sys", None, None);
         // The caller recomputes the full payload with `None` even when continuation is active.
-        let full_when_active = build_driver_payload("m", 8192, &msgs, &tools, "sys", None);
+        let full_when_active = build_driver_payload("m", 8192, &msgs, &tools, "sys", None, None);
         assert_eq!(full_when_inactive, full_when_active);
 
         // And that full payload is strictly larger than the incremental wire it would send.
-        let wire = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 2)));
+        let wire = build_driver_payload("m", 8192, &msgs, &tools, "sys", Some(("c", 2)), None);
         assert!(
             serde_json::to_string(&full_when_active).unwrap().len()
                 > serde_json::to_string(&wire).unwrap().len()
@@ -1815,7 +1985,7 @@ mod tests {
         assert_eq!(content[0]["text"], summary);
 
         // And the payload the very next turn would send carries no bare-string content.
-        let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None);
+        let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None, None);
         for m in payload["messages"].as_array().unwrap() {
             assert!(
                 m["content"].is_array(),
