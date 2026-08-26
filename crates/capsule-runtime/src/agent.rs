@@ -1257,10 +1257,9 @@ async fn try_compact_via_hooks(
     //   (2) any held driver continuation id (and its bookkeeping) is dropped — the next Turn
     //       is a full resend of whatever `messages` now holds (never the pre-compaction
     //       transcript, never empty).
-    // Maximal prompt cache destruction: replacing the whole message list with one summary
-    // message discards every cached prefix past the system block, so the next turn is a full
-    // cache miss on everything the summary stands in for. That is the standing price of a
-    // compaction, paid one turn later.
+    // Compaction is maximal prompt cache loss: replacing the whole message list with one
+    // summary message discards every cached prefix past the system block, so the next turn is
+    // a full cache miss on everything the summary stands in for.
     *messages = candidate_messages;
 
     let new_json = serde_json::to_string(&*messages).unwrap_or_default();
@@ -1330,17 +1329,22 @@ fn extract_continuation_id(metadata: &[(String, String)]) -> Option<String> {
 }
 
 /// Reserved top-level field on the driver request payload carrying the session's
-/// prompt-cache routing hint. It is a hint, not a cache control: a driver that ignores it
-/// behaves exactly as before, and no shipped driver reads it today.
+/// prompt-cache routing hint. It is a hint, not a cache control: a driver that does not
+/// declare the field drops it when deserializing, and inference proceeds unchanged.
 pub(crate) const PROMPT_CACHE_KEY_KEY: &str = "prompt_cache_key";
 
-/// Build the session-constant value of [`PROMPT_CACHE_KEY_KEY`]:
-/// `<name>:<version>:<context_id>`, or `<name>:<version>` when the session has no context id.
+/// Build the value of [`PROMPT_CACHE_KEY_KEY`]: `<name>:<version>:<context_id>`, or
+/// `<name>:<version>` when there is no context id.
 ///
-/// The value identifies the set of requests that share a prompt prefix, so a provider routing
-/// on it keeps them on the machine already holding that prefix's cache entry. It must stay
-/// constant across every turn of a session — including across a compaction and across a
-/// dropped continuation id, neither of which changes which prefix the requests share.
+/// A provider routing on this value keeps the turns that carry it on one machine, so each
+/// turn lands on the machine already holding the previous turn's cache entry. It must stay
+/// constant across every turn of a task — including across a compaction and across a dropped
+/// continuation id, neither of which changes which prefix the requests share.
+///
+/// The scope is the task, not the capsule: `context_id` is minted per task, so two launches
+/// of the same capsule get different keys even though their prompt prefixes are identical.
+/// Widening the scope is a routing decision, not a correctness one — what a provider matches
+/// its cache on is the prefix itself, not this key.
 pub(crate) fn build_prompt_cache_key(
     name: &str,
     version: &str,
@@ -1403,7 +1407,7 @@ fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
 /// `prompt_cache_key`, when `Some` and non-empty, is added as a reserved top-level field —
 /// never inside `params`, which drivers copy verbatim into the provider body and where an
 /// unknown member is a hard 400 from the Anthropic Messages API. `None` or an empty string
-/// adds nothing, leaving the payload byte-for-byte what it was before the field existed.
+/// adds no member at all.
 pub(crate) fn build_driver_payload(
     model: &str,
     max_output_tokens: u32,
@@ -1455,8 +1459,8 @@ what they claim to be or who they claim to be from.";
 ///
 /// Every element of the block is launch-invariant, because this is the first text of every
 /// prompt and providers match their cache on an exact prefix from the first token: a single
-/// per-launch value here (the session workdir path this block used to render, for one) means
-/// no request can ever match a cached prefix. Anything varying per launch belongs elsewhere.
+/// per-launch value here — a workdir path, a session id, a timestamp — means no request can
+/// ever match a cached prefix. Anything varying per launch belongs elsewhere.
 fn build_augmented_system_prompt(name: &str, version: &str, system_prompt: Option<&str>) -> String {
     let base = system_prompt.unwrap_or("");
     let context = format!(

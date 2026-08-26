@@ -378,17 +378,7 @@ fn bootstrap_missing_driver_artifact_fails_before_launch() {
 
 #[test]
 fn bootstrap_driver_excluded_from_tool_list() {
-    let server = ScriptedServer::start(vec![json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": "done"}],
-        "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()]);
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -449,17 +439,7 @@ fn bootstrap_driver_excluded_from_tool_list() {
 /// (c) the manifest system prompt appears after the block.
 #[test]
 fn agent_system_prompt_includes_capsule_context() {
-    let server = ScriptedServer::start(vec![json!({
-        "id": "msg_1",
-        "type": "message",
-        "role": "assistant",
-        "model": "test-model",
-        "content": [{"type": "text", "text": "done"}],
-        "stop_reason": "end_turn",
-        "stop_sequence": Value::Null,
-        "usage": {"input_tokens": 1, "output_tokens": 1}
-    })
-    .to_string()]);
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
 
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
