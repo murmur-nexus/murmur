@@ -48,7 +48,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
         .clone();
 
     let first_stdout = String::from_utf8(first).unwrap();
-    let first_workdir = parse_workdir_from_stdout(&first_stdout);
+    let first_workdir = common::parse_workdir_from_stdout(&first_stdout);
     assert_eq!(
         fs::read_to_string(first_workdir.join("out/result.txt")).unwrap(),
         "ok"
@@ -80,7 +80,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
         .clone();
 
     let second_stdout = String::from_utf8(second).unwrap();
-    let second_workdir = parse_workdir_from_stdout(&second_stdout);
+    let second_workdir = common::parse_workdir_from_stdout(&second_stdout);
     assert_eq!(
         fs::read_to_string(second_workdir.join("out/result.txt")).unwrap(),
         "ok"
@@ -115,7 +115,7 @@ fn run_unlisted_tool_call_returns_error_to_capsule_without_panic() {
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(stdout).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(stdout).unwrap());
     let output = fs::read_to_string(workdir.join("out/result.txt")).unwrap();
     assert!(output.contains("not declared in manifest allowlist"));
 }
@@ -286,7 +286,7 @@ fn run_disallowed_network_call_is_denied_without_panic() {
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "denied"
@@ -321,7 +321,7 @@ fn run_allowlisted_network_host_is_not_denied_at_handle_time() {
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "allowed"
@@ -357,7 +357,7 @@ fn run_env_echo(capabilities_yaml: Option<&str>, extra_env: &[(&str, &str)]) -> 
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
     fs::read_to_string(workdir.join("out/result.txt")).unwrap()
 }
 
@@ -433,7 +433,7 @@ fn run_without_network_capabilities_denies_outbound_http() {
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "denied"
@@ -468,7 +468,7 @@ fn run_filesystem_escape_attempt_fails_and_does_not_write_outside_workdir() {
         .stdout
         .clone();
 
-    let workdir = parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
+    let workdir = common::parse_workdir_from_stdout(&String::from_utf8(output).unwrap());
     assert_eq!(
         fs::read_to_string(workdir.join("out/result.txt")).unwrap(),
         "blocked"
@@ -614,15 +614,4 @@ fn write_registry_source_config(home: &Path, repo: &str) {
         ),
     )
     .unwrap();
-}
-
-fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
-    let marker = "workdir: ";
-    let start = stdout
-        .find(marker)
-        .unwrap_or_else(|| panic!("missing '{marker}' in stdout: {stdout}"));
-
-    let after = &stdout[start + marker.len()..];
-    let workdir = after.lines().next().unwrap_or_default().trim();
-    PathBuf::from(workdir)
 }

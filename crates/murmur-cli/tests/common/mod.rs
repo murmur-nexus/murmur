@@ -565,3 +565,18 @@ pub fn explain_scope_json(home: &TempDir, manifest: &Path) -> Value {
         .clone();
     serde_json::from_slice(&stdout).expect("--explain-scope --json emits one JSON object")
 }
+
+/// The session workdir `mur run --verbose` reports in its startup block.
+pub fn parse_workdir_from_stdout(stdout: &str) -> PathBuf {
+    let marker = "workdir: ";
+    let start = stdout
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing '{marker}' in stdout:\n{stdout}"));
+    PathBuf::from(
+        stdout[start + marker.len()..]
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim(),
+    )
+}

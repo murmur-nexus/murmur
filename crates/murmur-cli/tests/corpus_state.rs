@@ -290,22 +290,7 @@ fn run_session(home: &TempDir, manifest: &Path, task: &str) -> PathBuf {
         .stdout
         .clone();
 
-    workdir_from(&String::from_utf8(stdout).unwrap())
-}
-
-/// The `workdir:` line `--verbose` prints in the startup block.
-fn workdir_from(stdout: &str) -> PathBuf {
-    let marker = "workdir: ";
-    let start = stdout
-        .find(marker)
-        .unwrap_or_else(|| panic!("missing '{marker}' in stdout:\n{stdout}"));
-    PathBuf::from(
-        stdout[start + marker.len()..]
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim(),
-    )
+    common::parse_workdir_from_stdout(&String::from_utf8(stdout).unwrap())
 }
 
 fn tool_use_response(tool_id: &str, input: Value) -> String {
