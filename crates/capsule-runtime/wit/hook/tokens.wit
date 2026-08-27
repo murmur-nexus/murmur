@@ -1,0 +1,16 @@
+package murmur:runtime@0.3.0;
+
+/// Host-provided token counter available to any hook component.
+///
+/// Counting text is pure computation: no side effect, no host resource, no
+/// filesystem or network reach. The import is therefore ungated — no capability
+/// grant enables it and none can withhold it.
+interface tokens {
+    /// The host's own `cl100k_base` count of `text`.
+    ///
+    /// The same number the compaction trigger and the context-occupancy
+    /// calculation use, so a hook measuring a payload against a budget and the
+    /// host enforcing that budget agree on what the payload costs. A hook that
+    /// brings its own tokenizer is measuring something the host does not.
+    count: func(text: string) -> u64;
+}

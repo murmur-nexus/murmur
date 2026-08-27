@@ -1,9 +1,33 @@
-package murmur:hook@0.5.0;
+package murmur:hook@0.6.0;
 
 interface lifecycle {
     record message {
         role: string,
         content: string,
+        /// Stable identity for this message, minted by the runtime as `msg_`
+        /// followed by a uuid-v7 simple form. A uuid-v7 carries its own
+        /// millisecond timestamp, so there is no separate `created-at` field to
+        /// keep in step with it.
+        ///
+        /// This is **not** a content hash. An id must never repeat, even for two
+        /// messages whose content is byte-identical; a content hash must repeat
+        /// whenever the content does. The two answer different questions and are
+        /// never interchangeable.
+        ///
+        /// Stripped before the wire payload is built — see the note on
+        /// `source-id`. Always `none` today: nothing in the runtime mints one
+        /// yet, and an incoming value is ignored.
+        id: option<string>,
+        /// Opaque join key back to whatever produced this content — a corpus
+        /// record, a compaction summary, reloaded history. Recorded verbatim and
+        /// never parsed, exactly like `resource-id` in tool metadata: the runtime
+        /// makes no claim about its shape and reads no meaning out of it.
+        ///
+        /// Both `id` and `source-id` are stripped before the driver wire payload
+        /// is built. A uuid sitting at the head of a cached prefix is volatile
+        /// content, and would defeat provider prompt-prefix caching on every
+        /// request. Always `none` today, and an incoming value is ignored.
+        source-id: option<string>,
     }
 
     record tool-manifest {
@@ -25,6 +49,16 @@ interface lifecycle {
         /// `inference.max_turns` ceiling. Returned from any other lifecycle event
         /// it is a non-fatal dispatch fault (logged and traced, never honored).
         reopen-task(string),
+        /// Context to seed a task with, distinct from `replace-context` because
+        /// seeding needs a ceiling and compaction must not have one: compaction's
+        /// contract is that the hook has already done the shrinking, so the host
+        /// takes what it is handed. A seed is proposed against a budget the host
+        /// enforces.
+        ///
+        /// No lifecycle event honors this arm yet. Returning it from any of the
+        /// nine handlers is the ordinary unsupported-arm dispatch fault — logged
+        /// and traced, the value discarded, the session continuing.
+        seed-context(list<message>),
     }
 
     record session-context {
@@ -44,6 +78,20 @@ interface lifecycle {
         context-id: string,
         source: string,
         input-bytes: u64,
+        /// Token ceiling a hook may propose context up to for this task. Always
+        /// `0` today; a later slice computes it. A hook must read `0` as "the
+        /// host has not computed this" and decline rather than assume an
+        /// unbounded budget.
+        budget-tokens: u64,
+        /// The capsule's `context.max_tokens`, or `0` when the manifest declares
+        /// none. Precomputed by the host so a hook measuring against the window
+        /// never has to know which model the session runs or how wide its window
+        /// is.
+        context-window: u64,
+        /// Tokens already occupied by context the host loaded before this task's
+        /// first turn. Always `0` today; a later slice computes it, and the same
+        /// "`0` means not computed" reading applies as for `budget-tokens`.
+        prior-tokens: u64,
     }
 
     record task-end-event {

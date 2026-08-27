@@ -224,7 +224,7 @@ pub(crate) mod test_support {
     use super::TASK_IO_IFACE_VERSIONED;
     use wasmtime::component::Component;
 
-    /// One row per `murmur:hook/lifecycle@0.5.0` function: the WIT name, the WIT type of its
+    /// One row per `murmur:hook/lifecycle@0.6.0` function: the WIT name, the WIT type of its
     /// event parameter, and the core-function signature the canonical ABI flattens that type
     /// to. `on-inference`'s record flattens to 17 values, past the 16-parameter limit, so it
     /// is passed indirectly as a single pointer.
@@ -238,7 +238,7 @@ pub(crate) mod test_support {
         (
             "on-task-start",
             "$task-start-event",
-            "i32 i32 i32 i32 i32 i32 i64",
+            "i32 i32 i32 i32 i32 i32 i64 i64 i64 i64",
         ),
         ("on-inference", "$inference-event", "i32"),
         (
@@ -355,14 +355,19 @@ pub(crate) mod test_support {
 
     /// Every WIT type a lifecycle export in these doubles names.
     const LIFECYCLE_TYPES: &str = r#"
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $stage-event (record (field "shell-allow" (list string))))
   (type $session-context (record
     (field "capsule-name" string)
@@ -374,7 +379,10 @@ pub(crate) mod test_support {
     (field "task-id" string)
     (field "context-id" string)
     (field "source" string)
-    (field "input-bytes" u64)))
+    (field "input-bytes" u64)
+    (field "budget-tokens" u64)
+    (field "context-window" u64)
+    (field "prior-tokens" u64)))
   (type $inference-event (record
     (field "turn" u32)
     (field "input-tokens" u64)
@@ -435,7 +443,7 @@ pub(crate) mod test_support {
              (export \"rin\" (func $rin_l))\n      (export \"olen\" (func $olen_l))\n      \
              (export \"rout\" (func $rout_l))))))\n{LIFECYCLE_TYPES}\n{lifts}\n  \
              (instance $lc\n{TYPE_EXPORTS}{exports}  )\n  \
-             (export \"murmur:hook/lifecycle@0.5.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.6.0\" (instance $lc))\n)",
             preamble = preamble(),
         );
         let bytes = wat::parse_str(&wat).expect("task-io double WAT parses");

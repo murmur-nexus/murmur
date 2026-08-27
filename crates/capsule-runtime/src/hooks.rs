@@ -32,6 +32,7 @@ use crate::{
     runtime::NetworkPolicyHooks,
     state_store::STATE_PREOPEN_NAME,
     task_io_import::{add_task_io_to_linker, TaskIoState},
+    tokens_import::add_tokens_to_linker,
     types::StagedHookArtifact,
 };
 
@@ -39,7 +40,7 @@ use crate::{
 /// `murmur:hook` version declared in `wit/`. The host keeps no compatibility
 /// fallback: a hook compiled against any other version does not resolve, so a
 /// WIT bump requires every hook artifact to be rebuilt (see `wit/VERSIONING.md`).
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.5.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.6.0";
 
 /// Resolve the lifecycle instance export. `None` means the component does not
 /// export [`LIFECYCLE_IFACE`], which surfaces as a missing-export error at the
@@ -192,6 +193,7 @@ fn output_arm_name(output: &HookOutput) -> Option<&'static str> {
         HookOutput::WriteManifests(_) => Some("write-manifests"),
         HookOutput::Artifact(_) => Some("artifact"),
         HookOutput::ReopenTask(_) => Some("reopen-task"),
+        HookOutput::SeedContext(_) => Some("seed-context"),
     }
 }
 
@@ -343,6 +345,17 @@ pub(crate) enum HookEvent {
         context_id: String,
         source: String,
         input_bytes: u64,
+        /// Token ceiling for context proposed at this task. Always `0` today —
+        /// no caller computes one — and the WIT contract reads `0` as "not
+        /// computed" rather than "unbounded".
+        budget_tokens: u64,
+        /// The capsule's `context.max_tokens`, from
+        /// [`crate::runtime::resolve_context_window`], or `0` when the manifest
+        /// declares no `context:` block.
+        context_window: u64,
+        /// Tokens already occupied before this task's first turn. Always `0`
+        /// today, read the same way as `budget_tokens`.
+        prior_tokens: u64,
     },
     Inference {
         turn: u32,
@@ -590,6 +603,9 @@ async fn call_stage_once(
             .task_io_read
             .then(|| Arc::new(TaskIoState::new())),
     )?;
+    // Counting text reaches nothing, so the counter is defined on every linker
+    // with no grant to consult.
+    add_tokens_to_linker(&mut linker)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -1126,6 +1142,7 @@ async fn instantiate_hook(
         staged.grant.task_io_read.then(|| Arc::clone(task_io)),
     )
     .map_err(RuntimeError::Runtime)?;
+    add_tokens_to_linker(&mut linker).map_err(RuntimeError::Runtime)?;
 
     let state = HookStoreState {
         limits: limits.limiter(),
@@ -1314,12 +1331,18 @@ async fn call_hook(
             context_id,
             source,
             input_bytes,
+            budget_tokens,
+            context_window,
+            prior_tokens,
         } => {
             let evt = TaskStartEvent {
                 task_id: task_id.clone(),
                 context_id: context_id.clone(),
                 source: source.clone(),
                 input_bytes: *input_bytes,
+                budget_tokens: *budget_tokens,
+                context_window: *context_window,
+                prior_tokens: *prior_tokens,
             };
             call_typed(hook, "on-task-start", evt).await?
         }
@@ -1457,9 +1480,11 @@ async fn call_hook(
                     reason,
                 },
                 // `write-manifests` is honored only by `on-stage`, which is never
-                // dispatched through `call_hook`; no other arm is honored by any of
-                // the eight events reaching here.
-                _ => HookCallResult::None,
+                // dispatched through `call_hook`, and `seed-context` is honored by
+                // no event at all; neither can reach this arm as `Honored`.
+                HookOutput::WriteManifests(_) | HookOutput::SeedContext(_) | HookOutput::None => {
+                    HookCallResult::None
+                }
             },
             OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
                 event: event_fn.to_string(),
@@ -1647,7 +1672,7 @@ mod tests {
     /// A retired lifecycle instance name. The host accepts [`LIFECYCLE_IFACE`] and
     /// nothing else, so a double exporting this must fail to resolve — that is what
     /// the no-fallback tests below assert.
-    const RETIRED_IFACE: &str = "murmur:hook/lifecycle@0.4.0";
+    const RETIRED_IFACE: &str = "murmur:hook/lifecycle@0.5.0";
 
     /// Engine configured like the production one (component model + async + epoch
     /// interruption) so a hand-authored WAT component double can be compiled and
@@ -1674,7 +1699,7 @@ mod tests {
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
     /// instance name, so tests can build a component that exports the versioned
-    /// (`murmur:hook/lifecycle@0.2.0`), the legacy unversioned, or a
+    /// (`murmur:hook/lifecycle@0.6.0`), the legacy unversioned, or a
     /// deliberately-unmatched name to exercise `resolve_lifecycle_iface` and its
     /// hard-error path.
     fn hook_double_iface(engine: &wasmtime::Engine, iface: &str, fn_names: &[&str]) -> Component {
@@ -1820,6 +1845,9 @@ mod tests {
                         context_id: "ctx_1".to_string(),
                         source: "a2a".to_string(),
                         input_bytes: 3,
+                        budget_tokens: 0,
+                        context_window: 0,
+                        prior_tokens: 0,
                     },
                 )
                 .await;
@@ -1896,6 +1924,12 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// The whole of one hook's error log, empty when the file was never written.
+    fn hook_log_text(session: &Path, hook_name: &str) -> String {
+        let path = session.join("logs").join(format!("hook-{hook_name}.log"));
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
     /// Simulates the `runtime.rs` dispatch sequence for a `task_acceptance: queue` launch
     /// that processes three tasks: `on-session-start` once, then a
     /// `on-task-start`/inference/`on-task-end` trio per task, then `on-session-end` once.
@@ -1944,6 +1978,9 @@ mod tests {
                             context_id: format!("ctx_{t}"),
                             source: "a2a".to_string(),
                             input_bytes: 1,
+                            budget_tokens: 0,
+                            context_window: 0,
+                            prior_tokens: 0,
                         },
                     )
                     .await;
@@ -2048,7 +2085,7 @@ mod tests {
     }
 
     /// A hook component built against the *current* versioned
-    /// `murmur:hook/lifecycle@0.5.0` interface (the name a freshly-compiled hook
+    /// `murmur:hook/lifecycle@0.6.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
     /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
@@ -2197,14 +2234,19 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
@@ -2260,14 +2302,19 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $compaction-event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
@@ -2326,8 +2373,12 @@ mod tests {
     /// Return area is laid out by hand at offset 128:
     /// `result` discriminant `0` (ok); `hook-output` discriminant `1`
     /// (`replace-context`) at 132 with its `list<message>` (ptr 160, len 1) at 136/140;
-    /// the one `message` at 160 as `{role ptr/len, content ptr/len}`. The role string
-    /// lives at 200 and the absent-sentinel at 224.
+    /// the one `message` at 160. `message` is 40 bytes at align 4 —
+    /// `{role ptr 160/len 164, content ptr 168/len 172, id 176..188,
+    /// source-id 188..200}` — each `option<string>` being a 12-byte
+    /// `{discriminant, ptr, len}`. Both option discriminants are stored as `0`
+    /// (`none`); the host never lifts their payload words. The role string lives
+    /// at 240 and the absent-sentinel at 264, clear of the widened record.
     /// Unlike the other doubles this one needs a genuine bump `realloc` — a fixed
     /// address would lower the messages list, the model string and the system-prompt
     /// string all on top of each other, and the echoed bytes would be garbage.
@@ -2341,8 +2392,8 @@ mod tests {
         let core = format!(
             r#"    (memory (export "memory") 1)
     (global $bump (mut i32) (i32.const 1024))
-    (data (i32.const 200) "{role}")
-    (data (i32.const 224) "{MODEL_ABSENT_SENTINEL}")
+    (data (i32.const 240) "{role}")
+    (data (i32.const 264) "{MODEL_ABSENT_SENTINEL}")
     (func (export "realloc") (param i32 i32 i32 i32) (result i32)
       (local $r i32)
       (global.set $bump
@@ -2360,12 +2411,14 @@ mod tests {
       (i32.store (i32.const 132) (i32.const 1))
       (i32.store (i32.const 136) (i32.const 160))
       (i32.store (i32.const 140) (i32.const 1))
-      (i32.store (i32.const 160) (i32.const 200))
+      (i32.store (i32.const 160) (i32.const 240))
       (i32.store (i32.const 164) (i32.const {role_len}))
       (i32.store (i32.const 168)
-        (select (local.get ${field}-ptr) (i32.const 224) (local.get ${field}-some)))
+        (select (local.get ${field}-ptr) (i32.const 264) (local.get ${field}-some)))
       (i32.store (i32.const 172)
         (select (local.get ${field}-len) (i32.const {sentinel_len}) (local.get ${field}-some)))
+      (i32.store (i32.const 176) (i32.const 0))
+      (i32.store (i32.const 188) (i32.const 0))
       (i32.const 128))
     (func (export "noop"))"#
         );
@@ -2417,6 +2470,8 @@ mod tests {
                 vec![Message {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    id: None,
+                    source_id: None,
                 }],
                 1234,
                 0.98,
@@ -2601,6 +2656,8 @@ mod tests {
                 vec![Message {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    id: None,
+                    source_id: None,
                 }],
                 1234,
                 0.98,
@@ -2676,7 +2733,7 @@ mod tests {
         });
     }
 
-    // ---- shell-event: `binary` (the `@0.4.0 → @0.5.0` bump) ----
+    // ---- shell-event: `binary` (added by the `@0.5.0` bump) ----
 
     /// A double whose `on-shell` declares the **current** 9-field `shell-event`, and which
     /// verifies what it was handed rather than merely accepting it: the core function
@@ -2742,14 +2799,19 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $shell-event (record
     (field "turn" u32)
     (field "binary" string)
@@ -2777,8 +2839,8 @@ mod tests {
   (export "{iface}" (instance $lc))
 )"#
         );
-        let bytes = wat::parse_str(&wat).expect("@0.5.0 shell component WAT parses");
-        Component::new(engine, &bytes).expect("@0.5.0 shell component double compiles")
+        let bytes = wat::parse_str(&wat).expect("shell component WAT parses");
+        Component::new(engine, &bytes).expect("shell component double compiles")
     }
 
     /// Stage `component` as the sole `on-shell` hook and dispatch one shell event
@@ -2821,8 +2883,8 @@ mod tests {
             .await;
     }
 
-    /// A hook rebuilt against `@0.5.0` receives the new 9-field `shell-event`, and the
-    /// `binary` it observes is byte-for-byte what the host sent — the whole point of the
+    /// A current-version hook receives the 9-field `shell-event`, and the `binary` it
+    /// observes is byte-for-byte what the host sent — the whole point of the `@0.5.0`
     /// bump. The double traps on any mismatch, so an empty log is the assertion.
     #[test]
     fn current_hook_receives_the_invoked_binary_in_shell_event() {
@@ -2842,12 +2904,12 @@ mod tests {
         assert_eq!(
             hook_log_lines(session.path(), "sheller"),
             0,
-            "a @0.5.0 hook must receive on-shell cleanly with the exact binary the host sent"
+            "a current-version hook must receive on-shell cleanly with the exact binary the host sent"
         );
     }
 
     /// Guards the test above: the double really does inspect `binary`, so a wrong value
-    /// traps rather than passing silently. Without this, `v0_5_hook_receives_...` would
+    /// traps rather than passing silently. Without this, `current_hook_receives_the_invoked_binary_in_shell_event` would
     /// still pass if the host sent an empty or stale `binary`.
     #[test]
     fn shell_double_rejects_a_binary_it_did_not_expect() {
@@ -2875,7 +2937,7 @@ mod tests {
     }
 
     /// End-to-end through the real host import: a hook component that imports
-    /// `murmur:runtime/inference@0.2.0` and calls `run-inference` gets back the
+    /// `murmur:runtime/inference@0.3.0` and calls `run-inference` gets back the
     /// driver double's completion text, which it returns as an `on-inference`
     /// artifact so the test can read it.
     #[test]
@@ -2987,7 +3049,7 @@ mod tests {
         }
     }
 
-    /// A `@0.3.0` lifecycle double that *imports* `murmur:runtime/inference@0.2.0`
+    /// A current-version lifecycle double that *imports* `murmur:runtime/inference@0.3.0`
     /// and, on `on-inference`, calls `run-inference` with an empty message list
     /// and `model: none`, then returns whichever string the call produced —
     /// the completion text on success, the error message on failure — as
@@ -3009,14 +3071,18 @@ mod tests {
         let wat = format!(
             r#"(component
   (import "{INFERENCE_IFACE_VERSIONED}" (instance $inf
-    (type (record (field "role" string) (field "content" string)))
-    (export "message" (type (eq 0)))
-    (type (list 1))
     (type (option string))
     (type (record
-      (field "messages" 2)
-      (field "system-prompt" 3)
-      (field "model" 3)))
+      (field "role" string)
+      (field "content" string)
+      (field "id" 0)
+      (field "source-id" 0)))
+    (export "message" (type (eq 1)))
+    (type (list 2))
+    (type (record
+      (field "messages" 3)
+      (field "system-prompt" 0)
+      (field "model" 0)))
     (export "inference-request" (type (eq 4)))
     (type (record
       (field "text" string)
@@ -3064,14 +3130,19 @@ mod tests {
     (with "libc" (instance $li))
     (with "inf" (instance (export "run" (func $run_lowered))))))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $inference-event (record
     (field "turn" u32)
     (field "input-tokens" u64)
@@ -3164,6 +3235,199 @@ mod tests {
         );
     }
 
+    // ── murmur:runtime/tokens: the ungated host counter ──────────────────────
+
+    /// The string [`hook_token_counter_double`] measures. Long enough that the
+    /// `text.len() / 4` fallback in [`crate::agent::count_tokens`] and a real
+    /// `cl100k_base` count cannot coincide by accident.
+    use crate::tokens_import::TOKENS_IFACE_VERSIONED;
+
+    const TOKEN_PROBE: &str =
+        "the quick brown fox jumps over the lazy dog, and then counts its own tokens";
+
+    /// A lifecycle double that *imports* `murmur:runtime/tokens@0.3.0` and, on
+    /// `on-session-start`, calls `count` on [`TOKEN_PROBE`] and returns the result rendered
+    /// as decimal digits in `err(...)`. A returned `err` is appended verbatim to
+    /// `logs/hook-<name>.log`, so the number the host computed is readable from the log.
+    ///
+    /// Memory and `realloc` live in a separate core module so the lowered import can
+    /// reference them without a cyclic instantiation, the same arrangement
+    /// [`hook_inference_caller_double`] uses. `count` lowers to `(param i32 i32) (result
+    /// i64)` — the string's `(ptr,len)`, and the `u64` return as one flat value.
+    ///
+    /// Return area at 128: `result` discriminant `1` (err); the string `(ptr,len)` at
+    /// 132/136, its bytes written from 400 upwards.
+    fn hook_token_counter_double(engine: &wasmtime::Engine) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .filter(|n| **n != "on-session-start")
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let probe_len = TOKEN_PROBE.len();
+        let wat = format!(
+            r#"(component
+  (import "{TOKENS_IFACE_VERSIONED}" (instance $tk
+    (export "count" (func (param "text" string) (result u64)))
+  ))
+  (alias export $tk "count" (func $count))
+
+  (core module $libc
+    (memory (export "memory") 1)
+    (global $bump (mut i32) (i32.const 1024))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (i32.add (local.get 3) (i32.const 8))))
+      (local.get $p))
+  )
+  (core instance $li (instantiate $libc))
+  (alias core export $li "memory" (core memory $mem))
+  (alias core export $li "realloc" (core func $realloc))
+  (core func $count_lowered
+    (canon lower (func $count) (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "libc" "memory" (memory 1))
+    (import "tok" "count" (func $count (param i32 i32) (result i64)))
+    (data (i32.const 300) "{TOKEN_PROBE}")
+    (global $cur (mut i32) (i32.const 400))
+    (func $put (param $b i32)
+      (i32.store8 (global.get $cur) (local.get $b))
+      (global.set $cur (i32.add (global.get $cur) (i32.const 1))))
+    (func $dec (param $v i32)
+      (if (i32.ge_u (local.get $v) (i32.const 10))
+        (then (call $dec (i32.div_u (local.get $v) (i32.const 10)))))
+      (call $put (i32.add (i32.const 48) (i32.rem_u (local.get $v) (i32.const 10)))))
+    (func (export "onstart") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
+      (call $dec
+        (i32.wrap_i64 (call $count (i32.const 300) (i32.const {probe_len}))))
+      (i32.store (i32.const 128) (i32.const 1))
+      (i32.store (i32.const 132) (i32.const 400))
+      (i32.store (i32.const 136) (i32.sub (global.get $cur) (i32.const 400)))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m
+    (with "libc" (instance $li))
+    (with "tok" (instance (export "count" (func $count_lowered))))))
+
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
+  (type $session-context (record
+    (field "capsule-name" string)
+    (field "capsule-version" string)
+    (field "session-id" string)
+    (field "model" string)
+    (field "capabilities" (list string))))
+  (type $fs (func (param "ctx" $session-context) (result (result $hook-output (error string)))))
+
+  (func $os (type $fs)
+    (canon lift (core func $i "onstart") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "session-context" (type $session-context))
+    (export "on-session-start" (func $os))
+{stubs}
+  )
+  (export "{LIFECYCLE_IFACE}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("token-counter component WAT parses");
+        Component::new(engine, &bytes).expect("token-counter component double compiles")
+    }
+
+    /// Invariant: `murmur:runtime/tokens@0.3.0#count` is registered on the main hook
+    /// linker with no capability grant, and it answers with the host's own count.
+    ///
+    /// The double is staged default-deny — no network rules, no filesystem scope, no
+    /// task-io grant — so it links only because the counter is ungated. The number it
+    /// reports is compared against [`crate::agent::count_tokens`] directly: a host that
+    /// registered some other counter would link fine and still fail here.
+    #[test]
+    fn hook_importing_the_token_counter_gets_the_hosts_own_count() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let mut hooks = new_with_hooks(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged_double_named(
+                    "counter",
+                    HookBinding::OnSessionStart,
+                    hook_token_counter_double(&engine),
+                )],
+            )
+            .await
+            .expect("a tokens-importing hook instantiates like any other");
+            hooks.emit(session.path(), HookEvent::SessionStart).await;
+        });
+
+        let expected = crate::agent::count_tokens(TOKEN_PROBE);
+        assert!(
+            expected > 0,
+            "the probe must actually tokenize to something"
+        );
+        assert!(
+            hook_log_text(session.path(), "counter").contains(&expected.to_string()),
+            "the guest must report the host's own count ({expected}), got {:?}",
+            hook_log_text(session.path(), "counter")
+        );
+    }
+
+    /// The staging linker registers the counter too. `on-stage` runs on a linker of its
+    /// own, built before any inference driver or task exists; a hook that imports `count`
+    /// and is dispatched there must link rather than fail instantiation.
+    #[test]
+    fn the_staging_linker_also_defines_the_token_counter() {
+        let session = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+
+        let staged = staged_double_named(
+            "counter",
+            HookBinding::OnStage,
+            hook_token_counter_double(&engine),
+        );
+
+        dispatch_stage(
+            &engine,
+            session.path(),
+            std::slice::from_ref(&staged),
+            Vec::new(),
+            &HookEnvVars::default(),
+            ExecutionLimits::default(),
+        )
+        .expect("on-stage dispatch itself never fails on a hook-returned error");
+
+        // `on-stage` is a bare stub in this double, so the dispatch itself fails
+        // `.typed()` and is logged — but only after instantiation succeeded, which is
+        // the fact under test.
+        assert_eq!(
+            hook_log_lines(session.path(), "counter"),
+            1,
+            "the hook must have instantiated and been dispatched, not failed to link"
+        );
+    }
+
     // ── murmur:task-io/read: the per-hook grant and the scope table ───────────
 
     use crate::task_io_import::test_support::{probe_double, reader_double, REPORT_SEP};
@@ -3242,6 +3506,9 @@ mod tests {
                         context_id: "ctx_1".to_string(),
                         source: "task_md".to_string(),
                         input_bytes: 4,
+                        budget_tokens: 0,
+                        context_window: 0,
+                        prior_tokens: 0,
                     },
                 )
                 .await;
@@ -3863,14 +4130,19 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $tool-event (record
     (field "turn" u32)
     (field "tool-name" string)
@@ -3899,7 +4171,7 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
-    /// A *current-version* (`@0.5.0`, 5-case `hook-output`) `on-task-end` double that
+    /// A *current-version* (`@0.6.0`, 6-case `hook-output`) `on-task-end` double that
     /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
     /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
     /// offset 300 so the host lifts the real bytes the guest declared, exercising the
@@ -3938,14 +4210,19 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $task-end-event (record
     (field "task-id" string)
     (field "exit-status" string)))
@@ -4052,7 +4329,7 @@ artifacts:
     }
 
     /// Invariant: `reopen-task` returned from any event other than `on-task-end` is a
-    /// dispatch fault, not a silent grant. Bind the same 5-case double to `on-tool-call`
+    /// dispatch fault, not a silent grant. Bind the same 6-case double to `on-tool-call`
     /// (its `on-tool-call` export is a bare stub, so dispatching it fails `.typed()` —
     /// but the point tested here is the honored-arm *table*: `on-tool-call` honors no
     /// arm, so even if it returned `reopen-task` it would be classified `Fault`, exactly
@@ -4066,6 +4343,243 @@ artifacts:
                 honors_reopen,
                 *event == "on-task-end",
                 "{event} honoring reopen-task must be exactly on-task-end"
+            );
+        }
+    }
+
+    // ---- task-start-event: the new u64 fields, and the seed-context arm ----
+
+    /// An `on-task-start` double that checks what it was handed and reports back with an
+    /// arm the event does not honor.
+    ///
+    /// It traps unless the `context-window` it received equals `expect_window`, so a test
+    /// asserting "no log line" is asserting the guest saw the host's real number rather
+    /// than merely that the call completed. `arm_disc` selects the returned `hook-output`
+    /// case: `0` = `none`, `5` = `seed-context([one message])`.
+    ///
+    /// `on-task-start`'s flat params are the canonical lowering of the 7-field
+    /// `task-start-event`: three `string`s (6 i32) then `input-bytes`, `budget-tokens`,
+    /// `context-window`, `prior-tokens` (4 i64).
+    ///
+    /// Return area at 128: `result` discriminant `0` (ok); `hook-output` discriminant at
+    /// 132; the `list<message>` `(ptr,len)` = `(160,1)` at 136/140. The one `message`
+    /// occupies 160..200 — `role` ptr/len at 160/164, `content` ptr/len at 168/172, and
+    /// the two `option<string>` discriminants at 176 and 188, both `0` (`none`).
+    fn hook_task_start_double(
+        engine: &wasmtime::Engine,
+        expect_window: u64,
+        arm_disc: i32,
+    ) -> Component {
+        let stubs = REQUIRED_HOOK_FNS
+            .iter()
+            .map(|n| format!("    (export \"{n}\" (func $noop))"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let iface = LIFECYCLE_IFACE;
+        let wat = format!(
+            r#"(component
+  (core module $m
+    (memory (export "memory") 1)
+    (data (i32.const 300) "user")
+    (data (i32.const 320) "seed")
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
+    (func (export "ontaskstart")
+      (param $tid-ptr i32) (param $tid-len i32)
+      (param $cid-ptr i32) (param $cid-len i32)
+      (param $src-ptr i32) (param $src-len i32)
+      (param $input-bytes i64) (param $budget i64)
+      (param $window i64) (param $prior i64)
+      (result i32)
+      (if (i64.ne (local.get $window) (i64.const {expect_window})) (then unreachable))
+      (i32.store (i32.const 128) (i32.const 0))
+      (i32.store (i32.const 132) (i32.const {arm_disc}))
+      (i32.store (i32.const 136) (i32.const 160))
+      (i32.store (i32.const 140) (i32.const 1))
+      (i32.store (i32.const 160) (i32.const 300))
+      (i32.store (i32.const 164) (i32.const 4))
+      (i32.store (i32.const 168) (i32.const 320))
+      (i32.store (i32.const 172) (i32.const 4))
+      (i32.store (i32.const 176) (i32.const 0))
+      (i32.store (i32.const 188) (i32.const 0))
+      (i32.const 128))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m))
+  (alias core export $i "memory" (core memory $mem))
+  (alias core export $i "realloc" (core func $realloc))
+
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+  (type $hook-output (variant
+    (case "none")
+    (case "replace-context" (list $message))
+    (case "write-manifests" (list $tool-manifest))
+    (case "artifact" string)
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
+  (type $task-start-event (record
+    (field "task-id" string)
+    (field "context-id" string)
+    (field "source" string)
+    (field "input-bytes" u64)
+    (field "budget-tokens" u64)
+    (field "context-window" u64)
+    (field "prior-tokens" u64)))
+  (type $ft (func (param "event" $task-start-event) (result (result $hook-output (error string)))))
+
+  (func $ts (type $ft)
+    (canon lift (core func $i "ontaskstart") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "task-start-event" (type $task-start-event))
+    (export "on-task-start" (func $ts))
+{stubs}
+  )
+  (export "{iface}" (instance $lc))
+)"#
+        );
+        let bytes = wat::parse_str(&wat).expect("task-start component WAT parses");
+        Component::new(engine, &bytes).expect("task-start component double compiles")
+    }
+
+    /// Dispatch one `on-task-start` to `double` under the name `starter`, with
+    /// `context_window` on the event, and hand back the buffered dispatch faults.
+    async fn dispatch_task_start_against(
+        session: &Path,
+        accessible: &Path,
+        engine: &wasmtime::Engine,
+        double: Component,
+        context_window: u64,
+    ) -> Vec<DispatchFault> {
+        let mut hooks = new_with_hooks(
+            engine,
+            session,
+            accessible,
+            vec![staged_double_named(
+                "starter",
+                HookBinding::OnTaskStart,
+                double,
+            )],
+        )
+        .await
+        .expect("task-start double instantiates");
+        hooks
+            .emit(
+                session,
+                HookEvent::TaskStart {
+                    task_id: "tsk_1".to_string(),
+                    context_id: "ctx_1".to_string(),
+                    source: "task_md".to_string(),
+                    input_bytes: 12,
+                    budget_tokens: 0,
+                    context_window,
+                    prior_tokens: 0,
+                },
+            )
+            .await;
+        hooks.drain_dispatch_faults()
+    }
+
+    /// Invariant: the `context-window` a hook sees at `on-task-start` is the number the
+    /// host put on the event. The double traps on any other value, so an empty log is
+    /// the assertion.
+    #[test]
+    fn on_task_start_carries_the_context_window_to_the_guest() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let faults = rt.block_on(dispatch_task_start_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_task_start_double(&engine, 200_000, 0),
+            200_000,
+        ));
+
+        assert!(faults.is_empty(), "none is silent from every event");
+        assert_eq!(
+            hook_log_lines(session.path(), "starter"),
+            0,
+            "the guest must receive the exact context-window the host sent"
+        );
+    }
+
+    /// A capsule with no `context:` block sends `0`, and the guest sees `0` — not a
+    /// stale value and not an absent field.
+    #[test]
+    fn on_task_start_carries_a_zero_context_window_when_the_manifest_declares_none() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let faults = rt.block_on(dispatch_task_start_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_task_start_double(&engine, 0, 0),
+            0,
+        ));
+
+        assert!(faults.is_empty());
+        assert_eq!(hook_log_lines(session.path(), "starter"), 0);
+    }
+
+    /// Invariant: `seed-context` is a linkable arm no event honors. A hook returning it
+    /// from `on-task-start` instantiates, is dispatched, and its return lifts cleanly —
+    /// the failure mode this bump must not produce is a link or type error. What it does
+    /// produce is the ordinary unsupported-arm fault: one log line and one
+    /// `hook_dispatch_error` naming the arm.
+    #[test]
+    fn seed_context_from_on_task_start_is_an_unsupported_arm_fault() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let faults = rt.block_on(dispatch_task_start_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_task_start_double(&engine, 0, 5),
+            0,
+        ));
+
+        assert_eq!(faults.len(), 1, "exactly one fault: {faults:?}");
+        assert_eq!(faults[0].hook_name, "starter");
+        assert_eq!(faults[0].event, "on-task-start");
+        assert_eq!(faults[0].arm, "seed-context");
+        assert_eq!(
+            hook_log_lines(session.path(), "starter"),
+            1,
+            "the fault must also reach logs/hook-starter.log"
+        );
+        assert!(
+            hook_log_text(session.path(), "starter").contains("seed-context"),
+            "the log line must name the discarded arm"
+        );
+    }
+
+    /// No lifecycle event honors `seed-context`, which is what makes the arm inert in
+    /// this bump. Reads the honored-arm table directly, so adding an entry that honors
+    /// it fails here rather than in whichever dispatch test happens to cover it.
+    #[test]
+    fn no_event_honors_seed_context() {
+        for (event, arm) in HONORED_OUTPUT_ARM {
+            assert_ne!(
+                *arm,
+                Some("seed-context"),
+                "{event} must not honor seed-context"
             );
         }
     }
@@ -4098,14 +4612,19 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $stage-event (record (field "shell-allow" (list string))))
   (type $ft (func (param "event" $stage-event) (result (result $hook-output (error string)))))
 
@@ -4301,6 +4820,8 @@ artifacts:
                     vec![Message {
                         role: "user".to_string(),
                         content: "hello".to_string(),
+                        id: None,
+                        source_id: None,
                     }],
                     1234,
                     0.98,
@@ -4617,14 +5138,19 @@ artifacts:
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
@@ -4830,14 +5356,19 @@ artifacts:
   )
   (core instance $i (instantiate $m (with "host" (instance $imports))))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
@@ -5250,6 +5781,8 @@ artifacts:
                     vec![Message {
                         role: "user".to_string(),
                         content: "hello".to_string(),
+                        id: None,
+                        source_id: None,
                     }],
                     1234,
                     0.98,
