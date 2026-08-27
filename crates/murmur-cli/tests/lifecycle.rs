@@ -297,6 +297,7 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
                 received_count, 2,
                 "trace should record 2 a2a_task_received events; got:\n{trace}"
             );
+            assert_one_session_frame_over_two_tasks(&trace);
             break;
         }
         assert!(
@@ -309,6 +310,65 @@ fn lifecycle_queue_sleep_processes_two_tasks() {
 
     // The capsule is still alive (queue+sleep). Drop the join handle without waiting.
     drop(handle);
+}
+
+/// One launch, two queued tasks, one session frame: the `session_start` line precedes both
+/// tasks and is the `parent_id` both `task_start` lines name. This capsule is `queue`+`sleep`
+/// and never exits on its own, so nothing is asserted about `session_end` beyond it not having
+/// closed the frame before the second task did.
+fn assert_one_session_frame_over_two_tasks(trace: &str) {
+    let events: Vec<serde_json::Value> = trace
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every trace line must be valid JSON"))
+        .collect();
+
+    let starts: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == "session_start")
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "a launch handling two tasks writes exactly one session_start; got:\n{trace}"
+    );
+    let session_node = starts[0]["event_id"].as_str().unwrap();
+
+    let start_index = events
+        .iter()
+        .position(|e| e["event_type"] == "session_start")
+        .unwrap();
+    let task_starts: Vec<(usize, &serde_json::Value)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["event_type"] == "task_start")
+        .collect();
+    assert_eq!(task_starts.len(), 2, "both tasks must write task_start");
+    for (i, ts) in &task_starts {
+        assert!(
+            start_index < *i,
+            "session_start must precede every task_start"
+        );
+        assert_eq!(
+            ts["parent_id"], session_node,
+            "each task_start must parent to the session node"
+        );
+    }
+    assert_ne!(
+        task_starts[0].1["task_id"], task_starts[1].1["task_id"],
+        "the two tasks must carry distinct task_ids"
+    );
+
+    let last_task_end = events
+        .iter()
+        .rposition(|e| e["event_type"] == "task_end")
+        .unwrap();
+    if let Some(end_index) = events.iter().position(|e| e["event_type"] == "session_end") {
+        assert!(
+            end_index > last_task_end,
+            "session_end must not close the frame before the second task_end"
+        );
+    }
 }
 
 /// LifecycleOverride forces task_acceptance: none regardless of manifest default.

@@ -56,7 +56,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::UNTRUSTED_CONTENT_NOTICE,
+    agent::{AgentLoopExit, UNTRUSTED_CONTENT_NOTICE},
     errors::RuntimeError,
     hooks::{HookEvent, HookRuntime},
     murmur_md::MURMUR_MD_TRUST_NOTICE,
@@ -282,7 +282,7 @@ pub(crate) async fn run_process_inference_loop(
     accessible_workdir: &Path,
     _name: &str,
     _version: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<AgentLoopExit, RuntimeError> {
     let command_name = inference
         .command
         .as_deref()
@@ -298,19 +298,9 @@ pub(crate) async fn run_process_inference_loop(
     let inventory = build_tool_inventory(workdir, inference.system_prompt_artifact.as_deref());
     let bridge = claude_bridge::bind_bridge(BRIDGE_BIND_ADDR, &inventory).await;
 
-    // on-session-start / on-session-end hook dispatch fires once per launch from
-    // runtime.rs (around the task loop), not per task here. The trace's own
-    // session_start/session_end markers remain per task.
-    // Declare the bridge-exposed tools so `mur trace show` reflects them (process transport
-    // used to always record an empty tool set); empty when no tools are declared.
-    let tools_declared: Vec<String> = inventory
-        .iter()
-        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    trace
-        .write_session_start(max_turns, tools_declared)
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    // The trace's `session_start`/`session_end` frame and the `on-session-start`/
+    // `on-session-end` hook dispatch both fire once per launch, from runtime.rs around the
+    // task loop. This function runs one attempt of one task and writes neither.
     otel.begin_session(None);
 
     // Same fix as the http-transport path in agent.rs: task.md lives in accessible_workdir
@@ -452,7 +442,6 @@ pub(crate) async fn run_process_inference_loop(
 
     match result {
         Err(_elapsed) => {
-            let _ = trace.write_session_end("failed").await;
             otel.emit_session_end("failed").await;
             Err(RuntimeError::AgentLoopFailed(format!(
                 "inference subprocess timed out after {PROCESS_TIMEOUT_SECS}s{}",
@@ -530,7 +519,7 @@ async fn read_process_output(
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
     stderr_buf: &Arc<Mutex<String>>,
-) -> Result<(), RuntimeError> {
+) -> Result<AgentLoopExit, RuntimeError> {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let mut lines = BufReader::new(stdout).lines();
 
@@ -580,7 +569,6 @@ async fn read_process_output(
 
                 turns += 1;
                 if turns > max_turns {
-                    let _ = trace.write_session_end("failed").await;
                     otel.emit_session_end("failed").await;
                     return Err(RuntimeError::AgentLoopFailed(format!(
                         "max_turns ({max_turns}) exceeded"
@@ -703,6 +691,7 @@ async fn read_process_output(
                             .write_tool_call(
                                 pending.turn,
                                 pending.name.clone(),
+                                Some(id.to_string()),
                                 pending.input.clone(),
                                 pending.input_bytes,
                                 &output,
@@ -746,7 +735,6 @@ async fn read_process_output(
                         .get("result")
                         .and_then(Value::as_str)
                         .unwrap_or(subtype);
-                    let _ = trace.write_session_end("failed").await;
                     otel.emit_session_end("failed").await;
                     return Err(RuntimeError::AgentLoopFailed(format!(
                         "claude returned error: {err_msg}"
@@ -761,7 +749,6 @@ async fn read_process_output(
     }
 
     if !found_result {
-        let _ = trace.write_session_end("failed").await;
         otel.emit_session_end("failed").await;
         return Err(RuntimeError::AgentLoopFailed(format!(
             "inference subprocess closed stdout without producing a result{}",
@@ -771,10 +758,9 @@ async fn read_process_output(
 
     super::record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
 
-    let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
 
-    Ok(())
+    Ok(AgentLoopExit::Ok)
 }
 
 /// Read and process `codex exec --json` events (the codex dialect of the process transport).
@@ -793,7 +779,7 @@ async fn read_codex_output(
     trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
     stderr_buf: &Arc<Mutex<String>>,
-) -> Result<(), RuntimeError> {
+) -> Result<AgentLoopExit, RuntimeError> {
     let stdout = child.stdout.take().expect("stdout should be piped");
     let mut lines = BufReader::new(stdout).lines();
 
@@ -826,7 +812,7 @@ async fn read_codex_output(
                     "agent_message" => {
                         turns += 1;
                         if turns > max_turns {
-                            return codex_max_turns_error(max_turns, trace, otel).await;
+                            return codex_max_turns_error(max_turns, otel).await;
                         }
                         result_text = item
                             .get("text")
@@ -842,7 +828,7 @@ async fn read_codex_output(
                     "mcp_tool_call" => {
                         turns += 1;
                         if turns > max_turns {
-                            return codex_max_turns_error(max_turns, trace, otel).await;
+                            return codex_max_turns_error(max_turns, otel).await;
                         }
                         let tool_name = item
                             .get("tool")
@@ -884,6 +870,9 @@ async fn read_codex_output(
                             .write_tool_call(
                                 turns - 1,
                                 tool_name.clone(),
+                                // codex reports each `mcp_tool_call` item inline, call and
+                                // result together, and names no id for the pair.
+                                None,
                                 input,
                                 input_bytes,
                                 &output,
@@ -922,6 +911,7 @@ async fn read_codex_output(
                             .write_tool_call(
                                 turns.saturating_sub(1),
                                 format!("codex-shell: {cmd}"),
+                                None,
                                 json!({}),
                                 0,
                                 "",
@@ -947,7 +937,6 @@ async fn read_codex_output(
                     .and_then(Value::as_str)
                     .or_else(|| event.get("message").and_then(Value::as_str))
                     .unwrap_or("codex turn failed");
-                let _ = trace.write_session_end("failed").await;
                 otel.emit_session_end("failed").await;
                 return Err(RuntimeError::AgentLoopFailed(format!(
                     "codex returned error: {msg}{}",
@@ -959,7 +948,6 @@ async fn read_codex_output(
     }
 
     if !found_result {
-        let _ = trace.write_session_end("failed").await;
         otel.emit_session_end("failed").await;
         return Err(RuntimeError::AgentLoopFailed(format!(
             "inference subprocess closed stdout without producing a result{}",
@@ -968,18 +956,15 @@ async fn read_codex_output(
     }
 
     super::record_result(hooks, workdir, &result_text).map_err(RuntimeError::AgentLoopFailed)?;
-    let _ = trace.write_session_end("ok").await;
     otel.emit_session_end("ok").await;
-    Ok(())
+    Ok(AgentLoopExit::Ok)
 }
 
 /// Shared max-turns failure path for the codex reader.
 async fn codex_max_turns_error(
     max_turns: u32,
-    trace: &mut TraceWriter,
     otel: &mut OtelEmitter,
-) -> Result<(), RuntimeError> {
-    let _ = trace.write_session_end("failed").await;
+) -> Result<AgentLoopExit, RuntimeError> {
     otel.emit_session_end("failed").await;
     Err(RuntimeError::AgentLoopFailed(format!(
         "max_turns ({max_turns}) exceeded"

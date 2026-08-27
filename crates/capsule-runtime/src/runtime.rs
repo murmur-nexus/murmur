@@ -35,7 +35,7 @@ use wasmtime_wasi_http::{
 
 use crate::{
     a2a::{IncomingTask, TaskRegistry, TaskState},
-    agent,
+    agent::{self, AgentLoopExit},
     artifact::{extract_manifest_yaml, extract_native_binary, extract_root_wasm, extract_skill_md},
     artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::host::murmur::{
@@ -148,7 +148,7 @@ async fn run_task_with_reopens(
     mode: ConversationMode,
     context_id: Option<String>,
     trace_task_id: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<AgentLoopExit, RuntimeError> {
     let task_md_path = accessible_workdir.join("task.md");
     // Original task content, captured once before any feedback is appended, so repeated
     // reopens re-inject a fresh copy of every feedback item rather than compounding.
@@ -196,7 +196,13 @@ async fn run_task_with_reopens(
         )
         .await;
 
-        let exit_str = if result.is_ok() { "ok" } else { "failed" };
+        // The attempt's own terminal outcome, not a coarse ok/failed: an agent loop that
+        // burned its turn budget reports `max_turns_reached`, and this is the only record
+        // that keeps it.
+        let exit_str = match &result {
+            Ok(exit) => exit.as_str(),
+            Err(_) => "failed",
+        };
 
         // Let the `on-task-end` hooks inspect this attempt and decide whether to reopen.
         let reopen = hooks
@@ -1114,6 +1120,26 @@ pub fn launch_session(
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
 
+            // The session frame is written once per launch, around the task loop, so it frames
+            // the `on-session-start`/`on-session-end` hook pair rather than nesting inside each
+            // task the way the per-attempt marker used to. It goes in before anything else can
+            // write to the file: `session_start`'s `event_id` is the root of the trace's event
+            // tree, and the resource plane — opened next, and served concurrently from the
+            // moment the listener accepts — names that id as its `parent_id` on every line.
+            //
+            // Both transports derive `tools_declared` from this same inventory, so one call
+            // site serves both.
+            let tools_declared: Vec<String> =
+                agent::inventory::build_tool_inventory(&workdir, inference.system_prompt_artifact.as_deref())
+                    .iter()
+                    .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
+                    .map(str::to_string)
+                    .collect();
+            trace
+                .write_session_start(inference.max_turns, tools_declared)
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+
             // A second handle to the same trace.jsonl, not a borrow of the writer above: the
             // motivating read happens after `session_end`, when the agent loop's writer is gone.
             // A trace that cannot be opened must not make the plane unserveable — the read is
@@ -1121,6 +1147,7 @@ pub fn launch_session(
             let resource_trace = crate::trace::ResourceTraceAppender::open(
                 &workdir,
                 session_id.clone(),
+                trace.session_event_id().to_string(),
             )
             .await
             .ok()
@@ -1296,7 +1323,7 @@ pub fn launch_session(
                     // session boundary that the per-task on-task-start events nest inside.
                     hooks.emit(&workdir, HookEvent::SessionStart).await;
 
-                    let final_loop_result: Result<(), RuntimeError>;
+                    let final_loop_result: Result<AgentLoopExit, RuntimeError>;
 
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
                     // Each iteration processes one task. Single/none modes break after
@@ -1357,7 +1384,7 @@ pub fn launch_session(
                                     final_loop_result = result;
                                     break 'task_loop;
                                 } else {
-                                    final_loop_result = Ok(());
+                                    final_loop_result = Ok(AgentLoopExit::Ok);
                                     break 'task_loop;
                                 }
                             }
@@ -1430,7 +1457,7 @@ pub fn launch_session(
                                     match task_rx.recv().await {
                                         Some(task) => task,
                                         None => {
-                                            final_loop_result = Ok(());
+                                            final_loop_result = Ok(AgentLoopExit::Ok);
                                             break 'task_loop;
                                         }
                                     }
@@ -1448,7 +1475,7 @@ pub fn launch_session(
                                     {
                                         Ok(Some(task)) => task,
                                         Ok(None) => {
-                                            final_loop_result = Ok(());
+                                            final_loop_result = Ok(AgentLoopExit::Ok);
                                             break 'task_loop;
                                         }
                                         Err(_elapsed) => {
@@ -1588,10 +1615,14 @@ pub fn launch_session(
 
                     // on-session-end fires ONCE per launch, after the task loop exits.
                     // total_turns is the whole-launch aggregate accumulated by HookRuntime
-                    // (one per Inference event across every task), and exit_status reflects
-                    // the loop's final result.
-                    let session_exit_status =
-                        if final_loop_result.is_ok() { "ok" } else { "failed" };
+                    // (one per Inference event across every task). exit_status is the last
+                    // agent loop's own terminal outcome, so a launch that ended on a driver
+                    // error or a spent turn budget says so rather than reading `"ok"` because
+                    // the runtime kept the session alive to report it.
+                    let session_exit_status = match &final_loop_result {
+                        Ok(exit) => exit.as_str(),
+                        Err(_) => "failed",
+                    };
                     let session_total_turns = hooks.total_turns();
                     hooks
                         .emit(
@@ -1611,7 +1642,9 @@ pub fn launch_session(
                     // fault, which is why this runs *before* the flush below.
                     hooks.drain_async_hooks().await;
                     agent::flush_hook_dispatch_faults(&mut hooks, &mut trace).await;
-                    let _ = trace.write_session_end_if_not_ended("failed").await;
+                    let _ = trace
+                        .write_session_end_if_not_ended(session_exit_status)
+                        .await;
                     otel.emit_session_end_if_not_ended("failed").await;
                     trace.flush().await.map_err(|e| {
                         RuntimeError::AgentLoopFailed(format!("failed to flush trace: {e}"))
@@ -1621,7 +1654,7 @@ pub fn launch_session(
                     let _ = shutdown_tx.send(());
                     let _ = server_handle.await;
 
-                    final_loop_result
+                    final_loop_result.map(|_| ())
                 })
                 .await
         });
@@ -6817,7 +6850,7 @@ mod tests {
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        (result, events)
+        (result.map(|_| ()), events)
     }
 
     // ── murmur:task-io/read end to end ────────────────────────────────────────
@@ -7018,7 +7051,7 @@ mod tests {
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        (result, events)
+        (result.map(|_| ()), events)
     }
 
     /// The fields both transports share in [`run_task_io_scenario`].

@@ -112,6 +112,43 @@ const FIXTURE_NO_TOOLS: &str = concat!(
     "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":200,\"exit_status\":\"ok\"}\n"
 );
 
+// A launch written by the current runtime: one session frame around one task, every line
+// identified and parented, and a compaction the threshold tripped but nothing serviced.
+const FIXTURE_DECLINED: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5000,",
+    "\"capsule_name\":\"declining-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[]}\n",
+
+    "{\"event_type\":\"task_start\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000002\",",
+    "\"parent_id\":\"evt_dddddddddddd4ddd8ddd000000000001\",",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5010,",
+    "\"task_id\":\"tsk_1\",\"context_id\":\"ctx_1\",\"source\":\"task_md\",\"message_parts_bytes\":8}\n",
+
+    "{\"event_type\":\"inference\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000003\",",
+    "\"parent_id\":\"evt_dddddddddddd4ddd8ddd000000000002\",",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5020,",
+    "\"turn\":1,\"task_id\":\"tsk_1\",\"input_tokens\":5000,\"output_tokens\":100,",
+    "\"decision\":\"end_turn\",\"tool_name\":null}\n",
+
+    "{\"event_type\":\"compaction_declined\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000004\",",
+    "\"parent_id\":\"evt_dddddddddddd4ddd8ddd000000000003\",",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5030,",
+    "\"turn\":1,\"task_id\":\"tsk_1\",\"tokens\":5000,\"reason\":\"no_hook_replacement\"}\n",
+
+    "{\"event_type\":\"task_end\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000005\",",
+    "\"parent_id\":\"evt_dddddddddddd4ddd8ddd000000000002\",",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5040,",
+    "\"task_id\":\"tsk_1\",\"exit_status\":\"ok\",\"duration_ms\":30,\"turns\":1,",
+    "\"input_tokens\":5000,\"output_tokens\":100,\"tool_calls\":0,\"shell_calls\":0,\"reopen_count\":0}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000006\",",
+    "\"parent_id\":\"evt_dddddddddddd4ddd8ddd000000000001\",",
+    "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5050,",
+    "\"total_turns\":1,\"total_input_tokens\":5000,\"total_output_tokens\":100,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":50,\"exit_status\":\"ok\"}\n"
+);
+
 fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, content).unwrap();
@@ -188,6 +225,25 @@ fn show_compaction_appears_with_turn_and_token_counts() {
         .stdout(predicate::str::contains("turn 3"))
         .stdout(predicate::str::contains("5,300")) // tokens_before
         .stdout(predicate::str::contains("2,000")); // tokens_after
+}
+
+/// A declined compaction is listed under the same heading as a fired one, with its turn and
+/// reason — a session that ran on over budget must not read as one that never needed
+/// compacting.
+#[test]
+fn show_lists_declined_compactions_with_turn_and_reason() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "declined.jsonl", FIXTURE_DECLINED);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Compaction"))
+        .stdout(predicate::str::contains("declined"))
+        .stdout(predicate::str::contains("turn 1"))
+        .stdout(predicate::str::contains("no_hook_replacement"))
+        .stdout(predicate::str::contains("5,000"));
 }
 
 #[test]

@@ -11,18 +11,44 @@ Every agent session produces a structured trace at `workdir/<session_id>/trace.j
 runtime writes it directly: a capsule that declares no hook artifacts still produces one, and
 nothing the capsule does can suppress or rewrite it.
 
-**Format:** one JSON object per line (JSONL), UTF-8, line-terminated. Every line carries
-`event_type` (discriminator), `session_id` (identical on every line in a session, and the name of
-the session directory) and `timestamp` (Unix milliseconds).
+**Format:** one JSON object per line (JSONL), UTF-8, line-terminated. Every line carries these
+five fields, in this order, before its own payload:
 
-**`session_start`** — written before the first inference call of an agent-loop attempt
+| Field | Type | Notes |
+|---|---|---|
+| `event_type` | string | Discriminator |
+| `event_id` | string | `evt_` followed by a UUID v7 in undashed lowercase hex. Unique within the file, and unique across files: an id is minted at the moment the line is written and never reused, derived from content, or reconstructed. Ids sort by mint time and carry their own millisecond timestamp |
+| `parent_id` | string \| null | The `event_id` of the event this one hangs off. Always present; `null` only on `session_start` |
+| `session_id` | string | Identical on every line in a session, and the name of the session directory |
+| `timestamp` | u64 | Unix milliseconds |
+
+**The event tree.** `parent_id` makes the file walkable: every non-null `parent_id` names an
+`event_id` that appears earlier in the same file, and following them upward from any line
+terminates at `session_start`. The tree is session → task → turn → the turn's own events:
+
+| Event | Parents to |
+|---|---|
+| `session_start` | Nothing — its `event_id` is the session node |
+| `task_start` | The session node. Its `event_id` is the task node |
+| `task_end`, `task_reopened` | The task node |
+| `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
+| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
+
+A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
+a file that has no session frame — writes `parent_id: null` on every line, rather than naming a
+parent that has no line behind it.
+
+**`session_start`** — written once per launch, before the `on-session-start` hooks fire and
+before the first task begins
 
 | Field | Type | Notes |
 |---|---|---|
 | `capsule_name` | string | Manifest `name` |
 | `capsule_version` | string | Manifest `version` |
 | `model` | string | `inference.model` |
-| `max_turns` | u32 | Turns this attempt may spend: `inference.max_turns`, less whatever earlier attempts of a reopened task already spent |
+| `max_turns` | u32 | `inference.max_turns` — the turn ceiling each task of this launch runs under |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
@@ -39,6 +65,7 @@ the session directory) and `timestamp` (Unix milliseconds).
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | Zero-based turn index |
+| `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
 | `input_tokens` | u64 | The runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before the request was sent. This is the number the compaction threshold and the session totals run on |
 | `output_tokens` | u64 | The runtime's own tiktoken estimate of the driver response |
 | `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` |
@@ -61,7 +88,9 @@ runtime does with it.
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | |
+| `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
 | `tool_name` | string | |
+| `tool_call_id` | string \| null | The provider's own id for this call, recorded verbatim and never parsed. It is what pairs this line with the tool-result message the runtime sent back. `null` when the provider named none |
 | `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
 | `output` | string | The tool output text. Written only when the manifest sets `trace.include_tool_output: true` (default `false`) |
@@ -76,6 +105,7 @@ runtime does with it.
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | |
+| `task_id` | string \| null | The task this call belongs to. `null` when no task is in scope |
 | `skill_name` | string | |
 | `output_bytes` | u64 | Byte length of the returned `skill.md` text |
 | `duration_ms` | u64 | |
@@ -89,6 +119,7 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | |
+| `task_id` | string \| null | The task this command belongs to. `null` when no task is in scope |
 | `binary` | string | The program that ran — canonicalized absolute path when the invoked name resolved against the host `PATH` (e.g. `/usr/bin/pytest`), else the bare invoked name |
 | `command` | string | The argument list alone; for a shell interpreter, the script text passed via `-c`. Read `binary` to know what ran |
 | `exit_code` | i32 | Non-zero is data, not an error |
@@ -102,6 +133,7 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 | Field | Type | Notes |
 |---|---|---|
 | `turn` | u32 | |
+| `task_id` | string \| null | The task this compaction belongs to. `null` when no task is in scope |
 | `tokens_before` | u64 | Context occupancy before the replacement |
 | `tokens_after` | u64 | Context occupancy after it |
 
@@ -110,7 +142,22 @@ payload — system prompt, tool inventory and the complete `messages` array — 
 consumes the provider's context window. `tokens_before` is the same number the turn's
 `input_tokens` carries.
 
-**`session_end`** — written on every exit path of an agent-loop attempt
+**`compaction_declined`** — written when the compaction threshold is crossed and the context is
+left as it was
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn that crossed the threshold |
+| `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
+| `tokens` | u64 | Context occupancy at the moment of the decline — the same measurement `compaction` records as `tokens_before`, and the budget the session went on running over |
+| `reason` | string | `"no_hook_replacement"` when no bound hook returned `replace-context`; `"unresolved_tool_call"` when a hook's replacement was discarded because its tool calls and tool results did not pair up |
+
+The session continues over budget on both. Each decline is also written to
+`workdir/logs/bootstrap.log`. A trace can hold any number of them, and a `compaction_declined` on
+one turn does not stop a later turn from compacting successfully.
+
+**`session_end`** — written once per launch, after the `on-session-end` hooks fire and the task
+loop has exited, on every exit path
 
 | Field | Type | Notes |
 |---|---|---|
@@ -120,7 +167,7 @@ consumes the provider's context window. `tokens_before` is the same number the t
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` — the last task's own terminal outcome |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -276,21 +323,26 @@ replaced with `<handle:<handle_id>>`.
 **Guarantees:**
 
 - `trace.jsonl` exists after any capsule session, regardless of exit cause.
-- Each task writes one `task_start`/`task_end` pair, with one `session_start`/`session_end` pair
-  per agent-loop attempt nested inside it. A task an `on-task-end` hook reopens produces one such
-  pair per attempt.
-- `session_id` is identical on every line.
+- One `session_start`/`session_end` pair per launch, framing every task. A launch that handles
+  three queued tasks writes one pair and three `task_start`/`task_end` pairs inside it.
+- Each task writes one `task_start`/`task_end` pair, however many agent-loop attempts an
+  `on-task-end` hook reopened it for.
+- `session_id` is identical on every line, and `event_id` is distinct on every line.
+- Every non-null `parent_id` names an `event_id` written earlier in the same file.
 - Count fields in the last `session_end` are cumulative across every task and attempt in the
   session, and equal the sum of the corresponding per-task fields on every `task_end`.
 
 **Non-obvious behaviour:**
 
 - A trace write that fails ends the session with `E-RUN-007` (see [Diagnostics](diagnostics.md)).
-  The one exception is the `compaction` event: that failure is logged to
+  The exceptions are `compaction` and `compaction_declined`: that failure is logged to
   `workdir/logs/bootstrap.log` and the session continues.
-- When the agent loop fails before `session_start` is written (a missing driver artifact, for
+- When the launch fails before `session_start` is written (a missing driver artifact, for
   example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
   started.
+- A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"` or
+  `"max_turns_reached"` on a task the runtime survived and reported on. The launch's own
+  `session_end` carries the last task's outcome the same way.
 
 ---
 

@@ -41,8 +41,20 @@ pub(crate) struct TraceWriter {
     /// omits the field from `session_start` entirely.
     system_prompt: Option<String>,
     session_start_time: Instant,
+    /// The session node of the event tree: the `event_id` `session_start` carries, and the
+    /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
+    /// at write time so [`ResourceTraceAppender`], which is opened before the frame is written,
+    /// can be handed the same value.
+    session_event_id: String,
     session_started: bool,
     session_ended: bool,
+    /// The task node: the `event_id` of the active task's `task_start`. Set by
+    /// [`Self::write_task_start`], cleared by [`Self::write_task_end`], `None` between tasks.
+    task_event_id: Option<String>,
+    /// The turn node: the `event_id` of the active turn's own agent-loop `inference`. Every
+    /// event a turn produces hangs off it. Cleared at both task boundaries so a new task never
+    /// parents its first events to the previous task's last turn.
+    turn_event_id: Option<String>,
     // Running totals — updated as events are written, used for fallback session_end on error exit
     total_turns: u32,
     total_input_tokens: u64,
@@ -71,11 +83,43 @@ pub(crate) struct InferenceOrigin {
     pub(crate) model: String,
 }
 
+/// `compaction_declined.reason` when the threshold was crossed but no bound hook returned
+/// `replace-context`.
+pub(crate) const COMPACTION_DECLINED_NO_HOOK_REPLACEMENT: &str = "no_hook_replacement";
+
+/// `compaction_declined.reason` when a hook's replacement was rejected because its tool calls
+/// and tool results did not pair up.
+pub(crate) const COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL: &str = "unresolved_tool_call";
+
+/// Mint one event identity: `evt_` + a UUID v7 in simple form, the same scheme `ses_`, `tsk_`,
+/// `ctx_`, `dep_` and `req_` use. Ids therefore sort by mint time and carry their own
+/// millisecond timestamp, so a trace can be ordered and time-bounded without reading any
+/// payload field.
+///
+/// Called once per line at the moment of the write. An id is never reused, never derived from
+/// the event's content, and never reconstructed from anything else in the file.
+fn new_event_id() -> String {
+    format!("evt_{}", uuid::Uuid::now_v7().simple())
+}
+
 // ── Event structs (Serialize → JSONL lines) ──────────────────────────────────
+//
+// Every struct opens with `event_type`, `event_id`, `parent_id`, `session_id` and `timestamp`,
+// in that order, so a human scanning the file reads a line's identity before its payload.
+// `parent_id` is the `event_id` of the event this one hangs off — see [`TraceWriter`]'s
+// `session_parent`/`task_parent`/`turn_parent` for which node each event names, and
+// [`new_event_id`] for the id format.
+//
+// The turn-level events (`inference`, `tool_call`, `skill_call`, `shell`, `compaction`,
+// `compaction_declined`) additionally carry `task_id`, taken from the writer's active task and
+// always written — `null` when no task is in scope. `task_start`/`task_end` carry their own and
+// are not duplicated.
 
 #[derive(Serialize)]
 struct SessionStartEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     capsule_name: String,
@@ -142,9 +186,12 @@ struct SessionStartEvent {
 #[derive(Serialize)]
 struct InferenceEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     turn: u32,
+    task_id: Option<String>,
     /// The runtime's own tiktoken estimate of the request, counted before the request was
     /// sent — not the provider's count, which arrives afterwards as `input_tokens_actual`.
     input_tokens: u64,
@@ -178,10 +225,18 @@ struct InferenceEvent {
 #[derive(Serialize)]
 struct ToolCallEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     turn: u32,
+    task_id: Option<String>,
     tool_name: String,
+    /// The provider's own id for this call, as it appeared on the driver response block that
+    /// asked for it. Recorded verbatim and never parsed — the same contract `resource_id` has.
+    /// `null` when the provider named none, which is how the codex dialect's inline tool items
+    /// and every host-synthesized call read.
+    tool_call_id: Option<String>,
     input: Value,
     input_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,9 +260,12 @@ struct ToolCallEvent {
 #[derive(Serialize)]
 struct SkillCallEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     turn: u32,
+    task_id: Option<String>,
     skill_name: String,
     output_bytes: u64,
     duration_ms: u64,
@@ -217,9 +275,12 @@ struct SkillCallEvent {
 #[derive(Serialize)]
 struct ShellEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     turn: u32,
+    task_id: Option<String>,
     /// The program that ran — a canonical absolute path when the host `PATH` resolved
     /// the invoked name, else the bare name. `command` carries the argument list alone,
     /// so this is the only field that says *what* ran.
@@ -241,16 +302,41 @@ struct ShellEvent {
 #[derive(Serialize)]
 struct CompactionEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     turn: u32,
+    task_id: Option<String>,
     tokens_before: u64,
     tokens_after: u64,
+}
+
+/// The compaction threshold was crossed and the context was left as it was. The session
+/// continues over budget, so the record of *why* is the only thing separating this from a
+/// session that never needed compacting at all.
+#[derive(Serialize)]
+struct CompactionDeclinedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    /// Context occupancy at the moment of the decline — the same measurement `compaction`
+    /// records as `tokens_before`, and the budget the session went on running over.
+    tokens: u64,
+    /// `"no_hook_replacement"` when no bound hook returned `replace-context`;
+    /// `"unresolved_tool_call"` when the replacement's tool calls and tool results did not pair.
+    reason: String,
 }
 
 #[derive(Serialize)]
 struct A2aTaskReceivedEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     task_id: String,
@@ -262,6 +348,8 @@ struct A2aTaskReceivedEvent {
 #[derive(Serialize)]
 struct A2aSendEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     peer_url: String,
@@ -274,6 +362,8 @@ struct A2aSendEvent {
 #[derive(Serialize)]
 struct SessionEndEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     total_turns: u32,
@@ -288,6 +378,8 @@ struct SessionEndEvent {
 #[derive(Serialize)]
 struct TaskStartEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     task_id: String,
@@ -299,6 +391,8 @@ struct TaskStartEvent {
 #[derive(Serialize)]
 struct TaskEndEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     task_id: String,
@@ -320,6 +414,8 @@ struct TaskEndEvent {
 #[derive(Serialize)]
 struct TaskReopenedEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     task_id: String,
@@ -334,6 +430,8 @@ struct TaskReopenedEvent {
 #[derive(Serialize)]
 struct HookDispatchErrorEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     hook_name: String,
@@ -344,6 +442,8 @@ struct HookDispatchErrorEvent {
 #[derive(Serialize)]
 struct ResourceListEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     /// `exports.files.root` verbatim, or `""` when the capsule declares no export — a refusal on
@@ -363,6 +463,8 @@ struct ResourceListEvent {
 #[derive(Serialize)]
 struct ResourceReadEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     /// The requested path *after* percent-decoding, so `%2e%2e%2f` and `../` read as the same
@@ -382,6 +484,8 @@ struct ResourceReadEvent {
 #[derive(Serialize)]
 struct PeerHandleMintEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     /// `null` on every non-`ok` outcome: a mint that was refused produced no token, so there is
@@ -402,6 +506,8 @@ struct PeerHandleMintEvent {
 #[derive(Serialize)]
 struct PeerHandleRedeemEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     handle_id: String,
@@ -425,6 +531,8 @@ struct PeerHandleRedeemEvent {
 #[derive(Serialize)]
 struct PeerFileFetchEvent {
     event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
     session_id: String,
     timestamp: u64,
     peer: String,
@@ -482,8 +590,11 @@ impl TraceWriter {
             system_prompt_sha256,
             system_prompt: include_tool_output.then_some(system_prompt).flatten(),
             session_start_time: Instant::now(),
+            session_event_id: new_event_id(),
             session_started: false,
             session_ended: false,
+            task_event_id: None,
+            turn_event_id: None,
             total_turns: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -499,6 +610,34 @@ impl TraceWriter {
         })
     }
 
+    /// The session node of this writer's event tree — the `event_id` its `session_start` will
+    /// carry, available before that line is written so [`ResourceTraceAppender`] can be opened
+    /// against the same node.
+    pub(crate) fn session_event_id(&self) -> &str {
+        &self.session_event_id
+    }
+
+    /// Parent for a launch-scoped event: the session node, or `None` on a writer that has not
+    /// written `session_start`. A trace line must never name a parent that has no line behind
+    /// it, and the script-capsule `a2a_send` drain opens a writer over a file with no session
+    /// frame at all.
+    fn session_parent(&self) -> Option<String> {
+        self.session_started.then(|| self.session_event_id.clone())
+    }
+
+    /// Parent for a task-scoped event: the task node, falling back to the session node when no
+    /// task is active.
+    fn task_parent(&self) -> Option<String> {
+        self.task_event_id.clone().or_else(|| self.session_parent())
+    }
+
+    /// Parent for a turn-scoped event: the turn node, falling back to the task node and then to
+    /// the session node. The fallbacks are what keeps a tool call written outside any turn — a
+    /// hook's, or the process transport's, before its first `inference` — attached to the tree.
+    fn turn_parent(&self) -> Option<String> {
+        self.turn_event_id.clone().or_else(|| self.task_parent())
+    }
+
     pub(crate) async fn write_session_start(
         &mut self,
         max_turns: u32,
@@ -506,6 +645,8 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = SessionStartEvent {
             event_type: "session_start",
+            event_id: self.session_event_id.clone(),
+            parent_id: None,
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             capsule_name: self.capsule_name.clone(),
@@ -542,11 +683,25 @@ impl TraceWriter {
         origin: Option<&InferenceOrigin>,
         usage: Option<&DriverUsage>,
     ) -> std::io::Result<()> {
+        let event_id = new_event_id();
+        // The agent loop's own inference *is* the turn node — there is no separate turn line —
+        // so it hangs off the task and everything the turn goes on to produce hangs off it. A
+        // hook's `run-inference` (`origin: Some(_)`) is one of those products, not a new turn.
+        let parent_id = if origin.is_none() {
+            let parent = self.task_parent();
+            self.turn_event_id = Some(event_id.clone());
+            parent
+        } else {
+            self.turn_parent()
+        };
         let event = InferenceEvent {
             event_type: "inference",
+            event_id,
+            parent_id,
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            task_id: self.active_task_id.clone(),
             input_tokens,
             output_tokens,
             decision,
@@ -573,6 +728,7 @@ impl TraceWriter {
         &mut self,
         turn: u32,
         tool_name: String,
+        tool_call_id: Option<String>,
         mut input: Value,
         input_bytes: u64,
         output: &str,
@@ -589,10 +745,16 @@ impl TraceWriter {
         crate::peer_handoff::redact_handles_in_json(&mut input);
         let event = ToolCallEvent {
             event_type: "tool_call",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            task_id: self.active_task_id.clone(),
             tool_name,
+            // An absent or empty provider id records as `null`: `""` would read as an id the
+            // provider actually issued.
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()),
             input,
             input_bytes,
             output: self
@@ -622,9 +784,12 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = SkillCallEvent {
             event_type: "skill_call",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            task_id: self.active_task_id.clone(),
             skill_name,
             output_bytes,
             duration_ms,
@@ -650,9 +815,12 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = ShellEvent {
             event_type: "shell",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            task_id: self.active_task_id.clone(),
             binary,
             command,
             exit_code,
@@ -676,6 +844,8 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = A2aTaskReceivedEvent {
             event_type: "a2a_task_received",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             task_id: task_id.to_string(),
@@ -696,6 +866,8 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = A2aSendEvent {
             event_type: "a2a_send",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             peer_url: peer_url.to_string(),
@@ -723,8 +895,14 @@ impl TraceWriter {
         self.task_start_instant = Some(Instant::now());
         self.active_task_id = Some(task_id.to_string());
 
+        let event_id = new_event_id();
+        self.task_event_id = Some(event_id.clone());
+        self.turn_event_id = None;
+
         let event = TaskStartEvent {
             event_type: "task_start",
+            event_id: event_id.clone(),
+            parent_id: self.session_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             task_id: task_id.to_string(),
@@ -749,6 +927,8 @@ impl TraceWriter {
 
         let event = TaskEndEvent {
             event_type: "task_end",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             task_id: task_id.to_string(),
@@ -762,6 +942,8 @@ impl TraceWriter {
             reopen_count,
         };
         self.active_task_id = None;
+        self.task_event_id = None;
+        self.turn_event_id = None;
         self.write_event(&event).await
     }
 
@@ -777,6 +959,8 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = TaskReopenedEvent {
             event_type: "task_reopened",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             task_id: task_id.to_string(),
@@ -803,11 +987,38 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = CompactionEvent {
             event_type: "compaction",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             turn,
+            task_id: self.active_task_id.clone(),
             tokens_before,
             tokens_after,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that compaction was attempted and declined, leaving the context over budget.
+    /// `tokens` is the occupancy at the moment of the decline; `reason` is
+    /// [`COMPACTION_DECLINED_NO_HOOK_REPLACEMENT`] or
+    /// [`COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL`].
+    pub(crate) async fn write_compaction_declined(
+        &mut self,
+        turn: u32,
+        tokens: u64,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = CompactionDeclinedEvent {
+            event_type: "compaction_declined",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            tokens,
+            reason: reason.to_string(),
         };
         self.write_event(&event).await
     }
@@ -825,6 +1036,8 @@ impl TraceWriter {
     ) -> std::io::Result<()> {
         let event = HookDispatchErrorEvent {
             event_type: "hook_dispatch_error",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             hook_name: hook_name.to_string(),
@@ -843,6 +1056,8 @@ impl TraceWriter {
             .unwrap_or(u64::MAX);
         let event = SessionEndEvent {
             event_type: "session_end",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             total_turns: self.total_turns,
@@ -907,10 +1122,19 @@ pub struct ResourceTraceAppender {
     /// Async rather than a `std::sync::Mutex`: this is held across an `await` on the write.
     file: tokio::sync::Mutex<File>,
     session_id: String,
+    /// The session node every line this appender writes hangs off — [`TraceWriter`]'s own
+    /// [`TraceWriter::session_event_id`], handed over at open time. The plane has no turn or
+    /// task of its own: a read served after `session_end` belongs to the launch, not to
+    /// whatever task happened to run last.
+    session_event_id: String,
 }
 
 impl ResourceTraceAppender {
-    pub async fn open(workdir: &Path, session_id: String) -> std::io::Result<Self> {
+    pub async fn open(
+        workdir: &Path,
+        session_id: String,
+        session_event_id: String,
+    ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -919,6 +1143,7 @@ impl ResourceTraceAppender {
         Ok(Self {
             file: tokio::sync::Mutex::new(file),
             session_id,
+            session_event_id,
         })
     }
 
@@ -938,6 +1163,8 @@ impl ResourceTraceAppender {
     ) {
         let event = ResourceListEvent {
             event_type: "resource_list",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             root: root.to_string(),
@@ -966,6 +1193,8 @@ impl ResourceTraceAppender {
     ) {
         let event = ResourceReadEvent {
             event_type: "resource_read",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             path: path.to_string(),
@@ -993,6 +1222,8 @@ impl ResourceTraceAppender {
     ) {
         let event = PeerHandleMintEvent {
             event_type: "peer_handle_mint",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             handle_id,
@@ -1021,6 +1252,8 @@ impl ResourceTraceAppender {
     ) {
         let event = PeerHandleRedeemEvent {
             event_type: "peer_handle_redeem",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             handle_id: handle_id.to_string(),
@@ -1049,6 +1282,8 @@ impl ResourceTraceAppender {
     ) {
         let event = PeerFileFetchEvent {
             event_type: "peer_file_fetch",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
             session_id: self.session_id.clone(),
             timestamp: timestamp_ms(),
             peer: peer.to_string(),
@@ -1594,6 +1829,7 @@ mod tests {
         w.write_tool_call(
             1,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "echo hi"}),
             42,
             "hi\n",
@@ -1629,6 +1865,7 @@ mod tests {
         w.write_tool_call(
             0,
             "murmur-tool-editor".to_string(),
+            None,
             serde_json::json!({"operation": "read_file", "path": "a.txt"}),
             10,
             "hi\n",
@@ -1656,6 +1893,7 @@ mod tests {
         w.write_tool_call(
             0,
             "murmur-tool-code-graph".to_string(),
+            None,
             serde_json::json!({"symbol": "Foo::bar"}),
             10,
             "hi\n",
@@ -1683,6 +1921,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "echo hi"}),
             10,
             "hi\n",
@@ -1780,6 +2019,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "ls"}),
             10,
             "file.txt\n",
@@ -1902,6 +2142,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "echo"}),
             5,
             "ok",
@@ -1967,6 +2208,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "ls -la"}),
             20,
             "total 8\n",
@@ -1994,6 +2236,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "ls"}),
             10,
             "file.txt\n",
@@ -2043,6 +2286,7 @@ mod tests {
         w.write_tool_call(
             0,
             "real-tool".to_string(),
+            None,
             serde_json::json!({}),
             2,
             "data",
@@ -2078,6 +2322,7 @@ mod tests {
         w.write_tool_call(
             0,
             "bash".to_string(),
+            None,
             serde_json::json!({"command": "echo hello"}),
             22,
             "hello\n",
@@ -2168,5 +2413,290 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
+    }
+
+    // ── Event identity and parenting ──────────────────────────────────────────
+
+    /// The full tree one task produces, walked the way a reader walks it: every line is
+    /// identified, every non-null `parent_id` names a line already written, and the shape is
+    /// session → task → turn → {tool_call, shell}.
+    #[tokio::test]
+    async fn every_event_carries_a_unique_id_and_parents_to_an_earlier_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, vec!["bash".to_string()])
+            .await
+            .unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
+        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
+            .await
+            .unwrap();
+        w.write_tool_call(
+            0,
+            "bash".to_string(),
+            Some("toolu_1".to_string()),
+            serde_json::json!({"command": "echo hi"}),
+            10,
+            "hi\n",
+            3,
+            5,
+            "ok".to_string(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        w.write_shell(
+            0,
+            "/bin/bash".to_string(),
+            "echo hi".to_string(),
+            0,
+            3,
+            0,
+            2,
+            None,
+        )
+        .await
+        .unwrap();
+        w.write_task_end("tsk_1", "ok", 0).await.unwrap();
+        w.write_session_end("ok").await.unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (i, event) in events.iter().enumerate() {
+            let id = event["event_id"].as_str().unwrap();
+            assert!(id.starts_with("evt_") && id.len() == 36, "event {i}: {id}");
+            assert!(id[4..].chars().all(|c| c.is_ascii_hexdigit()), "event {i}");
+            assert!(seen.insert(id.to_string()), "event {i} reuses {id}");
+            assert!(
+                event.get("parent_id").is_some(),
+                "event {i} has no parent_id"
+            );
+            if let Some(parent) = event["parent_id"].as_str() {
+                assert!(seen.contains(parent), "event {i} names dangling {parent}");
+            }
+        }
+
+        let by_type = |ty: &str| {
+            events
+                .iter()
+                .find(|e| e["event_type"] == ty)
+                .unwrap_or_else(|| panic!("no {ty}"))
+                .clone()
+        };
+        let session = by_type("session_start");
+        assert!(session["parent_id"].is_null());
+        assert_eq!(session["event_id"], w.session_event_id());
+
+        let task = by_type("task_start");
+        assert_eq!(task["parent_id"], session["event_id"]);
+
+        let turn = by_type("inference");
+        assert_eq!(turn["parent_id"], task["event_id"]);
+
+        assert_eq!(by_type("tool_call")["parent_id"], turn["event_id"]);
+        assert_eq!(by_type("shell")["parent_id"], turn["event_id"]);
+        assert_eq!(by_type("task_end")["parent_id"], task["event_id"]);
+        assert_eq!(by_type("session_end")["parent_id"], session["event_id"]);
+    }
+
+    /// A hook's `run-inference` record is a product of the turn it ran inside, not a turn of
+    /// its own: it parents to the agent loop's inference and never replaces it as the node the
+    /// turn's other events hang off.
+    #[tokio::test]
+    async fn hook_origin_inference_hangs_off_the_turn_rather_than_becoming_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
+        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
+            .await
+            .unwrap();
+        let origin = InferenceOrigin {
+            source: "hook:gatekeeper".to_string(),
+            model: "claude-test".to_string(),
+        };
+        w.write_inference(0, 1, 1, "end_turn".to_string(), None, Some(&origin), None)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let turn = &events[2];
+        let hook = &events[3];
+        assert!(turn["origin"].is_null());
+        assert_eq!(hook["origin"], "hook:gatekeeper");
+        assert_eq!(hook["parent_id"], turn["event_id"]);
+    }
+
+    /// A writer with no session frame behind it names no parent. This is the script-capsule
+    /// `a2a_send` drain, which opens a writer purely to flush buffered sends into a file that
+    /// has no `session_start` line — naming one would dangle.
+    #[tokio::test]
+    async fn a2a_send_parents_to_null_without_a_session_frame_and_to_it_with_one() {
+        let bare = tempfile::tempdir().unwrap();
+        let mut w = make_writer(bare.path()).await;
+        w.write_a2a_send("http://peer", "msg_1", "tsk_1", "ctx_1", None)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        assert!(read_events(bare.path())[0]["parent_id"].is_null());
+
+        let framed = tempfile::tempdir().unwrap();
+        let mut w = make_writer(framed.path()).await;
+        w.write_session_start(1, Vec::new()).await.unwrap();
+        w.write_a2a_send("http://peer", "msg_1", "tsk_1", "ctx_1", None)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+        let events = read_events(framed.path());
+        assert_eq!(events[1]["parent_id"], events[0]["event_id"]);
+    }
+
+    /// Turn-level events carry the enclosing task's id, and `null` once the task has ended —
+    /// `task_id` is a record of scope, not a value the writer holds on to.
+    #[tokio::test]
+    async fn turn_level_events_carry_the_active_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
+        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
+            .await
+            .unwrap();
+        w.write_skill_call(0, "house-style".to_string(), 12, 1, "ok".to_string())
+            .await
+            .unwrap();
+        w.write_compaction(0, 100, 40).await.unwrap();
+        w.write_task_end("tsk_1", "ok", 0).await.unwrap();
+        w.write_inference(1, 1, 1, "end_turn".to_string(), None, None, None)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        for event in events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e["event_type"].as_str(),
+                    Some("inference" | "skill_call" | "compaction")
+                )
+            })
+            .take(3)
+        {
+            assert_eq!(event["task_id"], "tsk_1", "{event}");
+        }
+        let after = events.last().unwrap();
+        assert_eq!(after["event_type"], "inference");
+        assert!(
+            after["task_id"].is_null(),
+            "an inference outside any task carries a null task_id, not the last task's"
+        );
+        // Once the task has ended, its events fall back to the session node.
+        assert_eq!(after["parent_id"], events[0]["event_id"]);
+    }
+
+    /// The provider's id is recorded verbatim; an absent or empty one records as `null`, never
+    /// as an id the provider never issued.
+    #[tokio::test]
+    async fn tool_call_records_the_provider_id_verbatim_and_empty_as_null() {
+        for (given, expected) in [
+            (Some("toolu_1".to_string()), Some("toolu_1")),
+            (Some(String::new()), None),
+            (None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer(dir.path()).await;
+            w.write_tool_call(
+                0,
+                "bash".to_string(),
+                given.clone(),
+                serde_json::json!({}),
+                2,
+                "",
+                0,
+                1,
+                "ok".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            let e = &read_events(dir.path())[0];
+            match expected {
+                Some(id) => assert_eq!(e["tool_call_id"], id, "given={given:?}"),
+                None => assert!(e["tool_call_id"].is_null(), "given={given:?}"),
+            }
+        }
+    }
+
+    /// A declined compaction is a full record of the decline, not a bare marker: it names the
+    /// turn, the task, the occupancy the session went on running over, and the reason.
+    #[tokio::test]
+    async fn compaction_declined_records_turn_task_tokens_and_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_session_start(10, Vec::new()).await.unwrap();
+        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+            .await
+            .unwrap();
+        w.write_inference(2, 10, 5, "tool_call".to_string(), None, None, None)
+            .await
+            .unwrap();
+        w.write_compaction_declined(2, 4321, COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL)
+            .await
+            .unwrap();
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        let declined: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["event_type"] == "compaction_declined")
+            .collect();
+        assert_eq!(declined.len(), 1);
+        let d = declined[0];
+        assert_eq!(d["reason"], "unresolved_tool_call");
+        assert_eq!(d["turn"], 2);
+        assert_eq!(d["task_id"], "tsk_1");
+        assert_eq!(d["tokens"], 4321);
+        assert!(d["event_id"].as_str().unwrap().starts_with("evt_"));
+        assert_eq!(
+            d["parent_id"],
+            events
+                .iter()
+                .find(|e| e["event_type"] == "inference")
+                .unwrap()["event_id"]
+        );
+    }
+
+    /// `evt_` ids sort by mint time and carry their own millisecond timestamp, the same
+    /// property `mur trace list --since` reads off a `ses_` id.
+    #[tokio::test]
+    async fn event_ids_sort_by_mint_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        for turn in 0..5 {
+            w.write_inference(turn, 1, 1, "end_turn".to_string(), None, None, None)
+                .await
+                .unwrap();
+        }
+        w.flush().await.unwrap();
+
+        let ids: Vec<String> = read_events(dir.path())
+            .iter()
+            .map(|e| e["event_id"].as_str().unwrap().to_string())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "evt_ ids must sort into mint order");
     }
 }

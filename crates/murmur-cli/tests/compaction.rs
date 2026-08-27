@@ -192,6 +192,68 @@ fn compact_not_declared_threshold_reached_warning_logged() {
         log.contains("no hook returned replace-context"),
         "bootstrap.log should contain compaction skip warning, got: {log}"
     );
+
+    // The decline also reaches the trace: a session that silently continued over budget is
+    // indistinguishable in trace.jsonl from one that never needed compacting.
+    let trace = fs::read_to_string(launched.workdir.join("trace.jsonl")).unwrap_or_default();
+    let events: Vec<serde_json::Value> = trace
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every trace line must be valid JSON"))
+        .collect();
+    let ids: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| e["event_id"].as_str())
+        .collect();
+    let declined: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == "compaction_declined")
+        .collect();
+    assert!(
+        !declined.is_empty(),
+        "the decline must be recorded as compaction_declined; got:\n{trace}"
+    );
+    let task_id = events
+        .iter()
+        .find(|e| e["event_type"] == "task_start")
+        .expect("the session must have written task_start")["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for d in declined {
+        assert_eq!(d["reason"], "no_hook_replacement");
+        let parent = d["parent_id"]
+            .as_str()
+            .expect("a declined compaction must name a parent");
+        assert!(
+            ids.contains(parent),
+            "compaction_declined names parent_id {parent:?}, which is in no line: {d}"
+        );
+        assert!(
+            d["turn"].as_u64().is_some(),
+            "compaction_declined must name the tripping turn: {d}"
+        );
+        assert_eq!(d["task_id"], task_id.as_str());
+        assert!(
+            d["tokens"].as_u64().is_some_and(|t| t > 0),
+            "compaction_declined must carry the over-budget occupancy: {d}"
+        );
+    }
+
+    // `mur trace show` reads a trace this build wrote: it neither errors on the frame nor
+    // hides the decline behind the `fired: no` line.
+    assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .args([
+            "trace",
+            "show",
+            launched.workdir.join("trace.jsonl").to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("Compaction"))
+        .stdout(predicates::str::contains("declined"))
+        .stdout(predicates::str::contains("no_hook_replacement"));
 }
 
 /// Test 3: context.max_tokens absent → compaction disabled even if murmur-compact installed.

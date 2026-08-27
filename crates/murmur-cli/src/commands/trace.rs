@@ -136,6 +136,16 @@ struct CompactionEvent {
     tokens_after: u64,
 }
 
+/// Compaction was attempted and declined; the session continued over budget. Zero or more
+/// per session, each naming the turn that tripped the threshold and why the context was left
+/// alone.
+#[derive(Debug, Deserialize)]
+struct CompactionDeclinedEvent {
+    turn: u32,
+    tokens: u64,
+    reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionEndEvent {
     total_turns: u32,
@@ -192,6 +202,7 @@ enum TraceEvent {
     SkillCall(SkillCallEvent),
     Shell(ShellEvent),
     Compaction(CompactionEvent),
+    CompactionDeclined(CompactionDeclinedEvent),
     SessionEnd(SessionEndEvent),
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
@@ -206,6 +217,13 @@ struct CompactionRecord {
     turn: u32,
     tokens_before: u64,
     tokens_after: u64,
+}
+
+/// One `compaction_declined` record, surfaced in `mur trace show`.
+struct CompactionDeclinedRecord {
+    turn: u32,
+    tokens: u64,
+    reason: String,
 }
 
 struct ToolCallRecord {
@@ -264,6 +282,9 @@ struct TraceMetrics {
     skill_latencies_ms: Vec<u64>,
     skill_call_records: Vec<SkillCallRecord>,
     compaction: Option<CompactionRecord>,
+    /// Every `compaction_declined` record, in file order. A decline leaves the session running
+    /// over budget, so all of them are kept rather than just the last.
+    compactions_declined: Vec<CompactionDeclinedRecord>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
 }
@@ -488,6 +509,7 @@ fn compute_metrics(
     let mut skill_latencies: Vec<u64> = Vec::new();
     let mut skill_call_records: Vec<SkillCallRecord> = Vec::new();
     let mut compaction: Option<CompactionRecord> = None;
+    let mut compactions_declined: Vec<CompactionDeclinedRecord> = Vec::new();
     // Per-task state: task_id → partial TaskMetrics (filled in as events arrive)
     let mut task_starts: HashMap<String, (String, String)> = HashMap::new(); // task_id → (context_id, source)
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
@@ -565,6 +587,13 @@ fn compute_metrics(
                     tokens_after: e.tokens_after,
                 });
             }
+            TraceEvent::CompactionDeclined(e) => {
+                compactions_declined.push(CompactionDeclinedRecord {
+                    turn: e.turn,
+                    tokens: e.tokens,
+                    reason: e.reason,
+                });
+            }
             TraceEvent::SessionEnd(e) => se = Some(e),
             TraceEvent::TaskStart(e) => {
                 task_starts.insert(e.task_id.clone(), (e.context_id, e.source));
@@ -637,6 +666,7 @@ fn compute_metrics(
             skill_latencies_ms: skill_latencies,
             skill_call_records,
             compaction,
+            compactions_declined,
             reopens,
         },
         task_metrics,
@@ -1047,6 +1077,14 @@ fn print_show(m: &TraceMetrics) {
             fmt_thousands(c.tokens_before),
             fmt_thousands(c.tokens_after)
         ),
+    }
+    for d in &m.compactions_declined {
+        println!(
+            "declined:   at turn {}  ({} tokens)  {}",
+            d.turn,
+            fmt_thousands(d.tokens),
+            d.reason
+        );
     }
 
     if !m.reopens.is_empty() {
