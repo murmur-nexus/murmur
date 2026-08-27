@@ -46,7 +46,6 @@ use zip::{
 };
 
 const TOOL_NAME: &str = "murmur-tool-corpus";
-const TOOL_VERSION: &str = "0.1.0";
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
@@ -119,6 +118,21 @@ fn corpus_component(checkout: &Path) -> Option<PathBuf> {
     Some(wasm)
 }
 
+/// The version the corpus's own `murmur.yaml` declares.
+///
+/// Read from the checkout rather than pinned here, because `mur publish` takes the version from
+/// the manifest inside the archive: a literal in this file names what the capsule asks for but not
+/// what the store holds, so the two agree only until that repository's next release, and this
+/// suite builds against its default branch by design.
+fn manifest_version(manifest_bytes: &[u8]) -> String {
+    let manifest: serde_yaml::Value = serde_yaml::from_slice(manifest_bytes)
+        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml does not parse: {err}"));
+    manifest["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{TOOL_NAME}'s murmur.yaml declares no string version"))
+        .to_string()
+}
+
 /// Pack the corpus as a `runtime: tool` artifact: its own `murmur.yaml` verbatim at the archive
 /// root, and the component beside it under the name `requires_files` declares.
 ///
@@ -127,8 +141,13 @@ fn corpus_component(checkout: &Path) -> Option<PathBuf> {
 /// bundled `capabilities:` block — the last of which is what Scenarios B and C show grants
 /// nothing on its own. `select_root_wasm_in_archive` picks the single root `.wasm`, so the
 /// underscored file name is the entry name.
-fn create_corpus_artifact(dir: &Path, manifest_bytes: &[u8], wasm: &Path) -> PathBuf {
-    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+fn create_corpus_artifact(
+    dir: &Path,
+    manifest_bytes: &[u8],
+    tool_version: &str,
+    wasm: &Path,
+) -> PathBuf {
+    let artifact_path = dir.join(format!("{TOOL_NAME}-{tool_version}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&artifact_path).unwrap());
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -148,6 +167,8 @@ fn create_corpus_artifact(dir: &Path, manifest_bytes: &[u8], wasm: &Path) -> Pat
 struct Staging {
     home: TempDir,
     project: TempDir,
+    /// The corpus version this staging published, for the manifest rewrites that follow.
+    tool_version: String,
     /// Where the packed `.mur.zip`s live. Held only to keep the directory alive.
     _artifacts: TempDir,
 }
@@ -202,11 +223,14 @@ impl Staging {
 /// launch.
 fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Option<Staging> {
     let wasm = corpus_component(checkout)?;
+    let manifest_bytes = fs::read(checkout.join("tools/murmur-tool-corpus/murmur.yaml")).unwrap();
+    let tool_version = manifest_version(&manifest_bytes);
 
     let staging = Staging {
         home: tempfile::tempdir().unwrap(),
         project: tempfile::tempdir().unwrap(),
         _artifacts: tempfile::tempdir().unwrap(),
+        tool_version: tool_version.clone(),
     };
 
     // A placeholder endpoint, so `mur install` can find the project root before any server is
@@ -214,13 +238,15 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
     write_manifest(
         staging.project.path(),
         capsule_name,
+        &tool_version,
         "http://127.0.0.1:1",
         state_yaml,
     );
 
     let corpus_artifact = create_corpus_artifact(
         staging._artifacts.path(),
-        &fs::read(checkout.join("tools/murmur-tool-corpus/murmur.yaml")).unwrap(),
+        &manifest_bytes,
+        &tool_version,
         &wasm,
     );
     let driver_artifact = common::create_driver_artifact(
@@ -242,6 +268,7 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
 fn write_manifest(
     project: &Path,
     capsule_name: &str,
+    tool_version: &str,
     endpoint: &str,
     state_yaml: Option<&str>,
 ) -> PathBuf {
@@ -255,7 +282,7 @@ fn write_manifest(
         format!(
             "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
              version: {DRIVER_VERSION}\n    runtime: driver\n  - name: {TOOL_NAME}\n    version: \
-             {TOOL_VERSION}\n    runtime: tool\n{capabilities}capabilities:\n  network:\n    \
+             {tool_version}\n    runtime: tool\n{capabilities}capabilities:\n  network:\n    \
              allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: \
              {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: \
              {DRIVER_NAME}\n"
@@ -452,6 +479,7 @@ fn corpus_records_survive_into_a_second_session() {
     write_manifest(
         staging.project.path(),
         "corpus-proof-capsule",
+        &staging.tool_version,
         &first_server.endpoint,
         Some("\n        store: corpus-proof"),
     );
@@ -480,6 +508,7 @@ fn corpus_records_survive_into_a_second_session() {
     write_manifest(
         staging.project.path(),
         "corpus-proof-capsule",
+        &staging.tool_version,
         &second_server.endpoint,
         Some("\n        store: corpus-proof"),
     );
@@ -573,6 +602,7 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
     write_manifest(
         staging.project.path(),
         capsule,
+        &staging.tool_version,
         &server.endpoint,
         Some(" {}"),
     );
@@ -654,7 +684,13 @@ fn every_operation_refuses_without_the_state_grant() {
     responses.push(end_turn_response("every call refused"));
 
     let server = common::ScriptedServer::start(responses);
-    write_manifest(staging.project.path(), capsule, &server.endpoint, None);
+    write_manifest(
+        staging.project.path(),
+        capsule,
+        &staging.tool_version,
+        &server.endpoint,
+        None,
+    );
 
     // The tool refuses; it neither traps nor fails the session.
     let workdir = run_session(&staging.home, &staging.manifest(), "Try every operation.");
