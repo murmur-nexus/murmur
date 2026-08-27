@@ -206,7 +206,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -415,7 +415,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 
 | Span name | Source event | Attributes |
 |---|---|---|
-| `capsule.session` | `session_start` / `session_end` | `exit_status` |
+| `capsule.session` | One per task | `exit_status` |
 | `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens` and `cache_write_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
@@ -424,6 +424,11 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 Every span carries two resource attributes: `service.name` (the capsule name) and
 `service.version` (the manifest `version`). The `skill_call`, task and A2A events have no span of
 their own — they appear in `trace.jsonl` alone.
+
+A `capsule.session` span covers one task, under its own trace id. A launch that handles three
+queued tasks therefore posts three of them, where `trace.jsonl` holds a single
+`session_start`/`session_end` pair around three `task_start`/`task_end` pairs. Correlate the two
+by task, not by session.
 
 **Non-obvious behaviour:**
 

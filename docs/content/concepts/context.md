@@ -20,8 +20,9 @@ hard limit:
 Compaction never consumes a turn slot. Whether a failure to compact is fatal depends on why it
 failed:
 
-- **No hook bound to `on-compaction`** — non-fatal. The runtime logs a warning to
-  `logs/bootstrap.log` and continues the session with the uncompacted history.
+- **No hook bound to `on-compaction`, or a replacement the runtime rejected** — non-fatal. The
+  runtime writes a `compaction_declined` line to `trace.jsonl` naming the turn and the reason, and
+  continues the session with the uncompacted history.
 - **A bound hook ran and returned an error** — fatal. There is no fallback compactor behind a
   declared compaction hook, so the runtime ends the session as failed rather than continuing on
   a context it already knows is over budget: `out/result.txt` records the error, the trace and

@@ -1121,10 +1121,9 @@ pub fn launch_session(
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
 
             // The session frame is written once per launch, around the task loop, so it frames
-            // the `on-session-start`/`on-session-end` hook pair rather than nesting inside each
-            // task the way the per-attempt marker used to. It goes in before anything else can
-            // write to the file: `session_start`'s `event_id` is the root of the trace's event
-            // tree, and the resource plane — opened next, and served concurrently from the
+            // the `on-session-start`/`on-session-end` hook pair. It goes in before anything
+            // else can write to the file: `session_start`'s `event_id` is the root of the trace's
+            // event tree, and the resource plane — opened next, and served concurrently from the
             // moment the listener accepts — names that id as its `parent_id` on every line.
             //
             // Both transports derive `tools_declared` from this same inventory, so one call

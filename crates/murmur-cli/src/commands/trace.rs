@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -160,8 +160,6 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
-    context_id: String,
-    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,8 +170,6 @@ struct TaskEndEvent {
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    tool_calls: u32,
-    shell_calls: u32,
     /// Times an `on-task-end` hook reopened this task before it ended. Absent in
     /// pre-slice traces, so it defaults to 0.
     #[serde(default)]
@@ -360,18 +356,13 @@ impl TraceMetrics {
     }
 }
 
-#[allow(dead_code)]
 struct TaskMetrics {
     task_id: String,
-    context_id: String,
-    source: String,
     exit_status: String,
     duration_ms: u64,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    tool_calls: u32,
-    shell_calls: u32,
     reopen_count: u32,
 }
 
@@ -510,8 +501,9 @@ fn compute_metrics(
     let mut skill_call_records: Vec<SkillCallRecord> = Vec::new();
     let mut compaction: Option<CompactionRecord> = None;
     let mut compactions_declined: Vec<CompactionDeclinedRecord> = Vec::new();
-    // Per-task state: task_id → partial TaskMetrics (filled in as events arrive)
-    let mut task_starts: HashMap<String, (String, String)> = HashMap::new(); // task_id → (context_id, source)
+    // Task ids seen on a `task_start`, so a `task_end` with no opening line is ignored rather
+    // than counted as a task.
+    let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
 
@@ -596,21 +588,17 @@ fn compute_metrics(
             }
             TraceEvent::SessionEnd(e) => se = Some(e),
             TraceEvent::TaskStart(e) => {
-                task_starts.insert(e.task_id.clone(), (e.context_id, e.source));
+                task_starts.insert(e.task_id.clone());
             }
             TraceEvent::TaskEnd(e) => {
-                if let Some((context_id, source)) = task_starts.remove(&e.task_id) {
+                if task_starts.remove(&e.task_id) {
                     task_metrics.push(TaskMetrics {
                         task_id: e.task_id,
-                        context_id,
-                        source,
                         exit_status: e.exit_status,
                         duration_ms: e.duration_ms,
                         turns: e.turns,
                         input_tokens: e.input_tokens,
                         output_tokens: e.output_tokens,
-                        tool_calls: e.tool_calls,
-                        shell_calls: e.shell_calls,
                         reopen_count: e.reopen_count,
                     });
                 }

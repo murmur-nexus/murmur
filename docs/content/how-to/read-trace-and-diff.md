@@ -105,6 +105,16 @@ exit codes: 2 ok, 1 failed (exit 1)
 
 Non-zero exits are passed back to the model as output, not failures — but if the same exit code repeats across turns, the model is retrying a command that keeps failing.
 
+**Compaction that never happened** — a `declined:` row under **Compaction** means a turn crossed the compaction threshold and the context was left alone, so the rest of the session ran over budget:
+
+```text
+── Compaction ───────────────────────────────────
+fired:      no
+declined:   at turn 4  (198,340 tokens)  no_hook_replacement
+```
+
+`no_hook_replacement` means the capsule declares no compaction hook, or the one it declares returned nothing — declare one to fix it. `unresolved_tool_call` means a hook did return a replacement and the runtime discarded it because its tool calls and tool results no longer paired up; that is a defect in the hook.
+
 ---
 
 ## Step 3 — compare two runs with diff
@@ -188,7 +198,7 @@ grep '"event_type":"shell"' workdir/ses_.../trace.jsonl | jq .
 grep '"event_type":"session_end"' workdir/ses_.../trace.jsonl | jq '{turns: .total_turns, tokens: (.total_input_tokens + .total_output_tokens), status: .exit_status}'
 ```
 
-For persistent capsules (queue mode), each task produces its own `task_start` / `session_start` / `session_end` / `task_end` block inside a single `trace.jsonl`. `mur trace show` displays a per-task breakdown in the **Tasks** section.
+For persistent capsules (queue mode), one `trace.jsonl` holds one `session_start` / `session_end` pair for the launch, with a `task_start` / `task_end` block per task inside it. `mur trace show` displays a per-task breakdown in the **Tasks** section.
 
 To visualise the same trace data as Grafana spans, see [Work with capsule trace spans in Grafana](grafana-tempo-spans.md).
 

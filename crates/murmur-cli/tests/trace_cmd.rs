@@ -112,8 +112,8 @@ const FIXTURE_NO_TOOLS: &str = concat!(
     "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":200,\"exit_status\":\"ok\"}\n"
 );
 
-// A launch written by the current runtime: one session frame around one task, every line
-// identified and parented, and a compaction the threshold tripped but nothing serviced.
+// One session frame around one task, every line identified and parented, and a compaction
+// the threshold tripped but nothing serviced.
 const FIXTURE_DECLINED: &str = concat!(
     "{\"event_type\":\"session_start\",\"event_id\":\"evt_dddddddddddd4ddd8ddd000000000001\",\"parent_id\":null,",
     "\"session_id\":\"ses_dddddddddddd4ddd8ddd000000000004\",\"timestamp\":5000,",

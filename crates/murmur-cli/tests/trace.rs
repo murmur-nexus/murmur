@@ -364,7 +364,7 @@ fn trace_two_turn_session_all_event_types() {
         "must NOT have camelCase totalTurns"
     );
 
-    // ── Scenario 1: every line is identified and parents to an earlier line ──
+    // ── Every line is identified and parents to an earlier line ──
     assert_walkable_tree(&events);
 
     let session_node = ss["event_id"].as_str().unwrap();
@@ -408,7 +408,7 @@ fn trace_two_turn_session_all_event_types() {
         "shell must parent to its turn's inference"
     );
 
-    // ── Scenario 2: every turn-level line inside the task carries its task_id ──
+    // ── Every turn-level line inside the task carries its task_id ──
     let task_id = ts["task_id"].as_str().unwrap();
     for event in &events {
         let ty = event["event_type"].as_str().unwrap();
@@ -423,13 +423,13 @@ fn trace_two_turn_session_all_event_types() {
         }
     }
 
-    // ── Scenario 3: the provider's own id for the call is recorded verbatim ──
+    // ── The provider's own id for the call is recorded verbatim ──
     assert_eq!(
         tool["tool_call_id"], "toolu_1",
         "tool_call must carry the provider's tool_call_id"
     );
 
-    // ── Scenario 5: exactly one frame, with the task pair strictly inside it ──
+    // ── Exactly one frame, with the task pair strictly inside it ──
     assert_eq!(count_of(&events, "session_start"), 1);
     assert_eq!(count_of(&events, "session_end"), 1);
     assert_eq!(count_of(&events, "task_start"), 1);
@@ -546,7 +546,7 @@ fn trace_session_end_written_on_failed_exit() {
         "the launch's exit_status must be failed"
     );
 
-    // task_end now carries the attempt's own terminal status rather than a coarse "ok".
+    // task_end carries the attempt's own terminal status, not the launch's.
     assert_ne!(
         find(&events, "task_end")["exit_status"],
         "ok",

@@ -329,12 +329,21 @@ a compaction the tool-call-pairing safety net rejects writes nothing.
 
 ## Compaction failure modes
 
-Two situations can prevent compaction from replacing the context, and the runtime treats them
+Three situations can prevent compaction from replacing the context, and the runtime treats them
 differently:
 
 **No hook bound to `on-compaction`.** This is not a failure — it means compaction was never
 configured to begin with. The runtime logs `no hook returned replace-context` to
-`logs/bootstrap.log` and the session continues with the uncompacted history.
+`logs/bootstrap.log`, writes a `compaction_declined` line to `trace.jsonl` with
+`reason: "no_hook_replacement"`, and the session continues with the uncompacted history.
+
+**A bound hook returned a replacement the runtime rejected.** A compacted history whose tool calls
+and tool results no longer pair up would make the next request malformed, so the runtime discards
+the replacement whole and keeps the original, larger history. Non-fatal: it logs
+`compacted result has an unresolved tool_call` to `logs/bootstrap.log`, writes a
+`compaction_declined` line with `reason: "unresolved_tool_call"`, and the session continues over
+budget. Recurring `unresolved_tool_call` declines mean the hook is dropping one half of a
+call/result pair.
 
 **A bound hook ran and returned an error.** This *is* treated as a failure, and it ends the
 session: there is no fallback compactor behind a declared compaction hook, so continuing would
@@ -359,6 +368,7 @@ compaction.
 | `inference.compaction.threshold: 0.85` | Compaction fires when session tokens reach 85% of the budget |
 | `inference.compaction.model: claude-haiku-4-5` | Uses a different (typically cheaper) model for compaction calls |
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
-| No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; warning logged to `bootstrap.log` |
+| No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
+| A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns an error | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count after compaction | Reset to the count of the new (compacted) history, not to zero |

@@ -678,7 +678,7 @@ Output sections:
 | Tokens | Input tokens, output tokens, total, and per-turn averages |
 | Tool calls | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
 | Shell calls | Count, exit code distribution, average latency |
-| Compaction | Whether it fired; turn number and before/after token counts |
+| Compaction | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
 | Tasks | Per-task breakdown (only shown when the session contains more than one task) |
 
 The **Tasks** section appears only for multi-task persistent capsule sessions. Single-task and legacy traces (no task events) are unaffected — their output is unchanged.

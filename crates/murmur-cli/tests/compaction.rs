@@ -240,8 +240,8 @@ fn compact_not_declared_threshold_reached_warning_logged() {
         );
     }
 
-    // `mur trace show` reads a trace this build wrote: it neither errors on the frame nor
-    // hides the decline behind the `fired: no` line.
+    // `mur trace show` reads the frame without erroring, and does not hide the decline
+    // behind the `fired: no` line.
     assert_cmd::Command::cargo_bin("mur")
         .unwrap()
         .args([
