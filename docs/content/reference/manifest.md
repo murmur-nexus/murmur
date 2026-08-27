@@ -586,7 +586,7 @@ These fields are read under `transport: http`, and setting any of them under
 | `inference.endpoint` | string | yes | Base URL for inference API requests. Must be `https://` (any host) or `http://` with a loopback host — see [Endpoint scheme and host validation](#endpoint-validation). |
 | `inference.model` | string | yes | Model identifier passed to the driver. |
 | `inference.driver.artifact` | string | yes | Inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`. |
-| `inference.driver.config` | object | no | Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. A value that is not a mapping fails the manifest parse. See [Choosing a config block](#which-config-block). |
+| `inference.driver.config` | object | no | Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. A value that is not a mapping fails the manifest parse with `E-MAN-003`. See [Choosing a config block](#which-config-block). |
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.api_key` | string | no | Literal value or `${ENV_VAR}` reference — see [`inference.api_key` resolution](#inference-api-key). |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
@@ -704,6 +704,9 @@ The two blocks reach different environments:
 | `inference.driver.config` | `MURMUR_INFERENCE_DRIVER_CONFIG` | The driver, every WASM tool and every shell tool in the session. |
 | `artifacts[].config` | `MURMUR_ARTIFACT_CONFIG` | The declaring artifact alone. |
 
+For the rest of what a driver or a tool is handed, see
+[Driver and tool environment](default-artifacts.md#driver-environment).
+
 ### Yes — any driver would act on it { #which-config-block-yes }
 
 A retry budget means the same thing behind any provider, so it describes the role:
@@ -757,7 +760,7 @@ artifacts:
 ### The line is convention { #which-config-block-convention }
 
 The runtime validates the shape of both blocks and never their meaning. `inference.driver.config`
-must be a mapping or the manifest fails to parse; `artifacts[].config` must satisfy
+must be a mapping or the manifest fails to parse with `E-MAN-003`; `artifacts[].config` must satisfy
 [Artifact config shape](#artifact-config-shape) or the launch fails with
 [`E-CAP-010`](diagnostics.md#e-cap-010). Neither check can read what a key means, so a setting
 written into the wrong block still reaches its artifact and still works. The line holds because
