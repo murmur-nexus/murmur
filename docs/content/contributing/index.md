@@ -89,6 +89,24 @@ built; set `MURMUR_DEFAULT_ARTIFACTS_DIR` to point at one, then run with
 `cargo test -- --ignored`. Without that variable set, these tests skip themselves; every
 other test runs without needing a `default-artifacts` checkout at all.
 
+A test that proves this repository against a sibling one is gated by two variables:
+
+| Variable | Controls |
+| --- | --- |
+| `MURMUR_DEFAULT_ARTIFACTS_DIR` | Where the `default-artifacts` checkout is. |
+| `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` | Whether a missing or unusable checkout is a skip or a failure. Any non-empty value other than `0` makes it a failure. |
+
+Both are unset on a development machine, so `cargo test --workspace` stays fast and green with no
+checkout anywhere. The `cross-repo-integration` workflow sets both: it checks out
+`murmur-nexus/default-artifacts` beside this repository and runs
+`cargo test -p murmur-cli --test corpus_state -- --ignored`, so a pipeline that would have skipped
+those tests fails instead of passing having run nothing. Write a further cross-repository test
+against the same pair — reach the checkout through
+`common::default_artifacts_dir_or_skip(test_name)`, and report a checkout that is present but out
+of which a fixture could not be built through `common::skip_or_fail(test_name, reason)`. Both skip
+with a `[SKIP] <test name>: ` line when `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` is unset and panic when
+it is set.
+
 CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
 request. Tests that need a delegated cgroup v2 scope skip themselves with a
 `[SKIP-CGROUP]`-prefixed line instead of failing, since a CI runner cannot provide one; the job's

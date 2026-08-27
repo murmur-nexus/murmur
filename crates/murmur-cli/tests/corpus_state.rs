@@ -23,7 +23,9 @@
 //! The corpus component is built from the `default-artifacts` checkout named by
 //! `MURMUR_DEFAULT_ARTIFACTS_DIR` on every run, and no copy of it is committed here: a checked-in
 //! copy of a third-party artifact goes stale silently, and a proof against a stale copy says
-//! nothing about the corpus that ships. Unset variable means skip.
+//! nothing about the corpus that ships. Unset variable means skip, unless
+//! `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` is set: that turns both skip paths here into failures, so
+//! the job that exists to run these three cannot report success having run none of them.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -405,11 +407,9 @@ fn assert_store_is_private(staging: &Staging, store: &str) {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn corpus_records_survive_into_a_second_session() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] corpus_records_survive_into_a_second_session: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) =
+        common::default_artifacts_dir_or_skip("corpus_records_survive_into_a_second_session")
+    else {
         return;
     };
     let Some(staging) = stage(
@@ -417,10 +417,12 @@ fn corpus_records_survive_into_a_second_session() {
         "corpus-proof-capsule",
         Some("\n        store: corpus-proof"),
     ) else {
-        eprintln!(
-            "[SKIP] corpus_records_survive_into_a_second_session: the corpus component could not \
-             be built from {}",
-            checkout.display()
+        common::skip_or_fail(
+            "corpus_records_survive_into_a_second_session",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };
@@ -538,19 +540,19 @@ fn corpus_records_survive_into_a_second_session() {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn an_undeclared_store_name_defaults_to_the_capsule_name() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] an_undeclared_store_name_defaults_to_the_capsule_name: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) = common::default_artifacts_dir_or_skip(
+        "an_undeclared_store_name_defaults_to_the_capsule_name",
+    ) else {
         return;
     };
     let capsule = "corpus-default-capsule";
     let Some(staging) = stage(&checkout, capsule, Some(" {}")) else {
-        eprintln!(
-            "[SKIP] an_undeclared_store_name_defaults_to_the_capsule_name: the corpus component \
-             could not be built from {}",
-            checkout.display()
+        common::skip_or_fail(
+            "an_undeclared_store_name_defaults_to_the_capsule_name",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };
@@ -611,19 +613,19 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn every_operation_refuses_without_the_state_grant() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] every_operation_refuses_without_the_state_grant: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) =
+        common::default_artifacts_dir_or_skip("every_operation_refuses_without_the_state_grant")
+    else {
         return;
     };
     let capsule = "corpus-ungranted-capsule";
     let Some(staging) = stage(&checkout, capsule, None) else {
-        eprintln!(
-            "[SKIP] every_operation_refuses_without_the_state_grant: the corpus component could \
-             not be built from {}",
-            checkout.display()
+        common::skip_or_fail(
+            "every_operation_refuses_without_the_state_grant",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };

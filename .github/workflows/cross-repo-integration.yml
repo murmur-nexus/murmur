@@ -1,0 +1,83 @@
+name: cross-repo-integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # A default-artifacts push cannot redden this repository's CI on its own -- that needs a
+    # trigger in the sibling's workflows, which this repository does not own. A nightly run
+    # bounds how long a break in the join can sit unnoticed to one day.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  corpus-state:
+    name: corpus-state
+    runs-on: ubuntu-latest
+    # Three cargo builds dominate this job: this workspace, the sibling's wasm component, and the
+    # toolchain download the sibling's pin triggers. It is here so a hung launch fails the job
+    # rather than burning the runner's own limit.
+    timeout-minutes: 30
+    steps:
+      - name: Check out murmur
+        # Both repositories nest under $GITHUB_WORKSPACE: actions/checkout rejects a path that
+        # escapes it, so this is the sibling layout that passes its validation.
+        uses: actions/checkout@v4
+        with:
+          path: murmur
+      - name: Check out default-artifacts
+        # Its default branch, not a pinned SHA: the point of this job is that a corpus change
+        # which breaks the join reddens the next build here rather than waiting for a bump.
+        uses: actions/checkout@v4
+        with:
+          repository: murmur-nexus/default-artifacts
+          path: default-artifacts
+      - name: Record which sibling commit this ran against
+        # A red build has to say which sibling commit it ran against, since the branch it
+        # resolves moves under the job.
+        run: |
+          sha=$(git -C default-artifacts rev-parse HEAD)
+          echo "murmur-tool-corpus built from default-artifacts@$sha" >> "$GITHUB_STEP_SUMMARY"
+      - uses: Swatinem/rust-cache@v2
+        # `workspaces` is relative to $GITHUB_WORKSPACE, which holds two repositories here rather
+        # than one workspace at its root.
+        with:
+          workspaces: murmur
+      - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Install the sibling's pinned toolchain and wasm target
+        # rust-toolchain.toml in that checkout names the channel and the wasm32-wasip2 target;
+        # rustup installs both here so a toolchain download failure is its own step rather than
+        # an opaque `cargo build` failure inside the test.
+        working-directory: default-artifacts
+        run: rustup show
+      - name: Run the corpus integration tests
+        working-directory: murmur
+        env:
+          MURMUR_DEFAULT_ARTIFACTS_DIR: ${{ github.workspace }}/default-artifacts
+          MURMUR_REQUIRE_DEFAULT_ARTIFACTS: '1'
+        run: |
+          set -o pipefail
+          cargo test -p murmur-cli --test corpus_state -- --ignored --nocapture 2>&1 \
+            | tee corpus-test.log
+          # `--ignored` is what makes these three run at all: drop it and cargo filters them
+          # out, the job goes green, and nothing ran -- the exact failure this job removes.
+          if ! grep -q '3 passed; 0 failed' corpus-test.log; then
+            echo "::error::the corpus suite did not report 3 passed; 0 failed"
+            exit 1
+          fi
+          if grep -q '\[SKIP\]' corpus-test.log; then
+            echo "::error::a corpus test skipped in CI; MURMUR_REQUIRE_DEFAULT_ARTIFACTS should have made that a failure"
+            exit 1
+          fi
