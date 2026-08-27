@@ -2299,7 +2299,7 @@ mod tests {
     /// `content` and nothing else, and the payload built from the result carries neither
     /// key anywhere in its serialized form.
     #[test]
-    fn reconstructed_messages_carry_neither_id_nor_source_id() {
+    fn message_id_and_source_id_are_stripped_from_reconstructed_messages() {
         let msgs = reconstruct_compacted_messages(vec![WitMessage {
             role: "user".to_string(),
             content: "hello".to_string(),

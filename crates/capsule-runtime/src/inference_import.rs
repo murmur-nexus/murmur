@@ -581,7 +581,7 @@ mod tests {
     /// deliberately forwards it. A uuid at the head of a cached prefix is volatile
     /// content and would defeat provider prompt-prefix caching on every request.
     #[test]
-    fn wire_messages_carry_neither_id_nor_source_id() {
+    fn message_id_and_source_id_are_stripped_from_a_hooks_inference_request() {
         let req = InferenceRequest {
             messages: vec![Message {
                 role: "user".to_string(),

@@ -278,10 +278,10 @@ with the arm's string injected as feedback, subject to `lifecycle.max_task_reope
 `inference.max_turns`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task).
 
-`seed-context` is in the `hook-output` variant and appears in the table above under no handler:
-no handler commits it. Returning it is the same loud-but-non-fatal fault as any other unhonored
-arm — the value is discarded, a line reaches `logs/hook-<name>.log`, and a `hook_dispatch_error`
-reaches the trace. It is not a valid `commit_policy` for any binding.
+`seed-context` is in the `hook-output` variant and appears in the table above under no handler.
+Returning it from any handler is the same loud-but-non-fatal fault as any other unhonored arm —
+the value is discarded, a line reaches `logs/hook-<name>.log`, and a `hook_dispatch_error` reaches
+the trace. No binding accepts it as a `commit_policy`.
 
 ### Event field notes
 
@@ -291,12 +291,12 @@ reaches the trace. It is not a valid `commit_policy` for any binding.
   `inference.compaction.system_prompt_file` instead delivers that file's contents. Either field
   is absent when the manifest leaves it unset, and the hook resolves its own default.
 - `message.id` and `message.source-id` are runtime bookkeeping carried alongside a message's
-  `role` and `content`. `id` is `msg_` followed by a uuid — an identity, never a content hash, so
-  two byte-identical messages still carry different ids. `source-id` is opaque: whatever produced
-  the content sets it, the runtime records it verbatim and never parses it. Both are **stripped
-  before the driver payload is built**, so neither reaches the provider — a uuid at the head of a
-  cached prefix would break prompt-prefix caching on every request. Both are absent today; nothing
-  in the runtime sets either, and a value a hook sets on a returned message is ignored.
+  `role` and `content`. `id` is `msg_` followed by a uuid — an identity, so two byte-identical
+  messages still carry different ids. `source-id` is opaque: whatever produced the content sets
+  it, and the runtime records it verbatim without parsing it. Both are **stripped before the
+  driver payload is built**, so neither reaches the provider — a uuid at the head of a cached
+  prefix would break prompt-prefix caching on every request. The runtime sets neither, so a hook
+  always receives both absent, and a value a hook sets on a returned message is ignored.
 - `task-start-event.context-window` is the capsule's
   [`context.max_tokens`](manifest.md#field-context), or `0` when the manifest declares no `context:`
   block. It is precomputed so a hook sizing its work against the window never has to know which
@@ -336,14 +336,13 @@ Every call, success or failure, writes one `inference` record to `trace.jsonl` a
 
 ## `murmur:runtime/tokens`
 
-A runtime-provided import available to any hook component that declares it. Nothing needs to be
-exported, nothing in the manifest changes, and no capability grants it: counting text reaches no
-resource, so there is nothing to withhold.
+A runtime-provided import available to any hook component that declares it. It needs no
+capability grant and no manifest entry: counting text reaches no resource.
 
 `count` returns the runtime's own `cl100k_base` count of the string — the same number behind the
 compaction trigger and the context-occupancy calculation. A hook measuring a payload against a
-budget and the runtime enforcing that budget therefore agree on what the payload costs, which two
-independent tokenizers would not.
+budget and the runtime enforcing that budget therefore agree on what the payload costs, which a
+hook's own tokenizer would not guarantee.
 
 ---
 
@@ -448,9 +447,9 @@ A wholly new interface goes in a **new package at `0.1.0`** when the package tha
 host it already has published consumers. The package version is part of every instance name in
 that package, so a minor bump renames interfaces the new one has nothing to do with, and every
 artifact importing one of them stops loading until rebuilt. The exception is a change set that
-already forces that rebuild for another reason: `murmur:runtime/tokens` was added to
-`murmur:runtime` in the same step that took `murmur:hook` to `0.6.0`, which rebuilt every hook
-anyway.
+already forces that rebuild for another reason, in which case the new interface joins the existing
+package instead: `murmur:runtime/tokens` sits in `murmur:runtime` because the same bump that
+introduced it took `murmur:hook` to `0.6.0` and rebuilt every hook regardless.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an

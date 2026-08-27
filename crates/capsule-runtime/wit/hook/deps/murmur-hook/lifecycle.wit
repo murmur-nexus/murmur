@@ -15,8 +15,8 @@ interface lifecycle {
         /// never interchangeable.
         ///
         /// Stripped before the wire payload is built — see the note on
-        /// `source-id`. Always `none` today: nothing in the runtime mints one
-        /// yet, and an incoming value is ignored.
+        /// `source-id`. The runtime mints no id, so this is always `none` on the
+        /// way out, and a value set on an incoming message is ignored.
         id: option<string>,
         /// Opaque join key back to whatever produced this content — a corpus
         /// record, a compaction summary, reloaded history. Recorded verbatim and
@@ -26,7 +26,8 @@ interface lifecycle {
         /// Both `id` and `source-id` are stripped before the driver wire payload
         /// is built. A uuid sitting at the head of a cached prefix is volatile
         /// content, and would defeat provider prompt-prefix caching on every
-        /// request. Always `none` today, and an incoming value is ignored.
+        /// request. The runtime sets no `source-id`, so this is always `none` on
+        /// the way out, and a value set on an incoming message is ignored.
         source-id: option<string>,
     }
 
@@ -55,9 +56,9 @@ interface lifecycle {
         /// takes what it is handed. A seed is proposed against a budget the host
         /// enforces.
         ///
-        /// No lifecycle event honors this arm yet. Returning it from any of the
-        /// nine handlers is the ordinary unsupported-arm dispatch fault — logged
-        /// and traced, the value discarded, the session continuing.
+        /// No lifecycle event honors this arm. Returning it from any of the nine
+        /// handlers is the ordinary unsupported-arm dispatch fault — logged and
+        /// traced, the value discarded, the session continuing.
         seed-context(list<message>),
     }
 
@@ -78,10 +79,9 @@ interface lifecycle {
         context-id: string,
         source: string,
         input-bytes: u64,
-        /// Token ceiling a hook may propose context up to for this task. Always
-        /// `0` today; a later slice computes it. A hook must read `0` as "the
-        /// host has not computed this" and decline rather than assume an
-        /// unbounded budget.
+        /// Token ceiling a hook may propose context up to for this task. Read
+        /// `0` as "the host has not computed this" and decline, never as an
+        /// unbounded budget. The host sends `0`.
         budget-tokens: u64,
         /// The capsule's `context.max_tokens`, or `0` when the manifest declares
         /// none. Precomputed by the host so a hook measuring against the window
@@ -89,8 +89,8 @@ interface lifecycle {
         /// is.
         context-window: u64,
         /// Tokens already occupied by context the host loaded before this task's
-        /// first turn. Always `0` today; a later slice computes it, and the same
-        /// "`0` means not computed" reading applies as for `budget-tokens`.
+        /// first turn. The same "`0` means not computed" reading applies as for
+        /// `budget-tokens`. The host sends `0`.
         prior-tokens: u64,
     }
 

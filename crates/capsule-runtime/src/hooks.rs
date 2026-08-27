@@ -345,16 +345,16 @@ pub(crate) enum HookEvent {
         context_id: String,
         source: String,
         input_bytes: u64,
-        /// Token ceiling for context proposed at this task. Always `0` today —
-        /// no caller computes one — and the WIT contract reads `0` as "not
-        /// computed" rather than "unbounded".
+        /// Token ceiling for context proposed at this task. No caller computes
+        /// one, so this is `0`; the WIT contract reads `0` as "not computed"
+        /// rather than "unbounded".
         budget_tokens: u64,
         /// The capsule's `context.max_tokens`, from
         /// [`crate::runtime::resolve_context_window`], or `0` when the manifest
         /// declares no `context:` block.
         context_window: u64,
-        /// Tokens already occupied before this task's first turn. Always `0`
-        /// today, read the same way as `budget_tokens`.
+        /// Tokens already occupied before this task's first turn. `0`, read the
+        /// same way as `budget_tokens`.
         prior_tokens: u64,
     },
     Inference {
@@ -1918,10 +1918,7 @@ mod tests {
     }
 
     fn hook_log_lines(session: &Path, hook_name: &str) -> usize {
-        let path = session.join("logs").join(format!("hook-{hook_name}.log"));
-        std::fs::read_to_string(path)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
+        hook_log_text(session, hook_name).lines().count()
     }
 
     /// The whole of one hook's error log, empty when the file was never written.
@@ -3237,11 +3234,11 @@ mod tests {
 
     // ── murmur:runtime/tokens: the ungated host counter ──────────────────────
 
+    use crate::tokens_import::TOKENS_IFACE_VERSIONED;
+
     /// The string [`hook_token_counter_double`] measures. Long enough that the
     /// `text.len() / 4` fallback in [`crate::agent::count_tokens`] and a real
     /// `cl100k_base` count cannot coincide by accident.
-    use crate::tokens_import::TOKENS_IFACE_VERSIONED;
-
     const TOKEN_PROBE: &str =
         "the quick brown fox jumps over the lazy dog, and then counts its own tokens";
 
@@ -3360,7 +3357,7 @@ mod tests {
     /// reports is compared against [`crate::agent::count_tokens`] directly: a host that
     /// registered some other counter would link fine and still fail here.
     #[test]
-    fn hook_importing_the_token_counter_gets_the_hosts_own_count() {
+    fn tokens_count_answers_a_hook_with_the_hosts_own_number() {
         let session = TempDir::new().unwrap();
         let accessible = TempDir::new().unwrap();
         let engine = hook_test_engine();
@@ -3398,7 +3395,7 @@ mod tests {
     /// own, built before any inference driver or task exists; a hook that imports `count`
     /// and is dispatched there must link rather than fail instantiation.
     #[test]
-    fn the_staging_linker_also_defines_the_token_counter() {
+    fn tokens_count_is_registered_on_the_staging_linker_too() {
         let session = TempDir::new().unwrap();
         let engine = hook_test_engine();
 
@@ -3418,12 +3415,14 @@ mod tests {
         )
         .expect("on-stage dispatch itself never fails on a hook-returned error");
 
-        // `on-stage` is a bare stub in this double, so the dispatch itself fails
-        // `.typed()` and is logged — but only after instantiation succeeded, which is
-        // the fact under test.
+        // The double exports no `on-stage`, so dispatch fails looking that export up.
+        // Reaching *that* error means instantiation and lifecycle resolution both
+        // succeeded, which is the fact under test — a linker missing the counter would
+        // instead log a failure to instantiate.
+        let log = hook_log_text(session.path(), "counter");
         assert_eq!(
-            hook_log_lines(session.path(), "counter"),
-            1,
+            log.trim_end(),
+            "hook counter@0.0.1 missing on-stage",
             "the hook must have instantiated and been dispatched, not failed to link"
         );
     }
