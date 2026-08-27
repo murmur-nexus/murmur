@@ -192,7 +192,7 @@ mur_version: "1.0.0"
 | `artifacts[].local_source` | bool | no | Opts this artifact into `source:` resolution. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default in both directions. See [Local-source artifacts](#local-source-skills). |
 | `artifacts[].prompt_payload` | bool | no | Opts this artifact into being named by `inference.system_prompt_artifact`. Default: `true` for `runtime: skill`, `false` for every other role; an explicit value overrides that default. See [`inference.system_prompt_artifact`](#inference-system-prompt-artifact). |
 | `artifacts[].capabilities` | map | no | Per-artifact capability grant, recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`. The baseline differs by role: on a hook, absent means no network and no filesystem at all (see [Hook capabilities](#hook-capabilities)); on a tool or driver, absent means the unchanged capsule-wide ceiling, and a declared block *narrows* below it (see [Tool and driver capabilities](#tool-capabilities)). `capabilities.state` is the exception to both baselines: absent means no durable store for any role, and a declared block opens one directory outside every workdir. Declaring it on `runtime: skill` fails with `E-MAN-003`. |
-| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config). |
+| `artifacts[].config` | map | no | Operator-authored configuration delivered to this artifact alone as the `MURMUR_ARTIFACT_CONFIG` environment variable, serialized as compact JSON. Recognized on `runtime: hook`, `runtime: tool` and `runtime: driver`; declaring it on `runtime: skill`, or at the top level of the manifest, fails with `E-MAN-003`. Absent, the variable is absent from that artifact's environment. See [Artifact config](#artifact-config) and [Choosing a config block](#which-config-block). |
 | `artifacts[].on_overflow` | `drop \| block` | no | Default: `drop`. Recognized only on `runtime: hook`; declaring it on any other role fails with `E-MAN-003`. Governs what happens when an `execution_mode: async` hook's job queue is full — see [Async hook execution](#hook-overflow). Legal but inert on a hook that turns out to be `execution_mode: blocking`, which has no queue. |
 
 ##### Hook capabilities { #hook-capabilities }
@@ -586,7 +586,7 @@ These fields are read under `transport: http`, and setting any of them under
 | `inference.endpoint` | string | yes | Base URL for inference API requests. Must be `https://` (any host) or `http://` with a loopback host — see [Endpoint scheme and host validation](#endpoint-validation). |
 | `inference.model` | string | yes | Model identifier passed to the driver. |
 | `inference.driver.artifact` | string | yes | Inference driver artifact name; must be declared in `artifacts:` with `runtime: driver`. |
-| `inference.driver.config` | object | no | Driver-specific JSON object, passed to the driver as `MURMUR_INFERENCE_DRIVER_CONFIG`. |
+| `inference.driver.config` | object | no | Settings any driver of this role would act on, serialized to compact JSON and set as `MURMUR_INFERENCE_DRIVER_CONFIG` for the driver, every WASM tool and every shell tool in the session. A value that is not a mapping fails the manifest parse with `E-MAN-003`. See [Choosing a config block](#which-config-block). |
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.api_key` | string | no | Literal value or `${ENV_VAR}` reference — see [`inference.api_key` resolution](#inference-api-key). |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
@@ -678,6 +678,93 @@ gives the agent one runtime-provided tool, `share-file`, and opens
 
 There is no `list` verb and no path addressing on this plane. `share-file` clamps a requested `ttl`
 down to `max_ttl` and never up.
+
+---
+
+## Choosing a config block { #which-config-block }
+
+Two blocks carry operator-authored settings into an artifact: `inference.driver.config`, and
+`config:` on that artifact's own entry in `artifacts:`. One question decides which one a setting
+belongs in.
+
+**Does this setting mean anything to a *different* implementation of the same role?**
+
+| Answer | Block | The setting is about |
+|---|---|---|
+| Yes | [`inference.driver.config`](#field-inference) | Being a driver — endpoints, timeouts, retry behaviour, anything the runtime or any driver would act on. |
+| No | [`config:` on that artifact's own entry in `artifacts:`](#artifact-config) | Being *this* artifact — a provider quirk, a feature only this implementation has, a knob whose name would be meaningless to a sibling. |
+
+A driver may use both blocks. A tool or a hook has no `inference:` block, so it only ever uses
+`config:`.
+
+The two blocks reach different environments:
+
+| Block | Environment variable | Reaches |
+|---|---|---|
+| `inference.driver.config` | `MURMUR_INFERENCE_DRIVER_CONFIG` | The driver, every WASM tool and every shell tool in the session. |
+| `artifacts[].config` | `MURMUR_ARTIFACT_CONFIG` | The declaring artifact alone. |
+
+For the rest of what a driver or a tool is handed, see
+[Driver and tool environment](default-artifacts.md#driver-environment).
+
+### Yes — any driver would act on it { #which-config-block-yes }
+
+A retry budget means the same thing behind any provider, so it describes the role:
+
+```yaml
+inference:
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  driver:
+    artifact: murmur-driver-anthropic
+    config:
+      max_retries: 3
+      request_timeout_seconds: 60
+```
+
+Name a driver in front of another provider instead and both keys still read the same way. These
+key names illustrate the question; each driver documents the keys it reads.
+
+### No — the key belongs to one artifact { #which-config-block-no }
+
+`murmur-driver-anthropic` reads `prompt_cache` and `prompt_cache_ttl` from its own entry in
+`artifacts:`:
+
+```yaml
+artifacts:
+  - name: murmur-driver-anthropic
+    version: 1.0.0
+    runtime: driver
+    config:
+      prompt_cache: enabled
+      prompt_cache_ttl: 1h
+```
+
+A `cache_control` breakpoint is an Anthropic construct: no sibling driver has one to place, and
+other providers cache with no marker at all. Under `inference.driver.config` these two keys would
+read as settings every driver understands, which none of them do.
+
+A tool or a hook has only this block, so every setting either role reads arrives through it:
+
+```yaml
+artifacts:
+  - name: murmur-tool-corpus
+    version: 1.0.0
+    runtime: tool
+    capabilities:
+      state: {}
+    config:
+      read_recent: { default: 20, max: 100 }
+```
+
+### The line is convention { #which-config-block-convention }
+
+The runtime validates the shape of both blocks and never their meaning. `inference.driver.config`
+must be a mapping or the manifest fails to parse with `E-MAN-003`; `artifacts[].config` must satisfy
+[Artifact config shape](#artifact-config-shape) or the launch fails with
+[`E-CAP-010`](diagnostics.md#e-cap-010). Neither check can read what a key means, so a setting
+written into the wrong block still reaches its artifact and still works. The line holds because
+operators keep it, not because the host refuses to cross it.
 
 ---
 
