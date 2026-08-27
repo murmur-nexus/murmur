@@ -39,6 +39,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use murmur_artifact::Manifest;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
@@ -128,12 +129,11 @@ fn corpus_component(checkout: &Path) -> Option<PathBuf> {
 /// what the store holds, so the two agree only until that repository's next release, and this
 /// suite builds against its default branch by design.
 fn manifest_version(manifest_bytes: &[u8]) -> String {
-    let manifest: serde_yaml::Value = serde_yaml::from_slice(manifest_bytes)
-        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml does not parse: {err}"));
-    manifest["version"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{TOOL_NAME}'s murmur.yaml declares no string version"))
-        .to_string()
+    let yaml = std::str::from_utf8(manifest_bytes)
+        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml is not UTF-8: {err}"));
+    Manifest::from_yaml_str(yaml)
+        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml does not parse: {err}"))
+        .version
 }
 
 /// Pack the corpus as a `runtime: tool` artifact: its own `murmur.yaml` verbatim at the archive

@@ -121,8 +121,8 @@ lands on `main` where nobody is watching.
 CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
 request. Tests that need a host able to isolate a capsule — a delegated cgroup v2 scope, or a
 capsule network namespace — skip themselves with a `[SKIP-HOST]`-prefixed line instead of failing,
-since a CI runner provides neither; the job's
-step summary reports how many tests were skipped for that reason and points at
+since a CI runner provides neither; the job's step summary reports how many tests were skipped for
+that reason and points at
 `docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
 
 ## Formatting and lints
