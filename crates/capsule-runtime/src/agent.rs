@@ -1223,7 +1223,14 @@ async fn try_compact_via_hooks(
             } else {
                 m.get("content").map(|c| c.to_string()).unwrap_or_default()
             };
-            Some(Message { role, content })
+            // The host mints neither id: nothing in the runtime produces one, and
+            // `reconstruct_compacted_messages` drops both on the way back.
+            Some(Message {
+                role,
+                content,
+                id: None,
+                source_id: None,
+            })
         })
         .collect();
 
@@ -2243,6 +2250,8 @@ mod tests {
         WitMessage {
             role: role.to_string(),
             content: content.to_string(),
+            id: None,
+            source_id: None,
         }
     }
 
@@ -2280,6 +2289,43 @@ mod tests {
                 "driver payload has non-sequence content: {m}"
             );
         }
+    }
+
+    /// Invariant: `message.id` and `message.source-id` never reach the provider.
+    ///
+    /// Both are runtime bookkeeping — an id is a fresh uuid every time it is minted, and
+    /// a uuid at the head of a cached prefix is volatile content that would defeat
+    /// provider prompt-prefix caching on every request. Reconstruction emits `role` and
+    /// `content` and nothing else, and the payload built from the result carries neither
+    /// key anywhere in its serialized form.
+    #[test]
+    fn message_id_and_source_id_are_stripped_from_reconstructed_messages() {
+        let msgs = reconstruct_compacted_messages(vec![WitMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+            id: Some("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d".to_string()),
+            source_id: Some("corpus:abc".to_string()),
+        }]);
+
+        assert_eq!(msgs.len(), 1);
+        let keys: Vec<&String> = msgs[0]
+            .as_object()
+            .expect("a reconstructed message is a JSON object")
+            .keys()
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["content", "role"],
+            "a reconstructed message carries exactly role and content"
+        );
+
+        let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None, None);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d"));
+        assert!(!serialized.contains("corpus:abc"));
+        assert!(!serialized.contains("\"id\""));
+        assert!(!serialized.contains("source_id"));
+        assert!(!serialized.contains("source-id"));
     }
 
     /// Every other shape a hook can hand back also lands as a block array: a verbatim

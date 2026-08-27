@@ -1352,6 +1352,9 @@ pub fn launch_session(
                                                 context_id: context_id.clone(),
                                                 source: "task_md".to_string(),
                                                 input_bytes: bytes,
+                                                budget_tokens: 0,
+                                                context_window: u64::from(context_window),
+                                                prior_tokens: 0,
                                             },
                                         )
                                         .await;
@@ -1409,6 +1412,9 @@ pub fn launch_session(
                                                 context_id: context_id.clone(),
                                                 source: "task_md".to_string(),
                                                 input_bytes: bytes,
+                                                budget_tokens: 0,
+                                                context_window: u64::from(context_window),
+                                                prior_tokens: 0,
                                             },
                                         )
                                         .await;
@@ -1542,6 +1548,9 @@ pub fn launch_session(
                                     context_id: incoming.context_id.clone(),
                                     source: "a2a".to_string(),
                                     input_bytes: incoming.message_text.len() as u64,
+                                    budget_tokens: 0,
+                                    context_window: u64::from(context_window),
+                                    prior_tokens: 0,
                                 },
                             )
                             .await;
@@ -4362,6 +4371,46 @@ fn resolve_lifecycle(
 #[cfg(test)]
 mod tests {
 
+    // ── task-start-event.context-window ──────────────────────────────────────
+
+    /// The manifest body every `context:` case below shares, minus the `context:` block.
+    const CONTEXT_WINDOW_MANIFEST: &str = r#"name: windowed
+version: 0.1.0
+runtime: capsule
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_tokens: 4096
+  driver:
+    artifact: murmur-driver-anthropic
+"#;
+
+    /// The `context-window` the three `HookEvent::TaskStart` sites in `launch_session`
+    /// send, computed the way they compute it: from the parsed manifest's `context:`
+    /// block, through [`resolve_context_window`], widened to the WIT `u64`.
+    fn dispatched_context_window(manifest_yaml: &str) -> u64 {
+        let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
+            .expect("the manifest under test parses");
+        u64::from(resolve_context_window(manifest.context.as_ref()))
+    }
+
+    /// A capsule declaring `context.max_tokens` puts that number on every
+    /// `on-task-start`, so a seeding hook never has to know the model or its window.
+    #[test]
+    fn a_declared_context_window_reaches_on_task_start() {
+        let yaml = format!("{CONTEXT_WINDOW_MANIFEST}context:\n  max_tokens: 200000\n");
+        assert_eq!(dispatched_context_window(&yaml), 200_000);
+    }
+
+    /// A capsule with no `context:` block sends `0` — the WIT contract's "the host has
+    /// not computed this", never a guessed default window.
+    #[test]
+    fn no_context_block_sends_a_zero_context_window() {
+        assert_eq!(dispatched_context_window(CONTEXT_WINDOW_MANIFEST), 0);
+    }
+
     // ── The persistent-capsule handle-TTL rule ───────────────────────────────
 
     fn peer_export(max_ttl_secs: Option<u64>) -> murmur_artifact::PeerFilesExport {
@@ -6633,7 +6682,7 @@ mod tests {
         script
     }
 
-    /// A current-version (`@0.5.0`, 5-case `hook-output`) `on-task-end` hook double that
+    /// A current-version (`@0.6.0`, 6-case `hook-output`) `on-task-end` hook double that
     /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
     /// mutable core global that persists across a blocking hook's reused store) and `none`
     /// thereafter. `reopen_limit` large ⇒ "always reopen".
@@ -6680,14 +6729,19 @@ mod tests {
   (alias core export $i "memory" (core memory $mem))
   (alias core export $i "realloc" (core func $realloc))
 
-  (type $message (record (field "role" string) (field "content" string)))
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
   (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
   (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
-    (case "reopen-task" string)))
+    (case "reopen-task" string)
+    (case "seed-context" (list $message))))
   (type $task-end-event (record
     (field "task-id" string)
     (field "exit-status" string)))
@@ -6705,7 +6759,7 @@ mod tests {
     (export "on-task-end" (func $te))
 {stubs}
   )
-  (export "murmur:hook/lifecycle@0.5.0" (instance $lc))
+  (export "murmur:hook/lifecycle@0.6.0" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");

@@ -21,6 +21,7 @@ version each one carries.
 | [`murmur:text/chunks`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/deps/murmur-text/stream.wit) | Imported by tool and driver components | Emit response and thinking chunks to the session's SSE stream |
 | [`murmur:hook/lifecycle`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-hook/lifecycle.wit) | Exported by hook artifacts | The lifecycle handlers the runtime calls |
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
+| [`murmur:runtime/tokens`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/tokens.wit) | Provided by the runtime to hook components | Count the tokens in a string the way the runtime counts them |
 | [`murmur:task-io/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-task-io/read.wit) | Provided by the runtime to hook components | Read the task's input text and the agent's result text |
 
 ## Worlds
@@ -32,7 +33,7 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `tool` | `task/task`, `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `hook` | `runtime/inference`, `task-io/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
+| `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 
 Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
@@ -277,6 +278,11 @@ with the arm's string injected as feedback, subject to `lifecycle.max_task_reope
 `inference.max_turns`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task).
 
+`seed-context` is in the `hook-output` variant and appears in the table above under no handler.
+Returning it from any handler is the same loud-but-non-fatal fault as any other unhonored arm —
+the value is discarded, a line reaches `logs/hook-<name>.log`, and a `hook_dispatch_error` reaches
+the trace. No binding accepts it as a `commit_policy`.
+
 ### Event field notes
 
 - `compaction-event.model` and `compaction-event.system-prompt` carry
@@ -284,6 +290,19 @@ reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task)
   hook knows which model and which prompt to use for its own summarization call. Setting
   `inference.compaction.system_prompt_file` instead delivers that file's contents. Either field
   is absent when the manifest leaves it unset, and the hook resolves its own default.
+- `message.id` and `message.source-id` are runtime bookkeeping carried alongside a message's
+  `role` and `content`. `id` is `msg_` followed by a uuid — an identity, so two byte-identical
+  messages still carry different ids. `source-id` is opaque: whatever produced the content sets
+  it, and the runtime records it verbatim without parsing it. Both are **stripped before the
+  driver payload is built**, so neither reaches the provider — a uuid at the head of a cached
+  prefix would break prompt-prefix caching on every request. The runtime sets neither, so a hook
+  always receives both absent, and a value a hook sets on a returned message is ignored.
+- `task-start-event.context-window` is the capsule's
+  [`context.max_tokens`](manifest.md#field-context), or `0` when the manifest declares no `context:`
+  block. It is precomputed so a hook sizing its work against the window never has to know which
+  model the session runs.
+- `task-start-event.budget-tokens` and `task-start-event.prior-tokens` are `0`. Read `0` as "the
+  runtime has not computed this" and decline, rather than as an unbounded budget.
 - `shell-event.binary` is the program the shell tool actually invoked — a canonicalized absolute
   path (for example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the
   bare invoked name when nothing resolved. `shell-event.command` carries the argument list alone
@@ -312,6 +331,18 @@ are runtime-side tiktoken counts of the request payload and the raw driver respo
 
 Every call, success or failure, writes one `inference` record to `trace.jsonl` and one
 `capsule.inference` OTel span carrying `origin: "hook:<hook name>"` and `model`.
+
+---
+
+## `murmur:runtime/tokens`
+
+A runtime-provided import available to any hook component that declares it. It needs no
+capability grant and no manifest entry: counting text reaches no resource.
+
+`count` returns the runtime's own `cl100k_base` count of the string — the same number behind the
+compaction trigger and the context-occupancy calculation. A hook measuring a payload against a
+budget and the runtime enforcing that budget therefore agree on what the payload costs, which a
+hook's own tokenizer would not guarantee.
 
 ---
 
@@ -394,8 +425,8 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:task` | `0.1.0` |
 | `murmur:task-io` | `0.1.0` |
 | `murmur:text` | `0.1.0` |
-| `murmur:hook` | `0.5.0` |
-| `murmur:runtime` | `0.2.0` |
+| `murmur:hook` | `0.6.0` |
+| `murmur:runtime` | `0.3.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |
 
@@ -415,7 +446,10 @@ the shape of every call that carries the type.
 A wholly new interface goes in a **new package at `0.1.0`** when the package that would otherwise
 host it already has published consumers. The package version is part of every instance name in
 that package, so a minor bump renames interfaces the new one has nothing to do with, and every
-artifact importing one of them stops loading until rebuilt.
+artifact importing one of them stops loading until rebuilt. The exception is a change set that
+already forces that rebuild for another reason, in which case the new interface joins the existing
+package instead: `murmur:runtime/tokens` sits in `murmur:runtime` because the same bump that
+introduced it took `murmur:hook` to `0.6.0` and rebuilt every hook regardless.
 
 **One accepted version per interface.** The runtime resolves each interface by its versioned name
 and nothing else — there is no compatibility fallback for an earlier version or for an

@@ -1,4 +1,4 @@
-//! Host implementation of `murmur:runtime/inference@0.2.0#run-inference`.
+//! Host implementation of `murmur:runtime/inference@0.3.0#run-inference`.
 //!
 //! A hook component that imports this interface can run exactly one LLM
 //! completion through the capsule's already-configured inference driver. The
@@ -32,7 +32,7 @@ use crate::{
 
 /// The versioned instance name the host provides `run-inference` under. Hook
 /// components that do not import it simply ignore the registration.
-pub(crate) const INFERENCE_IFACE_VERSIONED: &str = "murmur:runtime/inference@0.2.0";
+pub(crate) const INFERENCE_IFACE_VERSIONED: &str = "murmur:runtime/inference@0.3.0";
 
 /// One completed `run-inference` call, buffered for the agent loop to write
 /// through the session's `TraceWriter`/`OtelEmitter`.
@@ -263,7 +263,7 @@ fn response_text(response: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Register `murmur:runtime/inference@0.2.0#run-inference` on a hook linker.
+/// Register `murmur:runtime/inference@0.3.0#run-inference` on a hook linker.
 ///
 /// `origin` is the `hook:<name>` tag attached to every trace record this hook's
 /// calls produce. `ctx` is `None` when the capsule has no usable inference
@@ -417,6 +417,8 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "summarize this".to_string(),
+                id: None,
+                source_id: None,
             }],
             system_prompt: None,
             model: model.map(str::to_string),
@@ -542,10 +544,14 @@ mod tests {
                 Message {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    id: None,
+                    source_id: None,
                 },
                 Message {
                     role: "assistant".to_string(),
                     content: "hi there".to_string(),
+                    id: None,
+                    source_id: None,
                 },
             ],
             system_prompt: None,
@@ -566,6 +572,42 @@ mod tests {
             assert_eq!(content[0]["type"], "text");
             assert_eq!(content[0]["text"], text);
         }
+    }
+
+    /// Invariant: `message.id` and `message.source-id` never reach the provider.
+    ///
+    /// `wire_messages` names the two fields it forwards rather than serializing the
+    /// record, so a field added to the WIT `message` is inert on the wire until someone
+    /// deliberately forwards it. A uuid at the head of a cached prefix is volatile
+    /// content and would defeat provider prompt-prefix caching on every request.
+    #[test]
+    fn message_id_and_source_id_are_stripped_from_a_hooks_inference_request() {
+        let req = InferenceRequest {
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                id: Some("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d".to_string()),
+                source_id: Some("corpus:abc".to_string()),
+            }],
+            system_prompt: None,
+            model: None,
+        };
+
+        let messages = wire_messages(&req);
+        assert_eq!(messages.len(), 1);
+        let keys: Vec<&String> = messages[0]
+            .as_object()
+            .expect("a wire message is a JSON object")
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["content", "role"]);
+
+        let payload = build_driver_payload("m", 8192, &messages, &[], "sys", None, None);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d"));
+        assert!(!serialized.contains("corpus:abc"));
+        assert!(!serialized.contains("source_id"));
+        assert!(!serialized.contains("source-id"));
     }
 
     /// A non-`passed` tool status from the driver is also an `Err`.

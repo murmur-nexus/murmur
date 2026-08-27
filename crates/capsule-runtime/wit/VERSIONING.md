@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.5.0`  |
+| `murmur:hook`            | `0.6.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -21,7 +21,7 @@ Current versions:
 | `murmur:task-io`         | `0.1.0`  |
 | `murmur:text`            | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
-| `murmur:runtime`         | `0.2.0`  |
+| `murmur:runtime`         | `0.3.0`  |
 | `murmur:runtime-guest`   | `0.1.0`  |
 
 `murmur:hook` started at `0.2.0` because its 9-function `lifecycle` interface
@@ -67,10 +67,41 @@ already-published hook importing `inference` would have stopped instantiating
 until rebuilt. Leaving `murmur:runtime` at `0.2.0` while adding an interface to
 it would have made this table untrue instead.
 
+`murmur:hook` then went to `0.6.0` carrying three shape changes at once, so
+the ecosystem pays for one rebuild window rather than three. `message` gained
+`id: option<string>` and `source-id: option<string>`; `hook-output` gained a
+sixth case, `seed-context(list<message>)`, **appended** so the existing
+discriminants `0`–`4` keep their indices; and `task-start-event` gained
+`budget-tokens`, `context-window` and `prior-tokens`, all `u64`. Each of the
+three is independently a breaking change under the rule below, and each was
+wanted by the same programme of work — bundling them means a hook author
+rebuilds once and reads one changelog entry. That is the argument for the
+bundle, and it is also the argument for refusing the next field: a bump whose
+contents are open is a bump nobody can finish paying for. Hooks built against
+`@0.5.0` or earlier stopped resolving at this bump and had to be rebuilt.
+
+`murmur:runtime` went to `0.3.0` in the same step: it gained a wholly new
+interface, `tokens`, whose single `count` function the host provides as an
+ungated import to any hook that declares it. **This is the standing exception to
+the new-package rule below.** That rule exists for one reason — bumping a package
+renames every instance name in it, so taking `murmur:runtime` to `0.3.0` renames
+`murmur:runtime/inference@0.2.0` to `@0.3.0` and forces a rebuild of every
+published hook importing it. Here that rebuild is already forced, by the
+`murmur:hook@0.6.0` bump above, and every hook binds the `hook` world as a whole.
+The marginal cost of folding `tokens` into `murmur:runtime` is therefore exactly
+zero, and the interface is `murmur:runtime/tokens.count` by the name the calling
+programme asked for. That is the whole of the difference from the `murmur:task-io`
+decision above, where no rebuild was already being paid for: when a new interface
+arrives on its own, the rule below still applies and it goes in a new package at
+`0.1.0`.
+
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,
 no artifact is rebuilt, and this table simply gains a row. Bump an existing
-package only when the change touches something that package already ships.
+package only when the change touches something that package already ships —
+*unless* the same change set already forces a rebuild of every consumer of that
+package, in which case folding the interface in costs nothing extra and the
+package is bumped instead. `murmur:runtime@0.3.0` is that case, recorded above.
 
 ## When to bump
 
@@ -161,7 +192,8 @@ only:
 
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
 `murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
-`murmur:runtime/inference@0.2.0`, `murmur:task-io/read@0.1.0`) are likewise
+`murmur:runtime/inference@0.3.0`, `murmur:runtime/tokens@0.3.0`,
+`murmur:task-io/read@0.1.0`) are likewise
 registered under the versioned name only.
 
 An artifact that still exports (or imports) only the unversioned name now
