@@ -9,8 +9,9 @@
 //!    `STATE_DIR`, both of which are the bare string `state`;
 //! 2. the store name `capabilities.state: {}` defaults to, which is the capsule's name and not the
 //!    artifact's;
-//! 3. where `corpus.config.json` resolves — inside the `0700` directory the runtime created, which
-//!    is what puts it out of the agent's reach;
+//! 3. how the operator's configuration reaches the tool — the `config:` block on its entry in the
+//!    capsule's own manifest, lowered by the runtime into the guest environment on that
+//!    artifact's grant alone, which is what puts it out of the agent's reach;
 //! 4. what a missing grant produces — `state_unavailable`, rather than a corpus quietly written
 //!    into the session workdir.
 //!
@@ -49,14 +50,16 @@ const TOOL_NAME: &str = "murmur-tool-corpus";
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-/// The corpus's own file names, relative to the state directory. Repeated here rather than
-/// imported because this crate does not depend on the corpus: these two literals are half of what
-/// the test is checking, so a copy that drifts is the failure it is meant to catch.
+/// The corpus's own file name, relative to the state directory. Repeated here rather than
+/// imported because this crate does not depend on the corpus: this literal is half of what the
+/// test is checking, so a copy that drifts is the failure it is meant to catch.
 const CORPUS_FILE: &str = "corpus.jsonl";
-const CONFIG_FILE: &str = "corpus.config.json";
 
-/// The operator configuration every scenario that expects a working corpus writes into the store
-/// before the first launch, exactly as an operator would.
+/// The operator configuration every scenario that expects a working corpus declares on the tool's
+/// entry in the capsule manifest, exactly as an operator would.
+///
+/// Compact JSON rather than a YAML block because JSON is YAML: spliced into the manifest it is a
+/// flow mapping, and the runtime lowers it back to the same bytes it arrived as.
 ///
 /// One type, `note`, whose derived three-letter id prefix (`not`) collides with none of the
 /// reserved runtime prefixes, so no `prefix_map` override is needed. `read_recent` and `search`
@@ -187,18 +190,6 @@ impl Staging {
         self.home.path().join(".murmur/state")
     }
 
-    /// Write the operator's configuration into a store, creating the store as an operator would.
-    ///
-    /// `ensure_state_store` is idempotent and re-asserts `0700` over whatever it finds, so a store
-    /// prepared here is the same store a launch would have made.
-    fn write_operator_config(&self, store: &str) -> PathBuf {
-        let dir = self.store_dir(store);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONFIG_FILE);
-        fs::write(&path, OPERATOR_CONFIG).unwrap();
-        path
-    }
-
     /// Non-empty lines in a store's corpus file.
     fn corpus_lines(&self, store: &str) -> Vec<String> {
         let path = self.store_dir(store).join(CORPUS_FILE);
@@ -221,7 +212,12 @@ impl Staging {
 /// project store: the first is what a staged session resolves against, the second is what a `mur
 /// run` CLI invocation resolves against, and installing into only one produces `E-RUN-008` at
 /// launch.
-fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Option<Staging> {
+fn stage(
+    checkout: &Path,
+    capsule_name: &str,
+    state_yaml: Option<&str>,
+    tool_config: Option<&str>,
+) -> Option<Staging> {
     let wasm = corpus_component(checkout)?;
     let manifest_bytes = fs::read(checkout.join("tools/murmur-tool-corpus/murmur.yaml")).unwrap();
     let tool_version = manifest_version(&manifest_bytes);
@@ -241,6 +237,7 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
         &tool_version,
         "http://127.0.0.1:1",
         state_yaml,
+        tool_config,
     );
 
     let corpus_artifact = create_corpus_artifact(
@@ -265,15 +262,23 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
 }
 
 /// Write the capsule manifest, pointing inference at `endpoint` and allowing it on the network.
+///
+/// `tool_config` is the operator's block for the corpus entry, and `None` leaves the entry with no
+/// `config:` key at all — an absent declaration, which is what the tool reports as
+/// `config_missing`, rather than an empty one.
 fn write_manifest(
     project: &Path,
     capsule_name: &str,
     tool_version: &str,
     endpoint: &str,
     state_yaml: Option<&str>,
+    tool_config: Option<&str>,
 ) -> PathBuf {
     let capabilities = state_yaml
         .map(|yaml| format!("    capabilities:\n      state:{yaml}\n"))
+        .unwrap_or_default();
+    let config = tool_config
+        .map(|json| format!("    config: {json}\n"))
         .unwrap_or_default();
 
     let manifest = project.join("murmur.yaml");
@@ -282,7 +287,7 @@ fn write_manifest(
         format!(
             "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
              version: {DRIVER_VERSION}\n    runtime: driver\n  - name: {TOOL_NAME}\n    version: \
-             {tool_version}\n    runtime: tool\n{capabilities}capabilities:\n  network:\n    \
+             {tool_version}\n    runtime: tool\n{capabilities}{config}capabilities:\n  network:\n    \
              allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: \
              {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: \
              {DRIVER_NAME}\n"
@@ -396,7 +401,7 @@ fn assert_workdir_holds_no_corpus(workdir: &Path) {
                 entry.path().display()
             );
             assert!(
-                !(name == CORPUS_FILE || name == CONFIG_FILE),
+                name != CORPUS_FILE,
                 "the corpus must never write into a session workdir: {}",
                 entry.path().display()
             );
@@ -443,6 +448,7 @@ fn corpus_records_survive_into_a_second_session() {
         &checkout,
         "corpus-proof-capsule",
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     ) else {
         common::skip_or_fail(
             "corpus_records_survive_into_a_second_session",
@@ -453,8 +459,6 @@ fn corpus_records_survive_into_a_second_session() {
         );
         return;
     };
-
-    let config = staging.write_operator_config("corpus-proof");
 
     // Session one: two appends the session never reads back.
     let first_server = common::ScriptedServer::start(vec![
@@ -482,6 +486,7 @@ fn corpus_records_survive_into_a_second_session() {
         &staging.tool_version,
         &first_server.endpoint,
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     );
     let first_workdir = run_session(&staging.home, &staging.manifest(), "Record two notes.");
 
@@ -511,6 +516,7 @@ fn corpus_records_survive_into_a_second_session() {
         &staging.tool_version,
         &second_server.endpoint,
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     );
     let second_workdir = run_session(&staging.home, &staging.manifest(), "Find the notes.");
 
@@ -547,11 +553,6 @@ fn corpus_records_survive_into_a_second_session() {
     // Reading is not writing: two sessions in, the corpus is still the two lines session one left.
     assert_eq!(staging.corpus_lines("corpus-proof").len(), 2);
     assert_store_is_private(&staging, "corpus-proof");
-    assert_eq!(
-        fs::read_to_string(&config).unwrap(),
-        OPERATOR_CONFIG,
-        "the operator's configuration is not the agent's to rewrite"
-    );
     for workdir in [&first_workdir, &second_workdir] {
         assert_workdir_holds_no_corpus(workdir);
     }
@@ -575,7 +576,7 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
         return;
     };
     let capsule = "corpus-default-capsule";
-    let Some(staging) = stage(&checkout, capsule, Some(" {}")) else {
+    let Some(staging) = stage(&checkout, capsule, Some(" {}"), Some(OPERATOR_CONFIG)) else {
         common::skip_or_fail(
             "an_undeclared_store_name_defaults_to_the_capsule_name",
             &format!(
@@ -585,8 +586,6 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
         );
         return;
     };
-
-    staging.write_operator_config(capsule);
 
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
@@ -605,6 +604,7 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
         &staging.tool_version,
         &server.endpoint,
         Some(" {}"),
+        Some(OPERATOR_CONFIG),
     );
     run_session(&staging.home, &staging.manifest(), "Record one note.");
 
@@ -649,7 +649,7 @@ fn every_operation_refuses_without_the_state_grant() {
         return;
     };
     let capsule = "corpus-ungranted-capsule";
-    let Some(staging) = stage(&checkout, capsule, None) else {
+    let Some(staging) = stage(&checkout, capsule, None, None) else {
         common::skip_or_fail(
             "every_operation_refuses_without_the_state_grant",
             &format!(
@@ -689,6 +689,7 @@ fn every_operation_refuses_without_the_state_grant() {
         capsule,
         &staging.tool_version,
         &server.endpoint,
+        None,
         None,
     );
 
