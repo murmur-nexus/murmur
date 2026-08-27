@@ -348,7 +348,7 @@ mur trace show 34af
 
 --8<-- "includes/mur-trace-show-info.md"
 
-The worker capsule trace includes an `a2a_task_received` event for each message it accepted, followed by the normal `session_start` / `inference` / `session_end` block for that task:
+The worker capsule trace includes an `a2a_task_received` event for each message it accepted, followed by that task's own `task_start` / `inference` / `task_end` block, all inside the launch's single `session_start` / `session_end` pair:
 
 ```text
 ── Session ──────────────────────────────────────

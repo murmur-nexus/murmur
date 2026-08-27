@@ -303,21 +303,21 @@ The task count is the number of rows in the Tasks section. Each row shows the fi
 The underlying `trace.jsonl` event sequence for a persistent session looks like:
 
 ```
+session_start       ← the capsule launched
 a2a_task_received   ← task-1 arrived
 task_start          ← task-1 begins
-session_start       ← inference loop starts for task-1
 inference           ← model calls for task-1
-session_end         ← inference loop ends for task-1
 task_end            ← task-1 metrics written
 
 a2a_task_received   ← task-2 arrived (was queued)
 task_start          ← task-2 begins
-session_start       ← inference loop starts for task-2
-...
+inference           ← model calls for task-2
 task_end            ← task-2 metrics written
+
+session_end         ← the capsule shut down
 ```
 
-Each task gets independent `session_start` / `session_end` events, so per-task token and turn counts are in the `task_end` line.
+One `session_start` / `session_end` pair frames the whole launch, however many tasks it handles. Per-task token and turn counts are in each `task_end` line; the `session_end` totals are the launch-wide sum.
 
 ---
 

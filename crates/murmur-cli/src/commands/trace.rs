@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -136,6 +136,16 @@ struct CompactionEvent {
     tokens_after: u64,
 }
 
+/// Compaction was attempted and declined; the session continued over budget. Zero or more
+/// per session, each naming the turn that tripped the threshold and why the context was left
+/// alone.
+#[derive(Debug, Deserialize)]
+struct CompactionDeclinedEvent {
+    turn: u32,
+    tokens: u64,
+    reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionEndEvent {
     total_turns: u32,
@@ -150,8 +160,6 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
-    context_id: String,
-    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,8 +170,6 @@ struct TaskEndEvent {
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    tool_calls: u32,
-    shell_calls: u32,
     /// Times an `on-task-end` hook reopened this task before it ended. Absent in
     /// pre-slice traces, so it defaults to 0.
     #[serde(default)]
@@ -192,6 +198,7 @@ enum TraceEvent {
     SkillCall(SkillCallEvent),
     Shell(ShellEvent),
     Compaction(CompactionEvent),
+    CompactionDeclined(CompactionDeclinedEvent),
     SessionEnd(SessionEndEvent),
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
@@ -206,6 +213,13 @@ struct CompactionRecord {
     turn: u32,
     tokens_before: u64,
     tokens_after: u64,
+}
+
+/// One `compaction_declined` record, surfaced in `mur trace show`.
+struct CompactionDeclinedRecord {
+    turn: u32,
+    tokens: u64,
+    reason: String,
 }
 
 struct ToolCallRecord {
@@ -264,6 +278,9 @@ struct TraceMetrics {
     skill_latencies_ms: Vec<u64>,
     skill_call_records: Vec<SkillCallRecord>,
     compaction: Option<CompactionRecord>,
+    /// Every `compaction_declined` record, in file order. A decline leaves the session running
+    /// over budget, so all of them are kept rather than just the last.
+    compactions_declined: Vec<CompactionDeclinedRecord>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
 }
@@ -339,18 +356,13 @@ impl TraceMetrics {
     }
 }
 
-#[allow(dead_code)]
 struct TaskMetrics {
     task_id: String,
-    context_id: String,
-    source: String,
     exit_status: String,
     duration_ms: u64,
     turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    tool_calls: u32,
-    shell_calls: u32,
     reopen_count: u32,
 }
 
@@ -488,8 +500,10 @@ fn compute_metrics(
     let mut skill_latencies: Vec<u64> = Vec::new();
     let mut skill_call_records: Vec<SkillCallRecord> = Vec::new();
     let mut compaction: Option<CompactionRecord> = None;
-    // Per-task state: task_id → partial TaskMetrics (filled in as events arrive)
-    let mut task_starts: HashMap<String, (String, String)> = HashMap::new(); // task_id → (context_id, source)
+    let mut compactions_declined: Vec<CompactionDeclinedRecord> = Vec::new();
+    // Task ids seen on a `task_start`, so a `task_end` with no opening line is ignored rather
+    // than counted as a task.
+    let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
 
@@ -565,23 +579,26 @@ fn compute_metrics(
                     tokens_after: e.tokens_after,
                 });
             }
+            TraceEvent::CompactionDeclined(e) => {
+                compactions_declined.push(CompactionDeclinedRecord {
+                    turn: e.turn,
+                    tokens: e.tokens,
+                    reason: e.reason,
+                });
+            }
             TraceEvent::SessionEnd(e) => se = Some(e),
             TraceEvent::TaskStart(e) => {
-                task_starts.insert(e.task_id.clone(), (e.context_id, e.source));
+                task_starts.insert(e.task_id.clone());
             }
             TraceEvent::TaskEnd(e) => {
-                if let Some((context_id, source)) = task_starts.remove(&e.task_id) {
+                if task_starts.remove(&e.task_id) {
                     task_metrics.push(TaskMetrics {
                         task_id: e.task_id,
-                        context_id,
-                        source,
                         exit_status: e.exit_status,
                         duration_ms: e.duration_ms,
                         turns: e.turns,
                         input_tokens: e.input_tokens,
                         output_tokens: e.output_tokens,
-                        tool_calls: e.tool_calls,
-                        shell_calls: e.shell_calls,
                         reopen_count: e.reopen_count,
                     });
                 }
@@ -637,6 +654,7 @@ fn compute_metrics(
             skill_latencies_ms: skill_latencies,
             skill_call_records,
             compaction,
+            compactions_declined,
             reopens,
         },
         task_metrics,
@@ -1047,6 +1065,14 @@ fn print_show(m: &TraceMetrics) {
             fmt_thousands(c.tokens_before),
             fmt_thousands(c.tokens_after)
         ),
+    }
+    for d in &m.compactions_declined {
+        println!(
+            "declined:   at turn {}  ({} tokens)  {}",
+            d.turn,
+            fmt_thousands(d.tokens),
+            d.reason
+        );
     }
 
     if !m.reopens.is_empty() {

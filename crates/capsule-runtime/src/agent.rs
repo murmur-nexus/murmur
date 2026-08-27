@@ -45,6 +45,31 @@ pub(crate) struct AgentRunConfig {
     pub max_output_tokens: u32,
 }
 
+/// How one agent-loop attempt ended, for a caller that needs the outcome rather than just
+/// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
+/// share, so the same value reads the same wherever it lands in a trace.
+///
+/// `Ok(Failed)` and `Err(_)` are both failures and differ only in whether the loop could keep
+/// the session alive: the loop returns `Ok(Failed)` for an outcome it already recorded and
+/// reported to the model's caller (a driver error, an unsupported stop reason), and `Err` for
+/// one that ends the launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentLoopExit {
+    Ok,
+    Failed,
+    MaxTurnsReached,
+}
+
+impl AgentLoopExit {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::MaxTurnsReached => "max_turns_reached",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_loop(
     store_state: &mut CapsuleStoreState,
@@ -62,7 +87,7 @@ pub(crate) async fn run_agent_loop(
     version: &str,
     mode: ConversationMode,
     context_id: Option<String>,
-) -> Result<(), RuntimeError> {
+) -> Result<AgentLoopExit, RuntimeError> {
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
         // `store_state` (shared &) is threaded through so the process path can start the
@@ -112,12 +137,6 @@ pub(crate) async fn run_agent_loop(
         RuntimeError::AgentLoopFailed(format!("failed to serialize tool inventory: {e}"))
     })?;
     append_bootstrap_log(workdir, &format!("Installed tools (JSON):\n{tools_json}"));
-
-    let tools_declared: Vec<String> = tools
-        .iter()
-        .filter_map(|t| t.get("name").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect();
 
     // task.md lives in accessible_workdir (where the agent's own tools are preopened),
     // not workdir (the internal `.murmur/<session_id>` bookkeeping dir) — reading from
@@ -170,13 +189,9 @@ pub(crate) async fn run_agent_loop(
     let task_id_str = task_id.clone().unwrap_or_default();
 
     let max_turns = inference.max_turns;
-    // on-session-start / on-session-end hook dispatch now fires once per launch from
-    // runtime.rs (around the task loop), not per task here. The trace's own
-    // session_start/session_end markers remain per task.
-    trace
-        .write_session_start(max_turns, tools_declared)
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    // The trace's `session_start`/`session_end` frame and the `on-session-start`/
+    // `on-session-end` hook dispatch both fire once per launch, from runtime.rs around the
+    // task loop. This function runs one attempt of one task and writes neither.
     for turn in 0..max_turns as usize {
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
@@ -311,10 +326,6 @@ pub(crate) async fn run_agent_loop(
             record_result(hooks, workdir, &format!("error: {error_text}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
-            trace
-                .write_session_end("failed")
-                .await
-                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
             otel.emit_session_end("failed").await;
             if task_id.is_some() {
                 emit_sse(
@@ -334,7 +345,7 @@ pub(crate) async fn run_agent_loop(
                 )
                 .await;
             }
-            return Ok(());
+            return Ok(AgentLoopExit::Failed);
         }
 
         let raw = driver_result
@@ -436,10 +447,6 @@ pub(crate) async fn run_agent_loop(
             record_result(hooks, workdir, &format!("error: {error}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
-            trace
-                .write_session_end("failed")
-                .await
-                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
             otel.emit_session_end("failed").await;
             if task_id.is_some() {
                 emit_sse(
@@ -459,7 +466,7 @@ pub(crate) async fn run_agent_loop(
                 )
                 .await;
             }
-            return Ok(());
+            return Ok(AgentLoopExit::Failed);
         }
 
         // Persist (or drop) the driver's continuation state for this Turn BEFORE the compaction
@@ -501,9 +508,6 @@ pub(crate) async fn run_agent_loop(
                     record_result(hooks, workdir, &format!("error: {error}"))
                         .map_err(RuntimeError::AgentLoopFailed)?;
                     flush_hook_dispatch_faults(hooks, trace).await;
-                    trace.write_session_end("failed").await.map_err(|e| {
-                        RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
-                    })?;
                     otel.emit_session_end("failed").await;
                     if task_id.is_some() {
                         emit_sse(
@@ -523,7 +527,7 @@ pub(crate) async fn run_agent_loop(
                         )
                         .await;
                     }
-                    return Ok(());
+                    return Ok(AgentLoopExit::Failed);
                 }
             }
         }
@@ -549,9 +553,6 @@ pub(crate) async fn run_agent_loop(
                     )
                     .map_err(RuntimeError::AgentLoopFailed)?;
                     flush_hook_dispatch_faults(hooks, trace).await;
-                    trace.write_session_end("failed").await.map_err(|e| {
-                        RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
-                    })?;
                     otel.emit_session_end("failed").await;
                     if task_id.is_some() {
                         emit_sse(
@@ -571,7 +572,7 @@ pub(crate) async fn run_agent_loop(
                         )
                         .await;
                     }
-                    return Ok(());
+                    return Ok(AgentLoopExit::Failed);
                 }
 
                 let mut tool_messages = Vec::new();
@@ -656,6 +657,7 @@ pub(crate) async fn run_agent_loop(
                                     .write_tool_call(
                                         turn_u32,
                                         tool_name.clone(),
+                                        Some(tool_call_id.clone()),
                                         input.clone(),
                                         input_bytes,
                                         &text,
@@ -769,6 +771,7 @@ pub(crate) async fn run_agent_loop(
                                 .write_tool_call(
                                     turn_u32,
                                     tool_name.clone(),
+                                    Some(tool_call_id.clone()),
                                     input.clone(),
                                     input_bytes,
                                     &error,
@@ -859,9 +862,6 @@ pub(crate) async fn run_agent_loop(
                 }
 
                 flush_hook_dispatch_faults(hooks, trace).await;
-                trace.write_session_end("ok").await.map_err(|e| {
-                    RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
-                })?;
                 otel.emit_session_end("ok").await;
                 if let (Some(ref tid), Some((ref tx, ref buf))) = (&task_id, &sse) {
                     // Forward every hook artifact to the SSE stream before the completed event.
@@ -911,16 +911,13 @@ pub(crate) async fn run_agent_loop(
                     )
                     .await;
                 }
-                return Ok(());
+                return Ok(AgentLoopExit::Ok);
             }
             other => {
                 let error = format!("error: unsupported stop_reason '{other}'");
                 eprintln!("{error}");
                 record_result(hooks, workdir, &error).map_err(RuntimeError::AgentLoopFailed)?;
                 flush_hook_dispatch_faults(hooks, trace).await;
-                trace.write_session_end("failed").await.map_err(|e| {
-                    RuntimeError::AgentLoopFailed(format!("trace write failed: {e}"))
-                })?;
                 otel.emit_session_end("failed").await;
                 if task_id.is_some() {
                     emit_sse(
@@ -940,7 +937,7 @@ pub(crate) async fn run_agent_loop(
                     )
                     .await;
                 }
-                return Ok(());
+                return Ok(AgentLoopExit::Failed);
             }
         }
     }
@@ -952,10 +949,6 @@ pub(crate) async fn run_agent_loop(
     )
     .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
-    trace
-        .write_session_end("max_turns_reached")
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
     otel.emit_session_end("max_turns_reached").await;
     if task_id.is_some() {
         emit_sse(
@@ -975,7 +968,7 @@ pub(crate) async fn run_agent_loop(
         )
         .await;
     }
-    Ok(())
+    Ok(AgentLoopExit::MaxTurnsReached)
 }
 
 /// Write every `run-inference` record a hook has buffered since the last flush
@@ -1143,6 +1136,54 @@ fn dump_compaction_summary(
         .map_err(|e| format!("failed to write compaction summary: {e}"))
 }
 
+/// Whether a candidate message list has a tool call and a tool result that do not pair up.
+///
+/// An `assistant` message's `tool_call` blocks and a `tool` message's `tool_call_id` only
+/// round-trip through a compaction hook independently of each other — one side can survive
+/// (verbatim content, or the `TOOL_MARKER` wrapper) while its pair is dropped or summarized
+/// away. Either direction of mismatch produces the same class of malformed request, so both
+/// answer `true` here: a `tool_call` with no answer, and an answer with no matching
+/// `tool_call`. The caller's remedy is the same either way — discard the whole compaction
+/// result and keep the original, larger, valid history.
+fn has_unresolved_tool_call(messages: &[Value]) -> bool {
+    let issued: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_call"))
+        .filter_map(|b| b.get("id").and_then(Value::as_str))
+        .collect();
+    let answered: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|m| m.get("tool_call_id").and_then(Value::as_str))
+        .collect();
+    issued != answered
+}
+
+/// Write the `compaction_declined` record for a threshold crossing that left the context
+/// alone. Same non-fatal contract as the committed path's `compaction` write: a trace failure
+/// here goes to `bootstrap.log` and the session continues over budget, because refusing to
+/// record the decline is not a reason to end a session that is otherwise still running.
+async fn record_compaction_declined(
+    trace: &mut TraceWriter,
+    workdir: &Path,
+    turn: u32,
+    tokens: u32,
+    reason: &str,
+) {
+    if let Err(e) = trace
+        .write_compaction_declined(turn, u64::from(tokens), reason)
+        .await
+    {
+        append_bootstrap_log(
+            workdir,
+            &format!("[compaction] trace write failed: {e}; continuing"),
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_compact_via_hooks(
     messages: &mut Vec<Value>,
@@ -1221,37 +1262,32 @@ async fn try_compact_via_hooks(
             workdir,
             "[compaction] threshold reached but no hook returned replace-context; continuing without compaction",
         );
+        record_compaction_declined(
+            trace,
+            workdir,
+            turn_u32,
+            tokens_before,
+            crate::trace::COMPACTION_DECLINED_NO_HOOK_REPLACEMENT,
+        )
+        .await;
         return Ok(());
     };
 
     let candidate_messages: Vec<Value> = reconstruct_compacted_messages(new_wit_messages);
 
-    // Safety net: an "assistant" message's tool_call blocks and a "tool" message's
-    // tool_call_id only round-trip independently of each other — one side can survive
-    // compaction (verbatim content, or our TOOL_MARKER wrapper) while its pair is dropped
-    // or summarized away. Either direction of mismatch (a tool_call with no answer, or an
-    // answer with no matching tool_call) produces the same class of malformed request.
-    // Rather than try to surgically repair the pairing, discard the whole compaction
-    // result and keep the original (larger, valid) history when either happens.
-    let issued_tool_call_ids: std::collections::HashSet<&str> = candidate_messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .filter_map(|m| m.get("content").and_then(Value::as_array))
-        .flatten()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_call"))
-        .filter_map(|b| b.get("id").and_then(Value::as_str))
-        .collect();
-    let answered_tool_call_ids: std::collections::HashSet<&str> = candidate_messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-        .filter_map(|m| m.get("tool_call_id").and_then(Value::as_str))
-        .collect();
-    let has_mismatched_tool_call = issued_tool_call_ids != answered_tool_call_ids;
-    if has_mismatched_tool_call {
+    if has_unresolved_tool_call(&candidate_messages) {
         append_bootstrap_log(
             workdir,
             "[compaction] compacted result has an unresolved tool_call; continuing without compaction",
         );
+        record_compaction_declined(
+            trace,
+            workdir,
+            turn_u32,
+            tokens_before,
+            crate::trace::COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1272,7 +1308,6 @@ async fn try_compact_via_hooks(
     // taken twice — the reported drop is the saving the provider actually sees.
     *session_tokens = occupancy.count(messages);
     store_state.clear_continuation();
-    let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
     if let Err(e) = trace
         .write_compaction(
@@ -2555,5 +2590,74 @@ mod tests {
             .join("out")
             .join("compaction-summaries.jsonl")
             .exists());
+    }
+
+    // ── Compaction tool-call pairing ─────────────────────────────────────────
+
+    fn assistant_with_tool_call(id: &str) -> Value {
+        json!({
+            "role": "assistant",
+            "content": [{"type": "tool_call", "id": id, "name": "bash", "input": {}}],
+        })
+    }
+
+    fn tool_result_for(id: &str) -> Value {
+        json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "is_error": false,
+            "content": [{"type": "text", "text": "ok"}],
+        })
+    }
+
+    /// Both directions of mismatch are the same defect to the driver, so both answer `true`:
+    /// a tool call nothing answered, and an answer to a tool call that is no longer there.
+    #[test]
+    fn unresolved_tool_call_detected_in_both_directions() {
+        assert!(
+            has_unresolved_tool_call(&[assistant_with_tool_call("toolu_1")]),
+            "a tool_call with no matching tool message is unresolved"
+        );
+        assert!(
+            has_unresolved_tool_call(&[tool_result_for("toolu_1")]),
+            "a tool message with no matching tool_call is unresolved"
+        );
+        assert!(
+            has_unresolved_tool_call(&[
+                assistant_with_tool_call("toolu_1"),
+                tool_result_for("toolu_2"),
+            ]),
+            "ids that do not correspond are unresolved in both directions at once"
+        );
+    }
+
+    /// A candidate whose two sets agree passes, including one carrying no tool calls at all —
+    /// the single summary message a compaction hook usually returns.
+    #[test]
+    fn paired_tool_calls_and_plain_summaries_are_resolved() {
+        assert!(!has_unresolved_tool_call(&[]));
+        assert!(!has_unresolved_tool_call(&[json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "summary of the conversation so far"}],
+        })]));
+        assert!(!has_unresolved_tool_call(&[
+            assistant_with_tool_call("toolu_1"),
+            tool_result_for("toolu_1"),
+        ]));
+        assert!(!has_unresolved_tool_call(&[
+            assistant_with_tool_call("toolu_1"),
+            assistant_with_tool_call("toolu_2"),
+            tool_result_for("toolu_2"),
+            tool_result_for("toolu_1"),
+        ]));
+    }
+
+    /// The strings that reach `task_end.exit_status` and `session_end.exit_status` are the
+    /// vocabulary those fields already used — a reader must not have to learn a second one.
+    #[test]
+    fn agent_loop_exit_maps_to_the_recorded_exit_status_strings() {
+        assert_eq!(AgentLoopExit::Ok.as_str(), "ok");
+        assert_eq!(AgentLoopExit::Failed.as_str(), "failed");
+        assert_eq!(AgentLoopExit::MaxTurnsReached.as_str(), "max_turns_reached");
     }
 }

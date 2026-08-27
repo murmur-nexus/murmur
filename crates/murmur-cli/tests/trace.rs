@@ -102,6 +102,54 @@ fn parse_events(workdir: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
+/// Every non-null `parent_id` in file order must name an `event_id` written earlier in the
+/// same file, and every `event_id` must be a distinct, well-formed `evt_` id. Panics with the
+/// offending line when either fails — this is the invariant that makes the file walkable.
+fn assert_walkable_tree(events: &[Value]) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, event) in events.iter().enumerate() {
+        let event_id = event["event_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("event {i} has no event_id: {event}"));
+        assert!(
+            event_id.len() == 36
+                && event_id.starts_with("evt_")
+                && event_id[4..]
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "event {i} has a malformed event_id {event_id:?}"
+        );
+        assert!(
+            seen.insert(event_id.to_string()),
+            "event {i} reuses event_id {event_id:?}"
+        );
+        assert!(
+            event.get("parent_id").is_some(),
+            "event {i} has no parent_id key: {event}"
+        );
+        if let Some(parent) = event["parent_id"].as_str() {
+            assert!(
+                seen.contains(parent),
+                "event {i} names parent_id {parent:?}, which appears nowhere earlier: {event}"
+            );
+        }
+    }
+}
+
+fn find<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|e| e["event_type"] == event_type)
+        .unwrap_or_else(|| panic!("trace must contain a {event_type} event"))
+}
+
+fn count_of(events: &[Value], event_type: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| e["event_type"] == event_type)
+        .count()
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// Happy-path two-turn session: tool_call (bash) then end_turn.
@@ -138,17 +186,17 @@ fn trace_two_turn_session_all_event_types() {
     let events = parse_events(&workdir);
     assert!(!events.is_empty(), "trace.jsonl must not be empty");
 
-    // ── Outer frame is the task lifecycle: task_start first, task_end last.
-    //    The session lifecycle (session_start/session_end) is nested inside. ──
+    // ── Outer frame is the launch: one session_start first, one session_end last,
+    //    with the task lifecycle nested inside. ──
     assert_eq!(
         events.first().unwrap()["event_type"],
-        "task_start",
-        "first event must be task_start"
+        "session_start",
+        "first event must be session_start"
     );
     assert_eq!(
         events.last().unwrap()["event_type"],
-        "task_end",
-        "last event must be task_end"
+        "session_end",
+        "last event must be session_end"
     );
 
     // ── All event types present ──
@@ -315,6 +363,95 @@ fn trace_two_turn_session_all_event_types() {
         se.get("totalTurns").is_none(),
         "must NOT have camelCase totalTurns"
     );
+
+    // ── Every line is identified and parents to an earlier line ──
+    assert_walkable_tree(&events);
+
+    let session_node = ss["event_id"].as_str().unwrap();
+    assert!(
+        ss["parent_id"].is_null(),
+        "session_start is the root and parents to nothing"
+    );
+
+    let ts = find(&events, "task_start");
+    assert_eq!(
+        ts["parent_id"], session_node,
+        "task_start must parent to the session node"
+    );
+    let task_node = ts["event_id"].as_str().unwrap();
+
+    let te = find(&events, "task_end");
+    assert_eq!(
+        te["parent_id"], task_node,
+        "task_end must parent to its task_start"
+    );
+    assert_eq!(
+        se["parent_id"], session_node,
+        "session_end must parent to the session node"
+    );
+
+    // tool_call and shell hang off the inference line of their own turn.
+    let tool = find(&events, "tool_call");
+    let shell = find(&events, "shell");
+    let turn_node = events
+        .iter()
+        .find(|e| {
+            e["event_type"] == "inference" && e["turn"] == tool["turn"] && e["origin"].is_null()
+        })
+        .expect("the tool call's turn must have an agent-loop inference line");
+    assert_eq!(
+        tool["parent_id"], turn_node["event_id"],
+        "tool_call must parent to its turn's inference"
+    );
+    assert_eq!(
+        shell["parent_id"], turn_node["event_id"],
+        "shell must parent to its turn's inference"
+    );
+
+    // ── Every turn-level line inside the task carries its task_id ──
+    let task_id = ts["task_id"].as_str().unwrap();
+    for event in &events {
+        let ty = event["event_type"].as_str().unwrap();
+        if matches!(
+            ty,
+            "inference" | "tool_call" | "shell" | "skill_call" | "compaction"
+        ) {
+            assert_eq!(
+                event["task_id"], task_id,
+                "{ty} written inside the task must carry the task's id: {event}"
+            );
+        }
+    }
+
+    // ── The provider's own id for the call is recorded verbatim ──
+    assert_eq!(
+        tool["tool_call_id"], "toolu_1",
+        "tool_call must carry the provider's tool_call_id"
+    );
+
+    // ── Exactly one frame, with the task pair strictly inside it ──
+    assert_eq!(count_of(&events, "session_start"), 1);
+    assert_eq!(count_of(&events, "session_end"), 1);
+    assert_eq!(count_of(&events, "task_start"), 1);
+    assert_eq!(count_of(&events, "task_end"), 1);
+    let index_of = |ty: &str| events.iter().position(|e| e["event_type"] == ty).unwrap();
+    assert!(
+        index_of("session_start") < index_of("task_start")
+            && index_of("task_end") < index_of("session_end"),
+        "the task pair must sit strictly inside the session frame"
+    );
+    assert_eq!(
+        se["total_turns"].as_u64().unwrap() as usize,
+        count_of(&events, "inference")
+    );
+    assert_eq!(
+        se["total_tool_calls"].as_u64().unwrap() as usize,
+        count_of(&events, "tool_call")
+    );
+    assert_eq!(
+        se["total_shell_calls"].as_u64().unwrap() as usize,
+        count_of(&events, "shell")
+    );
 }
 
 /// Session without hook artifacts still produces trace.jsonl.
@@ -346,10 +483,12 @@ fn trace_written_without_hook_artifacts() {
 
     let events = parse_events(&workdir);
     assert!(!events.is_empty(), "trace must not be empty");
-    assert_eq!(events.first().unwrap()["event_type"], "task_start");
-    assert_eq!(events.last().unwrap()["event_type"], "task_end");
-    // exit_status is recorded on the task_end frame too.
+    assert_eq!(events.first().unwrap()["event_type"], "session_start");
+    assert_eq!(events.last().unwrap()["event_type"], "session_end");
     assert_eq!(events.last().unwrap()["exit_status"], "ok");
+    // exit_status is recorded on the task frame too.
+    assert_eq!(find(&events, "task_end")["exit_status"], "ok");
+    assert_walkable_tree(&events);
 }
 
 /// session_end is written even when the session exits with "failed" status.
@@ -389,28 +528,29 @@ fn trace_session_end_written_on_failed_exit() {
     );
 
     let events = parse_events(&workdir);
-    // task_start must be first
+    assert_walkable_tree(&events);
+
+    // One session frame per launch, closed on the failing exit path.
     assert_eq!(
-        events.first().unwrap()["event_type"],
-        "task_start",
-        "task_start must be first event"
+        count_of(&events, "session_end"),
+        1,
+        "session_end must appear exactly once"
     );
-    // task_end must be last (regardless of how the failure manifests)
+    let se = events.last().unwrap();
     assert_eq!(
-        events.last().unwrap()["event_type"],
-        "task_end",
-        "task_end must be last event even on failure"
+        se["event_type"], "session_end",
+        "session_end must be the last event even on failure"
+    );
+    assert_eq!(
+        se["exit_status"], "failed",
+        "the launch's exit_status must be failed"
     );
 
-    // The session_end frame records the non-ok exit_status and the totals.
-    let se = events
-        .iter()
-        .find(|e| e["event_type"] == "session_end")
-        .unwrap();
-    let exit_status = se["exit_status"].as_str().unwrap();
+    // task_end carries the attempt's own terminal status, not the launch's.
     assert_ne!(
-        exit_status, "ok",
-        "exit_status must not be ok on failed session"
+        find(&events, "task_end")["exit_status"],
+        "ok",
+        "task_end must report the attempt's own failure, not a coarse ok"
     );
 
     // Count consistency still holds
