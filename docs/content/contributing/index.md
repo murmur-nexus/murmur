@@ -100,16 +100,28 @@ Both are unset on a development machine, so `cargo test --workspace` stays fast 
 checkout anywhere. The `cross-repo-integration` workflow sets both: it checks out
 `murmur-nexus/default-artifacts` beside this repository and runs
 `cargo test -p murmur-cli --test corpus_state -- --ignored`, so a pipeline that would have skipped
-those tests fails instead of passing having run nothing. Write a further cross-repository test
-against the same pair — reach the checkout through
-`common::default_artifacts_dir_or_skip(test_name)`, and report a checkout that is present but out
-of which a fixture could not be built through `common::skip_or_fail(test_name, reason)`. Both skip
-with a `[SKIP] <test name>: ` line when `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` is unset and panic when
-it is set.
+those tests fails instead of passing having run nothing.
+
+Write a further cross-repository test against the same pair by reaching for the checkout through
+one of two helpers in `crates/murmur-cli/tests/common/mod.rs`:
+
+- `common::default_artifacts_dir_or_skip(test_name)` — returns the checkout root, for a test that
+  cannot run without one.
+- `common::skip_or_fail(test_name, reason)` — for a checkout that is present but out of which a
+  fixture could not be built.
+
+Both print a `[SKIP] <test name>: ` line when `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` is unset and panic
+when it is set. Keep the test's `#[ignore]` attribute either way.
+
+Read anything the sibling owns — an artifact's version, the shape of its configuration — out of the
+checkout at run time rather than writing it as a literal in the test. These tests build that
+repository's default branch, so a copy is correct only until its next release, and the failure
+lands on `main` where nobody is watching.
 
 CI runs the full workspace suite, including both beta CLI surfaces, on every push and pull
-request. Tests that need a delegated cgroup v2 scope skip themselves with a
-`[SKIP-CGROUP]`-prefixed line instead of failing, since a CI runner cannot provide one; the job's
+request. Tests that need a host able to isolate a capsule — a delegated cgroup v2 scope, or a
+capsule network namespace — skip themselves with a `[SKIP-HOST]`-prefixed line instead of failing,
+since a CI runner provides neither; the job's
 step summary reports how many tests were skipped for that reason and points at
 `docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
 
