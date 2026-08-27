@@ -113,63 +113,6 @@ pub fn default_artifacts_dir() -> Option<PathBuf> {
     std::env::var_os("MURMUR_DEFAULT_ARTIFACTS_DIR").map(PathBuf::from)
 }
 
-/// Whether a missing or unusable `default-artifacts` checkout is a failure rather than a skip.
-///
-/// True when `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` holds a non-empty value that is not `0`; false
-/// when the variable is unset, empty, or exactly `0`.
-///
-/// The pair is two variables rather than one because they answer different questions:
-/// `MURMUR_DEFAULT_ARTIFACTS_DIR` says where the sibling checkout is, and this one says whether a
-/// run that cannot find it may still report success. A laptop leaves it unset and the suite stays
-/// fast and green with no checkout; the job that exists to run these tests sets it, so a pipeline
-/// that would have skipped them goes red instead of green having run nothing.
-pub fn default_artifacts_required() -> bool {
-    std::env::var_os("MURMUR_REQUIRE_DEFAULT_ARTIFACTS")
-        .is_some_and(|value| !value.is_empty() && value != "0")
-}
-
-/// Root of the `default-artifacts` checkout for a test that cannot run without one, or `None`
-/// for the caller to turn into a `return`.
-///
-/// Panics instead of returning `None` when [`default_artifacts_required`] is true: under that
-/// variable a run with no checkout is the failure the strict mode exists to catch, and the panic
-/// names the test so a red job says which one could not run.
-///
-/// `test_name` is the test function's own name, which is what the printed line and the panic
-/// identify; it is passed rather than derived because a test binary cannot see its own function
-/// names at runtime.
-pub fn default_artifacts_dir_or_skip(test_name: &str) -> Option<PathBuf> {
-    if let Some(dir) = default_artifacts_dir() {
-        return Some(dir);
-    }
-    assert!(
-        !default_artifacts_required(),
-        "{test_name} cannot run: MURMUR_REQUIRE_DEFAULT_ARTIFACTS is set, so a missing \
-         default-artifacts checkout is a failure rather than a skip, but \
-         MURMUR_DEFAULT_ARTIFACTS_DIR is unset. In CI this means the default-artifacts checkout \
-         step did not run or did not export MURMUR_DEFAULT_ARTIFACTS_DIR."
-    );
-    eprintln!(
-        "[SKIP] {test_name}: set MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-    );
-    None
-}
-
-/// Report a prerequisite that is present but unusable — a checkout that exists but out of which
-/// the fixture could not be built — as a skip, or as a panic under [`default_artifacts_required`].
-///
-/// `reason` completes the sentence `[SKIP] <test_name>: ` and so reads as a statement of what
-/// could not be done, e.g. `the corpus component could not be built from /path/to/checkout`.
-/// Returns so the caller can `return` itself; it does not end the test on its own.
-pub fn skip_or_fail(test_name: &str, reason: &str) {
-    assert!(
-        !default_artifacts_required(),
-        "{test_name} cannot run: MURMUR_REQUIRE_DEFAULT_ARTIFACTS is set, so an unusable \
-         default-artifacts checkout is a failure rather than a skip: {reason}"
-    );
-    eprintln!("[SKIP] {test_name}: {reason}");
-}
-
 /// Name of the fixture native tool crate under `tests/fixtures/native-tool/`,
 /// used both as the artifact name and as the binary name inside `bin/`.
 pub const FIXTURE_NATIVE_TOOL_NAME: &str = "murmur-tool-fixture";
