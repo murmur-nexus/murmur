@@ -9,8 +9,9 @@
 //!    `STATE_DIR`, both of which are the bare string `state`;
 //! 2. the store name `capabilities.state: {}` defaults to, which is the capsule's name and not the
 //!    artifact's;
-//! 3. where `corpus.config.json` resolves — inside the `0700` directory the runtime created, which
-//!    is what puts it out of the agent's reach;
+//! 3. how the operator's configuration reaches the tool — the `config:` block on its entry in the
+//!    capsule's own manifest, lowered by the runtime into the guest environment on that
+//!    artifact's grant alone, which is what puts it out of the agent's reach;
 //! 4. what a missing grant produces — `state_unavailable`, rather than a corpus quietly written
 //!    into the session workdir.
 //!
@@ -23,7 +24,9 @@
 //! The corpus component is built from the `default-artifacts` checkout named by
 //! `MURMUR_DEFAULT_ARTIFACTS_DIR` on every run, and no copy of it is committed here: a checked-in
 //! copy of a third-party artifact goes stale silently, and a proof against a stale copy says
-//! nothing about the corpus that ships. Unset variable means skip.
+//! nothing about the corpus that ships. Unset variable means skip, unless
+//! `MURMUR_REQUIRE_DEFAULT_ARTIFACTS` is set: that turns both skip paths here into failures, so
+//! the job that exists to run these three cannot report success having run none of them.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -36,6 +39,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use murmur_artifact::Manifest;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use zip::{
@@ -44,18 +48,19 @@ use zip::{
 };
 
 const TOOL_NAME: &str = "murmur-tool-corpus";
-const TOOL_VERSION: &str = "0.1.0";
 const DRIVER_NAME: &str = "murmur-driver-anthropic";
 const DRIVER_VERSION: &str = "0.1.4";
 
-/// The corpus's own file names, relative to the state directory. Repeated here rather than
-/// imported because this crate does not depend on the corpus: these two literals are half of what
-/// the test is checking, so a copy that drifts is the failure it is meant to catch.
+/// The corpus's own file name, relative to the state directory. Repeated here rather than
+/// imported because this crate does not depend on the corpus: this literal is half of what the
+/// test is checking, so a copy that drifts is the failure it is meant to catch.
 const CORPUS_FILE: &str = "corpus.jsonl";
-const CONFIG_FILE: &str = "corpus.config.json";
 
-/// The operator configuration every scenario that expects a working corpus writes into the store
-/// before the first launch, exactly as an operator would.
+/// The operator configuration every scenario that expects a working corpus declares on the tool's
+/// entry in the capsule manifest, exactly as an operator would.
+///
+/// Compact JSON rather than a YAML block because JSON is YAML: spliced into the manifest it is a
+/// flow mapping, and the runtime lowers it back to the same bytes it arrived as.
 ///
 /// One type, `note`, whose derived three-letter id prefix (`not`) collides with none of the
 /// reserved runtime prefixes, so no `prefix_map` override is needed. `read_recent` and `search`
@@ -117,6 +122,20 @@ fn corpus_component(checkout: &Path) -> Option<PathBuf> {
     Some(wasm)
 }
 
+/// The version the corpus's own `murmur.yaml` declares.
+///
+/// Read from the checkout rather than pinned here, because `mur publish` takes the version from
+/// the manifest inside the archive: a literal in this file names what the capsule asks for but not
+/// what the store holds, so the two agree only until that repository's next release, and this
+/// suite builds against its default branch by design.
+fn manifest_version(manifest_bytes: &[u8]) -> String {
+    let yaml = std::str::from_utf8(manifest_bytes)
+        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml is not UTF-8: {err}"));
+    Manifest::from_yaml_str(yaml)
+        .unwrap_or_else(|err| panic!("{TOOL_NAME}'s murmur.yaml does not parse: {err}"))
+        .version
+}
+
 /// Pack the corpus as a `runtime: tool` artifact: its own `murmur.yaml` verbatim at the archive
 /// root, and the component beside it under the name `requires_files` declares.
 ///
@@ -125,8 +144,13 @@ fn corpus_component(checkout: &Path) -> Option<PathBuf> {
 /// bundled `capabilities:` block — the last of which is what Scenarios B and C show grants
 /// nothing on its own. `select_root_wasm_in_archive` picks the single root `.wasm`, so the
 /// underscored file name is the entry name.
-fn create_corpus_artifact(dir: &Path, manifest_bytes: &[u8], wasm: &Path) -> PathBuf {
-    let artifact_path = dir.join(format!("{TOOL_NAME}-{TOOL_VERSION}.mur.zip"));
+fn create_corpus_artifact(
+    dir: &Path,
+    manifest_bytes: &[u8],
+    tool_version: &str,
+    wasm: &Path,
+) -> PathBuf {
+    let artifact_path = dir.join(format!("{TOOL_NAME}-{tool_version}.mur.zip"));
     let mut zip = ZipWriter::new(fs::File::create(&artifact_path).unwrap());
     let options: SimpleFileOptions =
         FileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -146,6 +170,8 @@ fn create_corpus_artifact(dir: &Path, manifest_bytes: &[u8], wasm: &Path) -> Pat
 struct Staging {
     home: TempDir,
     project: TempDir,
+    /// The corpus version this staging published, for the manifest rewrites that follow.
+    tool_version: String,
     /// Where the packed `.mur.zip`s live. Held only to keep the directory alive.
     _artifacts: TempDir,
 }
@@ -162,18 +188,6 @@ impl Staging {
 
     fn state_root(&self) -> PathBuf {
         self.home.path().join(".murmur/state")
-    }
-
-    /// Write the operator's configuration into a store, creating the store as an operator would.
-    ///
-    /// `ensure_state_store` is idempotent and re-asserts `0700` over whatever it finds, so a store
-    /// prepared here is the same store a launch would have made.
-    fn write_operator_config(&self, store: &str) -> PathBuf {
-        let dir = self.store_dir(store);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONFIG_FILE);
-        fs::write(&path, OPERATOR_CONFIG).unwrap();
-        path
     }
 
     /// Non-empty lines in a store's corpus file.
@@ -198,13 +212,21 @@ impl Staging {
 /// project store: the first is what a staged session resolves against, the second is what a `mur
 /// run` CLI invocation resolves against, and installing into only one produces `E-RUN-008` at
 /// launch.
-fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Option<Staging> {
+fn stage(
+    checkout: &Path,
+    capsule_name: &str,
+    state_yaml: Option<&str>,
+    tool_config: Option<&str>,
+) -> Option<Staging> {
     let wasm = corpus_component(checkout)?;
+    let manifest_bytes = fs::read(checkout.join("tools/murmur-tool-corpus/murmur.yaml")).unwrap();
+    let tool_version = manifest_version(&manifest_bytes);
 
     let staging = Staging {
         home: tempfile::tempdir().unwrap(),
         project: tempfile::tempdir().unwrap(),
         _artifacts: tempfile::tempdir().unwrap(),
+        tool_version: tool_version.clone(),
     };
 
     // A placeholder endpoint, so `mur install` can find the project root before any server is
@@ -212,13 +234,16 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
     write_manifest(
         staging.project.path(),
         capsule_name,
+        &tool_version,
         "http://127.0.0.1:1",
         state_yaml,
+        tool_config,
     );
 
     let corpus_artifact = create_corpus_artifact(
         staging._artifacts.path(),
-        &fs::read(checkout.join("tools/murmur-tool-corpus/murmur.yaml")).unwrap(),
+        &manifest_bytes,
+        &tool_version,
         &wasm,
     );
     let driver_artifact = common::create_driver_artifact(
@@ -237,14 +262,23 @@ fn stage(checkout: &Path, capsule_name: &str, state_yaml: Option<&str>) -> Optio
 }
 
 /// Write the capsule manifest, pointing inference at `endpoint` and allowing it on the network.
+///
+/// `tool_config` is the operator's block for the corpus entry, and `None` leaves the entry with no
+/// `config:` key at all — an absent declaration, which is what the tool reports as
+/// `config_missing`, rather than an empty one.
 fn write_manifest(
     project: &Path,
     capsule_name: &str,
+    tool_version: &str,
     endpoint: &str,
     state_yaml: Option<&str>,
+    tool_config: Option<&str>,
 ) -> PathBuf {
     let capabilities = state_yaml
         .map(|yaml| format!("    capabilities:\n      state:{yaml}\n"))
+        .unwrap_or_default();
+    let config = tool_config
+        .map(|json| format!("    config: {json}\n"))
         .unwrap_or_default();
 
     let manifest = project.join("murmur.yaml");
@@ -253,7 +287,7 @@ fn write_manifest(
         format!(
             "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    \
              version: {DRIVER_VERSION}\n    runtime: driver\n  - name: {TOOL_NAME}\n    version: \
-             {TOOL_VERSION}\n    runtime: tool\n{capabilities}capabilities:\n  network:\n    \
+             {tool_version}\n    runtime: tool\n{capabilities}{config}capabilities:\n  network:\n    \
              allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: \
              {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: \
              {DRIVER_NAME}\n"
@@ -367,7 +401,7 @@ fn assert_workdir_holds_no_corpus(workdir: &Path) {
                 entry.path().display()
             );
             assert!(
-                !(name == CORPUS_FILE || name == CONFIG_FILE),
+                name != CORPUS_FILE,
                 "the corpus must never write into a session workdir: {}",
                 entry.path().display()
             );
@@ -405,27 +439,26 @@ fn assert_store_is_private(staging: &Staging, store: &str) {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn corpus_records_survive_into_a_second_session() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] corpus_records_survive_into_a_second_session: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) =
+        common::default_artifacts_dir_or_skip("corpus_records_survive_into_a_second_session")
+    else {
         return;
     };
     let Some(staging) = stage(
         &checkout,
         "corpus-proof-capsule",
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     ) else {
-        eprintln!(
-            "[SKIP] corpus_records_survive_into_a_second_session: the corpus component could not \
-             be built from {}",
-            checkout.display()
+        common::skip_or_fail(
+            "corpus_records_survive_into_a_second_session",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };
-
-    let config = staging.write_operator_config("corpus-proof");
 
     // Session one: two appends the session never reads back.
     let first_server = common::ScriptedServer::start(vec![
@@ -450,8 +483,10 @@ fn corpus_records_survive_into_a_second_session() {
     write_manifest(
         staging.project.path(),
         "corpus-proof-capsule",
+        &staging.tool_version,
         &first_server.endpoint,
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     );
     let first_workdir = run_session(&staging.home, &staging.manifest(), "Record two notes.");
 
@@ -478,8 +513,10 @@ fn corpus_records_survive_into_a_second_session() {
     write_manifest(
         staging.project.path(),
         "corpus-proof-capsule",
+        &staging.tool_version,
         &second_server.endpoint,
         Some("\n        store: corpus-proof"),
+        Some(OPERATOR_CONFIG),
     );
     let second_workdir = run_session(&staging.home, &staging.manifest(), "Find the notes.");
 
@@ -516,11 +553,6 @@ fn corpus_records_survive_into_a_second_session() {
     // Reading is not writing: two sessions in, the corpus is still the two lines session one left.
     assert_eq!(staging.corpus_lines("corpus-proof").len(), 2);
     assert_store_is_private(&staging, "corpus-proof");
-    assert_eq!(
-        fs::read_to_string(&config).unwrap(),
-        OPERATOR_CONFIG,
-        "the operator's configuration is not the agent's to rewrite"
-    );
     for workdir in [&first_workdir, &second_workdir] {
         assert_workdir_holds_no_corpus(workdir);
     }
@@ -538,24 +570,22 @@ fn corpus_records_survive_into_a_second_session() {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn an_undeclared_store_name_defaults_to_the_capsule_name() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] an_undeclared_store_name_defaults_to_the_capsule_name: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) = common::default_artifacts_dir_or_skip(
+        "an_undeclared_store_name_defaults_to_the_capsule_name",
+    ) else {
         return;
     };
     let capsule = "corpus-default-capsule";
-    let Some(staging) = stage(&checkout, capsule, Some(" {}")) else {
-        eprintln!(
-            "[SKIP] an_undeclared_store_name_defaults_to_the_capsule_name: the corpus component \
-             could not be built from {}",
-            checkout.display()
+    let Some(staging) = stage(&checkout, capsule, Some(" {}"), Some(OPERATOR_CONFIG)) else {
+        common::skip_or_fail(
+            "an_undeclared_store_name_defaults_to_the_capsule_name",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };
-
-    staging.write_operator_config(capsule);
 
     let server = common::ScriptedServer::start(vec![
         tool_use_response(
@@ -571,8 +601,10 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
     write_manifest(
         staging.project.path(),
         capsule,
+        &staging.tool_version,
         &server.endpoint,
         Some(" {}"),
+        Some(OPERATOR_CONFIG),
     );
     run_session(&staging.home, &staging.manifest(), "Record one note.");
 
@@ -611,19 +643,19 @@ fn an_undeclared_store_name_defaults_to_the_capsule_name() {
 #[test]
 #[ignore = "requires a default-artifacts checkout; set MURMUR_DEFAULT_ARTIFACTS_DIR"]
 fn every_operation_refuses_without_the_state_grant() {
-    let Some(checkout) = common::default_artifacts_dir() else {
-        eprintln!(
-            "[SKIP] every_operation_refuses_without_the_state_grant: set \
-             MURMUR_DEFAULT_ARTIFACTS_DIR to a default-artifacts checkout"
-        );
+    let Some(checkout) =
+        common::default_artifacts_dir_or_skip("every_operation_refuses_without_the_state_grant")
+    else {
         return;
     };
     let capsule = "corpus-ungranted-capsule";
-    let Some(staging) = stage(&checkout, capsule, None) else {
-        eprintln!(
-            "[SKIP] every_operation_refuses_without_the_state_grant: the corpus component could \
-             not be built from {}",
-            checkout.display()
+    let Some(staging) = stage(&checkout, capsule, None, None) else {
+        common::skip_or_fail(
+            "every_operation_refuses_without_the_state_grant",
+            &format!(
+                "the corpus component could not be built from {}",
+                checkout.display()
+            ),
         );
         return;
     };
@@ -652,7 +684,14 @@ fn every_operation_refuses_without_the_state_grant() {
     responses.push(end_turn_response("every call refused"));
 
     let server = common::ScriptedServer::start(responses);
-    write_manifest(staging.project.path(), capsule, &server.endpoint, None);
+    write_manifest(
+        staging.project.path(),
+        capsule,
+        &staging.tool_version,
+        &server.endpoint,
+        None,
+        None,
+    );
 
     // The tool refuses; it neither traps nor fails the session.
     let workdir = run_session(&staging.home, &staging.manifest(), "Try every operation.");
