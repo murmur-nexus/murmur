@@ -24,29 +24,55 @@ package murmur:conversation@0.1.0;
 /// process` (whose CLI owns its own conversation and puts no message list in
 /// front of the model), there is no record: the read succeeds with an empty
 /// page rather than failing.
+///
+/// # The tool-message envelope
+///
+/// A message whose `role` is `"tool"` reaches a reader with its `content`
+/// replaced by a JSON object, because a tool result carries more than the one
+/// string `content` has room for. Its keys:
+///
+/// - `__murmur_tool_msg__`: always `true`, and what marks the envelope.
+/// - `tool_call_id`: the call this result answers, or `null`.
+/// - `is_error`: whether that call failed, or `null`.
+/// - `body`: the tool result as the runtime holds it.
+///
+/// A reader has to handle it. It is the same encoding a compaction hook already
+/// receives on `murmur:hook/lifecycle`'s `message` — one encoding, in both
+/// places.
 interface read {
     use murmur:hook/lifecycle@0.6.0.{message};
 
     /// One page of the record, newest first.
     record message-page {
         /// The page's messages, `messages[0]` being the most recently appended
-        /// one. Every message carries the `id` its record line holds.
+        /// one. Every message carries the `id` its record line holds, and a
+        /// message whose `role` is `"tool"` carries the envelope this
+        /// interface's doc describes.
         messages: list<message>,
         /// Cursor for the next (older) page, or `none` when this page reached
         /// the oldest message in the record.
         next-cursor: option<string>,
-        /// Parseable messages in the whole record, not in this page. A record
-        /// line that is not a message is skipped and not counted.
+        /// Parseable messages in the whole record at the moment this page was
+        /// served, not in this page. A record line that is not a message is
+        /// skipped and not counted.
+        ///
+        /// A snapshot, not a loop invariant: the runtime appends while a hook
+        /// pages, so `total` can grow from one page to the next and the page
+        /// lengths of a completed walk can sum to less than the final `total`.
+        /// Every page is a consistent snapshot anchored at the oldest message,
+        /// so nothing repeats and nothing is skipped; a loop is sized by
+        /// `next-cursor: none`, which is the only correct termination
+        /// condition.
         total: u32,
     }
 
     /// Newest first. `limit` is clamped by the host.
     ///
-    /// `cursor` is opaque and host-minted: pass `none` to start at the newest
-    /// message, then pass back the `next-cursor` of the page you just read. A
-    /// cursor the host did not mint is `invalid-cursor`. `limit` is clamped to
-    /// `1..=100`, so `0` reads one message and a paging loop always makes
-    /// progress.
+    /// `cursor` is an opaque token: pass `none` to start at the newest message,
+    /// then pass back the `next-cursor` of the page you just read, unmodified.
+    /// A cursor naming a position outside the record is `invalid-cursor`.
+    /// `limit` is clamped to `1..=100`, so `0` reads one message and a paging
+    /// loop always makes progress.
     ///
     /// Errors are strings: `not-granted` when this hook's entry does not declare
     /// `capabilities.conversation.read: true`, `invalid-cursor`, and

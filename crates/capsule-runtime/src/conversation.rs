@@ -111,6 +111,8 @@ pub(crate) struct ConversationRecord {
     /// A write failure is reported once, then survived silently: one full disk must not produce
     /// one stderr line per message.
     failure_reported: bool,
+    /// A malformed line is reported once for this record, however many times it is read.
+    malformed_reported: bool,
 }
 
 impl ConversationRecord {
@@ -136,6 +138,7 @@ impl ConversationRecord {
             workdir: workdir.to_path_buf(),
             recorded: HashSet::new(),
             failure_reported: false,
+            malformed_reported: false,
         })
     }
 
@@ -148,7 +151,8 @@ impl ConversationRecord {
     /// The agent loop starts a `threaded` task's message list from this. Each message keeps the
     /// `id` its line carries, byte for byte.
     pub(crate) fn load(&mut self) -> Vec<Value> {
-        let messages = match read_record(&self.path(), &self.workdir) {
+        let path = self.path();
+        let messages = match read_record(&path, &self.workdir, &mut self.malformed_reported) {
             Ok(messages) => messages,
             Err(reason) => {
                 report(
@@ -156,7 +160,7 @@ impl ConversationRecord {
                     &format!(
                         "[conversation] {} could not be read ({reason}); this task starts with no \
                          prior messages",
-                        self.path().display()
+                        path.display()
                     ),
                 );
                 Vec::new()
@@ -175,11 +179,16 @@ impl ConversationRecord {
     /// Called at each point a message enters the agent loop's context. A message whose id is
     /// already recorded is skipped, which is what a compaction hook returning part of the context
     /// verbatim produces.
+    ///
+    /// An id joins `recorded` only once its line is on disk. A failure the caller survives — a
+    /// disk that fills and is freed again, a descriptor limit that passes — is followed by an
+    /// append carrying the same messages, and a message marked as written before its write
+    /// succeeded would be skipped by that retry and lost from the record for good.
     pub(crate) fn append(&mut self, messages: &[Value]) {
         for message in messages {
             let id = crate::agent::message_id(message).map(str::to_string);
             if let Some(id) = id.as_deref() {
-                if !self.recorded.insert(id.to_string()) {
+                if self.recorded.contains(id) {
                     continue;
                 }
             }
@@ -196,6 +205,9 @@ impl ConversationRecord {
                     );
                 }
                 return;
+            }
+            if let Some(id) = id {
+                self.recorded.insert(id);
             }
         }
     }
@@ -233,13 +245,72 @@ impl ConversationRecord {
     }
 }
 
+/// The parsed record one reader holds between pages.
+///
+/// A hook pages a record it does not shrink and cannot write, so re-reading and re-parsing the
+/// whole file for each page makes a walk quadratic in a file designed to grow without bound. One
+/// cache serves a whole launch: [`crate::conversation_import::ConversationState`] holds it across
+/// every task, which is why the key carries the path as well as the length.
+#[derive(Default)]
+pub(crate) struct RecordCache {
+    /// Record the messages below were parsed from, and `None` while no parse is trusted.
+    path: Option<PathBuf>,
+    /// Length of that file at the moment it was stat'd for the parse below.
+    len: u64,
+    /// The record, oldest first, as [`read_record`] returned it.
+    messages: Vec<Value>,
+    /// A malformed line is reported once for this reader, however many pages it walks.
+    malformed_reported: bool,
+    /// Reads of the record file that reached the filesystem. What pins the cost of a paging loop.
+    #[cfg(test)]
+    reads: u32,
+}
+
+impl RecordCache {
+    /// The whole record, oldest first, parsed at most once per length the file has held.
+    ///
+    /// The runtime is the record's only writer and only ever appends, so a file whose length is
+    /// unchanged holds the same bytes and the parse above it still stands. A missing file is an
+    /// empty record of length 0, exactly as a read of one is.
+    fn messages(&mut self, path: &Path, workdir: &Path) -> Result<&[Value], String> {
+        let len = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err.to_string()),
+        };
+        if self.path.as_deref() == Some(path) && self.len == len {
+            return Ok(&self.messages);
+        }
+
+        // Cleared before the read and set again only after the messages are in place, so a read
+        // that fails leaves a cache that re-reads rather than one record's messages under
+        // another's key.
+        self.path = None;
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        self.messages = read_record(path, workdir, &mut self.malformed_reported)?;
+        self.len = len;
+        self.path = Some(path.to_path_buf());
+        Ok(&self.messages)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> u32 {
+        self.reads
+    }
+}
+
 /// One page of a record, newest first, as `murmur:conversation/read` serves it.
 ///
 /// `path` is `None` for a session that writes no record — `context.record: off`, a
 /// `process`-transport capsule, or a task whose context id was refused — and reads as an empty
 /// page rather than an error: there is nothing wrong with a conversation that has said nothing
-/// yet.
+/// yet. That case leaves `cache` alone, so a hook dispatched between two tasks does not cost the
+/// next one its parse.
 pub(crate) fn page(
+    cache: &mut RecordCache,
     path: Option<&Path>,
     workdir: &Path,
     cursor: Option<&str>,
@@ -248,7 +319,9 @@ pub(crate) fn page(
     let Some(path) = path else {
         return Ok(empty_page());
     };
-    let messages = read_record(path, workdir).map_err(|reason| format!("unavailable: {reason}"))?;
+    let messages = cache
+        .messages(path, workdir)
+        .map_err(|reason| format!("unavailable: {reason}"))?;
 
     // A cursor is the exclusive upper bound of the next page, counted from the oldest message, so
     // it stays valid while the runtime appends to the record underneath a paging hook.
@@ -295,10 +368,14 @@ fn empty_page() -> MessagePage {
 ///
 /// The single parser both readers go through — the `murmur:conversation/read` page and the
 /// `threaded` reload — so a line the hook can see is a line the next task will load. A line that
-/// is not a JSON object with a string `role` is skipped and reported once per read, naming the
-/// path and the 1-based line number; a truncated final line is exactly that case. A missing file
-/// is an empty record, not an error.
-fn read_record(path: &Path, workdir: &Path) -> Result<Vec<Value>, String> {
+/// is not a JSON object with a string `role` is skipped; a truncated final line is exactly that
+/// case. A missing file is an empty record, not an error.
+///
+/// `reported` is the reader's own once-only flag: the first skipped line it meets is reported
+/// naming the path and the 1-based line number, and every line after it, in this read and in the
+/// reader's later ones, is silent. One such line is worth one log entry however many times the
+/// reader goes back to the file.
+fn read_record(path: &Path, workdir: &Path, reported: &mut bool) -> Result<Vec<Value>, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -312,14 +389,19 @@ fn read_record(path: &Path, workdir: &Path) -> Result<Vec<Value>, String> {
         }
         match parse_message(line) {
             Some(message) => messages.push(message),
-            None => report(
-                workdir,
-                &format!(
-                    "[conversation] {}: line {} is not a message and was skipped",
-                    path.display(),
-                    index + 1
-                ),
-            ),
+            None => {
+                if !*reported {
+                    *reported = true;
+                    report(
+                        workdir,
+                        &format!(
+                            "[conversation] {}: line {} is not a message and was skipped",
+                            path.display(),
+                            index + 1
+                        ),
+                    );
+                }
+            }
         }
     }
     Ok(messages)
@@ -454,7 +536,14 @@ mod tests {
         let mut seen = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            let page = page(Some(&path), workdir.path(), cursor.as_deref(), 2).unwrap();
+            let page = page(
+                &mut RecordCache::default(),
+                Some(&path),
+                workdir.path(),
+                cursor.as_deref(),
+                2,
+            )
+            .unwrap();
             assert_eq!(page.total, 5);
             seen.extend(page.messages.iter().map(|m| m.id.clone().unwrap()));
             match page.next_cursor {
@@ -485,22 +574,35 @@ mod tests {
         let path = record.path();
 
         assert_eq!(
-            page(Some(&path), workdir.path(), None, 0)
-                .unwrap()
-                .messages
-                .len(),
+            page(
+                &mut RecordCache::default(),
+                Some(&path),
+                workdir.path(),
+                None,
+                0
+            )
+            .unwrap()
+            .messages
+            .len(),
             1
         );
         assert_eq!(
-            page(Some(&path), workdir.path(), None, u32::MAX)
-                .unwrap()
-                .messages
-                .len(),
+            page(
+                &mut RecordCache::default(),
+                Some(&path),
+                workdir.path(),
+                None,
+                u32::MAX
+            )
+            .unwrap()
+            .messages
+            .len(),
             MAX_PAGE_LIMIT as usize
         );
     }
 
-    /// A cursor the host did not mint is refused rather than read as a position.
+    /// A value that is not `mc_<number>`, and a position past the end of the record, are both
+    /// `invalid-cursor` rather than a page.
     #[test]
     fn a_foreign_cursor_is_refused() {
         let home = tempfile::tempdir().unwrap();
@@ -512,7 +614,14 @@ mod tests {
 
         for cursor in ["7", "mc_", "mc_nine", "mc_9", "cur_1"] {
             assert_eq!(
-                page(Some(&path), workdir.path(), Some(cursor), 10).err(),
+                page(
+                    &mut RecordCache::default(),
+                    Some(&path),
+                    workdir.path(),
+                    Some(cursor),
+                    10
+                )
+                .err(),
                 Some("invalid-cursor".to_string()),
                 "cursor '{cursor}'"
             );
@@ -530,11 +639,42 @@ mod tests {
             .join("conversations/capsule/ctx_1/conversation.jsonl");
 
         for path in [None, Some(missing.as_path())] {
-            let page = page(path, workdir.path(), None, 10).unwrap();
+            let page = page(&mut RecordCache::default(), path, workdir.path(), None, 10).unwrap();
             assert!(page.messages.is_empty());
             assert_eq!(page.next_cursor, None);
             assert_eq!(page.total, 0);
         }
+    }
+
+    /// A read for a session that keeps no record leaves the cache as it found it, so a hook
+    /// dispatched between two tasks does not cost the next one its parse.
+    #[test]
+    fn a_read_with_no_record_leaves_the_cache_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        record.append(&[message(&id_at(1), "user", "a")]);
+        let path = record.path();
+
+        let mut cache = RecordCache::default();
+        assert_eq!(
+            page(&mut cache, Some(&path), workdir.path(), None, 10)
+                .unwrap()
+                .total,
+            1
+        );
+        assert!(page(&mut cache, None, workdir.path(), None, 10)
+            .unwrap()
+            .messages
+            .is_empty());
+        assert_eq!(
+            page(&mut cache, Some(&path), workdir.path(), None, 10)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(cache.reads(), 1, "the parse survived the empty read");
     }
 
     /// A malformed line is skipped, reported once naming the path and its 1-based number, and
@@ -554,7 +694,14 @@ mod tests {
         raw.push_str("{\"role\":\"user\"");
         std::fs::write(&path, raw).unwrap();
 
-        let page = page(Some(&path), workdir.path(), None, 10).unwrap();
+        let page = page(
+            &mut RecordCache::default(),
+            Some(&path),
+            workdir.path(),
+            None,
+            10,
+        )
+        .unwrap();
         assert_eq!(page.total, 3);
         assert_eq!(page.messages.len(), 3);
 
@@ -566,6 +713,164 @@ mod tests {
                 .count(),
             1,
             "reported once, naming the line: {log}"
+        );
+    }
+
+    /// A write that fails and then can succeed leaves the record whole: the message the failure
+    /// cost is written by the next append that carries it, in its own order.
+    ///
+    /// The failure is a regular file sitting where the context directory has to go, which no
+    /// permission bit is involved in — the suite reads the same as root and as anyone else.
+    #[test]
+    fn a_failed_write_is_retried_and_leaves_no_hole() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        let blocker = root.join("ctx_1");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&blocker, "").unwrap();
+
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let first = message(&id_at(1), "user", "a");
+        let second = message(&id_at(2), "assistant", "b");
+        record.append(std::slice::from_ref(&first));
+        assert!(
+            blocker.is_file(),
+            "the directory chain could not be created"
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        record.append(&[first, second]);
+
+        let written: Vec<Value> = std::fs::read_to_string(record.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            written
+                .iter()
+                .map(|m| crate::agent::message_id(m).unwrap())
+                .collect::<Vec<_>>(),
+            vec![id_at(1), id_at(2)],
+            "the message the failure cost is on disk, before the one that followed it"
+        );
+    }
+
+    /// A whole paging walk costs one read of the record and one parse of it.
+    #[test]
+    fn a_paging_loop_reads_the_record_once() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        record.append(
+            &(1..=250)
+                .map(|n| message(&id_at(n), "user", "m"))
+                .collect::<Vec<_>>(),
+        );
+        let path = record.path();
+        let mut cache = RecordCache::default();
+
+        let mut pages = 0;
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = page(
+                &mut cache,
+                Some(&path),
+                workdir.path(),
+                cursor.as_deref(),
+                25,
+            )
+            .unwrap();
+            pages += 1;
+            seen.extend(page.messages.iter().map(|m| m.id.clone().unwrap()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(seen, (1..=250).rev().map(id_at).collect::<Vec<_>>());
+        assert_eq!(cache.reads(), 1, "one read for the whole walk");
+
+        // The record grows underneath the same reader: the next walk sees the new messages and
+        // pays for exactly one more read.
+        record.append(
+            &(251..=260)
+                .map(|n| message(&id_at(n), "user", "m"))
+                .collect::<Vec<_>>(),
+        );
+        let mut seen = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut first_total = None;
+        loop {
+            let page = page(
+                &mut cache,
+                Some(&path),
+                workdir.path(),
+                cursor.as_deref(),
+                25,
+            )
+            .unwrap();
+            first_total.get_or_insert(page.total);
+            seen.extend(page.messages.iter().map(|m| m.id.clone().unwrap()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(first_total, Some(260));
+        assert_eq!(seen, (1..=260).rev().map(id_at).collect::<Vec<_>>());
+        assert_eq!(cache.reads(), 2, "one further read for the second walk");
+    }
+
+    /// One truncated line is one log entry, however many pages are walked over it.
+    #[test]
+    fn a_malformed_line_is_reported_once_for_a_whole_walk() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let dir = home.path().join("conversations/capsule/ctx_1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RECORD_FILE_NAME);
+        let mut raw = String::new();
+        for n in 1..=10 {
+            raw.push_str(&serde_json::to_string(&message(&id_at(n), "user", "m")).unwrap());
+            raw.push('\n');
+        }
+        raw.push_str("{\"role\":\"user\"");
+        std::fs::write(&path, raw).unwrap();
+
+        let mut cache = RecordCache::default();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = page(
+                &mut cache,
+                Some(&path),
+                workdir.path(),
+                cursor.as_deref(),
+                2,
+            )
+            .unwrap();
+            pages += 1;
+            assert_eq!(page.total, 10);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 5);
+
+        let log =
+            std::fs::read_to_string(workdir.path().join("logs/bootstrap.log")).unwrap_or_default();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("line 11 is not a message"))
+                .count(),
+            1,
+            "one entry for the whole walk: {log}"
         );
     }
 
