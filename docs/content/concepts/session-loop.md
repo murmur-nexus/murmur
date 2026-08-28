@@ -94,6 +94,48 @@ commit_policy: reopen-task
 description: "Rejects a task's result until its own checks pass."
 ```
 
+## Context seeding (`commit_policy: seed-context`) { #context-seeding-commit_policy-seed-context }
+
+A hook bound to `on-task-start` with `commit_policy: seed-context` gives a capsule memory. It
+returns a list of messages, oldest first, and the runtime places them at the head of the task's
+message list — ahead of any conversation history the task loads and ahead of the task itself — so
+they are in the very first request the driver sees. The first bound hook to return a seed wins.
+
+Two manifest keys govern how much a seed may occupy:
+
+| Key | Controls |
+|---|---|
+| [`context.seed_budget`](../reference/manifest.md#field-context) | Fraction of `context.max_tokens` the seed may occupy. The product, rounded down, is the seed's ceiling and is sent to the hook as `task-start-event.budget-tokens` |
+| [`context.seed_overflow_margin`](../reference/manifest.md#field-context) | How far over that ceiling a seed may go before the runtime spends an inference call summarizing it instead of simply dropping its oldest messages |
+
+What the runtime does with a proposal, checked in this order:
+
+| Condition | Result |
+|---|---|
+| The session runs `inference.transport: process` | Nothing is seeded — that transport's CLI owns its own conversation |
+| The capsule declares no `context.max_tokens` | Nothing is seeded — there is no ceiling to enforce |
+| One message alone is wider than the whole ceiling | Nothing is seeded — no trim can fit it |
+| The proposal is more than three times the ceiling over it | Nothing is seeded — a seed that far over is a broken hook, not a full memory |
+| The proposal fits the ceiling | All of it is seeded |
+| It is over by no more than `context.seed_overflow_margin` of the ceiling | The oldest messages are dropped from the front until the rest fits |
+| It is over by more than that, and a `on-compaction` hook is bound | The overflowing front is summarized by that hook, and the summary becomes the seed's first message |
+| It is over by more than that, and no `on-compaction` hook answers | The oldest messages are dropped from the front until the rest fits |
+
+A seed that cannot be committed never fails the task: the task runs without it. Every outcome is
+written to `trace.jsonl` as a
+[`context_seed` event](../reference/observability-schemas.md#context-seed) and to
+`workdir/logs/bootstrap.log`.
+
+```yaml
+name: murmur-hook-memory
+version: 1.0.0
+runtime: hook
+binding: on-task-start
+execution_mode: blocking
+commit_policy: seed-context
+description: "Reloads what earlier sessions recorded."
+```
+
 ## Capsule lifecycle
 
 The `lifecycle:` manifest block controls how long a capsule stays running and how many tasks

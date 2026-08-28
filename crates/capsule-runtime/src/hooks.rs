@@ -4676,8 +4676,7 @@ artifacts:
 
     /// Invariant: `on-task-start` honors `seed-context`. The hook's messages come back on
     /// the [`HookSeed`], no fault is raised, and nothing reaches the hook's error log —
-    /// the failure this test exists to catch is the seed being discarded silently, which
-    /// is exactly how it looked before the arm was honored.
+    /// the failure this test exists to catch is the seed being discarded silently.
     #[test]
     fn seed_context_from_on_task_start_is_honored() {
         let session = TempDir::new().unwrap();
@@ -4705,8 +4704,8 @@ artifacts:
         assert_eq!(hook_log_lines(session.path(), "starter"), 0);
     }
 
-    /// A hook returning `none` from `on-task-start` proposes nothing, exactly as it did
-    /// before the arm was honored. This is what makes a bound-but-silent hook inert.
+    /// A hook returning `none` from `on-task-start` proposes nothing. This is what makes a
+    /// bound-but-silent hook inert.
     #[test]
     fn none_from_on_task_start_proposes_no_seed() {
         let session = TempDir::new().unwrap();

@@ -2090,7 +2090,7 @@ pub(crate) fn build_driver_payload(
 /// one is minted, so a seed message carrying its id at the head of the prompt is volatile
 /// content in the exact position a provider matches its cached prefix from — it would turn
 /// every request into a cache miss. A message carrying neither key is cloned through
-/// untouched, so a list that never met a hook serializes byte-for-byte as it always did.
+/// untouched, so a list that never met a hook serializes unchanged.
 fn strip_message_identity(messages: &[Value]) -> Value {
     Value::Array(
         messages
@@ -3102,8 +3102,7 @@ mod tests {
     }
 
     /// The id the runtime mints is an identity, never a content hash: two byte-identical
-    /// messages must not share one, or a later slice keying anything on it would silently
-    /// conflate them.
+    /// messages must not share one, or anything keyed on it would silently conflate them.
     #[test]
     fn message_ids_are_minted_fresh_for_byte_identical_messages() {
         let msgs =
@@ -3130,9 +3129,9 @@ mod tests {
         assert!(msgs[0].get(MESSAGE_ID_KEY).is_some());
     }
 
-    /// A message list carrying neither key serializes byte-for-byte as it did before
-    /// identity stripping existed — the whole point of stripping being that a prompt
-    /// prefix a provider already cached stays matchable.
+    /// A message list carrying neither identity key serializes byte-for-byte through
+    /// stripping — the whole point of stripping being that a prompt prefix a provider
+    /// already cached stays matchable.
     #[test]
     fn prompt_prefix_is_byte_identical_without_identity_keys() {
         let msgs = sample_messages();

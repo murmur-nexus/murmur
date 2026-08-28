@@ -466,8 +466,8 @@ fn seeds_the_first_inference_request() {
     );
 }
 
-/// A capsule with no seeding hook — and one whose bound hook returns `none` — produces
-/// exactly what it did before seeding existed.
+/// A capsule with no seeding hook — and one whose bound hook returns `none` — puts exactly
+/// the task message in the request and records no seed.
 #[test]
 fn inert_without_a_seeding_hook() {
     if common::skip_without_host_support("inert_without_a_seeding_hook") {
