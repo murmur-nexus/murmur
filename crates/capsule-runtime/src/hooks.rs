@@ -25,6 +25,7 @@ use crate::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
         ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
     },
+    conversation_import::{add_conversation_to_linker, ConversationState},
     errors::RuntimeError,
     inference_import::{add_inference_to_linker, HookInferenceCtx, HookInferenceRecord},
     limits::{classify_guest_failure, ExecutionLimiter, ExecutionLimits},
@@ -126,6 +127,9 @@ pub(crate) struct HookRuntime {
     /// [`Self::record_task_output`] put here is what a hook call reads. A hook without
     /// `capabilities.task_io.read` never receives the `Arc`.
     task_io: Arc<TaskIoState>,
+    /// The conversation record in scope, shared with every hook granted
+    /// `capabilities.conversation.read` on the same terms as [`Self::task_io`].
+    conversation: Arc<ConversationState>,
     /// Unsupported-arm faults produced by blocking hooks since the last drain, in
     /// dispatch order, plus drain-timeout faults. Drained by the agent loop via
     /// [`Self::drain_dispatch_faults`] and written to `trace.jsonl` as `hook_dispatch_error`
@@ -362,9 +366,9 @@ pub(crate) enum HookEvent {
         /// [`crate::runtime::resolve_context_window`], or `0` when the manifest
         /// declares no `context:` block.
         context_window: u64,
-        /// Tokens already occupied by the `contexts/<id>/history.json` this task
-        /// will load under `lifecycle.conversation: threaded`. `0` under every
-        /// other conversation mode, and read the same way as `budget_tokens`.
+        /// Tokens already occupied by the conversation record this task will load
+        /// under `lifecycle.conversation: threaded`. `0` under every other
+        /// conversation mode, and read the same way as `budget_tokens`.
         /// Without it a hook seeding into a threaded context duplicates history
         /// it cannot see.
         prior_tokens: u64,
@@ -658,6 +662,15 @@ async fn call_stage_once(
             .task_io_read
             .then(|| Arc::new(TaskIoState::new())),
     )?;
+    // `on-stage` runs before any task, so a granted hook gets a state with no context in scope:
+    // its reads truthfully report an empty page rather than `not-granted`.
+    add_conversation_to_linker(
+        &mut linker,
+        staged
+            .grant
+            .conversation_read
+            .then(|| Arc::new(ConversationState::new(None, workdir))),
+    )?;
     // Counting text reaches nothing, so the counter is defined on every linker
     // with no grant to consult.
     add_tokens_to_linker(&mut linker)?;
@@ -752,11 +765,15 @@ impl HookRuntime {
         env_vars: HookEnvVars<'_>,
         limits: ExecutionLimits,
         inference: Option<Arc<HookInferenceCtx>>,
+        conversation_root: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let mut blocking_hooks = Vec::new();
         let mut async_hooks = Vec::new();
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
-        let task_io = Arc::new(TaskIoState::new());
+        let host_state = HookHostState {
+            task_io: Arc::new(TaskIoState::new()),
+            conversation: Arc::new(ConversationState::new(conversation_root, workdir)),
+        };
 
         for staged in staged_hooks {
             let instance = instantiate_hook(
@@ -766,7 +783,7 @@ impl HookRuntime {
                 &env_vars,
                 limits,
                 inference.clone(),
-                &task_io,
+                &host_state,
             )
             .await?;
 
@@ -801,7 +818,8 @@ impl HookRuntime {
             fault_rx,
             context,
             inference,
-            task_io,
+            task_io: host_state.task_io,
+            conversation: host_state.conversation,
             dispatch_faults: Vec::new(),
             started: Instant::now(),
             total_input_tokens: 0,
@@ -1165,6 +1183,10 @@ impl HookRuntime {
         prior_tokens: u64,
     ) -> Option<HookSeed> {
         let workdir = self.workdir.clone();
+        // The task's conversation becomes the one `murmur:conversation/read` answers about, from
+        // this dispatch onward: a memory hook bound to `on-task-start` reads the record it is
+        // about to seed from.
+        self.conversation.set_context(Some(context_id.clone()));
         let event = HookEvent::TaskStart {
             task_id,
             context_id,
@@ -1216,6 +1238,13 @@ fn binding_matches_event(binding: &HookBinding, event: &HookEvent) -> bool {
     }
 }
 
+/// The host state every hook linker is built against, whatever the grant on the entry: one copy
+/// per launch, shared with each granted hook through an `Arc` and withheld from the rest.
+struct HookHostState {
+    task_io: Arc<TaskIoState>,
+    conversation: Arc<ConversationState>,
+}
+
 /// Instantiate one staged hook against its own `Store`, resolve its lifecycle exports, and
 /// hand back the reusable instance.
 ///
@@ -1229,7 +1258,7 @@ async fn instantiate_hook(
     env_vars: &HookEnvVars<'_>,
     limits: ExecutionLimits,
     inference: Option<Arc<HookInferenceCtx>>,
-    task_io: &Arc<TaskIoState>,
+    host_state: &HookHostState,
 ) -> Result<HookInstance, RuntimeError> {
     let mut linker: Linker<HookStoreState> = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -1242,7 +1271,18 @@ async fn instantiate_hook(
     // a granted one does and every read returns `not-granted`.
     add_task_io_to_linker(
         &mut linker,
-        staged.grant.task_io_read.then(|| Arc::clone(task_io)),
+        staged
+            .grant
+            .task_io_read
+            .then(|| Arc::clone(&host_state.task_io)),
+    )
+    .map_err(RuntimeError::Runtime)?;
+    add_conversation_to_linker(
+        &mut linker,
+        staged
+            .grant
+            .conversation_read
+            .then(|| Arc::clone(&host_state.conversation)),
     )
     .map_err(RuntimeError::Runtime)?;
     add_tokens_to_linker(&mut linker).map_err(RuntimeError::Runtime)?;
@@ -1906,6 +1946,7 @@ mod tests {
             },
             env_vars,
             limits,
+            None,
             None,
         )
         .await
@@ -3086,6 +3127,7 @@ mod tests {
                 HookEnvVars::default(),
                 ExecutionLimits::default(),
                 Some(Arc::clone(&ctx)),
+                None,
             )
             .await
             .expect("a hook importing murmur:runtime/inference must link");
@@ -3550,6 +3592,7 @@ mod tests {
                 network_allow_rules: Vec::new(),
                 filesystem_scope: None,
                 task_io_read,
+                conversation_read: false,
                 state_store: None,
                 state_dir: None,
                 config_json: None,
@@ -3722,6 +3765,240 @@ mod tests {
         });
     }
 
+    // ── murmur:conversation/read: the per-hook grant and the paged record ─────
+
+    use crate::conversation_import::test_support::{
+        reader_double as conversation_reader_double, REPORT_SEP as CONVERSATION_SEP,
+    };
+
+    /// A staged hook with the conversation grant flipped on or off, everything else default-deny:
+    /// no network rules and no filesystem scope, so anything it reports about the record can only
+    /// have come through the import.
+    fn staged_conversation_hook(
+        component: Component,
+        conversation_read: bool,
+    ) -> StagedHookArtifact {
+        StagedHookArtifact {
+            grant: HookCapabilityGrant {
+                conversation_read,
+                ..HookCapabilityGrant::default()
+            },
+            ..staged_double_named("reader", HookBinding::OnTaskEnd, component)
+        }
+    }
+
+    /// The id the nth message of a hand-written record carries.
+    fn recorded_id(n: usize) -> String {
+        format!("msg_{n:032x}")
+    }
+
+    /// Write `count` messages into the record `root`/`context_id` holds, ids `msg_…01` upward.
+    fn write_record(root: &Path, context_id: &str, count: usize) {
+        let dir = root.join(context_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = String::new();
+        for n in 1..=count {
+            raw.push_str(
+                &serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("m{n}")}],
+                    "id": recorded_id(n),
+                })
+                .to_string(),
+            );
+            raw.push('\n');
+        }
+        std::fs::write(dir.join("conversation.jsonl"), raw).unwrap();
+    }
+
+    /// Dispatch the reader double once at `on-task-end` and return the two pages it reported.
+    fn read_pages(
+        root: Option<PathBuf>,
+        context_id: Option<&str>,
+        conversation_read: bool,
+    ) -> Vec<String> {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let staged =
+            staged_conversation_hook(conversation_reader_double(&engine, 2), conversation_read);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut hooks = HookRuntime::new(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged],
+                SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "test-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                HookEnvVars::default(),
+                ExecutionLimits::default(),
+                None,
+                root,
+            )
+            .await
+            .expect("a conversation-importing hook instantiates like any other");
+
+            if let Some(context_id) = context_id {
+                hooks
+                    .dispatch_task_start(
+                        "tsk_1".to_string(),
+                        context_id.to_string(),
+                        "task_md".to_string(),
+                        4,
+                        0,
+                        0,
+                        0,
+                    )
+                    .await;
+            }
+            let reopen = hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await
+                .expect("the reader double always returns reopen-task");
+            reopen.reason.split('|').map(str::to_string).collect()
+        })
+    }
+
+    /// A granted hook reads a record an earlier run left: newest first, two per page, with the
+    /// cursor of the first page continuing into the second without repeating or skipping one.
+    #[test]
+    fn a_granted_hook_pages_a_prior_runs_record_newest_first() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("conversations/test-capsule");
+        write_record(&root, "ctx_fixed", 5);
+
+        let pages = read_pages(Some(root), Some("ctx_fixed"), true);
+
+        assert_eq!(
+            pages[0],
+            format!(
+                "T=5{sep}{id5}=user{sep}{id4}=user{sep}N=mc_3",
+                sep = CONVERSATION_SEP,
+                id5 = recorded_id(5),
+                id4 = recorded_id(4),
+            ),
+            "the newest two messages, each carrying the id its record line holds"
+        );
+        assert_eq!(
+            pages[1],
+            format!(
+                "T=5{sep}{id3}=user{sep}{id2}=user{sep}N=mc_1",
+                sep = CONVERSATION_SEP,
+                id3 = recorded_id(3),
+                id2 = recorded_id(2),
+            ),
+            "the cursor continues where the first page stopped"
+        );
+    }
+
+    /// The last page of a record says so: `next-cursor` is `none` once the oldest message has
+    /// been returned, which is what ends a paging loop.
+    #[test]
+    fn the_final_page_reports_no_next_cursor() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("conversations/test-capsule");
+        write_record(&root, "ctx_fixed", 2);
+
+        let pages = read_pages(Some(root), Some("ctx_fixed"), true);
+
+        assert!(pages[0].ends_with("N=-"), "page was: {}", pages[0]);
+    }
+
+    /// An ungranted hook still links, still runs and still ends its task; the read is a named
+    /// error it can branch on, and it is distinguishable from the empty page a session with no
+    /// record returns.
+    #[test]
+    fn an_ungranted_hook_reads_not_granted_rather_than_an_empty_page() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("conversations/test-capsule");
+        write_record(&root, "ctx_fixed", 3);
+
+        let pages = read_pages(Some(root), Some("ctx_fixed"), false);
+
+        assert_eq!(pages, vec!["!not-granted", "!not-granted"]);
+    }
+
+    /// A session the runtime built with no record — `context.record: off`, or the `process`
+    /// transport, which never builds a message list — reads as an empty page rather than an
+    /// error.
+    #[test]
+    fn a_session_with_no_record_reads_an_empty_page() {
+        assert_eq!(
+            read_pages(None, Some("ctx_fixed"), true),
+            vec![format!("T=0{CONVERSATION_SEP}N=-"); 2]
+        );
+    }
+
+    /// A record holding a malformed line returns every other message and reports the bad one,
+    /// naming the 1-based line number: one bad line never fails a read.
+    #[test]
+    fn a_malformed_record_line_is_skipped_and_the_read_still_succeeds() {
+        let home = TempDir::new().unwrap();
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let root = home.path().join("conversations/test-capsule");
+        write_record(&root, "ctx_fixed", 3);
+        let path = root.join("ctx_fixed/conversation.jsonl");
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"role\":\"user\"");
+        std::fs::write(&path, raw).unwrap();
+
+        let engine = hook_test_engine();
+        let staged = staged_conversation_hook(conversation_reader_double(&engine, 2), true);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reason = rt.block_on(async {
+            let mut hooks = HookRuntime::new(
+                &engine,
+                session.path(),
+                accessible.path(),
+                vec![staged],
+                SessionContextData {
+                    capsule_name: "test-capsule".to_string(),
+                    capsule_version: "0.1.0".to_string(),
+                    session_id: "sess-test".to_string(),
+                    model: "test-model".to_string(),
+                    capabilities: Vec::new(),
+                },
+                HookEnvVars::default(),
+                ExecutionLimits::default(),
+                None,
+                Some(root),
+            )
+            .await
+            .unwrap();
+            hooks
+                .dispatch_task_start(
+                    "tsk_1".to_string(),
+                    "ctx_fixed".to_string(),
+                    "task_md".to_string(),
+                    4,
+                    0,
+                    0,
+                    0,
+                )
+                .await;
+            hooks
+                .dispatch_task_end("tsk_1".to_string(), "ok".to_string())
+                .await
+                .expect("a malformed line never fails the read")
+                .reason
+        });
+
+        assert!(reason.starts_with("T=3"), "report was: {reason}");
+        let log = std::fs::read_to_string(session.path().join("logs/bootstrap.log")).unwrap();
+        assert!(
+            log.contains("line 4 is not a message"),
+            "the skipped line must be named: {log}"
+        );
+    }
+
     // ── Per-hook capability grants (default-deny network + filesystem) ────────
 
     use crate::network_policy::RequestTarget;
@@ -3747,6 +4024,7 @@ mod tests {
             resources: None,
             state: None,
             task_io: None,
+            conversation: None,
             containment: None,
         };
         HookCapabilityGrant::derive(Some(&caps), "test-capsule").expect("grant is valid")

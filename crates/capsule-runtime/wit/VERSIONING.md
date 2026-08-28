@@ -19,6 +19,7 @@ Current versions:
 | `murmur:message`         | `0.1.0`  |
 | `murmur:task`            | `0.1.0`  |
 | `murmur:task-io`         | `0.1.0`  |
+| `murmur:conversation`    | `0.1.0`  |
 | `murmur:text`            | `0.1.0`  |
 | `murmur:host`            | `0.1.0`  |
 | `murmur:runtime`         | `0.3.0`  |
@@ -94,6 +95,17 @@ programme asked for. That is the whole of the difference from the `murmur:task-i
 decision above, where no rebuild was already being paid for: when a new interface
 arrives on its own, the rule below still applies and it goes in a new package at
 `0.1.0`.
+
+`murmur:conversation` was created at `0.1.0` for the `read` interface — the single
+`read-messages` function serving the durable conversation record. It arrived on
+its own, with no bump already being paid for elsewhere, so the rule below applies
+and the `murmur:runtime@0.3.0` exception recorded above does not: folding it into
+`murmur:runtime` would have renamed `murmur:runtime/inference@0.3.0` and
+`murmur:runtime/tokens@0.3.0`, forcing a rebuild of every published hook to buy
+nothing. `read` *uses* `murmur:hook/lifecycle@0.6.0`'s `message` record, which is
+a reference and not a change: `murmur:hook` stays at `0.6.0`, and the only edit
+to it in the same step was the doc comment on `message.id`, a patch-tier change
+that moves no version.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,
@@ -193,7 +205,7 @@ only:
 The host-provided *import* interfaces (`murmur:tool-registry/invoke@0.1.0`,
 `murmur:text/chunks@0.1.0`, `murmur:task/task@0.1.0`,
 `murmur:runtime/inference@0.3.0`, `murmur:runtime/tokens@0.3.0`,
-`murmur:task-io/read@0.1.0`) are likewise
+`murmur:task-io/read@0.1.0`, `murmur:conversation/read@0.1.0`) are likewise
 registered under the versioned name only.
 
 An artifact that still exports (or imports) only the unversioned name now

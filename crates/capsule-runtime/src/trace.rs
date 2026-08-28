@@ -250,6 +250,12 @@ struct InferenceEvent {
     /// already on the session-start record and is not repeated per turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    /// Identities of the messages this request embedded, in the order they sat in it. Under an
+    /// active driver continuation only the tail past the acked length is sent, and this names
+    /// exactly that tail. Empty — and therefore absent — for a hook's own `run-inference` and for
+    /// the `process` transport, neither of which sends a message list the runtime minted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    message_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -750,6 +756,7 @@ impl TraceWriter {
         tool_name: Option<String>,
         origin: Option<&InferenceOrigin>,
         usage: Option<&DriverUsage>,
+        message_ids: Vec<String>,
     ) -> std::io::Result<()> {
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
@@ -780,6 +787,7 @@ impl TraceWriter {
             cache_write_tokens: usage.and_then(|u| u.cache_write_tokens),
             origin: origin.map(|o| o.source.clone()),
             model: origin.map(|o| o.model.clone()),
+            message_ids,
         };
         self.write_event(&event).await?;
         self.total_turns = self.total_turns.saturating_add(1);
@@ -1872,6 +1880,7 @@ mod tests {
             Some("bash".to_string()),
             None,
             None,
+            vec!["msg_0000000000000000000000000000000a".to_string()],
         )
         .await
         .unwrap();
@@ -1880,6 +1889,11 @@ mod tests {
         let events = read_events(dir.path());
         let e = &events[0];
         assert_eq!(e["event_type"], "inference");
+        assert_eq!(
+            e["message_ids"],
+            serde_json::json!(["msg_0000000000000000000000000000000a"]),
+            "an agent-loop turn names the messages its request embedded"
+        );
         assert_eq!(e["turn"], 0);
         assert_eq!(e["input_tokens"], 100);
         assert_eq!(e["output_tokens"], 50);
@@ -1911,9 +1925,18 @@ mod tests {
             cached_tokens: Some(0),
             cache_write_tokens: None,
         };
-        w.write_inference(0, 100, 50, "end_turn".to_string(), None, None, Some(&usage))
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            100,
+            50,
+            "end_turn".to_string(),
+            None,
+            None,
+            Some(&usage),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -2116,9 +2139,18 @@ mod tests {
     async fn session_end_fields_and_snake_case() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_inference(0, 100, 50, "tool_call".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            100,
+            50,
+            "tool_call".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -2214,9 +2246,18 @@ mod tests {
         w.write_session_start(10, vec!["bash".to_string()])
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            10,
+            5,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
 
@@ -2239,6 +2280,7 @@ mod tests {
             Some("bash".to_string()),
             None,
             None,
+            vec!["msg_0000000000000000000000000000000a".to_string()],
         )
         .await
         .unwrap();
@@ -2269,9 +2311,18 @@ mod tests {
         )
         .await
         .unwrap();
-        w.write_inference(1, 60, 30, "end_turn".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            1,
+            60,
+            30,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_session_end("ok").await.unwrap();
         w.flush().await.unwrap();
 
@@ -2504,12 +2555,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
-        w.write_inference(0, 10, 5, "end_turn".to_string(), None, None, None)
-            .await
-            .unwrap();
-        w.write_inference(1, 10, 5, "end_turn".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            10,
+            5,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        w.write_inference(
+            1,
+            10,
+            5,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(w.task_turns(), 2);
         // A new task resets the per-task counter.
         w.write_task_start("tsk_2", "ctx_2", "a2a", 3)
@@ -2533,9 +2602,18 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            10,
+            5,
+            "tool_call".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -2617,16 +2695,34 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            10,
+            5,
+            "tool_call".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         let origin = InferenceOrigin {
             source: "hook:gatekeeper".to_string(),
             model: "claude-test".to_string(),
         };
-        w.write_inference(0, 1, 1, "end_turn".to_string(), None, Some(&origin), None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            1,
+            1,
+            "end_turn".to_string(),
+            None,
+            Some(&origin),
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -2635,6 +2731,9 @@ mod tests {
         assert!(turn["origin"].is_null());
         assert_eq!(hook["origin"], "hook:gatekeeper");
         assert_eq!(hook["parent_id"], turn["event_id"]);
+        // The hook sent a message list the runtime never minted, so the key is absent rather
+        // than empty.
+        assert!(hook.get("message_ids").is_none(), "{hook}");
     }
 
     /// A writer with no session frame behind it names no parent. This is the script-capsule
@@ -2671,17 +2770,35 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
             .await
             .unwrap();
-        w.write_inference(0, 10, 5, "tool_call".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            0,
+            10,
+            5,
+            "tool_call".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_skill_call(0, "house-style".to_string(), 12, 1, "ok".to_string())
             .await
             .unwrap();
         w.write_compaction(0, 100, 40).await.unwrap();
         w.write_task_end("tsk_1", "ok", 0).await.unwrap();
-        w.write_inference(1, 1, 1, "end_turn".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            1,
+            1,
+            1,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
 
         let events = read_events(dir.path());
@@ -2752,9 +2869,18 @@ mod tests {
         w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
             .await
             .unwrap();
-        w.write_inference(2, 10, 5, "tool_call".to_string(), None, None, None)
-            .await
-            .unwrap();
+        w.write_inference(
+            2,
+            10,
+            5,
+            "tool_call".to_string(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         w.write_compaction_declined(2, 4321, COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL)
             .await
             .unwrap();
@@ -2788,9 +2914,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         for turn in 0..5 {
-            w.write_inference(turn, 1, 1, "end_turn".to_string(), None, None, None)
-                .await
-                .unwrap();
+            w.write_inference(
+                turn,
+                1,
+                1,
+                "end_turn".to_string(),
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
         }
         w.flush().await.unwrap();
 

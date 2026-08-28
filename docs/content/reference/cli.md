@@ -431,6 +431,7 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
+| `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
 | `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines |
 | `--json` | off | Emit launch info as a single JSON line instead of human-readable output. Takes precedence over `--verbose` |

@@ -15,10 +15,11 @@ interface lifecycle {
         /// never interchangeable.
         ///
         /// Stripped before the wire payload is built — see the note on
-        /// `source-id`. The runtime mints one for every message it builds out of
-        /// a hook-returned message list, so an id set on a message a hook returns
-        /// is replaced rather than kept: identity belongs to whoever put the
-        /// message in the context.
+        /// `source-id`. Minted once, at the message's creation site, and
+        /// preserved everywhere after: an id on a message a hook hands back is
+        /// kept, and so is the id a message reloaded from the conversation
+        /// record carries. The runtime mints one only for a message that arrives
+        /// without one.
         id: option<string>,
         /// Opaque join key back to whatever produced this content — a corpus
         /// record, a compaction summary, reloaded history. Recorded verbatim and

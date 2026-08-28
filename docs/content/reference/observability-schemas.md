@@ -76,6 +76,7 @@ before the first task begins
 | `cache_write_tokens` | u64 | Request tokens the provider wrote into its prompt cache |
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
 | `model` | string | The model this call was sent to. Written only alongside `origin` |
+| `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
 
 The four provider-reported fields are written only when the driver reported that member, and are
 absent otherwise — never `0`. They sit beside the runtime's estimates rather than replacing them,
@@ -168,7 +169,7 @@ one turn does not stop a later turn from compacting successfully.
 | `budget_tokens` | u64 | The ceiling in force: `context.max_tokens` × `context.seed_budget`, rounded down. `0` when the capsule declares no `context.max_tokens` |
 | `outcome` | string | What the runtime did — see below |
 | `reason` | string | Why nothing was committed. Present on `"rejected"` only; absent otherwise |
-| `message_ids` | list of string | The `msg_`-prefixed id of every committed message, in the order they were placed. Empty on a rejection. These ids never reach the driver, so this is the only place they are visible |
+| `message_ids` | list of string | The `msg_`-prefixed id of every committed message, in the order they were placed. Empty on a rejection. The same ids appear on the `inference` line of each request that carried these messages, and on their lines in the [conversation record](workdir.md#the-conversation-record); none of them ever reaches the driver |
 
 | `outcome` | Meaning |
 |---|---|

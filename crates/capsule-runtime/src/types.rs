@@ -196,6 +196,10 @@ pub struct CapabilityPolicy {
     /// `stage_session` can say that once (`W-SEC-014`) instead of leaving an operator to discover
     /// an empty directory, and it is read by nothing else.
     pub state_declared: bool,
+    /// Recorded for the same reason [`Self::state_declared`] is, and applied just as little: the
+    /// `murmur:conversation/read` grant is per artifact, so a capsule-wide declaration reaches
+    /// nothing and `stage_session` says so once (`W-SEC-016`).
+    pub conversation_declared: bool,
     /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
     /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
     /// above purely so hook calls can apply their own, lower default without mistaking an
@@ -262,6 +266,10 @@ pub struct StageRequest {
     /// `true` even when the override cleared the prompt to nothing.
     pub system_prompt_overridden: bool,
     pub context: Option<ContextConfig>,
+    /// Context id every `task.md` task of this launch runs under, from `mur run --context`.
+    /// `None` mints a fresh one per task. Validated by `stage_session` as one path segment: it is
+    /// a directory name in the conversation record path.
+    pub context_id: Option<String>,
     /// OTLP/HTTP endpoint for span export; None = no external OTel emission.
     pub otel_endpoint: Option<String>,
     /// JSON-serialized EvalConfig injected into hook WASI env as MURMUR_EVAL_CONFIG.
@@ -319,6 +327,9 @@ pub struct StagedSession {
     /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.
     pub(crate) system_prompt_overridden: bool,
     pub(crate) context: Option<ContextConfig>,
+    /// Copied from [`StageRequest::context_id`] and already validated. Read by `launch_session`,
+    /// which uses it in place of a freshly minted id for every `task.md` task.
+    pub(crate) context_id: Option<String>,
     pub(crate) engine: Engine,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,
@@ -405,6 +416,7 @@ pub fn capability_policy_from_runtime_manifest(
 
     // Recorded, never applied: see `CapabilityPolicy::state_declared`.
     let state_declared = caps.is_some_and(|c| c.state.is_some());
+    let conversation_declared = caps.is_some_and(|c| c.conversation.is_some());
 
     let filesystem_scope = caps
         .and_then(|c| c.filesystem.as_ref())
@@ -470,6 +482,7 @@ pub fn capability_policy_from_runtime_manifest(
         resources,
         containment_floor: caps.and_then(|c| c.containment).unwrap_or_default(),
         state_declared,
+        conversation_declared,
         declared_deadline_seconds,
     }
 }

@@ -157,6 +157,13 @@ enum Commands {
         #[arg(long, value_name = "TEXT")]
         system_prompt: Option<String>,
 
+        /// Context id for this run's task, making its conversation record reachable by name.
+        /// Two runs given the same id share one record, and a hook granted
+        /// capabilities.conversation.read reads what the earlier run left. Must be a single path
+        /// segment. Defaults to a fresh id per task.
+        #[arg(long, value_name = "ID")]
+        context: Option<String>,
+
         /// Override manifest lifecycle.task_acceptance (none|single|queue)
         #[arg(long, value_name = "MODE")]
         lifecycle_task_acceptance: Option<String>,
@@ -393,6 +400,7 @@ fn main() {
             manifest,
             task,
             system_prompt,
+            context,
             lifecycle_task_acceptance,
             lifecycle_after_task,
             workdir,
@@ -406,6 +414,7 @@ fn main() {
             &manifest,
             task.as_deref(),
             system_prompt.as_deref(),
+            context.as_deref(),
             lifecycle_task_acceptance.as_deref(),
             lifecycle_after_task.as_deref(),
             workdir,

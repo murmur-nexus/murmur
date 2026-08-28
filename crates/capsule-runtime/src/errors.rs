@@ -142,6 +142,21 @@ pub enum RuntimeError {
     #[error("invalid state store name '{store}': {message}")]
     InvalidStateStore { store: String, message: String },
 
+    /// A `context.record_store` value, or a `mur run --context` value, is not a single usable
+    /// directory segment of a conversation record path. Raised at staging, before any registry
+    /// pull, workdir creation or component instantiation, so a bad name never gets as far as
+    /// creating something on disk.
+    ///
+    /// Distinct from [`Self::InvalidStateStore`] because the remedies point at different keys, and
+    /// because a record is on by default while a state store is declared: an operator seeing this
+    /// may not have written a `context:` block at all, only a `--context` flag.
+    #[error("invalid {field} '{value}': {message}")]
+    InvalidConversationRecord {
+        field: String,
+        value: String,
+        message: String,
+    },
+
     /// The state store directory a validated name resolves to could not be resolved or created.
     /// Distinct from [`Self::InvalidStateStore`]: the declaration is well-formed and the failure is
     /// the host's — an unset `HOME`, or a path that cannot be made a `0700` directory.

@@ -3,7 +3,13 @@ pub(crate) mod inventory;
 mod process;
 
 use std::sync::{atomic::Ordering, Arc, Mutex};
-use std::{fs, io::Write, path::Path, sync::LazyLock, time::Instant};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+    time::Instant,
+};
 
 use murmur_artifact::{ConversationMode, InferenceConfig};
 use serde_json::{json, Value};
@@ -50,6 +56,10 @@ pub(crate) struct AgentRunConfig {
     /// Slack above the seed budget, as a fraction of it, within which an over-budget seed
     /// is trimmed rather than summarized. From `context.seed_overflow_margin`.
     pub seed_overflow_margin: f32,
+    /// `~/.murmur/conversations/<record>` for this capsule, resolved once per launch. `None`
+    /// means this session keeps no durable record: `context.record: off`, a `process`-transport
+    /// capsule, or a host whose home directory could not be resolved.
+    pub conversation_root: Option<PathBuf>,
 }
 
 /// How many multiples of the seed budget an overflow may reach before the seed is refused
@@ -73,6 +83,22 @@ pub(crate) fn new_message_id() -> String {
 
 /// Message field carrying the runtime-minted identity. Never sent to a driver.
 const MESSAGE_ID_KEY: &str = "id";
+
+/// The identity a message carries, or `None` for one built before identity existed.
+///
+/// The one reader of [`MESSAGE_ID_KEY`] outside this module: the conversation record uses it to
+/// tell a message it has already written from one it has not.
+pub(crate) fn message_id(message: &Value) -> Option<&str> {
+    message.get(MESSAGE_ID_KEY).and_then(Value::as_str)
+}
+
+/// `message` with a freshly minted identity, for the sites that build one from nothing.
+fn with_new_id(mut message: Value) -> Value {
+    if let Some(fields) = message.as_object_mut() {
+        fields.insert(MESSAGE_ID_KEY.to_string(), json!(new_message_id()));
+    }
+    message
+}
 
 /// Message field carrying the producing hook's opaque join key. Never sent to a driver, and
 /// never parsed by the runtime.
@@ -201,16 +227,29 @@ pub(crate) async fn run_agent_loop(
     // prompt prefix on one machine, so the provider's cache entry is the one it lands on.
     let prompt_cache_key = build_prompt_cache_key(name, version, context_id.as_deref());
 
-    // In threaded mode, prepend prior history for this contextId before the new user message.
-    // TODO: cross-session history persistence
-    // Currently history is session-scoped. An unknown context_id always starts a fresh thread,
-    // including contextIds that belonged to a previous torn-down session. Cross-session
-    // persistence requires a context registry outside the workdir.
-    let mut messages: Vec<Value> = load_threaded_history(workdir, &mode, context_id.as_deref());
-    messages.push(json!({
+    // The durable record this task appends to, opened before the first message exists so the
+    // task user message is the first line a fresh conversation gets. `None` is a session that
+    // keeps no record; every append below is then a no-op.
+    let mut record = match (
+        run_config.conversation_root.as_deref(),
+        context_id.as_deref(),
+    ) {
+        (Some(root), Some(context_id)) => {
+            crate::conversation::ConversationRecord::open(root, context_id, workdir)
+        }
+        _ => None,
+    };
+
+    // In threaded mode the task continues the record's conversation, so the message list starts
+    // from what the record already holds — including messages written by an earlier session,
+    // with the ids those lines carry. Loaded messages are never appended again.
+    let mut messages: Vec<Value> = load_recorded_history(record.as_mut(), &mode);
+    let task_message = with_new_id(json!({
         "role": "user",
         "content": [{"type": "text", "text": task}],
     }));
+    append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
+    messages.push(task_message);
 
     // The one occupancy counter for this session — used both for the per-turn
     // compaction-trigger input and for the recount after a replace-context commit.
@@ -243,6 +282,7 @@ pub(crate) async fn run_agent_loop(
             trace,
             otel,
             &run_config,
+            record.as_mut(),
         )
         .await;
     }
@@ -270,6 +310,12 @@ pub(crate) async fn run_agent_loop(
         // same-context continuation lets us wire only messages[acked_len..]; otherwise resend all.
         let send_len = messages.len();
         let active_continuation = store_state.active_continuation(context_id.as_deref());
+        // Exactly the messages this request embeds, so `message_ids` records what went on the
+        // wire rather than what the context held.
+        let message_ids: Vec<String> = wire_messages(&messages, active_continuation)
+            .iter()
+            .filter_map(|message| message_id(message).map(str::to_string))
+            .collect();
         let payload = build_driver_payload(
             &inference.model,
             run_config.max_output_tokens,
@@ -484,6 +530,7 @@ pub(crate) async fn run_agent_loop(
                 hook_tool_name.clone(),
                 None,
                 driver_usage.as_ref(),
+                message_ids,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -558,6 +605,7 @@ pub(crate) async fn run_agent_loop(
                     run_config.compaction_model.clone(),
                     run_config.compaction_system_prompt.clone(),
                     run_config.compaction_dump_summaries,
+                    record.as_mut(),
                 )
                 .await;
                 // A declared compaction hook that returned `Err` ends the session the
@@ -878,19 +926,23 @@ pub(crate) async fn run_agent_loop(
                         }
                     };
 
-                    tool_messages.push(json!({
+                    tool_messages.push(with_new_id(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "is_error": is_error,
                         "content": [{"type": "text", "text": text}],
-                    }));
+                    })));
                 }
 
-                messages.push(json!({
+                let turn_start = messages.len();
+                messages.push(with_new_id(json!({
                     "role": "assistant",
                     "content": content,
-                }));
+                })));
                 messages.extend(tool_messages);
+                // The turn's whole contribution, in the order it entered the context: the
+                // assistant message that asked for the tools, then each tool result.
+                append_to_record(record.as_mut(), &messages[turn_start..]);
             }
             "end_turn" | "max_tokens" => {
                 let final_text = extract_text_content(&content);
@@ -905,21 +957,21 @@ pub(crate) async fn run_agent_loop(
                     }
                 }
 
-                // In threaded mode: persist full conversation history (only on success).
-                if matches!(mode, ConversationMode::Threaded) {
-                    if let Some(ref cid) = context_id {
-                        let mut history = messages.clone();
-                        history.push(json!({
-                            "role": "assistant",
-                            "content": content,
-                        }));
-                        persist_history(workdir, cid, &history);
-                        // The assistant we just persisted is known to the driver (it generated
-                        // it), so advance the acked length past it: the next same-context Task
-                        // then wires only its new user message, not this assistant again.
-                        store_state
-                            .advance_continuation_acked_len(context_id.as_deref(), history.len());
-                    }
+                // The message the model just produced is part of the conversation whatever the
+                // capsule's mode: `stateless` decides what a later task *loads*, not what the
+                // record holds.
+                let assistant = with_new_id(json!({
+                    "role": "assistant",
+                    "content": content,
+                }));
+                append_to_record(record.as_mut(), std::slice::from_ref(&assistant));
+                messages.push(assistant);
+                // The assistant just recorded is known to the driver (it generated it), so
+                // advance the acked length past it: the next same-context Task then wires only
+                // its new user message, not this assistant again.
+                if matches!(mode, ConversationMode::Threaded) && context_id.is_some() {
+                    store_state
+                        .advance_continuation_acked_len(context_id.as_deref(), messages.len());
                 }
 
                 flush_hook_dispatch_faults(hooks, trace).await;
@@ -1052,6 +1104,9 @@ async fn flush_hook_inference_records(
                 None,
                 Some(&record.origin),
                 record.usage.as_ref(),
+                // A hook's own completion sent a message list the runtime never held, so there
+                // are no runtime message ids to name.
+                Vec::new(),
             )
             .await;
         otel.emit_inference(
@@ -1097,12 +1152,12 @@ const TOOL_MARKER: &str = "__murmur_tool_msg__";
 /// expected a sequence". Hooks are free to JSON-encode their summary as a plain string
 /// (`serde_json::to_string(summary)`) — normalizing it is the host's job, here.
 ///
-/// Every message the runtime builds here gets a freshly minted [`new_message_id`], including
-/// one a hook returned an `id` on: identity belongs to whoever put the message in the
-/// context, and a hook echoing an id back would otherwise let two live messages share one.
-/// `source-id` is the opposite — copied verbatim when the hook supplied one, absent when it
-/// did not, and never parsed. Both are stripped before the wire payload
-/// ([`strip_message_identity`]).
+/// An `id` the hook returned is kept: a message is minted once, at the site that created it,
+/// and a hook handing one back verbatim is handing back the same message — the conversation
+/// record recognizes it by that id and does not write it twice. A message the hook returned
+/// without one is new, and gets a freshly minted [`new_message_id`]. `source-id` is copied
+/// verbatim when the hook supplied one, absent when it did not, and never parsed. Both are
+/// stripped before the wire payload ([`strip_message_identity`]).
 fn reconstruct_hook_messages(
     wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
 ) -> Vec<Value> {
@@ -1110,9 +1165,13 @@ fn reconstruct_hook_messages(
         .into_iter()
         .filter_map(|m| {
             let source_id = m.source_id.clone();
+            let id = m.id.clone();
             let stamp = |mut message: Value| {
                 if let Some(fields) = message.as_object_mut() {
-                    fields.insert(MESSAGE_ID_KEY.to_string(), json!(new_message_id()));
+                    fields.insert(
+                        MESSAGE_ID_KEY.to_string(),
+                        json!(id.unwrap_or_else(new_message_id)),
+                    );
                     if let Some(source_id) = source_id {
                         fields.insert(MESSAGE_SOURCE_ID_KEY.to_string(), json!(source_id));
                     }
@@ -1167,7 +1226,7 @@ fn reconstruct_hook_messages(
 ///
 /// `id` and `source-id` are handed over as the runtime holds them, so a hook that keeps a
 /// message verbatim can report which record it came from.
-fn to_wit_messages(
+pub(crate) fn to_wit_messages(
     messages: &[Value],
 ) -> Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message> {
     use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
@@ -1325,6 +1384,7 @@ async fn try_compact_via_hooks(
     compaction_model: Option<String>,
     compaction_system_prompt: Option<String>,
     dump_summaries: bool,
+    record: Option<&mut crate::conversation::ConversationRecord>,
 ) -> Result<(), String> {
     let wit_messages = to_wit_messages(messages);
 
@@ -1399,6 +1459,10 @@ async fn try_compact_via_hooks(
     // Recounted through the same `ContextOccupancy` the compaction trigger reads, so
     // `tokens_before` and `tokens_after` on the `compaction` event are the same measurement
     // taken twice — the reported drop is the saving the provider actually sees.
+    // The summary joins the conversation, so it joins the record — beside, not instead of, the
+    // messages it replaced. A message the hook handed back verbatim carries the id it was
+    // written under and is not written a second time.
+    append_to_record(record, &candidate_messages);
     commit_context_messages(
         messages,
         session_tokens,
@@ -1613,45 +1677,57 @@ pub(crate) fn seed_budget_tokens(context_window: u32, seed_budget: f32) -> u64 {
     (f64::from(context_window) * f64::from(seed_budget)).floor() as u64
 }
 
-/// The conversation history this task will load before its first turn, or an empty list when
-/// the capsule is not threaded or the context has none yet.
+/// The conversation this task continues, or an empty list when the capsule is not threaded or
+/// the record holds nothing yet.
 ///
-/// The single reader of `contexts/<id>/history.json`: the agent loop starts its message list
-/// from it, and [`prior_history_tokens`] measures it for the `on-task-start` event, so a hook
-/// deciding what to seed and the loop deciding what to send are looking at the same bytes.
-pub(crate) fn load_threaded_history(
-    workdir: &Path,
+/// `lifecycle.conversation` decides what a task *loads*, never what the record holds: a
+/// `stateless` capsule writes its record like any other and simply starts every task from
+/// nothing. Every loaded message keeps the `id` its record line carries, and the record does
+/// not write it again.
+fn load_recorded_history(
+    record: Option<&mut crate::conversation::ConversationRecord>,
     mode: &ConversationMode,
-    context_id: Option<&str>,
 ) -> Vec<Value> {
-    if !matches!(mode, ConversationMode::Threaded) {
-        return Vec::new();
+    match record {
+        Some(record) if matches!(mode, ConversationMode::Threaded) => record.load(),
+        _ => Vec::new(),
     }
-    let Some(context_id) = context_id else {
-        return Vec::new();
-    };
-    let history_path = workdir
-        .join("contexts")
-        .join(context_id)
-        .join("history.json");
-    fs::read_to_string(&history_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
 }
 
-/// Tokens the history this task will load already occupies, for
+/// Append every message that has entered the context to the durable record. A no-op for a
+/// session that keeps none.
+///
+/// Called at each site a message is added to the agent loop's `messages`, which is what makes
+/// the record the loop's own list rather than a summary written at the end of it: a task that
+/// fails, or spends `inference.max_turns`, has already written everything it sent.
+fn append_to_record(
+    record: Option<&mut crate::conversation::ConversationRecord>,
+    messages: &[Value],
+) {
+    if let Some(record) = record {
+        record.append(messages);
+    }
+}
+
+/// Tokens the conversation this task will load already occupies, for
 /// `task-start-event.prior-tokens`.
 ///
-/// `0` when there is no history to load, which the WIT contract tells hooks to read as "the
-/// host has not computed this". Without it a hook in `lifecycle.conversation: threaded` seeds
-/// on top of history it cannot see and duplicates it.
+/// `0` when there is nothing to load, which the WIT contract tells hooks to read as "the host
+/// has not computed this". Without it a hook in `lifecycle.conversation: threaded` seeds on top
+/// of a conversation it cannot see and duplicates it.
 pub(crate) fn prior_history_tokens(
+    conversation_root: Option<&Path>,
     workdir: &Path,
     mode: &ConversationMode,
     context_id: Option<&str>,
 ) -> u64 {
-    let history = load_threaded_history(workdir, mode, context_id);
+    let mut record = match (conversation_root, context_id) {
+        (Some(root), Some(context_id)) if matches!(mode, ConversationMode::Threaded) => {
+            crate::conversation::ConversationRecord::open(root, context_id, workdir)
+        }
+        _ => None,
+    };
+    let history = load_recorded_history(record.as_mut(), mode);
     if history.is_empty() {
         return 0;
     }
@@ -1730,6 +1806,7 @@ pub(crate) async fn apply_seed_context(
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
     run_config: &AgentRunConfig,
+    record: Option<&mut crate::conversation::ConversationRecord>,
 ) {
     let HookSeed {
         hook_name,
@@ -1848,6 +1925,9 @@ pub(crate) async fn apply_seed_context(
         })
         .collect();
 
+    // Only what the seed commits is new to the conversation; the task message it is placed
+    // ahead of was recorded when it was built.
+    append_to_record(record, &committed);
     let mut new_messages = committed;
     new_messages.extend(messages.iter().cloned());
     commit_context_messages(
@@ -2059,13 +2139,10 @@ pub(crate) fn build_driver_payload(
     continuation: Option<(&str, usize)>,
     prompt_cache_key: Option<&str>,
 ) -> Value {
-    let (wire_messages, continuation_id): (Value, Option<&str>) = match continuation {
-        Some((id, acked_len)) => match messages.get(acked_len..) {
-            Some(slice) => (strip_message_identity(slice), Some(id)),
-            None => (strip_message_identity(messages), None),
-        },
-        None => (strip_message_identity(messages), None),
-    };
+    let continuation_id = continuation
+        .filter(|(_, acked_len)| *acked_len <= messages.len())
+        .map(|(id, _)| id);
+    let wire_messages = strip_message_identity(wire_messages(messages, continuation));
     let mut payload = json!({
         "model": model,
         "max_tokens": max_output_tokens,
@@ -2081,6 +2158,17 @@ pub(crate) fn build_driver_payload(
         payload[PROMPT_CACHE_KEY_KEY] = json!(key);
     }
     payload
+}
+
+/// The messages one request embeds: the tail past `acked_len` under an active continuation the
+/// driver can still hold, and the whole list otherwise.
+///
+/// Shared by [`build_driver_payload`] and by the `message_ids` the turn's `inference` event
+/// records, so what the trace names and what the driver received cannot drift apart.
+fn wire_messages<'a>(messages: &'a [Value], continuation: Option<(&str, usize)>) -> &'a [Value] {
+    continuation
+        .and_then(|(_, acked_len)| messages.get(acked_len..))
+        .unwrap_or(messages)
 }
 
 /// The `messages` array as it goes on the wire: every message minus [`MESSAGE_ID_KEY`] and
@@ -2285,14 +2373,6 @@ fn write_result_for_task(workdir: &Path, task_id: &str, value: &str) -> Result<(
     fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
     fs::write(out_dir.join(format!("result_{task_id}.txt")), value)
         .map_err(|e| format!("failed to write per-task result: {e}"))
-}
-
-fn persist_history(workdir: &Path, context_id: &str, messages: &[Value]) {
-    let history_dir = workdir.join("contexts").join(context_id);
-    let _ = fs::create_dir_all(&history_dir);
-    if let Ok(json) = serde_json::to_string(messages) {
-        let _ = fs::write(history_dir.join("history.json"), json);
-    }
 }
 
 fn extract_text_content(content: &[Value]) -> String {
@@ -3127,6 +3207,96 @@ mod tests {
         let msgs = reconstruct_hook_messages(vec![wit("user", "\"hi\"")]);
         assert!(msgs[0].get(MESSAGE_SOURCE_ID_KEY).is_none());
         assert!(msgs[0].get(MESSAGE_ID_KEY).is_some());
+    }
+
+    /// An id survives the round trip a compaction hook makes: out through `to_wit_messages`,
+    /// back through `reconstruct_hook_messages`, the same string. A message the hook returns
+    /// without one is new to the context and gets a freshly minted id.
+    #[test]
+    fn a_hook_returned_id_is_kept_and_a_missing_one_is_minted() {
+        let kept = "msg_0123456789abcdef0123456789abcdef";
+        let held = vec![json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "yo"}],
+            MESSAGE_ID_KEY: kept,
+        })];
+
+        let round_tripped = reconstruct_hook_messages(to_wit_messages(&held));
+        assert_eq!(round_tripped[0][MESSAGE_ID_KEY], json!(kept));
+
+        let fresh = reconstruct_hook_messages(vec![wit("user", "\"a summary\"")]);
+        let minted = fresh[0][MESSAGE_ID_KEY].as_str().unwrap();
+        assert_ne!(minted, kept);
+        assert!(minted.starts_with("msg_"), "{minted}");
+    }
+
+    /// A "tool" message's id survives the same round trip, which is what stops the record from
+    /// writing a second copy of one a hook kept verbatim.
+    #[test]
+    fn a_tool_messages_id_survives_the_round_trip() {
+        let kept = "msg_0123456789abcdef0123456789abcdef";
+        let held = vec![json!({
+            "role": "tool",
+            "tool_call_id": "t1",
+            "is_error": false,
+            "content": [{"type": "text", "text": "ok"}],
+            MESSAGE_ID_KEY: kept,
+        })];
+
+        let round_tripped = reconstruct_hook_messages(to_wit_messages(&held));
+        assert_eq!(round_tripped[0][MESSAGE_ID_KEY], json!(kept));
+        assert_eq!(round_tripped[0]["tool_call_id"], json!("t1"));
+    }
+
+    /// The four sites the agent loop mints at put an id on the message and nothing on the wire:
+    /// a payload built from them carries neither identity key at any depth.
+    #[test]
+    fn minted_messages_carry_an_id_and_reach_the_driver_without_one() {
+        let minted: Vec<Value> = [
+            json!({"role": "user", "content": [{"type": "text", "text": "task"}]}),
+            json!({"role": "assistant", "content": [{"type": "tool_call", "id": "t1"}]}),
+            json!({"role": "tool", "tool_call_id": "t1", "is_error": false,
+                   "content": [{"type": "text", "text": "ok"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}),
+        ]
+        .into_iter()
+        .map(with_new_id)
+        .collect();
+
+        let mut ids: Vec<&str> = minted
+            .iter()
+            .map(|m| message_id(m).expect("every minting site sets an id"))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 4, "each site mints its own identity");
+
+        let payload = build_driver_payload("m", 8192, &minted, &[], "sys", None, None);
+        for message in payload["messages"].as_array().unwrap() {
+            assert!(message.get(MESSAGE_ID_KEY).is_none(), "{message}");
+            assert!(message.get(MESSAGE_SOURCE_ID_KEY).is_none(), "{message}");
+        }
+        // A tool_call block's own `id` is the provider's, not a message identity, and must
+        // survive: stripping is by key at the message level only.
+        assert_eq!(payload["messages"][1]["content"][0]["id"], json!("t1"));
+    }
+
+    /// `message_ids` names what the request embedded: the whole list on a full resend, and
+    /// exactly the tail past `acked_len` under an active continuation.
+    #[test]
+    fn the_wire_slice_is_what_message_ids_reports() {
+        let minted: Vec<Value> = sample_messages().into_iter().map(with_new_id).collect();
+
+        assert_eq!(wire_messages(&minted, None).len(), 3);
+        assert_eq!(
+            wire_messages(&minted, Some(("c", 2)))
+                .iter()
+                .filter_map(message_id)
+                .collect::<Vec<_>>(),
+            vec![message_id(&minted[2]).unwrap()]
+        );
+        // A stale acked length falls back to the full resend, and the ids follow it.
+        assert_eq!(wire_messages(&minted, Some(("c", 9))).len(), 3);
     }
 
     /// A message list carrying neither identity key serializes byte-for-byte through

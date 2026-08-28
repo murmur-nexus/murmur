@@ -10,6 +10,8 @@ pub mod artifact_config;
 pub mod bindings;
 pub(crate) mod cgroup;
 pub mod containment;
+pub(crate) mod conversation;
+pub(crate) mod conversation_import;
 pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod hooks;

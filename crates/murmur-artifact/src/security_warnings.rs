@@ -128,6 +128,16 @@ pub const W_SEC_014: &str = "W-SEC-014";
 /// tool already warns `W-SEC-008`. Fires at staging, before any session workdir exists.
 pub const W_SEC_015: &str = "W-SEC-015";
 
+/// A `capabilities.conversation` block was declared in the capsule-wide `capabilities:` block,
+/// where nothing reads it, so no artifact was granted `murmur:conversation/read`.
+///
+/// The grant is applied per *artifact*, on the `runtime: hook` entry whose component imports the
+/// interface. The capsule's own guest holds no artifact grant and compiles against a world that
+/// has no such import, so a top-level declaration reaches nothing. Structurally valid and
+/// therefore warned rather than refused, on the same terms as `W-SEC-014`.
+/// Fires at staging, before any session workdir exists.
+pub const W_SEC_016: &str = "W-SEC-016";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -146,7 +156,7 @@ mod tests {
     fn every_code_is_unique_and_well_formed() {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
-            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015,
+            W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

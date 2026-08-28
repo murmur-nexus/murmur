@@ -23,6 +23,7 @@ version each one carries.
 | [`murmur:runtime/inference`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/inference.wit) | Provided by the runtime to hook components | Run one LLM completion through the capsule's configured driver |
 | [`murmur:runtime/tokens`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/tokens.wit) | Provided by the runtime to hook components | Count the tokens in a string the way the runtime counts them |
 | [`murmur:task-io/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-task-io/read.wit) | Provided by the runtime to hook components | Read the task's input text and the agent's result text |
+| [`murmur:conversation/read`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/deps/murmur-conversation/read.wit) | Provided by the runtime to hook components | Read the capsule's durable conversation record |
 
 ## Worlds
 
@@ -33,7 +34,7 @@ A world is what your component's source compiles against with `wit_bindgen::gene
 | `capsule` | `tool-registry/invoke` | `capsule/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `tool` | `task/task`, `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
 | `driver` | `text/chunks` | `tool/run` | [`guest/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/guest/worlds.wit) |
-| `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
+| `hook` | `runtime/inference`, `runtime/tokens`, `task-io/read`, `conversation/read` | `hook/lifecycle` | [`hook/worlds.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/hook/worlds.wit) |
 | `runtime-host` | `artifact-manager/manage`, `shell/execute`, `tool-registry/invoke`, `message/send` | — | [`host/host.wit`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/host/host.wit) |
 
 Agent capsules compile against no world — the agent loop runs inside the runtime, and the capsule
@@ -422,6 +423,53 @@ may be after the task has left scope. Bind a hook that reads the task as `blocki
 
 ---
 
+## `murmur:conversation/read`
+
+A runtime-provided import available to any hook component that declares it. It hands a hook the
+capsule's [durable conversation record](workdir.md#the-conversation-record) — every message the
+runtime put in front of the model, newest first, paged — without a `filesystem` grant. No artifact
+gets a filesystem path into `~/.murmur/conversations/`; this interface is the only way in. The
+runtime is the only writer, and there is no write function.
+
+Reading is granted per hook with
+[`capabilities.conversation.read: true`](manifest.md#hook-capabilities) on that hook's entry in the
+capsule manifest. A hook without the key still links and still runs — `read-messages` returns
+`not-granted`.
+
+| Function | Returns |
+|---|---|
+| `read-messages(cursor, limit)` | One `message-page`: `messages`, `next-cursor`, `total` |
+
+`messages[0]` is the most recently appended message, and each carries the `id` its record line
+holds. `total` is the number of messages in the whole record, not in this page.
+
+| Field | Meaning |
+|---|---|
+| `cursor` | Opaque and host-minted. `none` starts at the newest message; pass back the `next-cursor` of the page you just read. |
+| `next-cursor` | `none` once a page has reached the oldest message in the record, which is what ends a paging loop. |
+| `limit` | Clamped to `1..=100`, so `0` reads one message and a loop always makes progress. |
+
+A cursor stays valid while the runtime appends to the record underneath a paging hook: it names a
+position counted from the oldest message.
+
+| Error | Meaning |
+|---|---|
+| `not-granted` | The hook's entry does not declare `capabilities.conversation.read: true` |
+| `invalid-cursor` | A cursor the host did not mint, or one past the end of the record |
+| `unavailable: <reason>` | The record exists and could not be read |
+
+A record that does not exist is not an error: the read succeeds with no messages and `total: 0`.
+That is what a hook sees before the first task of a launch, under
+[`context.record: off`](manifest.md#context-record), and in a capsule running
+`inference.transport: process` — whose CLI owns its own conversation, so the runtime puts no
+message list in front of a model and writes no record.
+
+The record in scope is the one belonging to the task the hook is being dispatched for, which is
+the `context-id` on `task-start-event`. A hook bound to `on-task-start` therefore reads the
+conversation its task is about to continue.
+
+---
+
 ## Package versioning
 
 Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract a compiled
@@ -437,6 +485,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:message` | `0.1.0` |
 | `murmur:task` | `0.1.0` |
 | `murmur:task-io` | `0.1.0` |
+| `murmur:conversation` | `0.1.0` |
 | `murmur:text` | `0.1.0` |
 | `murmur:hook` | `0.6.0` |
 | `murmur:runtime` | `0.3.0` |

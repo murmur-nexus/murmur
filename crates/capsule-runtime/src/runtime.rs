@@ -15,7 +15,7 @@ use murmur_artifact::{
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
     LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
     MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
+    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -365,6 +365,21 @@ pub fn stage_session(
         &request.capsule_name,
     )?;
     warn_on_inert_capsule_wide_state(request.capability_policy.state_declared);
+    warn_on_inert_capsule_wide_conversation(request.capability_policy.conversation_declared);
+    // Both halves of a record path, checked here for the reason a state store name is: a value
+    // that cannot be one directory segment refuses the launch before anything is pulled, created
+    // or instantiated, naming the key the operator wrote it under.
+    if let Some(record) = request
+        .context
+        .as_ref()
+        .filter(|context| context.record)
+        .and_then(|context| context.record_store.as_deref())
+    {
+        crate::conversation::validate_record_segment("context.record_store", record)?;
+    }
+    if let Some(context_id) = request.context_id.as_deref() {
+        crate::conversation::validate_record_segment("--context", context_id)?;
+    }
     // Resolved here for the same reason `state_stores` above is: a malformed `config:` block
     // refuses the launch before any registry pull, workdir creation or component instantiation,
     // and through the identical function `mur run --explain-scope` calls on the identical inputs.
@@ -838,6 +853,7 @@ pub fn stage_session(
         inference: request.inference,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
+        context_id: request.context_id,
         engine,
         capsule_component,
         tool_components,
@@ -963,6 +979,12 @@ pub fn launch_session(
                 .as_ref()
                 .map(|c| c.seed_overflow_margin)
                 .unwrap_or(murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN),
+            conversation_root: resolve_conversation_root(
+                staged.context.as_ref(),
+                &staged.capsule_name,
+                inference,
+                &workdir,
+            ),
         };
 
         // --- Identity and HTTP server setup ---
@@ -1031,6 +1053,10 @@ pub fn launch_session(
         // --- Lifecycle config ---
         let effective_lifecycle = staged.lifecycle.clone();
         let conversation_mode = effective_lifecycle.conversation_mode.clone();
+        // `mur run --context <id>`: the id every `task.md` task of this launch runs under, so two
+        // runs given the same one share one conversation record. Validated at staging; `None`
+        // mints a fresh id per task, as it always has.
+        let supplied_context_id = staged.context_id.clone();
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
             _ => 1,
@@ -1336,6 +1362,7 @@ pub fn launch_session(
                         },
                         hook_limits,
                         hook_inference,
+                        run_config.conversation_root.clone(),
                     )
                     .await?;
 
@@ -1356,7 +1383,7 @@ pub fn launch_session(
                                 // Does not accept incoming tasks; run from task.md if present
                                 if workdir_task_md.exists() {
                                     let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                    let context_id = format!("ctx_{}", uuid::Uuid::now_v7().simple());
+                                    let context_id = task_context_id(supplied_context_id.as_deref());
                                     let bytes = tokio::fs::metadata(&workdir_task_md)
                                         .await
                                         .map(|m| m.len())
@@ -1375,6 +1402,7 @@ pub fn launch_session(
                                             seed_budget_tokens,
                                             u64::from(context_window),
                                             agent::prior_history_tokens(
+                                                run_config.conversation_root.as_deref(),
                                                 &workdir,
                                                 &conversation_mode,
                                                 Some(&context_id),
@@ -1418,7 +1446,7 @@ pub fn launch_session(
                                 if workdir_task_md.exists() {
                                     // Backward compat: existing task.md → single run, no A2A
                                     let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                    let context_id = format!("ctx_{}", uuid::Uuid::now_v7().simple());
+                                    let context_id = task_context_id(supplied_context_id.as_deref());
                                     let bytes = tokio::fs::metadata(&workdir_task_md)
                                         .await
                                         .map(|m| m.len())
@@ -1437,6 +1465,7 @@ pub fn launch_session(
                                             seed_budget_tokens,
                                             u64::from(context_window),
                                             agent::prior_history_tokens(
+                                                run_config.conversation_root.as_deref(),
                                                 &workdir,
                                                 &conversation_mode,
                                                 Some(&context_id),
@@ -1579,6 +1608,7 @@ pub fn launch_session(
                                 seed_budget_tokens,
                                 u64::from(context_window),
                                 agent::prior_history_tokens(
+                                    run_config.conversation_root.as_deref(),
                                     &workdir,
                                     &conversation_mode,
                                     Some(&incoming.context_id),
@@ -2116,6 +2146,26 @@ fn warn_on_inert_capsule_wide_state(state_declared: bool) {
          a durable state store is granted per artifact — nothing reads a top-level declaration, \
          so no store was created and no 'state' preopen exists. Move the block onto the tool, \
          driver or hook entry that needs it ({link})"
+    );
+}
+
+/// Warns (non-fatal, once per session) when the capsule's own top-level
+/// `capabilities.conversation` is declared, because that declaration reaches nothing.
+///
+/// The grant is per artifact, on the `runtime: hook` entry whose component imports
+/// `murmur:conversation/read`; the capsule's own guest holds no artifact grant and compiles
+/// against a world with no such import. Same seam and same terms as
+/// [`warn_on_inert_capsule_wide_state`].
+fn warn_on_inert_capsule_wide_conversation(conversation_declared: bool) {
+    if !conversation_declared {
+        return;
+    }
+    let link = security_warning_link(W_SEC_016);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_016}]: capsule-wide capabilities.conversation is \
+         declared, but the murmur:conversation/read grant is per artifact — nothing reads a \
+         top-level declaration, so no artifact can read the conversation record. Move the block \
+         onto the hook entry that needs it ({link})"
     );
 }
 
@@ -4350,6 +4400,48 @@ fn shell_result_to_tool_result(
     }
 }
 
+/// The context id one `task.md` task runs under: the operator's `--context` value when they gave
+/// one, or a fresh id.
+///
+/// A supplied id is what makes a record reachable outside A2A: it is the same id the A2A path
+/// gets from its client, so the two produce the same record path for the same conversation.
+fn task_context_id(supplied: Option<&str>) -> String {
+    supplied
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ctx_{}", uuid::Uuid::now_v7().simple()))
+}
+
+/// `~/.murmur/conversations/<record>` for this launch, or `None` when it keeps no record.
+///
+/// Three ways to have none, and all three are ordinary: `context.record: off`, a
+/// `process`-transport capsule (whose CLI owns its own conversation and whose loop never builds a
+/// message list), and a host whose home directory cannot be resolved. The last is reported and
+/// survived rather than refused — the record is on by default for every `http` capsule, so a host
+/// with no usable `HOME` must not become one where nothing launches.
+fn resolve_conversation_root(
+    context: Option<&ContextConfig>,
+    capsule_name: &str,
+    inference: &murmur_artifact::InferenceConfig,
+    workdir: &Path,
+) -> Option<PathBuf> {
+    if inference.transport == "process" {
+        return None;
+    }
+    let record = crate::conversation::resolve_record_name(context, capsule_name)?;
+    match crate::conversation::record_root(&record) {
+        Ok(root) => Some(root),
+        Err(reason) => {
+            let message = format!(
+                "[conversation] the record for '{record}' could not be located ({reason}); \
+                 this session runs unrecorded"
+            );
+            eprintln!("[capsule-runtime] {message}");
+            agent::append_bootstrap_log(workdir, &message);
+            None
+        }
+    }
+}
+
 fn resolve_context_window(context: Option<&ContextConfig>) -> u32 {
     context.and_then(|c| c.max_tokens).unwrap_or(0)
 }
@@ -4989,6 +5081,7 @@ inference:
             inference: None,
             system_prompt_overridden: false,
             context: None,
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5077,6 +5170,7 @@ inference:
             inference: None,
             system_prompt_overridden: false,
             context: None,
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5153,6 +5247,7 @@ inference:
             inference: None,
             system_prompt_overridden: false,
             context: None,
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5228,6 +5323,7 @@ inference:
             inference: None,
             system_prompt_overridden: false,
             context: None,
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5379,6 +5475,7 @@ inference:
             inference: Some(inference),
             system_prompt_overridden: false,
             context: None,
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -6235,6 +6332,7 @@ inference:
             resources: None,
             state: None,
             task_io: None,
+            conversation: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling(), "test-capsule")
@@ -6531,6 +6629,7 @@ inference:
                 resources: None,
                 state: None,
                 task_io: None,
+                conversation: None,
                 containment: None,
             }),
         };
@@ -6641,6 +6740,7 @@ inference:
                 resources: None,
                 state: None,
                 task_io: None,
+                conversation: None,
                 containment: None,
             }),
         };
@@ -6682,6 +6782,7 @@ inference:
             // an operator their durable store was ignored when it was granted.
             state: Some(murmur_artifact::StateCapabilities { store: None }),
             task_io: None,
+            conversation: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 
@@ -6888,6 +6989,7 @@ inference:
             HookEnvVars::default(),
             crate::limits::ExecutionLimits::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -6901,6 +7003,7 @@ inference:
             max_output_tokens: 1024,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            conversation_root: None,
         };
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
@@ -7071,6 +7174,7 @@ inference:
                 network_allow_rules: Vec::new(),
                 filesystem_scope: None,
                 task_io_read,
+                conversation_read: false,
                 state_store: None,
                 state_dir: None,
                 config_json: None,
@@ -7093,6 +7197,7 @@ inference:
             HookEnvVars::default(),
             crate::limits::ExecutionLimits::default(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -7106,6 +7211,7 @@ inference:
             max_output_tokens: 1024,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            conversation_root: None,
         };
 
         trace

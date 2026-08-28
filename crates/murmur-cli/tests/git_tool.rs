@@ -254,6 +254,7 @@ fn stage_fixture_tool_session(
             inference: runtime_manifest.inference.clone(),
             system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
