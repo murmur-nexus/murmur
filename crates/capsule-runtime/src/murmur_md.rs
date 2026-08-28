@@ -498,6 +498,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let context = ContextConfig {
             max_tokens: Some(200_000),
+            record: true,
+            record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
         };
@@ -518,6 +520,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let context = ContextConfig {
             max_tokens: Some(100_000),
+            record: true,
+            record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
         };
@@ -538,6 +542,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("tools")).unwrap();
         let context = ContextConfig {
             max_tokens: Some(100_000),
+            record: true,
+            record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
         };

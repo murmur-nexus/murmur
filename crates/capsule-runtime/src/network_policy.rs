@@ -257,6 +257,10 @@ pub(crate) struct HookCapabilityGrant {
     /// `murmur:task-io/read` host import. `false` = the import still links and every one of
     /// its functions returns `not-granted`.
     pub(crate) task_io_read: bool,
+    /// Whether this hook may read the capsule's durable conversation record through the
+    /// `murmur:conversation/read` host import. `false` = the import still links and
+    /// `read-messages` returns `not-granted`.
+    pub(crate) conversation_read: bool,
     /// Resolved, validated `capabilities.state.store` name, with the capsule-name default already
     /// applied. `None` = no `capabilities.state` block, so no durable store of any kind.
     pub(crate) state_store: Option<String>,
@@ -317,6 +321,10 @@ impl HookCapabilityGrant {
                 .task_io
                 .as_ref()
                 .is_some_and(|task_io| task_io.read),
+            conversation_read: capabilities
+                .conversation
+                .as_ref()
+                .is_some_and(|conversation| conversation.read),
             state_store: derive_state_store(capabilities, capsule_name)?,
             state_dir: None,
             config_json: None,
@@ -494,6 +502,7 @@ mod tests {
             resources: None,
             state: None,
             task_io: None,
+            conversation: None,
             containment: None,
         }
     }
@@ -575,10 +584,29 @@ mod tests {
         for (declared, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
             let caps = murmur_artifact::Capabilities {
                 task_io: declared.map(|read| murmur_artifact::TaskIoCapabilities { read }),
+                conversation: None,
                 ..capabilities_block(None, None)
             };
             let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
             assert_eq!(grant.task_io_read, expected, "declared: {declared:?}");
+            assert!(grant.network_allow_rules.is_empty());
+            assert!(grant.filesystem_scope.is_none());
+        }
+    }
+
+    /// `capabilities.conversation.read` lowers on its own axis, exactly as `task_io.read` does,
+    /// and neither ever widens network or filesystem.
+    #[test]
+    fn hook_grant_conversation_read_is_carried_through_independently() {
+        for (declared, expected) in [(None, false), (Some(false), false), (Some(true), true)] {
+            let caps = murmur_artifact::Capabilities {
+                conversation: declared
+                    .map(|read| murmur_artifact::ConversationCapabilities { read }),
+                ..capabilities_block(None, None)
+            };
+            let grant = HookCapabilityGrant::derive(Some(&caps), "test-capsule").unwrap();
+            assert_eq!(grant.conversation_read, expected, "declared: {declared:?}");
+            assert!(!grant.task_io_read, "one grant never implies the other");
             assert!(grant.network_allow_rules.is_empty());
             assert!(grant.filesystem_scope.is_none());
         }

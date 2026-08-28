@@ -834,6 +834,14 @@ pub const DEFAULT_SEED_OVERFLOW_MARGIN: f32 = 0.10;
 pub struct ContextConfig {
     /// Token budget for this session; None disables compaction.
     pub max_tokens: Option<u32>,
+    /// Whether the runtime keeps a durable conversation record for this capsule. `true` unless
+    /// the manifest says `record: off`; `false` turns the mechanism off entirely, creating
+    /// nothing under `~/.murmur/conversations/`.
+    pub record: bool,
+    /// Directory segment under `~/.murmur/conversations/` this capsule's records live in.
+    /// `None` means the capsule name. Validated as one path segment by the runtime, on the same
+    /// terms as `capabilities.state.store`. Inert when [`Self::record`] is `false`.
+    pub record_store: Option<String>,
     /// Fraction of [`Self::max_tokens`] an `on-task-start` hook's `seed-context` may
     /// occupy, in `0.0..=1.0`. Always populated; [`DEFAULT_SEED_BUDGET`] when the key is
     /// absent. Inert without `max_tokens`: a fraction of no ceiling is no ceiling, and a
@@ -921,6 +929,17 @@ pub struct TaskIoCapabilities {
     /// Whether this hook may read the in-scope task's input and result text. Never inferred:
     /// a `task_io:` block that omits `read:` is rejected, on the same terms as
     /// `capabilities.shell.interpreter_runtime[].dirs[].list_dir`.
+    pub read: bool,
+}
+
+/// The `capabilities.conversation` block on a `runtime: hook` artifact entry — the operator's
+/// grant of the `murmur:conversation/read` host import to that one hook. Rejected at parse time
+/// on any other artifact role; accepted but inert in the capsule-wide block, which warns
+/// `W-SEC-016` at staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationCapabilities {
+    /// Whether this hook may read the capsule's durable conversation record. Never inferred: a
+    /// `conversation:` block that omits `read:` is rejected, exactly as `task_io:` is.
     pub read: bool,
 }
 
@@ -1219,6 +1238,9 @@ pub struct Capabilities {
     /// Per-hook grant of the `murmur:task-io/read` host import. Only ever `Some` on a
     /// `runtime: hook` artifact entry — see [`TaskIoCapabilities`].
     pub task_io: Option<TaskIoCapabilities>,
+    /// Per-hook grant of the `murmur:conversation/read` host import — see
+    /// [`ConversationCapabilities`].
+    pub conversation: Option<ConversationCapabilities>,
     /// Minimum containment class this capsule declares. `None` (the overwhelmingly common
     /// case) means the capsule states no requirement and inherits whatever the workspace
     /// config or `--containment` asks for, defaulting to `advisory`.
@@ -1360,6 +1382,12 @@ struct RawNetworkConfig {
 #[derive(Debug, Deserialize)]
 struct RawContextConfig {
     max_tokens: Option<u32>,
+    /// `on` | `off`. Kept as a raw `String` so an unrecognized value reports as an invalid
+    /// value for this key rather than as a serde variant error against the whole block.
+    #[serde(default)]
+    record: Option<String>,
+    #[serde(default)]
+    record_store: Option<String>,
     #[serde(default)]
     seed_budget: Option<f32>,
     #[serde(default)]
@@ -1455,6 +1483,8 @@ struct RawCapabilities {
     state: Option<RawStateCapabilities>,
     #[serde(default)]
     task_io: Option<RawTaskIoCapabilities>,
+    #[serde(default)]
+    conversation: Option<RawConversationCapabilities>,
     /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
     /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
     /// "unknown variant" error attributed to the whole `capabilities:` block.
@@ -1466,6 +1496,14 @@ struct RawCapabilities {
 struct RawTaskIoCapabilities {
     // `Option` so an omitted `read` is distinguishable from an explicit `false`: the omission
     // is rejected outright rather than defaulted, because a capability is never inferred.
+    #[serde(default)]
+    read: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConversationCapabilities {
+    // `Option` for the reason `RawTaskIoCapabilities::read` is: an omitted key is refused rather
+    // than defaulted.
     #[serde(default)]
     read: Option<bool>,
 }
@@ -1805,6 +1843,21 @@ impl RuntimeManifest {
                                     "artifact '{name}' declares 'capabilities.task_io:' but has \
                                      'runtime: {}'; the key grants the murmur:task-io/read host \
                                      import and is only recognized on 'runtime: hook' entries",
+                                    runtime.as_str()
+                                ),
+                            });
+                        }
+                        // `conversation` grants the `murmur:conversation/read` host import, on the
+                        // same terms as `task_io` above: only a hook component's world can import
+                        // it, so on any other role the grant would be silently inert.
+                        if raw_caps.conversation.is_some() && runtime != ArtifactRuntime::Hook {
+                            return Err(RuntimeManifestError::InvalidArtifact {
+                                index,
+                                message: format!(
+                                    "artifact '{name}' declares 'capabilities.conversation:' but \
+                                     has 'runtime: {}'; the key grants the \
+                                     murmur:conversation/read host import and is only recognized \
+                                     on 'runtime: hook' entries",
                                     runtime.as_str()
                                 ),
                             });
@@ -2349,6 +2402,21 @@ fn parse_capabilities(
         })
         .transpose()?;
 
+    let conversation = raw_caps
+        .conversation
+        .map(|raw_conversation| {
+            raw_conversation
+                .read
+                .map(|read| ConversationCapabilities { read })
+                .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.conversation.read".to_string(),
+                    message: "must be set explicitly to true or false — a capability is never \
+                              inferred"
+                        .to_string(),
+                })
+        })
+        .transpose()?;
+
     let containment = raw_caps
         .containment
         .as_deref()
@@ -2375,6 +2443,7 @@ fn parse_capabilities(
         resources,
         state,
         task_io,
+        conversation,
         containment,
     }))
 }
@@ -2858,8 +2927,22 @@ fn parse_context(
         }),
     };
 
+    let record = match raw.record.as_deref().map(str::trim) {
+        None => true,
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => {
+            return Err(RuntimeManifestError::InvalidInferenceConfig {
+                field: "context.record".to_string(),
+                message: format!("unknown value '{other}'; expected: on, off"),
+            })
+        }
+    };
+
     Ok(Some(ContextConfig {
         max_tokens: raw.max_tokens,
+        record,
+        record_store: raw.record_store.map(|store| store.trim().to_string()),
         seed_budget: fraction("context.seed_budget", raw.seed_budget, DEFAULT_SEED_BUDGET)?,
         seed_overflow_margin: fraction(
             "context.seed_overflow_margin",
@@ -4030,6 +4113,123 @@ capabilities:
         let msg = err.to_string();
         assert!(msg.contains("capabilities.task_io"), "error was: {msg}");
         assert!(msg.contains("runtime: hook"), "error was: {msg}");
+    }
+
+    // ── capabilities.conversation (per-hook, honored only on runtime: hook) ───
+
+    /// A capsule manifest with one artifact entry carrying `capabilities: conversation: <block>`.
+    fn manifest_with_conversation(runtime: &str, block: &str) -> String {
+        format!(
+            "name: cap\nversion: 0.0.1\nartifacts:\n  - name: memory\n    version: 1.2.3\n    \
+             runtime: {runtime}\n    capabilities:\n      conversation:\n{block}"
+        )
+    }
+
+    #[test]
+    fn conversation_read_lowers_onto_the_hook_entry() {
+        for (declared, expected) in [("true", true), ("false", false)] {
+            let manifest = RuntimeManifest::from_yaml_str(&manifest_with_conversation(
+                "hook",
+                &format!("        read: {declared}\n"),
+            ))
+            .expect("conversation on a hook entry parses");
+            assert_eq!(
+                manifest.artifacts[0]
+                    .capabilities
+                    .as_ref()
+                    .unwrap()
+                    .conversation,
+                Some(ConversationCapabilities { read: expected })
+            );
+        }
+    }
+
+    /// The capability is never inferred: a block that omits `read:` is a parse error naming the
+    /// key, exactly as `capabilities.task_io.read` is.
+    #[test]
+    fn conversation_without_read_is_rejected() {
+        let err =
+            RuntimeManifest::from_yaml_str(&manifest_with_conversation("hook", "        {}\n"))
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("capabilities.conversation.read"), "was: {msg}");
+        assert!(msg.contains("explicitly"), "was: {msg}");
+    }
+
+    /// Only a hook's world can import the interface, so declaring the grant on any other role is
+    /// a parse error rather than a silently inert block.
+    #[test]
+    fn conversation_outside_a_hook_entry_is_rejected() {
+        for runtime in ["tool", "driver", "skill"] {
+            let err = RuntimeManifest::from_yaml_str(&manifest_with_conversation(
+                runtime,
+                "        read: true\n",
+            ))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("capabilities") && msg.contains("runtime: hook"),
+                "{runtime} entry: error was: {msg}"
+            );
+        }
+    }
+
+    /// Unlike `task_io`, the capsule-wide block parses: it is inert, and the runtime says so once
+    /// as `W-SEC-016` rather than refusing a manifest an operator can fix at leisure.
+    #[test]
+    fn conversation_in_the_capsule_wide_block_parses_and_is_inert() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncapabilities:\n  conversation:\n    read: true\n",
+        )
+        .expect("a capsule-wide block is accepted");
+        assert_eq!(
+            manifest.capabilities.unwrap().conversation,
+            Some(ConversationCapabilities { read: true })
+        );
+    }
+
+    // ── context.record / context.record_store ────────────────────────────────
+
+    /// The record is on unless the manifest says otherwise, and `record_store` defaults to
+    /// nothing — the runtime substitutes the capsule name.
+    #[test]
+    fn a_context_block_records_by_default() {
+        let context = context_of("context:\n  max_tokens: 1000\n").unwrap();
+        assert!(context.record);
+        assert_eq!(context.record_store, None);
+    }
+
+    #[test]
+    fn record_off_and_on_are_the_two_accepted_values() {
+        assert!(!context_of("context:\n  record: off\n").unwrap().record);
+        assert!(context_of("context:\n  record: on\n").unwrap().record);
+
+        let err = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncontext:\n  record: sometimes\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("context.record"), "was: {msg}");
+        assert!(msg.contains("sometimes"), "was: {msg}");
+    }
+
+    /// `record_store` is a name the runtime turns into a directory, so it is kept verbatim apart
+    /// from surrounding whitespace; its *shape* is refused at launch, where the path is built.
+    #[test]
+    fn record_store_is_kept_verbatim_and_trimmed() {
+        assert_eq!(
+            context_of("context:\n  record_store: '  shey  '\n")
+                .unwrap()
+                .record_store,
+            Some("shey".to_string())
+        );
+        assert_eq!(
+            context_of("context:\n  record: off\n  record_store: shey\n")
+                .unwrap()
+                .record_store,
+            Some("shey".to_string()),
+            "a store declared beside record: off is kept and simply never used"
+        );
     }
 
     #[test]

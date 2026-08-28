@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod hook_wat;
+
 use std::{
     collections::HashSet,
     fs,
@@ -197,6 +199,11 @@ pub fn stage_agent_session(
 ) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
+    // Staging in-process means the runtime resolves `$HOME` from the test binary's own
+    // environment, and an `http` capsule keeps a conversation record under it. Point it at the
+    // test's home so a suite that stages a session writes nothing into the developer's.
+    std::env::set_var("HOME", home.path());
+
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::new();
     for artifact in &runtime_manifest.artifacts {
@@ -230,6 +237,7 @@ pub fn stage_agent_session(
             inference: runtime_manifest.inference.clone(),
             system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

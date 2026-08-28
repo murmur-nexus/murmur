@@ -21,6 +21,7 @@ section that explains it.
 | `E-CAP-008` | a persistent capsule declares `exports.peer_files` without a short enough `max_ttl` | [E-CAP-008](#e-cap-008) |
 | `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
+| `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -78,6 +79,7 @@ section that explains it.
 | `W-SEC-013` | Unprivileged user namespaces are unrestricted host-wide, not granted to `mur` by the shipped AppArmor profile | [W-SEC-013](#w-sec-013) |
 | `W-SEC-014` | A capsule-wide `capabilities.state` block grants nothing — a durable store is granted per artifact | [W-SEC-014](#w-sec-014) |
 | `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
+| `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 
 ---
 
@@ -348,6 +350,29 @@ instantiation, so no session workdir appears and no `trace.jsonl` is written.
 
 The runtime checks the shape and not the meaning: which keys a given artifact requires is that
 artifact's own business, and a missing one surfaces as that artifact's error rather than this one.
+
+### E-CAP-011 — a conversation record path segment is not usable { #e-cap-011 }
+
+The [conversation record](workdir.md#the-conversation-record) lives at
+`~/.murmur/conversations/<record>/<context-id>/`, and both segments come from the operator:
+[`context.record_store`](manifest.md#field-context) and
+[`mur run --context`](cli.md#mur-run). Each must be a single path segment, and a value that is not
+refuses the launch, quoting what was written:
+
+```text
+error[E-CAP-011]: invalid context.record_store 'a/b': must be a single path segment: no '/', no '.' or '..', not absolute, and not starting with a dot
+  hint: context.record_store names one directory under ~/.murmur/conversations/, and --context names one directory beneath that, so each must be a single path segment. Omit context.record_store to use the capsule name, and omit --context to get a fresh id per task — see docs/content/reference/manifest.md
+```
+
+The refusal is decided at staging, before any registry pull, workdir creation or component
+instantiation, so nothing is created under `~/.murmur/conversations/`.
+
+Distinct from [`E-CAP-009`](#e-cap-009), which is the same shape rule applied to
+`capabilities.state.store` and points at a different key and a different directory.
+
+A `contextId` an A2A client sends is not an operator value and never refuses a launch: a task whose
+context id is not a usable segment simply goes unrecorded, reported once to stderr and to
+`logs/bootstrap.log`.
 
 ---
 
@@ -1005,3 +1030,34 @@ still lists the artifact under `artifact config:`, because that reports what the
 arguments or a file it is pointed at — or drop the block. `config:` on a `runtime: tool` entry
 backed by a WASM component, on a `runtime: driver` entry, or on a `runtime: hook` entry is
 delivered normally.
+
+---
+
+### W-SEC-016 — a capsule-wide `capabilities.conversation` block grants nothing { #w-sec-016 }
+
+**Fires when:** the capsule's own top-level `capabilities:` block declares `conversation`. Once, at
+staging, on stderr.
+
+**Why it matters:** the `murmur:conversation/read` grant is per *hook* — it is the `runtime: hook`
+entry whose component imports the interface that receives it. The capsule's own guest holds no
+artifact grant and compiles against a world with no such import, so a top-level declaration reaches
+nothing and no artifact can read the [conversation record](workdir.md#the-conversation-record).
+
+```text
+[capsule-runtime] warning[W-SEC-016]: capsule-wide capabilities.conversation is declared, but the murmur:conversation/read grant is per artifact — nothing reads a top-level declaration, so no artifact can read the conversation record. Move the block onto the hook entry that needs it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-016)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes, on the same terms
+as [`W-SEC-014`](#w-sec-014).
+
+**What to do:** move the block onto the hook entry that reads the record —
+
+```yaml
+artifacts:
+  - name: murmur-hook-recall
+    version: 0.1.0
+    runtime: hook
+    capabilities:
+      conversation:
+        read: true
+```

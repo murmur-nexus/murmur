@@ -590,7 +590,18 @@ async fn read_process_output(
                 };
 
                 let _ = trace
-                    .write_inference(turn_idx, 0, 0, decision.to_string(), None, None, None)
+                    .write_inference(
+                        turn_idx,
+                        0,
+                        0,
+                        decision.to_string(),
+                        None,
+                        None,
+                        None,
+                        // The CLI owns its own conversation; the runtime minted no message
+                        // for this request and has no id to name.
+                        Vec::new(),
+                    )
                     .await;
 
                 otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None, None)
@@ -820,7 +831,16 @@ async fn read_codex_output(
                             .unwrap_or("")
                             .to_string();
                         let _ = trace
-                            .write_inference(turns - 1, 0, 0, "end_turn".into(), None, None, None)
+                            .write_inference(
+                                turns - 1,
+                                0,
+                                0,
+                                "end_turn".into(),
+                                None,
+                                None,
+                                None,
+                                Vec::new(),
+                            )
                             .await;
                         otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None, None)
                             .await;
@@ -853,6 +873,7 @@ async fn read_codex_output(
                                 Some(tool_name.clone()),
                                 None,
                                 None,
+                                Vec::new(),
                             )
                             .await;
                         otel.emit_inference(

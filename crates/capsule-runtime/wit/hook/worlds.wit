@@ -7,11 +7,13 @@ package murmur:runtime@0.3.0;
 /// so each is referenced by its bare interface name (a fully-qualified
 /// self-package reference does not resolve in wit-parser). Any further interface
 /// added to this package must be imported the same way.
-/// `murmur:task-io/read` lives in its own package and is therefore named in
-/// full, the same shape the lifecycle export uses.
+/// `murmur:task-io/read` and `murmur:conversation/read` live in their own
+/// packages and are therefore named in full, the same shape the lifecycle export
+/// uses.
 world hook {
   import inference;
   import tokens;
   import murmur:task-io/read@0.1.0;
+  import murmur:conversation/read@0.1.0;
   export murmur:hook/lifecycle@0.6.0;
 }

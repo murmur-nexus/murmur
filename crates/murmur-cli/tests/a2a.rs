@@ -100,6 +100,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             inference: runtime_manifest.inference.clone(),
             system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

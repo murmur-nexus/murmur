@@ -88,6 +88,8 @@ network:
 
 context:
   max_tokens: 200000   # enables context compaction; omit to disable
+  record: on           # on (default) | off — the durable conversation record
+  record_store: shey   # optional; directory under ~/.murmur/conversations/, default: capsule name
 
 observability:
   otel_endpoint: http://localhost:4318  # OTLP/HTTP endpoint; absent = no external span export
@@ -229,6 +231,14 @@ artifacts:
       task_io:
         read: true
 
+  # granted the capsule's conversation record, and nothing else
+  - name: murmur-hook-recall
+    version: 0.1.0
+    runtime: hook
+    capabilities:
+      conversation:
+        read: true
+
   # granted a durable store and nothing else — no project directory at all
   - name: murmur-hook-memory
     version: 0.1.0
@@ -240,6 +250,7 @@ artifacts:
 | Key | Type | Required | Description |
 |---|---|---|---|
 | `task_io.read` | bool | yes | Whether this hook may read the task's input text and the agent's result text through [`murmur:task-io/read`](wit-interfaces.md#murmurtask-ioread). Never inferred: a `task_io:` block that omits it fails with `E-MAN-003`. |
+| `conversation.read` | bool | yes | Whether this hook may read the capsule's [conversation record](workdir.md#the-conversation-record) through [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread). Never inferred: a `conversation:` block that omits it fails with `E-MAN-003`. |
 | `state.store` | string | no | Directory name under `~/.murmur/state/`. Omitted, the capsule name is used. See [Durable state](workdir.md#state-store). |
 
 Rules:
@@ -268,9 +279,16 @@ Rules:
   `runtime: driver` or `runtime: skill` entry, or in the capsule-wide
   [`capabilities`](#field-capabilities) block, fails with `E-MAN-003` — nothing there could
   enforce it.
-- **Only `network`, `filesystem`, `state` and `task_io` govern a hook.** `shell`, `spawn`, `env`,
-  `limits`, `resources` and `containment` parse here but are capsule-wide concerns the runtime does
-  not apply per-hook; declaring one prints [`W-SEC-006`](diagnostics.md#w-sec-006).
+- **`conversation.read` grants a host import, not a directory.** Nothing is ever preopened under
+  `~/.murmur/conversations/`, so a granted hook reads the record through the interface and an
+  ungranted one gets `not-granted` from the call rather than failing to load. Declaring the key on
+  any role other than `runtime: hook` fails with `E-MAN-003`; declaring it in the capsule-wide
+  [`capabilities`](#field-capabilities) block is inert and prints
+  [`W-SEC-016`](diagnostics.md#w-sec-016).
+- **Only `network`, `filesystem`, `state`, `task_io` and `conversation` govern a hook.** `shell`,
+  `spawn`, `env`, `limits`, `resources` and `containment` parse here but are capsule-wide concerns
+  the runtime does not apply per-hook; declaring one prints
+  [`W-SEC-006`](diagnostics.md#w-sec-006).
 
 ##### Tool and driver capabilities { #tool-capabilities }
 
@@ -524,6 +542,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
 | `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging. |
+| `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.spawn.allow` | list<string> | no | Binaries a capsule component may spawn as native subprocesses. Like `capabilities.shell.allow`, a non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
@@ -617,6 +636,8 @@ these fields are accepted and inert:
 | `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
 | `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of `context.max_tokens` an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires `context.max_tokens`: without it there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
 | `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires `context.max_tokens` and is inert under `transport: process`, exactly like `context.seed_budget`. |
+| `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Inert under `transport: process`, which writes no record either way. |
+| `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
 
 #### `observability` { #field-observability }
 
@@ -1111,15 +1132,19 @@ See [request-input WIT import](wit-interfaces.md#murmurtasktask) and
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 
-Controls whether tasks that share a `contextId` accumulate conversation history within a session.
+Controls whether a task starts from the conversation its `contextId` already has. It governs what
+a task *loads*, never what is recorded: both modes append every message to the conversation
+record, which [`context.record`](#context-record) is what turns off.
 
 | Value | Behaviour |
 |---|---|
 | `stateless` (default) | Every task starts with an empty message history. The `contextId` on the incoming message is recorded but has no effect on context. |
-| `threaded` | When a task arrives with a `contextId` that has prior completed tasks in this session, the agent loads the full conversation history for that thread before running. History is persisted to `workdir/contexts/<contextId>/history.json` after every successful `end_turn` or `max_tokens` stop. A failed task does not overwrite the history, preserving the last known good state. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
+| `threaded` | A task that arrives with a `contextId` starts from the whole [conversation record](workdir.md#the-conversation-record) for that context, including messages an earlier session wrote. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
 
-Threaded mode requires a long-running capsule (`task_acceptance: queue`, `after_task: sleep`). With
-`task_acceptance: single` the capsule exits after the first task and can never receive a follow-up.
+A conversation outlives the session that started it. Threaded tasks reaching one capsule over A2A
+need a long-running capsule (`task_acceptance: queue`, `after_task: sleep`), since with
+`task_acceptance: single` the capsule exits after the first task; two separate
+[`mur run --context <id>`](cli.md#mur-run) launches continue one conversation without it.
 
 ```yaml
 lifecycle:

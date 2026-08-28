@@ -338,6 +338,7 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         inference: manifest.inference.clone(),
         system_prompt_overridden: false,
         context: manifest.context.clone(),
+        context_id: None,
         otel_endpoint: None,
         eval_config_json: None,
         case_id: None,

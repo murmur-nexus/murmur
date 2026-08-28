@@ -10,8 +10,9 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
-A third directory exists only for artifacts that ask for it by name: a
-[durable state store](#state-store), outside both of the above and outliving every session.
+Two more directories sit outside both and outlive every session: a
+[durable state store](#state-store), for artifacts that ask for one by name, and the
+[conversation record](#the-conversation-record), which every `http` capsule keeps by default.
 
 ---
 
@@ -47,7 +48,6 @@ task comes from the queue rather than from a stale file.
 | `out/result.txt` | The agent's final output. Written on every terminal outcome; a failure writes `error: <message>` |
 | `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's. Only under `lifecycle.conversation: threaded` |
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
-| `contexts/<context-id>/history.json` | Full message history for one A2A `contextId`, reloaded when a later task arrives on the same context. Only under `lifecycle.conversation: threaded`, and only after a task succeeds |
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, compaction decisions, and non-fatal write failures |
 | `logs/otel.log` | OpenTelemetry exporter diagnostics |
 | `logs/hook-<hook-name>.log` | Errors from one hook, one per line |
@@ -140,6 +140,66 @@ creates a store.
 See [Tool and driver capabilities](manifest.md#tool-capabilities),
 [Hook capabilities](manifest.md#hook-capabilities) and
 [State store name](manifest.md#state-store-name).
+
+---
+
+## The conversation record { #the-conversation-record }
+
+Every task on `inference.transport: http` appends the messages it puts in front of the model to one
+durable file:
+
+```
+~/.murmur/conversations/<record>/<context-id>/conversation.jsonl
+```
+
+| Segment | Value |
+|---|---|
+| `<record>` | [`context.record_store`](manifest.md#field-context), defaulting to the capsule name |
+| `<context-id>` | The task's context id: the `contextId` an A2A client sent, or the value of [`mur run --context`](cli.md#mur-run), or a fresh `ctx_…` per task |
+
+Two runs given the same context id continue one conversation, whether they arrive over A2A or from
+two `mur run --context <id>` launches with no session directory in common.
+
+One line is one message, as the runtime holds it:
+
+```json
+{"role":"user","content":[{"type":"text","text":"Summarize today's changes."}],"id":"msg_01a04900754b7183b66c11e744612e2d"}
+```
+
+`role`, `content` and `id` are always present. `id` is `msg_` plus a uuid-v7, minted once where the
+message was created and preserved everywhere after — including across a reload and across a hook
+that hands the message back. A `tool` message also carries `tool_call_id` and `is_error`; a message
+a hook produced carries `source_id` when that hook supplied one. Neither `id` nor `source_id` ever
+reaches a driver.
+
+The record holds every message that enters the context, in the order it enters: the task's user
+message, each committed `seed-context` message, each assistant message, each tool result, and each
+message a compaction commits — beside, not instead of, the messages it replaced. Nothing trims the
+record, and there is no retention or pruning mechanism.
+
+### What it means for a run
+
+**It is written as the context is built, not at the end.** A task that fails, and one that spends
+`inference.max_turns`, have both already recorded everything they sent.
+
+**`lifecycle.conversation` governs loading, not recording.** A `stateless` capsule appends to its
+record like any other and simply starts every task from nothing;
+[`threaded`](manifest.md#lifecycle-conversation) starts a task from the whole record for its
+context.
+
+**Turning it off creates nothing.** [`context.record: off`](manifest.md#context-record) means no
+`~/.murmur/conversations/` directory at all. So does `inference.transport: process`, whose CLI owns
+its own conversation.
+
+**A failure to write never fails a task.** An unresolvable `HOME`, a full disk or an unwritable
+directory is reported once to stderr and to `logs/bootstrap.log`, and the task runs on unrecorded.
+
+### Reading it from an artifact
+
+`~/.murmur/conversations/` is never preopened, for any role, under any grant. The only way in is
+[`murmur:conversation/read`](wit-interfaces.md#murmurconversationread), granted per hook with
+[`capabilities.conversation.read: true`](manifest.md#hook-capabilities). The conversation root and
+each directory under it are created mode `0700`.
 
 ---
 

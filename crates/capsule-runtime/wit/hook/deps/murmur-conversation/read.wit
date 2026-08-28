@@ -1,0 +1,56 @@
+package murmur:conversation@0.1.0;
+
+/// Host-provided capability available to any hook component.
+///
+/// The runtime keeps one durable record per conversation: every message it puts
+/// in front of the model, in the order it entered the context, appended as one
+/// JSON object per line under `~/.murmur/conversations/`. A hook that imports
+/// this interface reads that record without holding a `filesystem` grant and
+/// without any other artifact being involved. Nothing is ever preopened under
+/// `conversations/`; this interface is the only way in.
+///
+/// Reading is gated by `capabilities.conversation.read: true` on that hook's
+/// entry in the capsule operator's own `murmur.yaml`. Default-deny: an ungranted
+/// hook still links and still runs, and `read-messages` returns
+/// `not-granted`.
+///
+/// The runtime is the only writer, permanently — there is no write function.
+///
+/// # What is in scope
+///
+/// A read answers about the record of the conversation the current task belongs
+/// to, which is the record `context-id` on `task-start-event` names. Before the
+/// first task of a launch, and for a capsule running `inference.transport:
+/// process` (whose CLI owns its own conversation and puts no message list in
+/// front of the model), there is no record: the read succeeds with an empty
+/// page rather than failing.
+interface read {
+    use murmur:hook/lifecycle@0.6.0.{message};
+
+    /// One page of the record, newest first.
+    record message-page {
+        /// The page's messages, `messages[0]` being the most recently appended
+        /// one. Every message carries the `id` its record line holds.
+        messages: list<message>,
+        /// Cursor for the next (older) page, or `none` when this page reached
+        /// the oldest message in the record.
+        next-cursor: option<string>,
+        /// Parseable messages in the whole record, not in this page. A record
+        /// line that is not a message is skipped and not counted.
+        total: u32,
+    }
+
+    /// Newest first. `limit` is clamped by the host.
+    ///
+    /// `cursor` is opaque and host-minted: pass `none` to start at the newest
+    /// message, then pass back the `next-cursor` of the page you just read. A
+    /// cursor the host did not mint is `invalid-cursor`. `limit` is clamped to
+    /// `1..=100`, so `0` reads one message and a paging loop always makes
+    /// progress.
+    ///
+    /// Errors are strings: `not-granted` when this hook's entry does not declare
+    /// `capabilities.conversation.read: true`, `invalid-cursor`, and
+    /// `unavailable: <reason>` when the record exists but could not be read. No
+    /// record at all is not an error — it is an empty page with `total: 0`.
+    read-messages: func(cursor: option<string>, limit: u32) -> result<message-page, string>;
+}

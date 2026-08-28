@@ -342,6 +342,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             inference: stub_inference,
             system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
+            context_id: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

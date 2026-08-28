@@ -42,6 +42,7 @@ pub(crate) fn run_run(
     manifest_arg: &Path,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
+    context_id_arg: Option<&str>,
     lifecycle_task_acceptance: Option<&str>,
     lifecycle_after_task: Option<&str>,
     workdir_arg: Option<PathBuf>,
@@ -348,6 +349,7 @@ pub(crate) fn run_run(
         inference: staged_inference,
         system_prompt_overridden,
         context: runtime_manifest.context.clone(),
+        context_id: context_id_arg.map(str::to_string),
         otel_endpoint: runtime_manifest
             .observability
             .as_ref()

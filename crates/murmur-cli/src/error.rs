@@ -42,6 +42,7 @@ pub const E_CAP_007: &str = "E-CAP-007"; // exports.files.root resolves outside 
 pub const E_CAP_008: &str = "E-CAP-008"; // persistent capsule declares exports.peer_files without a short enough max_ttl
 pub const E_CAP_009: &str = "E-CAP-009"; // capabilities.state.store does not name a usable durable store
 pub const E_CAP_010: &str = "E-CAP-010"; // an artifact entry's config: block cannot be delivered as MURMUR_ARTIFACT_CONFIG
+pub const E_CAP_011: &str = "E-CAP-011"; // context.record_store or --context does not name one conversation record directory
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -261,6 +262,18 @@ impl From<RuntimeError> for CliError {
                      entirely to deliver no variable, and keep secrets out of it — see \
                      docs/content/reference/manifest.md"
                 ),
+            ),
+            // A record path is built from two operator-supplied segments, and both refuse here.
+            // Kept off `E-CAP-009` on purpose: that one points at `capabilities.state.store` and
+            // `~/.murmur/state/`, and an operator who wrote neither would go looking for a block
+            // they never declared.
+            error @ RuntimeError::InvalidConversationRecord { .. } => CliError::with_hint(
+                E_CAP_011,
+                error.to_string(),
+                "context.record_store names one directory under ~/.murmur/conversations/, and \
+                 --context names one directory beneath that, so each must be a single path \
+                 segment. Omit context.record_store to use the capsule name, and omit --context \
+                 to get a fresh id per task — see docs/content/reference/manifest.md",
             ),
             // Both arms below are the same operator problem — a declared store that does not
             // resolve to a usable directory — so they share one code, and both hints point at the

@@ -189,25 +189,31 @@ fn ensure_state_store_in(murmur_home: &Path, store: &str) -> Result<PathBuf, Run
 /// the pairing of the two: a declaration that needs a durable location, and a host that cannot say
 /// where the user's home is.
 fn murmur_home(store: &str) -> Result<PathBuf, RuntimeError> {
-    let unavailable = |message: &str| RuntimeError::StateStoreUnavailable {
+    murmur_home_dir().map_err(|message| RuntimeError::StateStoreUnavailable {
         store: store.to_string(),
         path: "~/.murmur".to_string(),
-        message: message.to_string(),
-    };
+        message,
+    })
+}
 
+/// `~/.murmur`, or why it could not be resolved.
+///
+/// The one home-directory lookup in the runtime, shared with [`crate::conversation`], so a host
+/// whose `HOME` is unusable says the same thing about a state store and about a conversation
+/// record. Each caller wraps the reason in its own error type.
+pub(crate) fn murmur_home_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            unavailable(
-                "the home directory could not be resolved: HOME is not set in the environment",
-            )
+            "the home directory could not be resolved: HOME is not set in the environment"
+                .to_string()
         })?;
 
     if !home.is_absolute() {
-        return Err(unavailable(
-            "the home directory could not be resolved: HOME is not an absolute path",
-        ));
+        return Err(
+            "the home directory could not be resolved: HOME is not an absolute path".to_string(),
+        );
     }
 
     Ok(home.join(".murmur"))
@@ -253,6 +259,7 @@ mod tests {
                 store: store.map(str::to_string),
             }),
             task_io: None,
+            conversation: None,
             containment: None,
         }
     }
