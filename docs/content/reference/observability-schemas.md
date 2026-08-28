@@ -30,7 +30,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened` | The task node |
+| `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error` | The session node |
@@ -155,6 +155,39 @@ left as it was
 The session continues over budget on both. Each decline is also written to
 `workdir/logs/bootstrap.log`. A trace can hold any number of them, and a `compaction_declined` on
 one turn does not stop a later turn from compacting successfully.
+
+**`context_seed`**{ #context-seed } — written once per task whose `on-task-start` hook returned
+`seed-context`, recording what the runtime did with it
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string \| null | The task the seed was proposed for. `null` when no task is in scope |
+| `hook_name` | string | Manifest name of the hook that returned the `seed-context` |
+| `tokens` | u64 | Tokens actually committed to the head of the context. `0` on a rejection |
+| `proposed_tokens` | u64 | Tokens the hook returned, before any trim or summarization |
+| `budget_tokens` | u64 | The ceiling in force: `context.max_tokens` × `context.seed_budget`, rounded down. `0` when the capsule declares no `context.max_tokens` |
+| `outcome` | string | What the runtime did — see below |
+| `reason` | string | Why nothing was committed. Present on `"rejected"` only; absent otherwise |
+| `message_ids` | list of string | The `msg_`-prefixed id of every committed message, in the order they were placed. Empty on a rejection. These ids never reach the driver, so this is the only place they are visible |
+
+| `outcome` | Meaning |
+|---|---|
+| `"seeded"` | The whole proposal fit the budget and was committed as-is |
+| `"trimmed"` | The proposal was over budget; its oldest messages were dropped from the front until the rest fit |
+| `"compacted"` | The overflowing front was summarized by the compaction hook, and that summary became the seed's first message. No `compaction` line is written — nothing about the session's own context was compacted |
+| `"rejected"` | Nothing was committed |
+
+| `reason` | Meaning |
+|---|---|
+| `"message_over_budget"` | One message alone was wider than the whole budget, so no trim could fit it |
+| `"overflow_over_limit"` | The proposal overflowed the budget by more than three times the budget |
+| `"no_budget"` | The capsule declares no `context.max_tokens`, so there is no ceiling to enforce |
+| `"unsupported_transport"` | The session runs `inference.transport: process`, which owns its own context |
+
+A rejection never fails the task: the seed is dropped, the task runs without it, and a
+`hook_dispatch_error` with `arm: "seed-rejected"` is written alongside naming the same hook. Every
+outcome is also written to `workdir/logs/bootstrap.log`. A capsule with no seeding hook, or one
+whose bound hook returned `none`, writes no `context_seed` line at all.
 
 **`session_end`** — written once per launch, after the `on-session-end` hooks fire and the task
 loop has exited, on every exit path
@@ -335,8 +368,8 @@ replaced with `<handle:<handle_id>>`.
 **Non-obvious behaviour:**
 
 - A trace write that fails ends the session with `E-RUN-007` (see [Diagnostics](diagnostics.md)).
-  The exceptions are `compaction` and `compaction_declined`: that failure is logged to
-  `workdir/logs/bootstrap.log` and the session continues.
+  The exceptions are `compaction`, `compaction_declined` and `context_seed`: that failure is
+  logged to `workdir/logs/bootstrap.log` and the session continues.
 - When the launch fails before `session_start` is written (a missing driver artifact, for
   example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
   started.

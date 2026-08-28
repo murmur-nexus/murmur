@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput},
     errors::RuntimeError,
-    hooks::{HookEvent, HookRuntime},
+    hooks::{DispatchFault, HookEvent, HookRuntime, HookSeed, FAULT_ARM_SEED_REJECTED},
     murmur_md::MURMUR_MD_TRUST_NOTICE,
     otel::OtelEmitter,
     runtime::CapsuleStoreState,
@@ -43,7 +43,40 @@ pub(crate) struct AgentRunConfig {
     /// Per-turn output cap sent to the driver as `max_tokens`. Resolved from
     /// `inference.max_tokens`, falling back to [`DEFAULT_MAX_OUTPUT_TOKENS`].
     pub max_output_tokens: u32,
+    /// Fraction of `context_window` an `on-task-start` `seed-context` may occupy, from
+    /// `context.seed_budget`. A window of 0 leaves no budget to enforce, so a seed is
+    /// rejected rather than committed unbounded — see [`seed_budget_tokens`].
+    pub seed_budget: f32,
+    /// Slack above the seed budget, as a fraction of it, within which an over-budget seed
+    /// is trimmed rather than summarized. From `context.seed_overflow_margin`.
+    pub seed_overflow_margin: f32,
 }
+
+/// How many multiples of the seed budget an overflow may reach before the seed is refused
+/// outright instead of summarized.
+///
+/// Not an operator knob: an overflow several multiples of the budget is a hook returning
+/// something other than a memory — a whole corpus, an unbounded log — and a lever for "how
+/// broken is too broken" only invites tuning around the bug rather than fixing it.
+pub(crate) const SEED_REJECT_OVERFLOW_MULTIPLE: u64 = 3;
+
+/// Mint one message identity: `msg_` + a UUID v7 in simple form, the same scheme the trace's
+/// `evt_` ids and the runtime's `ses_`/`tsk_`/`ctx_` ids use.
+///
+/// Minted fresh at every call and never derived from the message's content: two
+/// byte-identical messages get two different ids, which is exactly what separates an identity
+/// from a content hash. Stripped before the driver payload is built — see
+/// [`build_driver_payload`].
+pub(crate) fn new_message_id() -> String {
+    format!("msg_{}", uuid::Uuid::now_v7().simple())
+}
+
+/// Message field carrying the runtime-minted identity. Never sent to a driver.
+const MESSAGE_ID_KEY: &str = "id";
+
+/// Message field carrying the producing hook's opaque join key. Never sent to a driver, and
+/// never parsed by the runtime.
+const MESSAGE_SOURCE_ID_KEY: &str = "source_id";
 
 /// How one agent-loop attempt ended, for a caller that needs the outcome rather than just
 /// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
@@ -87,9 +120,29 @@ pub(crate) async fn run_agent_loop(
     version: &str,
     mode: ConversationMode,
     context_id: Option<String>,
+    seed: Option<HookSeed>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
+        // The CLI owns its own conversation and this path never builds a message list, so
+        // there is nowhere to put a seed. Recorded rather than dropped: a silently discarded
+        // seed is indistinguishable from a capsule with no memory hook.
+        if let Some(seed) = seed {
+            let proposed_tokens = reconstruct_hook_messages(seed.messages)
+                .iter()
+                .map(message_tokens)
+                .fold(0, u64::saturating_add);
+            record_seed_rejection(
+                hooks,
+                trace,
+                workdir,
+                &seed.hook_name,
+                proposed_tokens,
+                seed_budget_tokens(run_config.context_window, run_config.seed_budget),
+                crate::trace::SEED_REJECTED_UNSUPPORTED_TRANSPORT,
+            )
+            .await;
+        }
         // `store_state` (shared &) is threaded through so the process path can start the
         // Claude Bridge and execute declared tool artifacts — see agent/claude_bridge.rs.
         // The HTTP path below is unaffected.
@@ -153,19 +206,7 @@ pub(crate) async fn run_agent_loop(
     // Currently history is session-scoped. An unknown context_id always starts a fresh thread,
     // including contextIds that belonged to a previous torn-down session. Cross-session
     // persistence requires a context registry outside the workdir.
-    let mut messages: Vec<Value> = if matches!(mode, ConversationMode::Threaded) {
-        if let Some(ref cid) = context_id {
-            let history_path = workdir.join("contexts").join(cid).join("history.json");
-            fs::read_to_string(&history_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let mut messages: Vec<Value> = load_threaded_history(workdir, &mode, context_id.as_deref());
     messages.push(json!({
         "role": "user",
         "content": [{"type": "text", "text": task}],
@@ -182,9 +223,29 @@ pub(crate) async fn run_agent_loop(
     };
 
     // Current context occupancy, not a running total: every turn assigns its own
-    // full-context input count before anything reads it, so there is no initial value.
-    let mut session_tokens: u32;
+    // full-context input count before anything reads it. The initial value is what a seed
+    // commit recounts into, and is read by nothing else.
+    let mut session_tokens: u32 = 0;
     let mut sse_event_id: u64 = 0;
+
+    // Applied after the message list exists and before the first turn, so a committed seed
+    // sits at the head of the very first driver request — ahead of any loaded history and
+    // ahead of the task message.
+    if let Some(seed) = seed {
+        apply_seed_context(
+            seed,
+            &mut messages,
+            &mut session_tokens,
+            &occupancy,
+            store_state,
+            workdir,
+            hooks,
+            trace,
+            otel,
+            &run_config,
+        )
+        .await;
+    }
 
     let task_id_str = task_id.clone().unwrap_or_default();
 
@@ -1026,7 +1087,8 @@ pub(crate) async fn flush_hook_dispatch_faults(hooks: &mut HookRuntime, trace: &
 /// wrapper apart from a real hook-authored summary.
 const TOOL_MARKER: &str = "__murmur_tool_msg__";
 
-/// Rebuild agent-loop messages from the WIT messages a replace-context hook returned.
+/// Rebuild agent-loop messages from a WIT message list a hook returned — a compaction
+/// `replace-context` or an `on-task-start` `seed-context` alike.
 ///
 /// The one invariant every reconstructed message must satisfy: a non-"tool" message's
 /// `content` is a **sequence of content blocks**, never a bare string. The driver's
@@ -1034,12 +1096,29 @@ const TOOL_MARKER: &str = "__murmur_tool_msg__";
 /// next `build_driver_payload` request fail deserialization with "invalid type: string,
 /// expected a sequence". Hooks are free to JSON-encode their summary as a plain string
 /// (`serde_json::to_string(summary)`) — normalizing it is the host's job, here.
-fn reconstruct_compacted_messages(
+///
+/// Every message the runtime builds here gets a freshly minted [`new_message_id`], including
+/// one a hook returned an `id` on: identity belongs to whoever put the message in the
+/// context, and a hook echoing an id back would otherwise let two live messages share one.
+/// `source-id` is the opposite — copied verbatim when the hook supplied one, absent when it
+/// did not, and never parsed. Both are stripped before the wire payload
+/// ([`strip_message_identity`]).
+fn reconstruct_hook_messages(
     wit_messages: Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message>,
 ) -> Vec<Value> {
     wit_messages
         .into_iter()
         .filter_map(|m| {
+            let source_id = m.source_id.clone();
+            let stamp = |mut message: Value| {
+                if let Some(fields) = message.as_object_mut() {
+                    fields.insert(MESSAGE_ID_KEY.to_string(), json!(new_message_id()));
+                    if let Some(source_id) = source_id {
+                        fields.insert(MESSAGE_SOURCE_ID_KEY.to_string(), json!(source_id));
+                    }
+                }
+                message
+            };
             if m.role == "tool" {
                 // Only keep a "tool" message if our marker round-tripped intact (i.e. the
                 // hook left this message's content untouched) — otherwise we have no way
@@ -1053,12 +1132,12 @@ fn reconstruct_compacted_messages(
                 if tool_call_id.is_empty() {
                     return None;
                 }
-                Some(json!({
+                Some(stamp(json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "is_error": parsed.get("is_error").cloned().unwrap_or(Value::Null),
                     "content": parsed.get("body").cloned().unwrap_or(Value::Null),
-                }))
+                })))
             } else {
                 // Content from hooks is a JSON string: a verbatim round-trip parses back to
                 // the original block array, a summary parses back to a bare JSON string, and
@@ -1070,14 +1149,61 @@ fn reconstruct_compacted_messages(
                     Value::String(s) => json!([{"type": "text", "text": s}]),
                     other => json!([{"type": "text", "text": other.to_string()}]),
                 };
-                Some(json!({"role": m.role, "content": content}))
+                Some(stamp(json!({"role": m.role, "content": content})))
             }
         })
         .collect()
 }
 
+/// Lower agent-loop messages to the WIT `message` shape a hook receives.
+///
+/// The WIT record has no room for a "tool" message's sibling `tool_call_id`/`is_error`
+/// fields, so a naive round-trip through a hook drops them — and an OpenAI-shaped driver then
+/// rejects the next request outright ("tool message is missing required field
+/// 'tool_call_id'"). They are folded into the content string instead, under [`TOOL_MARKER`],
+/// so they survive a hook that keeps the message verbatim and
+/// [`reconstruct_hook_messages`] can tell the wrapper apart from a real hook-authored
+/// summary. A message with no `role` is dropped: there is no default that is not a guess.
+///
+/// `id` and `source-id` are handed over as the runtime holds them, so a hook that keeps a
+/// message verbatim can report which record it came from.
+fn to_wit_messages(
+    messages: &[Value],
+) -> Vec<crate::bindings::hook::exports::murmur::hook::lifecycle::Message> {
+    use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
+    messages
+        .iter()
+        .filter_map(|m| {
+            let role = m.get("role").and_then(Value::as_str)?.to_string();
+            let content = if role == "tool" {
+                json!({
+                    TOOL_MARKER: true,
+                    "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                    "is_error": m.get("is_error").cloned().unwrap_or(Value::Null),
+                    "body": m.get("content").cloned().unwrap_or(Value::Null),
+                })
+                .to_string()
+            } else {
+                m.get("content").map(|c| c.to_string()).unwrap_or_default()
+            };
+            Some(Message {
+                role,
+                content,
+                id: m
+                    .get(MESSAGE_ID_KEY)
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                source_id: m
+                    .get(MESSAGE_SOURCE_ID_KEY)
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 /// The verbatim replacement text a compaction hook produced, read back out of the messages
-/// [`reconstruct_compacted_messages`] built from its `replace-context` payload.
+/// [`reconstruct_hook_messages`] built from its `replace-context` payload.
 ///
 /// For the single-summary-message case the hook's content is `serde_json::to_string(summary)`,
 /// which reconstruction parses back to a bare string and wraps as one `text` block — so the
@@ -1200,39 +1326,7 @@ async fn try_compact_via_hooks(
     compaction_system_prompt: Option<String>,
     dump_summaries: bool,
 ) -> Result<(), String> {
-    use crate::bindings::hook::exports::murmur::hook::lifecycle::Message;
-
-    // The WIT Message{role, content} shape has no room for a "tool" message's sibling
-    // tool_call_id/is_error fields, so a naive round-trip through the hook drops them —
-    // and an OpenAI-shaped driver then rejects the next request outright ("tool message
-    // is missing required field 'tool_call_id'"). Fold those fields into the content
-    // string we hand the hook so they survive if the hook keeps this message verbatim;
-    // TOOL_MARKER lets us tell a real hook-summary payload apart from our own wrapper.
-    let wit_messages: Vec<Message> = messages
-        .iter()
-        .filter_map(|m| {
-            let role = m.get("role").and_then(Value::as_str)?.to_string();
-            let content = if role == "tool" {
-                json!({
-                    TOOL_MARKER: true,
-                    "tool_call_id": m.get("tool_call_id").cloned().unwrap_or(Value::Null),
-                    "is_error": m.get("is_error").cloned().unwrap_or(Value::Null),
-                    "body": m.get("content").cloned().unwrap_or(Value::Null),
-                })
-                .to_string()
-            } else {
-                m.get("content").map(|c| c.to_string()).unwrap_or_default()
-            };
-            // The host mints neither id: nothing in the runtime produces one, and
-            // `reconstruct_compacted_messages` drops both on the way back.
-            Some(Message {
-                role,
-                content,
-                id: None,
-                source_id: None,
-            })
-        })
-        .collect();
+    let wit_messages = to_wit_messages(messages);
 
     let tokens_before = *session_tokens;
     let threshold = f64::from(tokens_before) / f64::from(context_window).max(1.0);
@@ -1280,7 +1374,7 @@ async fn try_compact_via_hooks(
         return Ok(());
     };
 
-    let candidate_messages: Vec<Value> = reconstruct_compacted_messages(new_wit_messages);
+    let candidate_messages: Vec<Value> = reconstruct_hook_messages(new_wit_messages);
 
     if has_unresolved_tool_call(&candidate_messages) {
         append_bootstrap_log(
@@ -1298,23 +1392,20 @@ async fn try_compact_via_hooks(
         return Ok(());
     }
 
-    // ── Single replace-context commit site ──────────────────────────────────────
-    // Both universal replace-context rules fire here, together and unconditionally, so any
-    // future replace-context-producing hook inherits them by routing through this function:
-    //   (1) session_tokens is recomputed from the actual post-commit context; and
-    //   (2) any held driver continuation id (and its bookkeeping) is dropped — the next Turn
-    //       is a full resend of whatever `messages` now holds (never the pre-compaction
-    //       transcript, never empty).
     // Compaction is maximal prompt cache loss: replacing the whole message list with one
     // summary message discards every cached prefix past the system block, so the next turn is
     // a full cache miss on everything the summary stands in for.
-    *messages = candidate_messages;
-
+    //
     // Recounted through the same `ContextOccupancy` the compaction trigger reads, so
     // `tokens_before` and `tokens_after` on the `compaction` event are the same measurement
     // taken twice — the reported drop is the saving the provider actually sees.
-    *session_tokens = occupancy.count(messages);
-    store_state.clear_continuation();
+    commit_context_messages(
+        messages,
+        session_tokens,
+        occupancy,
+        store_state,
+        candidate_messages,
+    );
 
     if let Err(e) = trace
         .write_compaction(
@@ -1356,6 +1447,508 @@ async fn try_compact_via_hooks(
         ),
     );
     Ok(())
+}
+
+/// The one site that swaps a session's whole message list for a new one.
+///
+/// Both universal replace-context rules fire here, together and unconditionally, so any hook
+/// output that produces a new context inherits them by routing through this function:
+///   (1) `session_tokens` is recomputed from the actual post-commit context; and
+///   (2) any held driver continuation id (and its bookkeeping) is dropped — the next turn is
+///       a full resend of whatever `messages` now holds, never a tail of a list the driver no
+///       longer has.
+/// A continuation kept across a swap would have the driver append the new messages to the old
+/// transcript it is still holding, which is the one shape neither side can detect.
+fn commit_context_messages(
+    messages: &mut Vec<Value>,
+    session_tokens: &mut u32,
+    occupancy: &ContextOccupancy<'_>,
+    store_state: &mut CapsuleStoreState,
+    new_messages: Vec<Value>,
+) {
+    *messages = new_messages;
+    *session_tokens = occupancy.count(messages);
+    store_state.clear_continuation();
+}
+
+/// What the runtime decided to do with a proposed seed, before any compaction has run.
+///
+/// Produced by [`plan_seed`], which is pure: it measures an already-counted proposal against
+/// the budget and reports the decision, so every budget rule is testable without a session, a
+/// hook or a driver.
+struct SeedPlan {
+    /// The messages that survive, chronological and oldest-first like the proposal. Empty on
+    /// a rejection.
+    messages: Vec<Value>,
+    /// The messages dropped off the front, in their original order. The compaction branch
+    /// summarizes exactly these; the trim branch discards them.
+    dropped: Vec<Value>,
+    /// Index into the proposal at which [`Self::messages`] begins, i.e. the length of
+    /// [`Self::dropped`]. `0` when nothing was dropped.
+    split: usize,
+    /// One of the `SEED_OUTCOME_*` constants. [`crate::trace::SEED_OUTCOME_COMPACTED`] here is
+    /// an instruction rather than a result: the caller must summarize [`Self::dropped`], and
+    /// degrades to [`crate::trace::SEED_OUTCOME_TRIMMED`] if no summary comes back.
+    outcome: &'static str,
+    /// One of the `SEED_REJECTED_*` constants, set only alongside
+    /// [`crate::trace::SEED_OUTCOME_REJECTED`].
+    reason: Option<&'static str>,
+    /// Tokens the hook proposed, before any trim.
+    proposed_tokens: u64,
+    /// Tokens [`Self::messages`] occupies. `0` on a rejection.
+    committed_tokens: u64,
+}
+
+/// Measure a reconstructed seed against its budget and decide what becomes of it.
+///
+/// `per_message_tokens` is parallel to `messages` and is the caller's measurement, so this
+/// function never tokenizes and every rule below is arithmetic. `margin` is
+/// `context.seed_overflow_margin`, a fraction *of the budget*: within it an over-budget seed
+/// is trimmed rather than summarized, because compaction costs an inference call and a few
+/// tokens over must not buy one.
+///
+/// The order of the checks is the contract, not an implementation detail. A single message
+/// wider than the whole budget is refused before anything else, because no amount of trimming
+/// can fit it and a "trimmed" record would misdescribe an empty result.
+fn plan_seed(
+    messages: Vec<Value>,
+    per_message_tokens: &[u64],
+    budget: u64,
+    margin: f32,
+) -> SeedPlan {
+    let proposed_tokens: u64 = per_message_tokens
+        .iter()
+        .copied()
+        .fold(0, u64::saturating_add);
+
+    let reject = |reason: &'static str| SeedPlan {
+        messages: Vec::new(),
+        dropped: Vec::new(),
+        split: 0,
+        outcome: crate::trace::SEED_OUTCOME_REJECTED,
+        reason: Some(reason),
+        proposed_tokens,
+        committed_tokens: 0,
+    };
+
+    if per_message_tokens.iter().any(|&tokens| tokens > budget) {
+        return reject(crate::trace::SEED_REJECTED_MESSAGE_OVER_BUDGET);
+    }
+
+    let overflow = proposed_tokens.saturating_sub(budget);
+    if overflow > budget.saturating_mul(SEED_REJECT_OVERFLOW_MULTIPLE) {
+        return reject(crate::trace::SEED_REJECTED_OVERFLOW_OVER_LIMIT);
+    }
+
+    if overflow == 0 {
+        return SeedPlan {
+            messages,
+            dropped: Vec::new(),
+            split: 0,
+            outcome: crate::trace::SEED_OUTCOME_SEEDED,
+            reason: None,
+            proposed_tokens,
+            committed_tokens: proposed_tokens,
+        };
+    }
+
+    // The newest suffix that fits. Dropping from the front is the only well-defined trim for
+    // a chronological list: the newest memory is the one most likely to still be relevant,
+    // and keeping a hole in the middle would leave the hook's own ordering meaningless.
+    let split = fit_suffix(per_message_tokens, budget);
+    let committed_tokens = per_message_tokens[split..]
+        .iter()
+        .copied()
+        .fold(0, u64::saturating_add);
+    let mut messages = messages;
+    let dropped: Vec<Value> = messages.drain(..split).collect();
+
+    // Within the margin the front is simply discarded; past it, it is worth an inference call
+    // to keep what it said.
+    let outcome = if (overflow as f64) <= (budget as f64) * f64::from(margin) {
+        crate::trace::SEED_OUTCOME_TRIMMED
+    } else {
+        crate::trace::SEED_OUTCOME_COMPACTED
+    };
+
+    SeedPlan {
+        messages,
+        dropped,
+        split,
+        outcome,
+        reason: None,
+        proposed_tokens,
+        committed_tokens,
+    }
+}
+
+/// The lowest index at which the remaining suffix of `per_message_tokens` fits `budget`.
+/// Returns `per_message_tokens.len()` when even the last message alone does not fit, which
+/// [`plan_seed`]'s per-message check has already ruled out for a real seed.
+fn fit_suffix(per_message_tokens: &[u64], budget: u64) -> usize {
+    let mut kept: u64 = 0;
+    let mut split = per_message_tokens.len();
+    for (index, tokens) in per_message_tokens.iter().enumerate().rev() {
+        let next = kept.saturating_add(*tokens);
+        if next > budget {
+            break;
+        }
+        kept = next;
+        split = index;
+    }
+    split
+}
+
+/// The token ceiling a `seed-context` returned at this task is enforced against:
+/// `floor(context.max_tokens * context.seed_budget)`.
+///
+/// `0` when the capsule declares no `context.max_tokens` — a fraction of no ceiling is no
+/// ceiling, and the runtime refuses an unbounded seed rather than committing one. Sent to the
+/// hook as `task-start-event.budget-tokens` so a hook never has to know the model or the
+/// window.
+pub(crate) fn seed_budget_tokens(context_window: u32, seed_budget: f32) -> u64 {
+    if context_window == 0 || seed_budget <= 0.0 {
+        return 0;
+    }
+    (f64::from(context_window) * f64::from(seed_budget)).floor() as u64
+}
+
+/// The conversation history this task will load before its first turn, or an empty list when
+/// the capsule is not threaded or the context has none yet.
+///
+/// The single reader of `contexts/<id>/history.json`: the agent loop starts its message list
+/// from it, and [`prior_history_tokens`] measures it for the `on-task-start` event, so a hook
+/// deciding what to seed and the loop deciding what to send are looking at the same bytes.
+pub(crate) fn load_threaded_history(
+    workdir: &Path,
+    mode: &ConversationMode,
+    context_id: Option<&str>,
+) -> Vec<Value> {
+    if !matches!(mode, ConversationMode::Threaded) {
+        return Vec::new();
+    }
+    let Some(context_id) = context_id else {
+        return Vec::new();
+    };
+    let history_path = workdir
+        .join("contexts")
+        .join(context_id)
+        .join("history.json");
+    fs::read_to_string(&history_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Tokens the history this task will load already occupies, for
+/// `task-start-event.prior-tokens`.
+///
+/// `0` when there is no history to load, which the WIT contract tells hooks to read as "the
+/// host has not computed this". Without it a hook in `lifecycle.conversation: threaded` seeds
+/// on top of history it cannot see and duplicates it.
+pub(crate) fn prior_history_tokens(
+    workdir: &Path,
+    mode: &ConversationMode,
+    context_id: Option<&str>,
+) -> u64 {
+    let history = load_threaded_history(workdir, mode, context_id);
+    if history.is_empty() {
+        return 0;
+    }
+    u64::from(count_tokens(&strip_message_identity(&history).to_string()))
+}
+
+/// Record a seed the runtime refused to commit, and let the task run anyway.
+///
+/// Three destinations, because a rejection that reaches only one of them is invisible from
+/// the other two: `logs/bootstrap.log` for the operator reading the session directory, a
+/// `context_seed` line carrying the numbers that explain the refusal, and a
+/// [`FAULT_ARM_SEED_REJECTED`] dispatch fault so the rejection also appears among the
+/// ordinary `hook_dispatch_error` records naming the hook. None of them can fail the task: a
+/// capsule whose memory could not be committed must still do its work.
+async fn record_seed_rejection(
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    workdir: &Path,
+    hook_name: &str,
+    proposed_tokens: u64,
+    budget_tokens: u64,
+    reason: &str,
+) {
+    append_bootstrap_log(
+        workdir,
+        &format!(
+            "[seed] hook '{hook_name}' proposed {proposed_tokens} tokens against a budget of \
+             {budget_tokens}; rejected ({reason}); the task runs without a seed"
+        ),
+    );
+    if let Err(e) = trace
+        .write_context_seed(
+            hook_name,
+            0,
+            proposed_tokens,
+            budget_tokens,
+            crate::trace::SEED_OUTCOME_REJECTED,
+            Some(reason),
+            Vec::new(),
+        )
+        .await
+    {
+        append_bootstrap_log(
+            workdir,
+            &format!("[seed] trace write failed: {e}; continuing"),
+        );
+    }
+    hooks.record_dispatch_fault(DispatchFault {
+        hook_name: hook_name.to_string(),
+        event: "on-task-start".to_string(),
+        arm: FAULT_ARM_SEED_REJECTED.to_string(),
+    });
+}
+
+/// Commit an `on-task-start` hook's `seed-context` to the head of this task's context, or
+/// record why it could not be.
+///
+/// Called once, after `messages` holds the loaded history and the task message and before the
+/// first turn, so a committed seed is in the very first driver request. Position is fixed at
+/// the head and is not configurable: history grows from the tail across tasks in a threaded
+/// context, so a seed placed after it would move on every task and invalidate the cached
+/// prefix an operator has no other way to protect.
+///
+/// Nothing here is fallible. Every refusal, trim, hook error and failed trace write is
+/// recorded and the task proceeds — unlike compaction, where a bound hook's `Err` ends the
+/// session, because a capsule with no memory must still run.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_seed_context(
+    seed: HookSeed,
+    messages: &mut Vec<Value>,
+    session_tokens: &mut u32,
+    occupancy: &ContextOccupancy<'_>,
+    store_state: &mut CapsuleStoreState,
+    workdir: &Path,
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &OtelEmitter,
+    run_config: &AgentRunConfig,
+) {
+    let HookSeed {
+        hook_name,
+        messages: wit_messages,
+    } = seed;
+    let budget = seed_budget_tokens(run_config.context_window, run_config.seed_budget);
+
+    let proposed = reconstruct_hook_messages(wit_messages);
+    let per_message_tokens: Vec<u64> = proposed.iter().map(message_tokens).collect();
+
+    // `seed_budget` is a fraction of `context.max_tokens`; a capsule declaring none has no
+    // ceiling to enforce, and an unbounded seed is exactly what this budget exists to prevent.
+    if budget == 0 {
+        let proposed_tokens = per_message_tokens
+            .iter()
+            .copied()
+            .fold(0, u64::saturating_add);
+        record_seed_rejection(
+            hooks,
+            trace,
+            workdir,
+            &hook_name,
+            proposed_tokens,
+            budget,
+            crate::trace::SEED_REJECTED_NO_BUDGET,
+        )
+        .await;
+        return;
+    }
+
+    let plan = plan_seed(
+        proposed,
+        &per_message_tokens,
+        budget,
+        run_config.seed_overflow_margin,
+    );
+    let proposed_tokens = plan.proposed_tokens;
+
+    if let Some(reason) = plan.reason {
+        record_seed_rejection(
+            hooks,
+            trace,
+            workdir,
+            &hook_name,
+            proposed_tokens,
+            budget,
+            reason,
+        )
+        .await;
+        return;
+    }
+
+    let mut outcome = plan.outcome;
+    let mut committed = plan.messages;
+    let mut committed_tokens = plan.committed_tokens;
+
+    if outcome == crate::trace::SEED_OUTCOME_COMPACTED {
+        let front_tokens = per_message_tokens[..plan.split]
+            .iter()
+            .copied()
+            .fold(0, u64::saturating_add);
+        match summarize_seed_overflow(
+            &plan.dropped,
+            front_tokens,
+            workdir,
+            hooks,
+            trace,
+            otel,
+            run_config,
+        )
+        .await
+        {
+            Some(summary) => {
+                let summary_tokens = summary.iter().map(message_tokens).sum::<u64>();
+                // The summary is the whole point of having taken the inference call, so it is
+                // never what gets dropped; if it alone will not fit, nothing about this seed
+                // will.
+                if summary_tokens > budget {
+                    record_seed_rejection(
+                        hooks,
+                        trace,
+                        workdir,
+                        &hook_name,
+                        proposed_tokens,
+                        budget,
+                        crate::trace::SEED_REJECTED_MESSAGE_OVER_BUDGET,
+                    )
+                    .await;
+                    return;
+                }
+                let kept_tokens: Vec<u64> = committed.iter().map(message_tokens).collect();
+                let room = budget - summary_tokens;
+                let split = fit_suffix(&kept_tokens, room);
+                committed_tokens = summary_tokens
+                    + kept_tokens[split..]
+                        .iter()
+                        .copied()
+                        .fold(0, u64::saturating_add);
+                let mut merged = summary;
+                merged.extend(committed.drain(split..));
+                committed = merged;
+            }
+            // No summary came back, so the front is simply gone: the same result the trim
+            // branch produces, and recorded as that rather than as a compaction that did not
+            // happen.
+            None => outcome = crate::trace::SEED_OUTCOME_TRIMMED,
+        }
+    }
+
+    let message_ids: Vec<String> = committed
+        .iter()
+        .filter_map(|m| {
+            m.get(MESSAGE_ID_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+
+    let mut new_messages = committed;
+    new_messages.extend(messages.iter().cloned());
+    commit_context_messages(
+        messages,
+        session_tokens,
+        occupancy,
+        store_state,
+        new_messages,
+    );
+
+    append_bootstrap_log(
+        workdir,
+        &format!(
+            "[seed] hook '{hook_name}' seeded {committed_tokens} of {proposed_tokens} proposed \
+             tokens against a budget of {budget} ({outcome})"
+        ),
+    );
+    if let Err(e) = trace
+        .write_context_seed(
+            &hook_name,
+            committed_tokens,
+            proposed_tokens,
+            budget,
+            outcome,
+            None,
+            message_ids,
+        )
+        .await
+    {
+        append_bootstrap_log(
+            workdir,
+            &format!("[seed] trace write failed: {e}; continuing"),
+        );
+    }
+}
+
+/// Hand the overflowing front of a seed to the compaction hook and return its replacement.
+///
+/// Compaction gains a second trigger here, not a second implementation: the same
+/// [`HookRuntime::dispatch_compaction`] the threshold trigger calls, carrying the same
+/// manifest-configured `inference.compaction.model` / `.system_prompt`, and flushing the
+/// hook's own `run-inference` records the same way. What differs is the consequence of
+/// failure — the threshold trigger has no other way back under budget and fails the session,
+/// while here `None` simply means the front is trimmed instead of summarized.
+///
+/// No `compaction` trace event is written: nothing about the session's context was compacted,
+/// and the summarization is recorded inside `context_seed` as `outcome: "compacted"`.
+async fn summarize_seed_overflow(
+    front: &[Value],
+    front_tokens: u64,
+    workdir: &Path,
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &OtelEmitter,
+    run_config: &AgentRunConfig,
+) -> Option<Vec<Value>> {
+    let dispatched = hooks
+        .dispatch_compaction(
+            to_wit_messages(front),
+            front_tokens,
+            f64::from(run_config.seed_budget),
+            run_config.compaction_model.clone(),
+            run_config.compaction_system_prompt.clone(),
+        )
+        .await;
+
+    // The seed is applied before the first turn, so these records belong to turn 0.
+    flush_hook_inference_records(hooks, trace, otel, 0).await;
+
+    match dispatched {
+        Ok(Some(wit_messages)) => {
+            let summary = reconstruct_hook_messages(wit_messages);
+            if summary.is_empty() {
+                append_bootstrap_log(
+                    workdir,
+                    "[seed] the compaction hook's replacement reconstructed to nothing; \
+                     trimming the overflowing front instead",
+                );
+                return None;
+            }
+            Some(summary)
+        }
+        Ok(None) => {
+            append_bootstrap_log(
+                workdir,
+                "[seed] no compaction hook returned replace-context for the overflowing front; \
+                 trimming it instead",
+            );
+            None
+        }
+        Err(error) => {
+            append_bootstrap_log(
+                workdir,
+                &format!(
+                    "[seed] compaction hook failed while summarizing the overflowing front \
+                     ({error}); trimming it instead"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// Reserved `tool-result.metadata` key by which an inference driver opts into host-side
@@ -1468,10 +2061,10 @@ pub(crate) fn build_driver_payload(
 ) -> Value {
     let (wire_messages, continuation_id): (Value, Option<&str>) = match continuation {
         Some((id, acked_len)) => match messages.get(acked_len..) {
-            Some(slice) => (json!(slice), Some(id)),
-            None => (json!(messages), None),
+            Some(slice) => (strip_message_identity(slice), Some(id)),
+            None => (strip_message_identity(messages), None),
         },
-        None => (json!(messages), None),
+        None => (strip_message_identity(messages), None),
     };
     let mut payload = json!({
         "model": model,
@@ -1488,6 +2081,41 @@ pub(crate) fn build_driver_payload(
         payload[PROMPT_CACHE_KEY_KEY] = json!(key);
     }
     payload
+}
+
+/// The `messages` array as it goes on the wire: every message minus [`MESSAGE_ID_KEY`] and
+/// [`MESSAGE_SOURCE_ID_KEY`].
+///
+/// Both are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
+/// one is minted, so a seed message carrying its id at the head of the prompt is volatile
+/// content in the exact position a provider matches its cached prefix from — it would turn
+/// every request into a cache miss. A message carrying neither key is cloned through
+/// untouched, so a list that never met a hook serializes byte-for-byte as it always did.
+fn strip_message_identity(messages: &[Value]) -> Value {
+    Value::Array(
+        messages
+            .iter()
+            .map(|message| match message.as_object() {
+                Some(fields)
+                    if fields.contains_key(MESSAGE_ID_KEY)
+                        || fields.contains_key(MESSAGE_SOURCE_ID_KEY) =>
+                {
+                    let mut stripped = fields.clone();
+                    stripped.remove(MESSAGE_ID_KEY);
+                    stripped.remove(MESSAGE_SOURCE_ID_KEY);
+                    Value::Object(stripped)
+                }
+                _ => message.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// The tiktoken count of one message as the driver will receive it — identity fields
+/// stripped, so a seed is measured against its budget by what it actually occupies.
+fn message_tokens(message: &Value) -> u64 {
+    let wire = strip_message_identity(std::slice::from_ref(message));
+    u64::from(count_tokens(&wire.to_string()))
 }
 
 /// The tiktoken count of everything a turn puts in front of the model.
@@ -2270,7 +2898,7 @@ mod tests {
             "\"Earlier turns: the agent read two files and ran the tests.\""
         );
 
-        let msgs = reconstruct_compacted_messages(vec![wit("user", &encoded)]);
+        let msgs = reconstruct_hook_messages(vec![wit("user", &encoded)]);
 
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
@@ -2291,16 +2919,158 @@ mod tests {
         }
     }
 
+    // ── The seed budget planner ─────────────────────────────────────────────
+
+    /// One seed message of roughly `tokens` tiktoken units, so a planner test can state its
+    /// arithmetic in tokens rather than in prose. `"word "` is one token under cl100k.
+    fn seed_message(label: &str, tokens: usize) -> Value {
+        json!({
+            "role": "user",
+            "content": [{"type": "text", "text": format!("{label} {}", "word ".repeat(tokens))}],
+            MESSAGE_ID_KEY: new_message_id(),
+        })
+    }
+
+    /// Plan `messages` against `budget` using their real measured token counts, the way
+    /// `apply_seed_context` does.
+    fn plan_measured(messages: Vec<Value>, budget: u64, margin: f32) -> SeedPlan {
+        let per: Vec<u64> = messages.iter().map(message_tokens).collect();
+        plan_seed(messages, &per, budget, margin)
+    }
+
+    fn message_label(message: &Value) -> String {
+        message["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Scenario: a chronological proposal a little over budget, within the margin, is
+    /// trimmed from the **front** — the oldest go, the newest stay, and no compaction is
+    /// asked for.
+    #[test]
+    fn seed_plan_trims_the_oldest_within_the_margin() {
+        // 1050 tokens against a budget of 1000 with a 10% margin: 50 over, well inside the
+        // 100 the margin allows, and no single message anywhere near the budget. The counts
+        // are stated rather than measured so the arithmetic under test is the planner's.
+        let messages = vec![
+            seed_message("oldest", 1),
+            seed_message("middle", 1),
+            seed_message("newest", 1),
+        ];
+        let plan = plan_seed(messages, &[350, 350, 350], 1000, 0.10);
+
+        assert_eq!(plan.outcome, crate::trace::SEED_OUTCOME_TRIMMED);
+        assert_eq!(plan.reason, None);
+        assert_eq!(plan.proposed_tokens, 1050);
+        assert_eq!(plan.committed_tokens, 700);
+        assert_eq!(plan.split, 1);
+        assert_eq!(
+            plan.messages.iter().map(message_label).collect::<Vec<_>>(),
+            vec!["middle", "newest"],
+            "the newest survive and the oldest is what goes"
+        );
+        assert_eq!(
+            plan.dropped.iter().map(message_label).collect::<Vec<_>>(),
+            vec!["oldest"]
+        );
+    }
+
+    /// A proposal that fits is committed whole, and nothing is measured as dropped.
+    #[test]
+    fn seed_plan_commits_a_proposal_that_fits() {
+        let plan = plan_measured(vec![seed_message("only", 10)], 1000, 0.10);
+        assert_eq!(plan.outcome, crate::trace::SEED_OUTCOME_SEEDED);
+        assert_eq!(plan.split, 0);
+        assert!(plan.dropped.is_empty());
+        assert_eq!(plan.committed_tokens, plan.proposed_tokens);
+    }
+
+    /// Past the margin the front is worth an inference call, so the planner asks for one.
+    /// It still reports the suffix that fits, which is what the caller keeps if no summary
+    /// comes back.
+    #[test]
+    fn seed_plan_asks_for_compaction_past_the_margin() {
+        let messages = vec![
+            seed_message("a", 400),
+            seed_message("b", 400),
+            seed_message("c", 400),
+        ];
+        let plan = plan_measured(messages, 500, 0.10);
+        assert_eq!(plan.outcome, crate::trace::SEED_OUTCOME_COMPACTED);
+        assert_eq!(plan.split, 2, "only the newest fits a 500-token budget");
+        assert_eq!(
+            plan.dropped.iter().map(message_label).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    /// A single message wider than the whole budget is refused before any trim is
+    /// attempted: trimming cannot help, and a `trimmed` record would misdescribe an empty
+    /// result.
+    #[test]
+    fn seed_plan_rejects_a_message_wider_than_the_budget() {
+        let plan = plan_measured(
+            vec![seed_message("small", 5), seed_message("huge", 400)],
+            100,
+            0.10,
+        );
+        assert_eq!(plan.outcome, crate::trace::SEED_OUTCOME_REJECTED);
+        assert_eq!(
+            plan.reason,
+            Some(crate::trace::SEED_REJECTED_MESSAGE_OVER_BUDGET)
+        );
+        assert_eq!(plan.committed_tokens, 0);
+        assert!(plan.messages.is_empty());
+    }
+
+    /// An overflow several multiples of the budget is a broken hook, not a full memory.
+    #[test]
+    fn seed_plan_rejects_an_overflow_past_the_multiple() {
+        let per: Vec<u64> = vec![100; 50];
+        let messages: Vec<Value> = (0..50).map(|i| seed_message(&format!("m{i}"), 1)).collect();
+        let plan = plan_seed(messages, &per, 1000, 0.10);
+        assert_eq!(plan.outcome, crate::trace::SEED_OUTCOME_REJECTED);
+        assert_eq!(
+            plan.reason,
+            Some(crate::trace::SEED_REJECTED_OVERFLOW_OVER_LIMIT)
+        );
+        // 5000 proposed against a 1000 budget is 4000 over — past 3x, and one token less
+        // over would not be.
+        assert_eq!(plan.proposed_tokens, 5000);
+        let at_limit = plan_seed(
+            (0..40).map(|i| seed_message(&format!("m{i}"), 1)).collect(),
+            &vec![100; 40],
+            1000,
+            0.10,
+        );
+        assert_eq!(at_limit.outcome, crate::trace::SEED_OUTCOME_COMPACTED);
+    }
+
+    /// The ceiling is a plain floor of the product, and a capsule with no declared window
+    /// gets no ceiling at all — which the caller turns into a rejection rather than an
+    /// unbounded commit.
+    #[test]
+    fn seed_budget_tokens_floors_the_product_and_zeroes_without_a_window() {
+        assert_eq!(seed_budget_tokens(200_000, 0.10), 20_000);
+        assert_eq!(seed_budget_tokens(1001, 0.10), 100);
+        assert_eq!(seed_budget_tokens(0, 0.10), 0);
+        assert_eq!(seed_budget_tokens(200_000, 0.0), 0);
+    }
+
     /// Invariant: `message.id` and `message.source-id` never reach the provider.
     ///
-    /// Both are runtime bookkeeping — an id is a fresh uuid every time it is minted, and
-    /// a uuid at the head of a cached prefix is volatile content that would defeat
-    /// provider prompt-prefix caching on every request. Reconstruction emits `role` and
-    /// `content` and nothing else, and the payload built from the result carries neither
-    /// key anywhere in its serialized form.
+    /// Both are runtime bookkeeping — an id is a fresh uuid every time it is minted, and a
+    /// uuid at the head of a cached prefix is volatile content that would defeat provider
+    /// prompt-prefix caching on every request. Reconstruction stamps a fresh id and copies
+    /// the hook's `source-id`; the payload built from the result carries neither key
+    /// anywhere in its serialized form, including the id the hook itself proposed.
     #[test]
-    fn message_id_and_source_id_are_stripped_from_reconstructed_messages() {
-        let msgs = reconstruct_compacted_messages(vec![WitMessage {
+    fn message_id_and_source_id_are_stripped_from_the_driver_payload() {
+        let msgs = reconstruct_hook_messages(vec![WitMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
             id: Some("msg_0198f1c2d3e44a5b8c9d0e1f2a3b4c5d".to_string()),
@@ -2308,16 +3078,15 @@ mod tests {
         }]);
 
         assert_eq!(msgs.len(), 1);
-        let keys: Vec<&String> = msgs[0]
+        let mut keys: Vec<&str> = msgs[0]
             .as_object()
             .expect("a reconstructed message is a JSON object")
             .keys()
+            .map(String::as_str)
             .collect();
-        assert_eq!(
-            keys,
-            vec!["content", "role"],
-            "a reconstructed message carries exactly role and content"
-        );
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["content", "id", "role", "source_id"]);
+        assert_eq!(msgs[0]["source_id"], "corpus:abc");
 
         let payload = build_driver_payload("m", 8192, &msgs, &[], "sys", None, None);
         let serialized = serde_json::to_string(&payload).unwrap();
@@ -2326,6 +3095,63 @@ mod tests {
         assert!(!serialized.contains("\"id\""));
         assert!(!serialized.contains("source_id"));
         assert!(!serialized.contains("source-id"));
+        assert_eq!(
+            payload["messages"][0],
+            json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})
+        );
+    }
+
+    /// The id the runtime mints is an identity, never a content hash: two byte-identical
+    /// messages must not share one, or a later slice keying anything on it would silently
+    /// conflate them.
+    #[test]
+    fn message_ids_are_minted_fresh_for_byte_identical_messages() {
+        let msgs =
+            reconstruct_hook_messages(vec![wit("user", "\"same\""), wit("user", "\"same\"")]);
+        let first = msgs[0][MESSAGE_ID_KEY].as_str().unwrap();
+        let second = msgs[1][MESSAGE_ID_KEY].as_str().unwrap();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            let hex = id.strip_prefix("msg_").expect("id is msg_-prefixed: {id}");
+            assert_eq!(hex.len(), 32, "id is msg_ + 32 hex chars: {id}");
+            assert!(hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+        assert_eq!(new_message_id().len(), 36);
+    }
+
+    /// A hook that supplied no `source-id` leaves the key absent rather than null: the
+    /// runtime records what it was given and invents nothing.
+    #[test]
+    fn message_source_id_is_absent_when_the_hook_supplied_none() {
+        let msgs = reconstruct_hook_messages(vec![wit("user", "\"hi\"")]);
+        assert!(msgs[0].get(MESSAGE_SOURCE_ID_KEY).is_none());
+        assert!(msgs[0].get(MESSAGE_ID_KEY).is_some());
+    }
+
+    /// A message list carrying neither key serializes byte-for-byte as it did before
+    /// identity stripping existed — the whole point of stripping being that a prompt
+    /// prefix a provider already cached stays matchable.
+    #[test]
+    fn prompt_prefix_is_byte_identical_without_identity_keys() {
+        let msgs = sample_messages();
+        let tools = vec![json!({"name": "bash"})];
+        let payload = build_driver_payload("m", 8192, &msgs, &tools, "sys", None, Some("k"));
+
+        let mut expected = json!({
+            "model": "m",
+            "max_tokens": 8192,
+            "messages": msgs,
+            "tools": tools,
+            "params": {},
+        });
+        expected["system"] = json!("sys");
+        expected[PROMPT_CACHE_KEY_KEY] = json!("k");
+        assert_eq!(
+            serde_json::to_string(&payload).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
     }
 
     /// Every other shape a hook can hand back also lands as a block array: a verbatim
@@ -2334,7 +3160,7 @@ mod tests {
     #[test]
     fn reconstructed_non_tool_content_is_always_a_block_array() {
         let verbatim = json!([{"type": "text", "text": "kept as-is"}]);
-        let msgs = reconstruct_compacted_messages(vec![
+        let msgs = reconstruct_hook_messages(vec![
             wit("assistant", &verbatim.to_string()),
             wit("user", "not json at all"),
             wit("user", "42"),
@@ -2366,7 +3192,7 @@ mod tests {
             "is_error": false,
             "body": [{"type": "text", "text": "ok"}],
         });
-        let msgs = reconstruct_compacted_messages(vec![
+        let msgs = reconstruct_hook_messages(vec![
             wit("tool", &wrapped.to_string()),
             wit("tool", "\"the hook summarized this away\""),
         ]);
@@ -2497,10 +3323,8 @@ mod tests {
     #[test]
     fn extracted_summary_is_the_hook_string_verbatim() {
         let summary = "1. THE BUG: a \"quoted\" path\n\tC:\\tmp — and a trailing space ";
-        let msgs = reconstruct_compacted_messages(vec![wit(
-            "user",
-            &serde_json::to_string(summary).unwrap(),
-        )]);
+        let msgs =
+            reconstruct_hook_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())]);
 
         assert_eq!(extract_compaction_summary_text(&msgs), summary);
         // Same string that landed in the post-compaction context.
@@ -2517,7 +3341,7 @@ mod tests {
             "is_error": false,
             "body": [{"type": "text", "text": "tool output must not appear"}],
         });
-        let msgs = reconstruct_compacted_messages(vec![
+        let msgs = reconstruct_hook_messages(vec![
             wit("user", &serde_json::to_string("first part").unwrap()),
             wit("tool", &wrapped.to_string()),
             wit("assistant", &serde_json::to_string("second part").unwrap()),
@@ -2532,7 +3356,7 @@ mod tests {
     /// Reconstructed post-commit messages, as `try_compact_via_hooks` would hand them to the
     /// dumper — a hook returning one JSON-encoded summary string.
     fn compacted_with_summary(summary: &str) -> Vec<Value> {
-        reconstruct_compacted_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())])
+        reconstruct_hook_messages(vec![wit("user", &serde_json::to_string(summary).unwrap())])
     }
 
     fn dump_lines(dir: &Path) -> Vec<Value> {

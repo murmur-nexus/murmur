@@ -615,6 +615,8 @@ these fields are accepted and inert:
 | Field | Type | Required | Notes |
 |---|---|---:|---|
 | `context.max_tokens` | integer | no | Token budget for the session. Required to enable compaction; omit to disable it. Must be > 0. Read only under `transport: http`, like the [`inference.compaction`](#field-inference) block it drives. Distinct from [`inference.max_tokens`](#field-inference), the per-turn output cap. |
+| `context.seed_budget` | float (0.0–1.0) | no | Default: `0.10`. Fraction of `context.max_tokens` an `on-task-start` hook's `seed-context` may occupy. The product, rounded down, is sent to the hook as `task-start-event.budget-tokens`. Requires `context.max_tokens`: without it there is no ceiling, and a returned seed is refused with `reason: "no_budget"`. Inert under `transport: process`, where a seed is refused with `reason: "unsupported_transport"`. |
+| `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires `context.max_tokens` and is inert under `transport: process`, exactly like `context.seed_budget`. |
 
 #### `observability` { #field-observability }
 
@@ -850,6 +852,7 @@ inference:
 | Result | The CLI's final result text is written to `out/result.txt`. |
 | Observability | Session, inference and tool hooks, `trace.jsonl` and OTel spans are all emitted normally. Token counts are reported as 0, which the subprocess protocol does not carry. |
 | Compaction | Does not run. `context.max_tokens` and `inference.compaction` parse but are inert under this transport; the CLI manages its own context. |
+| Context seeding | Does not run. The `context.seed_budget` keys parse but are inert, and a `seed-context` an `on-task-start` hook returns is recorded as a rejected [`context_seed`](observability-schemas.md#context-seed) with `reason: "unsupported_transport"`. |
 
 ### `inference.api_key` resolution { #inference-api-key }
 
@@ -929,7 +932,7 @@ operator cannot change them by editing their own manifest.
 |---|---|---|---|
 | `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every event | Which lifecycle event(s) the hook is dispatched for. |
 | `execution_mode` | `blocking`, `async` | `blocking` | Whether the agent loop waits for the hook. A binding that commits an arm must be `blocking`, so `async` requires `commit_policy: none`. `on-stage` must be `blocking`. |
-| `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task` | `none` | What the runtime does with the hook's successful output. |
+| `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task`, `seed-context` | `none` | What the runtime does with the hook's successful output. |
 
 **`binding` is the single source of truth for what a hook can commit**, and `commit_policy` is
 checked against it when the capsule is staged. Each binding honors exactly one output, so it admits
@@ -940,9 +943,10 @@ exactly one `commit_policy` — plus `none`, which is always valid and means the
 | `on-stage` | `write-manifests` or `none` |
 | `on-compaction` | `replace-context` or `none` |
 | `on-task-end` | `reopen-task` or `none` |
+| `on-task-start` | `seed-context` or `none` |
 | `on-inference` | `none` only — `on-inference` commits an `artifact` output, which has no `commit_policy` spelling |
-| `on-session-start`, `on-task-start`, `on-tool-call`, `on-shell`, `on-session-end` | `none` only — these events commit nothing |
-| absent (all events) | any value — the hook receives every event, including all four that commit something |
+| `on-session-start`, `on-tool-call`, `on-shell`, `on-session-end` | `none` only — these events commit nothing |
+| absent (all events) | any value — the hook receives every event, including all five that commit something |
 
 Declaring a `commit_policy` the `binding` cannot honor is an error at capsule-staging time, before
 the hook component is compiled or run. For example `binding: on-task-end` with

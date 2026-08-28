@@ -52,4 +52,7 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+# Pinned in lockstep with capsule-runtime's: the hook components the seed-context tests
+# build are hand-authored WAT compiled in-test, so no artifact checkout is needed.
+wat = "=1.251.0"
 zip = { version = "2", default-features = false, features = ["deflate"] }

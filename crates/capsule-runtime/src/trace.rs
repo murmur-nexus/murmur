@@ -91,6 +91,36 @@ pub(crate) const COMPACTION_DECLINED_NO_HOOK_REPLACEMENT: &str = "no_hook_replac
 /// and tool results did not pair up.
 pub(crate) const COMPACTION_DECLINED_UNRESOLVED_TOOL_CALL: &str = "unresolved_tool_call";
 
+/// `context_seed.outcome` when the whole proposal fit the budget and was committed as-is.
+pub(crate) const SEED_OUTCOME_SEEDED: &str = "seeded";
+
+/// `context_seed.outcome` when the proposal was over budget and the oldest messages were
+/// dropped from its front until the rest fit.
+pub(crate) const SEED_OUTCOME_TRIMMED: &str = "trimmed";
+
+/// `context_seed.outcome` when the overflowing front was handed to the compaction hook and
+/// its summary became the seed's first message.
+pub(crate) const SEED_OUTCOME_COMPACTED: &str = "compacted";
+
+/// `context_seed.outcome` when nothing was committed. Always paired with a `reason`.
+pub(crate) const SEED_OUTCOME_REJECTED: &str = "rejected";
+
+/// `context_seed.reason` when one message alone is wider than the whole budget. Trimming
+/// cannot help — dropping everything else still leaves it over — so nothing is committed.
+pub(crate) const SEED_REJECTED_MESSAGE_OVER_BUDGET: &str = "message_over_budget";
+
+/// `context_seed.reason` when the proposal overflows the budget by more multiples of it than
+/// the runtime will summarize. A seed that far over is a broken hook, not a full memory.
+pub(crate) const SEED_REJECTED_OVERFLOW_OVER_LIMIT: &str = "overflow_over_limit";
+
+/// `context_seed.reason` when the capsule declares no `context.max_tokens`, so
+/// `context.seed_budget` is a fraction of nothing and there is no ceiling to enforce.
+pub(crate) const SEED_REJECTED_NO_BUDGET: &str = "no_budget";
+
+/// `context_seed.reason` when the session runs `inference.transport: process`, which owns its
+/// own context and has no host-side message list to seed.
+pub(crate) const SEED_REJECTED_UNSUPPORTED_TRANSPORT: &str = "unsupported_transport";
+
 /// Mint one event identity: `evt_` + a UUID v7 in simple form, the same scheme `ses_`, `tsk_`,
 /// `ctx_`, `dep_` and `req_` use. Ids therefore sort by mint time and carry their own
 /// millisecond timestamp, so a trace can be ordered and time-bounded without reading any
@@ -330,6 +360,44 @@ struct CompactionDeclinedEvent {
     /// `"no_hook_replacement"` when no bound hook returned `replace-context`;
     /// `"unresolved_tool_call"` when the replacement's tool calls and tool results did not pair.
     reason: String,
+}
+
+/// An `on-task-start` hook proposed context and the runtime decided what to do with it.
+///
+/// Written once per task that had a seeding hook return something, whatever the decision —
+/// including a rejection, where `tokens` is `0`. A seed that was silently discarded is
+/// indistinguishable from a capsule with no memory hook at all, which is the failure this
+/// record exists to make impossible.
+#[derive(Serialize)]
+struct ContextSeedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: Option<String>,
+    /// Manifest name of the hook that returned the `seed-context`.
+    hook_name: String,
+    /// Tokens actually committed to the head of the context: `0` for a rejection, the
+    /// proposal's own count for `seeded`, and the surviving count for `trimmed`/`compacted`.
+    tokens: u64,
+    /// Tokens the hook proposed, before any trim or summarization. Together with
+    /// `budget_tokens` this is what makes a rejection readable without the hook's own log.
+    proposed_tokens: u64,
+    /// The ceiling in force: `floor(context.max_tokens * context.seed_budget)`, or `0` when
+    /// the capsule declares no `context.max_tokens`.
+    budget_tokens: u64,
+    /// `"seeded"`, `"trimmed"`, `"compacted"` or `"rejected"` — see the `SEED_OUTCOME_*`
+    /// constants.
+    outcome: String,
+    /// Why nothing was committed, on `"rejected"` only — see the `SEED_REJECTED_*`
+    /// constants. Absent from the JSONL for every other outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The `msg_`-prefixed id of every message committed, in the order they were placed.
+    /// Empty on a rejection. These are the ids the runtime minted; they never reach the
+    /// driver payload, so this record is the only place they are visible.
+    message_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1019,6 +1087,41 @@ impl TraceWriter {
             task_id: self.active_task_id.clone(),
             tokens,
             reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record what the runtime did with an `on-task-start` hook's `seed-context`.
+    ///
+    /// Written for every outcome, committed or not: `tokens` is what reached the context
+    /// (`0` on a rejection), `proposed_tokens` is what the hook returned, and
+    /// `budget_tokens` is the ceiling it was measured against. `reason` is `Some` only for
+    /// [`SEED_OUTCOME_REJECTED`]. Task-scoped, like `task_start`/`task_end`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_context_seed(
+        &mut self,
+        hook_name: &str,
+        tokens: u64,
+        proposed_tokens: u64,
+        budget_tokens: u64,
+        outcome: &str,
+        reason: Option<&str>,
+        message_ids: Vec<String>,
+    ) -> std::io::Result<()> {
+        let event = ContextSeedEvent {
+            event_type: "context_seed",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: self.active_task_id.clone(),
+            hook_name: hook_name.to_string(),
+            tokens,
+            proposed_tokens,
+            budget_tokens,
+            outcome: outcome.to_string(),
+            reason: reason.map(str::to_string),
+            message_ids,
         };
         self.write_event(&event).await
     }

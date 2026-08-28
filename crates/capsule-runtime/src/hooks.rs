@@ -93,6 +93,14 @@ const FAULT_ARM_QUEUE_OVERFLOW: &str = "queue-overflow";
 /// out.
 const FAULT_ARM_TIMEOUT: &str = "timeout";
 
+/// [`DispatchFault::arm`] for a `seed-context` the runtime honored the arm of but refused to
+/// commit — no budget to enforce it against, a single message wider than the whole budget, an
+/// overflow several multiples past it, or a transport with no message list to seed. The arm
+/// was honored, so this is not an unsupported-arm fault; it is recorded beside the
+/// `context_seed` event so a rejection is visible in `trace.jsonl` without reading
+/// `logs/bootstrap.log`.
+pub(crate) const FAULT_ARM_SEED_REJECTED: &str = "seed-rejected";
+
 pub(crate) struct HookRuntime {
     /// Session directory — used for error log paths and mounted as "." in hook WASI contexts.
     workdir: PathBuf,
@@ -163,7 +171,7 @@ const OPTIONAL_HOOK_FNS: [&str; 2] = ["on-task-start", "on-task-end"];
 const HONORED_OUTPUT_ARM: &[(&str, Option<&str>)] = &[
     ("on-stage", Some("write-manifests")),
     ("on-session-start", None),
-    ("on-task-start", None),
+    ("on-task-start", Some("seed-context")),
     ("on-inference", Some("artifact")),
     ("on-tool-call", None),
     ("on-shell", None),
@@ -345,16 +353,20 @@ pub(crate) enum HookEvent {
         context_id: String,
         source: String,
         input_bytes: u64,
-        /// Token ceiling for context proposed at this task. No caller computes
-        /// one, so this is `0`; the WIT contract reads `0` as "not computed"
-        /// rather than "unbounded".
+        /// Token ceiling a `seed-context` returned from this event is enforced
+        /// against: `floor(context.max_tokens * context.seed_budget)`. `0` when
+        /// the capsule declares no `context.max_tokens`, which the WIT contract
+        /// reads as "not computed" rather than "unbounded".
         budget_tokens: u64,
         /// The capsule's `context.max_tokens`, from
         /// [`crate::runtime::resolve_context_window`], or `0` when the manifest
         /// declares no `context:` block.
         context_window: u64,
-        /// Tokens already occupied before this task's first turn. `0`, read the
-        /// same way as `budget_tokens`.
+        /// Tokens already occupied by the `contexts/<id>/history.json` this task
+        /// will load under `lifecycle.conversation: threaded`. `0` under every
+        /// other conversation mode, and read the same way as `budget_tokens`.
+        /// Without it a hook seeding into a threaded context duplicates history
+        /// it cannot see.
         prior_tokens: u64,
     },
     Inference {
@@ -427,6 +439,13 @@ enum HookCallResult {
     Artifact(HookArtifact),
     /// A replacement conversation history (only meaningful for `on-compaction`).
     ReplaceContext(Vec<Message>),
+    /// Messages proposed as the head of the task's context (only honored for
+    /// `on-task-start`). Carries the proposing hook's manifest name; the runtime
+    /// enforces the budget and records the outcome against it. See [`HookSeed`].
+    SeedContext {
+        hook_name: String,
+        messages: Vec<Message>,
+    },
     /// A control decision to reopen the task (only honored for `on-task-end`).
     /// Carries the requesting hook's manifest name and its feedback `reason`; the
     /// agent loop re-runs with that feedback injected into the task content, up to
@@ -437,6 +456,25 @@ enum HookCallResult {
     /// and continues as if the hook had returned `none`. Carries the event's WIT
     /// function name and the discarded arm name.
     UnsupportedArm { event: String, arm: String },
+}
+
+/// What one pass of [`HookRuntime::dispatch`] produced, across every bound blocking hook.
+///
+/// One struct rather than a tuple because each field belongs to a different event and only
+/// one caller ever reads each: a positional tuple makes every new honored arm rewrite every
+/// call site, and makes it possible to read the wrong half without the compiler noticing.
+struct DispatchOutcome {
+    /// Every `on-inference` `HookOutput::Artifact`, in hook-registration order.
+    artifacts: Vec<HookArtifact>,
+    /// The first `on-compaction` `HookOutput::ReplaceContext`.
+    replacement: Option<Vec<Message>>,
+    /// The first `on-task-start` `HookOutput::SeedContext`.
+    seed: Option<HookSeed>,
+    /// The message of the first bound hook that returned `Err` for this event. Only
+    /// `on-compaction` treats it as fatal.
+    first_error: Option<String>,
+    /// The first `on-task-end` `HookOutput::ReopenTask`.
+    reopen: Option<TaskReopen>,
 }
 
 /// A blocking `on-task-end` hook returned `reopen-task(reason)`: a control
@@ -450,6 +488,23 @@ pub(crate) struct TaskReopen {
     pub hook_name: String,
     /// Feedback text the hook wants injected into the reopened task's content.
     pub reason: String,
+}
+
+/// A blocking `on-task-start` hook returned `seed-context(messages)`: context it proposes
+/// as the head of this task's message list, ahead of any loaded history and the task
+/// message. Surfaced by [`HookRuntime::dispatch_task_start`]; what the agent loop does with
+/// it depends on how it measures against the task's seed budget, which is the hook's
+/// proposal and the runtime's decision respectively.
+///
+/// The messages are chronological, oldest first, matching the loop's own `messages` — that
+/// is what makes "drop from the front" a well-defined trim.
+#[derive(Debug, Clone)]
+pub(crate) struct HookSeed {
+    /// Manifest name of the hook that proposed the seed, recorded on the `context_seed`
+    /// trace event and on any rejection fault.
+    pub hook_name: String,
+    /// The proposed messages, exactly as the hook returned them.
+    pub messages: Vec<Message>,
 }
 
 /// An artifact emitted by a blocking hook via `HookOutput::Artifact`.
@@ -890,32 +945,30 @@ impl HookRuntime {
     /// any blocking hook via `HookOutput::Artifact`, in hook-registration order.
     /// An empty `Vec` means no hook produced an artifact for this event.
     pub(crate) async fn emit(&mut self, workdir: &Path, event: HookEvent) -> Vec<HookArtifact> {
-        self.dispatch(workdir, event).await.0
+        self.dispatch(workdir, event).await.artifacts
+    }
+
+    /// Buffer a fault the runtime itself raised about a hook, for the same drain the
+    /// dispatch-path faults go through.
+    ///
+    /// Dispatch reports what a hook *returned*; this reports what the runtime *did* with a
+    /// return it honored — the only current caller is the seed commit refusing an
+    /// over-budget or unbudgeted `seed-context` under [`FAULT_ARM_SEED_REJECTED`]. Both end
+    /// up as `hook_dispatch_error` lines, because from a trace reader's side there is one
+    /// question: which hook output did not take effect, and on which event.
+    pub(crate) fn record_dispatch_fault(&mut self, fault: DispatchFault) {
+        self.dispatch_faults.push(fault);
     }
 
     /// Shared dispatch path used by every Lifecycle Event. Iterates the blocking
     /// hooks (binding-filtered) and calls each inline, then enqueues the event on each
     /// matching async hook's queue and returns without waiting for any of them.
-    /// Returns `(artifacts, replacement, first_error, reopen)`: `artifacts` collects every
-    /// `on-inference` `HookOutput::Artifact`; `replacement` is the first `on-compaction`
-    /// `HookOutput::ReplaceContext`; `first_error` is the message of the first bound
-    /// hook that returned `Err` for this event; `reopen` is the first `on-task-end`
-    /// `HookOutput::ReopenTask`. Callers read only the half they need — `emit()` takes
-    /// `artifacts`, `dispatch_compaction` `replacement`/`first_error`, `dispatch_task_end`
-    /// `reopen` — and discard the rest; the per-hook error is still logged and the loop
-    /// still continues, so `emit()`'s observable behaviour is unchanged. Event-keyed side
-    /// effects (the running token/tool-call/shell-call totals) run here so all events
-    /// funnel through one place.
-    async fn dispatch(
-        &mut self,
-        workdir: &Path,
-        event: HookEvent,
-    ) -> (
-        Vec<HookArtifact>,
-        Option<Vec<Message>>,
-        Option<String>,
-        Option<TaskReopen>,
-    ) {
+    ///
+    /// Every caller reads only the [`DispatchOutcome`] field its event honors and ignores
+    /// the rest; a per-hook error is still logged and the loop still continues regardless
+    /// of which field the caller reads. Event-keyed side effects (the running
+    /// token/tool-call/shell-call totals) run here so all events funnel through one place.
+    async fn dispatch(&mut self, workdir: &Path, event: HookEvent) -> DispatchOutcome {
         if let HookEvent::Inference {
             input_tokens,
             output_tokens,
@@ -942,6 +995,7 @@ impl HookRuntime {
 
         let mut artifacts: Vec<HookArtifact> = Vec::new();
         let mut replacement: Option<Vec<Message>> = None;
+        let mut seed: Option<HookSeed> = None;
         let mut reopen: Option<TaskReopen> = None;
         let mut first_error: Option<String> = None;
         // Faults are collected here and appended to `self.dispatch_faults` after the
@@ -959,6 +1013,18 @@ impl HookRuntime {
                 Ok(HookCallResult::ReplaceContext(msgs)) => {
                     if replacement.is_none() {
                         replacement = Some(msgs);
+                    }
+                }
+                Ok(HookCallResult::SeedContext {
+                    hook_name,
+                    messages,
+                }) => {
+                    // First seeding hook wins, mirroring `replacement`.
+                    if seed.is_none() {
+                        seed = Some(HookSeed {
+                            hook_name,
+                            messages,
+                        });
                     }
                 }
                 Ok(HookCallResult::Reopen { hook_name, reason }) => {
@@ -1032,7 +1098,13 @@ impl HookRuntime {
             }
         }
 
-        (artifacts, replacement, first_error, reopen)
+        DispatchOutcome {
+            artifacts,
+            replacement,
+            seed,
+            first_error,
+            reopen,
+        }
     }
 
     /// Fire `on-compaction` on all hooks with a matching binding.
@@ -1066,19 +1138,51 @@ impl HookRuntime {
             model,
             system_prompt,
         };
-        let (_, replacement, first_error, _) = self.dispatch(&workdir, event).await;
-        match first_error {
+        let outcome = self.dispatch(&workdir, event).await;
+        match outcome.first_error {
             Some(error) => Err(error),
-            None => Ok(replacement),
+            None => Ok(outcome.replacement),
         }
+    }
+
+    /// Fire `on-task-start` on all hooks with a matching binding and surface the first
+    /// [`HookSeed`] any blocking hook proposed via `seed-context`, or `None` if none did.
+    ///
+    /// A thin wrapper over the shared [`Self::dispatch`] path, mirroring
+    /// [`Self::dispatch_task_end`]. First hook to return a seed wins, matching compaction:
+    /// merging two hooks' proposals would need an ordering rule neither hook declared.
+    /// A hook-returned `Err` is logged per-hook inside `dispatch` and never fails the task —
+    /// a capsule whose memory hook broke must still run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn dispatch_task_start(
+        &mut self,
+        task_id: String,
+        context_id: String,
+        source: String,
+        input_bytes: u64,
+        budget_tokens: u64,
+        context_window: u64,
+        prior_tokens: u64,
+    ) -> Option<HookSeed> {
+        let workdir = self.workdir.clone();
+        let event = HookEvent::TaskStart {
+            task_id,
+            context_id,
+            source,
+            input_bytes,
+            budget_tokens,
+            context_window,
+            prior_tokens,
+        };
+        self.dispatch(&workdir, event).await.seed
     }
 
     /// Fire `on-task-end` on all hooks with a matching binding and surface the first
     /// [`TaskReopen`] any blocking hook requested via `reopen-task`, or `None` if none
     /// did. A thin wrapper over the shared [`Self::dispatch`] path, mirroring
     /// [`Self::dispatch_compaction`]: it builds a `HookEvent::TaskEnd` and reads only
-    /// the `reopen` half of the four-tuple. `on-task-end` honors no artifact or
-    /// replacement arm, so those halves are discarded; async hooks are still only
+    /// the `reopen` field of the outcome. `on-task-end` honors no artifact or
+    /// replacement arm, so those fields are discarded; async hooks are still only
     /// enqueued. A hook-returned `Err` is logged per-hook inside `dispatch`
     /// and does not abort the task, matching `emit`.
     pub(crate) async fn dispatch_task_end(
@@ -1091,8 +1195,7 @@ impl HookRuntime {
             task_id,
             exit_status,
         };
-        let (_, _, _, reopen) = self.dispatch(&workdir, event).await;
-        reopen
+        self.dispatch(&workdir, event).await.reopen
     }
 }
 
@@ -1456,10 +1559,8 @@ async fn call_hook(
     };
 
     // A single decision against `HONORED_OUTPUT_ARM`: commit the one arm this event
-    // honors (only `on-inference`/`artifact` and `on-compaction`/`replace-context`
-    // among the eight events reaching here), stay silent for `none` and for an
-    // absent optional function, and turn any other non-`none` arm into an
-    // unsupported-arm fault the caller logs and traces.
+    // honors, stay silent for `none` and for an absent optional function, and turn any
+    // other non-`none` arm into an unsupported-arm fault the caller logs and traces.
     let event_fn = event_fn_name(event);
     Ok(match output {
         // Optional function absent from this component — never a fault; the hook
@@ -1473,6 +1574,12 @@ async fn call_hook(
                     payload,
                 }),
                 HookOutput::ReplaceContext(msgs) => HookCallResult::ReplaceContext(msgs),
+                // `seed-context` is honored only by `on-task-start`; the runtime's
+                // seed-application path reads this off `dispatch_task_start`.
+                HookOutput::SeedContext(messages) => HookCallResult::SeedContext {
+                    hook_name: hook.name.clone(),
+                    messages,
+                },
                 // `reopen-task` is honored only by `on-task-end`; the runtime's
                 // reopen loop reads this off `dispatch_task_end`.
                 HookOutput::ReopenTask(reason) => HookCallResult::Reopen {
@@ -1480,11 +1587,9 @@ async fn call_hook(
                     reason,
                 },
                 // `write-manifests` is honored only by `on-stage`, which is never
-                // dispatched through `call_hook`, and `seed-context` is honored by
-                // no event at all; neither can reach this arm as `Honored`.
-                HookOutput::WriteManifests(_) | HookOutput::SeedContext(_) | HookOutput::None => {
-                    HookCallResult::None
-                }
+                // dispatched through `call_hook`, so it cannot reach this arm as
+                // `Honored`; `none` classifies as `Ignore` before it gets here.
+                HookOutput::WriteManifests(_) | HookOutput::None => HookCallResult::None,
             },
             OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
                 event: event_fn.to_string(),
@@ -4348,8 +4453,8 @@ artifacts:
 
     // ---- task-start-event: the new u64 fields, and the seed-context arm ----
 
-    /// An `on-task-start` double that checks what it was handed and reports back with an
-    /// arm the event does not honor.
+    /// An `on-task-start` double that checks what it was handed and reports back with a
+    /// selectable `hook-output` arm.
     ///
     /// It traps unless the `context-window` it received equals `expect_window`, so a test
     /// asserting "no log line" is asserting the guest saw the host's real number rather
@@ -4487,6 +4592,41 @@ artifacts:
         hooks.drain_dispatch_faults()
     }
 
+    /// [`dispatch_task_start_against`] through the honoring path: hands back both the
+    /// proposed seed and the buffered faults.
+    async fn seed_from_task_start_against(
+        session: &Path,
+        accessible: &Path,
+        engine: &wasmtime::Engine,
+        double: Component,
+        context_window: u64,
+    ) -> (Option<HookSeed>, Vec<DispatchFault>) {
+        let mut hooks = new_with_hooks(
+            engine,
+            session,
+            accessible,
+            vec![staged_double_named(
+                "starter",
+                HookBinding::OnTaskStart,
+                double,
+            )],
+        )
+        .await
+        .expect("task-start double instantiates");
+        let seed = hooks
+            .dispatch_task_start(
+                "tsk_1".to_string(),
+                "ctx_1".to_string(),
+                "task_md".to_string(),
+                12,
+                20_000,
+                context_window,
+                0,
+            )
+            .await;
+        (seed, hooks.drain_dispatch_faults())
+    }
+
     /// Invariant: the `context-window` a hook sees at `on-task-start` is the number the
     /// host put on the event. The double traps on any other value, so an empty log is
     /// the assertion.
@@ -4534,19 +4674,18 @@ artifacts:
         assert_eq!(hook_log_lines(session.path(), "starter"), 0);
     }
 
-    /// Invariant: `seed-context` is a linkable arm no event honors. A hook returning it
-    /// from `on-task-start` instantiates, is dispatched, and its return lifts cleanly —
-    /// the failure mode this bump must not produce is a link or type error. What it does
-    /// produce is the ordinary unsupported-arm fault: one log line and one
-    /// `hook_dispatch_error` naming the arm.
+    /// Invariant: `on-task-start` honors `seed-context`. The hook's messages come back on
+    /// the [`HookSeed`], no fault is raised, and nothing reaches the hook's error log —
+    /// the failure this test exists to catch is the seed being discarded silently, which
+    /// is exactly how it looked before the arm was honored.
     #[test]
-    fn seed_context_from_on_task_start_is_an_unsupported_arm_fault() {
+    fn seed_context_from_on_task_start_is_honored() {
         let session = TempDir::new().unwrap();
         let accessible = TempDir::new().unwrap();
         let engine = hook_test_engine();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let faults = rt.block_on(dispatch_task_start_against(
+        let (seed, faults) = rt.block_on(seed_from_task_start_against(
             session.path(),
             accessible.path(),
             &engine,
@@ -4554,31 +4693,49 @@ artifacts:
             0,
         ));
 
-        assert_eq!(faults.len(), 1, "exactly one fault: {faults:?}");
-        assert_eq!(faults[0].hook_name, "starter");
-        assert_eq!(faults[0].event, "on-task-start");
-        assert_eq!(faults[0].arm, "seed-context");
-        assert_eq!(
-            hook_log_lines(session.path(), "starter"),
-            1,
-            "the fault must also reach logs/hook-starter.log"
-        );
+        let seed = seed.expect("on-task-start must surface the hook's seed-context");
+        assert_eq!(seed.hook_name, "starter");
+        assert_eq!(seed.messages.len(), 1);
+        assert_eq!(seed.messages[0].role, "user");
+        assert_eq!(seed.messages[0].content, "seed");
         assert!(
-            hook_log_text(session.path(), "starter").contains("seed-context"),
-            "the log line must name the discarded arm"
+            faults.is_empty(),
+            "an honored arm raises no fault: {faults:?}"
         );
+        assert_eq!(hook_log_lines(session.path(), "starter"), 0);
     }
 
-    /// No lifecycle event honors `seed-context`, which is what makes the arm inert in
-    /// this bump. Reads the honored-arm table directly, so adding an entry that honors
-    /// it fails here rather than in whichever dispatch test happens to cover it.
+    /// A hook returning `none` from `on-task-start` proposes nothing, exactly as it did
+    /// before the arm was honored. This is what makes a bound-but-silent hook inert.
     #[test]
-    fn no_event_honors_seed_context() {
+    fn none_from_on_task_start_proposes_no_seed() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let (seed, faults) = rt.block_on(seed_from_task_start_against(
+            session.path(),
+            accessible.path(),
+            &engine,
+            hook_task_start_double(&engine, 0, 0),
+            0,
+        ));
+
+        assert!(seed.is_none());
+        assert!(faults.is_empty());
+    }
+
+    /// `on-task-start` is the one event that honors `seed-context`. Reads the honored-arm
+    /// table directly, so widening the arm to a second event fails here rather than in
+    /// whichever dispatch test happens to cover it.
+    #[test]
+    fn only_on_task_start_honors_seed_context() {
         for (event, arm) in HONORED_OUTPUT_ARM {
-            assert_ne!(
-                *arm,
-                Some("seed-context"),
-                "{event} must not honor seed-context"
+            assert_eq!(
+                *arm == Some("seed-context"),
+                *event == "on-task-start",
+                "{event} honoring seed-context must be exactly on-task-start"
             );
         }
     }
@@ -4976,7 +5133,11 @@ artifacts:
                 assert!(
                     matches!(
                         *arm,
-                        "replace-context" | "write-manifests" | "artifact" | "reopen-task"
+                        "replace-context"
+                            | "write-manifests"
+                            | "artifact"
+                            | "reopen-task"
+                            | "seed-context"
                     ),
                     "honored arm {arm} must be a real hook-output variant"
                 );

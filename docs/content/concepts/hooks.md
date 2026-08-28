@@ -34,7 +34,9 @@ compaction), **`write-manifests`** (runtime writes tool manifest records to
 `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file; used for shell tool
 enrichment during staging), or **`reopen-task`** (runtime re-runs the task's agent loop with the
 hook's feedback instead of finalizing it — see [Task
-reopening](session-loop.md#task-reopening-commit_policy-reopen-task)). `binding` is the single
+reopening](session-loop.md#task-reopening-commit_policy-reopen-task)), or **`seed-context`**
+(runtime places the hook's messages at the head of the task's first message list, under the
+`context.seed_budget` ceiling; used for memory). `binding` is the single
 source of truth for what a hook commits: each binding honors exactly one arm, so it admits that one
 policy plus `none`, and a `commit_policy` the binding cannot honor fails at capsule-staging time —
 before the hook component is compiled — with an error naming the binding, the declared policy, and
@@ -57,7 +59,7 @@ version: 1.0.0
 runtime: hook
 binding: on-compaction           # when it fires
 execution_mode: blocking         # blocking or async
-commit_policy: replace-context   # none, replace-context, write-manifests, or reopen-task
+commit_policy: replace-context   # none, replace-context, write-manifests, reopen-task, seed-context
 description: "Hook description."
 ```
 
