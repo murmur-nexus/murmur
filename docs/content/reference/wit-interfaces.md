@@ -252,6 +252,7 @@ A handler may return any `hook-output` arm, but the runtime commits only one arm
 | `on-inference` | `artifact` |
 | `on-compaction` | `replace-context` |
 | `on-task-end` | `reopen-task` |
+| `on-task-start` | `seed-context` |
 | All others | none — only `none` is silent |
 
 This table is also enforced ahead of time. A hook artifact declares in its own `murmur.yaml`
@@ -278,10 +279,15 @@ with the arm's string injected as feedback, subject to `lifecycle.max_task_reope
 `inference.max_turns`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task).
 
-`seed-context` is in the `hook-output` variant and appears in the table above under no handler.
-Returning it from any handler is the same loud-but-non-fatal fault as any other unhonored arm —
-the value is discarded, a line reaches `logs/hook-<name>.log`, and a `hook_dispatch_error` reaches
-the trace. No binding accepts it as a `commit_policy`.
+`seed-context` is honored at `on-task-start` alone: the first bound blocking hook to return it
+wins, and its messages are placed at the head of the task's context, ahead of any loaded history
+and ahead of the task message. The list is chronological, oldest first. The host measures it
+against `task-start-event.budget-tokens` — `context.max_tokens` × `context.seed_budget` — and
+commits it whole, drops its oldest messages, summarizes the overflowing front through the
+compaction hook, or refuses it; every outcome is recorded as a
+[`context_seed`](observability-schemas.md#context-seed) event, and a refusal never fails the task.
+Returning it from any other handler is the same loud-but-non-fatal fault as any other unhonored
+arm. Only `binding: on-task-start` accepts it as a `commit_policy`.
 
 ### Event field notes
 
@@ -295,14 +301,21 @@ the trace. No binding accepts it as a `commit_policy`.
   messages still carry different ids. `source-id` is opaque: whatever produced the content sets
   it, and the runtime records it verbatim without parsing it. Both are **stripped before the
   driver payload is built**, so neither reaches the provider — a uuid at the head of a cached
-  prefix would break prompt-prefix caching on every request. The runtime sets neither, so a hook
-  always receives both absent, and a value a hook sets on a returned message is ignored.
+  prefix would break prompt-prefix caching on every request. The runtime mints an `id` for every
+  message it builds out of a hook-returned message list, so an `id` a hook sets on a message it
+  returns is replaced rather than kept; a `source-id` a hook sets is carried verbatim, and the
+  field is absent when the hook set none.
 - `task-start-event.context-window` is the capsule's
   [`context.max_tokens`](manifest.md#field-context), or `0` when the manifest declares no `context:`
   block. It is precomputed so a hook sizing its work against the window never has to know which
   model the session runs.
-- `task-start-event.budget-tokens` and `task-start-event.prior-tokens` are `0`. Read `0` as "the
-  runtime has not computed this" and decline, rather than as an unbounded budget.
+- `task-start-event.budget-tokens` is the ceiling a `seed-context` returned from this event is
+  enforced against: [`context.max_tokens`](manifest.md#field-context) ×
+  [`context.seed_budget`](manifest.md#field-context), rounded down.
+  `task-start-event.prior-tokens` is the token count of the conversation history the task will
+  load under [`lifecycle.conversation: threaded`](manifest.md#lifecycle-conversation), and `0`
+  under every other conversation mode. Read `0` as "the runtime has not computed this" and
+  decline, rather than as an unbounded budget.
 - `shell-event.binary` is the program the shell tool actually invoked — a canonicalized absolute
   path (for example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the
   bare invoked name when nothing resolved. `shell-event.command` carries the argument list alone

@@ -244,6 +244,10 @@ pub enum HookCommitPolicy {
     /// `"reopen-task"` — runtime re-runs the task's agent loop with the hook's feedback.
     /// Valid only with on-task-end.
     ReopenTask,
+    /// `"seed-context"` — runtime places the hook's messages at the head of the task's
+    /// first message list, under the `context.seed_budget` ceiling. Valid only with
+    /// on-task-start.
+    SeedContext,
 }
 
 impl HookCommitPolicy {
@@ -255,6 +259,7 @@ impl HookCommitPolicy {
             Self::ReplaceContext => "replace-context",
             Self::WriteManifests => "write-manifests",
             Self::ReopenTask => "reopen-task",
+            Self::SeedContext => "seed-context",
         }
     }
 }
@@ -318,8 +323,8 @@ impl Default for HookConfig {
 /// produces — which `hook-output` arm the runtime commits for each event. Two bindings
 /// return `None` for different reasons, and the distinction matters:
 ///
-/// - `on-session-start`, `on-task-start`, `on-tool-call`, `on-shell`, `on-session-end`
-///   honor no arm at all; every output from them is discarded.
+/// - `on-session-start`, `on-tool-call`, `on-shell`, `on-session-end` honor no arm at
+///   all; every output from them is discarded.
 /// - `on-inference` *does* honor an arm (`artifact`), but that arm has no
 ///   `commit_policy` spelling — [`HookCommitPolicy`] has no `Artifact` variant — so no
 ///   non-`none` policy is declarable for it either.
@@ -334,8 +339,8 @@ pub fn commit_policy_for_binding(binding: &HookBinding) -> Option<HookCommitPoli
         HookBinding::OnStage => Some(HookCommitPolicy::WriteManifests),
         HookBinding::OnCompaction => Some(HookCommitPolicy::ReplaceContext),
         HookBinding::OnTaskEnd => Some(HookCommitPolicy::ReopenTask),
+        HookBinding::OnTaskStart => Some(HookCommitPolicy::SeedContext),
         HookBinding::OnSessionStart
-        | HookBinding::OnTaskStart
         | HookBinding::OnInference
         | HookBinding::OnToolCall
         | HookBinding::OnShell
@@ -406,9 +411,10 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
             "replace-context" => Ok(HookCommitPolicy::ReplaceContext),
             "write-manifests" => Ok(HookCommitPolicy::WriteManifests),
             "reopen-task" => Ok(HookCommitPolicy::ReopenTask),
+            "seed-context" => Ok(HookCommitPolicy::SeedContext),
             other => Err(format!(
                 "unknown commit_policy '{other}'; expected: none, replace-context, write-manifests, \
-                 reopen-task"
+                 reopen-task, seed-context"
             )),
         })
         .transpose()?
@@ -814,11 +820,34 @@ pub struct CompactionConfig {
 // Threshold values are validated to (0.0, 1.0] at parse time so NaN is impossible.
 impl Eq for CompactionConfig {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `context.seed_budget` when the manifest leaves it out: a tenth of the window.
+/// Small enough that a seed cannot crowd out the task it precedes, large enough that a
+/// memory hook has room to say something.
+pub const DEFAULT_SEED_BUDGET: f32 = 0.10;
+
+/// `context.seed_overflow_margin` when the manifest leaves it out. Slack above
+/// `seed_budget` within which an over-budget seed is trimmed rather than summarized —
+/// a few tokens over must not buy an inference call.
+pub const DEFAULT_SEED_OVERFLOW_MARGIN: f32 = 0.10;
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContextConfig {
     /// Token budget for this session; None disables compaction.
     pub max_tokens: Option<u32>,
+    /// Fraction of [`Self::max_tokens`] an `on-task-start` hook's `seed-context` may
+    /// occupy, in `0.0..=1.0`. Always populated; [`DEFAULT_SEED_BUDGET`] when the key is
+    /// absent. Inert without `max_tokens`: a fraction of no ceiling is no ceiling, and a
+    /// seed with no ceiling is rejected rather than committed unbounded.
+    pub seed_budget: f32,
+    /// Slack above the seed budget, as a fraction of it, within which an over-budget seed
+    /// is trimmed from its front rather than handed to the compaction hook, in
+    /// `0.0..=1.0`. Always populated; [`DEFAULT_SEED_OVERFLOW_MARGIN`] when the key is
+    /// absent.
+    pub seed_overflow_margin: f32,
 }
+
+// Both fractions are validated to 0.0..=1.0 at parse time, so NaN is impossible.
+impl Eq for ContextConfig {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservabilityConfig {
@@ -1331,6 +1360,10 @@ struct RawNetworkConfig {
 #[derive(Debug, Deserialize)]
 struct RawContextConfig {
     max_tokens: Option<u32>,
+    #[serde(default)]
+    seed_budget: Option<f32>,
+    #[serde(default)]
+    seed_overflow_margin: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2816,8 +2849,23 @@ fn parse_context(
         }
     }
 
+    let fraction = |field: &str, value: Option<f32>, default: f32| match value {
+        None => Ok(default),
+        Some(v) if (0.0..=1.0).contains(&v) => Ok(v),
+        Some(_) => Err(RuntimeManifestError::InvalidInferenceConfig {
+            field: field.to_string(),
+            message: "must be between 0.0 and 1.0".to_string(),
+        }),
+    };
+
     Ok(Some(ContextConfig {
         max_tokens: raw.max_tokens,
+        seed_budget: fraction("context.seed_budget", raw.seed_budget, DEFAULT_SEED_BUDGET)?,
+        seed_overflow_margin: fraction(
+            "context.seed_overflow_margin",
+            raw.seed_overflow_margin,
+            DEFAULT_SEED_OVERFLOW_MARGIN,
+        )?,
     }))
 }
 
@@ -5530,14 +5578,13 @@ context:
 
     // ── binding is the single source of truth for what a hook commits ─────────────
 
-    /// The five bindings whose events honor no `hook-output` arm at all cannot declare
+    /// The four bindings whose events honor no `hook-output` arm at all cannot declare
     /// any non-`none` `commit_policy`. The error names the binding, the declared policy,
     /// and `none` as what the binding honors.
     #[test]
     fn hook_config_non_committing_binding_rejects_any_commit_policy() {
         for binding in [
             "on-session-start",
-            "on-task-start",
             "on-tool-call",
             "on-shell",
             "on-session-end",
@@ -5563,6 +5610,7 @@ context:
             ("on-stage", "reopen-task", "write-manifests"),
             ("on-compaction", "write-manifests", "replace-context"),
             ("on-task-end", "replace-context", "reopen-task"),
+            ("on-task-start", "replace-context", "seed-context"),
         ] {
             let yaml = format!(
                 "name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: {declared}\n"
@@ -5754,11 +5802,14 @@ context:
             commit_policy_for_binding(&HookBinding::OnTaskEnd),
             Some(HookCommitPolicy::ReopenTask)
         );
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnTaskStart),
+            Some(HookCommitPolicy::SeedContext)
+        );
         // `on-inference` honors `artifact`, which has no `commit_policy` spelling; the
-        // other five honor nothing. `All` is unconstrained by design.
+        // other four honor nothing. `All` is unconstrained by design.
         for binding in [
             HookBinding::OnSessionStart,
-            HookBinding::OnTaskStart,
             HookBinding::OnInference,
             HookBinding::OnToolCall,
             HookBinding::OnShell,
@@ -5766,6 +5817,101 @@ context:
             HookBinding::All,
         ] {
             assert_eq!(commit_policy_for_binding(&binding), None, "{binding:?}");
+        }
+    }
+
+    /// The `on-task-start` pairing is declarable end to end: the parser accepts it, and
+    /// refuses the same policy on any other binding by name.
+    #[test]
+    fn seed_context_commit_policy_is_declarable_only_on_on_task_start() {
+        let config = parse_hook_config_from_yaml(
+            "name: memory\nversion: 0.1.0\nruntime: hook\nbinding: on-task-start\n\
+             commit_policy: seed-context\n",
+        )
+        .expect("on-task-start + seed-context is the declarable pairing");
+        assert_eq!(config.binding, HookBinding::OnTaskStart);
+        assert_eq!(config.commit_policy, HookCommitPolicy::SeedContext);
+
+        let error = parse_hook_config_from_yaml(
+            "name: memory\nversion: 0.1.0\nruntime: hook\nbinding: on-compaction\n\
+             commit_policy: seed-context\n",
+        )
+        .expect_err("on-compaction cannot commit a seed");
+        assert!(error.contains("on-compaction"), "{error}");
+        assert!(error.contains("seed-context"), "{error}");
+    }
+
+    /// The unknown-value diagnostic lists every accepted spelling, so an operator who
+    /// mistypes one reads the whole set rather than guessing.
+    #[test]
+    fn unknown_commit_policy_names_seed_context_among_the_accepted_values() {
+        let error = parse_hook_config_from_yaml(
+            "name: h\nversion: 0.1.0\nruntime: hook\ncommit_policy: seed-contxt\n",
+        )
+        .expect_err("a misspelled policy is rejected");
+        assert!(error.contains("seed-context"), "{error}");
+    }
+
+    // ── context.seed_budget / context.seed_overflow_margin ───────────────────
+
+    fn context_of(yaml_block: &str) -> Option<ContextConfig> {
+        RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.1.0\nartifacts: []\n{yaml_block}"
+        ))
+        .expect("the manifest under test parses")
+        .context
+    }
+
+    #[test]
+    fn seed_budget_and_overflow_margin_parse_from_the_context_block() {
+        let context = context_of(
+            "context:\n  max_tokens: 200000\n  seed_budget: 0.10\n  seed_overflow_margin: 0.10\n",
+        )
+        .expect("a declared context block parses to Some");
+        assert_eq!(context.max_tokens, Some(200_000));
+        assert!((context.seed_budget - 0.10).abs() < f32::EPSILON);
+        assert!((context.seed_overflow_margin - 0.10).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn seed_budget_and_overflow_margin_default_when_omitted() {
+        let context = context_of("context:\n  max_tokens: 200000\n")
+            .expect("a declared context block parses to Some");
+        assert!((context.seed_budget - DEFAULT_SEED_BUDGET).abs() < f32::EPSILON);
+        assert!((context.seed_overflow_margin - DEFAULT_SEED_OVERFLOW_MARGIN).abs() < f32::EPSILON);
+    }
+
+    /// No `context:` block at all stays `None` — the two fractions default *within* a
+    /// declared block, and never conjure one that the operator did not write.
+    #[test]
+    fn seed_budget_defaults_do_not_create_a_context_block() {
+        assert_eq!(context_of(""), None);
+    }
+
+    #[test]
+    fn seed_budget_outside_zero_to_one_is_rejected_by_field_name() {
+        for (block, field) in [
+            ("context:\n  seed_budget: 1.5\n", "context.seed_budget"),
+            ("context:\n  seed_budget: -0.1\n", "context.seed_budget"),
+            (
+                "context:\n  seed_overflow_margin: 2.0\n",
+                "context.seed_overflow_margin",
+            ),
+        ] {
+            let error = RuntimeManifest::from_yaml_str(&format!(
+                "name: cap\nversion: 0.1.0\nartifacts: []\n{block}"
+            ))
+            .expect_err("an out-of-range fraction is rejected");
+            match error {
+                RuntimeManifestError::InvalidInferenceConfig {
+                    field: got,
+                    ref message,
+                } => {
+                    assert_eq!(got, field);
+                    assert!(message.contains("0.0 and 1.0"), "{message}");
+                }
+                other => panic!("expected InvalidInferenceConfig for {block:?}, got {other:?}"),
+            }
         }
     }
 

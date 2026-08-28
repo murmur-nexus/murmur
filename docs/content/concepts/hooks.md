@@ -28,18 +28,22 @@ round trip inline every time. An async hook is one reused instance per session, 
 persists across calls; its calls are serialized in dispatch order and finish before the session
 ends. See [Async hook execution](../reference/manifest.md#hook-overflow) for overflow rules.
 
-**Commit policy** — what the runtime does with the output: **`none`** (discarded; used for
-observability hooks), **`replace-context`** (runtime replaces conversation history; used for
-compaction), **`write-manifests`** (runtime writes tool manifest records to
-`workdir/tools/<binary>/murmur.yaml`, overwriting any existing file; used for shell tool
-enrichment during staging), or **`reopen-task`** (runtime re-runs the task's agent loop with the
-hook's feedback instead of finalizing it — see [Task
-reopening](session-loop.md#task-reopening-commit_policy-reopen-task)). `binding` is the single
-source of truth for what a hook commits: each binding honors exactly one arm, so it admits that one
-policy plus `none`, and a `commit_policy` the binding cannot honor fails at capsule-staging time —
-before the hook component is compiled — with an error naming the binding, the declared policy, and
-the policy the binding honors. A hook with no `binding:` receives every event, so any policy is
-valid for it — see [Hook contract fields](../reference/manifest.md#hook-contract-fields).
+**Commit policy** — what the runtime does with the hook's output.
+
+| `commit_policy` | What the runtime does | Typical use |
+|---|---|---|
+| `none` | Discards the output | Observability hooks |
+| `replace-context` | Replaces the conversation history | Compaction |
+| `write-manifests` | Writes tool manifest records to `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file | Shell tool enrichment during staging |
+| `reopen-task` | Re-runs the task's agent loop with the hook's feedback instead of finalizing it — see [Task reopening](session-loop.md#task-reopening-commit_policy-reopen-task) | Review and retry hooks |
+| `seed-context` | Places the hook's messages at the head of the task's first message list, under the [`context.seed_budget`](../reference/manifest.md#field-context) ceiling — see [Context seeding](session-loop.md#context-seeding-commit_policy-seed-context) | Memory |
+
+`binding` is the single source of truth for what a hook commits: each binding honors exactly one
+arm, so it admits that one policy plus `none`, and a `commit_policy` the binding cannot honor fails
+at capsule-staging time — before the hook component is compiled — with an error naming the binding,
+the declared policy, and the policy the binding honors. A hook with no `binding:` receives every
+event, so any policy is valid for it — see [Hook contract
+fields](../reference/manifest.md#hook-contract-fields).
 
 The two fields meet in one rule: a binding that commits an arm must be blocking, because every
 committable arm is a decision the agent loop is blocked on — the context it continues from, the
@@ -57,7 +61,7 @@ version: 1.0.0
 runtime: hook
 binding: on-compaction           # when it fires
 execution_mode: blocking         # blocking or async
-commit_policy: replace-context   # none, replace-context, write-manifests, or reopen-task
+commit_policy: replace-context   # none, replace-context, write-manifests, reopen-task, seed-context
 description: "Hook description."
 ```
 

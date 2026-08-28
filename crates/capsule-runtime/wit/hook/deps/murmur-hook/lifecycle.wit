@@ -15,8 +15,10 @@ interface lifecycle {
         /// never interchangeable.
         ///
         /// Stripped before the wire payload is built — see the note on
-        /// `source-id`. The runtime mints no id, so this is always `none` on the
-        /// way out, and a value set on an incoming message is ignored.
+        /// `source-id`. The runtime mints one for every message it builds out of
+        /// a hook-returned message list, so an id set on a message a hook returns
+        /// is replaced rather than kept: identity belongs to whoever put the
+        /// message in the context.
         id: option<string>,
         /// Opaque join key back to whatever produced this content — a corpus
         /// record, a compaction summary, reloaded history. Recorded verbatim and
@@ -26,8 +28,8 @@ interface lifecycle {
         /// Both `id` and `source-id` are stripped before the driver wire payload
         /// is built. A uuid sitting at the head of a cached prefix is volatile
         /// content, and would defeat provider prompt-prefix caching on every
-        /// request. The runtime sets no `source-id`, so this is always `none` on
-        /// the way out, and a value set on an incoming message is ignored.
+        /// request. A `source-id` a hook supplies is carried verbatim; the key is
+        /// absent when the hook supplied none.
         source-id: option<string>,
     }
 
@@ -56,9 +58,18 @@ interface lifecycle {
         /// takes what it is handed. A seed is proposed against a budget the host
         /// enforces.
         ///
-        /// No lifecycle event honors this arm. Returning it from any of the nine
-        /// handlers is the ordinary unsupported-arm dispatch fault — logged and
-        /// traced, the value discarded, the session continuing.
+        /// Honored only at `on-task-start`, where the first bound blocking hook to
+        /// return it wins and its messages are placed at the head of the task's
+        /// context — ahead of any loaded history and ahead of the task message.
+        /// The list is chronological, oldest first, which is what makes the
+        /// runtime's "drop from the front" trim well-defined. Returned from any
+        /// other lifecycle event it is a non-fatal dispatch fault (logged and
+        /// traced, never honored).
+        ///
+        /// The host measures the proposal against `task-start-event.budget-tokens`
+        /// and may commit it whole, trim its oldest messages away, summarize the
+        /// overflowing front through the compaction hook, or refuse it entirely.
+        /// A refusal never fails the task.
         seed-context(list<message>),
     }
 
@@ -79,9 +90,11 @@ interface lifecycle {
         context-id: string,
         source: string,
         input-bytes: u64,
-        /// Token ceiling a hook may propose context up to for this task. Read
+        /// Token ceiling a hook may propose context up to for this task:
+        /// `context.max_tokens` times `context.seed_budget`, rounded down. Read
         /// `0` as "the host has not computed this" and decline, never as an
-        /// unbounded budget. The host sends `0`.
+        /// unbounded budget — a capsule declaring no `context.max_tokens` sends
+        /// `0` and refuses any seed returned against it.
         budget-tokens: u64,
         /// The capsule's `context.max_tokens`, or `0` when the manifest declares
         /// none. Precomputed by the host so a hook measuring against the window
@@ -89,8 +102,11 @@ interface lifecycle {
         /// is.
         context-window: u64,
         /// Tokens already occupied by context the host loaded before this task's
-        /// first turn. The same "`0` means not computed" reading applies as for
-        /// `budget-tokens`. The host sends `0`.
+        /// first turn: the conversation history a capsule running
+        /// `lifecycle.conversation: threaded` will start from, and `0` under every
+        /// other conversation mode. The same "`0` means not computed" reading
+        /// applies as for `budget-tokens`. Without it a hook seeding into a
+        /// threaded context duplicates history it cannot otherwise see.
         prior-tokens: u64,
     }
 

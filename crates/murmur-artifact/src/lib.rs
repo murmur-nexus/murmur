@@ -57,7 +57,8 @@ pub use runtime_manifest::{
     ResourceLimits, RuntimeArtifact, RuntimeManifest, RuntimeManifestError, ScorerConfig,
     ShellCapabilities, StagedRuntimeGrant, StateCapabilities, TaskAcceptance, TaskIoCapabilities,
     TraceConfig, BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES,
-    DEFAULT_PEER_HANDLE_TTL_SECS, DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
+    DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN,
+    DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
     PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};

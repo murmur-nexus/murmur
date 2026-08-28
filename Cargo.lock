@@ -1731,6 +1731,7 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
+ "wat",
  "zip",
 ]
 

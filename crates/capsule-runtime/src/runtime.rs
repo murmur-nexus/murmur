@@ -45,8 +45,8 @@ use crate::{
     containment::{achieved_containment_class, check_containment_floor},
     errors::RuntimeError,
     hooks::{
-        dispatch_stage, HookEnvVars, HookEvent, HookRuntime, SessionContextData, ShellDispatchInfo,
-        TaskReopen,
+        dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, SessionContextData,
+        ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
     inference_import::HookInferenceCtx,
@@ -125,6 +125,9 @@ fn resolve_versioned_iface<T>(
 /// exhausted reopen as a failed task. In that case the terminal record's `exit_status` is
 /// `"reopen_budget_exhausted"`; otherwise it is the last attempt's `"ok"`/`"failed"`.
 ///
+/// `seed` is whatever the task's single `on-task-start` dispatch proposed, handed to every
+/// attempt so a reopened task starts from the same context as its first run.
+///
 /// `agent_task_id` is what [`agent::run_agent_loop`] receives (governs A2A SSE emission);
 /// `trace_task_id` is the id used for the `task_start`/`task_reopened`/`task_end` records
 /// and the `on-task-end` hook event. The two coincide on the A2A path and differ on the
@@ -148,6 +151,7 @@ async fn run_task_with_reopens(
     mode: ConversationMode,
     context_id: Option<String>,
     trace_task_id: &str,
+    seed: Option<HookSeed>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let task_md_path = accessible_workdir.join("task.md");
     // Original task content, captured once before any feedback is appended, so repeated
@@ -193,6 +197,10 @@ async fn run_task_with_reopens(
             capsule_version,
             mode.clone(),
             context_id.clone(),
+            // Cloned per attempt rather than moved into the first: a reopened task re-runs
+            // the same task, so every attempt must start from the same context the hook
+            // proposed. The hook is dispatched once, at task start, and is not asked again.
+            seed.clone(),
         )
         .await;
 
@@ -923,6 +931,14 @@ pub fn launch_session(
         let session_id = staged.session_id.clone();
         let accessible_workdir = staged.accessible_workdir.clone();
         let context_window = resolve_context_window(staged.context.as_ref());
+        let seed_budget = staged
+            .context
+            .as_ref()
+            .map(|c| c.seed_budget)
+            .unwrap_or(murmur_artifact::DEFAULT_SEED_BUDGET);
+        // Computed once for the whole launch: the ceiling depends only on the manifest, and
+        // every `on-task-start` in the session is measured against the same number.
+        let seed_budget_tokens = agent::seed_budget_tokens(context_window, seed_budget);
 
         let run_config = agent::AgentRunConfig {
             context_window,
@@ -941,6 +957,12 @@ pub fn launch_session(
             max_output_tokens: inference
                 .max_tokens
                 .unwrap_or(agent::DEFAULT_MAX_OUTPUT_TOKENS),
+            seed_budget,
+            seed_overflow_margin: staged
+                .context
+                .as_ref()
+                .map(|c| c.seed_overflow_margin)
+                .unwrap_or(murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN),
         };
 
         // --- Identity and HTTP server setup ---
@@ -1344,18 +1366,19 @@ pub fn launch_session(
                                             &task_id, &context_id, "task_md", bytes,
                                         )
                                         .await;
-                                    hooks
-                                        .emit(
-                                            &workdir,
-                                            HookEvent::TaskStart {
-                                                task_id: task_id.clone(),
-                                                context_id: context_id.clone(),
-                                                source: "task_md".to_string(),
-                                                input_bytes: bytes,
-                                                budget_tokens: 0,
-                                                context_window: u64::from(context_window),
-                                                prior_tokens: 0,
-                                            },
+                                    let seed = hooks
+                                        .dispatch_task_start(
+                                            task_id.clone(),
+                                            context_id.clone(),
+                                            "task_md".to_string(),
+                                            bytes,
+                                            seed_budget_tokens,
+                                            u64::from(context_window),
+                                            agent::prior_history_tokens(
+                                                &workdir,
+                                                &conversation_mode,
+                                                Some(&context_id),
+                                            ),
                                         )
                                         .await;
                                     otel.begin_session(None);
@@ -1381,6 +1404,7 @@ pub fn launch_session(
                                         conversation_mode.clone(),
                                         Some(context_id.clone()),
                                         &task_id,
+                                        seed,
                                     )
                                     .await;
                                     final_loop_result = result;
@@ -1404,18 +1428,19 @@ pub fn launch_session(
                                             &task_id, &context_id, "task_md", bytes,
                                         )
                                         .await;
-                                    hooks
-                                        .emit(
-                                            &workdir,
-                                            HookEvent::TaskStart {
-                                                task_id: task_id.clone(),
-                                                context_id: context_id.clone(),
-                                                source: "task_md".to_string(),
-                                                input_bytes: bytes,
-                                                budget_tokens: 0,
-                                                context_window: u64::from(context_window),
-                                                prior_tokens: 0,
-                                            },
+                                    let seed = hooks
+                                        .dispatch_task_start(
+                                            task_id.clone(),
+                                            context_id.clone(),
+                                            "task_md".to_string(),
+                                            bytes,
+                                            seed_budget_tokens,
+                                            u64::from(context_window),
+                                            agent::prior_history_tokens(
+                                                &workdir,
+                                                &conversation_mode,
+                                                Some(&context_id),
+                                            ),
                                         )
                                         .await;
                                     otel.begin_session(None);
@@ -1438,6 +1463,7 @@ pub fn launch_session(
                                         conversation_mode.clone(),
                                         Some(context_id.clone()),
                                         &task_id,
+                                        seed,
                                     )
                                     .await;
                                     let _ = trace.flush().await;
@@ -1503,6 +1529,10 @@ pub fn launch_session(
                                                 &capsule_version,
                                                 conversation_mode.clone(),
                                                 None,
+                                                // No task was ever put in scope on this
+                                                // path, so `on-task-start` never fired and
+                                                // there is no seed to apply.
+                                                None,
                                             )
                                             .await;
                                             break 'task_loop;
@@ -1540,18 +1570,19 @@ pub fn launch_session(
                                 incoming.message_text.len() as u64,
                             )
                             .await;
-                        hooks
-                            .emit(
-                                &workdir,
-                                HookEvent::TaskStart {
-                                    task_id: incoming.task_id.clone(),
-                                    context_id: incoming.context_id.clone(),
-                                    source: "a2a".to_string(),
-                                    input_bytes: incoming.message_text.len() as u64,
-                                    budget_tokens: 0,
-                                    context_window: u64::from(context_window),
-                                    prior_tokens: 0,
-                                },
+                        let seed = hooks
+                            .dispatch_task_start(
+                                incoming.task_id.clone(),
+                                incoming.context_id.clone(),
+                                "a2a".to_string(),
+                                incoming.message_text.len() as u64,
+                                seed_budget_tokens,
+                                u64::from(context_window),
+                                agent::prior_history_tokens(
+                                    &workdir,
+                                    &conversation_mode,
+                                    Some(&incoming.context_id),
+                                ),
                             )
                             .await;
 
@@ -1577,6 +1608,7 @@ pub fn launch_session(
                             conversation_mode.clone(),
                             Some(incoming.context_id.clone()),
                             &incoming.task_id,
+                            seed,
                         )
                         .await;
 
@@ -6867,6 +6899,8 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
+            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
         };
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
@@ -6893,6 +6927,7 @@ inference:
             ConversationMode::Stateless,
             Some("ctx_1".to_string()),
             "tsk_1",
+            None,
         )
         .await;
 
@@ -7069,6 +7104,8 @@ inference:
             compaction_system_prompt: None,
             compaction_dump_summaries: false,
             max_output_tokens: 1024,
+            seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
+            seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
         };
 
         trace
@@ -7094,6 +7131,7 @@ inference:
             ConversationMode::Stateless,
             Some("ctx_1".to_string()),
             "tsk_1",
+            None,
         )
         .await;
 
