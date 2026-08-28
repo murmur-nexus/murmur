@@ -441,21 +441,40 @@ capsule manifest. A hook without the key still links and still runs — `read-me
 | `read-messages(cursor, limit)` | One `message-page`: `messages`, `next-cursor`, `total` |
 
 `messages[0]` is the most recently appended message, and each carries the `id` its record line
-holds. `total` is the number of messages in the whole record, not in this page.
+holds.
 
 | Field | Meaning |
 |---|---|
-| `cursor` | Opaque and host-minted. `none` starts at the newest message; pass back the `next-cursor` of the page you just read. |
+| `cursor` | An opaque token. `none` starts at the newest message; pass back the `next-cursor` of the page you just read, unmodified. |
 | `next-cursor` | `none` once a page has reached the oldest message in the record, which is what ends a paging loop. |
 | `limit` | Clamped to `1..=100`, so `0` reads one message and a loop always makes progress. |
+| `total` | Parseable messages in the whole record at the moment the page was served, not in this page. |
 
 A cursor stays valid while the runtime appends to the record underneath a paging hook: it names a
 position counted from the oldest message.
 
+`total` is a snapshot, not a loop invariant. The runtime appends while a hook pages, so it grows
+from one page to the next and the page lengths of a completed walk can sum to less than the final
+`total`. Every page is a consistent snapshot anchored at the oldest message, so nothing repeats and
+nothing is skipped; `next-cursor: none` is the termination condition a loop is sized by.
+
+A message whose `role` is `"tool"` reaches a reader with its `content` replaced by a JSON object,
+because a tool result carries more than the one string `content` has room for.
+
+| Key | Value |
+|---|---|
+| `__murmur_tool_msg__` | Always `true`, and what marks the envelope |
+| `tool_call_id` | The call this result answers, or `null` |
+| `is_error` | Whether that call failed, or `null` |
+| `body` | The tool result as the runtime holds it |
+
+This is the same encoding a compaction hook receives on
+[`murmur:hook/lifecycle`'s `message`](#murmurhooklifecycle) — one encoding, in both places.
+
 | Error | Meaning |
 |---|---|
 | `not-granted` | The hook's entry does not declare `capabilities.conversation.read: true` |
-| `invalid-cursor` | A cursor the host did not mint, or one past the end of the record |
+| `invalid-cursor` | A cursor naming a position outside the record |
 | `unavailable: <reason>` | The record exists and could not be read |
 
 A record that does not exist is not an error: the read succeeds with no messages and `total: 0`.

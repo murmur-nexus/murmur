@@ -33,6 +33,10 @@ pub(crate) struct ConversationState {
     workdir: PathBuf,
     /// Context id of the task in scope. `None` before the first task of a launch.
     context_id: Mutex<Option<String>>,
+    /// The record parsed for the last read, held so a hook paging one record reads and parses it
+    /// once rather than once per page. Keyed on the record path as well as its length, because
+    /// [`Self::set_context`] moves this one state between the records of a launch.
+    cache: Mutex<crate::conversation::RecordCache>,
 }
 
 impl ConversationState {
@@ -41,6 +45,7 @@ impl ConversationState {
             root,
             workdir: workdir.to_path_buf(),
             context_id: Mutex::new(None),
+            cache: Mutex::new(crate::conversation::RecordCache::default()),
         }
     }
 
@@ -60,6 +65,8 @@ impl ConversationState {
         cursor: Option<String>,
         limit: u32,
     ) -> Result<MessagePage, String> {
+        // Cloned out from under the context lock before the cache lock is taken: the two are
+        // never held at once, so a reading hook cannot stand between a task and `set_context`.
         let context_id = self.lock().clone();
         let path = match (self.root.as_deref(), context_id.as_deref()) {
             (Some(root), Some(context_id))
@@ -69,7 +76,19 @@ impl ConversationState {
             }
             _ => None,
         };
-        crate::conversation::page(path.as_deref(), &self.workdir, cursor.as_deref(), limit)
+        crate::conversation::page(
+            &mut self.cache(),
+            path.as_deref(),
+            &self.workdir,
+            cursor.as_deref(),
+            limit,
+        )
+    }
+
+    /// Reads of the record file this state has made, for the tests that pin a paging loop's cost.
+    #[cfg(test)]
+    pub(crate) fn record_reads(&self) -> u32 {
+        self.cache().reads()
     }
 
     /// A hook that panicked mid-call must not turn every later read into a different error than
@@ -79,6 +98,12 @@ impl ConversationState {
         self.context_id
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Recovered on poison for the reason [`Self::lock`] is: a cache holds a parse of a file that
+    /// is still on disk, so the worst a panic mid-update leaves behind is a re-read.
+    fn cache(&self) -> std::sync::MutexGuard<'_, crate::conversation::RecordCache> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -378,6 +403,49 @@ mod tests {
             assert_eq!(page.next_cursor, None);
             assert_eq!(page.total, 0);
         }
+    }
+
+    /// One state serves every task of a launch, so a read after `set_context` answers about the
+    /// record that just came into scope and never about the one that left it.
+    #[test]
+    fn a_read_follows_the_context_the_state_was_moved_to() {
+        use serde_json::json;
+
+        let workdir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+
+        for (context_id, count) in [("ctx_a", 2), ("ctx_b", 3)] {
+            let dir = root.join(context_id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let raw: String = (0..count)
+                .map(|n| {
+                    format!(
+                        "{}\n",
+                        json!({"role": "user", "content": "m", "id": format!("{context_id}_{n}")})
+                    )
+                })
+                .collect();
+            std::fs::write(dir.join("conversation.jsonl"), raw).unwrap();
+        }
+
+        let state = ConversationState::new(Some(root), workdir.path());
+        state.set_context(Some("ctx_a".to_string()));
+        let first = state.read_messages(None, 10).unwrap();
+        assert_eq!(first.total, 2);
+
+        state.set_context(Some("ctx_b".to_string()));
+        let second = state.read_messages(None, 10).unwrap();
+        assert_eq!(second.total, 3);
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|m| m.id.clone().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ctx_b_2", "ctx_b_1", "ctx_b_0"],
+        );
+        assert_eq!(state.record_reads(), 2, "one read per record in scope");
     }
 
     /// A context id an A2A client could send is checked before it becomes a path: the read is

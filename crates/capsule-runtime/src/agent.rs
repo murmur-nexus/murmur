@@ -3145,9 +3145,9 @@ mod tests {
     ///
     /// Both are runtime bookkeeping — an id is a fresh uuid every time it is minted, and a
     /// uuid at the head of a cached prefix is volatile content that would defeat provider
-    /// prompt-prefix caching on every request. Reconstruction stamps a fresh id and copies
-    /// the hook's `source-id`; the payload built from the result carries neither key
-    /// anywhere in its serialized form, including the id the hook itself proposed.
+    /// prompt-prefix caching on every request. Reconstruction keeps the id and the
+    /// `source-id` the hook returned, and the payload built from those messages carries
+    /// neither key anywhere in its serialized form — including the id the hook proposed.
     #[test]
     fn message_id_and_source_id_are_stripped_from_the_driver_payload() {
         let msgs = reconstruct_hook_messages(vec![WitMessage {
