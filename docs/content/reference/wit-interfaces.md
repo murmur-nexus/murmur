@@ -456,7 +456,7 @@ position counted from the oldest message.
 `total` is a snapshot, not a loop invariant. The runtime appends while a hook pages, so it grows
 from one page to the next and the page lengths of a completed walk can sum to less than the final
 `total`. Every page is a consistent snapshot anchored at the oldest message, so nothing repeats and
-nothing is skipped; `next-cursor: none` is the termination condition a loop is sized by.
+nothing is skipped. Never size a paging loop from `total`; stop on `next-cursor: none`.
 
 A message whose `role` is `"tool"` reaches a reader with its `content` replaced by a JSON object,
 because a tool result carries more than the one string `content` has room for.

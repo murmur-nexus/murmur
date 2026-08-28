@@ -373,8 +373,8 @@ fn empty_page() -> MessagePage {
 ///
 /// `reported` is the reader's own once-only flag: the first skipped line it meets is reported
 /// naming the path and the 1-based line number, and every line after it, in this read and in the
-/// reader's later ones, is silent. A record with one truncated line is read again for every page
-/// a hook walks, and one such line is worth one log entry, not one per page.
+/// reader's later ones, is silent. One such line is worth one log entry however many times the
+/// reader goes back to the file.
 fn read_record(path: &Path, workdir: &Path, reported: &mut bool) -> Result<Vec<Value>, String> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -644,6 +644,37 @@ mod tests {
             assert_eq!(page.next_cursor, None);
             assert_eq!(page.total, 0);
         }
+    }
+
+    /// A read for a session that keeps no record leaves the cache as it found it, so a hook
+    /// dispatched between two tasks does not cost the next one its parse.
+    #[test]
+    fn a_read_with_no_record_leaves_the_cache_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/capsule");
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        record.append(&[message(&id_at(1), "user", "a")]);
+        let path = record.path();
+
+        let mut cache = RecordCache::default();
+        assert_eq!(
+            page(&mut cache, Some(&path), workdir.path(), None, 10)
+                .unwrap()
+                .total,
+            1
+        );
+        assert!(page(&mut cache, None, workdir.path(), None, 10)
+            .unwrap()
+            .messages
+            .is_empty());
+        assert_eq!(
+            page(&mut cache, Some(&path), workdir.path(), None, 10)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(cache.reads(), 1, "the parse survived the empty read");
     }
 
     /// A malformed line is skipped, reported once naming the path and its 1-based number, and
