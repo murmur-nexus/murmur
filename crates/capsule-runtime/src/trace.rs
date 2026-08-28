@@ -2732,8 +2732,7 @@ mod tests {
         assert_eq!(hook["origin"], "hook:gatekeeper");
         assert_eq!(hook["parent_id"], turn["event_id"]);
         // The hook sent a message list the runtime never minted, so the key is absent rather
-        // than empty — a hook-origin record stays byte-identical to what it was before
-        // `message_ids` existed.
+        // than empty.
         assert!(hook.get("message_ids").is_none(), "{hook}");
     }
 

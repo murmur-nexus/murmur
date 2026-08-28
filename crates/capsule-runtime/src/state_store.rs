@@ -225,19 +225,28 @@ pub(crate) fn murmur_home_dir() -> Result<PathBuf, String> {
 /// *is*, so a run must not silently continue against one an earlier umask, a restore or a stray
 /// `chmod` left group- or world-readable.
 fn create_private_dir(store: &str, path: &Path) -> Result<(), RuntimeError> {
+    ensure_private_dir(path, STATE_DIR_MODE).map_err(|message| {
+        RuntimeError::StateStoreUnavailable {
+            store: store.to_string(),
+            path: path.display().to_string(),
+            message,
+        }
+    })
+}
+
+/// Create `path` if missing and hold it at `mode`, reporting why it could not be done.
+///
+/// The one owner-only-directory helper in the runtime, shared with [`crate::conversation`]. The
+/// mode is applied whether or not this call created the directory: an earlier umask, a restore or
+/// a stray `chmod` must not leave a private directory group- or world-readable. Each caller wraps
+/// the reason in its own error type.
+pub(crate) fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
-    let unavailable = |message: String| RuntimeError::StateStoreUnavailable {
-        store: store.to_string(),
-        path: path.display().to_string(),
-        message,
-    };
-
     std::fs::create_dir_all(path)
-        .map_err(|err| unavailable(format!("failed to create the directory: {err}")))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STATE_DIR_MODE))
-        .map_err(|err| unavailable(format!("failed to set mode {STATE_DIR_MODE:04o}: {err}")))?;
-    Ok(())
+        .map_err(|err| format!("failed to create the directory: {err}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(|err| format!("failed to set mode {mode:04o}: {err}"))
 }
 
 #[cfg(test)]

@@ -196,7 +196,7 @@ directory is reported once to stderr and to `logs/bootstrap.log`, and the task r
 
 ### Reading it from an artifact
 
-`~/.murmur/conversations/` is never preopened, for any role, under any grant. The only way in is
+No artifact ever gets a filesystem path into `~/.murmur/conversations/`. The only way in is
 [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread), granted per hook with
 [`capabilities.conversation.read: true`](manifest.md#hook-capabilities). The conversation root and
 each directory under it are created mode `0700`.

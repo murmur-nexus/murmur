@@ -192,6 +192,30 @@ pub fn create_native_tool_zip(
     artifact_path
 }
 
+/// Point `$HOME` at a scratch directory that lives as long as the test process.
+///
+/// Staging in-process means the runtime resolves `$HOME` from the test binary's own environment,
+/// and an `http` capsule keeps a conversation record under it — so without this a suite that
+/// stages a session writes into the developer's home. Set once, never per test: `set_var` mutates
+/// process-global state that the launch reads on another thread, so a per-test value would race
+/// with every sibling test in the same binary. No caller needs `$HOME` to be its own temp home:
+/// the artifact store is passed to `stage_session` explicitly.
+fn redirect_home_away_from_the_developers() {
+    static SCRATCH_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let home = SCRATCH_HOME.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("a scratch home");
+        let path = dir.path().to_path_buf();
+        // Held for the process: `$HOME` must not dangle while a later test is still launching.
+        std::mem::forget(dir);
+        std::env::set_var("HOME", &path);
+        path
+    });
+    debug_assert_eq!(
+        std::env::var_os("HOME").map(PathBuf::from).as_ref(),
+        Some(home)
+    );
+}
+
 pub fn stage_agent_session(
     home: &TempDir,
     project_dir: &Path,
@@ -199,10 +223,7 @@ pub fn stage_agent_session(
 ) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
-    // Staging in-process means the runtime resolves `$HOME` from the test binary's own
-    // environment, and an `http` capsule keeps a conversation record under it. Point it at the
-    // test's home so a suite that stages a session writes nothing into the developer's.
-    std::env::set_var("HOME", home.path());
+    redirect_home_away_from_the_developers();
 
     let mut allowlisted_tools = HashSet::new();
     let mut requested_artifacts = Vec::new();

@@ -279,9 +279,9 @@ Rules:
   `runtime: driver` or `runtime: skill` entry, or in the capsule-wide
   [`capabilities`](#field-capabilities) block, fails with `E-MAN-003` — nothing there could
   enforce it.
-- **`conversation.read` grants a host import, not a directory.** Nothing is ever preopened under
-  `~/.murmur/conversations/`, so a granted hook reads the record through the interface and an
-  ungranted one gets `not-granted` from the call rather than failing to load. Declaring the key on
+- **`conversation.read` grants a host import, not a directory.** No artifact ever gets a
+  filesystem path into `~/.murmur/conversations/`, so a granted hook reads the record through the
+  interface and an ungranted one gets `not-granted` from the call rather than failing to load. Declaring the key on
   any role other than `runtime: hook` fails with `E-MAN-003`; declaring it in the capsule-wide
   [`capabilities`](#field-capabilities) block is inert and prints
   [`W-SEC-016`](diagnostics.md#w-sec-016).

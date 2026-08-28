@@ -2136,6 +2136,19 @@ pub fn warn_on_userns_restriction_disabled_host_wide(grant: Option<UsernsGrant>)
 ///
 /// Same seam as [`warn_on_workdir_exec`]: fires at staging, before any session workdir exists, so
 /// it goes to stderr only and not to `logs/bootstrap.log`.
+fn warn_on_inert_capsule_wide_state(state_declared: bool) {
+    if !state_declared {
+        return;
+    }
+    let link = security_warning_link(W_SEC_014);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_014}]: capsule-wide capabilities.state is declared, but \
+         a durable state store is granted per artifact — nothing reads a top-level declaration, \
+         so no store was created and no 'state' preopen exists. Move the block onto the tool, \
+         driver or hook entry that needs it ({link})"
+    );
+}
+
 /// Warns (non-fatal, once per session) when the capsule's own top-level
 /// `capabilities.conversation` is declared, because that declaration reaches nothing.
 ///
@@ -2149,20 +2162,10 @@ fn warn_on_inert_capsule_wide_conversation(conversation_declared: bool) {
     }
     let link = security_warning_link(W_SEC_016);
     eprintln!(
-        "[capsule-runtime] warning[{W_SEC_016}]: capsule-wide capabilities.conversation is          declared, but the murmur:conversation/read grant is per artifact — nothing reads a          top-level declaration, so no artifact can read the conversation record. Move the block          onto the hook entry that needs it ({link})"
-    );
-}
-
-fn warn_on_inert_capsule_wide_state(state_declared: bool) {
-    if !state_declared {
-        return;
-    }
-    let link = security_warning_link(W_SEC_014);
-    eprintln!(
-        "[capsule-runtime] warning[{W_SEC_014}]: capsule-wide capabilities.state is declared, but \
-         a durable state store is granted per artifact — nothing reads a top-level declaration, \
-         so no store was created and no 'state' preopen exists. Move the block onto the tool, \
-         driver or hook entry that needs it ({link})"
+        "[capsule-runtime] warning[{W_SEC_016}]: capsule-wide capabilities.conversation is \
+         declared, but the murmur:conversation/read grant is per artifact — nothing reads a \
+         top-level declaration, so no artifact can read the conversation record. Move the block \
+         onto the hook entry that needs it ({link})"
     );
 }
 
@@ -4429,7 +4432,8 @@ fn resolve_conversation_root(
         Ok(root) => Some(root),
         Err(reason) => {
             let message = format!(
-                "[conversation] the record for '{record}' could not be located ({reason}); this                  session runs unrecorded"
+                "[conversation] the record for '{record}' could not be located ({reason}); \
+                 this session runs unrecorded"
             );
             eprintln!("[capsule-runtime] {message}");
             agent::append_bootstrap_log(workdir, &message);

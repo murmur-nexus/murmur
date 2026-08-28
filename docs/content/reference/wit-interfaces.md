@@ -427,9 +427,9 @@ may be after the task has left scope. Bind a hook that reads the task as `blocki
 
 A runtime-provided import available to any hook component that declares it. It hands a hook the
 capsule's [durable conversation record](workdir.md#the-conversation-record) — every message the
-runtime put in front of the model, newest first, paged — with no filesystem grant and no other
-artifact involved. Nothing is preopened under `~/.murmur/conversations/`; this interface is the
-only way in. The runtime is the only writer, and there is no write function.
+runtime put in front of the model, newest first, paged — without a `filesystem` grant. No artifact
+gets a filesystem path into `~/.murmur/conversations/`; this interface is the only way in. The
+runtime is the only writer, and there is no write function.
 
 Reading is granted per hook with
 [`capabilities.conversation.read: true`](manifest.md#hook-capabilities) on that hook's entry in the

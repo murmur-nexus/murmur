@@ -220,7 +220,8 @@ impl ConversationRecord {
             }
         }
         for path in chain.into_iter().rev() {
-            create_private_dir(path)?;
+            crate::state_store::ensure_private_dir(path, RECORD_DIR_MODE)
+                .map_err(|reason| format!("{}: {reason}", path.display()))?;
         }
 
         std::fs::OpenOptions::new()
@@ -342,18 +343,6 @@ fn encode_cursor(position: usize) -> String {
 
 fn decode_cursor(cursor: &str) -> Option<usize> {
     cursor.strip_prefix(CURSOR_PREFIX)?.parse().ok()
-}
-
-/// Create `path` if missing and hold it at [`RECORD_DIR_MODE`], for the same reason
-/// [`crate::state_store`] re-asserts its mode: `0700` is what a record directory *is*, so a run
-/// must not continue against one a umask or a restore left readable.
-fn create_private_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(path)
-        .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(RECORD_DIR_MODE))
-        .map_err(|err| format!("failed to set mode on {}: {err}", path.display()))
 }
 
 /// Both places an operator looks for what the runtime did with a record. Never fatal.
