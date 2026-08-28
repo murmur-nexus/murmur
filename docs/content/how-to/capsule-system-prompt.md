@@ -238,7 +238,7 @@ mur trace show
 --8<-- "includes/mur-trace-explore.md"
 
 !!! note "The prompt text is recorded only when you ask for it"
-    `system_prompt_source` and `system_prompt_sha256` are always written. The prompt itself is written to `session_start` as `system_prompt` only when the manifest sets `trace.include_tool_output: true` — the same opt-in that captures tool output text. Without it the hash still tells you whether two sessions ran with the same prompt. See [Session trace schema](../reference/observability-schemas.md).
+    `system_prompt_source` and `system_prompt_sha256` are always written, and the hash alone tells you whether two sessions ran with the same prompt. To read the prompt itself, set `trace.capture: content` in the manifest and `cat <session_id>/blobs/<system_prompt_sha256>`. See [Session trace schema](../reference/observability-schemas.md#trace-blobs).
 
 If the agent is ignoring your constraints, add a more explicit rule to the system prompt and re-run.
 
@@ -301,4 +301,4 @@ On a capsule with no `inference:` block there is no prompt to override, and the 
 | No field set | No `system` parameter is sent; model receives no system prompt |
 | `mur run --system-prompt "text"` | Replaces whichever field the manifest set, for that run only; value is trimmed; empty value clears the prompt; `murmur.yaml` untouched |
 | `mur run --system-prompt` on a manifest with no `inference:` | CLI error `error[E-IO-003]` — nothing is staged |
-| `session_start.system_prompt_source` in `trace.jsonl` | `"manifest"` \| `"cli"` \| `"none"`, alongside `system_prompt_sha256`; the prompt text itself only when `trace.include_tool_output: true` |
+| `session_start.system_prompt_source` in `trace.jsonl` | `"manifest"` \| `"cli"` \| `"none"`, alongside `system_prompt_sha256`; the prompt text itself at `blobs/<system_prompt_sha256>` only under `trace.capture: content` |

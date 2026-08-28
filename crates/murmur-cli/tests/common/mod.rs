@@ -265,7 +265,9 @@ pub fn stage_agent_session(
             dataset_id: None,
             lifecycle: None,
             lifecycle_override: None,
-            trace: None,
+            // Carried through the same way `mur run` carries it, so a test manifest's `trace:`
+            // block reaches the session's writer instead of being silently dropped.
+            trace: runtime_manifest.trace,
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,

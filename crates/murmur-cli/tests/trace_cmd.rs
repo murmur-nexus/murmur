@@ -1930,7 +1930,7 @@ const FIXTURE_OLD_NO_INPUT: &str = concat!(
     "\"total_tool_calls\":1,\"total_shell_calls\":0,\"duration_ms\":350,\"exit_status\":\"ok\"}\n"
 );
 
-// Fixture: trace with both input and output fields (include_tool_output = true).
+// Fixture: trace with both input and output fields, as `trace.capture: content` writes them.
 const FIXTURE_WITH_OUTPUT: &str = concat!(
     "{\"event_type\":\"session_start\",\"session_id\":\"ses_3333333333334333833300000000003c\",\"timestamp\":1000,",
     "\"capsule_name\":\"output-test\",\"capsule_version\":\"1.0.0\",\"model\":\"claude-test\",",
@@ -2017,7 +2017,7 @@ fn old_trace_without_input_field_still_parses() {
 
 #[test]
 fn show_trace_with_output_field_parses_cleanly() {
-    // Traces that include the output field (include_tool_output = true) must parse cleanly.
+    // Traces that include the output field, as `trace.capture: content` writes them, must parse cleanly.
     let tmp = TempDir::new().unwrap();
     let path = write_fixture(tmp.path(), "with-output.jsonl", FIXTURE_WITH_OUTPUT);
 

@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use crate::manifest_path::MANIFEST_FILENAME;
+use crate::{
+    manifest_path::MANIFEST_FILENAME,
+    trace_capture::{resolve_trace_capture, TraceCapture},
+};
 
 // ── Lifecycle types ───────────────────────────────────────────────────────────
 
@@ -863,11 +866,12 @@ pub struct ObservabilityConfig {
     pub eval: Option<EvalConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceConfig {
-    /// When true, the raw tool output is captured in each tool_call trace event.
-    /// Defaults to false because tool output can be large (file diffs, shell dumps).
-    pub include_tool_output: bool,
+    /// How much of each turn's driver request this session's trace keeps — resolved from
+    /// `trace.capture`, or from the retired `trace.include_tool_output` alias, by
+    /// [`crate::trace_capture::resolve_trace_capture`].
+    pub capture: TraceCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1284,6 +1288,8 @@ pub enum RuntimeManifestError {
         reference: String,
         variable: String,
     },
+    #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
+    InvalidTraceConfig { field: String, message: String },
     #[error("failed to read {} at {path}: {source}", MANIFEST_FILENAME)]
     Io {
         path: String,
@@ -1404,6 +1410,13 @@ struct RawObservabilityConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawTraceConfig {
+    /// Untyped so an unparseable mode reaches [`resolve_trace_capture`] and is reported as a
+    /// [`RuntimeManifestError::InvalidTraceConfig`] naming the field and the accepted values,
+    /// rather than as a serde message about an unknown variant.
+    #[serde(default)]
+    capture: Option<String>,
+    /// The retired alias. `None` means the key was absent, which is what separates a manifest
+    /// that opted out from one that never mentioned it — see [`resolve_trace_capture`].
     #[serde(default)]
     include_tool_output: Option<bool>,
 }
@@ -1993,9 +2006,13 @@ impl RuntimeManifest {
         }
         let context = parse_context(raw.context)?;
         let observability = parse_observability(raw.observability);
-        let trace = raw.trace.map(|raw_trace| TraceConfig {
-            include_tool_output: raw_trace.include_tool_output.unwrap_or(false),
-        });
+        let trace = raw
+            .trace
+            .map(|raw_trace| {
+                resolve_trace_capture(raw_trace.capture.as_deref(), raw_trace.include_tool_output)
+                    .map(|capture| TraceConfig { capture })
+            })
+            .transpose()?;
         let network = raw.network.map(|n| NetworkConfig {
             internal_port: n.internal_port,
         });
@@ -3184,6 +3201,86 @@ fn is_valid_env_variable(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace_capture::TRACE_CAPTURE_ACCEPTED_VALUES;
+
+    fn manifest_with_trace(block: &str) -> String {
+        format!("name: cap\nversion: 0.0.1\ntrace:\n{block}")
+    }
+
+    /// No `trace:` block at all leaves the config absent; the runtime substitutes
+    /// [`TraceCapture::default`] rather than the manifest carrying a synthesized one.
+    #[test]
+    fn absent_trace_block_stays_absent_and_defaults_to_meta() {
+        let manifest = RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\n").unwrap();
+        assert_eq!(manifest.trace, None);
+        assert_eq!(TraceCapture::default(), TraceCapture::Meta);
+    }
+
+    #[test]
+    fn each_capture_mode_parses_from_the_trace_block() {
+        for (yaml, expected) in [
+            ("none", TraceCapture::None),
+            ("meta", TraceCapture::Meta),
+            ("content", TraceCapture::Content),
+        ] {
+            let manifest = RuntimeManifest::from_yaml_str(&manifest_with_trace(&format!(
+                "  capture: {yaml}\n"
+            )))
+            .unwrap_or_else(|e| panic!("'{yaml}' must parse: {e}"));
+            assert_eq!(manifest.trace, Some(TraceConfig { capture: expected }));
+        }
+    }
+
+    /// The retired boolean keeps working, mapping to exactly what each value did before
+    /// `trace.capture` existed.
+    #[test]
+    fn include_tool_output_still_resolves_to_content_and_meta() {
+        let opted_in =
+            RuntimeManifest::from_yaml_str(&manifest_with_trace("  include_tool_output: true\n"))
+                .unwrap();
+        assert_eq!(
+            opted_in.trace,
+            Some(TraceConfig {
+                capture: TraceCapture::Content
+            })
+        );
+
+        let opted_out =
+            RuntimeManifest::from_yaml_str(&manifest_with_trace("  include_tool_output: false\n"))
+                .unwrap();
+        assert_eq!(
+            opted_out.trace,
+            Some(TraceConfig {
+                capture: TraceCapture::Meta
+            })
+        );
+    }
+
+    #[test]
+    fn setting_both_capture_keys_is_refused_naming_both() {
+        let err = RuntimeManifest::from_yaml_str(&manifest_with_trace(
+            "  capture: content\n  include_tool_output: true\n",
+        ))
+        .expect_err("both keys must be refused even when they agree");
+        assert!(matches!(
+            err,
+            RuntimeManifestError::InvalidTraceConfig { .. }
+        ));
+        let rendered = err.to_string();
+        assert!(rendered.contains("trace.capture"), "{rendered}");
+        assert!(rendered.contains("trace.include_tool_output"), "{rendered}");
+    }
+
+    #[test]
+    fn unparseable_capture_value_names_the_field_and_accepted_values() {
+        let err = RuntimeManifest::from_yaml_str(&manifest_with_trace("  capture: verbose\n"))
+            .expect_err("'verbose' is not a capture mode");
+        let rendered = err.to_string();
+        assert!(rendered.contains("trace.capture"), "{rendered}");
+        for accepted in TRACE_CAPTURE_ACCEPTED_VALUES {
+            assert!(rendered.contains(accepted), "{rendered}");
+        }
+    }
 
     #[test]
     fn resources_block_is_optional_and_absent_stays_absent() {

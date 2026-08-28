@@ -94,7 +94,6 @@ extra:
     murmur_hook_eval: "1.0.0"
     murmur_hook_grafana: "1.0.0"
     murmur_hook_debug: "1.0.0"
-    murmur_tool_create: "1.0.0"
     murmur_tool_git: "1.0.0"
     murmur_tool_editor: "1.0.0"
     murmur_tool_request_input: "1.0.0"

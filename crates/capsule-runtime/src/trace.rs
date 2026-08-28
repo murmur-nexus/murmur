@@ -3,7 +3,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use murmur_artifact::ContainmentClass;
+use murmur_artifact::{ContainmentClass, TraceCapture};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
 };
 
-use crate::{agent::DriverUsage, containment::ScopeReport};
+use crate::{agent::DriverUsage, containment::ScopeReport, trace_blobs::BlobStore};
 
 pub(crate) struct TraceWriter {
     writer: BufWriter<File>,
@@ -26,7 +26,13 @@ pub(crate) struct TraceWriter {
     /// off this report rather than passed in beside it, so a trace cannot claim one containment
     /// class at the top level and another inside the report.
     effective_grants: ScopeReport,
-    include_tool_output: bool,
+    /// How much of each turn's driver request this trace keeps — see [`TraceCapture`]. Decides
+    /// whether an `inference` event carries content hashes at all, whether the bodies behind
+    /// them reach [`Self::blobs`], and whether `tool_call.output` is written.
+    capture: TraceCapture,
+    /// The content-addressed bodies this session stored, at `<workdir>/blobs/<sha256>`. Only
+    /// written to under [`TraceCapture::Content`]; the directory is created on the first blob.
+    blobs: BlobStore,
     /// Where the effective system prompt came from: `"manifest"`, `"cli"` or `"none"`. Derived
     /// once in [`TraceWriter::open`] from the resolved prompt and the override flag, then repeated
     /// on every `session_start` the same way `model` is — the prompt cannot change between the
@@ -36,10 +42,6 @@ pub(crate) struct TraceWriter {
     /// effect. Always written to `session_start` (as `null` when absent) so a trace records *that*
     /// a prompt was in effect and which one, even when the text itself is withheld.
     system_prompt_sha256: Option<String>,
-    /// The resolved system prompt verbatim — populated only when the manifest opted in via
-    /// `trace.include_tool_output`, on the same terms as tool output text. `None` otherwise, which
-    /// omits the field from `session_start` entirely.
-    system_prompt: Option<String>,
     session_start_time: Instant,
     /// The session node of the event tree: the `event_id` `session_start` carries, and the
     /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
@@ -205,12 +207,11 @@ struct SessionStartEvent {
     /// returned it, before the `[Capsule]` identity block is prepended — or `null` when no prompt
     /// was in effect. Always written, so two sessions can be compared for prompt equality without
     /// either trace having to carry the prompt itself.
+    ///
+    /// Deliberately not the same value as `inference.system_sha`, which covers the augmented
+    /// prompt that actually went on the wire: this one names the prompt the operator wrote.
+    /// Under `trace.capture: content` those resolved bytes are also the blob this hash names.
     system_prompt_sha256: Option<String>,
-    /// The resolved prompt verbatim. Written only when the manifest set
-    /// `trace.include_tool_output: true`; omitted otherwise, since a system prompt is capsule
-    /// content on the same footing as tool output and is not captured by default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system_prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -256,6 +257,88 @@ struct InferenceEvent {
     /// the `process` transport, neither of which sends a message list the runtime minted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     message_ids: Vec<String>,
+    /// SHA-256 (lowercase hex) of the UTF-8 bytes of this request's `system` string — the
+    /// augmented prompt with the `[Capsule]` block already in it.
+    ///
+    /// These are the bytes Murmur **sent**, not what the model **saw**: provider-side injection,
+    /// tokenizer differences and safety layers all happen past the wire and are invisible to the
+    /// runtime. Absent under `trace.capture: none`, and for a record the runtime did not build
+    /// the payload for — a hook's `run-inference`, and the `process` transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_sha: Option<String>,
+    /// SHA-256 (lowercase hex) of this request's serialized `tools` array. The bytes Murmur
+    /// sent, on the same terms as [`Self::system_sha`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools_sha: Option<String>,
+    /// SHA-256 (lowercase hex) of the raw driver response body, as the loop read it before
+    /// parsing. What the driver returned to Murmur, byte for byte.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_sha: Option<String>,
+    /// SHA-256 (lowercase hex) of each message this request embedded, in send order — one entry
+    /// per `message_ids` entry, over the same messages after the runtime's identity keys are
+    /// stripped. The bytes Murmur sent, on the same terms as [`Self::system_sha`].
+    ///
+    /// Not redundant with `message_ids`: an id names an entity and is freshly minted every run,
+    /// so comparing two runs' id arrays only says every id differs. Comparing these says where
+    /// the two prompts stopped agreeing — the divergence index is the first unequal position.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    message_shas: Vec<String>,
+}
+
+/// The bodies one driver request put on the wire, split into the pieces an `inference` event
+/// hashes.
+///
+/// Built from the payload [`crate::agent::build_driver_payload`] produced and the raw response
+/// string the driver returned, so what the trace names and what the driver received cannot
+/// drift: there is no second serialization for them to drift apart in.
+///
+/// Every piece is the bytes Murmur **sent** (or, for the response, was handed back), never what
+/// the model saw.
+pub(crate) struct WireCapture {
+    /// The payload's `system` string value as UTF-8 text — the augmented prompt, `[Capsule]`
+    /// block included. Stored as text so its blob `cat`s as a readable prompt.
+    system: Vec<u8>,
+    /// The payload's `tools` array, serialized.
+    tools: Vec<u8>,
+    /// Each element of the payload's `messages` array, serialized, in send order. That array is
+    /// the `wire_messages` slice after `strip_message_identity`, so no message identity key can
+    /// reach a hash or a blob.
+    messages: Vec<Vec<u8>>,
+    /// The raw driver response body, exactly as the loop read it.
+    response: Vec<u8>,
+}
+
+impl WireCapture {
+    /// Split a built driver payload and its raw response into the four bodies the trace hashes.
+    ///
+    /// `payload` must be the value that was serialized and handed to the driver; taking the
+    /// pieces out of it, rather than rebuilding them from the loop's own state, is what makes a
+    /// blob byte-identical to the substring of the request it came from.
+    pub(crate) fn from_driver_payload(payload: &Value, response: &str) -> Self {
+        Self {
+            system: payload
+                .get("system")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec(),
+            tools: payload
+                .get("tools")
+                .map(|tools| serde_json::to_vec(tools).unwrap_or_default())
+                .unwrap_or_default(),
+            messages: payload
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .map(|message| serde_json::to_vec(message).unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            response: response.as_bytes().to_vec(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -632,7 +715,7 @@ impl TraceWriter {
         model: String,
         capabilities: Vec<String>,
         effective_grants: ScopeReport,
-        include_tool_output: bool,
+        capture: TraceCapture,
         system_prompt: Option<String>,
         system_prompt_overridden: bool,
     ) -> std::io::Result<Self> {
@@ -651,6 +734,17 @@ impl TraceWriter {
         let system_prompt_sha256 = system_prompt
             .as_ref()
             .map(|prompt| murmur_artifact::sha256_hex(prompt.as_bytes()));
+        let blobs = BlobStore::new(workdir);
+        // The prompt the operator wrote, kept under the hash `session_start` already carried.
+        // Written here rather than at `session_start` because a session writes that frame once
+        // per task and the blob is the same one every time.
+        if let (true, Some(prompt), Some(sha)) = (
+            capture.captures_content(),
+            system_prompt.as_ref(),
+            system_prompt_sha256.as_deref(),
+        ) {
+            blobs.put(sha, prompt.as_bytes()).await?;
+        }
         Ok(Self {
             writer: BufWriter::new(file),
             session_id,
@@ -659,10 +753,10 @@ impl TraceWriter {
             model,
             capabilities,
             effective_grants,
-            include_tool_output,
+            capture,
+            blobs,
             system_prompt_source,
             system_prompt_sha256,
-            system_prompt: include_tool_output.then_some(system_prompt).flatten(),
             session_start_time: Instant::now(),
             session_event_id: new_event_id(),
             session_started: false,
@@ -689,6 +783,13 @@ impl TraceWriter {
     /// against the same node.
     pub(crate) fn session_event_id(&self) -> &str {
         &self.session_event_id
+    }
+
+    /// Whether this session's `inference` records carry content hashes — everything but
+    /// `trace.capture: none`. The agent loop asks before splitting a payload into a
+    /// [`WireCapture`], so `none` costs no serialization at all.
+    pub(crate) fn captures_wire(&self) -> bool {
+        self.capture.captures_hashes()
     }
 
     /// Parent for a launch-scoped event: the session node, or `None` on a writer that has not
@@ -736,7 +837,6 @@ impl TraceWriter {
             effective_grants: self.effective_grants.clone(),
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
-            system_prompt: self.system_prompt.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -757,6 +857,7 @@ impl TraceWriter {
         origin: Option<&InferenceOrigin>,
         usage: Option<&DriverUsage>,
         message_ids: Vec<String>,
+        wire: Option<&WireCapture>,
     ) -> std::io::Result<()> {
         let event_id = new_event_id();
         // The agent loop's own inference *is* the turn node — there is no separate turn line —
@@ -769,6 +870,11 @@ impl TraceWriter {
         } else {
             self.turn_parent()
         };
+        let (system_sha, tools_sha, response_sha, message_shas) =
+            match wire.filter(|_| self.capture.captures_hashes()) {
+                Some(wire) => self.record_wire(wire).await?,
+                None => (None, None, None, Vec::new()),
+            };
         let event = InferenceEvent {
             event_type: "inference",
             event_id,
@@ -788,6 +894,10 @@ impl TraceWriter {
             origin: origin.map(|o| o.source.clone()),
             model: origin.map(|o| o.model.clone()),
             message_ids,
+            system_sha,
+            tools_sha,
+            response_sha,
+            message_shas,
         };
         self.write_event(&event).await?;
         self.total_turns = self.total_turns.saturating_add(1);
@@ -797,6 +907,45 @@ impl TraceWriter {
         self.task_input_tokens = self.task_input_tokens.saturating_add(input_tokens);
         self.task_output_tokens = self.task_output_tokens.saturating_add(output_tokens);
         Ok(())
+    }
+
+    /// Hash the four bodies of one request and, under [`TraceCapture::Content`], store each
+    /// behind its hash.
+    ///
+    /// The hash is computed in every capture mode that reaches here; only the blob write is
+    /// gated, so `meta` and `content` name the same bytes and differ solely in whether those
+    /// bytes are also on disk.
+    async fn record_wire(
+        &mut self,
+        wire: &WireCapture,
+    ) -> std::io::Result<(Option<String>, Option<String>, Option<String>, Vec<String>)> {
+        let system_sha = murmur_artifact::sha256_hex(&wire.system);
+        let tools_sha = murmur_artifact::sha256_hex(&wire.tools);
+        let response_sha = murmur_artifact::sha256_hex(&wire.response);
+        let message_shas: Vec<String> = wire
+            .messages
+            .iter()
+            .map(|message| murmur_artifact::sha256_hex(message))
+            .collect();
+
+        if self.capture.captures_content() {
+            // Verbatim, unredacted. `write_tool_call` redacts peer handles out of its own summary
+            // fields; a blob is not a summary, and redacting one would make its hash name bytes
+            // no file holds — destroying the only property this store exists to provide.
+            self.blobs.put(&system_sha, &wire.system).await?;
+            self.blobs.put(&tools_sha, &wire.tools).await?;
+            self.blobs.put(&response_sha, &wire.response).await?;
+            for (sha, body) in message_shas.iter().zip(&wire.messages) {
+                self.blobs.put(sha, body).await?;
+            }
+        }
+
+        Ok((
+            Some(system_sha),
+            Some(tools_sha),
+            Some(response_sha),
+            message_shas,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -834,7 +983,8 @@ impl TraceWriter {
             input,
             input_bytes,
             output: self
-                .include_tool_output
+                .capture
+                .captures_content()
                 .then(|| crate::peer_handoff::redact_handle_tokens(output).into_owned()),
             output_bytes,
             duration_ms,
@@ -1434,7 +1584,7 @@ mod tests {
     use super::*;
     use crate::{
         containment::scope_report_for_tier, sandbox::EnforcementTier, sealed::UsernsGrant,
-        types::CapabilityPolicy,
+        trace_blobs::BLOB_DIR_NAME, types::CapabilityPolicy,
     };
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
@@ -1463,19 +1613,16 @@ mod tests {
     }
 
     async fn make_writer(dir: &std::path::Path) -> TraceWriter {
-        make_writer_with_opts(dir, false).await
+        make_writer_with_opts(dir, TraceCapture::Meta).await
     }
 
-    async fn make_writer_with_opts(
-        dir: &std::path::Path,
-        include_tool_output: bool,
-    ) -> TraceWriter {
-        make_writer_with_prompt(dir, include_tool_output, None, false).await
+    async fn make_writer_with_opts(dir: &std::path::Path, capture: TraceCapture) -> TraceWriter {
+        make_writer_with_prompt(dir, capture, None, false).await
     }
 
     async fn make_writer_with_prompt(
         dir: &std::path::Path,
-        include_tool_output: bool,
+        capture: TraceCapture,
         system_prompt: Option<&str>,
         system_prompt_overridden: bool,
     ) -> TraceWriter {
@@ -1491,7 +1638,7 @@ mod tests {
                 EnforcementTier::EnvironmentOnly,
                 false,
             ),
-            include_tool_output,
+            capture,
             system_prompt.map(str::to_string),
             system_prompt_overridden,
         )
@@ -1551,7 +1698,8 @@ mod tests {
             (None, true, "cli", None),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let mut w = make_writer_with_prompt(dir.path(), false, prompt, overridden).await;
+            let mut w =
+                make_writer_with_prompt(dir.path(), TraceCapture::Meta, prompt, overridden).await;
             w.write_session_start(1, Vec::new()).await.unwrap();
             w.flush().await.unwrap();
 
@@ -1568,53 +1716,69 @@ mod tests {
         }
     }
 
-    /// The prompt text itself rides on `trace.include_tool_output`, the same opt-in that governs
-    /// tool output: withheld by default, verbatim when asked for. The source and hash are written
-    /// either way, so a default trace still records that a prompt was in effect.
+    /// `session_start` never carries the prompt text. The hash is written in every capture
+    /// mode; under `content` the bytes behind it are a blob named by that same hash, which is
+    /// how a reader gets from the record to the prompt.
     #[tokio::test]
-    async fn session_start_writes_verbatim_system_prompt_only_when_tool_output_is_included() {
+    async fn session_start_records_the_prompt_by_hash_and_stores_it_only_under_content() {
+        let sha = murmur_artifact::sha256_hex(b"Be terse.");
+
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer_with_prompt(dir.path(), false, Some("Be terse."), false).await;
+        let mut w =
+            make_writer_with_prompt(dir.path(), TraceCapture::Meta, Some("Be terse."), false).await;
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.flush().await.unwrap();
 
         let e = &read_events(dir.path())[0];
         assert!(
             e.get("system_prompt").is_none(),
-            "prompt text must be omitted without the opt-in, got {e}"
+            "the verbatim prompt is not a session_start field, got {e}"
         );
-        assert_eq!(
-            e["system_prompt_sha256"],
-            murmur_artifact::sha256_hex(b"Be terse.")
+        assert_eq!(e["system_prompt_sha256"], sha.as_str());
+        assert!(
+            !dir.path().join(BLOB_DIR_NAME).exists(),
+            "meta stores no bodies"
         );
 
         let opted_in = tempfile::tempdir().unwrap();
-        let mut w = make_writer_with_prompt(opted_in.path(), true, Some("Be terse."), false).await;
+        let mut w = make_writer_with_prompt(
+            opted_in.path(),
+            TraceCapture::Content,
+            Some("Be terse."),
+            false,
+        )
+        .await;
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.flush().await.unwrap();
 
-        assert_eq!(
-            read_events(opted_in.path())[0]["system_prompt"],
-            "Be terse."
-        );
+        let event = &read_events(opted_in.path())[0];
+        assert!(event.get("system_prompt").is_none());
+        assert_eq!(event["system_prompt_sha256"], sha.as_str());
+        let blob = opted_in.path().join(BLOB_DIR_NAME).join(&sha);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"Be terse.");
     }
 
-    /// Opting in cannot conjure a prompt that was never in effect.
+    /// Opting in cannot conjure a prompt that was never in effect — and a session with no
+    /// prompt and nothing else to store leaves no blob directory at all.
     #[tokio::test]
-    async fn session_start_omits_verbatim_system_prompt_when_there_is_none() {
+    async fn content_capture_stores_no_prompt_blob_when_there_is_no_prompt() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer_with_prompt(dir.path(), true, None, false).await;
+        let mut w = make_writer_with_prompt(dir.path(), TraceCapture::Content, None, false).await;
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.flush().await.unwrap();
 
-        assert!(read_events(dir.path())[0].get("system_prompt").is_none());
+        let e = &read_events(dir.path())[0];
+        assert!(e.get("system_prompt").is_none());
+        assert!(e["system_prompt_sha256"].is_null());
+        assert!(!dir.path().join(BLOB_DIR_NAME).exists());
     }
 
     /// The prompt is a session constant, like `model` — every task's `session_start` repeats it.
     #[tokio::test]
     async fn every_task_session_start_repeats_the_same_system_prompt_record() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer_with_prompt(dir.path(), false, Some("Be terse."), true).await;
+        let mut w =
+            make_writer_with_prompt(dir.path(), TraceCapture::Meta, Some("Be terse."), true).await;
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.write_session_start(1, Vec::new()).await.unwrap();
         w.flush().await.unwrap();
@@ -1652,7 +1816,7 @@ mod tests {
                 EnforcementTier::KernelFull,
                 true,
             ),
-            false,
+            TraceCapture::Meta,
             None,
             false,
         )
@@ -1679,7 +1843,7 @@ mod tests {
             "claude-test".to_string(),
             Vec::new(),
             report_for(ContainmentClass::Sealed, EnforcementTier::KernelFull, false),
-            false,
+            TraceCapture::Meta,
             None,
             false,
         )
@@ -1722,7 +1886,7 @@ mod tests {
                 "claude-test".to_string(),
                 Vec::new(),
                 report,
-                false,
+                TraceCapture::Meta,
                 None,
                 false,
             )
@@ -1820,7 +1984,7 @@ mod tests {
             "claude-test".to_string(),
             vec!["network".to_string(), "shell".to_string()],
             expected.clone(),
-            false,
+            TraceCapture::Meta,
             None,
             false,
         )
@@ -1881,6 +2045,7 @@ mod tests {
             None,
             None,
             vec!["msg_0000000000000000000000000000000a".to_string()],
+            None,
         )
         .await
         .unwrap();
@@ -1934,6 +2099,7 @@ mod tests {
             None,
             Some(&usage),
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2148,6 +2314,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2255,6 +2422,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2281,6 +2449,7 @@ mod tests {
             None,
             None,
             vec!["msg_0000000000000000000000000000000a".to_string()],
+            None,
         )
         .await
         .unwrap();
@@ -2320,6 +2489,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2358,7 +2528,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_input_always_present() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer(dir.path()).await; // include_tool_output = false
+        let mut w = make_writer(dir.path()).await; // TraceCapture::Meta
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -2386,7 +2556,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_output_absent_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer(dir.path()).await; // include_tool_output = false
+        let mut w = make_writer(dir.path()).await; // TraceCapture::Meta
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -2408,7 +2578,7 @@ mod tests {
         let e = &events[0];
         assert!(
             e.get("output").is_none(),
-            "output must be absent when include_tool_output is false"
+            "output must be absent under a capture mode that stores no bodies"
         );
         assert_eq!(e["output_bytes"], 90, "output_bytes must still be recorded");
     }
@@ -2472,7 +2642,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_output_present_when_opted_in() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = make_writer_with_opts(dir.path(), true).await;
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
         w.write_tool_call(
             0,
             "bash".to_string(),
@@ -2495,7 +2665,7 @@ mod tests {
         assert_eq!(
             e["output"].as_str().unwrap(),
             "hello\n",
-            "output must be present when include_tool_output is true"
+            "output must be present under capture: content"
         );
         assert_eq!(e["output_bytes"], 60);
     }
@@ -2564,6 +2734,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2576,6 +2747,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2611,6 +2783,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2704,6 +2877,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2720,6 +2894,7 @@ mod tests {
             Some(&origin),
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2779,6 +2954,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2796,6 +2972,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2878,6 +3055,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2923,6 +3101,7 @@ mod tests {
                 None,
                 None,
                 Vec::new(),
+                None,
             )
             .await
             .unwrap();
@@ -2936,5 +3115,340 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort();
         assert_eq!(ids, sorted, "evt_ ids must sort into mint order");
+    }
+
+    // ── Wire capture: hashes, blobs and the capture gate ─────────────────────
+
+    /// A payload in the shape `build_driver_payload` produces, with `n` messages.
+    fn wire_payload(system: &str, messages: usize) -> Value {
+        let messages: Vec<Value> = (0..messages)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("m{i}")}))
+            .collect();
+        serde_json::json!({
+            "model": "claude-test",
+            "max_tokens": 1024,
+            "messages": messages,
+            "tools": [{"name": "bash"}],
+            "params": {},
+            "system": system,
+        })
+    }
+
+    async fn write_turn(w: &mut TraceWriter, turn: u32, payload: &Value, response: &str) {
+        let wire = WireCapture::from_driver_payload(payload, response);
+        w.write_inference(
+            turn,
+            10,
+            5,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            vec!["msg_0000000000000000000000000000000a".to_string()],
+            Some(&wire),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn blob_path(dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+        dir.join(BLOB_DIR_NAME).join(sha)
+    }
+
+    /// Every hash an `inference` event names under `content` is the filename of a real file whose
+    /// own digest is that filename — the whole point of the store.
+    #[tokio::test]
+    async fn content_capture_names_blobs_that_exist_and_rehash_to_their_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let payload = wire_payload("You are a capsule.", 3);
+        write_turn(&mut w, 0, &payload, r#"{"stop_reason":"end_turn"}"#).await;
+        w.flush().await.unwrap();
+
+        let e = &read_events(dir.path())[0];
+        let mut named: Vec<String> = ["system_sha", "tools_sha", "response_sha"]
+            .iter()
+            .map(|key| {
+                e[*key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} missing from {e}"))
+                    .to_string()
+            })
+            .collect();
+        let shas = e["message_shas"].as_array().expect("message_shas");
+        assert_eq!(shas.len(), 3);
+        named.extend(shas.iter().map(|s| s.as_str().unwrap().to_string()));
+
+        for sha in &named {
+            let path = blob_path(dir.path(), sha);
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|err| panic!("blob {sha} must exist: {err}"));
+            assert_eq!(murmur_artifact::sha256_hex(&bytes), *sha);
+            // A bare sha256 names content; `evt_`/`msg_`/`ses_` name entities. Neither a prefix
+            // nor an extension may creep onto a blob name.
+            assert_eq!(sha.len(), 64, "{sha}");
+            assert!(
+                sha.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{sha}"
+            );
+        }
+    }
+
+    /// The hashed system body is the payload's `system` string, as text — so the blob reads as a
+    /// prompt rather than as a JSON-quoted one.
+    #[tokio::test]
+    async fn the_system_blob_holds_the_prompt_as_readable_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let payload = wire_payload("[Capsule] you are cap.\nBe terse.", 1);
+        write_turn(&mut w, 0, &payload, "{}").await;
+        w.flush().await.unwrap();
+
+        let sha = read_events(dir.path())[0]["system_sha"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            std::fs::read_to_string(blob_path(dir.path(), &sha)).unwrap(),
+            "[Capsule] you are cap.\nBe terse."
+        );
+    }
+
+    /// `meta` is the default and hashes exactly what `content` hashes; the difference is only
+    /// whether the bodies are on disk.
+    #[tokio::test]
+    async fn meta_writes_the_same_hashes_and_no_bodies() {
+        let payload = wire_payload("You are a capsule.", 2);
+        let response = r#"{"stop_reason":"end_turn"}"#;
+
+        let meta = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(meta.path(), TraceCapture::Meta).await;
+        write_turn(&mut w, 0, &payload, response).await;
+        w.flush().await.unwrap();
+
+        let content = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(content.path(), TraceCapture::Content).await;
+        write_turn(&mut w, 0, &payload, response).await;
+        w.flush().await.unwrap();
+
+        let meta_event = read_events(meta.path()).remove(0);
+        let content_event = read_events(content.path()).remove(0);
+        for key in ["system_sha", "tools_sha", "response_sha", "message_shas"] {
+            assert_eq!(meta_event[key], content_event[key], "{key}");
+        }
+        assert!(
+            !meta.path().join(BLOB_DIR_NAME).exists(),
+            "meta must not create the blob directory"
+        );
+        assert!(content.path().join(BLOB_DIR_NAME).is_dir());
+    }
+
+    /// The default a writer gets when the manifest declares no `trace:` block.
+    #[tokio::test]
+    async fn the_default_capture_mode_is_meta() {
+        assert_eq!(TraceCapture::default(), TraceCapture::Meta);
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_prompt(dir.path(), TraceCapture::default(), None, false).await;
+        write_turn(&mut w, 0, &wire_payload("s", 1), "{}").await;
+        w.flush().await.unwrap();
+
+        let e = &read_events(dir.path())[0];
+        assert!(e.get("system_sha").is_some());
+        assert!(!dir.path().join(BLOB_DIR_NAME).exists());
+    }
+
+    /// `none` leaves the record exactly as it was before content hashes existed: not one of the
+    /// four keys is present, and every other field still is.
+    #[tokio::test]
+    async fn none_omits_every_hash_and_leaves_the_rest_of_the_event_intact() {
+        let payload = wire_payload("You are a capsule.", 2);
+
+        let off = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(off.path(), TraceCapture::None).await;
+        write_turn(&mut w, 3, &payload, "{}").await;
+        w.flush().await.unwrap();
+
+        let e = read_events(off.path()).remove(0);
+        for key in ["system_sha", "tools_sha", "response_sha", "message_shas"] {
+            assert!(
+                e.get(key).is_none(),
+                "{key} must be absent under none, got {e}"
+            );
+        }
+        assert!(!off.path().join(BLOB_DIR_NAME).exists());
+        for key in [
+            "event_type",
+            "event_id",
+            "parent_id",
+            "session_id",
+            "timestamp",
+            "turn",
+            "task_id",
+            "input_tokens",
+            "output_tokens",
+            "decision",
+            "tool_name",
+            "message_ids",
+        ] {
+            assert!(
+                e.get(key).is_some(),
+                "{key} must survive under none, got {e}"
+            );
+        }
+        assert_eq!(e["turn"], 3);
+        assert_eq!(e["message_ids"].as_array().unwrap().len(), 1);
+    }
+
+    /// A prompt that does not change across ten turns is one blob, written once and never
+    /// rewritten — the file's bytes are replaced by hand after the first turn and must survive.
+    #[tokio::test]
+    async fn an_unchanged_system_prompt_is_stored_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let payload = wire_payload("You are a capsule.", 1);
+        write_turn(&mut w, 0, &payload, "{}").await;
+
+        let sha = {
+            w.flush().await.unwrap();
+            read_events(dir.path())[0]["system_sha"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let path = blob_path(dir.path(), &sha);
+        std::fs::write(&path, b"sentinel").unwrap();
+
+        for turn in 1..10 {
+            write_turn(&mut w, turn, &payload, "{}").await;
+        }
+        w.flush().await.unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 10);
+        for e in &events {
+            assert_eq!(e["system_sha"], sha.as_str());
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"sentinel",
+            "an existing blob is never rewritten"
+        );
+        let matching = std::fs::read_dir(dir.path().join(BLOB_DIR_NAME))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() == sha.as_str())
+            .count();
+        assert_eq!(matching, 1, "exactly one file bears that name");
+    }
+
+    /// A hook's `run-inference` sends a payload the runtime never built, so its record names no
+    /// hashes — absent from the JSON, not empty strings.
+    #[tokio::test]
+    async fn a_hook_origin_record_carries_no_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let origin = InferenceOrigin {
+            source: "hook:gatekeeper".to_string(),
+            model: "claude-test".to_string(),
+        };
+        w.write_inference(
+            0,
+            1,
+            1,
+            "end_turn".to_string(),
+            None,
+            Some(&origin),
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let e = read_events(dir.path()).remove(0);
+        assert_eq!(e["origin"], "hook:gatekeeper");
+        for key in ["system_sha", "tools_sha", "response_sha", "message_shas"] {
+            assert!(e.get(key).is_none(), "{key} must be absent, got {e}");
+        }
+        assert!(!dir.path().join(BLOB_DIR_NAME).exists());
+    }
+
+    /// Two runs sharing a prefix agree on that prefix's `message_shas` and disagree from the
+    /// changed message onwards — the divergence index is the first unequal position.
+    #[tokio::test]
+    async fn message_shas_locate_the_index_two_runs_diverge_at() {
+        async fn shas_for(payload: &Value) -> Vec<String> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut w = make_writer_with_opts(dir.path(), TraceCapture::Meta).await;
+            write_turn(&mut w, 0, payload, "{}").await;
+            w.flush().await.unwrap();
+            read_events(dir.path())[0]["message_shas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        let first = wire_payload("You are a capsule.", 4);
+        let mut second = first.clone();
+        second["messages"][2]["content"] = serde_json::json!("diverged");
+
+        let a = shas_for(&first).await;
+        let b = shas_for(&second).await;
+        assert_eq!(a.len(), 4);
+        let divergence = a.iter().zip(&b).position(|(x, y)| x != y);
+        assert_eq!(divergence, Some(2));
+        assert_eq!(a[3], b[3], "only the changed message changes its own sha");
+    }
+
+    /// A message repeated inside one request hashes to one name and one file. Ids never repeat;
+    /// shas repeat exactly when content does, and that is what makes them comparable.
+    #[tokio::test]
+    async fn identical_messages_share_one_sha_and_one_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "same"}, {"role": "user", "content": "same"}],
+            "tools": [],
+            "system": "s",
+        });
+        write_turn(&mut w, 0, &payload, "{}").await;
+        w.flush().await.unwrap();
+
+        let shas = read_events(dir.path())[0]["message_shas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(shas[0], shas[1]);
+        assert!(blob_path(dir.path(), &shas[0]).is_file());
+    }
+
+    /// Blobs are the bytes as sent, so a peer handle a tool call would have had redacted out of
+    /// its summary stays in the body a `content` capture stores.
+    #[tokio::test]
+    async fn a_message_blob_is_the_body_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer_with_opts(dir.path(), TraceCapture::Content).await;
+        let message = serde_json::json!({"role": "user", "content": "hello"});
+        let payload = serde_json::json!({
+            "messages": [message.clone()],
+            "tools": [],
+            "system": "s",
+        });
+        write_turn(&mut w, 0, &payload, "{}").await;
+        w.flush().await.unwrap();
+
+        let sha = read_events(dir.path())[0]["message_shas"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            std::fs::read(blob_path(dir.path(), &sha)).unwrap(),
+            serde_json::to_vec(&message).unwrap()
+        );
     }
 }

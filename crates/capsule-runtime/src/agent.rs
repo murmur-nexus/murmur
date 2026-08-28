@@ -25,7 +25,7 @@ use crate::{
         emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
         TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
-    trace::TraceWriter,
+    trace::{TraceWriter, WireCapture},
 };
 
 /// Output cap sent to the driver when `inference.max_tokens` is absent from the manifest.
@@ -521,6 +521,13 @@ pub(crate) async fn run_agent_loop(
         // handling the event just emitted above — flush whatever it buffered
         // before writing this turn's own record.
         flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+        // What this turn actually put on the wire, taken back out of the payload that was
+        // serialized and dispatched above rather than rebuilt beside it — a second construction
+        // is a second thing to drift. `None` under `trace.capture: none`, the one mode that
+        // hashes nothing.
+        let wire = trace
+            .captures_wire()
+            .then(|| WireCapture::from_driver_payload(&payload, raw));
         trace
             .write_inference(
                 turn_u32,
@@ -531,6 +538,7 @@ pub(crate) async fn run_agent_loop(
                 None,
                 driver_usage.as_ref(),
                 message_ids,
+                wire.as_ref(),
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
@@ -1105,8 +1113,10 @@ async fn flush_hook_inference_records(
                 Some(&record.origin),
                 record.usage.as_ref(),
                 // A hook's own completion sent a message list the runtime never held, so there
-                // are no runtime message ids to name.
+                // are no runtime message ids to name — and, for the same reason, no payload the
+                // runtime built and could hash.
                 Vec::new(),
+                None,
             )
             .await;
         otel.emit_inference(
@@ -2647,6 +2657,41 @@ mod tests {
 
     // ── Wire payload construction (Scenarios 1, 2, 4) ──────────────────────────────
 
+    /// A `trace.capture: content` writer over `dir`, the seam the byte-fidelity tests use to
+    /// get real blobs without launching a session.
+    async fn content_capture_writer(dir: &std::path::Path) -> crate::trace::TraceWriter {
+        crate::trace::TraceWriter::open(
+            dir,
+            "ses_test".to_string(),
+            "cap".to_string(),
+            "1.0.0".to_string(),
+            "test-model".to_string(),
+            Vec::new(),
+            crate::containment::scope_report_for_tier(
+                &crate::types::CapabilityPolicy::default(),
+                murmur_artifact::ContainmentClass::Advisory,
+                crate::sandbox::EnforcementTier::EnvironmentOnly,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+            murmur_artifact::TraceCapture::Content,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The single event a byte-fidelity test's writer produced.
+    fn read_one_event(dir: &std::path::Path) -> Value {
+        let content = std::fs::read_to_string(dir.join("trace.jsonl")).unwrap();
+        let line = content.lines().find(|l| !l.is_empty()).unwrap();
+        serde_json::from_str(line).unwrap()
+    }
+
     fn sample_messages() -> Vec<Value> {
         vec![
             json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
@@ -3298,6 +3343,134 @@ mod tests {
         );
         // A stale acked length falls back to the full resend, and the ids follow it.
         assert_eq!(wire_messages(&minted, Some(("c", 9))).len(), 3);
+    }
+
+    /// The trace's hashes and the driver's request are the same bytes.
+    ///
+    /// `payload_json` is what the loop hands the driver; the bodies behind `message_shas` are
+    /// taken out of the same `payload` value, so each one has to appear verbatim inside that
+    /// string. If a future change reserialized the messages a second time — or reordered a map,
+    /// or reintroduced `preserve_order` — this is the assertion that would break.
+    #[tokio::test]
+    async fn every_message_blob_appears_verbatim_inside_the_payload_the_driver_got() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut trace = content_capture_writer(dir.path()).await;
+
+        let messages: Vec<Value> = sample_messages().into_iter().map(with_new_id).collect();
+        let tools = vec![json!({"name": "bash"})];
+        let payload = build_driver_payload(
+            "test-model",
+            8192,
+            &messages,
+            &tools,
+            "[Capsule] sys",
+            None,
+            Some("cap:1.0.0:ctx-1"),
+        );
+        let payload_json = serde_json::to_string(&payload).unwrap();
+        let raw = r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}"#;
+
+        let wire = WireCapture::from_driver_payload(&payload, raw);
+        trace
+            .write_inference(
+                0,
+                1,
+                1,
+                "end_turn".to_string(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Some(&wire),
+            )
+            .await
+            .unwrap();
+        trace.flush().await.unwrap();
+
+        let event = read_one_event(dir.path());
+        let blobs = dir.path().join("blobs");
+
+        let shas: Vec<String> = event["message_shas"]
+            .as_array()
+            .expect("message_shas")
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(shas.len(), messages.len());
+        for sha in &shas {
+            let body = std::fs::read_to_string(blobs.join(sha)).unwrap();
+            assert!(
+                payload_json.contains(&body),
+                "blob {sha} is not a substring of the request:\n  blob: {body}\n  request: \
+                 {payload_json}"
+            );
+            // The runtime's bookkeeping keys never leave the host, so they cannot reach a blob.
+            // Checked as keys, not as text: `tool_call_id` is a provider field that survives.
+            let fields = serde_json::from_str::<Value>(&body).unwrap();
+            assert!(fields.get(MESSAGE_ID_KEY).is_none(), "{body}");
+            assert!(fields.get(MESSAGE_SOURCE_ID_KEY).is_none(), "{body}");
+        }
+
+        // The same holds for the system prompt and the tool inventory.
+        let system_blob =
+            std::fs::read_to_string(blobs.join(event["system_sha"].as_str().unwrap())).unwrap();
+        assert_eq!(system_blob, "[Capsule] sys");
+        let tools_blob =
+            std::fs::read_to_string(blobs.join(event["tools_sha"].as_str().unwrap())).unwrap();
+        assert_eq!(tools_blob, serde_json::to_string(&json!(tools)).unwrap());
+        assert!(payload_json.contains(&tools_blob));
+
+        // `response_sha` names the raw driver response string, before it is parsed.
+        assert_eq!(
+            event["response_sha"],
+            json!(murmur_artifact::sha256_hex(raw.as_bytes()))
+        );
+        assert_eq!(
+            std::fs::read_to_string(blobs.join(event["response_sha"].as_str().unwrap())).unwrap(),
+            raw
+        );
+    }
+
+    /// The `message_shas` an event carries hash the post-strip bytes, so a run whose messages
+    /// carry freshly minted ids and one whose messages carry none agree hash for hash.
+    #[tokio::test]
+    async fn message_shas_are_taken_after_message_identity_is_stripped() {
+        async fn shas(dir: &std::path::Path, messages: &[Value]) -> Vec<String> {
+            let mut trace = content_capture_writer(dir).await;
+            let payload = build_driver_payload("m", 8192, messages, &[], "sys", None, None);
+            let wire = WireCapture::from_driver_payload(&payload, "{}");
+            trace
+                .write_inference(
+                    0,
+                    1,
+                    1,
+                    "end_turn".to_string(),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(&wire),
+                )
+                .await
+                .unwrap();
+            trace.flush().await.unwrap();
+            read_one_event(dir)["message_shas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        let bare = sample_messages();
+        let identified: Vec<Value> = bare.clone().into_iter().map(with_new_id).collect();
+
+        let bare_dir = tempfile::tempdir().unwrap();
+        let identified_dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            shas(bare_dir.path(), &bare).await,
+            shas(identified_dir.path(), &identified).await
+        );
     }
 
     /// A message list carrying neither identity key serializes byte-for-byte through

@@ -374,26 +374,40 @@ fn cli_system_prompt_is_trimmed_before_use() {
     );
 }
 
-/// The prompt text itself is capsule content: withheld from the trace by default, written
-/// verbatim only when the manifest opts in the same way it opts in to tool output.
+/// `session_start` names the prompt by hash and never carries its text. Under
+/// `trace.capture: content` the bytes behind that hash are a blob named by it, which is how a
+/// reader gets from the record to the prompt the operator wrote.
 #[test]
-fn trace_records_the_prompt_verbatim_only_when_tool_output_is_included() {
+fn trace_records_the_prompt_by_hash_and_stores_it_only_under_content_capture() {
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest("  system_prompt: \"Manifest prompt\"\n");
     let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
     let start = session_start(&workdir);
     assert!(
         start.get("system_prompt").is_none(),
-        "prompt text must be withheld by default; got: {start}"
+        "the verbatim prompt is not a session_start field; got: {start}"
+    );
+    assert_eq!(start["system_prompt_sha256"], sha256_hex_of("CLI prompt"));
+    assert!(
+        !workdir.join("blobs").exists(),
+        "the default capture mode stores no bodies"
     );
 
     let fixture = CliFixture::new(vec![one_turn_response()]);
     let manifest_path = fixture.write_manifest_with_trailer(
         "  system_prompt: \"Manifest prompt\"\n",
-        "trace:\n  include_tool_output: true\n",
+        "trace:\n  capture: content\n",
     );
     let workdir = fixture.run_ok(&manifest_path, &["--system-prompt", "CLI prompt"]);
-    assert_eq!(session_start(&workdir)["system_prompt"], "CLI prompt");
+    let start = session_start(&workdir);
+    assert!(start.get("system_prompt").is_none());
+    let sha = start["system_prompt_sha256"].as_str().unwrap();
+    assert_eq!(sha, sha256_hex_of("CLI prompt"));
+    assert_eq!(
+        fs::read_to_string(workdir.join("blobs").join(sha)).unwrap(),
+        "CLI prompt",
+        "the resolved prompt is the blob its own hash names"
+    );
 }
 
 /// A script capsule has no prompt to override. The flag is refused before anything is staged.

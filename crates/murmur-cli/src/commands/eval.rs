@@ -708,7 +708,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
             dataset_id: dataset_id.clone(),
             lifecycle: runtime_manifest.lifecycle.clone(),
             lifecycle_override: None,
-            trace: runtime_manifest.trace.clone(),
+            trace: runtime_manifest.trace,
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: runtime_manifest

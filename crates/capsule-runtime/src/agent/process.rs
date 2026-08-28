@@ -599,8 +599,10 @@ async fn read_process_output(
                         None,
                         None,
                         // The CLI owns its own conversation; the runtime minted no message
-                        // for this request and has no id to name.
+                        // for this request and has no id to name — and it built no payload to
+                        // hash either.
                         Vec::new(),
+                        None,
                     )
                     .await;
 
@@ -840,6 +842,7 @@ async fn read_codex_output(
                                 None,
                                 None,
                                 Vec::new(),
+                                None,
                             )
                             .await;
                         otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None, None)
@@ -874,6 +877,7 @@ async fn read_codex_output(
                                 None,
                                 None,
                                 Vec::new(),
+                                None,
                             )
                             .await;
                         otel.emit_inference(

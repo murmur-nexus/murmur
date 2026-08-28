@@ -79,6 +79,10 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid exports config for '{field}': {message}"),
         ),
+        RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
+            E_MAN_003,
+            format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),
+        ),
         RuntimeManifestError::MissingInferenceEnvVar {
             field: _,
             reference,
