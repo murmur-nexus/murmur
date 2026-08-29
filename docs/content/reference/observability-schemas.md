@@ -122,17 +122,12 @@ body by joining the two: `cat <session_id>/blobs/<the sha the line names>`.
 | Write policy | Write-once. A path that already exists is never rewritten, so a system prompt unchanged across a session costs one file |
 | Lifetime | Session-scoped. Readable exactly as long as the session directory is; nothing prunes it |
 
-The bare SHA-256 filename is deliberate: across the runtime a prefixed UUID v7 (`evt_`, `msg_`,
-`ses_`) names an entity and a bare SHA-256 names content.
-
 `system_prompt_sha256` from `session_start` resolves the same way, to the resolved prompt before
 the `[Capsule]` block was prepended.
 
-**Blob bodies are the payload verbatim, unredacted.** Where `tool_call` redacts peer handle tokens
-out of its `input` and `output` — that record is a summary — a blob is the thing the hash names,
-and redacting it would make the hash name bytes no file contains. `capture: content` is an
-explicit opt-in to storing the wire payload as sent, including any peer handle it embedded. The
-default, `meta`, stores no bodies at all.
+**Blob bodies are the payload verbatim, unredacted** — including any peer handle token, which
+`tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
+storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 
 **`tool_call`** — written after each tool invocation returns
 

@@ -1163,7 +1163,8 @@ pub fn launch_session(
                 effective_grants,
                 trace_capture,
                 trace_system_prompt,
-                system_prompt_overridden)
+                system_prompt_overridden,
+            )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
 

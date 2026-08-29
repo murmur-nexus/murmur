@@ -3258,8 +3258,7 @@ mod tests {
         assert!(!dir.path().join(BLOB_DIR_NAME).exists());
     }
 
-    /// `none` leaves the record exactly as it was before content hashes existed: not one of the
-    /// four keys is present, and every other field still is.
+    /// Under `none` not one of the four hash keys is present, and every other field is.
     #[tokio::test]
     async fn none_omits_every_hash_and_leaves_the_rest_of_the_event_intact() {
         let payload = wire_payload("You are a capsule.", 2);

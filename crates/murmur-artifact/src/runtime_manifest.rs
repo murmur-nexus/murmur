@@ -3231,8 +3231,7 @@ mod tests {
         }
     }
 
-    /// The retired boolean keeps working, mapping to exactly what each value did before
-    /// `trace.capture` existed.
+    /// The retired boolean keeps working, mapping `true` to `Content` and `false` to `Meta`.
     #[test]
     fn include_tool_output_still_resolves_to_content_and_meta() {
         let opted_in =

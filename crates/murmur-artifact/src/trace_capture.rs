@@ -4,8 +4,8 @@
 //! Two manifest keys reach [`resolve_trace_capture`]: `trace.capture`, which names a
 //! [`TraceCapture`] directly, and the retired `trace.include_tool_output` boolean. The boolean is
 //! accepted as an alias — `true` maps to [`TraceCapture::Content`] and `false` to
-//! [`TraceCapture::Meta`], which is what each did before `trace.capture` existed — and its use
-//! prints one `warning:` line to stderr naming `trace.capture` as the replacement. Setting both
+//! [`TraceCapture::Meta`] — and its use prints one `warning:` line to stderr naming
+//! `trace.capture` as the replacement. Setting both
 //! keys is rejected, including when the two agree, rather than resolved by precedence.
 
 use crate::runtime_manifest::RuntimeManifestError;
@@ -19,8 +19,8 @@ pub const TRACE_CAPTURE_ACCEPTED_VALUES: &[&str] = &["none", "meta", "content"];
 /// injection, tokenizer differences and safety layers happen past the wire and are invisible here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TraceCapture {
-    /// No content hashes on `inference`, no `blobs/` directory, no `tool_call.output`. An
-    /// `inference` event is byte-identical to one written before content hashes existed.
+    /// No content hashes on `inference`, no `blobs/` directory, no `tool_call.output`. Every
+    /// other field on an `inference` event is written exactly as the other modes write it.
     None,
     /// Content hashes on every `inference` event, and no bodies on disk. The default.
     #[default]
@@ -162,7 +162,7 @@ mod tests {
         );
     }
 
-    /// The alias maps in both directions to exactly what each boolean did before it was retired.
+    /// The alias maps in both directions: `true` to `Content`, `false` to `Meta`.
     #[test]
     fn include_tool_output_aliases_content_and_meta() {
         assert_eq!(

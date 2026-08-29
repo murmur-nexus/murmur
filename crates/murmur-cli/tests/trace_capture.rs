@@ -154,7 +154,7 @@ fn shas(event: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Scenario 1 and 2(a): under `content` the event's hashes are the driver's own digests of what
+/// Under `content` the event's hashes are the driver's own digests of what
 /// it received, and every one of them is the name of a real file that re-hashes to that name.
 #[test]
 fn content_capture_hashes_match_the_driver_and_name_blobs_that_exist() {
@@ -205,7 +205,7 @@ fn content_capture_hashes_match_the_driver_and_name_blobs_that_exist() {
     }
 }
 
-/// Scenario 4: an absent `trace:` block and an explicit `capture: meta` behave identically —
+/// An absent `trace:` block and an explicit `capture: meta` behave identically —
 /// hashes present, no bodies, no `tool_call.output`.
 #[test]
 fn meta_is_the_default_and_writes_no_bodies() {
@@ -232,7 +232,7 @@ fn meta_is_the_default_and_writes_no_bodies() {
     }
 }
 
-/// Scenario 5: `none` omits all four keys and leaves the rest of the record as it was.
+/// `none` omits all four hash keys and leaves every other field on the record intact.
 #[test]
 fn none_omits_every_hash_and_creates_no_blob_directory() {
     let run = run_session("trace:\n  capture: none\n");
@@ -260,7 +260,7 @@ fn none_omits_every_hash_and_creates_no_blob_directory() {
     }
 }
 
-/// Scenario 6: no message identity key reaches a blob, and a `message_shas` entry hashes the
+/// No message identity key reaches a blob, and a `message_shas` entry hashes the
 /// post-strip bytes — which is exactly what the driver, which only ever sees post-strip
 /// messages, independently computed.
 #[test]
@@ -280,10 +280,11 @@ fn no_message_identity_reaches_a_blob() {
     );
 }
 
-/// Scenario 7: two runs of the same capsule share a message prefix, so their `message_shas`
-/// agree pairwise up to the first message whose content differs — the divergence index.
+/// Two runs of the same capsule send byte-identical messages, so their `message_shas` agree
+/// pairwise and the divergence index is `None`. Their `message_ids`, by contrast, differ at
+/// every position, which is why an id array cannot locate a divergence.
 #[test]
-fn two_runs_diverge_at_the_first_unequal_message_sha() {
+fn two_runs_of_one_capsule_agree_on_every_message_sha_and_on_no_message_id() {
     let first = run_session("trace:\n  capture: meta\n");
     let second = run_session("trace:\n  capture: meta\n");
 
@@ -305,8 +306,8 @@ fn two_runs_diverge_at_the_first_unequal_message_sha() {
     );
 }
 
-/// Scenario 8: the retired boolean still behaves exactly as it did — `true` stores bodies,
-/// `false` does not — and both spellings warn.
+/// The retired boolean maps as documented — `true` stores bodies, `false` does not — and both
+/// spellings warn.
 #[test]
 fn the_include_tool_output_alias_still_behaves_as_before() {
     let opted_in = run_session("trace:\n  include_tool_output: true\n");
@@ -364,7 +365,7 @@ fn session_dirs(project: &tempfile::TempDir) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Scenario 8: using the retired boolean warns once, naming `trace.capture` as the replacement.
+/// Using the retired boolean warns once, naming `trace.capture` as the replacement.
 #[test]
 fn the_retired_boolean_warns_and_names_its_replacement() {
     for flag in ["true", "false"] {
@@ -388,7 +389,7 @@ fn the_retired_boolean_warns_and_names_its_replacement() {
     }
 }
 
-/// Scenario 9: setting both keys is refused — even when they agree — and nothing is staged.
+/// Setting both keys is refused — even when they agree — and nothing is staged.
 #[test]
 fn setting_both_capture_keys_refuses_the_launch() {
     let (assert, project) =
@@ -409,7 +410,7 @@ fn setting_both_capture_keys_refuses_the_launch() {
     );
 }
 
-/// Scenario 10: a `capture` value that is not one of the three modes is refused, naming the field
+/// A `capture` value that is not one of the three modes is refused, naming the field
 /// and every value it would have accepted.
 #[test]
 fn an_unparseable_capture_value_is_refused() {
