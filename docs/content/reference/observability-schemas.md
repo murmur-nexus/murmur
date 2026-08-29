@@ -56,8 +56,7 @@ before the first task begins
 | `userns_grant` | string \| null | Where this host's permission to create an unprivileged user namespace came from: `"apparmor_absent"`, `"restriction_disabled_host_wide"`, `"profile_confining"` or `"withheld"`. Always written; `null` only off Linux, where AppArmor does not exist. Two sessions can reach the same `containment_achieved` through different permissions, so read this alongside it. See [`W-SEC-013`](diagnostics.md#w-sec-013) |
 | `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
-| `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself |
-| `system_prompt` | string | The resolved prompt verbatim. Written **only** when the manifest sets `trace.include_tool_output: true`; omitted otherwise, on the same terms as tool output text. Omitted regardless when no prompt was in effect |
+| `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)) and `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)). Where `capabilities` above names categories, this names the actual destinations, binaries and paths |
 
 **`inference`** — written after each driver response is parsed
@@ -77,12 +76,58 @@ before the first task begins
 | `origin` | string | `hook:<hook name>` when a hook produced this completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference). Absent for an ordinary agent-loop turn |
 | `model` | string | The model this call was sent to. Written only alongside `origin` |
 | `message_ids` | array of string | Ids of the messages this request embedded, in the order they sat in it. Under an active [driver continuation](wit-interfaces.md#stateful-driver-continuation) only the tail the driver has not seen is sent, and this names exactly that tail. Absent when the list is empty: a hook's own completion and the `process` transport both send a message list the runtime never minted |
+| `system_sha` | string | SHA-256 (lowercase hex) of this request's `system` string — the resolved prompt with the `[Capsule]` identity block already prepended |
+| `tools_sha` | string | SHA-256 (lowercase hex) of this request's serialized `tools` array |
+| `response_sha` | string | SHA-256 (lowercase hex) of the raw driver response body, as the runtime read it before parsing |
+| `message_shas` | array of string | SHA-256 (lowercase hex) of each message this request embedded, in send order — one entry per `message_ids` entry, over the same messages once the runtime's own identity keys are stripped |
 
 The four provider-reported fields are written only when the driver reported that member, and are
 absent otherwise — never `0`. They sit beside the runtime's estimates rather than replacing them,
 so estimator drift is a subtraction on one line. See
 [Reported token usage](wit-interfaces.md#driver-usage) for what a driver sends and what the
 runtime does with it.
+
+### What the wire hashes cover { #wire-hashes }
+
+`system_sha`, `tools_sha`, `response_sha` and `message_shas` are the bytes Murmur **sent**, not
+what the model **saw**: provider-side prompt injection, tokenizer differences and safety layers
+all happen past the wire and are invisible to the runtime.
+
+They are taken from the same request the driver was handed, so a `message_shas` entry hashes a
+message exactly as it was serialized into that request — after the runtime's own `id` and
+`source_id` bookkeeping keys are stripped, which is why no blob ever contains one.
+
+All four are written under [`trace.capture`](manifest.md#field-trace) `meta` and `content`, and
+none under `none`. They are absent on a record the runtime did not build the request for: a hook's
+own completion through [`run-inference`](wit-interfaces.md#murmurruntimeinference), and the
+`process` transport, both of which send a request the runtime never held.
+
+`message_shas` does not duplicate `message_ids`. An id names an entity and is freshly minted every
+run, so comparing two runs' id arrays only reports that every id differs; a hash names content, and
+repeats exactly when content repeats. Comparing two runs' `message_shas` pairwise gives the
+divergence index — the first position at which the two prompts stopped agreeing.
+
+### Content blobs (`blobs/`) { #trace-blobs }
+
+Under [`trace.capture: content`](manifest.md#field-trace) the body behind every hash above is also
+written to `<session_id>/blobs/<sha256>`, beside `trace.jsonl`. A reader resolves a hash to its
+body by joining the two: `cat <session_id>/blobs/<the sha the line names>`.
+
+| Property | Value |
+|---|---|
+| Path | `workdir/<session_id>/blobs/<sha256>` |
+| Filename | The lowercase-hex SHA-256 of that file's own contents — no prefix, no extension |
+| Directory mode | `0o700`, owner only |
+| Created | On the first blob written, and only under `capture: content` |
+| Write policy | Write-once. A path that already exists is never rewritten, so a system prompt unchanged across a session costs one file |
+| Lifetime | Session-scoped. Readable exactly as long as the session directory is; nothing prunes it |
+
+`system_prompt_sha256` from `session_start` resolves the same way, to the resolved prompt before
+the `[Capsule]` block was prepended.
+
+**Blob bodies are the payload verbatim, unredacted** — including any peer handle token, which
+`tool_call` redacts out of its own `input` and `output`. Setting `capture: content` opts in to
+storing the wire payload as sent; the default, `meta`, stores no bodies at all.
 
 **`tool_call`** — written after each tool invocation returns
 
@@ -94,7 +139,7 @@ runtime does with it.
 | `tool_call_id` | string \| null | The provider's own id for this call, recorded verbatim and never parsed. It is what pairs this line with the tool-result message the runtime sent back. `null` when the provider named none |
 | `input` | object | The tool input, as the model supplied it |
 | `input_bytes` | u64 | Byte length of the serialized tool input |
-| `output` | string | The tool output text. Written only when the manifest sets `trace.include_tool_output: true` (default `false`) |
+| `output` | string | The tool output text, with peer handle tokens redacted. Written only under [`trace.capture: content`](manifest.md#field-trace) |
 | `output_bytes` | u64 | Byte length of the tool output text |
 | `duration_ms` | u64 | |
 | `status` | string | `"ok"` \| `"error"` |

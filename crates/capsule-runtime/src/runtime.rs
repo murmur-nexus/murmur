@@ -873,11 +873,11 @@ pub fn stage_session(
         case_id: request.case_id,
         dataset_id: request.dataset_id,
         lifecycle,
-        trace_include_tool_output: request
+        trace_capture: request
             .trace
             .as_ref()
-            .map(|t| t.include_tool_output)
-            .unwrap_or(false),
+            .map(|t| t.capture)
+            .unwrap_or_default(),
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
@@ -1132,7 +1132,7 @@ pub fn launch_session(
             .as_ref()
             .map(|d| d.artifact.clone())
             .filter(|a| !a.is_empty());
-        let trace_include_tool_output = staged.trace_include_tool_output;
+        let trace_capture = staged.trace_capture;
         // The trace records the *resolved* prompt — what `resolve_system_prompt` returned, before
         // `build_augmented_system_prompt` prepends the `[Capsule]` block — so a reader compares
         // what the manifest (or `--system-prompt`) actually said, not the runtime's framing of it.
@@ -1161,7 +1161,7 @@ pub fn launch_session(
                 inference_model.clone(),
                 capabilities.clone(),
                 effective_grants,
-                trace_include_tool_output,
+                trace_capture,
                 trace_system_prompt,
                 system_prompt_overridden,
             )
@@ -1887,7 +1887,9 @@ pub fn launch_session(
                 String::new(),
                 Vec::new(),
                 staged.scope_report.clone(),
-                false,
+                // This writer exists only to drain buffered `a2a_send` events; it writes no
+                // record that can carry a hash or a body.
+                murmur_artifact::TraceCapture::None,
                 None,
                 false,
             )
@@ -6115,7 +6117,7 @@ inference:
                     Vec::new(),
                     Vec::new(),
                 ),
-                false,
+                murmur_artifact::TraceCapture::Meta,
                 None,
                 false,
             )
@@ -6952,7 +6954,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
             ),
-            false,
+            murmur_artifact::TraceCapture::Meta,
             None,
             false,
         )
@@ -7153,7 +7155,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
             ),
-            false,
+            murmur_artifact::TraceCapture::Meta,
             None,
             false,
         )

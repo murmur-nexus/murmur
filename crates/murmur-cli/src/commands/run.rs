@@ -363,7 +363,7 @@ pub(crate) fn run_run(
         dataset_id: None,
         lifecycle: runtime_manifest.lifecycle.clone(),
         lifecycle_override,
-        trace: runtime_manifest.trace.clone(),
+        trace: runtime_manifest.trace,
         workdir: workdir_arg.clone().map(|w| {
             if w.is_absolute() {
                 w

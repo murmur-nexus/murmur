@@ -349,8 +349,10 @@ pub struct StagedSession {
     pub(crate) dataset_id: Option<String>,
     /// Resolved lifecycle config (manifest + override already applied).
     pub(crate) lifecycle: LifecycleConfig,
-    /// Whether to capture tool output in trace events (resolved from manifest trace config).
-    pub(crate) trace_include_tool_output: bool,
+    /// How much of each turn's driver request this session's trace keeps (resolved from the
+    /// manifest's `trace:` block, or [`murmur_artifact::TraceCapture::default`] when it has
+    /// none).
+    pub(crate) trace_capture: murmur_artifact::TraceCapture,
     /// Address the HTTP server is bound to (copied from StageRequest::bind_addr).
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).

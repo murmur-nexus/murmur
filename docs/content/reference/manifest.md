@@ -109,7 +109,7 @@ observability:
         expected: [bash, python]
 
 trace:
-  include_tool_output: true  # optional; default false: record raw tool output in trace.jsonl
+  capture: content  # optional; default meta: also store the bodies behind the trace's hashes
 
 inference:
   transport: http
@@ -655,7 +655,19 @@ these fields are accepted and inert:
 
 | Field | Type | Required | Notes |
 |---|---|---:|---|
-| `trace.include_tool_output` | bool | no | Default: `false`. Whether each `tool_call` event in `trace.jsonl` carries the tool's raw output text alongside `output_bytes`. Tool output can be large — file diffs, shell dumps — so it is left out unless asked for. See the [`tool_call` event](observability-schemas.md#session-trace-tracejsonl). |
+| `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
+| `trace.include_tool_output` | bool | no | Retired; use `trace.capture`. Accepted as an alias — `true` for `capture: content`, `false` for `capture: meta` — and its use prints a warning. Setting it alongside `trace.capture` is an error, even when the two agree. |
+
+| `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
+|---|---|---|---|
+| `none` | — | — | — |
+| `meta` | written | — | — |
+| `content` | written | written | written |
+
+The hashes are `system_sha`, `tools_sha`, `response_sha` and `message_shas` on each
+[`inference` event](observability-schemas.md#wire-hashes). Under `content` the body behind each
+one is also written to [`<session_id>/blobs/<sha256>`](observability-schemas.md#trace-blobs),
+verbatim and unredacted — bodies can be large, and a blob holds the wire payload as sent.
 
 #### `lifecycle` { #field-lifecycle }
 
