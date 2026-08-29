@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -25,6 +26,14 @@ pub(crate) enum TraceCommand {
         /// Directory containing session subdirectories (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
+        /// Print the recorded body behind one hash and nothing else: `system`, `tools`,
+        /// `response`, `message:<i>` (each needing --turn), or a sha256 — full, or a
+        /// prefix of 8+ characters naming exactly one hash in the trace.
+        #[arg(long, value_name = "SELECTOR")]
+        body: Option<String>,
+        /// The turn whose hashes `--body system|tools|response|message:<i>` names.
+        #[arg(long, value_name = "N")]
+        turn: Option<u32>,
     },
     /// Compare two trace sessions side-by-side.
     ///
@@ -77,6 +86,28 @@ pub(crate) enum TraceCommand {
 
 // ── Event model ───────────────────────────────────────────────────────────────
 
+/// The identity every runtime-written line carries, read from the same line as the event
+/// itself so the payload structs below stay payload-only. `mur trace steps` follows
+/// `parent_id` to rebuild the session → task → turn tree; a trace written before these
+/// fields existed carries none of them and renders flat.
+#[derive(Debug, Default, Deserialize)]
+struct EventIdentity {
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    parent_id: Option<String>,
+    /// The task a turn-level line belongs to. Used only as the fallback attribution when a
+    /// line's `parent_id` names no event in this file.
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+/// One trace line: what this build understands of it, plus where it hangs in the tree.
+struct TraceRecord {
+    identity: EventIdentity,
+    event: TraceEvent,
+}
+
 #[derive(Debug, Deserialize)]
 struct SessionStartEvent {
     session_id: String,
@@ -84,6 +115,31 @@ struct SessionStartEvent {
     capsule_version: String,
     model: String,
     max_turns: u32,
+    /// Capability categories the manifest granted anything under.
+    #[serde(default)]
+    capabilities: Vec<String>,
+    /// Names of the tools offered to the model.
+    #[serde(default)]
+    tools_declared: Vec<String>,
+    /// The strongest containment class asked for, and the class this host could enforce.
+    /// Absent on a trace from a runtime predating the keys.
+    #[serde(default)]
+    containment_declared: Option<String>,
+    #[serde(default)]
+    containment_achieved: Option<String>,
+    #[serde(default)]
+    workdir_exec: Option<bool>,
+    /// Where the host's permission to create an unprivileged user namespace came from;
+    /// `null` off Linux.
+    #[serde(default)]
+    userns_grant: Option<String>,
+    /// `"manifest"`, `"cli"` or `"none"` — where the system prompt in effect came from.
+    #[serde(default)]
+    system_prompt_source: Option<String>,
+    /// The resolved prompt's hash, before the runtime prepends its `[Capsule]` block, and a
+    /// blob name in its own right under `trace.capture: content`.
+    #[serde(default)]
+    system_prompt_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +148,30 @@ struct InferenceEvent {
     decision: String,
     #[serde(default)]
     tool_name: Option<String>,
+    /// `hook:<name>` when a hook produced this completion through `run-inference`. Absent on
+    /// an agent-loop turn, which is how the Wire section and the divergence comparison — both
+    /// of which pair records by turn — keep a hook's completion out of a turn's own record.
+    #[serde(default)]
+    origin: Option<String>,
+    /// The provider's own counts, each written only when the driver reported it.
+    #[serde(default)]
+    input_tokens_actual: Option<u64>,
+    #[serde(default)]
+    output_tokens_actual: Option<u64>,
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
+    /// The four wire hashes. All absent under `trace.capture: none`, and on a record the
+    /// runtime did not build the request for.
+    #[serde(default)]
+    system_sha: Option<String>,
+    #[serde(default)]
+    tools_sha: Option<String>,
+    #[serde(default)]
+    response_sha: Option<String>,
+    #[serde(default)]
+    message_shas: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +207,10 @@ struct SkillCallEvent {
 struct ShellEvent {
     exit_code: i32,
     duration_ms: u64,
+    /// The program that ran, as the runtime resolved it. Rendered on the shell row of the
+    /// `steps` tree; absent on a trace from a runtime predating the key.
+    #[serde(default)]
+    binary: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +244,12 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
+    /// Rendered on the task row of the `steps` tree. Both default to the empty string so a
+    /// trace written before they existed still parses.
+    #[serde(default)]
+    context_id: String,
+    #[serde(default)]
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +279,47 @@ struct TaskReopenedEvent {
     reopen_number: u32,
 }
 
+/// What an `on-task-start` hook proposed as context and what the runtime did with it. One
+/// per task that had a seeding hook return something, including a rejection.
+#[derive(Debug, Deserialize)]
+struct ContextSeedEvent {
+    hook_name: String,
+    /// Tokens actually committed to the head of the context; `0` on a rejection.
+    tokens: u64,
+    proposed_tokens: u64,
+    budget_tokens: u64,
+    /// `"seeded"`, `"trimmed"`, `"compacted"` or `"rejected"`.
+    outcome: String,
+    /// Why nothing was committed. Written on `"rejected"` only.
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    message_ids: Vec<String>,
+}
+
+/// A hook call that failed in a way the session survived. Rendered where it cannot be
+/// scrolled past, because nothing else in the session says the hook did not run.
+#[derive(Debug, Deserialize)]
+struct HookDispatchErrorEvent {
+    hook_name: String,
+    /// The WIT lifecycle function the fault is attributed to, or `"drain"`.
+    event: String,
+    /// The unsupported `hook-output` arm, or the async failure that surfaced here.
+    arm: String,
+}
+
+/// The resource-plane and peer-file records are rendered as counts by outcome, so `outcome`
+/// is the only field five of the nine event types contribute.
+#[derive(Debug, Deserialize)]
+struct OutcomeEvent {
+    outcome: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct A2aSendEvent {
+    peer_url: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -199,10 +330,21 @@ enum TraceEvent {
     Shell(ShellEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
+    ContextSeed(ContextSeedEvent),
     SessionEnd(SessionEndEvent),
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
+    HookDispatchError(HookDispatchErrorEvent),
+    ResourceList(OutcomeEvent),
+    ResourceRead(OutcomeEvent),
+    PeerHandleMint(OutcomeEvent),
+    PeerHandleRedeem(OutcomeEvent),
+    PeerFileFetch(OutcomeEvent),
+    /// Counted, not detailed: the A2A section reports how many tasks arrived, and nothing
+    /// on the record beyond its own existence is rendered.
+    A2aTaskReceived,
+    A2aSend(A2aSendEvent),
     #[serde(other)]
     Unknown,
 }
@@ -229,6 +371,68 @@ struct ToolCallRecord {
     status: String,
     duration_ms: u64,
 }
+
+/// One `inference` line, kept whole because three sections read different parts of it: the
+/// Tool calls breakdown wants the decision, the Wire section wants the hashes, and `--body`
+/// resolves a selector against them.
+struct InferenceRecord {
+    turn: u32,
+    decision: String,
+    /// `hook:<name>` when a hook produced this completion. A hook's record never carries
+    /// hashes, and is never a turn of the agent loop.
+    origin: Option<String>,
+    system_sha: Option<String>,
+    tools_sha: Option<String>,
+    response_sha: Option<String>,
+    message_shas: Vec<String>,
+}
+
+impl InferenceRecord {
+    /// This record belongs to the agent loop's own turn sequence rather than to a hook.
+    fn is_agent_loop(&self) -> bool {
+        self.origin.is_none()
+    }
+
+    /// Whether the turn recorded any wire hash at all. `false` means the session ran under
+    /// `trace.capture: none` — a different situation from a hash whose body was not stored.
+    fn has_hashes(&self) -> bool {
+        self.system_sha.is_some()
+            || self.tools_sha.is_some()
+            || self.response_sha.is_some()
+            || !self.message_shas.is_empty()
+    }
+}
+
+/// The provider's own token counts, summed over every turn that reported them. Absent when
+/// no turn did — the runtime writes these keys only when the driver returned a `usage` block.
+#[derive(Default)]
+struct ProviderTokens {
+    input: u64,
+    output: u64,
+    cached: u64,
+    cache_write: u64,
+}
+
+/// One `context_seed` record: what a seeding hook proposed, and what survived the budget.
+struct ContextSeedRecord {
+    hook_name: String,
+    tokens: u64,
+    proposed_tokens: u64,
+    budget_tokens: u64,
+    outcome: String,
+    reason: Option<String>,
+    message_ids: Vec<String>,
+}
+
+/// One `hook_dispatch_error` record — a hook that failed without failing the session.
+struct HookFailureRecord {
+    hook_name: String,
+    event: String,
+    arm: String,
+}
+
+/// Outcome tallies for one plane's records, in outcome order so the rendering is stable.
+type OutcomeCounts = BTreeMap<String, u32>;
 
 struct SkillCallRecord {
     turn: u32,
@@ -258,6 +462,14 @@ struct TraceMetrics {
     capsule_version: String,
     model: String,
     max_turns: u32,
+    capabilities: Vec<String>,
+    tools_declared: Vec<String>,
+    containment_declared: Option<String>,
+    containment_achieved: Option<String>,
+    workdir_exec: Option<bool>,
+    userns_grant: Option<String>,
+    system_prompt_source: Option<String>,
+    system_prompt_sha256: Option<String>,
     exit_status: String,
     duration_ms: u64,
     total_turns: u32,
@@ -269,7 +481,8 @@ struct TraceMetrics {
     tool_latencies_ms: Vec<u64>,
     tool_call_records: Vec<ToolCallRecord>,
     redundant_calls: Vec<RedundantCallRecord>,
-    inference_turns: Vec<(u32, String)>,
+    inference_records: Vec<InferenceRecord>,
+    provider_tokens: Option<ProviderTokens>,
     total_shell_calls: u32,
     shell_exit_codes: HashMap<i32, u32>,
     shell_latencies_ms: Vec<u64>,
@@ -283,6 +496,18 @@ struct TraceMetrics {
     compactions_declined: Vec<CompactionDeclinedRecord>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
+    /// Every `context_seed` record, in file order — one per seeded task.
+    context_seeds: Vec<ContextSeedRecord>,
+    /// Every `hook_dispatch_error` record, in file order.
+    hook_failures: Vec<HookFailureRecord>,
+    resource_lists: OutcomeCounts,
+    resource_reads: OutcomeCounts,
+    peer_mints: OutcomeCounts,
+    peer_redeems: OutcomeCounts,
+    peer_fetches: OutcomeCounts,
+    a2a_tasks_received: u32,
+    /// The peer URL of every `a2a_send`, in file order.
+    a2a_sends: Vec<String>,
 }
 
 /// One `task_reopened` trace record, surfaced in `mur trace show`.
@@ -369,6 +594,18 @@ struct TaskMetrics {
 // ── Parsing ───────────────────────────────────────────────────────────────────
 
 fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
+    Ok(parse_trace_records(path)?
+        .into_iter()
+        .map(|record| record.event)
+        .collect())
+}
+
+/// Parse every line into the event this build understands plus its place in the tree.
+///
+/// Tolerance and strictness are the file's contract: an unknown key on a known event type is
+/// ignored, an unknown event type becomes [`TraceEvent::Unknown`], and a line that is not
+/// valid JSON aborts with `E-TRC-001` naming `file:line`.
+fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
     let content = fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => CliError::new(
             E_IO_001,
@@ -384,7 +621,13 @@ fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
             continue;
         }
         match serde_json::from_str::<TraceEvent>(line) {
-            Ok(ev) => events.push(ev),
+            // Identity is read in a second pass over the same line, so the event structs stay
+            // payload-only rather than repeating three keys apiece. Every field defaults, so
+            // this cannot fail where the event parse succeeded on an object.
+            Ok(event) => events.push(TraceRecord {
+                identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+                event,
+            }),
             Err(err) => {
                 return Err(CliError::new(
                     E_TRC_001,
@@ -492,7 +735,8 @@ fn compute_metrics(
     // invalidated when a later call declares it *mutated* (or is undeclared, treated
     // conservatively as a mutate) against the same resource.
     let mut resource_last_access: HashMap<String, u32> = HashMap::new();
-    let mut inference_turns: Vec<(u32, String)> = Vec::new();
+    let mut inference_records: Vec<InferenceRecord> = Vec::new();
+    let mut provider_tokens: Option<ProviderTokens> = None;
     let mut shell_exit_codes: HashMap<i32, u32> = HashMap::new();
     let mut shell_latencies: Vec<u64> = Vec::new();
     let mut skill_ok = 0u32;
@@ -506,12 +750,42 @@ fn compute_metrics(
     let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
+    let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
+    let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
+    let mut resource_lists = OutcomeCounts::new();
+    let mut resource_reads = OutcomeCounts::new();
+    let mut peer_mints = OutcomeCounts::new();
+    let mut peer_redeems = OutcomeCounts::new();
+    let mut peer_fetches = OutcomeCounts::new();
+    let mut a2a_tasks_received = 0u32;
+    let mut a2a_sends: Vec<String> = Vec::new();
 
     for event in events {
         match event {
             TraceEvent::SessionStart(e) => ss = Some(e),
             TraceEvent::Inference(e) => {
-                inference_turns.push((e.turn, e.decision));
+                // Summed over every record that reported them, a hook's `run-inference`
+                // included: these are what the provider billed the session for.
+                if e.input_tokens_actual.is_some()
+                    || e.output_tokens_actual.is_some()
+                    || e.cached_tokens.is_some()
+                    || e.cache_write_tokens.is_some()
+                {
+                    let totals = provider_tokens.get_or_insert_with(ProviderTokens::default);
+                    totals.input += e.input_tokens_actual.unwrap_or(0);
+                    totals.output += e.output_tokens_actual.unwrap_or(0);
+                    totals.cached += e.cached_tokens.unwrap_or(0);
+                    totals.cache_write += e.cache_write_tokens.unwrap_or(0);
+                }
+                inference_records.push(InferenceRecord {
+                    turn: e.turn,
+                    decision: e.decision,
+                    origin: e.origin,
+                    system_sha: e.system_sha,
+                    tools_sha: e.tools_sha,
+                    response_sha: e.response_sha,
+                    message_shas: e.message_shas,
+                });
             }
             TraceEvent::ToolCall(e) => {
                 tool_latencies.push(e.duration_ms);
@@ -610,6 +884,31 @@ fn compute_metrics(
                     reason: e.reason,
                 });
             }
+            TraceEvent::ContextSeed(e) => {
+                context_seeds.push(ContextSeedRecord {
+                    hook_name: e.hook_name,
+                    tokens: e.tokens,
+                    proposed_tokens: e.proposed_tokens,
+                    budget_tokens: e.budget_tokens,
+                    outcome: e.outcome,
+                    reason: e.reason,
+                    message_ids: e.message_ids,
+                });
+            }
+            TraceEvent::HookDispatchError(e) => {
+                hook_failures.push(HookFailureRecord {
+                    hook_name: e.hook_name,
+                    event: e.event,
+                    arm: e.arm,
+                });
+            }
+            TraceEvent::ResourceList(e) => *resource_lists.entry(e.outcome).or_insert(0) += 1,
+            TraceEvent::ResourceRead(e) => *resource_reads.entry(e.outcome).or_insert(0) += 1,
+            TraceEvent::PeerHandleMint(e) => *peer_mints.entry(e.outcome).or_insert(0) += 1,
+            TraceEvent::PeerHandleRedeem(e) => *peer_redeems.entry(e.outcome).or_insert(0) += 1,
+            TraceEvent::PeerFileFetch(e) => *peer_fetches.entry(e.outcome).or_insert(0) += 1,
+            TraceEvent::A2aTaskReceived => a2a_tasks_received += 1,
+            TraceEvent::A2aSend(e) => a2a_sends.push(e.peer_url),
             TraceEvent::Unknown => {}
         }
     }
@@ -634,6 +933,14 @@ fn compute_metrics(
             capsule_version: ss.capsule_version,
             model: ss.model,
             max_turns: ss.max_turns,
+            capabilities: ss.capabilities,
+            tools_declared: ss.tools_declared,
+            containment_declared: ss.containment_declared,
+            containment_achieved: ss.containment_achieved,
+            workdir_exec: ss.workdir_exec,
+            userns_grant: ss.userns_grant,
+            system_prompt_source: ss.system_prompt_source,
+            system_prompt_sha256: ss.system_prompt_sha256,
             exit_status: se.exit_status,
             duration_ms: se.duration_ms,
             total_turns: se.total_turns,
@@ -645,7 +952,8 @@ fn compute_metrics(
             tool_latencies_ms: tool_latencies,
             tool_call_records,
             redundant_calls,
-            inference_turns,
+            inference_records,
+            provider_tokens,
             total_shell_calls: se.total_shell_calls,
             shell_exit_codes,
             shell_latencies_ms: shell_latencies,
@@ -656,6 +964,15 @@ fn compute_metrics(
             compaction,
             compactions_declined,
             reopens,
+            context_seeds,
+            hook_failures,
+            resource_lists,
+            resource_reads,
+            peer_mints,
+            peer_redeems,
+            peer_fetches,
+            a2a_tasks_received,
+            a2a_sends,
         },
         task_metrics,
     ))
@@ -916,6 +1233,37 @@ fn fmt_exit_codes(codes: &HashMap<i32, u32>) -> String {
     parts.join(", ")
 }
 
+/// How many characters of a sha256 the human-readable sections print. Long enough to
+/// distinguish two hashes at a glance, short enough to leave a turn on one line; a `--body`
+/// selector accepts any prefix of 8 or more.
+const SHA_DISPLAY_LEN: usize = 12;
+
+/// A hash abbreviated for reading, with an ellipsis marking what was cut. Never the value a
+/// reader should copy back into `--body` blindly — though a 12-character prefix is accepted.
+fn fmt_sha_short(sha: &str) -> String {
+    match sha.char_indices().nth(SHA_DISPLAY_LEN) {
+        Some((i, _)) => format!("{}…", &sha[..i]),
+        None => sha.to_string(),
+    }
+}
+
+/// An id abbreviated to `len` characters, with an ellipsis when anything was cut.
+fn fmt_id_short(id: &str, len: usize) -> String {
+    match id.char_indices().nth(len) {
+        Some((i, _)) => format!("{}…", &id[..i]),
+        None => id.to_string(),
+    }
+}
+
+/// `<n> ok, <n> refused-with-this-code`, in outcome order.
+fn fmt_outcomes(counts: &OutcomeCounts) -> String {
+    counts
+        .iter()
+        .map(|(outcome, count)| format!("{count} {outcome}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn fmt_session_short(id: &str) -> String {
     let short_len = "ses_".len() + 8;
     if id.len() > short_len {
@@ -934,7 +1282,66 @@ fn print_show(m: &TraceMetrics) {
     println!("model:      {}", m.model);
     println!("status:     {}", m.exit_status);
     println!("duration:   {}", fmt_dur(m.duration_ms));
+    if !m.capabilities.is_empty() {
+        println!("{:<11} {}", "capabilities:", m.capabilities.join(", "));
+    }
+    if !m.tools_declared.is_empty() {
+        println!("{:<11} {}", "tools:", m.tools_declared.join(", "));
+    }
+    // What was asked for against what this host could enforce. The two are read together:
+    // a capsule that declared `sealed` and achieved `advisory` ran with neither.
+    if let (Some(declared), Some(achieved)) = (&m.containment_declared, &m.containment_achieved) {
+        println!("{:<11} {} → {}", "containment:", declared, achieved);
+    }
+    if let Some(exec) = m.workdir_exec {
+        println!(
+            "{:<11} {}",
+            "workdir exec:",
+            if exec { "yes" } else { "no" }
+        );
+    }
+    if let Some(grant) = &m.userns_grant {
+        println!("{:<11} {}", "userns:", grant);
+    }
+    if let Some(source) = &m.system_prompt_source {
+        let sha = match &m.system_prompt_sha256 {
+            Some(sha) => format!("  {}", fmt_sha_short(sha)),
+            None => String::new(),
+        };
+        println!("{:<11} {}{}", "prompt:", source, sha);
+    }
     println!();
+
+    // Placed where it cannot be scrolled past: a hook that failed left the session running
+    // as if it had returned nothing, and no other section says so.
+    if !m.hook_failures.is_empty() {
+        println!("── Hook failures ────────────────────────────────");
+        for f in &m.hook_failures {
+            println!("✗ {}  {}  {}", f.hook_name, f.event, f.arm);
+        }
+        println!();
+    }
+
+    if !m.context_seeds.is_empty() {
+        println!("── Context ──────────────────────────────────────");
+        for seed in &m.context_seeds {
+            println!(
+                "{}  {}  {} tokens (proposed {}, budget {})",
+                seed.hook_name,
+                seed.outcome,
+                fmt_thousands(seed.tokens),
+                fmt_thousands(seed.proposed_tokens),
+                fmt_thousands(seed.budget_tokens)
+            );
+            if let Some(reason) = &seed.reason {
+                println!("  reason:   {}", reason);
+            }
+            if !seed.message_ids.is_empty() {
+                println!("  messages: {}", seed.message_ids.join(", "));
+            }
+        }
+        println!();
+    }
 
     println!("── Turns ────────────────────────────────────────");
     println!("count:      {}  (max: {})", m.total_turns, m.max_turns);
@@ -955,7 +1362,52 @@ fn print_show(m: &TraceMetrics) {
         "total:      {}",
         fmt_thousands(m.total_input_tokens + m.total_output_tokens)
     );
+    // The provider's own counts, beside the runtime's tiktoken estimates above rather than
+    // replacing them: the difference between the two lines is estimator drift.
+    if let Some(p) = &m.provider_tokens {
+        println!(
+            "provider:   in {}, out {}, cached {}, cache write {}",
+            fmt_thousands(p.input),
+            fmt_thousands(p.output),
+            fmt_thousands(p.cached),
+            fmt_thousands(p.cache_write)
+        );
+    }
     println!();
+
+    let wire_turns: Vec<&InferenceRecord> = m
+        .inference_records
+        .iter()
+        .filter(|rec| rec.is_agent_loop() && rec.has_hashes())
+        .collect();
+    if !wire_turns.is_empty() {
+        println!("── Wire ─────────────────────────────────────────");
+        for rec in &wire_turns {
+            println!(
+                "turn {}  system {}  tools {}  response {}  {} message{}",
+                rec.turn,
+                rec.system_sha
+                    .as_deref()
+                    .map(fmt_sha_short)
+                    .unwrap_or_else(|| "—".to_string()),
+                rec.tools_sha
+                    .as_deref()
+                    .map(fmt_sha_short)
+                    .unwrap_or_else(|| "—".to_string()),
+                rec.response_sha
+                    .as_deref()
+                    .map(fmt_sha_short)
+                    .unwrap_or_else(|| "—".to_string()),
+                rec.message_shas.len(),
+                if rec.message_shas.len() == 1 { "" } else { "s" }
+            );
+        }
+        println!(
+            "bodies:     mur trace show --body system --turn {}",
+            wire_turns[0].turn
+        );
+        println!();
+    }
 
     println!("── Tool calls ───────────────────────────────────");
     if m.total_tool_calls == 0 {
@@ -974,9 +1426,9 @@ fn print_show(m: &TraceMetrics) {
             by_turn.entry(rec.turn).or_default().push(rec);
         }
         let inference_map: BTreeMap<u32, &str> = m
-            .inference_turns
+            .inference_records
             .iter()
-            .map(|(t, d)| (*t, d.as_str()))
+            .map(|rec| (rec.turn, rec.decision.as_str()))
             .collect();
         let all_turns: BTreeSet<u32> = by_turn
             .keys()
@@ -1086,18 +1538,352 @@ fn print_show(m: &TraceMetrics) {
             );
         }
     }
+
+    if !m.resource_lists.is_empty() || !m.resource_reads.is_empty() {
+        println!();
+        println!("── Resource plane ───────────────────────────────");
+        if !m.resource_lists.is_empty() {
+            println!("list:       {}", fmt_outcomes(&m.resource_lists));
+        }
+        if !m.resource_reads.is_empty() {
+            println!("read:       {}", fmt_outcomes(&m.resource_reads));
+        }
+    }
+
+    if !m.peer_mints.is_empty() || !m.peer_redeems.is_empty() || !m.peer_fetches.is_empty() {
+        println!();
+        println!("── Peer files ───────────────────────────────────");
+        if !m.peer_mints.is_empty() {
+            println!("minted:     {}", fmt_outcomes(&m.peer_mints));
+        }
+        if !m.peer_redeems.is_empty() {
+            println!("redeemed:   {}", fmt_outcomes(&m.peer_redeems));
+        }
+        if !m.peer_fetches.is_empty() {
+            println!("fetched:    {}", fmt_outcomes(&m.peer_fetches));
+        }
+    }
+
+    if m.a2a_tasks_received > 0 || !m.a2a_sends.is_empty() {
+        println!();
+        println!("── A2A ──────────────────────────────────────────");
+        println!(
+            "received:   {} task{}",
+            m.a2a_tasks_received,
+            if m.a2a_tasks_received == 1 { "" } else { "s" }
+        );
+        println!(
+            "sent:       {} message{}",
+            m.a2a_sends.len(),
+            if m.a2a_sends.len() == 1 { "" } else { "s" }
+        );
+        let mut peers: Vec<&String> = Vec::new();
+        for url in &m.a2a_sends {
+            if !peers.contains(&url) {
+                peers.push(url);
+            }
+        }
+        for url in peers {
+            println!("  → {}", url);
+        }
+    }
+}
+
+// ── Bodies ────────────────────────────────────────────────────────────────────
+
+/// The content-addressed store the runtime writes beside `trace.jsonl` under
+/// `trace.capture: content`, one file per distinct body named by its own sha256. Spelled out
+/// here because the runtime's own constant is private to `capsule-runtime`.
+const BLOB_DIR_NAME: &str = "blobs";
+
+/// The shortest `--body <sha>` prefix that is accepted. Eight hex characters is where a
+/// prefix stops being a plausible typo for one of the named selectors.
+const SHA_PREFIX_MIN: usize = 8;
+
+/// The length of a full lowercase-hex sha256 — a blob's whole filename.
+const SHA_FULL_LEN: usize = 64;
+
+/// One piece of the request a turn put on the wire.
+#[derive(Clone, Copy)]
+enum WirePiece {
+    System,
+    Tools,
+    Response,
+    /// The message at this 0-based position in the turn's `message_shas`.
+    Message(usize),
+}
+
+impl WirePiece {
+    /// How the piece is named in a failure message, reading as prose after a turn number.
+    fn label(self) -> String {
+        match self {
+            WirePiece::System => "system prompt".to_string(),
+            WirePiece::Tools => "tool schemas".to_string(),
+            WirePiece::Response => "response".to_string(),
+            WirePiece::Message(i) => format!("message {i}"),
+        }
+    }
+}
+
+/// What a `--body` argument names.
+enum BodySelector {
+    /// A piece of one named turn's request, resolved against that turn's `inference` record.
+    Piece(WirePiece),
+    /// A hash given directly: a full sha256, or a prefix of at least [`SHA_PREFIX_MIN`]
+    /// characters naming exactly one hash in the trace.
+    Sha(String),
+}
+
+fn parse_body_selector(arg: &str) -> Result<BodySelector, CliError> {
+    match arg {
+        "system" => return Ok(BodySelector::Piece(WirePiece::System)),
+        "tools" => return Ok(BodySelector::Piece(WirePiece::Tools)),
+        "response" => return Ok(BodySelector::Piece(WirePiece::Response)),
+        _ => {}
+    }
+    if let Some(index) = arg.strip_prefix("message:") {
+        let i: usize = index.parse().map_err(|_| {
+            CliError::new(
+                E_TRC_001,
+                format!("--body message:<i> expects a 0-based index, got '{index}'"),
+            )
+        })?;
+        return Ok(BodySelector::Piece(WirePiece::Message(i)));
+    }
+    let is_hash = arg.len() >= SHA_PREFIX_MIN
+        && arg.len() <= SHA_FULL_LEN
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    if is_hash {
+        return Ok(BodySelector::Sha(arg.to_string()));
+    }
+    Err(CliError::new(
+        E_TRC_001,
+        format!(
+            "unrecognised --body selector '{arg}' — expected system, tools, response, \
+             message:<i>, or a sha256 (full, or a prefix of {SHA_PREFIX_MIN}+ characters)"
+        ),
+    ))
+}
+
+/// Every hash a trace names that a blob could be stored under, plus the agent loop's own
+/// turns. Built without requiring a `session_end`, so a body can be pulled out of a session
+/// that is still running.
+struct WireIndex {
+    turns: Vec<InferenceRecord>,
+    /// In file order, deduplicated: `session_start.system_prompt_sha256` first, then each
+    /// turn's system, tools, response and message hashes.
+    known_hashes: Vec<String>,
+}
+
+impl WireIndex {
+    fn build(events: Vec<TraceEvent>) -> Self {
+        let mut turns = Vec::new();
+        let mut known_hashes: Vec<String> = Vec::new();
+        fn note(hash: Option<&String>, known: &mut Vec<String>) {
+            if let Some(h) = hash {
+                if !known.iter().any(|k| k == h) {
+                    known.push(h.clone());
+                }
+            }
+        }
+        for event in events {
+            match event {
+                TraceEvent::SessionStart(e) => {
+                    note(e.system_prompt_sha256.as_ref(), &mut known_hashes);
+                }
+                TraceEvent::Inference(e) => {
+                    let record = InferenceRecord {
+                        turn: e.turn,
+                        decision: e.decision,
+                        origin: e.origin,
+                        system_sha: e.system_sha,
+                        tools_sha: e.tools_sha,
+                        response_sha: e.response_sha,
+                        message_shas: e.message_shas,
+                    };
+                    note(record.system_sha.as_ref(), &mut known_hashes);
+                    note(record.tools_sha.as_ref(), &mut known_hashes);
+                    note(record.response_sha.as_ref(), &mut known_hashes);
+                    for sha in &record.message_shas {
+                        note(Some(sha), &mut known_hashes);
+                    }
+                    if record.is_agent_loop() {
+                        turns.push(record);
+                    }
+                }
+                _ => {}
+            }
+        }
+        WireIndex {
+            turns,
+            known_hashes,
+        }
+    }
+
+    fn turn(&self, n: u32) -> Option<&InferenceRecord> {
+        self.turns.iter().find(|rec| rec.turn == n)
+    }
+
+    /// `1, 2, 3` — the turns a `--turn` argument can name.
+    fn turn_list(&self) -> String {
+        self.turns
+            .iter()
+            .map(|rec| rec.turn.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The hash a selector names, and how that hash is described in a failure message.
+fn resolve_body_hash(
+    index: &WireIndex,
+    arg: &str,
+    selector: BodySelector,
+    turn: Option<u32>,
+    blob_dir: &Path,
+) -> Result<(String, String), CliError> {
+    let piece = match selector {
+        BodySelector::Sha(prefix) => {
+            let matches: Vec<&String> = index
+                .known_hashes
+                .iter()
+                .filter(|h| h.starts_with(&prefix))
+                .collect();
+            return match matches.len() {
+                1 => Ok((matches[0].clone(), matches[0].clone())),
+                0 => {
+                    // A full hash the trace never named is still resolvable when its body is
+                    // on disk; otherwise the honest answer is that nothing named it.
+                    if prefix.len() == SHA_FULL_LEN && blob_dir.join(&prefix).exists() {
+                        Ok((prefix.clone(), prefix.clone()))
+                    } else {
+                        Err(CliError::new(
+                            E_TRC_001,
+                            format!("no hash in this trace matches {arg}"),
+                        ))
+                    }
+                }
+                n => Err(CliError::new(
+                    E_TRC_001,
+                    format!(
+                        "{arg} matches {n} hashes in this trace — provide more characters\n{}",
+                        matches
+                            .iter()
+                            .map(|h| format!("  {h}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    ),
+                )),
+            };
+        }
+        BodySelector::Piece(piece) => piece,
+    };
+
+    let Some(n) = turn else {
+        let turns = if index.turns.is_empty() {
+            "this trace has no inference records".to_string()
+        } else {
+            format!("this trace has turns {}", index.turn_list())
+        };
+        return Err(CliError::new(
+            E_TRC_001,
+            format!("--turn is required with --body {arg}; {turns}"),
+        ));
+    };
+    let record = index.turn(n).ok_or_else(|| {
+        CliError::new(
+            E_TRC_001,
+            format!("turn {n} has no inference record in this trace"),
+        )
+    })?;
+    if !record.has_hashes() {
+        return Err(CliError::new(
+            E_TRC_001,
+            format!(
+                "turn {n} recorded no content hashes — the session ran under trace.capture: none"
+            ),
+        ));
+    }
+
+    let hash = match piece {
+        WirePiece::System => record.system_sha.clone(),
+        WirePiece::Tools => record.tools_sha.clone(),
+        WirePiece::Response => record.response_sha.clone(),
+        WirePiece::Message(i) => {
+            if i >= record.message_shas.len() {
+                return Err(CliError::new(
+                    E_TRC_001,
+                    format!(
+                        "turn {n} recorded {} message{}; there is no message {i}",
+                        record.message_shas.len(),
+                        if record.message_shas.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                ));
+            }
+            Some(record.message_shas[i].clone())
+        }
+    };
+    let label = piece.label();
+    let hash =
+        hash.ok_or_else(|| CliError::new(E_TRC_001, format!("turn {n} recorded no {label} hash")))?;
+    Ok((hash.clone(), format!("turn {n} {label} {hash}")))
+}
+
+/// Print the recorded body behind one hash to stdout, and nothing else — no header, no added
+/// newline — so the output pipes into `sha256sum` and matches the blob's own name.
+fn print_body(path: &Path, arg: &str, turn: Option<u32>) -> Result<(), CliError> {
+    let selector = parse_body_selector(arg)?;
+    let index = WireIndex::build(parse_trace_file(path)?);
+    let blob_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(BLOB_DIR_NAME);
+    let (hash, described) = resolve_body_hash(&index, arg, selector, turn, &blob_dir)?;
+
+    let blob = blob_dir.join(&hash);
+    let bytes = fs::read(&blob).map_err(|e| match e.kind() {
+        // The hash is recorded, so the session ran under `meta` or better; a body that is not
+        // on disk means no body was ever stored, not that a file went missing.
+        std::io::ErrorKind::NotFound => CliError::new(
+            E_TRC_001,
+            format!("{described}: recorded under capture: meta; no body was stored"),
+        ),
+        _ => CliError::new(E_IO_003, format!("failed to read {}: {e}", blob.display())),
+    })?;
+
+    let mut out = std::io::stdout();
+    out.write_all(&bytes)
+        .and_then(|()| out.flush())
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to write body to stdout: {e}")))
 }
 
 pub(crate) fn run_trace_show(
     session: Option<String>,
     workdir_arg: Option<PathBuf>,
+    body: Option<String>,
+    turn: Option<u32>,
 ) -> Result<(), CliError> {
+    if body.is_none() && turn.is_some() {
+        return Err(CliError::new(
+            E_TRC_001,
+            "--turn has no meaning without --body",
+        ));
+    }
     let workdir = workdir_arg.unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("workdir")
     });
     let path = resolve_session(session, &workdir)?;
+    if let Some(arg) = &body {
+        return print_body(&path, arg, turn);
+    }
     let (metrics, tasks) = load_metrics(&path)?;
     print_show(&metrics);
     if tasks.len() > 1 {
@@ -1140,8 +1926,8 @@ pub(crate) fn run_trace_steps(
             .join("workdir")
     });
     let path = resolve_session(session, &workdir)?;
-    let events = parse_trace_file(&path)?;
-    if events.is_empty() {
+    let records = parse_trace_records(&path)?;
+    if records.is_empty() {
         return Err(CliError::new(
             E_TRC_001,
             format!(
@@ -1151,13 +1937,220 @@ pub(crate) fn run_trace_steps(
         ));
     }
 
+    // A trace written before the identity fields existed carries no `event_id` on any line
+    // and has no tree to walk, so it renders exactly the flat table it always did.
+    if records.iter().any(|r| r.identity.event_id.is_some()) {
+        print_steps_tree(&records, verbose);
+    } else {
+        print_steps_flat(&records, verbose);
+    }
+    Ok(())
+}
+
+/// The column a `steps` tree row's own detail starts in, after the event type that opens it.
+const STEPS_KIND_WIDTH: usize = 11;
+
+/// One row of the `steps` tree, or `None` for a line the tree does not render — its children
+/// (it has none) would hang off its own parent.
+fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
+    // Every row but a turn's own opens with the event type it came from, padded so the rows
+    // under one turn line up; a name past the column keeps a single separating space.
+    let kind = |name: &str| {
+        if name.len() >= STEPS_KIND_WIDTH {
+            format!("{name} ")
+        } else {
+            format!("{name:<STEPS_KIND_WIDTH$}")
+        }
+    };
+    Some(match &record.event {
+        TraceEvent::TaskStart(e) => {
+            let source = if e.source.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", e.source)
+            };
+            let context = if e.context_id.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", fmt_id_short(&e.context_id, 12))
+            };
+            format!("task {}{}{}", fmt_id_short(&e.task_id, 12), context, source)
+        }
+        TraceEvent::Inference(e) => match &e.origin {
+            // A hook's completion is not a turn of the agent loop; it hangs off the turn it
+            // ran inside.
+            Some(origin) => format!("{}{}  {}", kind("inference"), origin, e.decision),
+            None => match &e.tool_name {
+                Some(tool) => format!("turn {}  {}  {}", e.turn, e.decision, tool),
+                None => format!("turn {}  {}", e.turn, e.decision),
+            },
+        },
+        TraceEvent::ToolCall(e) => format!(
+            "{}{}  {}  {}{}",
+            kind("tool_call"),
+            e.tool_name,
+            fmt_dur(e.duration_ms),
+            if e.status == "ok" { "✓" } else { "✗" },
+            if verbose {
+                e.input
+                    .as_ref()
+                    .map(|v| {
+                        let summary = extract_input_summary(v);
+                        if summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {summary}")
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        ),
+        TraceEvent::Shell(e) => format!(
+            "{}{}  exit {}  {}",
+            kind("shell"),
+            e.binary.as_deref().unwrap_or("—"),
+            e.exit_code,
+            fmt_dur(e.duration_ms)
+        ),
+        TraceEvent::SkillCall(e) => format!(
+            "{}{}  {}  {}",
+            kind("skill_call"),
+            e.skill_name,
+            fmt_dur(e.duration_ms),
+            if e.status == "ok" { "✓" } else { "✗" }
+        ),
+        TraceEvent::Compaction(e) => format!(
+            "{}{} → {} tokens",
+            kind("compaction"),
+            fmt_thousands(e.tokens_before),
+            fmt_thousands(e.tokens_after)
+        ),
+        TraceEvent::CompactionDeclined(e) => format!(
+            "{}{} tokens  {}",
+            kind("compaction_declined"),
+            fmt_thousands(e.tokens),
+            e.reason
+        ),
+        TraceEvent::ContextSeed(e) => format!(
+            "{}{}  {}  {} tokens",
+            kind("context_seed"),
+            e.hook_name,
+            e.outcome,
+            fmt_thousands(e.tokens)
+        ),
+        TraceEvent::TaskReopened(e) => format!(
+            "{}{}  reopen {}",
+            kind("task_reopened"),
+            e.hook_name,
+            e.reopen_number
+        ),
+        _ => return None,
+    })
+}
+
+/// Render the session → task → turn tree by following `parent_id`, one indent level per
+/// rendered ancestor, in file order within each parent.
+fn print_steps_tree(records: &[TraceRecord], verbose: bool) {
+    let mut session_id = String::new();
+    let mut tasks = 0usize;
+    let mut turns = 0usize;
+    // `event_id` → index, and `task_id` → the index of that task's `task_start`, which is
+    // how a turn-level line whose `parent_id` names nothing in this file is still attributed.
+    let mut by_event_id: HashMap<&str, usize> = HashMap::new();
+    let mut task_nodes: HashMap<&str, usize> = HashMap::new();
+    for (i, record) in records.iter().enumerate() {
+        if let Some(id) = &record.identity.event_id {
+            by_event_id.insert(id.as_str(), i);
+        }
+        match &record.event {
+            TraceEvent::SessionStart(e) => session_id = e.session_id.clone(),
+            TraceEvent::TaskStart(e) => {
+                tasks += 1;
+                task_nodes.insert(e.task_id.as_str(), i);
+            }
+            TraceEvent::Inference(e) if e.origin.is_none() => turns += 1,
+            _ => {}
+        }
+    }
+
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, record) in records.iter().enumerate() {
+        let parent = record
+            .identity
+            .parent_id
+            .as_deref()
+            .and_then(|pid| by_event_id.get(pid).copied())
+            .or_else(|| {
+                record
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .and_then(|tid| task_nodes.get(tid).copied())
+                    .filter(|&t| t != i)
+            });
+        match parent {
+            Some(p) => children.entry(p).or_default().push(i),
+            None => roots.push(i),
+        }
+    }
+
+    let task_note = match tasks {
+        0 => String::new(),
+        1 => "1 task, ".to_string(),
+        n => format!("{n} tasks, "),
+    };
+    println!(
+        "Session {}  ({}{} turn{})",
+        session_id,
+        task_note,
+        turns,
+        if turns == 1 { "" } else { "s" }
+    );
+
+    for root in roots {
+        walk_steps_tree(records, &children, root, 0, verbose);
+    }
+    println!();
+}
+
+fn walk_steps_tree(
+    records: &[TraceRecord],
+    children: &HashMap<usize, Vec<usize>>,
+    index: usize,
+    depth: usize,
+    verbose: bool,
+) {
+    let child_depth = match steps_row(&records[index], verbose) {
+        Some(row) => {
+            if matches!(records[index].event, TraceEvent::TaskStart(_)) {
+                println!();
+            }
+            println!("{}{}", "  ".repeat(depth), row);
+            depth + 1
+        }
+        // A line the tree does not render — `session_start` itself, and the session-level
+        // records `mur trace show` covers — leaves its children at its own depth.
+        None => depth,
+    };
+    if let Some(kids) = children.get(&index) {
+        for &child in kids {
+            walk_steps_tree(records, children, child, child_depth, verbose);
+        }
+    }
+}
+
+/// The turn-per-row table `steps` has always printed, for a trace with no identity fields.
+fn print_steps_flat(records: &[TraceRecord], verbose: bool) {
     let mut session_id = String::new();
     let mut inferences: Vec<(u32, String, Option<String>)> = Vec::new();
     let mut tool_durations: HashMap<u32, u64> = HashMap::new();
     let mut tool_inputs: HashMap<u32, String> = HashMap::new();
 
-    for event in &events {
-        match event {
+    for record in records {
+        match &record.event {
             TraceEvent::SessionStart(e) => session_id = e.session_id.clone(),
             TraceEvent::Inference(e) => {
                 inferences.push((e.turn, e.decision.clone(), e.tool_name.clone()));
@@ -1233,7 +2226,6 @@ pub(crate) fn run_trace_steps(
     }
 
     println!();
-    Ok(())
 }
 
 fn extract_input_summary(v: &serde_json::Value) -> String {
@@ -1504,6 +2496,143 @@ fn print_diff(a: &TraceMetrics, b: &TraceMetrics) {
     );
 }
 
+/// The agent loop's own turns that recorded wire hashes, in file order.
+fn hashed_turns(m: &TraceMetrics) -> Vec<&InferenceRecord> {
+    m.inference_records
+        .iter()
+        .filter(|rec| rec.is_agent_loop() && rec.has_hashes())
+        .collect()
+}
+
+/// One run's answer for a piece that is fixed across the session, and the turn (if any) that
+/// changed it mid-run.
+fn prefix_piece<'a>(
+    turns: &[&'a InferenceRecord],
+    pick: fn(&'a InferenceRecord) -> Option<&'a String>,
+) -> (Option<&'a String>, Option<(u32, &'a String)>) {
+    let mut first: Option<&String> = None;
+    let mut changed: Option<(u32, &String)> = None;
+    for rec in turns {
+        let Some(value) = pick(rec) else { continue };
+        match first {
+            None => first = Some(value),
+            Some(seen) if seen != value && changed.is_none() => {
+                changed = Some((rec.turn, value));
+            }
+            _ => {}
+        }
+    }
+    (first, changed)
+}
+
+/// Render one fixed-across-the-session piece: what each run recorded, and whether they agree.
+fn print_prefix_line(label: &str, a: Option<&String>, b: Option<&String>) {
+    let body = match (a, b) {
+        (Some(x), Some(y)) if x == y => format!("{:<10} {}", "identical", fmt_sha_short(x)),
+        (Some(x), Some(y)) => format!(
+            "{:<10} A {}  B {}",
+            "differs",
+            fmt_sha_short(x),
+            fmt_sha_short(y)
+        ),
+        (Some(x), None) => format!("{:<10} A {}  B not recorded", "only in A", fmt_sha_short(x)),
+        (None, Some(y)) => format!("{:<10} A not recorded  B {}", "only in B", fmt_sha_short(y)),
+        (None, None) => format!("{:<10}", "not recorded"),
+    };
+    println!("{:<15}{}", label, body);
+}
+
+/// Where two runs' prompts stopped agreeing — the answer to "why did my cache miss".
+///
+/// Divergence has no polarity: neither run is better for having a longer or shorter agreeing
+/// prefix, so no `(A better)`/`(B better)` marker appears anywhere in this section.
+fn print_prefix_divergence(a: &TraceMetrics, b: &TraceMetrics) {
+    println!();
+    println!("── Prefix divergence ────────────────────────────");
+
+    let turns_a = hashed_turns(a);
+    let turns_b = hashed_turns(b);
+    // Nothing to compare: `trace.capture: none` writes no hashes at all, which is a different
+    // record from a session that recorded hashes and stored no bodies.
+    match (turns_a.is_empty(), turns_b.is_empty()) {
+        (true, true) => {
+            println!(
+                "runs A and B recorded no content hashes — both ran under trace.capture: none"
+            );
+            return;
+        }
+        (true, false) => {
+            println!("run A recorded no content hashes — it ran under trace.capture: none");
+            return;
+        }
+        (false, true) => {
+            println!("run B recorded no content hashes — it ran under trace.capture: none");
+            return;
+        }
+        (false, false) => {}
+    }
+
+    let (sys_a, sys_changed_a) = prefix_piece(&turns_a, |rec| rec.system_sha.as_ref());
+    let (sys_b, sys_changed_b) = prefix_piece(&turns_b, |rec| rec.system_sha.as_ref());
+    print_prefix_line("system prompt:", sys_a, sys_b);
+    let (tools_a, _) = prefix_piece(&turns_a, |rec| rec.tools_sha.as_ref());
+    let (tools_b, _) = prefix_piece(&turns_b, |rec| rec.tools_sha.as_ref());
+    print_prefix_line("tool schemas:", tools_a, tools_b);
+    for (run, changed) in [("A", sys_changed_a), ("B", sys_changed_b)] {
+        if let Some((turn, sha)) = changed {
+            println!(
+                "note:          run {} changes its system prompt at turn {} ({})",
+                run,
+                turn,
+                fmt_sha_short(sha)
+            );
+        }
+    }
+
+    // Messages are paired by turn and compared element-wise: the first unequal position is
+    // where the shared prefix — and any provider-side cache hit resting on it — ends.
+    let turn_numbers: BTreeSet<u32> = turns_a
+        .iter()
+        .chain(turns_b.iter())
+        .map(|rec| rec.turn)
+        .collect();
+    for turn in turn_numbers {
+        let in_a = turns_a.iter().find(|rec| rec.turn == turn);
+        let in_b = turns_b.iter().find(|rec| rec.turn == turn);
+        let line = match (in_a, in_b) {
+            (Some(ra), Some(rb)) => {
+                let (ma, mb) = (&ra.message_shas, &rb.message_shas);
+                match ma.iter().zip(mb.iter()).position(|(x, y)| x != y) {
+                    Some(i) => format!(
+                        "diverges at message {i}  A {}  B {}",
+                        fmt_sha_short(&ma[i]),
+                        fmt_sha_short(&mb[i])
+                    ),
+                    // Equal as far as both go: one array being a prefix of the other diverges
+                    // at the shorter one's length, where a message exists in only one run.
+                    None if ma.len() == mb.len() => {
+                        format!(
+                            "identical  ({} message{})",
+                            ma.len(),
+                            if ma.len() == 1 { "" } else { "s" }
+                        )
+                    }
+                    None => format!(
+                        "diverges at message {}  (A has {} messages, B has {})",
+                        ma.len().min(mb.len()),
+                        ma.len(),
+                        mb.len()
+                    ),
+                }
+            }
+            (Some(_), None) => "only in run A".to_string(),
+            (None, Some(_)) => "only in run B".to_string(),
+            (None, None) => continue,
+        };
+        println!("turn {}:  {}", turn, line);
+    }
+}
+
 pub(crate) fn run_trace_diff(
     before: Option<String>,
     after: Option<String>,
@@ -1543,6 +2672,7 @@ pub(crate) fn run_trace_diff(
     let (ma, _) = load_metrics(&path_a)?;
     let (mb, _) = load_metrics(&path_b)?;
     print_diff(&ma, &mb);
+    print_prefix_divergence(&ma, &mb);
     Ok(())
 }
 
