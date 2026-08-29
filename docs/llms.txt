@@ -1,0 +1,108 @@
+# murmur Documentation
+
+> Curated documentation map for developers and coding agents working with murmur, the infrastructure layer for AI agents.
+
+<!--
+  This file is CURATED, not generated. The build copies it verbatim over
+  leadtype's generated llms.txt (scripts/agent-artifacts.mjs).
+
+  Edit freely: cut pages that do not help an agent orient, reorder by
+  importance rather than nav order, and rewrite descriptions to say when a
+  page is the right one to read.
+-->
+
+## How To Use This File
+
+Read the summary links first. If the page links are not enough, use `/llms-full.txt` as the broad full-context fallback — every page concatenated into one file.
+
+## Start Here
+
+- [Home](/index.md): What murmur is: agents packaged as a single capsule — inference, tools, skills, and configuration in one manifest — run on your own infrastructure, fully isolated.
+- [Overview](/getting-started/overview.md): The mental model: a capsule as the unit of packaging, the manifest as the whole contract, and what "fully isolated" means in practice.
+- [Quickstart](/getting-started/quickstart.md): From an empty directory to a running, inspectable agent capsule using nothing but a manifest.
+
+## Concepts
+
+- [Capsules](/concepts/capsules.md): Murmur's primary execution abstraction — the unit that packages an agent's inference, tools, skills, and configuration together.
+- [Artifacts](/concepts/artifacts.md): Tools, drivers, hooks, and skills — the named, versioned pieces a capsule's manifest declares as dependencies.
+- [Session Loop](/concepts/session-loop.md): The runtime's native execution environment for a capsule: the inference loop and its extension points (tools, hooks, drivers).
+- [Hooks](/concepts/hooks.md): An artifact that observes a lifecycle point, receives structured input from the runtime, and can return output the runtime commits.
+- [Tools](/concepts/tools.md): How murmur defines tool artifacts — both WASM and native — and how the runtime invokes them during a session.
+- [Access Control](/concepts/access-control.md): The `capabilities` block: what a capsule and its artifacts are allowed to reach — filesystem, network, and subprocesses.
+- [Context](/concepts/context.md): Context compaction — how the runtime condenses message history automatically so a long-running session avoids hitting a hard token limit.
+- [Formations](/concepts/formations.md): The HTTP endpoint an active session serves — an Agent Card and a JSON-RPC task interface — so other capsules or agents can discover and address it.
+- [Observability](/concepts/observability.md): The structured trace every session writes to `workdir/<session_id>/trace.jsonl`, regardless of whether any hooks are declared.
+- [Registry](/concepts/registry.md): Murmur Nexus, the artifact registry: how capsules discover, install, and publish versioned artifacts.
+
+## How-to Guides
+
+### Agent Behavior
+
+- [Shape agent behavior with a system prompt](/how-to/capsule-system-prompt.md): The system parameter is injected on every inference call, not just the first turn — what that means for how you write it.
+- [Pause your agent for human input](/how-to/hitl-request-input.md): Handling a decision point the agent can't resolve alone — a target environment, an approval threshold, a destructive step needing sign-off.
+- [Give a capsule memory](/how-to/give-capsule-memory.md): By default every task starts from nothing; how to carry context across tasks.
+- [Enable context compaction](/how-to/context-compaction.md): Turning on automatic history condensation for sessions that run many turns.
+- [Decompose tasks recursively within a single capsule](/how-to/task-decomposition-single-capsule.md): Using the first turn as a router that identifies steps and dispatches each as a sub-task.
+
+### Security & Composition
+
+- [Lock down a capsule's capabilities](/how-to/lock-down-capsule.md): Scoping what a capsule can reach so a bug or a prompt injection can't turn into reading files or hosts it shouldn't.
+- [Connect two capsules with A2A messaging](/how-to/capsules-a2a-messaging.md): Having an orchestrator capsule delegate work to a worker capsule directly.
+- [Configure a long-running capsule](/how-to/long-running-capsule.md): Keeping a capsule alive across multiple tasks instead of the default exit-on-completion.
+
+### Observability & Evaluation
+
+- [Read your agent's trace and compare two runs](/how-to/read-trace-and-diff.md): Working with `trace.jsonl` — the full record of inference calls, tool invocations, shell commands, and compaction events.
+- [Work with capsule trace spans in Grafana](/how-to/grafana-tempo-spans.md): The OpenTelemetry span tree a session emits when `observability.otel_endpoint` is set, and how to read it in Tempo.
+- [Visualise capsule sessions with mur topology](/how-to/topology-view.md): Reconstructing which capsule called which from Grafana Tempo spans, rendered as an interactive graph.
+- [Score your agent's behavior with eval](/how-to/agent-eval-score.md): Running a capsule against a dataset of test cases and scoring each session automatically.
+
+### Packaging & Deployment
+
+- [Package a skill into an artifact](/how-to/package-skill-artifact.md): Packaging a `skill.md` file into a `.mur.zip` artifact the runtime installs alongside a capsule.
+- [Generate a capsule manifest with mur new](/how-to/generate-manifest.md): Turning a plain-language task description into a ready-to-refine `murmur.yaml`.
+- [Deploy a capsule to the cloud with mur deploy](/how-to/deploy-capsule-cloud.md): Uploading capsule files to a VM via SSH and getting back a public A2A endpoint.
+- [Run a capsule from the CLI or from another program](/how-to/different-ways-to-run-murmur.md): `mur run`'s two output modes and which callers each one serves.
+
+## Language Guides
+
+- [Python Tool Quickstart (WASM)](/language-guides/python.md): Packaging a Python tool as a WASM artifact for murmur's Rust-centric but language-agnostic ecosystem.
+- [Python Tool Quickstart (Native)](/language-guides/python-native.md): The native compatibility path for tools, for when WASM isn't the right fit.
+
+## Reference
+
+### CLI & Configuration
+
+- [CLI Commands](/reference/cli.md): The currently implemented `mur` CLI surface in this repository.
+- [Manifest Schema](/reference/manifest.md): `murmur.yaml`'s two roles — an artifact's own manifest, and a capsule's manifest that packages them.
+- [Configuration](/reference/config.md): The up-to-two YAML files `mur` reads and resolves into one effective config.
+
+### Runtime & Security
+
+- [Containment](/reference/containment.md): The enforcement tier each host resolves to, and the containment class a capsule can require of it.
+- [Resource Limits](/reference/resource-limits.md): `capabilities.limits` (bounding components) versus `capabilities.resources` (bounding OS processes).
+- [Session Workdir](/reference/workdir.md): The two directories every session runs against — what the capsule can see, and what the runtime keeps for bookkeeping.
+- [Resource Plane](/reference/resource-plane.md): The two read-only file surfaces a capsule serves under `/resources/`, each addressing a separate subtree for a separate audience.
+- [Diagnostics](/reference/diagnostics.md): Every `E-` (stops the command) and `W-` (warns, continues) code `mur` reports, indexed to the section that explains it.
+
+### Observability
+
+- [Observability Schemas](/reference/observability-schemas.md): The file formats a session writes and the OpenTelemetry span tree they map onto.
+
+### Artifacts & Registry
+
+- [Default Artifacts](/reference/default-artifacts.md): The artifacts murmur publishes — declare one in `artifacts:` and `mur install` fetches it; none has to be built locally.
+- [Installing Artifacts](/reference/installing-artifacts.md): How the way you reference an artifact determines what gets fetched and where authentication comes from.
+- [WIT Interfaces](/reference/wit-interfaces.md): Every WIT interface WASM artifacts use to talk to the runtime — who uses each one, and what it means for you.
+- [Nexus API](/reference/nexus-api.md): The artifact registry `mur` publishes to and installs from in remote registry mode.
+- [Roost API](/reference/roost-api.md): `mur-roost`, the local daemon that spawns capsules on request — its health check, spawn, and poll endpoints.
+
+## Contributing
+
+- [Overview](/contributing.md): Contributor guidelines — commit sign-off (DCO), employer contributions, and how reviews work.
+
+## Optional
+
+Lower-priority — safe to skip for a shorter context.
+
+- [Full documentation corpus](https://docs.murmur.nexus/llms-full.txt): Every page concatenated, for when the page map above is not enough.

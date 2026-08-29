@@ -36,11 +36,26 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: docs/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
       - name: Install docs dependencies
         run: pip install -r docs/requirements.txt
       - name: Build site
         working-directory: docs
         run: mkdocs build --strict
+      - name: Generate agent artifacts
+        working-directory: docs
+        run: |
+          npm ci
+          node scripts/agent-artifacts.mjs
+      - name: Test agent surface
+        working-directory: docs
+        # Checks the WebMCP tools against the artifacts just built and the
+        # CloudFront negotiation rules. Both fail only in production otherwise.
+        run: npm test
 
   deploy:
     name: deploy
@@ -60,6 +75,11 @@ jobs:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: docs/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
       - name: Install docs dependencies
         run: pip install -r docs/requirements.txt
       - uses: aws-actions/configure-aws-credentials@v4
