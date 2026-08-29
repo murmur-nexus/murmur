@@ -3,8 +3,8 @@ mod common;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader, ErrorKind, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -375,15 +375,32 @@ fn http_server_not_reachable_after_session_ends() {
     // of it until it execs, and the socket stays in LISTEN — completing handshakes nothing will
     // ever accept — for as long as that lasts. Pinning the port is what makes waiting it out
     // sound, since no other binder can claim the number in the meantime.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut connect_result = TcpStream::connect(&capsule_url);
-    while connect_result.is_ok() && Instant::now() < deadline {
+    //
+    // Only ECONNREFUSED proves the port is unbound. A listener nothing accepts on refuses nothing
+    // either: it completes handshakes until its backlog fills and then leaves connects hanging
+    // until the TCP retransmission timeout, so an unbounded `connect` that eventually errors is
+    // evidence the listener is *up*, not gone. Each attempt is bounded for the same reason.
+    let addr = capsule_url
+        .to_socket_addrs()
+        .expect("capsule_url should resolve")
+        .next()
+        .expect("capsule_url should resolve to at least one address");
+    let settle = Duration::from_secs(5);
+    let deadline = Instant::now() + settle;
+    let refused = loop {
+        let refused = matches!(
+            TcpStream::connect_timeout(&addr, Duration::from_millis(250)),
+            Err(ref e) if e.kind() == ErrorKind::ConnectionRefused
+        );
+        if refused || Instant::now() >= deadline {
+            break refused;
+        }
         thread::sleep(Duration::from_millis(25));
-        connect_result = TcpStream::connect(&capsule_url);
-    }
+    };
     assert!(
-        connect_result.is_err(),
-        "TCP connection to {capsule_url} should fail after session ends, but it succeeded"
+        refused,
+        "{capsule_url} still had a listener {settle:?} after the session ended; \
+         the capsule's HTTP server should be gone"
     );
 
     let _ = staged_workdir;

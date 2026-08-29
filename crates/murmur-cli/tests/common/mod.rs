@@ -429,10 +429,10 @@ pub fn create_shell_desc_driver_artifact(
 
 /// A pinned port, claimed for the lifetime of the test process.
 ///
-/// Deliberately **not** an OS-assigned `:0` port. Each capsule's manifest has to name the other's
-/// address, so the port must be known before either capsule launches — and an ephemeral port
-/// released to be named later can be handed straight back out, to another test in this binary or
-/// to one of this test's own scripted endpoints, in the window before the capsule binds it.
+/// For tests that need the number itself: to write into a manifest before the capsule that binds
+/// it launches, or to assert on after the capsule releases it. An OS-assigned `:0` port serves
+/// neither, because the number is only known once something has bound it, and once released it
+/// can be handed straight back out to any other binder in this process.
 ///
 /// Candidates come from below the Linux ephemeral range (32768–60999), so no `:0` bind anywhere in
 /// the process can be assigned one, and a process-wide claim set keeps two tests from picking the
