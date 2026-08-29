@@ -951,6 +951,7 @@ pub fn stage_session(
             .as_ref()
             .map(|t| t.capture)
             .unwrap_or_default(),
+        trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
@@ -1058,6 +1059,14 @@ pub fn launch_session(
                 inference,
                 &workdir,
             ),
+            // Ownership is claimed only by a capsule that declares a record policy: without one
+            // there is nothing retention needs the header for, and an upgrading capsule's record
+            // keeps the exact bytes it had.
+            record_owner: staged
+                .context
+                .as_ref()
+                .and_then(|context| context.retain)
+                .map(|_| staged.capsule_name.clone()),
             resume: staged.resume.as_ref().map(|resume| resume.mode),
         };
 
@@ -1216,6 +1225,12 @@ pub fn launch_session(
             .map(|d| d.artifact.clone())
             .filter(|a| !a.is_empty());
         let trace_capture = staged.trace_capture;
+        // Retention inputs, taken before `staged` and `run_config` are moved into the agent loop.
+        // Both are `None` on a capsule that declared no `retain:` block, and `None` deletes
+        // nothing, ever.
+        let trace_retain = staged.trace_retain;
+        let context_retain = staged.context.as_ref().and_then(|context| context.retain);
+        let retention_conversation_root = run_config.conversation_root.clone();
         // The trace records the *resolved* prompt — what `resolve_system_prompt` returned, before
         // `build_augmented_system_prompt` prepends the `[Capsule]` block — so a reader compares
         // what the manifest (or `--system-prompt`) actually said, not the runtime's framing of it.
@@ -1271,6 +1286,21 @@ pub fn launch_session(
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
                 .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+
+            // Retention runs here and nowhere else: the session node exists from the line above,
+            // so every deletion has a parent to hang off, and a policy that only runs when an
+            // operator remembers to invoke a command does not run.
+            apply_retention(
+                &mut trace,
+                &workdir,
+                &session_id,
+                trace_retain.as_ref(),
+                context_retain.as_ref(),
+                retention_conversation_root.as_deref(),
+                &capsule_name,
+                supplied_context_id.as_deref(),
+            )
+            .await;
 
             // A second handle to the same trace.jsonl, not a borrow of the writer above: the
             // motivating read happens after `session_end`, when the agent loop's writer is gone.
@@ -4534,6 +4564,113 @@ fn resolve_conversation_root(
     }
 }
 
+/// Enforce both `retain:` blocks and record every deletion in this session's own trace.
+///
+/// Called once per launch, immediately after `session_start`. Nothing here can fail a launch: a
+/// store that cannot be read, a directory that cannot be removed and a trace line that cannot be
+/// written are each survived, on the same terms as an unresolvable `HOME` in
+/// [`resolve_conversation_root`] — a capsule whose retention cannot run must still do its work.
+///
+/// Session pruning is computed from `workdir.parent()`, the directory holding every sibling
+/// session, and never considers an id at or after this session's own. Record pruning needs the
+/// resolved conversation root, the capsule name — records this capsule does not own are never
+/// touched — and the launch's context id, which is never removed and is the one record
+/// `max_messages` truncates.
+#[allow(clippy::too_many_arguments)]
+async fn apply_retention(
+    trace: &mut TraceWriter,
+    workdir: &Path,
+    session_id: &str,
+    trace_retain: Option<&murmur_artifact::TraceRetainConfig>,
+    context_retain: Option<&murmur_artifact::ContextRetainConfig>,
+    conversation_root: Option<&Path>,
+    capsule_name: &str,
+    context_id: Option<&str>,
+) {
+    use crate::trace::{
+        RETENTION_REASON_MAX_MESSAGES, RETENTION_STORE_RECORDS, RETENTION_STORE_SESSIONS,
+    };
+
+    let now_ms = crate::retention::now_ms();
+
+    if let (Some(policy), Some(sessions_root)) = (trace_retain, workdir.parent()) {
+        let pruned = crate::retention::prune_sessions(sessions_root, session_id, policy, now_ms);
+        for reason in [
+            crate::trace::RETENTION_REASON_MAX_SESSIONS,
+            crate::trace::RETENTION_REASON_MAX_AGE,
+        ] {
+            let targets: Vec<String> = pruned
+                .iter()
+                .filter(|session| session.reason == reason)
+                .map(|session| session.name.clone())
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            let _ = trace
+                .write_retention(RETENTION_STORE_SESSIONS, reason, targets, None)
+                .await;
+        }
+    }
+
+    let (Some(policy), Some(root)) = (context_retain, conversation_root) else {
+        return;
+    };
+
+    let pruned = crate::retention::prune_records(root, capsule_name, context_id, policy, now_ms);
+    if !pruned.is_empty() {
+        let targets: Vec<String> = pruned
+            .iter()
+            .map(|record| record.context_id.clone())
+            .collect();
+        let _ = trace
+            .write_retention(
+                RETENTION_STORE_RECORDS,
+                crate::trace::RETENTION_REASON_MAX_AGE,
+                targets,
+                None,
+            )
+            .await;
+    }
+
+    // `max_messages` truncates the one record this launch opens, at the point it is opened: that
+    // is where the growth is, it is O(one record) rather than O(every conversation), and it never
+    // rewrites a conversation this capsule is not touching. A launch that mints a context per
+    // task opens no record here, so it has nothing to truncate.
+    let (Some(keep), Some(context_id)) = (policy.max_messages, context_id) else {
+        return;
+    };
+    let path = crate::conversation::record_file(root, context_id);
+    match crate::conversation::read_header(&path) {
+        // A header naming another capsule is that capsule's record, whatever context id this
+        // launch was handed. An unowned record on this launch's own context is one this launch
+        // is about to append to and adopt, so the truncation adopts it in the same rewrite.
+        Some(header) if header.capsule != capsule_name => return,
+        _ => {}
+    }
+    match crate::retention::truncate_record(&path, keep, capsule_name) {
+        Ok(outcome) if outcome.dropped > 0 => {
+            let _ = trace
+                .write_retention(
+                    RETENTION_STORE_RECORDS,
+                    RETENTION_REASON_MAX_MESSAGES,
+                    vec![context_id.to_string()],
+                    Some(outcome.dropped),
+                )
+                .await;
+        }
+        Ok(_) => {}
+        Err(reason) => {
+            let message = format!(
+                "[retention] {} could not be truncated ({reason}); this record keeps growing",
+                path.display()
+            );
+            eprintln!("[capsule-runtime] {message}");
+            agent::append_bootstrap_log(workdir, &message);
+        }
+    }
+}
+
 fn resolve_context_window(context: Option<&ContextConfig>) -> u32 {
     context.and_then(|c| c.max_tokens).unwrap_or(0)
 }
@@ -7105,6 +7242,7 @@ inference:
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
+            record_owner: None,
             resume: None,
         };
 
@@ -7316,6 +7454,7 @@ inference:
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
+            record_owner: None,
             resume: None,
         };
 

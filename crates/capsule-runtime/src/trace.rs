@@ -130,6 +130,22 @@ pub(crate) const SEED_REJECTED_NO_BUDGET: &str = "no_budget";
 /// own context and has no host-side message list to seed.
 pub(crate) const SEED_REJECTED_UNSUPPORTED_TRANSPORT: &str = "unsupported_transport";
 
+/// `retention.store` for the session directories under a workdir.
+pub(crate) const RETENTION_STORE_SESSIONS: &str = "sessions";
+
+/// `retention.store` for the conversation records under `~/.murmur/conversations/`.
+pub(crate) const RETENTION_STORE_RECORDS: &str = "records";
+
+/// `retention.reason` when `trace.retain.max_sessions` put a session outside the newest N.
+pub(crate) const RETENTION_REASON_MAX_SESSIONS: &str = "max_sessions";
+
+/// `retention.reason` when `trace.retain.max_age` or `context.retain.max_age` put a session or a
+/// record outside the window.
+pub(crate) const RETENTION_REASON_MAX_AGE: &str = "max_age";
+
+/// `retention.reason` when `context.retain.max_messages` truncated the front of a record.
+pub(crate) const RETENTION_REASON_MAX_MESSAGES: &str = "max_messages";
+
 /// Mint one event identity: `evt_` + a UUID v7 in simple form, the same scheme `ses_`, `tsk_`,
 /// `ctx_`, `dep_` and `req_` use. Ids therefore sort by mint time and carry their own
 /// millisecond timestamp, so a trace can be ordered and time-bounded without reading any
@@ -507,6 +523,37 @@ struct ContextSeedEvent {
     /// Empty on a rejection. These are the ids the runtime minted; they never reach the
     /// driver payload, so this record is the only place they are visible.
     message_ids: Vec<String>,
+}
+
+/// Retention deleted something. One line per (store, reason) pair that removed anything, in the
+/// trace of the session that performed the deletion — the only place the pruning of session N's
+/// predecessors can go.
+///
+/// Session-scoped, and written immediately after `session_start`: a session directory that
+/// vanishes with no explanation makes "where did my trace go" unanswerable, and the answer has to
+/// be in the trace of the run that did it.
+#[derive(Serialize)]
+struct RetentionEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// [`RETENTION_STORE_SESSIONS`] or [`RETENTION_STORE_RECORDS`].
+    store: String,
+    /// [`RETENTION_REASON_MAX_SESSIONS`], [`RETENTION_REASON_MAX_AGE`] or
+    /// [`RETENTION_REASON_MAX_MESSAGES`].
+    reason: String,
+    /// How many units this reason removed from this store: session directories, context
+    /// directories, or — for a truncation — the one record that was rewritten. Never zero;
+    /// nothing removed means no event.
+    removed: u32,
+    /// What went: `ses_` directory names, or context ids.
+    targets: Vec<String>,
+    /// Messages dropped from the front of the record. Written for
+    /// [`RETENTION_REASON_MAX_MESSAGES`] only, and absent from the JSONL otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages_dropped: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1306,6 +1353,33 @@ impl TraceWriter {
             outcome: outcome.to_string(),
             reason: reason.map(str::to_string),
             message_ids,
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record one store's deletion, naming the reason and everything that went.
+    ///
+    /// Session-scoped: `parent_id` is the session node, so the deletion hangs off the launch that
+    /// performed it rather than off whatever task happened to be open. `messages_dropped` is
+    /// `Some` only for [`RETENTION_REASON_MAX_MESSAGES`].
+    pub(crate) async fn write_retention(
+        &mut self,
+        store: &str,
+        reason: &str,
+        targets: Vec<String>,
+        messages_dropped: Option<u64>,
+    ) -> std::io::Result<()> {
+        let event = RetentionEvent {
+            event_type: "retention",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            store: store.to_string(),
+            reason: reason.to_string(),
+            removed: u32::try_from(targets.len()).unwrap_or(u32::MAX),
+            targets,
+            messages_dropped,
         };
         self.write_event(&event).await
     }

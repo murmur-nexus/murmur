@@ -61,6 +61,14 @@ pub(crate) struct AgentRunConfig {
     /// means this session keeps no durable record: `context.record: off`, a `process`-transport
     /// capsule, or a host whose home directory could not be resolved.
     pub conversation_root: Option<PathBuf>,
+    /// The capsule name to stamp on this record's header line, or `None` when the capsule
+    /// declares no `context.retain`.
+    ///
+    /// A record with no retention policy is left exactly as it always was — no header line, no
+    /// ownership, and byte-for-byte the file an earlier release wrote. Retention is the only
+    /// thing that needs to know which capsule a record belongs to, so a capsule that declares
+    /// none never writes the claim.
+    pub record_owner: Option<String>,
     /// `mur run --resume`'s mode, or `None` on an ordinary launch.
     ///
     /// `Some(_)` is an operator override of `lifecycle.conversation`, launch-scoped: every task
@@ -246,9 +254,12 @@ pub(crate) async fn run_agent_loop(
         run_config.conversation_root.as_deref(),
         context_id.as_deref(),
     ) {
-        (Some(root), Some(context_id)) => {
-            crate::conversation::ConversationRecord::open(root, context_id, workdir)
-        }
+        (Some(root), Some(context_id)) => crate::conversation::ConversationRecord::open(
+            root,
+            context_id,
+            workdir,
+            run_config.record_owner.as_deref(),
+        ),
         _ => None,
     };
 
@@ -1781,9 +1792,11 @@ pub(crate) fn prior_history_tokens(
     context_id: Option<&str>,
     resume: bool,
 ) -> u64 {
+    // Opened to read and never to append, so it claims no ownership: a record this walk touches
+    // must not gain a header line from being measured.
     let mut record = match (conversation_root, context_id) {
         (Some(root), Some(context_id)) if matches!(mode, ConversationMode::Threaded) || resume => {
-            crate::conversation::ConversationRecord::open(root, context_id, workdir)
+            crate::conversation::ConversationRecord::open(root, context_id, workdir, None)
         }
         _ => None,
     };

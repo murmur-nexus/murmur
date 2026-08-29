@@ -298,6 +298,23 @@ struct ContextSeedEvent {
     message_ids: Vec<String>,
 }
 
+/// Retention deleted something. Rendered where it cannot be scrolled past: a session directory
+/// that vanished with no explanation makes "where did my trace go" unanswerable, and this line is
+/// the answer.
+#[derive(Debug, Deserialize)]
+struct RetentionEvent {
+    /// `"sessions"` or `"records"`.
+    store: String,
+    /// `"max_sessions"`, `"max_age"` or `"max_messages"`.
+    reason: String,
+    removed: u32,
+    #[serde(default)]
+    targets: Vec<String>,
+    /// Written for `"max_messages"` only.
+    #[serde(default)]
+    messages_dropped: Option<u64>,
+}
+
 /// A hook call that failed in a way the session survived. Rendered where it cannot be
 /// scrolled past, because nothing else in the session says the hook did not run.
 #[derive(Debug, Deserialize)]
@@ -337,6 +354,7 @@ enum TraceEvent {
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
     HookDispatchError(HookDispatchErrorEvent),
+    Retention(RetentionEvent),
     ResourceList(OutcomeEvent),
     ResourceRead(OutcomeEvent),
     PeerHandleMint(OutcomeEvent),
@@ -501,6 +519,9 @@ struct TraceMetrics {
     context_seeds: Vec<ContextSeedRecord>,
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
+    /// Every `retention` record, in file order — one per (store, reason) pair that removed
+    /// anything at this session's launch.
+    retentions: Vec<RetentionRecord>,
     resource_lists: OutcomeCounts,
     resource_reads: OutcomeCounts,
     peer_mints: OutcomeCounts,
@@ -509,6 +530,15 @@ struct TraceMetrics {
     a2a_tasks_received: u32,
     /// The peer URL of every `a2a_send`, in file order.
     a2a_sends: Vec<String>,
+}
+
+/// One `retention` trace record, surfaced in `mur trace show`.
+struct RetentionRecord {
+    store: String,
+    reason: String,
+    removed: u32,
+    targets: Vec<String>,
+    messages_dropped: Option<u64>,
 }
 
 /// One `task_reopened` trace record, surfaced in `mur trace show`.
@@ -768,6 +798,7 @@ fn compute_metrics(
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
+    let mut retentions: Vec<RetentionRecord> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
     let mut resource_reads = OutcomeCounts::new();
     let mut peer_mints = OutcomeCounts::new();
@@ -918,6 +949,15 @@ fn compute_metrics(
                     arm: e.arm,
                 });
             }
+            TraceEvent::Retention(e) => {
+                retentions.push(RetentionRecord {
+                    store: e.store,
+                    reason: e.reason,
+                    removed: e.removed,
+                    targets: e.targets,
+                    messages_dropped: e.messages_dropped,
+                });
+            }
             TraceEvent::ResourceList(e) => *resource_lists.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::ResourceRead(e) => *resource_reads.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::PeerHandleMint(e) => *peer_mints.entry(e.outcome).or_insert(0) += 1,
@@ -982,6 +1022,7 @@ fn compute_metrics(
             reopens,
             context_seeds,
             hook_failures,
+            retentions,
             resource_lists,
             resource_reads,
             peer_mints,
@@ -1200,14 +1241,6 @@ fn parse_since(s: &str) -> Result<u64, CliError> {
     Ok(n * multiplier)
 }
 
-fn session_id_timestamp_ms(ses_name: &str) -> Option<u64> {
-    let hex = ses_name.strip_prefix("ses_")?;
-    if hex.len() < 12 {
-        return None;
-    }
-    u64::from_str_radix(&hex[..12], 16).ok()
-}
-
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
 fn fmt_thousands(n: u64) -> String {
@@ -1356,6 +1389,26 @@ fn print_show(m: &TraceMetrics) {
         println!("── Hook failures ────────────────────────────────");
         for f in &m.hook_failures {
             println!("✗ {}  {}  {}", f.hook_name, f.event, f.arm);
+        }
+        println!();
+    }
+
+    // Beside the hook failures, and for the same reason: this is the only record that something
+    // an operator might go looking for is gone, and why.
+    if !m.retentions.is_empty() {
+        println!("── Retention ────────────────────────────────────");
+        for r in &m.retentions {
+            let dropped = r
+                .messages_dropped
+                .map(|n| format!(", {n} messages dropped"))
+                .unwrap_or_default();
+            println!(
+                "{}  {}  removed {}{}",
+                r.store, r.reason, r.removed, dropped
+            );
+            if !r.targets.is_empty() {
+                println!("  {}", r.targets.join(", "));
+            }
         }
         println!();
     }
@@ -2869,7 +2922,7 @@ pub(crate) fn run_trace_report(
                 .as_millis() as u64;
             let cutoff_ms = now_ms.saturating_sub(duration_ms);
             entries.retain(|e| {
-                session_id_timestamp_ms(e)
+                capsule_runtime::retention::session_id_timestamp_ms(e)
                     .map(|ts| ts >= cutoff_ms)
                     .unwrap_or(false)
             });

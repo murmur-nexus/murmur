@@ -58,6 +58,11 @@ pub const E_IO_001: &str = "E-IO-001"; // file or directory not found
 pub const E_IO_002: &str = "E-IO-002"; // permission denied (host, not capsule)
 pub const E_IO_003: &str = "E-IO-003"; // general I/O error
 
+// Conversation records
+pub const E_CNV_001: &str = "E-CNV-001"; // no such record store or context id
+pub const E_CNV_002: &str = "E-CNV-002"; // context id is present under more than one record store
+pub const E_CNV_003: &str = "E-CNV-003"; // --keep is not a usable number of messages to keep
+
 // Config
 #[cfg(feature = "beta-mur-new")]
 pub const E_CFG_001: &str = "E-CFG-001"; // inference provider not configured; wizard requires TTY

@@ -502,6 +502,7 @@ mod tests {
             record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            retain: None,
         };
         let content = generate_murmur_md(
             tmp.path(),
@@ -524,6 +525,7 @@ mod tests {
             record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            retain: None,
         };
         let content = generate_murmur_md(
             tmp.path(),
@@ -546,6 +548,7 @@ mod tests {
             record_store: None,
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            retain: None,
         };
         let content = generate_murmur_md(
             tmp.path(),

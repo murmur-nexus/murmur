@@ -28,6 +28,7 @@ pub mod plan;
 pub(crate) mod reachability;
 pub mod resource_plane;
 pub mod resources;
+pub mod retention;
 pub mod runtime;
 pub(crate) mod sandbox;
 pub mod sealed;
@@ -85,6 +86,14 @@ pub use resource_plane::{
     ResourcePlane, ResourceResponse, SymlinkPolicy, RESOURCE_PATH_PREFIX,
 };
 pub use resources::HostResourceLimits;
+// `retention` is its own public module rather than a set of flat re-exports: `mur conversation`
+// consumes six of its entry points and four of its types, and a facade that wide is a second
+// place for the names to drift.
+pub use retention::{
+    list_records, locate_message, prune_records, prune_sessions, remove_record, truncate_record,
+    MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader, RecordSummary,
+    RemovedRecord, TruncationMarker, TruncationOutcome,
+};
 pub use runtime::{
     launch_session, stage_session, warn_on_interpreter_runtime_grants,
     warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
