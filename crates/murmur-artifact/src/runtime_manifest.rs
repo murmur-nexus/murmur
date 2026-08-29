@@ -6043,12 +6043,12 @@ context:
                 },
             ),
             (
-                "murmur-hook-memory-jsonl",
-                "execution_mode: blocking\ncommit_policy: replace-context\n",
+                "murmur-hook-memory",
+                "binding: on-task-start\nexecution_mode: blocking\ncommit_policy: seed-context\n",
                 HookConfig {
-                    binding: HookBinding::All,
+                    binding: HookBinding::OnTaskStart,
                     execution_mode: HookExecutionMode::Blocking,
-                    commit_policy: HookCommitPolicy::ReplaceContext,
+                    commit_policy: HookCommitPolicy::SeedContext,
                 },
             ),
             (

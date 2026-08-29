@@ -40,7 +40,7 @@ need a [`filesystem` grant](manifest.md#hook-capabilities).
 | `murmur-hook-diff-summary` | Every event | Snapshots files before each editor tool call and emits a unified-diff summary at the end of the turn |
 | `murmur-hook-eval` | Every event | Scores the session against the configured scorers and writes `eval.jsonl` |
 | `murmur-hook-grafana` | Every event | Emits OpenTelemetry spans for each lifecycle event to a Grafana Tempo OTLP/HTTP endpoint |
-| `murmur-hook-memory-jsonl` | Every event | Appends each turn to a JSONL file, reloads prior turns at task start, and writes a close-out marker at task end |
+| `murmur-hook-memory` | `on-task-start` | Seeds a task with the relevant, budget-bounded slice of the conversation record read so far |
 | `murmur-hook-regression-verifier` | Every event | Watches a task's test runs and reopens the task when a change broke previously-passing tests |
 | `murmur-hook-shell-desc` | `on-stage` | Returns enriched tool manifests for common shell binaries at staging time |
 
@@ -113,12 +113,34 @@ files.
 |---|---|
 | `murmur-tool-code-coverage` | Spectrum-based fault localization (Ochiai / Tarantula) over per-test LCOV reports the agent has already captured. Reads a repository indexed by `murmur-tool-code-graph` |
 | `murmur-tool-code-graph` | Indexes a Rust or Python repository into a symbol/edge graph and answers structured queries over it. Symbols are addressed by a stable identity rather than by `file:line` |
+| `murmur-tool-corpus` | Append-only, schema-validated record store for a capsule's own notes, behind the capsule's `capabilities.state` grant |
 | `murmur-tool-create` | Scaffolds a new tool artifact directory: `murmur.yaml`, a stub implementation and a README |
 | `murmur-tool-editor` | Reads, writes, patches and searches files without a shell grant |
 | `murmur-tool-git` | Structured git operations returning typed JSON, in place of `git` in `capabilities.shell.allow` |
 | `murmur-tool-registry-search` | Searches the artifact index by keyword |
 | `murmur-tool-request-input` | Pauses the agent loop and requests external input over A2A; the answer comes back as the tool result |
 | `murmur-tool-test-report` | Parses a test-runner output file the agent has already captured into a structured list of failures |
+
+### `murmur-tool-corpus`
+
+An append-only JSON-lines store for records a capsule wants to keep across turns —
+`state/corpus.jsonl`, reachable only where the manifest entry grants
+[`capabilities.state`](manifest.md#field-capabilities); every operation returns
+`state_unavailable` without it.
+
+| Operation | Does |
+|---|---|
+| `append` | Writes one record of a declared type. `external_id` makes a retried call idempotent, returning the first call's id with `deduped: true`; `withdraws: <id>` retires an earlier record instead of deleting it |
+| `get` | Reads one record by id, withdrawn or not |
+| `read_recent` | Newest non-withdrawn records of one type |
+| `search` | Term-matched hits, each `{id, type, created_at, score, excerpt}` — the excerpt is one matching line, not the record body |
+| `verify` | Reports every unreadable line by number, parse error and preview. Needs the state grant but not the configuration |
+
+Record types, their JSON Schema, and the caps on `read_recent`'s `n` and `search`'s `k` come from
+this tool's own `config:` block — see [Choosing a config block](manifest.md#which-config-block). An
+entry with none gets `config_missing` on every operation but `verify`. A line that fails to parse
+is skipped rather than failing the call: the response carries `skipped_lines` and
+`skipped_line_count` so the damage reaches the trace on the next call.
 
 ### `murmur-tool-registry-search`
 

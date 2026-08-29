@@ -99,6 +99,12 @@ Forward it only where the provider defines a field of its own for it: the OpenAI
 Responses APIs accept `prompt_cache_key` in the request body, and the Anthropic Messages API
 rejects a body carrying any field it does not define.
 
+The `[Capsule]` block the runtime prepends to every system prompt is a pure function of the
+capsule's name and version — it names no host-specific path, so it is byte-identical across every
+launch of the same capsule and version. Prefix caching depends on that stability: a provider
+matches its cache against the bytes it has seen before, and the first block of every prompt would
+otherwise never repeat.
+
 ### Reported token usage { #driver-usage }
 
 A driver response may carry a top-level `usage` object holding the provider's own token counts
