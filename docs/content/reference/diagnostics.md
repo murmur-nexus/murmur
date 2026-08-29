@@ -204,10 +204,11 @@ error[E-RUN-017]: cannot resume session ses_0193f2…: context 'ctx_0193f2…' h
   hint: a session is resumable only if its capsule kept a conversation record: an http-transport capsule that did not declare context.record: off. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see docs/content/reference/cli.md
 ```
 
-Four ways to have no record: [`context.record: off`](manifest.md#field-context),
+The reasons: [`context.record: off`](manifest.md#field-context),
 [`inference.transport: process`](manifest.md#inference-config) — whose CLI owns its own
-conversation — a capsule with no `inference:` block, and a record path that resolves but holds no
-file. Refused at staging, before this launch's session directory is created.
+conversation — a capsule with no `inference:` block, a host whose home directory cannot be
+resolved, and a record path that resolves but holds no file. Refused at staging, before this
+launch's session directory is created.
 
 ### E-RUN-018 — `--resume-mode compact` with no compaction hook { #e-run-018 }
 

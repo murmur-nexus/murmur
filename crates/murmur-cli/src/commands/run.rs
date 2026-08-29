@@ -532,14 +532,8 @@ pub(crate) fn run_run(
         let capsule_version = runtime_manifest.version.clone();
         let pid = std::process::id();
         // Compute accessible_workdir for JSON output (mirrors stage_session logic).
-        let accessible_workdir_for_json = match &workdir_arg {
-            Some(wd) => {
-                if wd.is_absolute() {
-                    wd.clone()
-                } else {
-                    std::env::current_dir().unwrap_or_default().join(wd)
-                }
-            }
+        let accessible_workdir_for_json = match workdir_arg.as_deref() {
+            Some(wd) => absolutise(wd),
             None => staged.workdir.clone(),
         };
         launch_session(staged, move |url| {
