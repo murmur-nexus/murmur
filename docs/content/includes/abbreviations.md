@@ -59,3 +59,15 @@
 *[observability.eval.scorers]: scorer types: exit_ok | max_turns | max_tokens | tool_sequence
 
 *[capabilities.containment]: advisory: no kernel enforcement · default | scoped: Landlock + seccomp | sealed: composed root · refuses launch when host falls short
+
+*[context.record]: on: keep durable conversation record · default | off: nothing written
+
+*[context.record_store]: directory under ~/.murmur/conversations/ · default: capsule name
+
+*[context.seed_budget]: float 0.0–1.0 · fraction of context.max_tokens a task-start seed may occupy · default 0.10
+
+*[context.seed_overflow_margin]: float 0.0–1.0 · slack above seed_budget before trimming or summarizing · default 0.10
+
+*[capabilities.conversation.read]: bool · grants a hook read access to the conversation record · required, never inferred
+
+*[capabilities.state]: durable directory outside the workdir · keyed by capsule · unreachable by the capsule's own file tools

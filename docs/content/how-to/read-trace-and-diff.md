@@ -51,6 +51,14 @@ count:      4  (max: 10)
 input:      5,840  (avg 1460/turn)
 output:     612  (avg 153/turn)
 total:      6,452
+provider:   in 5,720, out 590, cached 4,980, cache write 0
+
+── Wire ─────────────────────────────────────────
+turn 0  system bbc5e661e106…  tools f9d35d43770d…  response afb8c1747105…  1 messages
+turn 1  system bbc5e661e106…  tools f9d35d43770d…  response 4ed87cafe960…  3 messages
+turn 2  system bbc5e661e106…  tools f9d35d43770d…  response 7c02d4f1ae33…  5 messages
+turn 3  system bbc5e661e106…  tools f9d35d43770d…  response 9b4e6a2f0d18…  7 messages
+bodies:     mur trace show --body system --turn 0
 
 ── Tool calls ───────────────────────────────────
 count:      3  (3 ok, 0 error)  success 100.0%
@@ -68,7 +76,12 @@ latency:    avg 18ms
 fired:      no
 ```
 
-Each section maps to a class of events in `trace.jsonl`. The turn count and token totals give you the most immediate signal — if a session is taking more turns than expected, the turn count shows it immediately. Under **Tool calls**, each turn row shows the tool that ran, its duration, a `✓`/`✗` status icon, and — when the trace recorded one — the tool's input as compact JSON (truncated to 120 characters).
+Each section maps to a class of events in `trace.jsonl`. The turn count and token totals give you the most immediate signal — if a session is taking more turns than expected, the turn count shows it immediately. Under **Tool calls**, each turn row shows the tool that ran, its duration, a `✓`/`✗` status icon, and — when the trace recorded one — the tool's input as compact JSON (truncated to 120 characters). The `provider:` row under **Tokens** appears whenever the driver reported its own counts, and breaks out `cached`/`cache write` tokens so you can see whether the provider's prompt cache actually hit. **Wire** lists each turn's system-prompt, tool-schema and response hashes — not the bytes themselves, which Step 3 covers.
+
+Two more sections appear only when they have something to report, both placed so you cannot miss them:
+
+- **Hook failures** — printed immediately after **Session**, above every other section. One `✗ <hook> <lifecycle event> <arm>` row per fault, so a broken hook never sits buried below a wall of tool calls.
+- **Context** — printed when an `on-task-start` hook seeded the task's conversation: the hook's name, whether it committed or was trimmed, the tokens it proposed against its budget, and the ids of the messages it seeded.
 
 ---
 
@@ -81,15 +94,19 @@ mur trace steps --verbose
 ```
 
 ```text
-Session ses_6801f81dd28b4a9daf434e8324c4793e  (4 turns)
+Session ses_6801f81dd28b4a9daf434e8324c4793e  (1 task, 4 turns)
 
-  0  tool_call    bash        820ms   "cargo build --release"
-  1  tool_call    bash        1.2s    "cargo test --workspace"
-  2  tool_call    bash        340ms   "cargo clippy"
-  3  end_turn     —           —
+task tsk_7a91c2e0…
+  turn 0  tool_call  bash
+    tool_call  bash  820ms  ✓  {"command":"cargo build --release"}
+  turn 1  tool_call  bash
+    tool_call  bash  1.2s  ✓  {"command":"cargo test --workspace"}
+  turn 2  tool_call  bash
+    tool_call  bash  340ms  ✓  {"command":"cargo clippy"}
+  turn 3  end_turn
 ```
 
-Repeated calls to the same tool with similar inputs is the most common sign of a retry loop.
+`steps` walks the session → task → turn tree: every turn nests under its task, and every tool call, shell command or skill call nests under the turn that made it. Repeated calls to the same tool with similar inputs, at the same nesting level turn after turn, is the most common sign of a retry loop.
 
 **Tool errors** — if the tool calls line shows errors, the model called a tool that returned a failure. Use `mur trace show` to see which tool failed and what input triggered it.
 
@@ -117,7 +134,35 @@ declined:   at turn 4  (198,340 tokens)  no_hook_replacement
 
 ---
 
-## Step 3 — compare two runs with diff
+## Step 3 — print the exact bytes behind a hash
+
+`mur trace show` never prints a request or response body itself — only its hash, under **Wire**. To read what a turn actually sent or received, pass `--body` with a selector and the turn it belongs to:
+
+```bash
+mur trace show --body system --turn 1
+```
+
+Printing a body requires the session to have recorded one — set
+[`trace.capture: content`](../reference/manifest.md#field-trace) in the manifest before the run;
+the default, `meta`, keeps only the hashes.
+
+| Selector | Prints |
+|---|---|
+| `system` | The turn's system prompt |
+| `tools` | The turn's tool schemas |
+| `response` | The turn's response |
+| `message:<i>` | Message `i` (0-based) of the turn's request |
+| a hash, or an 8+ character prefix of one | The body behind that hash directly — no `--turn` needed |
+
+`--body` writes raw bytes with no trailing newline, so it pipes straight into another command:
+
+```bash
+mur trace show --body response --turn 2 | tee response.txt | wc -c
+```
+
+---
+
+## Step 4 — compare two runs with diff
 
 When you change a manifest, system prompt, or model and want to know if the change helped, use `mur trace diff`. With no arguments it compares the two most recent sessions automatically:
 
@@ -149,9 +194,21 @@ Lower-is-better metrics (turns, tokens, latency) flag the lower run as better. `
 
 This is the fastest way to confirm that a prompt or model change actually reduced turn count or token usage.
 
+**Why did my cache miss** — below the metrics table, a **Prefix divergence** section names the point where the two runs' requests stopped agreeing, which is also the point a provider-side prompt cache stopped matching:
+
+```text
+── Prefix divergence ────────────────────────────
+system prompt: differs    A d27e9be1c0de…  B aaaaaaaaaaaa…
+tool schemas:  identical  143f541e445d…
+turn 1:  diverges at message 1  A 4d3fd85ffaa2…  B ffffffffffff…
+turn 2:  identical  (2 messages)
+```
+
+It checks the system prompt first, then the tool schemas, then each turn's messages in order — the earliest of these to differ is where the two runs' requests parted ways, and everything after it is a guaranteed cache miss. Both runs need [`trace.capture`](../reference/manifest.md#field-trace) `meta` or `content` for this section to compare anything.
+
 ---
 
-## Step 4 — aggregate across sessions
+## Step 5 — aggregate across sessions
 
 After multiple runs, `mur trace report` automatically picks up every session in the workdir and aggregates them into a single report:
 
@@ -183,7 +240,7 @@ The exit status distribution immediately shows how often the agent hit the turn 
 
 ---
 
-## Step 5 — read the raw events
+## Step 6 — read the raw events
 
 `trace.jsonl` is plain JSONL — each line is one JSON object. You can inspect it directly for detailed debugging:
 
@@ -210,7 +267,7 @@ To visualise the same trace data as Grafana spans, see [Work with capsule trace 
 |---|---|
 | `mur trace show [session]` | Quick health check of a single session: turns, tokens, tool errors, latency |
 | [`mur trace show --body`](../reference/cli.md#mur-trace-show-body) | Print the exact bytes of the system prompt, tool schemas, one message or the response a turn recorded |
-| `mur trace steps [session]` | Turn-by-turn breakdown of what the agent did, with per-call latency |
+| `mur trace steps [session]` | Session → task → turn → tool-call breakdown of what the agent did, with per-call latency |
 | `mur trace diff [a] [b]` | Confirm a change improved (or didn't regress) key metrics; defaults to last two sessions |
 | [`mur trace diff` prefix divergence](../reference/cli.md#mur-trace-diff-divergence) | Find where two runs' requests stopped matching, when a provider-side prompt cache missed |
 | `mur trace report` | Spot high variance across runs, find outliers, check exit status distribution |

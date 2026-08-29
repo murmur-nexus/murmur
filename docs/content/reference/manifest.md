@@ -240,7 +240,7 @@ artifacts:
         read: true
 
   # granted a durable store and nothing else — no project directory at all
-  - name: murmur-hook-memory
+  - name: murmur-hook-notes
     version: 0.1.0
     runtime: hook
     capabilities:

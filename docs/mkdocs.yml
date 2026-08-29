@@ -94,10 +94,12 @@ extra:
     murmur_hook_eval: "1.0.0"
     murmur_hook_grafana: "1.0.0"
     murmur_hook_debug: "1.0.0"
+    murmur_hook_memory: "1.0.0"
     murmur_tool_git: "1.0.0"
     murmur_tool_editor: "1.0.0"
     murmur_tool_request_input: "1.0.0"
     murmur_tool_registry_search: "1.0.0"
+    murmur_tool_corpus: "1.0.0"
     murmur_skill_create_manifest: "1.0.0"
 
 markdown_extensions:
@@ -141,6 +143,7 @@ nav:
       - Score your agent's behavior with eval: how-to/agent-eval-score.md
       - Shape agent behavior with a system prompt: how-to/capsule-system-prompt.md
       - Enable context compaction: how-to/context-compaction.md
+      - Give a capsule memory: how-to/give-capsule-memory.md
       - Package a skill into an artifact: how-to/package-skill-artifact.md
       - Work with capsule trace spans in Grafana: how-to/grafana-tempo-spans.md
       - Deploy a capsule to the cloud with mur deploy: how-to/deploy-capsule-cloud.md
