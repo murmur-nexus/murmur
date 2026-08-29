@@ -72,7 +72,8 @@ use crate::{
     trace::TraceWriter,
     types::{
         ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
-        ResolvedLockArtifact, StageRequest, StagedHookArtifact, StagedSession,
+        ResolvedLockArtifact, ResumeMode, ResumeRequest, StageRequest, StagedHookArtifact,
+        StagedSession,
     },
 };
 
@@ -305,6 +306,63 @@ fn has_compaction_hook(hooks: &[StagedHookArtifact]) -> bool {
             HookBinding::OnCompaction | HookBinding::All
         )
     })
+}
+
+/// Whether `mur run --resume` can do what it was asked, checked at staging so a launch that
+/// cannot continue anything never creates a session directory.
+///
+/// Two ways to be unlaunchable, and each is refused rather than degraded: `compact` with nothing
+/// bound to `on-compaction` has nothing to produce the summary, and a context with no record on
+/// disk has nothing to continue. Silently falling back to `full`, or starting fresh, would both
+/// be indistinguishable to the operator from a resume that worked.
+fn check_resume_launchable(
+    resume: &ResumeRequest,
+    context_id: Option<&str>,
+    context: Option<&ContextConfig>,
+    capsule_name: &str,
+    inference: Option<&InferenceConfig>,
+    hooks: &[StagedHookArtifact],
+) -> Result<(), RuntimeError> {
+    if resume.mode == ResumeMode::Compact && !has_compaction_hook(hooks) {
+        return Err(RuntimeError::ResumeCompactionHookMissing);
+    }
+    // A resume that reached staging with no context id resolved nothing, so there is no record to
+    // look for; the placeholder keeps the refusal's wording honest about that.
+    let context_id = context_id.unwrap_or("<unresolved>").to_string();
+    let missing = |reason: String| RuntimeError::ResumeRecordMissing {
+        session: resume.from_session.clone(),
+        context_id: context_id.clone(),
+        reason,
+    };
+    // The same three ways `resolve_conversation_root` returns `None`, plus the two this check
+    // adds: a capsule with no `inference:` block at all, and a record path that resolves but
+    // holds no file.
+    let Some(inference) = inference else {
+        return Err(missing(
+            "the capsule declares no inference block and keeps no conversation record".to_string(),
+        ));
+    };
+    if inference.transport == "process" {
+        return Err(missing(
+            "the capsule declares inference.transport: process, whose CLI owns its own \
+             conversation, and kept no conversation record"
+                .to_string(),
+        ));
+    }
+    let Some(record) = crate::conversation::resolve_record_name(context, capsule_name) else {
+        return Err(missing(
+            "the capsule declares context.record: off and kept no conversation record".to_string(),
+        ));
+    };
+    let root = crate::conversation::record_root(&record).map_err(&missing)?;
+    let path = crate::conversation::record_file(&root, &context_id);
+    if !path.is_file() {
+        return Err(missing(format!(
+            "no conversation record at {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolves and verifies all artifacts, compiles components, and prepares session state.
@@ -719,6 +777,20 @@ pub fn stage_session(
         });
     }
 
+    // Asked as soon as the hook artifacts are staged and their bindings are known, and before
+    // the session directory is created: a resume that cannot continue anything must leave no
+    // `ses_*` directory behind for the next `--resume @1` to name.
+    if let Some(ref resume) = request.resume {
+        check_resume_launchable(
+            resume,
+            request.context_id.as_deref(),
+            request.context.as_ref(),
+            &request.capsule_name,
+            request.inference.as_ref(),
+            &hook_components,
+        )?;
+    }
+
     // For agent capsules (inference configured, empty WASM bytes) skip component compilation.
     // For script capsules, compile the WASM component.
     let capsule_component =
@@ -854,6 +926,7 @@ pub fn stage_session(
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         context_id: request.context_id,
+        resume: request.resume,
         engine,
         capsule_component,
         tool_components,
@@ -985,6 +1058,7 @@ pub fn launch_session(
                 inference,
                 &workdir,
             ),
+            resume: staged.resume.as_ref().map(|resume| resume.mode),
         };
 
         // --- Identity and HTTP server setup ---
@@ -1057,6 +1131,15 @@ pub fn launch_session(
         // runs given the same one share one conversation record. Validated at staging; `None`
         // mints a fresh id per task, as it always has.
         let supplied_context_id = staged.context_id.clone();
+        // Provenance for `session_start`, taken before `staged.resume` is consumed below: which
+        // session this launch continues, and the launch-scoped context it runs under. Both are
+        // `None` on an ordinary launch, and `context_id` is `None` whenever each task mints its
+        // own — `task_start` carries the id a task actually ran under either way.
+        let trace_resumed_from = staged
+            .resume
+            .as_ref()
+            .map(|resume| resume.from_session.clone());
+        let trace_context_id = supplied_context_id.clone();
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
             _ => 1,
@@ -1164,6 +1247,8 @@ pub fn launch_session(
                 trace_capture,
                 trace_system_prompt,
                 system_prompt_overridden,
+                trace_resumed_from,
+                trace_context_id,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
@@ -1406,6 +1491,7 @@ pub fn launch_session(
                                                 &workdir,
                                                 &conversation_mode,
                                                 Some(&context_id),
+                                                run_config.resume.is_some(),
                                             ),
                                         )
                                         .await;
@@ -1469,6 +1555,7 @@ pub fn launch_session(
                                                 &workdir,
                                                 &conversation_mode,
                                                 Some(&context_id),
+                                                run_config.resume.is_some(),
                                             ),
                                         )
                                         .await;
@@ -1612,6 +1699,7 @@ pub fn launch_session(
                                     &workdir,
                                     &conversation_mode,
                                     Some(&incoming.context_id),
+                                    run_config.resume.is_some(),
                                 ),
                             )
                             .await;
@@ -1892,6 +1980,8 @@ pub fn launch_session(
                 murmur_artifact::TraceCapture::None,
                 None,
                 false,
+                None,
+                None,
             )
             .await
             {
@@ -5084,6 +5174,7 @@ inference:
             system_prompt_overridden: false,
             context: None,
             context_id: None,
+            resume: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5173,6 +5264,7 @@ inference:
             system_prompt_overridden: false,
             context: None,
             context_id: None,
+            resume: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5250,6 +5342,7 @@ inference:
             system_prompt_overridden: false,
             context: None,
             context_id: None,
+            resume: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5326,6 +5419,7 @@ inference:
             system_prompt_overridden: false,
             context: None,
             context_id: None,
+            resume: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -5478,6 +5572,7 @@ inference:
             system_prompt_overridden: false,
             context: None,
             context_id: None,
+            resume: None,
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,
@@ -6120,6 +6215,8 @@ inference:
                 murmur_artifact::TraceCapture::Meta,
                 None,
                 false,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -6957,6 +7054,8 @@ inference:
             murmur_artifact::TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -7006,6 +7105,7 @@ inference:
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
+            resume: None,
         };
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
@@ -7158,6 +7258,8 @@ inference:
             murmur_artifact::TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -7214,6 +7316,7 @@ inference:
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
             conversation_root: None,
+            resume: None,
         };
 
         trace

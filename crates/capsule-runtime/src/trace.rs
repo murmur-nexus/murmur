@@ -42,6 +42,13 @@ pub(crate) struct TraceWriter {
     /// effect. Always written to `session_start` (as `null` when absent) so a trace records *that*
     /// a prompt was in effect and which one, even when the text itself is withheld.
     system_prompt_sha256: Option<String>,
+    /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
+    /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
+    /// identifies a trace from a runtime that predates the key.
+    resumed_from: Option<String>,
+    /// The launch-scoped context id: the `--context` value, or the id `--resume` resolved to.
+    /// `None` when each task of this launch mints its own.
+    context_id: Option<String>,
     session_start_time: Instant,
     /// The session node of the event tree: the `event_id` `session_start` carries, and the
     /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
@@ -212,6 +219,19 @@ struct SessionStartEvent {
     /// prompt that actually went on the wire: this one names the prompt the operator wrote.
     /// Under `trace.capture: content` those resolved bytes are also the blob this hash names.
     system_prompt_sha256: Option<String>,
+    /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
+    /// `context_id` below it is what makes a resumed conversation followable back through the
+    /// sessions that built it.
+    ///
+    /// Always written, on the same terms as `workdir_exec`: its absence identifies a trace from a
+    /// runtime that predates the key.
+    resumed_from: Option<String>,
+    /// The context id every task of this launch runs under — the `mur run --context` value, or
+    /// the id `--resume` resolved to — and `null` when each task mints its own. `task_start`
+    /// carries the id a task actually ran under either way.
+    ///
+    /// Always written, on the same terms as `resumed_from`.
+    context_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -718,6 +738,8 @@ impl TraceWriter {
         capture: TraceCapture,
         system_prompt: Option<String>,
         system_prompt_overridden: bool,
+        resumed_from: Option<String>,
+        context_id: Option<String>,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -757,6 +779,8 @@ impl TraceWriter {
             blobs,
             system_prompt_source,
             system_prompt_sha256,
+            resumed_from,
+            context_id,
             session_start_time: Instant::now(),
             session_event_id: new_event_id(),
             session_started: false,
@@ -837,6 +861,8 @@ impl TraceWriter {
             effective_grants: self.effective_grants.clone(),
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
+            resumed_from: self.resumed_from.clone(),
+            context_id: self.context_id.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -1641,6 +1667,8 @@ mod tests {
             capture,
             system_prompt.map(str::to_string),
             system_prompt_overridden,
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -1819,6 +1847,8 @@ mod tests {
             TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1846,6 +1876,8 @@ mod tests {
             TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1889,6 +1921,8 @@ mod tests {
                 TraceCapture::Meta,
                 None,
                 false,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1987,6 +2021,8 @@ mod tests {
             TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap();

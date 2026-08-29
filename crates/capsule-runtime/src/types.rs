@@ -248,6 +248,33 @@ pub(crate) struct StagedHookArtifact {
     pub on_overflow: murmur_artifact::HookOverflowPolicy,
 }
 
+/// How `mur run --resume` puts the loaded conversation in front of the model.
+///
+/// `Full` is often the cheaper of the two: a verbatim reload can land on the provider's own
+/// prompt cache, while compaction changes the prefix from the first altered token, guarantees a
+/// cache miss, and costs an inference call to produce the summary. `Compact` is the answer when
+/// the conversation would not fit the context window at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResumeMode {
+    #[default]
+    Full,
+    Compact,
+}
+
+/// One operator act: continue *this* conversation, whatever the capsule's own
+/// `lifecycle.conversation` policy says about carrying one between tasks.
+///
+/// Sugar over [`StageRequest::context_id`], never a second load path: the CLI resolves a session
+/// address to the context id that session ran under and fills both this and `context_id`. What
+/// this adds is the override — the record is loaded even under `lifecycle.conversation:
+/// stateless` — and the provenance the trace records.
+#[derive(Debug, Clone)]
+pub struct ResumeRequest {
+    /// The prior session's id, recorded verbatim as `session_start.resumed_from`.
+    pub from_session: String,
+    pub mode: ResumeMode,
+}
+
 #[derive(Debug, Clone)]
 pub struct StageRequest {
     pub manifest_dir: PathBuf,
@@ -270,6 +297,11 @@ pub struct StageRequest {
     /// `None` mints a fresh one per task. Validated by `stage_session` as one path segment: it is
     /// a directory name in the conversation record path.
     pub context_id: Option<String>,
+    /// `mur run --resume <session>`, already resolved: `context_id` above holds the context that
+    /// session ran under, and this carries the session's own id and the mode. `None` is every
+    /// ordinary launch. `stage_session` refuses a resume whose context kept no record on disk,
+    /// and a `--resume-mode compact` with no hook bound to `on-compaction`.
+    pub resume: Option<ResumeRequest>,
     /// OTLP/HTTP endpoint for span export; None = no external OTel emission.
     pub otel_endpoint: Option<String>,
     /// JSON-serialized EvalConfig injected into hook WASI env as MURMUR_EVAL_CONFIG.
@@ -330,6 +362,9 @@ pub struct StagedSession {
     /// Copied from [`StageRequest::context_id`] and already validated. Read by `launch_session`,
     /// which uses it in place of a freshly minted id for every `task.md` task.
     pub(crate) context_id: Option<String>,
+    /// Copied from [`StageRequest::resume`] and already checked. Read by `launch_session`, which
+    /// turns it into `session_start.resumed_from` and the agent loop's record-load override.
+    pub(crate) resume: Option<ResumeRequest>,
     pub(crate) engine: Engine,
     /// `None` for manifest-only agent capsules; `Some` for script capsules with a WASM component.
     pub(crate) capsule_component: Option<Component>,

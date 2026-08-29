@@ -94,6 +94,15 @@ pub(crate) fn record_root(record: &str) -> Result<PathBuf, String> {
         .join(record))
 }
 
+/// The record file one context writes under `root`. Resolves only, like [`record_root`]: nothing
+/// is created and nothing is checked for existence.
+///
+/// `mur run --resume` asks whether this path exists before staging goes any further, which is the
+/// one question that separates "continue this conversation" from "start fresh and say nothing".
+pub(crate) fn record_file(root: &Path, context_id: &str) -> PathBuf {
+    root.join(context_id).join(RECORD_FILE_NAME)
+}
+
 /// One context's durable record, and the ids it already holds.
 ///
 /// Held by the agent loop for one attempt. Every message the loop puts in the context goes through

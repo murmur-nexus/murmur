@@ -56,6 +56,10 @@ section that explains it.
 | `E-RUN-012` | The capsule can spawn native subprocesses but no cgroup v2 scope could be delegated to bound them (Linux only) | [Platform behavior](resource-limits.md#platform-behavior) |
 | `E-RUN-013` | Session workdir grew past `capabilities.resources.workdir_max_bytes` | [Host resource limits](resource-limits.md#host-resource-limits) |
 | `E-RUN-014` | A `sealed` session cleared the host probe at launch but its composed root could not be built for a subprocess | [Containment class](containment.md#field-containment) |
+| `E-RUN-015` | `mur run --resume` and `--context` were both given | [E-RUN-015](#e-run-015) |
+| `E-RUN-016` | The session `--resume` named records no `task_start` carrying a context id | [E-RUN-016](#e-run-016) |
+| `E-RUN-017` | The context `--resume` resolved to kept no conversation record | [E-RUN-017](#e-run-017) |
+| `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -160,6 +164,65 @@ and the message names the failing step and its errno:
   policy changed. Re-probe with `mur run --explain-scope`.
 
 Neither means the declared floor was wrong; `E-CAP-003` covers that.
+
+### E-RUN-015 — `--resume` and `--context` together { #e-run-015 }
+
+[`mur run --resume <session>`](cli.md#mur-run) resolves a session address to the context id that
+session ran under, and then runs exactly as `--context <id>` would. The two name the same thing two
+ways, so passing both is refused rather than resolved by precedence:
+
+```text
+error[E-RUN-015]: --resume and --context name the same thing two ways
+  hint: --resume <session> resolves that session's context id for you; --context <id> names one directly. Pass whichever you have, not both — see docs/content/reference/cli.md
+```
+
+Refused before the session address is resolved and before anything is staged, so no session
+directory appears.
+
+### E-RUN-016 — the resumed session ran no task { #e-run-016 }
+
+`--resume` reads the context id off the named session's `trace.jsonl`, from the first
+[`task_start`](observability-schemas.md#session-trace-tracejsonl) line. A session that never
+reached a task carries none, and there is no conversation to continue:
+
+```text
+error[E-RUN-016]: cannot resume session ses_0193f2…: its trace.jsonl records no task_start carrying a context id
+  hint: only a session that actually ran a task has a conversation to continue. Run `mur trace show <session>` to see what it did, and resume one that reached a task — see docs/content/reference/cli.md
+```
+
+Run [`mur trace show <session>`](cli.md#mur-trace-show) to see what that session did.
+
+### E-RUN-017 — the resumed context kept no record { #e-run-017 }
+
+The context id `--resume` resolved has no
+[conversation record](workdir.md#the-conversation-record) on disk. Resuming it would start a fresh
+conversation while reporting success, so it is refused instead, naming the session, the context and
+which of the reasons applies:
+
+```text
+error[E-RUN-017]: cannot resume session ses_0193f2…: context 'ctx_0193f2…' has no conversation record (the capsule declares inference.transport: process, whose CLI owns its own conversation, and kept no conversation record)
+  hint: a session is resumable only if its capsule kept a conversation record: an http-transport capsule that did not declare context.record: off. Run `mur trace show <session>` to see what that session did, and omit --resume to start a fresh conversation — see docs/content/reference/cli.md
+```
+
+Four ways to have no record: [`context.record: off`](manifest.md#field-context),
+[`inference.transport: process`](manifest.md#inference-config) — whose CLI owns its own
+conversation — a capsule with no `inference:` block, and a record path that resolves but holds no
+file. Refused at staging, before this launch's session directory is created.
+
+### E-RUN-018 — `--resume-mode compact` with no compaction hook { #e-run-018 }
+
+`--resume-mode compact` runs the capsule's `on-compaction` hook over the loaded record and
+continues from its summary. With nothing bound to that event there is nothing to produce the
+summary, and quietly serving `full` instead would give the operator a mode they did not ask for:
+
+```text
+error[E-RUN-018]: --resume-mode compact needs a hook bound to on-compaction; this capsule declares none
+  hint: declare a hook artifact whose binding is on-compaction (or all) with commit_policy: replace-context, or use --resume-mode full, which loads the record verbatim and needs no hook — see docs/content/reference/cli.md
+```
+
+`--resume-mode full` is often the cheaper mode anyway: a verbatim reload can hit the provider's
+prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache
+miss, and costs an extra inference call to produce the summary.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

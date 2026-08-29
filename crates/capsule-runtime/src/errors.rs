@@ -157,6 +157,26 @@ pub enum RuntimeError {
         message: String,
     },
 
+    /// `mur run --resume` named a session whose context kept no conversation record on disk, so
+    /// there is nothing to continue. Raised at staging, before this launch's workdir exists: a
+    /// resume that silently started fresh would be indistinguishable from one that worked.
+    #[error(
+        "cannot resume session {session}: context '{context_id}' has no conversation record ({reason})"
+    )]
+    ResumeRecordMissing {
+        session: String,
+        context_id: String,
+        reason: String,
+    },
+
+    /// `mur run --resume-mode compact` on a capsule with no hook bound to `on-compaction`. There
+    /// is nothing to produce the summary, and falling back to `full` would silently give the
+    /// operator the mode they did not ask for.
+    #[error(
+        "--resume-mode compact needs a hook bound to on-compaction; this capsule declares none"
+    )]
+    ResumeCompactionHookMissing,
+
     /// The state store directory a validated name resolves to could not be resolved or created.
     /// Distinct from [`Self::InvalidStateStore`]: the declaration is well-formed and the failure is
     /// the host's — an unset `HOME`, or a path that cannot be made a `0700` directory.

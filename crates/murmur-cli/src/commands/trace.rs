@@ -160,6 +160,10 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
+    /// The context this task ran under. Absent in traces written before the runtime recorded it,
+    /// which is what `mur run --resume` reports as a session it cannot continue.
+    #[serde(default)]
+    context_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +371,21 @@ struct TaskMetrics {
 }
 
 // ── Parsing ───────────────────────────────────────────────────────────────────
+
+/// The context id the first task of `session_dir` ran under, read off its `trace.jsonl`.
+///
+/// `mur run --resume` turns a session address into the `--context` value it would otherwise have
+/// been given by hand, and this is the lookup: `task_start` is where the runtime already records
+/// the context, so the resolution needs no new trace field and no index. `None` means the trace
+/// holds no `task_start` carrying one — a session that never ran a task, or one written by a
+/// runtime that predates the key.
+pub(crate) fn first_task_context_id(session_dir: &Path) -> Result<Option<String>, CliError> {
+    let events = parse_trace_file(&session_dir.join("trace.jsonl"))?;
+    Ok(events.into_iter().find_map(|event| match event {
+        TraceEvent::TaskStart(task) => task.context_id,
+        _ => None,
+    }))
+}
 
 fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
     let content = fs::read_to_string(path).map_err(|e| match e.kind() {
@@ -771,6 +790,31 @@ pub(crate) fn resolve_session(
             }
         }
     }
+}
+
+/// The session directory an address names, under `workdir`.
+///
+/// The whole `mur trace diff` address vocabulary — a full `ses_` id, a 4+-character
+/// case-insensitive suffix, an `@N` ordinal, a literal path — resolved by exactly the resolver
+/// `diff` uses, so `mur run --resume` and `mur trace diff` can never disagree about what an
+/// address names or how an unresolvable one reads. `label` prefixes the `E-TRC-002` message with
+/// the flag the operator wrote.
+pub(crate) fn resolve_session_dir(
+    arg: &str,
+    workdir: &Path,
+    label: &str,
+) -> Result<PathBuf, CliError> {
+    let resolved = resolve_diff_arg(arg, workdir, label)?;
+    // Every non-literal address resolves to `<session dir>/trace.jsonl`; the literal-path form
+    // passes through whatever was written, which is a session directory as often as it is the
+    // file inside it.
+    if resolved.is_dir() {
+        return Ok(resolved);
+    }
+    resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| CliError::new(E_TRC_002, format!("{label}: '{arg}' names no session")))
 }
 
 fn resolve_diff_arg(arg: &str, workdir: &Path, label: &str) -> Result<PathBuf, CliError> {

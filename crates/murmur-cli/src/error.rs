@@ -30,6 +30,10 @@ pub const E_RUN_011: &str = "E-RUN-011"; // subprocess killed for exceeding a ca
 pub const E_RUN_012: &str = "E-RUN-012"; // no cgroup v2 scope could be delegated on Linux
 pub const E_RUN_013: &str = "E-RUN-013"; // session workdir grew past capabilities.resources.workdir_max_bytes
 pub const E_RUN_014: &str = "E-RUN-014"; // a sealed session's composed root could not be built after the host probe had cleared it
+pub const E_RUN_015: &str = "E-RUN-015"; // --resume and --context both given
+pub const E_RUN_016: &str = "E-RUN-016"; // the resumed session's trace holds no task_start carrying a context id
+pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversation record on disk
+pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -262,6 +266,24 @@ impl From<RuntimeError> for CliError {
                      entirely to deliver no variable, and keep secrets out of it — see \
                      docs/content/reference/manifest.md"
                 ),
+            ),
+            // Both resume refusals arrive from staging, before this launch's session directory
+            // exists, so the hints can point the operator at a different flag rather than at a
+            // half-created run.
+            error @ RuntimeError::ResumeRecordMissing { .. } => CliError::with_hint(
+                E_RUN_017,
+                error.to_string(),
+                "a session is resumable only if its capsule kept a conversation record: an \
+                 http-transport capsule that did not declare context.record: off. Run `mur trace \
+                 show <session>` to see what that session did, and omit --resume to start a fresh \
+                 conversation — see docs/content/reference/cli.md",
+            ),
+            error @ RuntimeError::ResumeCompactionHookMissing => CliError::with_hint(
+                E_RUN_018,
+                error.to_string(),
+                "declare a hook artifact whose binding is on-compaction (or all) with \
+                 commit_policy: replace-context, or use --resume-mode full, which loads the \
+                 record verbatim and needs no hook — see docs/content/reference/cli.md",
             ),
             // A record path is built from two operator-supplied segments, and both refuse here.
             // Kept off `E-CAP-009` on purpose: that one points at `capabilities.state.store` and

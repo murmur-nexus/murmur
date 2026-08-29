@@ -8,7 +8,8 @@ use std::{
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
     launch_session, stage_session, state_store_reports, AfterTask, ArtifactRequest,
-    LifecycleOverride, LockExpectation, RuntimeError, StageRequest, TaskAcceptance,
+    LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
+    TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
@@ -18,8 +19,9 @@ use murmur_artifact::{
 };
 
 use crate::{
+    commands::trace::{first_task_context_id, resolve_session_dir},
     config::load_effective_mur_config_if_any_exists,
-    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008},
+    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008, E_RUN_015, E_RUN_016},
     registry_client::FallbackRegistry,
 };
 
@@ -37,12 +39,76 @@ fn fail(session_id: &str, workdir: &std::path::Path, error: CliError, json: bool
     }
 }
 
+/// Where this launch's sessions live, and therefore where `--resume` looks for the one it names.
+///
+/// The two layouts are not interchangeable, and `--resume` has to match whichever this launch
+/// will use: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>`, and without it they go
+/// to `<manifest_dir>/workdir/<ses_id>`. Never `$CWD/workdir` — a `--manifest` pointing
+/// elsewhere would then resolve `@1` against a directory this capsule never wrote to.
+fn session_root(project_dir: &Path, workdir_arg: Option<&Path>) -> PathBuf {
+    match workdir_arg {
+        Some(dir) => absolutise(dir).join(".murmur"),
+        None => project_dir.join("workdir"),
+    }
+}
+
+/// `dir` made absolute against the current directory, unchanged when it already is.
+fn absolutise(dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(dir)
+    }
+}
+
+/// `--resume <session>` turned into the context id the named session ran under, plus the request
+/// the runtime stages under.
+///
+/// Resolved here, before `stage_session`, and therefore before this launch's own session
+/// directory exists — which is what makes `@1` name the previous run rather than the one being
+/// started. `--resume` is sugar over `--context`: the id this returns goes into the same
+/// `StageRequest.context_id` field `--context` fills, and there is no second load path.
+fn resolve_resume(
+    resume_arg: &str,
+    resume_mode: ResumeMode,
+    project_dir: &Path,
+    workdir_arg: Option<&Path>,
+) -> Result<(ResumeRequest, String), CliError> {
+    let root = session_root(project_dir, workdir_arg);
+    let session_dir = resolve_session_dir(resume_arg, &root, "--resume")?;
+    let session = session_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| resume_arg.to_string());
+    let context_id = first_task_context_id(&session_dir)?.ok_or_else(|| {
+        CliError::with_hint(
+            E_RUN_016,
+            format!(
+                "cannot resume session {session}: its trace.jsonl records no task_start carrying \
+                 a context id"
+            ),
+            "only a session that actually ran a task has a conversation to continue. Run \
+             `mur trace show <session>` to see what it did, and resume one that reached a task \
+             — see docs/content/reference/cli.md",
+        )
+    })?;
+    Ok((
+        ResumeRequest {
+            from_session: session,
+            mode: resume_mode,
+        },
+        context_id,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_run(
     manifest_arg: &Path,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
     context_id_arg: Option<&str>,
+    resume_arg: Option<&str>,
+    resume_mode: capsule_runtime::ResumeMode,
     lifecycle_task_acceptance: Option<&str>,
     lifecycle_after_task: Option<&str>,
     workdir_arg: Option<PathBuf>,
@@ -87,6 +153,36 @@ pub(crate) fn run_run(
             )
         })?;
     workdir = project_dir.join("workdir");
+
+    // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
+    // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
+    // is still the *previous* run; and a refusal must leave nothing behind to clean up.
+    if resume_arg.is_some() && context_id_arg.is_some() {
+        return Err(fail(
+            &session_id,
+            &workdir,
+            CliError::with_hint(
+                E_RUN_015,
+                "--resume and --context name the same thing two ways",
+                "--resume <session> resolves that session's context id for you; --context <id> \
+                 names one directly. Pass whichever you have, not both — see \
+                 docs/content/reference/cli.md",
+            ),
+            json,
+        ));
+    }
+    let resume = match resume_arg {
+        Some(arg) => Some(
+            resolve_resume(arg, resume_mode, &project_dir, workdir_arg.as_deref())
+                .map_err(|error| fail(&session_id, &workdir, error, json))?,
+        ),
+        None => None,
+    };
+    // `--resume` is sugar over `--context`: one field, one record, one set of bookkeeping.
+    let context_id = resume
+        .as_ref()
+        .map(|(_, context_id)| context_id.clone())
+        .or_else(|| context_id_arg.map(str::to_string));
 
     let workspace_root = find_workspace_root(&project_dir);
     if !no_env_file {
@@ -349,7 +445,8 @@ pub(crate) fn run_run(
         inference: staged_inference,
         system_prompt_overridden,
         context: runtime_manifest.context.clone(),
-        context_id: context_id_arg.map(str::to_string),
+        context_id,
+        resume: resume.map(|(request, _)| request),
         otel_endpoint: runtime_manifest
             .observability
             .as_ref()
@@ -364,13 +461,7 @@ pub(crate) fn run_run(
         lifecycle: runtime_manifest.lifecycle.clone(),
         lifecycle_override,
         trace: runtime_manifest.trace,
-        workdir: workdir_arg.clone().map(|w| {
-            if w.is_absolute() {
-                w
-            } else {
-                std::env::current_dir().unwrap_or_default().join(w)
-            }
-        }),
+        workdir: workdir_arg.as_deref().map(absolutise),
         bind_addr: bind_addr.to_string(),
         internal_port: runtime_manifest
             .network
