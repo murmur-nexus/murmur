@@ -1,6 +1,7 @@
 pub(crate) mod beta;
 pub(crate) mod build;
 pub(crate) mod config_cmd;
+pub(crate) mod conversation;
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod deploy;
 #[cfg(feature = "beta-mur-deploy")]

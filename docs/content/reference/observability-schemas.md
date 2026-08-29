@@ -33,7 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error` | The session node |
+| `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
@@ -325,6 +325,21 @@ and for the three failures nothing else can surface. `on-stage` faults never rea
 because staging runs before `trace.jsonl` exists. Every fault is also written to
 `workdir/logs/hook-<name>.log`. Faults are flushed just before the `session_end` they precede, so
 they always appear earlier in the file than the event that flushed them.
+
+**`retention`**{ #retention } — written when a [`retain:` policy](manifest.md#retention) deleted
+something, once per (`store`, `reason`) pair that removed anything
+
+| Field | Type | Notes |
+|---|---|---|
+| `store` | string | `"sessions"` for the session directories under the workdir, `"records"` for the conversation records under `~/.murmur/conversations/` |
+| `reason` | string | `"max_sessions"`, `"max_age"` or `"max_messages"` — the key that condemned what went |
+| `removed` | u32 | Units removed: session directories, context directories, or, for `"max_messages"`, the one record that was rewritten. Never `0` |
+| `targets` | array of string | What went: `ses_` directory names for `"sessions"`, context ids for `"records"` |
+| `messages_dropped` | u64 | Messages dropped from the front of the record. Written for `"max_messages"` only, and absent otherwise |
+
+Written immediately after `session_start`, in the trace of the session that performed the
+deletion — the only place the pruning of an earlier session can go. A launch that removed nothing
+writes no line.
 
 **`resource_list`** — written when the [resource plane](resource-plane.md) answers a `list`, served
 or refused

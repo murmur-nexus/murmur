@@ -162,6 +162,9 @@ two `mur run --context <id>` launches with no session directory in common. `mur 
 <session>` reaches the same record without you having to know the id: it reads the context off that
 session's trace.
 
+A record whose capsule declares [`context.retain`](manifest.md#context-retain) opens with a
+[header line](#record-header). Every other line is one message.
+
 One line is one message, as the runtime holds it:
 
 ```json
@@ -176,8 +179,46 @@ reaches a driver.
 
 The record holds every message that enters the context, in the order it enters: the task's user
 message, each committed `seed-context` message, each assistant message, each tool result, and each
-message a compaction commits — beside, not instead of, the messages it replaced. Nothing trims the
-record, and there is no retention or pruning mechanism.
+message a compaction commits — beside, not instead of, the messages it replaced.
+
+[`context.retain`](manifest.md#retention) is what bounds it, and
+[`mur conversation`](cli.md#mur-conversation) is what an operator prunes it with by hand. Without
+a `retain:` block the record grows without bound.
+
+### The header line { #record-header }
+
+The first line of a record whose capsule declares `context.retain`, and of any record
+[`mur conversation truncate`](cli.md#mur-conversation-truncate) has rewritten:
+
+```json
+{"type":"murmur.record","capsule":"shey","created_ms":1756400000000,"truncated":{"dropped":500,"oldest_surviving_id":"msg_01a0490075…","last_dropped_id":"msg_0199f2a1c3…","at_ms":1756400000000}}
+```
+
+| Key | Value |
+|---|---|
+| `type` | Always `murmur.record`. A first line carrying anything else is not a header |
+| `capsule` | The capsule that owns this record — `name:` from its manifest, not the record store. What makes pruning safe when two capsules share one `context.record_store` |
+| `created_ms` | When the header was written. On a record adopted from before the header existed, that is the adoption |
+| `truncated` | Absent until the record has been truncated. `dropped` is cumulative over the record's life; `last_dropped_id` is what [`mur conversation ls --message`](cli.md#mur-conversation-ls-message) classifies a missing id against |
+
+It is a JSON object with no `role`, so it is not a message: every reader of a record skips it, the
+`total` a [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) page reports does
+not count it, and a `threaded` reload does not load it.
+
+A record with no header line is unowned. Automatic pruning skips it however old it is; the capsule
+that owns it writes the header the next time it appends, and the policy applies from then on.
+
+### What pruning removes { #what-pruning-removes }
+
+| Policy | Removed |
+|---|---|
+| [`trace.retain`](manifest.md#trace-retain) | A whole `<session-id>/` directory under the workdir, including its `trace.jsonl` and its `blobs/` |
+| [`context.retain.max_messages`](manifest.md#context-retain) | The oldest message lines of one `conversation.jsonl`. The file, the directory and every surviving `id` stay |
+| [`context.retain.max_age`](manifest.md#context-retain) | A whole `<context-id>/` directory under the record store |
+
+Pruning runs at launch, in the runtime, immediately after the session's `session_start`. Every
+deletion is written to that session's own trace as a
+[`retention` event](observability-schemas.md#retention).
 
 ### What it means for a run
 

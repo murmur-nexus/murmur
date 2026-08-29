@@ -24,6 +24,9 @@ use commands::{
     beta::{run_beta, BetaCommand},
     build::run_build,
     config_cmd::{run_config, ConfigCommand},
+    conversation::{
+        run_conversation_ls, run_conversation_rm, run_conversation_truncate, ConversationCommand,
+    },
     doctor::run_doctor,
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
     install::run_install,
@@ -256,6 +259,11 @@ enum Commands {
         #[arg(long)]
         explain_scope: bool,
     },
+    /// Inspect and prune the durable conversation records under ~/.murmur/conversations/
+    Conversation {
+        #[command(subcommand)]
+        command: ConversationCommand,
+    },
     /// Analyze trace.jsonl files from past sessions
     Trace {
         #[command(subcommand)]
@@ -469,6 +477,21 @@ fn main() {
             containment.as_deref(),
             explain_scope,
         ),
+        Commands::Conversation { command } => match command {
+            ConversationCommand::Ls {
+                record,
+                message,
+                json,
+            } => run_conversation_ls(record, message, json),
+            ConversationCommand::Rm { context_id, record } => {
+                run_conversation_rm(&context_id, record)
+            }
+            ConversationCommand::Truncate {
+                context_id,
+                keep,
+                record,
+            } => run_conversation_truncate(&context_id, keep, record),
+        },
         Commands::Trace { command } => match command {
             TraceCommand::Show {
                 session,

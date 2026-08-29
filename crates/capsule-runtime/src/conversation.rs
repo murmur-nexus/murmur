@@ -31,7 +31,10 @@ use crate::errors::RuntimeError;
 pub(crate) const CONVERSATION_ROOT_DIR: &str = "conversations";
 
 /// The record file inside `<record>/<context-id>/`.
-const RECORD_FILE_NAME: &str = "conversation.jsonl";
+pub(crate) const RECORD_FILE_NAME: &str = "conversation.jsonl";
+
+/// The `type` value on a record's header line, and the only value a header is recognised by.
+pub(crate) const RECORD_HEADER_TYPE: &str = "murmur.record";
 
 /// Mode applied to the conversation root, each record directory and each context directory:
 /// owner-only, because a record is the whole of one capsule's conversation.
@@ -51,6 +54,82 @@ const MAX_PAGE_LIMIT: u32 = 100;
 /// value they wrote is in front of them.
 const SEGMENT_RULE: &str = "must be a single path segment: no '/', no '.' or '..', not absolute, \
                             and not starting with a dot";
+
+/// What one record has already dropped from its front.
+///
+/// Cumulative over the record's life: `dropped` is every message truncation has ever taken from
+/// this record, not what the last one took.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TruncationMarker {
+    pub dropped: u64,
+    /// The `msg_` id of the oldest message still in the file.
+    pub oldest_surviving_id: String,
+    /// The `msg_` id of the newest message that went. A reference to any message minted at or
+    /// before this one reads as truncated rather than as unknown — see
+    /// [`crate::retention::locate_message`].
+    pub last_dropped_id: String,
+    /// When the most recent truncation ran, in milliseconds since the epoch.
+    pub at_ms: u64,
+}
+
+/// The first line of a record: a JSON object with a `type` key and no `role`.
+///
+/// Deliberately not a message, and deliberately not a sidecar. Not a message, because every
+/// reader of a record skips a line that is not a JSON object carrying a string `role`, so a
+/// header is invisible to `murmur:conversation/read`, to the `threaded` reload, and to the
+/// `total` a page reports. Not a sidecar, because a sidecar needs a second write that a crash
+/// could desynchronise from the rename — a header makes the whole truncation exactly one atomic
+/// rename of one file.
+///
+/// [`Self::capsule`] is what makes automatic record pruning store-safe: two capsules pointed at
+/// one `context.record_store` each own only the records their own name is on.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordHeader {
+    /// Always [`RECORD_HEADER_TYPE`]. A first line carrying anything else is not a header.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The capsule that owns this record — `name:` from its manifest, never the record store.
+    pub capsule: String,
+    /// When the header was written, in milliseconds since the epoch. On a record adopted from
+    /// before this slice, that is the adoption, not the conversation's first message.
+    pub created_ms: u64,
+    /// Absent until this record has been truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<TruncationMarker>,
+}
+
+/// `header` as the one line it occupies, newline included.
+pub(crate) fn header_line(header: &RecordHeader) -> Result<String, String> {
+    let mut line = serde_json::to_string(header)
+        .map_err(|err| format!("failed to encode the record header: {err}"))?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// The header `path` carries, or `None` for a record whose first line is not one — every record
+/// written before this slice, and every file that does not exist.
+pub(crate) fn read_header(path: &Path) -> Option<RecordHeader> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_header(raw.lines().next()?)
+}
+
+/// One line as a record header, or `None` when it is not one.
+pub(crate) fn parse_header(line: &str) -> Option<RecordHeader> {
+    let header: RecordHeader = serde_json::from_str(line).ok()?;
+    (header.kind == RECORD_HEADER_TYPE).then_some(header)
+}
+
+/// The millisecond timestamp inside a `msg_` id, or `None` when the id is not one the runtime
+/// minted. Message ids are uuid v7 in simple form, so the first 12 hex characters are the mint
+/// time — which is what lets a dropped id be placed against a truncation marker without the
+/// messages themselves.
+pub(crate) fn message_id_timestamp_ms(id: &str) -> Option<u64> {
+    let hex = id.strip_prefix("msg_")?;
+    if hex.len() < 12 {
+        return None;
+    }
+    u64::from_str_radix(&hex[..12], 16).ok()
+}
 
 /// Whether `value` is usable as one directory segment of a record path.
 ///
@@ -113,6 +192,12 @@ pub(crate) struct ConversationRecord {
     dir: PathBuf,
     /// Session directory the failures are reported into, beside stderr.
     workdir: PathBuf,
+    /// The capsule this record's header names, or `None` for a capsule that declares no
+    /// `context.retain` — which writes no header at all. See [`Self::ensure_header`].
+    capsule: Option<String>,
+    /// Whether the header has been settled for this instance. One check per attempt, not one per
+    /// message: the header is written or adopted at most once and then never looked at again.
+    header_ensured: bool,
     /// Ids already on disk: those loaded from the record and those this attempt appended. A
     /// compaction hook that hands a message back verbatim returns its id with it, and a threaded
     /// reload starts from messages that are already lines — neither may be written twice.
@@ -131,7 +216,12 @@ impl ConversationRecord {
     /// A context id arrives from an A2A client as well as from `mur run --context`, so it is
     /// checked here rather than trusted: a rejected id costs that conversation its record and
     /// nothing else.
-    pub(crate) fn open(root: &Path, context_id: &str, workdir: &Path) -> Option<Self> {
+    pub(crate) fn open(
+        root: &Path,
+        context_id: &str,
+        workdir: &Path,
+        capsule: Option<&str>,
+    ) -> Option<Self> {
         if crate::state_store::validate_store_name(context_id).is_err() {
             report(
                 workdir,
@@ -145,6 +235,8 @@ impl ConversationRecord {
         Some(Self {
             dir: root.join(context_id),
             workdir: workdir.to_path_buf(),
+            capsule: capsule.map(str::to_string),
+            header_ensured: false,
             recorded: HashSet::new(),
             failure_reported: false,
             malformed_reported: false,
@@ -225,15 +317,28 @@ impl ConversationRecord {
     ///
     /// Creation happens here rather than at staging so `context.record: off`, and a launch that
     /// never reaches a message, both leave nothing behind.
-    fn append_line(&self, message: &Value) -> Result<(), String> {
+    fn append_line(&mut self, message: &Value) -> Result<(), String> {
         let mut line = serde_json::to_string(message)
             .map_err(|err| format!("failed to encode the message: {err}"))?;
         line.push('\n');
 
+        self.ensure_dirs()?;
+        self.ensure_header()?;
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.path())
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .map_err(|err| err.to_string())
+    }
+
+    /// Create the record root, the record directory and the context directory if they are
+    /// missing, oldest ancestor first, so a context directory is never reachable through a parent
+    /// a wider mode left open.
+    fn ensure_dirs(&self) -> Result<(), String> {
         let mut chain = Vec::new();
         let mut dir = Some(self.dir.as_path());
-        // The record root, the record directory and the context directory, oldest ancestor first,
-        // so a context directory is never reachable through a parent a wider mode left open.
         for _ in 0..3 {
             if let Some(current) = dir {
                 chain.push(current);
@@ -244,13 +349,64 @@ impl ConversationRecord {
             crate::state_store::ensure_private_dir(path, RECORD_DIR_MODE)
                 .map_err(|reason| format!("{}: {reason}", path.display()))?;
         }
+        Ok(())
+    }
 
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path())
-            .and_then(|mut file| file.write_all(line.as_bytes()))
-            .map_err(|err| err.to_string())
+    /// Put a [`RecordHeader`] at the front of this record, once, before its first new line.
+    ///
+    /// A capsule that declares no `context.retain` writes no header: there is nothing to own a
+    /// record for, and a record that gains a line on upgrade is a behaviour change an operator
+    /// did not ask for. Everything below is therefore conditional on [`Self::capsule`].
+    ///
+    /// Three cases, and the third is the whole reason this is not just a write:
+    ///
+    /// * A record that does not exist yet gets its header as its first line.
+    /// * A record that already carries one is left exactly as it is.
+    /// * A record written before the header existed is **adopted**: the header is prepended
+    ///   through the same atomic temp-and-rename rewrite a truncation uses, so a crash leaves the
+    ///   original whole. Until that adoption the record is unowned and automatic pruning skips
+    ///   it, however old it is.
+    ///
+    /// Adoption is what makes retention apply to a pre-slice record without ever guessing at
+    /// ownership: the capsule that writes to a record is the capsule that owns it.
+    fn ensure_header(&mut self) -> Result<(), String> {
+        if self.header_ensured {
+            return Ok(());
+        }
+        let Some(capsule) = self.capsule.clone() else {
+            self.header_ensured = true;
+            return Ok(());
+        };
+        let path = self.path();
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        if existing.lines().next().and_then(parse_header).is_some() {
+            self.header_ensured = true;
+            return Ok(());
+        }
+
+        let header = RecordHeader {
+            kind: RECORD_HEADER_TYPE.to_string(),
+            capsule,
+            created_ms: crate::retention::now_ms(),
+            truncated: None,
+        };
+        let line = header_line(&header)?;
+        // The flag is set only once the header is on disk: a failure the caller survives is
+        // followed by an append carrying the same messages, and a record marked as headered
+        // before its header was written would take those messages headerless and stay unowned.
+        if existing.is_empty() {
+            std::fs::write(&path, line).map_err(|err| format!("{}: {err}", path.display()))?;
+        } else {
+            let mut contents = line;
+            contents.push_str(&existing);
+            crate::retention::StagedRewrite::stage(&path, contents.as_bytes())?.commit()?;
+        }
+        self.header_ensured = true;
+        Ok(())
     }
 }
 
@@ -396,7 +552,7 @@ fn read_record(path: &Path, workdir: &Path, reported: &mut bool) -> Result<Vec<V
         if line.trim().is_empty() {
             continue;
         }
-        match parse_message(line) {
+        match parse_message_line(line) {
             Some(message) => messages.push(message),
             None => {
                 if !*reported {
@@ -418,8 +574,9 @@ fn read_record(path: &Path, workdir: &Path, reported: &mut bool) -> Result<Vec<V
 
 /// One record line as a message, or `None` when it is not one. A message is a JSON object
 /// carrying a string `role`: everything the runtime writes is, and nothing else can be lowered
-/// into the WIT `message` record.
-fn parse_message(line: &str) -> Option<Value> {
+/// into the WIT `message` record. The header line is the deliberate non-message — it is how a
+/// truncation marker rides in the file without being visible to anything that reads messages.
+pub(crate) fn parse_message_line(line: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(line).ok()?;
     value
         .get("role")
@@ -447,12 +604,128 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The capsule every record below is opened for, and therefore the name its header carries.
+    const CAPSULE: &str = "capsule";
+
     fn message(id: &str, role: &str, text: &str) -> Value {
         json!({"role": role, "content": [{"type": "text", "text": text}], "id": id})
     }
 
     fn id_at(id: usize) -> String {
         format!("msg_{:032x}", id)
+    }
+
+    /// The header is the first line a new record gets, and it names the capsule that wrote it —
+    /// which is what makes automatic pruning store-safe when two capsules share one record store.
+    #[test]
+    fn the_first_append_writes_a_header_naming_the_capsule() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/shared");
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[message(&id_at(1), "user", "hello")]);
+
+        let raw = std::fs::read_to_string(record.path()).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "a header and one message: {lines:?}");
+        let header = parse_header(lines[0]).expect("the first line is a header");
+        assert_eq!(header.kind, RECORD_HEADER_TYPE);
+        assert_eq!(header.capsule, CAPSULE);
+        assert!(header.truncated.is_none(), "nothing has been dropped yet");
+        assert!(header.created_ms > 0);
+    }
+
+    /// The header is invisible to everything that reads messages: `read_record` skips it, so the
+    /// `total` a `murmur:conversation/read` page reports counts messages and nothing else.
+    #[test]
+    fn a_header_line_changes_neither_the_loaded_messages_nor_total() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/c");
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[
+            message(&id_at(1), "user", "one"),
+            message(&id_at(2), "assistant", "two"),
+        ]);
+        let path = record.path();
+
+        let mut reader =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        let loaded = reader.load();
+        assert_eq!(loaded.len(), 2, "the header is not a message: {loaded:?}");
+
+        let mut cache = RecordCache::default();
+        let page = page(&mut cache, Some(&path), workdir.path(), None, 100).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.messages.len(), 2);
+    }
+
+    /// A record written before the header existed is unowned, and is adopted on the next append
+    /// by the capsule that writes to it — through the same atomic rewrite a truncation uses, so
+    /// every line it already held survives byte for byte.
+    #[test]
+    fn a_headerless_record_is_adopted_on_the_next_append() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/c");
+        let dir = root.join("ctx_1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RECORD_FILE_NAME);
+        let pre_slice = format!(
+            "{}
+{}
+",
+            serde_json::to_string(&message(&id_at(1), "user", "one")).unwrap(),
+            serde_json::to_string(&message(&id_at(2), "assistant", "two")).unwrap()
+        );
+        std::fs::write(&path, &pre_slice).unwrap();
+        assert!(read_header(&path).is_none(), "unowned before the append");
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[message(&id_at(3), "user", "three")]);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(read_header(&path).unwrap().capsule, CAPSULE);
+        assert!(
+            raw.contains(pre_slice.trim_end()),
+            "every pre-slice line survives byte for byte: {raw}"
+        );
+        assert_eq!(raw.lines().count(), 4, "a header and three messages");
+    }
+
+    /// A record already carrying a header is left exactly as it is — the header is written once,
+    /// not once per launch, and a truncation marker on it is never cleared by an append.
+    #[test]
+    fn an_owned_record_keeps_the_header_it_already_has() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/c");
+        let dir = root.join("ctx_1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RECORD_FILE_NAME);
+        let header = RecordHeader {
+            kind: RECORD_HEADER_TYPE.to_string(),
+            capsule: "someone-else".to_string(),
+            created_ms: 1_756_400_000_000,
+            truncated: Some(TruncationMarker {
+                dropped: 5,
+                oldest_surviving_id: id_at(6),
+                last_dropped_id: id_at(5),
+                at_ms: 1_756_400_000_001,
+            }),
+        };
+        std::fs::write(&path, header_line(&header).unwrap()).unwrap();
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[message(&id_at(7), "user", "seven")]);
+
+        assert_eq!(read_header(&path).unwrap(), header);
     }
 
     /// A record written by one session and read back by the next: the ids are the same bytes, and
@@ -463,10 +736,12 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
 
-        let mut first = ConversationRecord::open(&root, "ctx_fixed", workdir.path()).unwrap();
+        let mut first =
+            ConversationRecord::open(&root, "ctx_fixed", workdir.path(), Some(CAPSULE)).unwrap();
         first.append(&[message(&id_at(1), "user", "hello")]);
 
-        let mut second = ConversationRecord::open(&root, "ctx_fixed", workdir.path()).unwrap();
+        let mut second =
+            ConversationRecord::open(&root, "ctx_fixed", workdir.path(), Some(CAPSULE)).unwrap();
         let loaded = second.load();
         assert_eq!(loaded.len(), 1);
         assert_eq!(
@@ -494,7 +769,8 @@ mod tests {
         let conversations = home.path().join("conversations");
         let root = conversations.join("capsule");
 
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         assert!(!conversations.exists(), "opening a record creates nothing");
 
         record.append(&[message(&id_at(1), "user", "hello")]);
@@ -520,7 +796,8 @@ mod tests {
                 ConversationRecord::open(
                     &home.path().join("conversations/c"),
                     context_id,
-                    workdir.path()
+                    workdir.path(),
+                    Some(CAPSULE)
                 )
                 .is_none(),
                 "'{context_id}' must not open a record"
@@ -535,7 +812,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         let written: Vec<Value> = (1..=5)
             .map(|n| message(&id_at(n), "user", &format!("m{n}")))
             .collect();
@@ -574,7 +852,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         record.append(
             &(1..=120)
                 .map(|n| message(&id_at(n), "user", "m"))
@@ -617,7 +896,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         record.append(&[message(&id_at(1), "user", "m")]);
         let path = record.path();
 
@@ -662,7 +942,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         record.append(&[message(&id_at(1), "user", "a")]);
         let path = record.path();
 
@@ -739,7 +1020,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(&blocker, "").unwrap();
 
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         let first = message(&id_at(1), "user", "a");
         let second = message(&id_at(2), "assistant", "b");
         record.append(std::slice::from_ref(&first));
@@ -754,7 +1036,7 @@ mod tests {
         let written: Vec<Value> = std::fs::read_to_string(record.path())
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .filter_map(parse_message_line)
             .collect();
         assert_eq!(
             written
@@ -772,7 +1054,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
         let root = home.path().join("conversations/capsule");
-        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path()).unwrap();
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
         record.append(
             &(1..=250)
                 .map(|n| message(&id_at(n), "user", "m"))
@@ -893,6 +1176,7 @@ mod tests {
             record_store: Some("shey".to_string()),
             seed_budget: murmur_artifact::DEFAULT_SEED_BUDGET,
             seed_overflow_margin: murmur_artifact::DEFAULT_SEED_OVERFLOW_MARGIN,
+            retain: None,
         };
         assert_eq!(resolve_record_name(Some(&off), "capsule"), None);
 

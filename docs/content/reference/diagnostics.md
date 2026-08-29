@@ -22,6 +22,9 @@ section that explains it.
 | `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
+| `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
+| `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
+| `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
 | `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
@@ -437,6 +440,46 @@ Distinct from [`E-CAP-009`](#e-cap-009), which is the same shape rule applied to
 A `contextId` an A2A client sends is not an operator value and never refuses a launch: a task whose
 context id is not a usable segment simply goes unrecorded, reported once to stderr and to
 `logs/bootstrap.log`.
+
+---
+
+## Conversation record errors
+
+[`mur conversation`](cli.md#mur-conversation) acts on the
+[record store](workdir.md#the-conversation-record) directly. All three refusals happen before
+anything is read or written.
+
+### E-CNV-001 — no such record or context { #e-cnv-001 }
+
+`rm` and `truncate` name one context id, optionally narrowed with `--record`. Nothing matching it
+is refused naming what was looked for and where:
+
+```text
+error[E-CNV-001]: no context 'ctx_nowhere' in any record under ~/.murmur/conversations/
+  hint: `mur conversation ls` lists every record and context on this host
+```
+
+### E-CNV-002 — a context id is ambiguous across record stores { #e-cnv-002 }
+
+A context id is unique inside one record store and nowhere else: two capsules can be handed the
+same one, and two capsules can be pointed at one
+[`context.record_store`](manifest.md#field-context). An id present under more than one store is
+refused naming every store it is in, rather than guessing which conversation to delete or rewrite:
+
+```text
+error[E-CNV-002]: context 'ctx_fixed' is present under 2 record stores: store-a, store-b
+  hint: pass --record <NAME> to say which one, e.g. --record store-a
+```
+
+### E-CNV-003 — invalid `--keep` { #e-cnv-003 }
+
+`mur conversation truncate --keep 0` is refused, because truncating a record to nothing is
+[`mur conversation rm`](cli.md#mur-conversation-rm):
+
+```text
+error[E-CNV-003]: --keep must be at least 1
+  hint: truncating a record to nothing is `mur conversation rm ctx_fixed`
+```
 
 ---
 

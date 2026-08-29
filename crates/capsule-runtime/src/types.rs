@@ -388,6 +388,9 @@ pub struct StagedSession {
     /// manifest's `trace:` block, or [`murmur_artifact::TraceCapture::default`] when it has
     /// none).
     pub(crate) trace_capture: murmur_artifact::TraceCapture,
+    /// What bounds this workdir's session directories, from the manifest's `trace.retain` block.
+    /// `None` — the overwhelmingly common case — prunes nothing, ever.
+    pub(crate) trace_retain: Option<murmur_artifact::TraceRetainConfig>,
     /// Address the HTTP server is bound to (copied from StageRequest::bind_addr).
     pub(crate) bind_addr: String,
     /// Internal port from the manifest (copied from StageRequest::internal_port).

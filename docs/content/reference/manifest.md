@@ -90,6 +90,9 @@ context:
   max_tokens: 200000   # enables context compaction; omit to disable
   record: on           # on (default) | off — the durable conversation record
   record_store: shey   # optional; directory under ~/.murmur/conversations/, default: capsule name
+  retain:              # optional; omit to keep every record whole and forever
+    max_messages: 2000 # truncate the front of the record this launch opens beyond this
+    max_age: 90d       # drop a record this capsule owns and has not written to for this long
 
 observability:
   otel_endpoint: http://localhost:4318  # OTLP/HTTP endpoint; absent = no external span export
@@ -109,7 +112,10 @@ observability:
         expected: [bash, python]
 
 trace:
-  capture: content  # optional; default meta: also store the bodies behind the trace's hashes
+  capture: content    # optional; default meta: also store the bodies behind the trace's hashes
+  retain:             # optional; omit to keep every session directory forever
+    max_sessions: 50  # keep the newest N session directories, this launch's own included
+    max_age: 14d      # and/or drop anything whose ses_ id was minted longer ago than this
 
 inference:
   transport: http
@@ -638,6 +644,9 @@ these fields are accepted and inert:
 | `context.seed_overflow_margin` | float (0.0–1.0) | no | Default: `0.10`. Slack above `context.seed_budget`, as a fraction of it, within which an over-budget seed has its oldest messages dropped rather than being handed to the compaction hook. Requires `context.max_tokens` and is inert under `transport: process`, exactly like `context.seed_budget`. |
 | `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Inert under `transport: process`, which writes no record either way. |
 | `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
+| `context.retain` { #context-retain } | block | no | What bounds this capsule's [conversation records](workdir.md#the-conversation-record). Omitted, nothing is ever deleted. See [Retention](#retention). |
+| `context.retain.max_messages` | integer ≥ 1 | no | Messages to keep. At each launch the record that launch opens is truncated to its newest N; the older ones are dropped and the [header line](workdir.md#record-header) records the drop. Applies only to a record this capsule owns. |
+| `context.retain.max_age` | duration | no | Age beyond which a record this capsule owns is removed whole, measured from the last write to its `conversation.jsonl`. |
 
 #### `observability` { #field-observability }
 
@@ -657,6 +666,9 @@ these fields are accepted and inert:
 |---|---|---:|---|
 | `trace.capture` | `none \| meta \| content` | no | Default: `meta`. How much of each turn's driver request `trace.jsonl` keeps — see the table below. |
 | `trace.include_tool_output` | bool | no | Retired; use `trace.capture`. Accepted as an alias — `true` for `capture: content`, `false` for `capture: meta` — and its use prints a warning. Setting it alongside `trace.capture` is an error, even when the two agree. |
+| `trace.retain` { #trace-retain } | block | no | What bounds the [session directories](workdir.md) beside the running one. Omitted, nothing is ever deleted. See [Retention](#retention). |
+| `trace.retain.max_sessions` | integer ≥ 1 | no | Session directories to keep, counting the running session itself. The rest are removed whole, taking their `trace.jsonl` and `blobs/` with them. |
+| `trace.retain.max_age` | duration | no | Age beyond which a session directory is removed, measured from the millisecond timestamp inside its own uuid-v7 `ses_` id. No file metadata is read. |
 
 | `trace.capture` | `inference` content hashes | `blobs/` | `tool_call.output` |
 |---|---|---|---|
@@ -1089,6 +1101,51 @@ the same terms. Omit the key to deliver no variable.
 - A `capabilities.shell` block present with an empty `allow` list is rejected at parse time.
 - A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for
   each listed binary; the agent discovers these alongside artifact-backed tools.
+
+---
+
+## Retention { #retention }
+
+Two stores grow as a capsule runs: the [session directories](workdir.md) under the workdir, and
+the [conversation records](workdir.md#the-conversation-record) under `~/.murmur/conversations/`.
+`trace.retain` bounds the first, `context.retain` the second. Both blocks are enforced at launch,
+by the runtime, and every deletion is written to the running session's trace as a
+[`retention` event](observability-schemas.md#retention).
+
+**There are no defaults. A capsule with no `retain:` block deletes nothing, ever.**
+
+| Rule | Effect |
+|---|---|
+| The block is omitted | Nothing is deleted. Both stores grow without bound, as they always have. |
+| The block is present but empty (`retain: {}`, or `retain:` with nothing under it) | Refused at parse time, naming the block. Omitting the block is how a capsule declares no policy. |
+| Both keys are present | ANDed. A session or record survives only if it is inside both limits. |
+| A key is `0` | Refused at parse time, naming the key. |
+
+Durations are written as an integer optionally suffixed `s`, `m`, `h` or `d`; a bare integer is
+seconds.
+
+### What each key measures { #retention-measures }
+
+| Key | Age is measured from | Unit removed |
+|---|---|---|
+| `trace.retain.max_sessions` | — | One session directory, whole |
+| `trace.retain.max_age` | The uuid-v7 timestamp inside the `ses_` id | One session directory, whole |
+| `context.retain.max_messages` | — | The oldest messages of one record |
+| `context.retain.max_age` | The last write to `conversation.jsonl` | One context directory, whole |
+
+A session directory is an independent unit — nothing references it and nothing spans two of them
+— so it is removed whole, taking its `trace.jsonl` and its `blobs/` with it. A record is one unit
+that grows, so it is trimmed from the front: the newest `max_messages` stay, each keeping the `id`
+it has always carried, and the [header line](workdir.md#record-header) records what went.
+
+### What retention never touches { #retention-never }
+
+| Never removed | Why |
+|---|---|
+| The running session's own directory, or any `ses_` id at or after it | The floor is the id itself, so a sibling capsule launched a moment ago is safe with no lock file. |
+| The context the launch is using | Retention must not delete the conversation it is about to continue. |
+| A record whose header names another capsule | Two capsules sharing a `context.record_store` is a deliberate act; one pruning the other's history is not. |
+| A record with no header line | Every record written before `context.retain` existed is unowned. It is adopted — and the policy starts applying — the next time the capsule that owns it appends to it. [`mur conversation rm`](cli.md#mur-conversation-rm) is what reaches an abandoned one. |
 
 ---
 

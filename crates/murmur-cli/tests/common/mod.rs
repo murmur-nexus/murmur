@@ -435,6 +435,15 @@ pub struct ScriptedServer {
 
 impl ScriptedServer {
     pub fn start(responses: Vec<String>) -> Self {
+        Self::start_with_delay(responses, std::time::Duration::ZERO)
+    }
+
+    /// `start`, with `delay` slept before each response is written.
+    ///
+    /// For the one property that needs a launch to take measurable wall-clock time: a retention
+    /// policy whose age window is shorter than the run itself must still leave the running
+    /// session's own directory standing.
+    pub fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let endpoint = format!("http://{addr}");
@@ -450,6 +459,9 @@ impl ScriptedServer {
                     .unwrap_or_else(|_| json!({"_raw": request_body}));
                 requests_for_thread.lock().unwrap().push(parsed);
 
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     body.len(),

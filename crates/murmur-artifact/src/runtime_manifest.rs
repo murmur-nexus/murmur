@@ -617,9 +617,9 @@ pub struct PeerFetchCapabilities {
 /// The accepted spelling of every duration in the manifest, stated once so the parser and the
 /// error it produces cannot drift apart.
 pub const DURATION_ACCEPTED_FORM: &str =
-    "must be a duration: an integer, optionally suffixed s/m/h";
+    "must be a duration: an integer, optionally suffixed s/m/h/d";
 
-/// Parses `90`, `30s`, `15m`, `1h` into a whole number of seconds.
+/// Parses `90`, `30s`, `15m`, `1h`, `14d` into a whole number of seconds.
 ///
 /// A bare integer is seconds. Suffixes are lowercase and single-character; `5 minutes` and `30S`
 /// are rejected rather than guessed at, on the same terms as [`parse_byte_size`]. Returns the
@@ -632,7 +632,10 @@ pub fn parse_duration_secs(input: &str) -> Result<u64, String> {
             Some(digits) => (digits, 60),
             None => match trimmed.strip_suffix('h') {
                 Some(digits) => (digits, 3600),
-                None => (trimmed, 1),
+                None => match trimmed.strip_suffix('d') {
+                    Some(digits) => (digits, 86_400),
+                    None => (trimmed, 1),
+                },
             },
         },
     };
@@ -855,6 +858,9 @@ pub struct ContextConfig {
     /// `0.0..=1.0`. Always populated; [`DEFAULT_SEED_OVERFLOW_MARGIN`] when the key is
     /// absent.
     pub seed_overflow_margin: f32,
+    /// What bounds this capsule's conversation records. `None` — the `retain:` block was absent
+    /// — keeps every record whole and forever. Inert when [`Self::record`] is `false`.
+    pub retain: Option<ContextRetainConfig>,
 }
 
 // Both fractions are validated to 0.0..=1.0 at parse time, so NaN is impossible.
@@ -872,6 +878,42 @@ pub struct TraceConfig {
     /// `trace.capture`, or from the retired `trace.include_tool_output` alias, by
     /// [`crate::trace_capture::resolve_trace_capture`].
     pub capture: TraceCapture,
+    /// What bounds the session directories under the workdir. `None` — the `retain:` block was
+    /// absent — keeps every session forever; there is no default policy, because a mechanism
+    /// that deletes an operator's traces unless they opt out is the one default-allow in a
+    /// runtime that is default-deny everywhere else.
+    pub retain: Option<TraceRetainConfig>,
+}
+
+/// The `trace.retain` block: what bounds the set of session directories beside the running one.
+///
+/// Both keys are optional and ANDed — a session survives only if it is inside every limit
+/// declared. An empty block is a parse error, not a no-op: omitting `retain:` is how a capsule
+/// says "keep everything".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceRetainConfig {
+    /// Newest session directories to keep, counting the running session itself. `None` means
+    /// the count is unbounded. Never `Some(0)`: truncating the set to nothing would delete the
+    /// running session's own trace, so it is refused at parse time.
+    pub max_sessions: Option<u32>,
+    /// Age beyond which a session directory is removed, in seconds, measured from the
+    /// millisecond timestamp inside its own uuid-v7 `ses_` id. `None` means no age limit.
+    pub max_age_secs: Option<u64>,
+}
+
+/// The `context.retain` block: what bounds this capsule's conversation records.
+///
+/// Both keys are optional and ANDed. `max_messages` truncates the front of the record the
+/// launch opens; `max_age_secs` removes a context directory this capsule owns and has not
+/// written to inside the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextRetainConfig {
+    /// Messages to keep at the tail of a record. `None` means the record grows without bound.
+    /// Never `Some(0)`: truncating a record to nothing is `mur conversation rm`, not retention.
+    pub max_messages: Option<u32>,
+    /// Age beyond which a record this capsule owns is removed, in seconds, measured from the
+    /// last write to its `conversation.jsonl`. `None` means no age limit.
+    pub max_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1398,6 +1440,10 @@ struct RawContextConfig {
     seed_budget: Option<f32>,
     #[serde(default)]
     seed_overflow_margin: Option<f32>,
+    /// Untyped so an empty block, a null block and an unknown key inside it are each reported
+    /// as an invalid `context.retain` rather than as a serde message about a struct field.
+    #[serde(default, deserialize_with = "present_yaml_value")]
+    retain: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1419,6 +1465,9 @@ struct RawTraceConfig {
     /// that opted out from one that never mentioned it — see [`resolve_trace_capture`].
     #[serde(default)]
     include_tool_output: Option<bool>,
+    /// Untyped for the same reason as `context.retain` — see [`RawContextConfig::retain`].
+    #[serde(default, deserialize_with = "present_yaml_value")]
+    retain: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2009,8 +2058,12 @@ impl RuntimeManifest {
         let trace = raw
             .trace
             .map(|raw_trace| {
-                resolve_trace_capture(raw_trace.capture.as_deref(), raw_trace.include_tool_output)
-                    .map(|capture| TraceConfig { capture })
+                let capture = resolve_trace_capture(
+                    raw_trace.capture.as_deref(),
+                    raw_trace.include_tool_output,
+                )?;
+                let retain = parse_trace_retain(raw_trace.retain)?;
+                Ok::<_, RuntimeManifestError>(TraceConfig { capture, retain })
             })
             .transpose()?;
         let network = raw.network.map(|n| NetworkConfig {
@@ -2143,6 +2196,18 @@ fn parse_peer_files_export(
 
 /// A YAML scalar as the text the byte-size and duration parsers expect, or `None` for a mapping
 /// or a sequence — a shape neither parser could report on without quoting the whole node.
+/// `Some` for a key that is present, whatever its value — including an explicit null.
+///
+/// The plain `Option<serde_yaml::Value>` a `#[serde(default)]` field gets collapses `retain:`
+/// with nothing under it into the same `None` an absent key produces, and those two say opposite
+/// things: absent means "keep everything", and empty is the error this slice refuses.
+fn present_yaml_value<'de, D>(deserializer: D) -> Result<Option<serde_yaml::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_yaml::Value::deserialize(deserializer).map(Some)
+}
+
 fn scalar_text(value: &serde_yaml::Value) -> Option<String> {
     match value {
         serde_yaml::Value::String(text) => Some(text.clone()),
@@ -2966,6 +3031,137 @@ fn parse_context(
             raw.seed_overflow_margin,
             DEFAULT_SEED_OVERFLOW_MARGIN,
         )?,
+        retain: parse_context_retain(raw.retain)?,
+    }))
+}
+
+/// The keys `trace.retain` accepts, in the order an error lists them.
+const TRACE_RETAIN_KEYS: [&str; 2] = ["max_sessions", "max_age"];
+
+/// The keys `context.retain` accepts, in the order an error lists them.
+const CONTEXT_RETAIN_KEYS: [&str; 2] = ["max_messages", "max_age"];
+
+/// What both `retain:` blocks say when they carry nothing. Stated once so the two errors, which
+/// travel through different `RuntimeManifestError` variants, cannot drift apart.
+const RETAIN_EMPTY_BLOCK: &str =
+    "must declare at least one key — omit the block entirely to keep everything, which is what      no policy means";
+
+/// One `retain:` block, reduced to its two recognized keys.
+///
+/// Shared by `trace.retain` and `context.retain`: they differ only in the name of the count key,
+/// so the shape check, the unknown-key refusal and the empty-block refusal are written once.
+/// `count_key` is `max_sessions` or `max_messages`; `block` is the dotted path an error names.
+fn parse_retain_block(
+    block: &str,
+    count_key: &str,
+    accepted: &[&str],
+    raw: serde_yaml::Value,
+    invalid: &dyn Fn(String, String) -> RuntimeManifestError,
+) -> Result<(Option<u32>, Option<u64>), RuntimeManifestError> {
+    let mapping = match raw {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        // `retain:` with nothing under it parses as null and means exactly `retain: {}`.
+        serde_yaml::Value::Null => {
+            return Err(invalid(block.to_string(), RETAIN_EMPTY_BLOCK.to_string()))
+        }
+        other => {
+            return Err(invalid(
+                block.to_string(),
+                format!(
+                    "must be a block of keys ({}), got '{other:?}'",
+                    accepted.join(", ")
+                ),
+            ))
+        }
+    };
+    if mapping.is_empty() {
+        return Err(invalid(block.to_string(), RETAIN_EMPTY_BLOCK.to_string()));
+    }
+
+    let mut count: Option<u32> = None;
+    let mut max_age_secs: Option<u64> = None;
+    for (key, value) in &mapping {
+        let key = key.as_str().unwrap_or_default();
+        let field = format!("{block}.{key}");
+        if key == count_key {
+            let parsed = value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    invalid(
+                        field.clone(),
+                        "must be a whole number of at least 1".to_string(),
+                    )
+                })?;
+            if parsed == 0 {
+                return Err(invalid(
+                    field,
+                    "must be at least 1 — a limit of zero would delete what retention exists to                      keep; remove the key to leave it unbounded"
+                        .to_string(),
+                ));
+            }
+            count = Some(parsed);
+        } else if key == "max_age" {
+            let text = scalar_text(value).ok_or_else(|| {
+                invalid(
+                    field.clone(),
+                    format!("'{value:?}' {DURATION_ACCEPTED_FORM}"),
+                )
+            })?;
+            let parsed =
+                parse_duration_secs(&text).map_err(|message| invalid(field.clone(), message))?;
+            if parsed == 0 {
+                return Err(invalid(
+                    field,
+                    format!("must be greater than zero; {DURATION_ACCEPTED_FORM}"),
+                ));
+            }
+            max_age_secs = Some(parsed);
+        } else {
+            return Err(invalid(
+                block.to_string(),
+                format!("unknown key '{key}'; expected: {}", accepted.join(", ")),
+            ));
+        }
+    }
+    Ok((count, max_age_secs))
+}
+
+fn parse_trace_retain(
+    raw: Option<serde_yaml::Value>,
+) -> Result<Option<TraceRetainConfig>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let (max_sessions, max_age_secs) = parse_retain_block(
+        "trace.retain",
+        "max_sessions",
+        &TRACE_RETAIN_KEYS,
+        raw,
+        &|field, message| RuntimeManifestError::InvalidTraceConfig { field, message },
+    )?;
+    Ok(Some(TraceRetainConfig {
+        max_sessions,
+        max_age_secs,
+    }))
+}
+
+fn parse_context_retain(
+    raw: Option<serde_yaml::Value>,
+) -> Result<Option<ContextRetainConfig>, RuntimeManifestError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let (max_messages, max_age_secs) = parse_retain_block(
+        "context.retain",
+        "max_messages",
+        &CONTEXT_RETAIN_KEYS,
+        raw,
+        &|field, message| RuntimeManifestError::InvalidInferenceConfig { field, message },
+    )?;
+    Ok(Some(ContextRetainConfig {
+        max_messages,
+        max_age_secs,
     }))
 }
 
@@ -3227,7 +3423,181 @@ mod tests {
                 "  capture: {yaml}\n"
             )))
             .unwrap_or_else(|e| panic!("'{yaml}' must parse: {e}"));
-            assert_eq!(manifest.trace, Some(TraceConfig { capture: expected }));
+            assert_eq!(
+                manifest.trace,
+                Some(TraceConfig {
+                    capture: expected,
+                    retain: None
+                })
+            );
+        }
+    }
+
+    // ── retain ───────────────────────────────────────────────────────────────
+
+    /// The whole slice's invariant at the manifest level: a `trace:` block with only `capture`
+    /// and a `context:` block with only `record` declare no retention at all, and the absent
+    /// `retain:` is what an upgrading capsule keeps.
+    #[test]
+    fn no_retain_block_anywhere_parses_as_no_policy() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ntrace:\n  capture: content\ncontext:\n  record: on\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.trace.unwrap().retain, None);
+        assert_eq!(manifest.context.unwrap().retain, None);
+    }
+
+    #[test]
+    fn trace_retain_parses_both_keys_and_the_day_suffix() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n  retain:\n    max_sessions: 50\n    max_age: 14d\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.trace.unwrap().retain,
+            Some(TraceRetainConfig {
+                max_sessions: Some(50),
+                max_age_secs: Some(14 * 86_400),
+            })
+        );
+    }
+
+    #[test]
+    fn context_retain_parses_both_keys_and_either_alone() {
+        let both = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncontext:\n  record: on\n  retain:\n    max_messages: 2000\n    max_age: 90d\n",
+        )
+        .unwrap();
+        assert_eq!(
+            both.context.unwrap().retain,
+            Some(ContextRetainConfig {
+                max_messages: Some(2000),
+                max_age_secs: Some(90 * 86_400),
+            })
+        );
+
+        let count_only = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncontext:\n  retain:\n    max_messages: 10\n",
+        )
+        .unwrap();
+        assert_eq!(
+            count_only.context.unwrap().retain,
+            Some(ContextRetainConfig {
+                max_messages: Some(10),
+                max_age_secs: None,
+            })
+        );
+    }
+
+    /// S13: an empty block is not a way to declare no policy — omitting the block is. Both
+    /// spellings of empty are refused, naming the block an operator has to go and change.
+    #[test]
+    fn an_empty_retain_block_is_refused_naming_the_block() {
+        for (yaml, expect_trace) in [
+            (
+                "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n  retain: {}\n",
+                true,
+            ),
+            (
+                "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n  retain:\n",
+                true,
+            ),
+            (
+                "name: cap\nversion: 0.0.1\ncontext:\n  record: on\n  retain: {}\n",
+                false,
+            ),
+            (
+                "name: cap\nversion: 0.0.1\ncontext:\n  record: on\n  retain:\n",
+                false,
+            ),
+        ] {
+            let err = RuntimeManifest::from_yaml_str(yaml)
+                .expect_err("an empty retain block must be refused");
+            let (field, message) = match (&err, expect_trace) {
+                (RuntimeManifestError::InvalidTraceConfig { field, message }, true) => {
+                    (field, message)
+                }
+                (RuntimeManifestError::InvalidInferenceConfig { field, message }, false) => {
+                    (field, message)
+                }
+                _ => panic!("wrong variant for {yaml:?}: {err:?}"),
+            };
+            assert_eq!(
+                field,
+                if expect_trace {
+                    "trace.retain"
+                } else {
+                    "context.retain"
+                }
+            );
+            assert!(message.contains("at least one key"), "{message}");
+        }
+    }
+
+    /// S13's other half: a limit of zero would delete what retention exists to keep, so it is
+    /// refused naming the key rather than accepted as "keep nothing".
+    #[test]
+    fn a_zero_retain_limit_is_refused_naming_the_key() {
+        let trace = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ntrace:\n  capture: meta\n  retain:\n    max_sessions: 0\n",
+        )
+        .expect_err("max_sessions: 0 must be refused");
+        assert!(
+            matches!(&trace, RuntimeManifestError::InvalidTraceConfig { field, .. }
+                     if field == "trace.retain.max_sessions"),
+            "{trace:?}"
+        );
+
+        let context = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncontext:\n  retain:\n    max_messages: 0\n",
+        )
+        .expect_err("max_messages: 0 must be refused");
+        assert!(
+            matches!(&context, RuntimeManifestError::InvalidInferenceConfig { field, .. }
+                     if field == "context.retain.max_messages"),
+            "{context:?}"
+        );
+
+        let age = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ntrace:\n  retain:\n    max_age: 0\n",
+        )
+        .expect_err("max_age: 0 must be refused");
+        assert!(
+            matches!(&age, RuntimeManifestError::InvalidTraceConfig { field, .. }
+                     if field == "trace.retain.max_age"),
+            "{age:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_retain_key_is_refused_listing_the_accepted_ones() {
+        let err = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ntrace:\n  retain:\n    max_traces: 3\n",
+        )
+        .expect_err("an unknown key must be refused");
+        match err {
+            RuntimeManifestError::InvalidTraceConfig { field, message } => {
+                assert_eq!(field, "trace.retain");
+                assert!(message.contains("max_traces"), "{message}");
+                assert!(message.contains("max_sessions"), "{message}");
+            }
+            other => panic!("expected InvalidTraceConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unparseable_retain_duration_reports_the_accepted_form() {
+        let err = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\ncontext:\n  retain:\n    max_age: 5 weeks\n",
+        )
+        .expect_err("'5 weeks' must be refused");
+        match err {
+            RuntimeManifestError::InvalidInferenceConfig { field, message } => {
+                assert_eq!(field, "context.retain.max_age");
+                assert!(message.contains(DURATION_ACCEPTED_FORM), "{message}");
+            }
+            other => panic!("expected InvalidInferenceConfig, got {other:?}"),
         }
     }
 
@@ -3240,7 +3610,8 @@ mod tests {
         assert_eq!(
             opted_in.trace,
             Some(TraceConfig {
-                capture: TraceCapture::Content
+                capture: TraceCapture::Content,
+                retain: None
             })
         );
 
@@ -3250,7 +3621,8 @@ mod tests {
         assert_eq!(
             opted_out.trace,
             Some(TraceConfig {
-                capture: TraceCapture::Meta
+                capture: TraceCapture::Meta,
+                retain: None
             })
         );
     }
@@ -7219,6 +7591,7 @@ capabilities:
         assert_eq!(parse_duration_secs("30s").unwrap(), 30);
         assert_eq!(parse_duration_secs("15m").unwrap(), 900);
         assert_eq!(parse_duration_secs("1h").unwrap(), 3600);
+        assert_eq!(parse_duration_secs("14d").unwrap(), 14 * 86_400);
         assert_eq!(parse_duration_secs("  2h  ").unwrap(), 7200);
         assert_eq!(parse_duration_secs("0").unwrap(), 0);
     }

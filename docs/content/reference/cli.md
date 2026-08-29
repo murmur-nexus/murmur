@@ -17,6 +17,9 @@ This page documents the **currently implemented** `mur` CLI surface in this repo
 | `mur deploy` | Upload a capsule to an existing VM and return its public URL |
 | `mur destroy` | Remove a deployment record from the local tracking list |
 | `mur ps` | List all deployed capsules |
+| `mur conversation ls` | List the durable conversation records, or place one message id in them |
+| `mur conversation rm` | Remove one context's record directory, whole |
+| `mur conversation truncate` | Drop the oldest messages from a record, keeping the newest N |
 | `mur trace show` | Human-readable summary of a single `trace.jsonl` session |
 | `mur trace steps` | Turn-by-turn tree of what one session's agent did |
 | `mur trace diff` | Side-by-side metric comparison of two trace files |
@@ -659,6 +662,85 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
 
 ---
 
+## `mur conversation`
+
+Inspect and prune the [durable conversation records](workdir.md#the-conversation-record) under
+`~/.murmur/conversations/`. These commands read and write that store directly; they do not stage
+or launch a capsule, and they need no manifest.
+
+A context id is unique inside one record store and nowhere else. When one appears under more than
+one store, `rm` and `truncate` refuse with [`E-CNV-002`](diagnostics.md#e-cnv-002) rather than
+guess, and `--record <NAME>` says which store to act on.
+
+### `mur conversation ls`
+
+```bash
+mur conversation ls [--record <NAME>] [--message <MSG-ID>] [--json]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--record` | every store | Limit to one directory under `~/.murmur/conversations/` |
+| `--message` | — | Report where one `msg_` id stands instead of listing records |
+| `--json` | off | Print the same values as JSON |
+
+Without `--message`, one row per context:
+
+```
+RECORD                   CONTEXT                      MESSAGES       SIZE  LAST TOUCHED         TRUNCATED
+shey                     ctx_0199f2a1                       48    12.4 KiB  2026-08-29 09:14:02  500 dropped
+```
+
+| Column | Contents |
+|---|---|
+| `RECORD` | The record store: the directory under `~/.murmur/conversations/` |
+| `CONTEXT` | The context id: the directory under the record store |
+| `MESSAGES` | Message lines. The [header line](workdir.md#record-header) is not a message and is not counted |
+| `SIZE` | Bytes of `conversation.jsonl` |
+| `LAST TOUCHED` | Last write to `conversation.jsonl`, in UTC |
+| `TRUNCATED` | Messages this record has dropped over its life, or `-` |
+
+`--json` prints an array whose objects carry `record`, `context_id`, `path`, `messages`, `bytes`,
+`last_touched_ms`, `capsule` (`null` for a record no capsule owns) and `truncated` (`null`, or an
+object with `dropped`, `oldest_surviving_id`, `last_dropped_id` and `at_ms`).
+
+#### `mur conversation ls --message` { #mur-conversation-ls-message }
+
+Answers one of three things about a `msg_` id, which is what an artifact that stored a
+`source_id` and now finds nothing needs to know:
+
+| Answer | When | Reported |
+|---|---|---|
+| `present` | The id is a line in a record | The record, the context, and its position |
+| `truncated` | The id is not a line, the record's header carries a truncation marker, and the id's own uuid-v7 timestamp is at or before the `last_dropped_id`'s | The record, the context, how many were dropped, and the oldest surviving id |
+| `unknown` | Anything else | Nothing further |
+
+### `mur conversation rm` { #mur-conversation-rm }
+
+```bash
+mur conversation rm <CONTEXT-ID> [--record <NAME>]
+```
+
+Removes that context directory whole and reports the path and the message count it held. The only
+way to reclaim a record no capsule owns — [automatic retention](manifest.md#retention-never) skips
+one whose header line names no capsule.
+
+### `mur conversation truncate` { #mur-conversation-truncate }
+
+```bash
+mur conversation truncate <CONTEXT-ID> --keep <N> [--record <NAME>]
+```
+
+Drops everything before the newest `N` messages and reports what went. `N` must be at least 1;
+`--keep 0` is refused with [`E-CNV-003`](diagnostics.md#e-cnv-003), because truncating a record to
+nothing is `mur conversation rm`.
+
+The rewrite is atomic: the kept tail plus a [header line](workdir.md#record-header) recording the
+drop is staged beside the record and renamed over it, so an interrupted truncation leaves the
+original whole. Every surviving message keeps the exact `id` it carried.
+
+---
+
 ## `mur trace`
 
 Read and analyze `trace.jsonl` files produced by `mur run`. These commands are read-only — they do not modify any file and do not require a running registry or runtime.
@@ -687,6 +769,7 @@ Output sections, in the order they are printed:
 |---|---|---|
 | Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
+| Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
 | Turns | always | Turn count and configured max |
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing the provider's own counts over the turns that reported them |
