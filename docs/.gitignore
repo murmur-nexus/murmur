@@ -1,0 +1,7 @@
+node_modules/
+.agent-export/
+__pycache__/
+# Written by infra/setup-cloudfront-negotiation.sh; dist.json is a rollback copy
+# of the live distribution config and must not be committed.
+infra/dist.json
+infra/config.json

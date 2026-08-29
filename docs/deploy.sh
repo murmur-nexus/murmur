@@ -24,11 +24,25 @@ cd "$(dirname "$0")"
 echo "==> Building site"
 mkdocs build --clean --strict
 
+echo "==> Generating agent artifacts"
+# Markdown twins, llms-full.txt, search index, WebMCP bundle, agent-readability
+# manifest, sitemap and robots. Writes into site/, so the sync below picks them
+# up with everything else. Not --omit=dev: esbuild bundles the WebMCP client.
+npm ci --silent
+node scripts/agent-artifacts.mjs
+
 echo "==> Syncing to s3://${BUCKET}/${PREFIX}"
 aws s3 sync site/ "s3://${BUCKET}/${PREFIX}" \
     --delete \
     --exclude ".DS_Store" \
     --exclude "*/.DS_Store"
+
+# The api-catalog linkset has no file extension, so the sync above uploads it as
+# application/octet-stream. Agents that discover it via the homepage
+# `Link: rel="api-catalog"` header expect JSON.
+aws s3 cp "site/.well-known/api-catalog" "s3://${BUCKET}/${PREFIX}/.well-known/api-catalog" \
+    --content-type "application/linkset+json" \
+    --metadata-directive REPLACE
 
 echo "==> Invalidating CloudFront"
 INVALIDATION=$(aws cloudfront create-invalidation \
