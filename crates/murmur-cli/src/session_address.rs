@@ -112,7 +112,7 @@ pub(crate) fn resolve(
         return Ok(workdir.join(&entries[n - 1]).join(query.record_file));
     }
 
-    // Backward compatibility: treat as a literal path if it looks like one.
+    // A literal path is taken verbatim; the workdir is not consulted.
     if address.contains('/') || address.ends_with(".jsonl") {
         return Ok(PathBuf::from(address));
     }

@@ -3342,8 +3342,8 @@ fn steps_without_event_ids_renders_the_flat_table() {
 // ── one address vocabulary ────────────────────────────────────────────────────
 //
 // Every `mur trace` command that names a session accepts the same four forms, and omitting the
-// address means `@1`. These cases pin the two halves of that: the ordinal reaching commands that
-// used to reject it, and omission being `@1` rather than merely resembling it.
+// address means `@1`. These cases pin both halves: the ordinal reaching every command, and
+// omission being `@1` rather than merely resembling it.
 
 /// A workdir holding A (older) and B (newer), so `@2` is A and `@1` is B.
 fn two_sessions() -> TempDir {
@@ -3390,8 +3390,8 @@ fn show_accepts_an_ordinal() {
         ));
 }
 
-/// The strongest available statement that omission and `@1` are one thing rather than two that
-/// currently agree: all three spellings of "the most recent session" print the same bytes.
+/// Omission and `@1` are one thing, not two that happen to agree: all three spellings of "the
+/// most recent session" print the same bytes.
 #[test]
 fn show_omitted_at1_and_full_id_print_identical_bytes() {
     let tmp = two_sessions();
@@ -3441,7 +3441,7 @@ fn steps_omitted_and_at1_print_identical_bytes() {
     );
 }
 
-/// `mur trace report`'s own help has always advertised `@N`; now it takes one.
+/// `mur trace report`'s help advertises `@N`, and the command accepts it.
 #[test]
 fn report_accepts_an_ordinal() {
     let tmp = two_sessions();

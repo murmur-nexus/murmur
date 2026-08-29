@@ -498,7 +498,8 @@ fn show_accepts_a_suffix() {
         ));
 }
 
-/// Omitted arguments are `@2 @1`, the older run first, so `(B better)` names the later run.
+/// Omitted arguments are `@2 @1`, the older run first, so the delta column reads forwards in
+/// time and Run B is the later run.
 #[test]
 fn diff_omitted_args_print_the_same_bytes_as_at2_at1() {
     let tmp = two_sessions();

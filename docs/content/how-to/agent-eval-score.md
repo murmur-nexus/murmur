@@ -396,5 +396,5 @@ mur trace show
 | Configure `observability.eval.scorers` | Defines the scoring criteria — all scorers run for every case |
 | Write `eval.jsonl` | One case per line, each with a `case_id` and `task_path` |
 | `mur eval run` | Runs all cases against `eval.jsonl` and prints a pass/fail summary |
-| `mur eval show <eval.jsonl>` | Shows which scorers passed, which failed, and why |
-| `mur eval diff <a> <b>` | Compares two runs to check for regressions |
+| `mur eval show` | Shows which scorers passed, which failed, and why, for the most recent session |
+| `mur eval diff` | Compares the two most recent runs to check for regressions |

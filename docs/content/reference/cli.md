@@ -49,7 +49,7 @@ commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside 
 | Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest |
 | Path | `workdir/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session directory itself |
 
-Omit the address and each command uses the session you almost always meant:
+Omitting the address selects a default:
 
 | Command | Bare form means |
 |---|---|
@@ -1047,9 +1047,9 @@ mur trace report [<session>...] [--last <n>] [--since <duration>] [--workdir <di
 | `--since` | — | Limit to sessions created within a duration, written `<n>m`, `<n>h` or `<n>d` |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 
-Output: mean, population stddev, min, and max for each numeric metric, followed by exit status distribution. If any sessions contain more than one task, a **Per-task averages** section is appended showing per-task metrics across all multi-task sessions.
+Output: a short block per session, then mean, population stddev, min, and max for each numeric metric, followed by exit status distribution. If any sessions contain more than one task, a **Per-task averages** section is appended showing per-task metrics across all multi-task sessions.
 
-Example (3 sessions, no multi-task sessions):
+The aggregate section, for 3 sessions with no multi-task session:
 
 ```text
 Sessions: 3  (./workdir)
@@ -1063,6 +1063,7 @@ output tokens          513            420            100            1,090
 tool calls             2.0            2.2            0.0            5.0
 tool success (%)       90.0           10.0           80.0           100.0
 shell calls            2.0            2.2            0.0            5.0
+redundant calls        0.0            0.0            0.0            0.0
 
 Exit status:
   max_turns_reached        1  (33.3%)
