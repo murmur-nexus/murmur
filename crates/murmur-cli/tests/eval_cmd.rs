@@ -403,3 +403,132 @@ fn run_both_explicit_uses_given_paths() {
                 .and(predicate::str::contains(dataset_path)),
         );
 }
+
+// ── one address vocabulary ────────────────────────────────────────────────────
+//
+// `mur eval` names a session exactly the way `mur trace` does, down to the omission rule.
+
+/// A session directory holding one `eval.jsonl`.
+fn write_session(workdir: &std::path::Path, session_id: &str, content: &str) {
+    let ses_dir = workdir.join(session_id);
+    fs::create_dir_all(&ses_dir).unwrap();
+    fs::write(ses_dir.join("eval.jsonl"), content).unwrap();
+}
+
+/// A workdir holding A (older) and B (newer), so `@2` is A and `@1` is B.
+fn two_sessions() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    write_session(
+        tmp.path(),
+        "ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        FIXTURE_A,
+    );
+    write_session(
+        tmp.path(),
+        "ses_bbbbbbbbbbbb4bbb8bbb000000000002",
+        FIXTURE_B,
+    );
+    tmp
+}
+
+fn stdout_of(args: &[&str]) -> Vec<u8> {
+    mur()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+}
+
+#[test]
+fn show_accepts_an_ordinal() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "eval",
+            "show",
+            "@2",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        ));
+}
+
+#[test]
+fn show_omitted_at1_and_full_id_print_identical_bytes() {
+    let tmp = two_sessions();
+    let workdir = tmp.path().to_str().unwrap();
+
+    let omitted = stdout_of(&["eval", "show", "--workdir", workdir]);
+    let ordinal = stdout_of(&["eval", "show", "@1", "--workdir", workdir]);
+    let full_id = stdout_of(&[
+        "eval",
+        "show",
+        "ses_bbbbbbbbbbbb4bbb8bbb000000000002",
+        "--workdir",
+        workdir,
+    ]);
+
+    assert_eq!(omitted, ordinal, "omitting the address must be @1");
+    assert_eq!(ordinal, full_id, "@1 must be the most recent session");
+}
+
+#[test]
+fn show_accepts_a_suffix() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "eval",
+            "show",
+            "0001",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        ));
+}
+
+/// Omitted arguments are `@2 @1`, the older run first, so `(B better)` names the later run.
+#[test]
+fn diff_omitted_args_print_the_same_bytes_as_at2_at1() {
+    let tmp = two_sessions();
+    let workdir = tmp.path().to_str().unwrap();
+
+    let omitted = stdout_of(&["eval", "diff", "--workdir", workdir]);
+    assert_eq!(
+        omitted,
+        stdout_of(&["eval", "diff", "@2", "@1", "--workdir", workdir]),
+    );
+    let text = String::from_utf8(omitted).unwrap();
+    assert!(
+        text.contains("(A better)"),
+        "the older run is Run A, and it scored better here: {text}"
+    );
+}
+
+#[test]
+fn diff_one_arg_gives_clear_error() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "eval",
+            "diff",
+            "@1",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expects 0 or 2 arguments, got 1"));
+}

@@ -572,7 +572,8 @@ fn run_help_states_that_full_is_often_cheaper_than_compact() {
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    assert!(stdout.contains("--resume <SESSION>"), "{stdout}");
+    // Rendered with the value in brackets because omitting it is the common case.
+    assert!(stdout.contains("--resume [<SESSION>]"), "{stdout}");
     assert!(stdout.contains("--resume-mode <MODE>"), "{stdout}");
     assert!(
         stdout.contains("full is often the cheaper"),
@@ -604,5 +605,123 @@ fn an_unresolvable_address_reuses_the_existing_trace_errors() {
     assert!(stderr.contains("E-TRC-002"), "{stderr}");
     assert!(stderr.contains("ambiguous"), "{stderr}");
     assert!(stderr.contains(one) && stderr.contains(two), "{stderr}");
+    drop(f.project);
+}
+
+/// Omitting `--resume`'s value means `@1`, the session that just finished — the same thing
+/// `--resume @1` names, resolved through the same arm.
+#[test]
+fn bare_resume_means_at_1_without_workdir() {
+    let f = fixture(
+        vec![end_turn("first reply"), end_turn("second reply")],
+        "",
+        &[],
+    );
+
+    let first_dir = workdir_of(f.run("first task", &[]));
+    let first_id = first_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let second_dir = workdir_of(f.run("second task", &["--resume"]));
+
+    let second = request_text(&f.server.requests()[1]);
+    assert!(
+        second.contains("first task") && second.contains("first reply"),
+        "run 1's conversation must be in front of the model: {second}"
+    );
+    assert_eq!(session_start(&second_dir)["resumed_from"], json!(first_id));
+    drop(f.project);
+}
+
+/// The other workdir layout: `--workdir <dir>` puts sessions at `<dir>/.murmur/<ses_id>`, and a
+/// valueless `--resume` has to find `@1` there. `--workdir` following it also shows that clap
+/// never takes a `--`-prefixed token as the optional value.
+#[test]
+fn bare_resume_means_at_1_with_workdir() {
+    let f = fixture(
+        vec![end_turn("first reply"), end_turn("second reply")],
+        "",
+        &[],
+    );
+    let mount = tempfile::tempdir().unwrap();
+    let mount_arg = mount.path().to_str().unwrap();
+
+    let first = session_id_of(f.run("first task", &["--workdir", mount_arg]));
+    let second_dir = workdir_of(f.run("second task", &["--resume", "--workdir", mount_arg]));
+
+    let second = request_text(&f.server.requests()[1]);
+    assert!(second.contains("first task"), "{second}");
+    assert_eq!(session_start(&second_dir)["resumed_from"], json!(first));
+    drop(f.project);
+}
+
+/// `--resume-mode` reads `--resume`'s presence, not its value, so it still applies when the
+/// value is omitted.
+#[test]
+fn bare_resume_takes_a_resume_mode() {
+    let f = fixture(
+        vec![end_turn("verbatim assistant text"), end_turn("second")],
+        "",
+        &[(
+            "compactor",
+            "on-compaction",
+            "replace-context",
+            compaction_hook_wasm(SUMMARY),
+        )],
+    );
+
+    f.run("first task", &[]).success();
+    f.run("second task", &["--resume", "--resume-mode", "compact"])
+        .success();
+
+    let second = request_text(&f.server.requests()[1]);
+    assert!(second.contains(SUMMARY), "{second}");
+    assert!(
+        !second.contains("verbatim assistant text"),
+        "compaction replaced the context it stood for: {second}"
+    );
+    drop(f.project);
+}
+
+/// A valueless `--resume` arrives as `@1`, so it names the same thing `--context` does and is
+/// refused for the same reason.
+#[test]
+fn bare_resume_with_context_is_an_error() {
+    let f = fixture(vec![end_turn("first")], "", &[]);
+
+    f.run("first task", &[]).success();
+    let before = fs::read_dir(f.session_root()).unwrap().count();
+
+    let assert = f
+        .run("second task", &["--resume", "--context", "ctx_x"])
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-RUN-015"), "{stderr}");
+    assert!(
+        stderr.contains("--resume and --context name the same thing two ways"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_dir(f.session_root()).unwrap().count(),
+        before,
+        "a refused resume must create no session directory"
+    );
+    drop(f.project);
+}
+
+/// A bare word after `--resume` binds as the address, and an address that names nothing reads as
+/// an addressing failure rather than as clap's "unexpected argument".
+#[test]
+fn a_value_after_bare_resume_is_read_as_an_address() {
+    let f = fixture(vec![end_turn("first")], "", &[]);
+    f.run("first task", &[]).success();
+
+    let assert = f.run("second task", &["--resume", "nonesuch"]).failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-TRC-002"), "{stderr}");
+    assert!(stderr.contains("--resume"), "{stderr}");
+    assert!(stderr.contains("nonesuch"), "{stderr}");
     drop(f.project);
 }
