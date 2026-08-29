@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod error;
 mod registry_client;
+mod session_address;
 mod source;
 
 use std::path::PathBuf;
@@ -190,10 +191,11 @@ enum Commands {
         /// Continue the conversation a previous session ran. Takes the same session address
         /// `mur trace diff` does: a full ses_ id, a 4+-character suffix, an @N ordinal
         /// (@1 = most recent), or a path to a session directory or its trace.jsonl.
+        /// Given with no value, it means @1 — the session that just finished.
         /// Resolves that session's context id and runs under it, loading its conversation
         /// record even when the capsule declares lifecycle.conversation: stateless.
         /// Cannot be combined with --context, which names the same thing directly.
-        #[arg(long, value_name = "SESSION")]
+        #[arg(long, num_args = 0..=1, default_missing_value = "@1", value_name = "SESSION")]
         resume: Option<String>,
 
         /// How --resume puts the loaded conversation in front of the model
@@ -522,7 +524,7 @@ fn main() {
                 workdir,
                 json,
             } => run_eval_show(session, workdir, json),
-            EvalCommand::Diff { a, b, workdir } => run_eval_diff(Some(a), Some(b), workdir),
+            EvalCommand::Diff { a, b, workdir } => run_eval_diff(a, b, workdir),
             EvalCommand::Run { capsule, dataset } => {
                 run_eval_run(capsule.as_deref(), dataset.as_deref())
             }

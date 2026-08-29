@@ -3338,3 +3338,142 @@ fn steps_without_event_ids_renders_the_flat_table() {
         "the flat table must be byte-identical to what it has always been"
     );
 }
+
+// ── one address vocabulary ────────────────────────────────────────────────────
+//
+// Every `mur trace` command that names a session accepts the same four forms, and omitting the
+// address means `@1`. These cases pin both halves: the ordinal reaching every command, and
+// omission being `@1` rather than merely resembling it.
+
+/// A workdir holding A (older) and B (newer), so `@2` is A and `@1` is B.
+fn two_sessions() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    write_session(
+        tmp.path(),
+        "ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        FIXTURE_A,
+    );
+    write_session(
+        tmp.path(),
+        "ses_bbbbbbbbbbbb4bbb8bbb000000000002",
+        FIXTURE_B,
+    );
+    tmp
+}
+
+fn stdout_of(args: &[&str]) -> Vec<u8> {
+    mur()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+}
+
+#[test]
+fn show_accepts_an_ordinal() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            "@2",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "session:    ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        ));
+}
+
+/// Omission and `@1` are one thing, not two that happen to agree: all three spellings of "the
+/// most recent session" print the same bytes.
+#[test]
+fn show_omitted_at1_and_full_id_print_identical_bytes() {
+    let tmp = two_sessions();
+    let workdir = tmp.path().to_str().unwrap();
+
+    let omitted = stdout_of(&["trace", "show", "--workdir", workdir]);
+    let ordinal = stdout_of(&["trace", "show", "@1", "--workdir", workdir]);
+    let full_id = stdout_of(&[
+        "trace",
+        "show",
+        "ses_bbbbbbbbbbbb4bbb8bbb000000000002",
+        "--workdir",
+        workdir,
+    ]);
+
+    assert_eq!(omitted, ordinal, "omitting the address must be @1");
+    assert_eq!(ordinal, full_id, "@1 must be the most recent session");
+}
+
+#[test]
+fn steps_accepts_an_ordinal() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "trace",
+            "steps",
+            "@2",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Session ses_aaaaaaaaaaaa4aaa8aaa000000000001",
+        ));
+}
+
+#[test]
+fn steps_omitted_and_at1_print_identical_bytes() {
+    let tmp = two_sessions();
+    let workdir = tmp.path().to_str().unwrap();
+
+    assert_eq!(
+        stdout_of(&["trace", "steps", "--workdir", workdir]),
+        stdout_of(&["trace", "steps", "@1", "--workdir", workdir]),
+    );
+}
+
+/// `mur trace report`'s help advertises `@N`, and the command accepts it.
+#[test]
+fn report_accepts_an_ordinal() {
+    let tmp = two_sessions();
+
+    mur()
+        .args([
+            "trace",
+            "report",
+            "@1",
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses_bbbbbbbb"));
+}
+
+/// `before` is the older run, so the delta column reads forwards in time. Getting this backwards
+/// inverts every delta and is invisible afterwards.
+#[test]
+fn diff_omitted_args_print_the_same_bytes_as_at2_at1() {
+    let tmp = two_sessions();
+    let workdir = tmp.path().to_str().unwrap();
+
+    let omitted = stdout_of(&["trace", "diff", "--workdir", workdir]);
+    assert_eq!(
+        omitted,
+        stdout_of(&["trace", "diff", "@2", "@1", "--workdir", workdir]),
+    );
+    let text = String::from_utf8(omitted).unwrap();
+    assert!(
+        text.contains("500ms") && text.contains("1.7s"),
+        "Run A is the older session: {text}"
+    );
+}

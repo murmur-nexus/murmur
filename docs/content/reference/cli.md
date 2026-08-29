@@ -22,13 +22,52 @@ This page documents the **currently implemented** `mur` CLI surface in this repo
 | `mur conversation truncate` | Drop the oldest messages from a record, keeping the newest N |
 | `mur trace show` | Human-readable summary of a single `trace.jsonl` session |
 | `mur trace steps` | Turn-by-turn tree of what one session's agent did |
-| `mur trace diff` | Side-by-side metric comparison of two trace files |
-| `mur trace report` | Aggregate statistics across all `.jsonl` files in a directory |
+| `mur trace diff` | Side-by-side metric comparison of two sessions |
+| `mur trace report` | Aggregate statistics across a set of sessions |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
-| `mur eval diff` | Side-by-side scorer comparison of two eval files |
+| `mur eval diff` | Side-by-side scorer comparison of two eval sessions |
 | `mur eval run` | Drive a multi-case dataset and collect `eval.jsonl` per run |
 | `mur search` | Search the public artifact index for artifacts matching a keyword |
 | `mur topology` | Render capsule sessions as a DAG from Grafana Tempo OTel data |
+
+---
+
+## Session addresses { #session-addresses }
+
+[`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show),
+[`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff),
+[`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show) and
+[`mur eval diff`](#mur-eval-diff) name a session the same four ways. Each is resolved against the
+`ses_*` session directories in the workdir: `./workdir` for the `mur trace` and `mur eval`
+commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
+`--workdir` names. See [Session workdir](workdir.md).
+
+| Form | Example | Names |
+|---|---|---|
+| Full ID | `ses_019f01a940ce7761854e768ecbe3d399` | The session with that ID: `ses_` followed by 32 hex characters |
+| Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them |
+| Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest |
+| Path | `workdir/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session directory itself |
+
+Omitting the address selects a default:
+
+| Command | Bare form means |
+|---|---|
+| `mur run --resume` | `@1` |
+| `mur trace show` | `@1` |
+| `mur trace steps` | `@1` |
+| `mur trace diff` | `@2 @1` |
+| `mur trace report` | every session in the workdir |
+| `mur eval show` | `@1` |
+| `mur eval diff` | `@2 @1` |
+
+`mur trace diff` and `mur eval diff` take their arguments in *before, after* order, so the bare
+`@2 @1` puts the older run in the Run A column and the delta column reads forwards in time. Both
+take two addresses or none; one address is refused.
+
+An address matching no session, or several, is refused with
+[`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`, and
+[`E-EVAL-002`](diagnostics.md) under `mur eval`.
 
 ---
 
@@ -436,7 +475,7 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
 | `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
-| `--resume` | — | Session whose conversation this run continues. Takes the same session address [`mur trace diff`](#mur-trace-diff) does: a full `ses_…` id, a 4+-character case-insensitive suffix, an `@N` ordinal (`@1` = most recent), or a path to a session directory or its `trace.jsonl`. Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) even when the capsule declares `lifecycle.conversation: stateless`. Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015) |
+| `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) even when the capsule declares `lifecycle.conversation: stateless`. Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015) |
 | `--resume-mode` | `full` | How `--resume` puts the loaded conversation in front of the model. `full` loads the record verbatim; `compact` runs the capsule's `on-compaction` hook over it first and continues from the summary, which is the answer when the conversation would not fit the context window at all. `full` is often the cheaper of the two: a verbatim reload can hit the provider's prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache miss, and costs an extra inference call to produce the summary. `compact` with no hook bound to `on-compaction` refuses the launch with [`E-RUN-018`](diagnostics.md#e-run-018) |
 | `--workdir` | `<manifest-dir>/workdir/<session-id>` | Directory mounted as the capsule's accessible workspace. When passed, session artifacts are created inside it under `.murmur/<session-id>`. See [Session workdir](workdir.md) |
 | `--bind` | `127.0.0.1` | Address the capsule's HTTP server binds. Use `0.0.0.0` to accept connections from other machines |
@@ -758,7 +797,7 @@ mur trace show [<session>] [--workdir <dir>] [--body <selector> --turn <n>]
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<session>` | the most recent session in the workdir | Full session ID, the last 4+ characters of one as a suffix, or a literal path to a `trace.jsonl` |
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses) |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 | `--body` | — | Print the body behind one hash and nothing else. Selectors below |
 | `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name. Required with those four, invalid without `--body` |
@@ -897,7 +936,7 @@ mur trace steps [<session>] [--verbose] [--workdir <dir>]
 
 | Argument / Flag | Default | Description |
 |---|---|---|
-| `<session>` | the most recent session in the workdir | Full session ID, the last 4+ characters of one as a suffix, or a literal path to a `trace.jsonl` |
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses) |
 | `--verbose` | off | Append a truncated summary of each tool call's input |
 | `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 
@@ -929,11 +968,20 @@ Session ses_aaaaaaaaaaaa4aaa8aaa000000000001  (2 turns)
 
 ### `mur trace diff`
 
-Compare two trace files side by side, with a delta and directional indicator per metric.
+Compare two sessions side by side, with a delta and directional indicator per metric.
 
 ```bash
-mur trace diff <trace-a.jsonl> <trace-b.jsonl>
+mur trace diff [<before> <after>] [--workdir <dir>]
 ```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<before>` | `@2` | The run in the Run A column, as a [session address](#session-addresses) |
+| `<after>` | `@1` | The run in the Run B column, as a [session address](#session-addresses) |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+
+Both addresses or neither: one argument is refused with
+[`E-TRC-002`](diagnostics.md).
 
 Example (A = 2 turns, ok; B = 5 turns, max_turns_reached):
 
@@ -986,18 +1034,25 @@ nothing is compared.
 
 ### `mur trace report`
 
-Aggregate statistics across all `.jsonl` files in a directory. Useful for repeated-run experiments.
+Aggregate statistics across a set of sessions. Useful for repeated-run experiments.
 
 ```bash
-mur trace report <directory>
+mur trace report [<session>...] [--last <n>] [--since <duration>] [--workdir <dir>]
 ```
 
-Output: mean, population stddev, min, and max for each numeric metric, followed by exit status distribution. If any sessions contain more than one task, a **Per-task averages** section is appended showing per-task metrics across all multi-task sessions.
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>...` | every session in the workdir | One or more [session addresses](#session-addresses). Cannot be combined with `--last` or `--since` |
+| `--last` | — | Limit to the `n` most recently created sessions. Must be at least 1 |
+| `--since` | — | Limit to sessions created within a duration, written `<n>m`, `<n>h` or `<n>d` |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
 
-Example (3 files, no multi-task sessions):
+Output: a short block per session, then mean, population stddev, min, and max for each numeric metric, followed by exit status distribution. If any sessions contain more than one task, a **Per-task averages** section is appended showing per-task metrics across all multi-task sessions.
+
+The aggregate section, for 3 sessions with no multi-task session:
 
 ```text
-Files: 3  (/path/to/traces)
+Sessions: 3  (./workdir)
 
 Metric                 Mean           StdDev         Min            Max
 ────────────────────── ────────────── ────────────── ────────────── ──────────────
@@ -1008,16 +1063,17 @@ output tokens          513            420            100            1,090
 tool calls             2.0            2.2            0.0            5.0
 tool success (%)       90.0           10.0           80.0           100.0
 shell calls            2.0            2.2            0.0            5.0
+redundant calls        0.0            0.0            0.0            0.0
 
 Exit status:
   max_turns_reached        1  (33.3%)
   ok                       2  (66.7%)
 ```
 
-Example (directory includes multi-task session files):
+Example (the set includes multi-task sessions):
 
 ```text
-Files: 2  (/path/to/traces)
+Sessions: 2  (./workdir)
 
 Metric                 Mean           StdDev         Min            Max
 ...
@@ -1034,11 +1090,11 @@ Tasks: 6
 
 Notes:
 
-- Only `.jsonl` files are read; other files in the directory are ignored.
-- Files with no tool calls are excluded from the `tool success (%)` row (not counted as 0%).
-- A single file produces stddev = 0.
-- The Per-task averages section only appears when at least one multi-task session (more than one task) is present. Old-format traces (no task events) are excluded from per-task aggregation.
-- Exits non-zero if the directory does not exist or contains no `.jsonl` files.
+- Sessions whose `trace.jsonl` holds no events are skipped, and a `note: skipped <n> incomplete session(s)` line on stderr says how many.
+- Sessions with no tool calls are excluded from the `tool success (%)` row rather than counted as 0%.
+- A single session produces stddev = 0.
+- The Per-task averages section appears when at least one session ran more than one task. Traces carrying no task events are excluded from per-task aggregation.
+- Exits non-zero if the workdir does not exist or holds no sessions.
 
 ---
 
@@ -1053,8 +1109,14 @@ See [Structured evaluation (`eval.jsonl`)](observability-schemas.md#structured-e
 Print a human-readable summary of a single session's scored events, or emit a JSON object for programmatic use.
 
 ```bash
-mur eval show <eval.jsonl> [--json]
+mur eval show [<session>] [--workdir <dir>] [--json]
 ```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | `@1`, the most recent session in the workdir | A [session address](#session-addresses), resolved to that session's `eval.jsonl` |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--json` | off | Emit a single pretty-printed JSON object instead of human-readable text |
 
 Human output sections:
 
@@ -1081,11 +1143,20 @@ Exit codes: `0` on success (including empty files and no-scorer sessions), `1` o
 
 ### `mur eval diff`
 
-Compare two `eval.jsonl` files side by side with a delta column.
+Compare two eval sessions side by side with a delta column.
 
 ```bash
-mur eval diff <a.jsonl> <b.jsonl>
+mur eval diff [<a> <b>] [--workdir <dir>]
 ```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<a>` | `@2` | The run in the Run A column, as a [session address](#session-addresses) |
+| `<b>` | `@1` | The run in the Run B column, as a [session address](#session-addresses) |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+
+Both addresses or neither: one argument is refused with
+[`E-EVAL-002`](diagnostics.md).
 
 Example output:
 

@@ -10,6 +10,7 @@ use clap::Subcommand;
 use serde::Deserialize;
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
+use crate::session_address::{self, ses_entries, SessionQuery};
 
 const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
@@ -1051,100 +1052,22 @@ fn load_metrics(path: &Path) -> Result<(TraceMetrics, Vec<TaskMetrics>), CliErro
 
 // ── Session resolution ────────────────────────────────────────────────────────
 
-fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
-    if !workdir.exists() || !workdir.is_dir() {
-        return Ok(Vec::new());
+/// `trace.jsonl` addressing: the shared vocabulary, this command's diagnostic code, and the
+/// argument a failure should name.
+fn trace_query(label: Option<&str>) -> SessionQuery<'_> {
+    SessionQuery {
+        record_file: "trace.jsonl",
+        code: E_TRC_002,
+        label,
     }
-    let mut entries = Vec::new();
-    for entry_res in fs::read_dir(workdir).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to read {}: {e}", workdir.display()),
-        )
-    })? {
-        let entry = entry_res.map_err(|e| {
-            CliError::new(
-                E_IO_003,
-                format!("failed to read entry in {}: {e}", workdir.display()),
-            )
-        })?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("ses_") && entry.path().is_dir() {
-            entries.push(name);
-        }
-    }
-    Ok(entries)
 }
 
+/// The `trace.jsonl` a session address names, or the most recent session's when none is given.
 pub(crate) fn resolve_session(
     session: Option<String>,
     workdir: &Path,
 ) -> Result<PathBuf, CliError> {
-    match session {
-        None => {
-            let mut entries = ses_entries(workdir)?;
-            if entries.is_empty() {
-                return Err(CliError::new(
-                    E_TRC_002,
-                    format!("no sessions found in workdir at {}", workdir.display()),
-                ));
-            }
-            entries.sort();
-            let latest = entries.into_iter().last().unwrap();
-            Ok(workdir.join(latest).join("trace.jsonl"))
-        }
-        Some(s) => {
-            // Backward compatibility: treat as a literal path if it looks like one.
-            if s.contains('/') || s.ends_with(".jsonl") {
-                return Ok(PathBuf::from(&s));
-            }
-            // Full session ID: "ses_" prefix + 32-char hex = 36 chars total.
-            if s.starts_with("ses_") && s.len() == 36 {
-                let path = workdir.join(&s).join("trace.jsonl");
-                if !path.exists() {
-                    return Err(CliError::new(
-                        E_TRC_002,
-                        format!("session {} not found in {}", s, workdir.display()),
-                    ));
-                }
-                return Ok(path);
-            }
-            // Suffix matching (case-insensitive).
-            let suffix_lower = s.to_lowercase();
-            let entries = ses_entries(workdir)?;
-            let mut matches: Vec<String> = entries
-                .into_iter()
-                .filter(|e| e.to_lowercase().ends_with(&suffix_lower))
-                .collect();
-            match matches.len() {
-                0 => Err(CliError::new(
-                    E_TRC_002,
-                    format!(
-                        "no session found matching suffix '{}' in {}",
-                        s,
-                        workdir.display()
-                    ),
-                )),
-                1 => Ok(workdir.join(&matches[0]).join("trace.jsonl")),
-                n => {
-                    matches.sort();
-                    Err(CliError::new(
-                        E_TRC_002,
-                        format!(
-                            "ambiguous: '{}' matches {} sessions — provide more characters\n{}",
-                            s,
-                            n,
-                            matches
-                                .iter()
-                                .map(|m| format!("  {m}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ),
-                    ))
-                }
-            }
-        }
-    }
+    session_address::resolve(session.as_deref(), workdir, &trace_query(None))
 }
 
 /// The session directory an address names, under `workdir`.
@@ -1172,43 +1095,9 @@ pub(crate) fn resolve_session_dir(
         .ok_or_else(|| CliError::new(E_TRC_002, format!("{label}: '{arg}' names no session")))
 }
 
+/// One side of a `mur trace diff`, with `label` naming which side when it will not resolve.
 fn resolve_diff_arg(arg: &str, workdir: &Path, label: &str) -> Result<PathBuf, CliError> {
-    if let Some(n_str) = arg.strip_prefix('@') {
-        let n: usize = n_str.parse().map_err(|_| {
-            CliError::new(
-                E_TRC_002,
-                format!("{label}: invalid ordinal '{arg}' — expected @1, @2, ..."),
-            )
-        })?;
-        if n == 0 {
-            return Err(CliError::new(
-                E_TRC_002,
-                format!("{label}: ordinal must be @1 or higher"),
-            ));
-        }
-        let mut entries = ses_entries(workdir)?;
-        if entries.is_empty() {
-            return Err(CliError::new(
-                E_TRC_002,
-                format!("no sessions found in workdir at {}", workdir.display()),
-            ));
-        }
-        entries.sort();
-        entries.reverse(); // descending: most recent first
-        if n > entries.len() {
-            return Err(CliError::new(
-                E_TRC_002,
-                format!(
-                    "{label}: @{n} is out of range — workdir has {} session{}",
-                    entries.len(),
-                    if entries.len() == 1 { "" } else { "s" }
-                ),
-            ));
-        }
-        return Ok(workdir.join(&entries[n - 1]).join("trace.jsonl"));
-    }
-    resolve_session(Some(arg.to_string()), workdir)
-        .map_err(|e| CliError::new(e.code, format!("{label}: {}", e.message)))
+    session_address::resolve(Some(arg), workdir, &trace_query(Some(label)))
 }
 
 // ── Report helpers ────────────────────────────────────────────────────────────

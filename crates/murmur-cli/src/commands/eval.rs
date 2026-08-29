@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, E_IO_001, E_IO_003};
 use crate::registry_client::FallbackRegistry;
+use crate::session_address::{self, SessionQuery};
 
 use super::{fail_run, lockfile_error_to_cli, runtime_manifest_error_to_cli};
 
@@ -41,12 +42,17 @@ pub(crate) enum EvalCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Compare two eval files side-by-side
+    /// Compare two eval sessions side-by-side.
+    ///
+    /// Each argument accepts: a full session ID (ses_<32hex>), the last 4+ characters
+    /// of a session ID as a suffix, an ordinal shortcut (@1 = most recent, @2 = second
+    /// most recent, …), or a literal file path for backward compatibility.
     Diff {
-        /// Session A: full ID, last 4+ chars as suffix, or literal path
-        a: String,
-        /// Session B: full ID, last 4+ chars as suffix, or literal path
-        b: String,
+        /// Session A: full ID, suffix (4+ chars), @N ordinal, or literal path.
+        /// Omit both arguments to diff the two most recent sessions (@2 vs @1).
+        a: Option<String>,
+        /// Session B: full ID, suffix (4+ chars), @N ordinal, or literal path.
+        b: Option<String>,
         /// Directory containing session subdirectories (default: ./workdir)
         #[arg(long)]
         workdir: Option<PathBuf>,
@@ -133,96 +139,14 @@ impl EvalMetrics {
 
 // ── Session resolution ────────────────────────────────────────────────────────
 
-fn ses_entries(workdir: &Path) -> Result<Vec<String>, CliError> {
-    if !workdir.exists() || !workdir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    for entry_res in fs::read_dir(workdir).map_err(|e| {
-        CliError::new(
-            E_IO_003,
-            format!("failed to read {}: {e}", workdir.display()),
-        )
-    })? {
-        let entry = entry_res.map_err(|e| {
-            CliError::new(
-                E_IO_003,
-                format!("failed to read entry in {}: {e}", workdir.display()),
-            )
-        })?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("ses_") && entry.path().is_dir() {
-            entries.push(name);
-        }
-    }
-    Ok(entries)
-}
-
-fn resolve_eval_session(session: Option<String>, workdir: &Path) -> Result<PathBuf, CliError> {
-    match session {
-        None => {
-            let mut entries = ses_entries(workdir)?;
-            if entries.is_empty() {
-                return Err(CliError::new(
-                    E_EVAL_002,
-                    format!("no sessions found in workdir at {}", workdir.display()),
-                ));
-            }
-            entries.sort();
-            let latest = entries.into_iter().last().unwrap();
-            Ok(workdir.join(latest).join("eval.jsonl"))
-        }
-        Some(s) => {
-            // Literal path: contains '/' or ends with '.jsonl'
-            if s.contains('/') || s.ends_with(".jsonl") {
-                return Ok(PathBuf::from(&s));
-            }
-            // Full session ID: "ses_" prefix + 32-char hex = 36 chars total
-            if s.starts_with("ses_") && s.len() == 36 {
-                let path = workdir.join(&s).join("eval.jsonl");
-                if !path.exists() {
-                    return Err(CliError::new(
-                        E_EVAL_002,
-                        format!("session {} not found in {}", s, workdir.display()),
-                    ));
-                }
-                return Ok(path);
-            }
-            // Suffix matching (case-insensitive)
-            let suffix_lower = s.to_lowercase();
-            let entries = ses_entries(workdir)?;
-            let mut matches: Vec<String> = entries
-                .into_iter()
-                .filter(|e| e.to_lowercase().ends_with(&suffix_lower))
-                .collect();
-            match matches.len() {
-                0 => Err(CliError::new(
-                    E_EVAL_002,
-                    format!(
-                        "no session found matching suffix '{}' in {}",
-                        s,
-                        workdir.display()
-                    ),
-                )),
-                1 => Ok(workdir.join(&matches[0]).join("eval.jsonl")),
-                n => {
-                    matches.sort();
-                    Err(CliError::new(
-                        E_EVAL_002,
-                        format!(
-                            "ambiguous: '{}' matches {} sessions — provide more characters\n{}",
-                            s,
-                            n,
-                            matches
-                                .iter()
-                                .map(|m| format!("  {m}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        ),
-                    ))
-                }
-            }
-        }
+/// `eval.jsonl` addressing: the vocabulary every session-naming command shares, under this
+/// command's own diagnostic code. Neither `mur eval show` nor either side of `mur eval diff`
+/// labels its failures — the command line already shows which address was written.
+fn eval_query() -> SessionQuery<'static> {
+    SessionQuery {
+        record_file: "eval.jsonl",
+        code: E_EVAL_002,
+        label: None,
     }
 }
 
@@ -274,7 +198,7 @@ pub(crate) fn run_eval_show(
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("workdir")
     });
-    let path = resolve_eval_session(session, &workdir)?;
+    let path = session_address::resolve(session.as_deref(), &workdir, &eval_query())?;
     let metrics = parse_eval_file(&path)?;
 
     if json {
@@ -398,9 +322,22 @@ pub(crate) fn run_eval_diff(
     b: Option<String>,
     workdir: Option<PathBuf>,
 ) -> Result<(), CliError> {
+    // Same two-or-nothing rule `mur trace diff` has, and the same default: the older run is
+    // `a` so the delta column reads forwards in time.
+    let (a, b) = match (a, b) {
+        (None, None) => ("@2".to_string(), "@1".to_string()),
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            return Err(CliError::new(
+                E_EVAL_002,
+                "mur eval diff expects 0 or 2 arguments, got 1. Usage: mur eval diff [<a> <b>]",
+            ));
+        }
+    };
+
     let workdir = workdir.unwrap_or_else(|| PathBuf::from("workdir"));
-    let path_a = resolve_eval_session(a, &workdir)?;
-    let path_b = resolve_eval_session(b, &workdir)?;
+    let path_a = session_address::resolve(Some(&a), &workdir, &eval_query())?;
+    let path_b = session_address::resolve(Some(&b), &workdir, &eval_query())?;
     let ma = parse_eval_file(&path_a)?;
     let mb = parse_eval_file(&path_b)?;
     print_diff(&ma, &mb);
