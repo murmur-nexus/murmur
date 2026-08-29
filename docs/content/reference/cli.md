@@ -18,6 +18,7 @@ This page documents the **currently implemented** `mur` CLI surface in this repo
 | `mur destroy` | Remove a deployment record from the local tracking list |
 | `mur ps` | List all deployed capsules |
 | `mur trace show` | Human-readable summary of a single `trace.jsonl` session |
+| `mur trace steps` | Turn-by-turn tree of what one session's agent did |
 | `mur trace diff` | Side-by-side metric comparison of two trace files |
 | `mur trace report` | Aggregate statistics across all `.jsonl` files in a directory |
 | `mur eval show` | Human-readable (or JSON) summary of a single `eval.jsonl` session |
@@ -666,27 +667,76 @@ See [Session trace (`trace.jsonl`)](observability-schemas.md#session-trace-trace
 
 ### `mur trace show`
 
-Print a human-readable summary of a single session.
+Print a human-readable summary of a single session, or the recorded body behind one of its
+content hashes.
 
 ```bash
-mur trace show <trace.jsonl>
+mur trace show [<session>] [--workdir <dir>] [--body <selector> --turn <n>]
 ```
 
-Output sections:
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | the most recent session in the workdir | Full session ID, the last 4+ characters of one as a suffix, or a literal path to a `trace.jsonl` |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+| `--body` | — | Print the body behind one hash and nothing else. Selectors below |
+| `--turn` | — | The turn whose hashes `--body system`, `tools`, `response` and `message:<i>` name. Required with those four, invalid without `--body` |
 
-| Section | Contents |
+Output sections, in the order they are printed:
+
+| Section | Printed | Contents |
+|---|---|---|
+| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash |
+| Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
+| Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
+| Turns | always | Turn count and configured max |
+| Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing the provider's own counts over the turns that reported them |
+| Wire | one or more turns carrying content hashes | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried, then the `--body` command that prints one of them |
+| Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
+| Redundant calls | always | Calls that re-read a resource nothing had changed since |
+| Skill calls | always | Count, ok/error breakdown, success rate, average latency |
+| Shell calls | always | Count, exit code distribution, average latency |
+| Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
+| Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, and the feedback it injected |
+| Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
+| Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
+| A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
+| Tasks | more than one task in the session | Per-task breakdown |
+
+#### Printing one recorded body { #mur-trace-show-body }
+
+`--body` prints the bytes behind one hash to stdout — no headers, no added trailing newline — so
+the output pipes into `sha256sum` and matches the blob's own name. The bodies live in
+[`<session>/blobs/`](observability-schemas.md#trace-blobs) and are stored only under
+[`trace.capture: content`](manifest.md#field-trace).
+
+| Selector | Resolves to |
 |---|---|
-| Session | `session_id`, capsule name+version, model, exit status, duration |
-| Turns | Turn count and configured max |
-| Tokens | Input tokens, output tokens, total, and per-turn averages |
-| Tool calls | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
-| Shell calls | Count, exit code distribution, average latency |
-| Compaction | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
-| Tasks | Per-task breakdown (only shown when the session contains more than one task) |
+| `system` | the named turn's `system_sha` |
+| `tools` | the named turn's `tools_sha` |
+| `response` | the named turn's `response_sha` |
+| `message:<i>` | entry `i` (0-based) of the named turn's `message_shas` |
+| `<sha256>` | that hash — a full 64-character lowercase hex string, or a prefix of 8 or more characters naming exactly one hash anywhere in the trace, `session_start.system_prompt_sha256` included. Needs no `--turn` |
 
-The **Tasks** section appears only for multi-task persistent capsule sessions. Single-task and legacy traces (no task events) are unaffected — their output is unchanged.
+```bash
+mur trace show --body system --turn 1 | sha256sum
+```
 
-Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. Calls without a recorded input (older traces, or tools invoked with no arguments) show no input segment at all.
+Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
+
+| Situation | Message |
+|---|---|
+| A named selector with no `--turn` | `--turn is required with --body <selector>; this trace has turns 1, 2, 3` |
+| `--turn` names no `inference` record | `turn 7 has no inference record in this trace` |
+| The turn recorded no hashes | `turn 3 recorded no content hashes — the session ran under trace.capture: none` |
+| `message:<i>` past the end of the list | `turn 2 recorded 4 messages; there is no message 7` |
+| The hash is recorded and the body is not | `turn 1 system prompt <sha>: recorded under capture: meta; no body was stored` |
+| A hash nothing in the trace names | `no hash in this trace matches <arg>` |
+| A prefix matching several hashes | The refusal lists every hash it matched |
+| `--turn` without `--body` | `--turn has no meaning without --body` |
+
+The **Tasks** section appears only for sessions that ran more than one task.
+
+Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. A call with no recorded input shows no input segment at all.
 
 Example (single-task session — no Tasks section):
 
@@ -697,6 +747,12 @@ capsule:    my-agent v0.1.0
 model:      claude-3-5-sonnet
 status:     ok
 duration:   500ms
+capabilities: shell
+tools:      bash
+containment: sealed → scoped
+workdir exec: no
+userns:     profile_confining
+prompt:     manifest  cf07194ee232…
 
 ── Turns ────────────────────────────────────────
 count:      2  (max: 10)
@@ -705,15 +761,28 @@ count:      2  (max: 10)
 input:      2,200  (avg 1100/turn)
 output:     350  (avg 175/turn)
 total:      2,550
+provider:   in 2,090, out 320, cached 1,840, cache write 210
+
+── Wire ─────────────────────────────────────────
+turn 1  system bbc5e661e106…  tools f9d35d43770d…  response afb8c1747105…  3 messages
+turn 2  system bbc5e661e106…  tools f9d35d43770d…  response 4ed87cafe960…  5 messages
+bodies:     mur trace show --body system --turn 1
 
 ── Tool calls ───────────────────────────────────
 count:      1  (1 ok, 0 error)  success 100.0%
 latency:    avg 100ms
-  turn 0  bash 100ms ✓  {"command":"cargo test --workspace"}
+  turn 1  bash 100ms ✓  {"command":"cargo test --workspace"}
+  turn 2  end_turn
+
+── Redundant calls ──────────────────────────────
+count:      0
+
+── Skill calls ──────────────────────────────────
+count:      0
 
 ── Shell calls ──────────────────────────────────
 count:      1
-exit codes: 1×0
+exit codes: 1 ok
 latency:    avg 50ms
 
 ── Compaction ───────────────────────────────────
@@ -734,6 +803,46 @@ task 2  d014bbd7  turns: 1  in: 39  out: 20  ok  2ms
 ```
 
 Each task row shows the first 8 characters of the `task_id`, per-task turns, input tokens, output tokens, exit status, and duration.
+
+### `mur trace steps`
+
+Print what the agent did, turn by turn.
+
+```bash
+mur trace steps [<session>] [--verbose] [--workdir <dir>]
+```
+
+| Argument / Flag | Default | Description |
+|---|---|---|
+| `<session>` | the most recent session in the workdir | Full session ID, the last 4+ characters of one as a suffix, or a literal path to a `trace.jsonl` |
+| `--verbose` | off | Append a truncated summary of each tool call's input |
+| `--workdir` | `./workdir` | Directory holding the `ses_*` session directories |
+
+A trace whose lines carry [`event_id`](observability-schemas.md#session-trace-tracejsonl) renders as
+the session → task → turn tree that its `parent_id` chain describes: each turn's tool, shell and
+skill calls under their turn, each turn under its task, and each task under the session. A
+turn-level line whose `parent_id` names no line in the file is attributed by its `task_id`.
+
+```text
+Session ses_019f01a940ce7761854e768ecbe3d399  (1 task, 2 turns)
+
+task tsk_11112222…  ctx_11112222…  (a2a)
+  context_seed memory-hook  trimmed  1,204 tokens
+  turn 1  tool_call  bash
+    tool_call  bash  120ms  ✓
+    shell      /usr/bin/bash  exit 0  50ms
+  turn 2  end_turn
+```
+
+A trace whose lines carry no `event_id` renders one row per turn: turn number, decision, tool
+name, duration.
+
+```text
+Session ses_aaaaaaaaaaaa4aaa8aaa000000000001  (2 turns)
+
+  1  tool_call    bash        100ms
+  2  end_turn     —           —
+```
 
 ### `mur trace diff`
 
@@ -766,6 +875,31 @@ exit status            ok               max_turns_reached —
 - Numeric metrics that are lower-is-better (turns, tokens, latency) flag the lower run as `(X better)`.
 - `tool success rate` is higher-is-better.
 - Non-numeric or non-comparable fields (`compaction`, `exit status`) show `—` in the Delta column.
+
+#### Prefix divergence { #mur-trace-diff-divergence }
+
+Below the table, a **Prefix divergence** section reports where the two runs' requests stopped
+agreeing — the answer to why a provider-side prompt cache missed. It reads the
+[content hashes](observability-schemas.md#wire-hashes) each run's `inference` lines recorded, so
+both runs need [`trace.capture`](manifest.md#field-trace) `meta` or `content`.
+
+```text
+── Prefix divergence ────────────────────────────
+system prompt: differs    A d27e9be1c0de…  B aaaaaaaaaaaa…
+tool schemas:  identical  143f541e445d…
+turn 1:  diverges at message 1  A 4d3fd85ffaa2…  B ffffffffffff…
+turn 2:  identical  (2 messages)
+```
+
+| Line | Reports |
+|---|---|
+| `system prompt:` | The `system_sha` each run's first agent-loop turn recorded. A run that changes its system prompt mid-session gets a `note:` line naming the turn |
+| `tool schemas:` | The `tools_sha` each run's first agent-loop turn recorded |
+| `turn <n>:` | The two runs' `message_shas` for that turn, compared element-wise: the index of the first entry that differs, `identical (<n> messages)` when every entry agrees, or `only in run A` when the other run has no such turn. When one array is a prefix of the other, the divergence index is the shorter array's length and the line reports both lengths |
+
+Divergence has no polarity, so no `(A better)`/`(B better)` marker appears in this section. When a
+run recorded no hashes at all, one line names it and says it ran under `trace.capture: none`, and
+nothing is compared.
 
 ### `mur trace report`
 

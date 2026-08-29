@@ -470,7 +470,12 @@ fn main() {
             explain_scope,
         ),
         Commands::Trace { command } => match command {
-            TraceCommand::Show { session, workdir } => run_trace_show(session, workdir),
+            TraceCommand::Show {
+                session,
+                workdir,
+                body,
+                turn,
+            } => run_trace_show(session, workdir, body, turn),
             TraceCommand::Steps {
                 session,
                 verbose,

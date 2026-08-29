@@ -104,6 +104,10 @@ struct Session {
     requests: Vec<Value>,
     trace: Vec<Value>,
     trace_raw: String,
+    /// The session directory, and the project tempdir it lives under — kept alive so a test
+    /// can run `mur trace show` against the trace this session actually wrote.
+    workdir: PathBuf,
+    _project: tempfile::TempDir,
 }
 
 impl Session {
@@ -176,6 +180,8 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
         requests: server.requests(),
         trace,
         trace_raw,
+        workdir,
+        _project: project,
     }
 }
 
@@ -470,4 +476,44 @@ fn oversized_message_is_rejected() {
     // A refused seed must not cost the task its ordinary terminal records.
     assert_eq!(session.events("task_end").len(), 1);
     assert_eq!(session.events("session_end").len(), 1);
+}
+
+/// The `context_seed` line the runtime wrote is what `mur trace show` renders: a Context
+/// section naming the hook, its outcome, the tokens it committed and the ids it seeded.
+#[test]
+fn trace_show_renders_the_context_section_for_a_seeded_session() {
+    if common::skip_without_host_support(
+        "trace_show_renders_the_context_section_for_a_seeded_session",
+    ) {
+        return;
+    }
+    let session = run_session(
+        "0.10",
+        &[(
+            "seed-hook",
+            "on-task-start",
+            "seed-context",
+            seed_hook_wasm(&[("user", "REMEMBER-THIS the operator prefers terse answers.")]),
+        )],
+    );
+    let seed = session.context_seed();
+    let seeded_id = seed["message_ids"][0].as_str().unwrap().to_string();
+    let tokens = seed["tokens"].as_u64().unwrap();
+
+    let assert = assert_cmd::Command::cargo_bin("mur")
+        .unwrap()
+        .args(["trace", "show"])
+        .arg(session.workdir.join("trace.jsonl"))
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("\u{2500}\u{2500} Context"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "seed-hook  seeded  {tokens} tokens (proposed {tokens},"
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&seeded_id), "{stdout}");
 }
