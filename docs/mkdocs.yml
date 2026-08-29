@@ -76,6 +76,15 @@ plugins:
         reference/capsule-io.md: reference/workdir.md
         reference/verification.md: reference/containment.md
 
+hooks:
+  # Dumps fully-resolved page markdown to .agent-export/pages.json for the
+  # leadtype agent-artifact build (scripts/agent-artifacts.mjs). Build-only;
+  # does not alter rendered output.
+  - hooks/agent_export.py
+  # Adds the markdown-twin <link rel="alternate"> and the WebMCP bundle to
+  # every page head.
+  - hooks/agent_head.py
+
 extra:
   v:
     model_anthropic: "claude-sonnet-5"

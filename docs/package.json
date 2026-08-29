@@ -1,0 +1,17 @@
+{
+  "name": "murmur-docs-agent-artifacts",
+  "private": true,
+  "type": "module",
+  "description": "Generates the agent-readable artifact set (llms.txt, markdown mirrors, agent-readability.json) on top of the MkDocs build.",
+  "scripts": {
+    "build": "mkdocs build --strict && node scripts/agent-artifacts.mjs",
+    "agent-artifacts": "node scripts/agent-artifacts.mjs",
+    "test": "node --test scripts/webmcp.test.mjs infra/cloudfront-agent-negotiation.test.mjs"
+  },
+  "dependencies": {
+    "leadtype": "^0.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
