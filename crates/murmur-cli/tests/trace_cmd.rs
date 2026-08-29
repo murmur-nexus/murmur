@@ -2519,3 +2519,822 @@ fn show_surfaces_reopen_events_and_count() {
         .stdout(predicate::str::contains("gatekeeper"))
         .stdout(predicate::str::contains("tests still fail"));
 }
+
+// ── the nine session-level event types ───────────────────────────────────────
+
+const SESSION_ID_NINE: &str = "ses_99999999999949998999000000000009";
+
+/// One session frame around one line of each session-level event type, shaped as
+/// `docs/content/reference/observability-schemas.md` documents them.
+fn nine_event_fixture() -> String {
+    let s = SESSION_ID_NINE;
+    [
+        format!("{{\"event_type\":\"session_start\",\"event_id\":\"evt_1\",\"parent_id\":null,\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"wide-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-test\",\"max_turns\":10,\"capabilities\":[\"network\",\"shell\"],\"tools_declared\":[\"bash\",\"share-file\"],\"containment_declared\":\"sealed\",\"containment_achieved\":\"scoped\",\"workdir_exec\":false,\"userns_grant\":\"profile_confining\",\"system_prompt_source\":\"manifest\",\"system_prompt_sha256\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"effective_grants\":{{\"declared_containment\":\"sealed\",\"network_allow\":[]}}}}"),
+        format!("{{\"event_type\":\"task_start\",\"event_id\":\"evt_2\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1010,\"task_id\":\"tsk_one\",\"context_id\":\"ctx_one\",\"source\":\"a2a\",\"message_parts_bytes\":12}}"),
+        format!("{{\"event_type\":\"context_seed\",\"event_id\":\"evt_3\",\"parent_id\":\"evt_2\",\"session_id\":\"{s}\",\"timestamp\":1020,\"task_id\":\"tsk_one\",\"hook_name\":\"memory-hook\",\"tokens\":1204,\"proposed_tokens\":1400,\"budget_tokens\":20000,\"outcome\":\"trimmed\",\"message_ids\":[\"msg_aaa\",\"msg_bbb\"]}}"),
+        format!("{{\"event_type\":\"a2a_task_received\",\"event_id\":\"evt_4\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1030,\"task_id\":\"tsk_one\",\"context_id\":\"ctx_one\",\"message_id\":\"msg-in\",\"traceparent_from_caller\":null}}"),
+        format!("{{\"event_type\":\"inference\",\"event_id\":\"evt_5\",\"parent_id\":\"evt_2\",\"session_id\":\"{s}\",\"timestamp\":1100,\"turn\":1,\"task_id\":\"tsk_one\",\"input_tokens\":100,\"output_tokens\":20,\"decision\":\"end_turn\",\"tool_name\":null,\"message_ids\":[\"msg_aaa\"]}}"),
+        format!("{{\"event_type\":\"task_end\",\"event_id\":\"evt_6\",\"parent_id\":\"evt_2\",\"session_id\":\"{s}\",\"timestamp\":1200,\"task_id\":\"tsk_one\",\"exit_status\":\"ok\",\"duration_ms\":190,\"turns\":1,\"input_tokens\":100,\"output_tokens\":20,\"tool_calls\":0,\"shell_calls\":0,\"reopen_count\":0}}"),
+        format!("{{\"event_type\":\"a2a_send\",\"event_id\":\"evt_7\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1210,\"peer_url\":\"http://peer.example/a2a\",\"message_id\":\"msg-out\",\"task_id\":\"tsk_peer\",\"context_id\":\"ctx_peer\",\"traceparent\":null}}"),
+        format!("{{\"event_type\":\"hook_dispatch_error\",\"event_id\":\"evt_8\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1220,\"hook_name\":\"audit-hook\",\"event\":\"on-tool-call\",\"arm\":\"write-manifests\"}}"),
+        format!("{{\"event_type\":\"resource_list\",\"event_id\":\"evt_9\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1230,\"root\":\"out\",\"entry_count\":2,\"total_bytes\":40,\"generation\":1,\"containment_achieved\":\"scoped\",\"outcome\":\"ok\",\"reason\":null}}"),
+        format!("{{\"event_type\":\"resource_read\",\"event_id\":\"evt_10\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1240,\"path\":\"../etc/passwd\",\"outcome\":\"not_found\",\"bytes\":null,\"sha256\":null,\"generation\":1,\"containment_achieved\":\"scoped\",\"reason\":\"outside the export root\"}}"),
+        format!("{{\"event_type\":\"peer_handle_mint\",\"event_id\":\"evt_11\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1250,\"handle_id\":\"abcdef0123456789\",\"path\":\"report.md\",\"audience\":\"peer@host:8080\",\"expires_at_ms\":99,\"outcome\":\"ok\",\"reason\":null}}"),
+        format!("{{\"event_type\":\"peer_handle_redeem\",\"event_id\":\"evt_12\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1260,\"handle_id\":\"abcdef0123456789\",\"path\":\"report.md\",\"generation\":1,\"audience_asserted\":\"peer@host:8080\",\"bytes\":40,\"sha256\":\"aa\",\"outcome\":\"ok\",\"reason\":null}}"),
+        format!("{{\"event_type\":\"peer_file_fetch\",\"event_id\":\"evt_13\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1270,\"peer\":\"peer@host:8080\",\"handle_id\":\"abcdef0123456789\",\"stored_path\":null,\"bytes\":null,\"sha256\":null,\"outcome\":\"peer_unreachable\",\"reason\":\"connection refused\"}}"),
+        format!("{{\"event_type\":\"session_end\",\"event_id\":\"evt_14\",\"parent_id\":\"evt_1\",\"session_id\":\"{s}\",\"timestamp\":1300,\"total_turns\":1,\"total_input_tokens\":100,\"total_output_tokens\":20,\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":300,\"exit_status\":\"ok\"}}"),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// Every session-level event type reaches the output.
+#[test]
+fn show_names_every_previously_dropped_event_type() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "nine.jsonl", &nine_event_fixture());
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        // context_seed
+        .stdout(predicate::str::contains("── Context"))
+        .stdout(predicate::str::contains("memory-hook"))
+        .stdout(predicate::str::contains("trimmed"))
+        .stdout(predicate::str::contains("msg_aaa, msg_bbb"))
+        // hook_dispatch_error
+        .stdout(predicate::str::contains("── Hook failures"))
+        .stdout(predicate::str::contains(
+            "✗ audit-hook  on-tool-call  write-manifests",
+        ))
+        // resource_list / resource_read
+        .stdout(predicate::str::contains("── Resource plane"))
+        .stdout(predicate::str::contains("list:       1 ok"))
+        .stdout(predicate::str::contains("read:       1 not_found"))
+        // peer_handle_mint / peer_handle_redeem / peer_file_fetch
+        .stdout(predicate::str::contains("── Peer files"))
+        .stdout(predicate::str::contains("minted:     1 ok"))
+        .stdout(predicate::str::contains("redeemed:   1 ok"))
+        .stdout(predicate::str::contains("fetched:    1 peer_unreachable"))
+        // a2a_task_received / a2a_send
+        .stdout(predicate::str::contains("── A2A"))
+        .stdout(predicate::str::contains("received:   1 task"))
+        .stdout(predicate::str::contains("sent:       1 message"))
+        .stdout(predicate::str::contains("http://peer.example/a2a"));
+}
+
+/// The Session block reports what the session ran under, not just what it was called.
+#[test]
+fn show_session_block_reports_containment_and_prompt() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "nine.jsonl", &nine_event_fixture());
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("capabilities: network, shell"))
+        .stdout(predicate::str::contains("tools:      bash, share-file"))
+        .stdout(predicate::str::contains("containment: sealed → scoped"))
+        .stdout(predicate::str::contains("workdir exec: no"))
+        .stdout(predicate::str::contains("userns:     profile_confining"))
+        .stdout(predicate::str::contains(
+            "prompt:     manifest  111111111111…",
+        ));
+}
+
+/// A hook fault is placed where it cannot be scrolled past: after Session, before Turns.
+#[test]
+fn show_hook_failures_precede_the_turns_section() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "nine.jsonl", &nine_event_fixture());
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    let session = stdout.find("── Session").unwrap();
+    let failures = stdout.find("── Hook failures").unwrap();
+    let turns = stdout.find("── Turns").unwrap();
+    assert!(session < failures && failures < turns, "{stdout}");
+}
+
+/// A rejected seed names why nothing was committed.
+#[test]
+fn show_context_section_reports_a_rejection_reason() {
+    let tmp = TempDir::new().unwrap();
+    let s = SESSION_ID_NINE;
+    let trace = [
+        format!("{{\"event_type\":\"session_start\",\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"c\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5,\"capabilities\":[],\"tools_declared\":[]}}"),
+        format!("{{\"event_type\":\"context_seed\",\"session_id\":\"{s}\",\"timestamp\":1010,\"task_id\":null,\"hook_name\":\"seed-hook\",\"tokens\":0,\"proposed_tokens\":221,\"budget_tokens\":19,\"outcome\":\"rejected\",\"reason\":\"message_over_budget\",\"message_ids\":[]}}"),
+        format!("{{\"event_type\":\"session_end\",\"session_id\":\"{s}\",\"timestamp\":1100,\"total_turns\":0,\"total_input_tokens\":0,\"total_output_tokens\":0,\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":100,\"exit_status\":\"ok\"}}"),
+    ]
+    .join("\n")
+        + "\n";
+    let path = write_fixture(tmp.path(), "rejected.jsonl", &trace);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "seed-hook  rejected  0 tokens (proposed 221, budget 19)",
+        ))
+        .stdout(predicate::str::contains("reason:   message_over_budget"));
+}
+
+/// A known event type carrying a key this build does not know, beside an event type it does
+/// not know at all: everything else still renders.
+#[test]
+fn show_tolerates_unknown_keys_and_unknown_types_together() {
+    let tmp = TempDir::new().unwrap();
+    let s = SESSION_ID_NINE;
+    let trace = [
+        format!("{{\"event_type\":\"session_start\",\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"tolerant\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5,\"capabilities\":[],\"tools_declared\":[],\"a_key_from_the_future\":{{\"nested\":true}}}}"),
+        format!("{{\"event_type\":\"context_seed\",\"session_id\":\"{s}\",\"timestamp\":1010,\"hook_name\":\"memory-hook\",\"tokens\":10,\"proposed_tokens\":10,\"budget_tokens\":100,\"outcome\":\"seeded\",\"message_ids\":[\"msg_x\"],\"seed_provenance\":\"from a later runtime\"}}"),
+        format!("{{\"event_type\":\"an_event_type_from_the_future\",\"session_id\":\"{s}\",\"timestamp\":1020,\"whatever\":1}}"),
+        format!("{{\"event_type\":\"session_end\",\"session_id\":\"{s}\",\"timestamp\":1100,\"total_turns\":0,\"total_input_tokens\":0,\"total_output_tokens\":0,\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":100,\"exit_status\":\"ok\"}}"),
+    ]
+    .join("\n")
+        + "\n";
+    let path = write_fixture(tmp.path(), "tolerant.jsonl", &trace);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tolerant"))
+        .stdout(predicate::str::contains("memory-hook  seeded  10 tokens"))
+        .stdout(predicate::str::contains("msg_x"));
+}
+
+// ── wire hashes and bodies ────────────────────────────────────────────────────
+
+const PROMPT_BODY: &str = "You are a helpful capsule.\n";
+const TOOLS_BODY: &str = "[{\"name\":\"bash\",\"description\":\"run a command\"}]";
+const RESPONSE_BODY: &str = "{\"stop_reason\":\"end_turn\"}";
+const MESSAGE_BODIES: [&str; 4] = [
+    "{\"role\":\"user\",\"content\":\"one\"}",
+    "{\"role\":\"assistant\",\"content\":\"two\"}",
+    "{\"role\":\"user\",\"content\":\"three\"}",
+    "{\"role\":\"assistant\",\"content\":\"four\"}",
+];
+/// The marker the system-prompt body carries, and the reason it is longer than a line: a
+/// default `show` must name the hash and never the body, whatever the body's size.
+const SYSTEM_MARKER: &str = "DISTINCTIVE-SYSTEM-PROMPT-MARKER";
+
+fn system_body() -> String {
+    format!("{SYSTEM_MARKER}\n{}", "padding ".repeat(5000))
+}
+
+fn sha(body: &str) -> String {
+    murmur_artifact::sha256_hex(body.as_bytes())
+}
+
+/// A two-turn session carrying the four wire hashes on every turn, plus the bodies behind
+/// them. `store_bodies` is the whole difference between `trace.capture: content` and
+/// `capture: meta`: the same hashes, with or without a `blobs/` directory beside the trace.
+fn write_wire_session(
+    workdir: &Path,
+    session_id: &str,
+    system: &str,
+    messages: &[&str],
+    store_bodies: bool,
+) {
+    let message_shas: Vec<String> = messages.iter().map(|m| sha(m)).collect();
+    let quoted: Vec<String> = message_shas.iter().map(|s| format!("\"{s}\"")).collect();
+    let turn = |n: u32, ts: u64| {
+        format!(
+            "{{\"event_type\":\"inference\",\"session_id\":\"{session_id}\",\"timestamp\":{ts},\
+             \"turn\":{n},\"input_tokens\":100,\"output_tokens\":20,\"decision\":\"end_turn\",\
+             \"tool_name\":null,\"system_sha\":\"{}\",\"tools_sha\":\"{}\",\"response_sha\":\"{}\",\
+             \"message_shas\":[{}]}}",
+            sha(system),
+            sha(TOOLS_BODY),
+            sha(RESPONSE_BODY),
+            quoted.join(",")
+        )
+    };
+    let trace = [
+        format!(
+            "{{\"event_type\":\"session_start\",\"session_id\":\"{session_id}\",\"timestamp\":1000,\
+             \"capsule_name\":\"wire\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5,\
+             \"capabilities\":[],\"tools_declared\":[],\"system_prompt_source\":\"manifest\",\
+             \"system_prompt_sha256\":\"{}\"}}",
+            sha(PROMPT_BODY)
+        ),
+        turn(1, 1100),
+        turn(2, 1200),
+        format!(
+            "{{\"event_type\":\"session_end\",\"session_id\":\"{session_id}\",\"timestamp\":1300,\
+             \"total_turns\":2,\"total_input_tokens\":200,\"total_output_tokens\":40,\
+             \"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":300,\"exit_status\":\"ok\"}}"
+        ),
+    ]
+    .join("\n")
+        + "\n";
+    write_session(workdir, session_id, &trace);
+
+    if store_bodies {
+        let blobs = workdir.join(session_id).join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        for body in [system, TOOLS_BODY, RESPONSE_BODY, PROMPT_BODY]
+            .into_iter()
+            .chain(messages.iter().copied())
+        {
+            fs::write(blobs.join(sha(body)), body).unwrap();
+        }
+    }
+}
+
+const SESSION_ID_WIRE: &str = "ses_11111111111141118111000000000011";
+
+/// Default `show` names the hashes and the command that prints a body — and prints no body,
+/// however large the body is.
+#[test]
+fn show_names_wire_hashes_and_never_prints_a_body() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("── Wire"))
+        .stdout(predicate::str::contains(format!(
+            "turn 1  system {}…",
+            &sha(&system)[..12]
+        )))
+        .stdout(predicate::str::contains("4 messages"))
+        .stdout(predicate::str::contains(
+            "mur trace show --body system --turn 1",
+        ))
+        .stdout(predicate::str::contains(SYSTEM_MARKER).not());
+}
+
+/// Under `capture: content` every named selector prints exactly the blob on disk.
+#[test]
+fn body_selectors_print_the_stored_blob_verbatim() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+    let blobs = tmp.path().join(SESSION_ID_WIRE).join("blobs");
+
+    for (selector, body) in [
+        ("system", system.as_str()),
+        ("tools", TOOLS_BODY),
+        ("response", RESPONSE_BODY),
+        ("message:2", MESSAGE_BODIES[2]),
+    ] {
+        let out = mur()
+            .args([
+                "trace",
+                "show",
+                SESSION_ID_WIRE,
+                "--workdir",
+                tmp.path().to_str().unwrap(),
+                "--body",
+                selector,
+                "--turn",
+                "1",
+            ])
+            .assert()
+            .success();
+        let stdout = out.get_output().stdout.clone();
+        assert_eq!(
+            stdout,
+            fs::read(blobs.join(sha(body))).unwrap(),
+            "--body {selector} must print the blob byte for byte"
+        );
+        assert_eq!(
+            murmur_artifact::sha256_hex(&stdout),
+            sha(body),
+            "--body {selector} output must hash to the blob's own name"
+        );
+        // Nothing but the body: no section header, no added trailing newline.
+        assert!(!String::from_utf8_lossy(&stdout).contains("──"));
+    }
+}
+
+/// A bare sha resolves without a `--turn`, including the `session_start` prompt hash that
+/// belongs to no turn at all.
+#[test]
+fn a_bare_sha_selector_resolves_without_a_turn() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+
+    for selector in [sha(PROMPT_BODY), sha(PROMPT_BODY)[..8].to_string()] {
+        mur()
+            .args([
+                "trace",
+                "show",
+                SESSION_ID_WIRE,
+                "--workdir",
+                tmp.path().to_str().unwrap(),
+                "--body",
+                &selector,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::eq(PROMPT_BODY));
+    }
+}
+
+/// Under `capture: meta` the hash is recorded and the body never was — which is what the
+/// failure says, rather than reporting a file that went missing.
+#[test]
+fn body_under_meta_explains_that_no_body_was_stored() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, false);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "system",
+            "--turn",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("E-TRC-001"))
+        .stderr(predicate::str::contains(sha(&system)))
+        .stderr(predicate::str::contains(
+            "recorded under capture: meta; no body was stored",
+        ))
+        .stderr(predicate::str::contains("No such file").not());
+}
+
+/// Under `capture: none` the reason is the absent hash, not an absent blob.
+#[test]
+fn body_under_capture_none_names_the_missing_hashes() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "none.jsonl", FIXTURE_A);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            path.to_str().unwrap(),
+            "--body",
+            "system",
+            "--turn",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("E-TRC-001"))
+        .stderr(predicate::str::contains(
+            "turn 1 recorded no content hashes — the session ran under trace.capture: none",
+        ));
+}
+
+/// An ambiguous sha prefix lists every hash it matched.
+#[test]
+fn an_ambiguous_sha_prefix_lists_every_match() {
+    let tmp = TempDir::new().unwrap();
+    // Real bodies never collide on eight hex characters, so the hashes are written by hand:
+    // ambiguity is resolved against what the trace names, before any blob is opened.
+    let s = SESSION_ID_WIRE;
+    let shas = [
+        "abcdef1200000000000000000000000000000000000000000000000000000001",
+        "abcdef1200000000000000000000000000000000000000000000000000000002",
+        "abcdef1200000000000000000000000000000000000000000000000000000003",
+    ];
+    let trace = [
+        format!("{{\"event_type\":\"session_start\",\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"wire\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5}}"),
+        format!("{{\"event_type\":\"inference\",\"session_id\":\"{s}\",\"timestamp\":1100,\"turn\":1,\"input_tokens\":10,\"output_tokens\":2,\"decision\":\"end_turn\",\"tool_name\":null,\"system_sha\":\"{}\",\"tools_sha\":\"{}\",\"response_sha\":\"{}\",\"message_shas\":[]}}", shas[0], shas[1], shas[2]),
+        format!("{{\"event_type\":\"session_end\",\"session_id\":\"{s}\",\"timestamp\":1300,\"total_turns\":1,\"total_input_tokens\":10,\"total_output_tokens\":2,\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":300,\"exit_status\":\"ok\"}}"),
+    ]
+    .join("\n")
+        + "\n";
+    let path = write_fixture(tmp.path(), "ambiguous.jsonl", &trace);
+
+    let assert = mur()
+        .args([
+            "trace",
+            "show",
+            path.to_str().unwrap(),
+            "--body",
+            "abcdef12",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stderr.contains("abcdef12 matches 3 hashes in this trace — provide more characters"),
+        "{stderr}"
+    );
+    for sha in shas {
+        assert!(stderr.contains(sha), "{stderr}");
+    }
+}
+
+/// A sha the trace never names is reported as unmatched rather than as a missing file.
+#[test]
+fn a_sha_no_hash_matches_is_reported_as_unmatched() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no hash in this trace matches 00000000000000000000000000000000",
+        ));
+}
+
+/// `--turn` names a turn no `inference` line covers.
+#[test]
+fn body_with_an_unknown_turn_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "system",
+            "--turn",
+            "7",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "turn 7 has no inference record in this trace",
+        ));
+}
+
+/// A named selector without `--turn` says which turns the trace has; `--turn` without
+/// `--body` says it means nothing on its own.
+#[test]
+fn body_and_turn_must_be_used_together() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+    let workdir = tmp.path().to_str().unwrap().to_string();
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            &workdir,
+            "--body",
+            "message:0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--turn is required with --body message:0; this trace has turns 1, 2",
+        ));
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            &workdir,
+            "--turn",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--turn has no meaning without --body",
+        ));
+}
+
+/// `message:<i>` past the end of the turn's list names how many it recorded.
+#[test]
+fn body_message_index_out_of_range_reports_the_length() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
+
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "message:7",
+            "--turn",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "turn 2 recorded 4 messages; there is no message 7",
+        ));
+}
+
+// ── prefix divergence ─────────────────────────────────────────────────────────
+
+const SESSION_ID_DIV_A: &str = "ses_2222222222224222822200000000002a";
+const SESSION_ID_DIV_B: &str = "ses_3333333333334333833300000000003b";
+
+fn diff_divergence(workdir: &Path) -> String {
+    let out = mur()
+        .args([
+            "trace",
+            "diff",
+            SESSION_ID_DIV_A,
+            SESSION_ID_DIV_B,
+            "--workdir",
+            workdir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let at = stdout
+        .find("── Prefix divergence")
+        .unwrap_or_else(|| panic!("no divergence section in:\n{stdout}"));
+    stdout[at..].to_string()
+}
+
+/// Two runs that sent the same bytes diverge nowhere — and nothing in the section claims
+/// either run is better for it.
+#[test]
+fn diff_reports_an_identical_prefix_as_no_divergence() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_A,
+        &system,
+        &MESSAGE_BODIES,
+        false,
+    );
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_B,
+        &system,
+        &MESSAGE_BODIES,
+        false,
+    );
+
+    let section = diff_divergence(tmp.path());
+    assert!(section.contains("system prompt: identical"), "{section}");
+    assert!(section.contains("tool schemas:  identical"), "{section}");
+    assert!(
+        section.contains("turn 1:  identical  (4 messages)"),
+        "{section}"
+    );
+    assert!(
+        section.contains("turn 2:  identical  (4 messages)"),
+        "{section}"
+    );
+    assert!(!section.contains("(A better)"), "{section}");
+    assert!(!section.contains("(B better)"), "{section}");
+}
+
+/// One changed message is reported at its index, naming both runs' hashes there.
+#[test]
+fn diff_reports_the_index_of_a_changed_message() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    let mut changed = MESSAGE_BODIES;
+    changed[2] = "{\"role\":\"user\",\"content\":\"three, reworded\"}";
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_A,
+        &system,
+        &MESSAGE_BODIES,
+        false,
+    );
+    write_wire_session(tmp.path(), SESSION_ID_DIV_B, &system, &changed, false);
+
+    let section = diff_divergence(tmp.path());
+    assert!(
+        section.contains(&format!(
+            "turn 1:  diverges at message 2  A {}…  B {}…",
+            &sha(MESSAGE_BODIES[2])[..12],
+            &sha(changed[2])[..12]
+        )),
+        "{section}"
+    );
+    assert!(section.contains("system prompt: identical"), "{section}");
+}
+
+/// A changed system prompt is the first thing the section says, before any turn.
+#[test]
+fn diff_reports_a_changed_system_prompt_first() {
+    let tmp = TempDir::new().unwrap();
+    let system_a = system_body();
+    let system_b = format!("{}\nand one more instruction.\n", system_body());
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_A,
+        &system_a,
+        &MESSAGE_BODIES,
+        false,
+    );
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_B,
+        &system_b,
+        &MESSAGE_BODIES,
+        false,
+    );
+
+    let section = diff_divergence(tmp.path());
+    let first_line = section.lines().nth(1).unwrap();
+    assert!(
+        first_line.starts_with("system prompt: differs"),
+        "{section}"
+    );
+    assert!(first_line.contains(&sha(&system_a)[..12]), "{section}");
+    assert!(first_line.contains(&sha(&system_b)[..12]), "{section}");
+    let turn_line = section.find("turn 1:").unwrap();
+    assert!(
+        section.find("system prompt:").unwrap() < turn_line,
+        "{section}"
+    );
+}
+
+/// A run with no hashes at all is named, and nothing is compared.
+#[test]
+fn diff_says_which_run_recorded_no_hashes() {
+    let tmp = TempDir::new().unwrap();
+    let system = system_body();
+    write_wire_session(
+        tmp.path(),
+        SESSION_ID_DIV_A,
+        &system,
+        &MESSAGE_BODIES,
+        false,
+    );
+    write_session(tmp.path(), SESSION_ID_DIV_B, FIXTURE_A);
+
+    let section = diff_divergence(tmp.path());
+    assert!(
+        section.contains("run B recorded no content hashes — it ran under trace.capture: none"),
+        "{section}"
+    );
+    assert!(!section.contains("turn 1:"), "{section}");
+}
+
+// ── steps: tree and flat ──────────────────────────────────────────────────────
+
+const SESSION_ID_TREE: &str = "ses_4444444444444444844400000000004c";
+
+/// Two tasks, each with its own turns and calls, every line identified and parented.
+fn tree_fixture() -> String {
+    let s = SESSION_ID_TREE;
+    let mut lines = vec![format!(
+        "{{\"event_type\":\"session_start\",\"event_id\":\"evt_s\",\"parent_id\":null,\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"tree\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[]}}"
+    )];
+    for (i, task) in ["tsk_first0000000000", "tsk_second000000000"]
+        .iter()
+        .enumerate()
+    {
+        let base = 1100 + i as u64 * 1000;
+        lines.push(format!("{{\"event_type\":\"task_start\",\"event_id\":\"evt_t{i}\",\"parent_id\":\"evt_s\",\"session_id\":\"{s}\",\"timestamp\":{base},\"task_id\":\"{task}\",\"context_id\":\"ctx_{i}0000000000000\",\"source\":\"a2a\",\"message_parts_bytes\":10}}"));
+        lines.push(format!("{{\"event_type\":\"context_seed\",\"event_id\":\"evt_cs{i}\",\"parent_id\":\"evt_t{i}\",\"session_id\":\"{s}\",\"timestamp\":{},\"task_id\":\"{task}\",\"hook_name\":\"memory-hook\",\"tokens\":1204,\"proposed_tokens\":1204,\"budget_tokens\":20000,\"outcome\":\"seeded\",\"message_ids\":[\"msg_{i}\"]}}", base + 1));
+        lines.push(format!("{{\"event_type\":\"inference\",\"event_id\":\"evt_i{i}\",\"parent_id\":\"evt_t{i}\",\"session_id\":\"{s}\",\"timestamp\":{},\"turn\":{},\"task_id\":\"{task}\",\"input_tokens\":10,\"output_tokens\":2,\"decision\":\"tool_call\",\"tool_name\":\"bash\"}}", base + 2, i * 2 + 1));
+        lines.push(format!("{{\"event_type\":\"tool_call\",\"event_id\":\"evt_tc{i}\",\"parent_id\":\"evt_i{i}\",\"session_id\":\"{s}\",\"timestamp\":{},\"turn\":{},\"task_id\":\"{task}\",\"tool_name\":\"bash\",\"input\":{{\"command\":\"echo task-{i}\"}},\"input_bytes\":10,\"output_bytes\":2,\"duration_ms\":120,\"status\":\"ok\"}}", base + 3, i * 2 + 1));
+        // The second task's shell names a parent this file does not carry, so its turn-level
+        // `task_id` is the only thing that can attribute it — and it lands under that task.
+        let shell_parent = if i == 0 {
+            format!("evt_i{i}")
+        } else {
+            "evt_gone".to_string()
+        };
+        lines.push(format!("{{\"event_type\":\"shell\",\"event_id\":\"evt_sh{i}\",\"parent_id\":\"{shell_parent}\",\"session_id\":\"{s}\",\"timestamp\":{},\"turn\":{},\"task_id\":\"{task}\",\"binary\":\"/usr/bin/bash\",\"command\":\"echo task-{i}\",\"exit_code\":0,\"stdout_bytes\":2,\"stderr_bytes\":0,\"duration_ms\":50}}", base + 4, i * 2 + 1));
+        lines.push(format!("{{\"event_type\":\"inference\",\"event_id\":\"evt_j{i}\",\"parent_id\":\"evt_t{i}\",\"session_id\":\"{s}\",\"timestamp\":{},\"turn\":{},\"task_id\":\"{task}\",\"input_tokens\":10,\"output_tokens\":2,\"decision\":\"end_turn\",\"tool_name\":null}}", base + 5, i * 2 + 2));
+        lines.push(format!("{{\"event_type\":\"task_end\",\"event_id\":\"evt_te{i}\",\"parent_id\":\"evt_t{i}\",\"session_id\":\"{s}\",\"timestamp\":{},\"task_id\":\"{task}\",\"exit_status\":\"ok\",\"duration_ms\":100,\"turns\":2,\"input_tokens\":20,\"output_tokens\":4,\"tool_calls\":1,\"shell_calls\":1,\"reopen_count\":0}}", base + 6));
+    }
+    lines.push(format!("{{\"event_type\":\"session_end\",\"event_id\":\"evt_e\",\"parent_id\":\"evt_s\",\"session_id\":\"{s}\",\"timestamp\":9000,\"total_turns\":4,\"total_input_tokens\":40,\"total_output_tokens\":8,\"total_tool_calls\":2,\"total_shell_calls\":2,\"duration_ms\":900,\"exit_status\":\"ok\"}}"));
+    lines.join("\n") + "\n"
+}
+
+/// Every turn's calls sit under their turn, every turn under its task, and the task row
+/// names the task.
+#[test]
+fn steps_renders_the_identity_tree() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "tree.jsonl", &tree_fixture());
+
+    let out = mur()
+        .args(["trace", "steps", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.starts_with(&format!("Session {SESSION_ID_TREE}  (2 tasks, 4 turns)")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\ntask tsk_first000…  ctx_00000000…  (a2a)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n  context_seed memory-hook  seeded  1,204 tokens"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n  turn 1  tool_call  bash"), "{stdout}");
+    assert!(
+        stdout.contains("\n    tool_call  bash  120ms  ✓"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n    shell      /usr/bin/bash  exit 0  50ms"),
+        "{stdout}"
+    );
+    // The second task's shell names no parent this file carries; its `task_id` puts it under
+    // its own task rather than under the other task's turn.
+    let orphan = stdout
+        .rfind("\n  shell      /usr/bin/bash")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        orphan > stdout.find("task tsk_second00…").unwrap(),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n  turn 2  end_turn"), "{stdout}");
+    assert!(stdout.contains("\n  turn 3  tool_call  bash"), "{stdout}");
+
+    // Each task's calls are attributed to that task: the second task's rows come after the
+    // second task row, and the first task's after the first.
+    let first_task = stdout.find("task tsk_first000…").unwrap();
+    let second_task = stdout.find("task tsk_second00…").unwrap();
+    let turn_3 = stdout.find("turn 3  tool_call").unwrap();
+    assert!(first_task < second_task && second_task < turn_3, "{stdout}");
+}
+
+/// `--verbose` appends the truncated input summary to a tool-call row in tree mode too.
+#[test]
+fn steps_tree_verbose_appends_the_input_summary() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "tree.jsonl", &tree_fixture());
+
+    mur()
+        .args(["trace", "steps", "--verbose", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "tool_call  bash  120ms  ✓  \"echo task-0\"",
+        ));
+}
+
+/// A trace carrying no identity fields has no tree to walk, and renders the flat table.
+#[test]
+fn steps_without_event_ids_renders_the_flat_table() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "legacy.jsonl", FIXTURE_A);
+
+    let out = mur()
+        .args(["trace", "steps", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert_eq!(
+        stdout,
+        concat!(
+            "Session ses_aaaaaaaaaaaa4aaa8aaa000000000001  (2 turns)\n",
+            "\n",
+            "  1  tool_call    bash        100ms\n",
+            "  2  end_turn     —           —\n",
+            "\n"
+        ),
+        "the flat table must be byte-identical to what it has always been"
+    );
+}

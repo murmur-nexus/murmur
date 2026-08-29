@@ -428,3 +428,134 @@ fn an_unparseable_capture_value_is_refused() {
     assert!(stderr.contains("verbose"), "{stderr}");
     assert!(session_dirs(&project).is_empty());
 }
+
+// ── Reading a body back out with `mur trace show --body` ─────────────────────
+//
+// The blob store's contract is that a hash on an `inference` line names a file whose bytes
+// the CLI can hand back verbatim. These drive the real `mur` binary against the session
+// directory the run above left behind, so the reader and the writer are checked against each
+// other rather than against a fixture either of them could have shaped.
+
+impl Run {
+    /// `mur trace show <this run's trace> <args…>`.
+    fn mur_trace_show(&self, args: &[&str]) -> assert_cmd::assert::Assert {
+        assert_cmd::Command::cargo_bin("mur")
+            .unwrap()
+            .args(["trace", "show"])
+            .arg(self.workdir.join("trace.jsonl"))
+            .args(args)
+            .assert()
+    }
+
+    /// The turn the sole `inference` line recorded, as a `--turn` argument.
+    fn sole_turn(&self) -> String {
+        self.sole_inference()["turn"].as_u64().unwrap().to_string()
+    }
+}
+
+/// Under `content`, every named selector prints the stored body byte for byte, and the
+/// SHA-256 of what was printed is the blob's own filename.
+#[test]
+fn body_selectors_print_bytes_that_hash_to_the_blob_name() {
+    let run = run_session("trace:\n  capture: content\n");
+    let event = run.sole_inference();
+    let turn = run.sole_turn();
+
+    let mut cases: Vec<(String, String)> = ["system_sha", "tools_sha", "response_sha"]
+        .into_iter()
+        .map(|key| {
+            (
+                key.trim_end_matches("_sha").to_string(),
+                event[key].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    cases.push((
+        "message:0".to_string(),
+        shas(&event, "message_shas")[0].clone(),
+    ));
+
+    for (selector, sha) in cases {
+        let assert = run
+            .mur_trace_show(&["--body", &selector, "--turn", &turn])
+            .success();
+        let stdout = assert.get_output().stdout.clone();
+        assert_eq!(
+            stdout,
+            fs::read(run.blob_dir().join(&sha)).unwrap(),
+            "--body {selector} must print the blob the turn names"
+        );
+        assert_eq!(
+            murmur_artifact::sha256_hex(&stdout),
+            sha,
+            "--body {selector} output must hash to the blob's own name"
+        );
+        assert!(
+            !String::from_utf8_lossy(&stdout).contains("── Session"),
+            "--body prints the body and nothing else"
+        );
+    }
+}
+
+/// A default `show` names the hashes and prints no body — not even part of one.
+#[test]
+fn default_show_names_hashes_and_prints_no_body() {
+    let run = run_session("trace:\n  capture: content\n");
+    let event = run.sole_inference();
+    let system_sha = event["system_sha"].as_str().unwrap();
+    let system_body = fs::read_to_string(run.blob_dir().join(system_sha)).unwrap();
+
+    let assert = run.mur_trace_show(&[]).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("── Wire"), "{stdout}");
+    assert!(stdout.contains(&system_sha[..12]), "{stdout}");
+    assert!(
+        stdout.contains("mur trace show --body system --turn"),
+        "{stdout}"
+    );
+    let distinctive: String = system_body.chars().take(40).collect();
+    assert!(
+        !stdout.contains(distinctive.trim()),
+        "no part of a body may reach default output:\n{stdout}"
+    );
+}
+
+/// Under `meta` the hash is recorded and no body ever was: the request explains that rather
+/// than reporting a file that went missing.
+#[test]
+fn body_under_meta_says_no_body_was_stored() {
+    let run = run_session("trace:\n  capture: meta\n");
+    let system_sha = run.sole_inference()["system_sha"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let assert = run
+        .mur_trace_show(&["--body", "system", "--turn", &run.sole_turn()])
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("E-TRC-001"), "{stderr}");
+    assert!(stderr.contains(&system_sha), "{stderr}");
+    assert!(
+        stderr.contains("recorded under capture: meta; no body was stored"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("No such file"), "{stderr}");
+}
+
+/// Under `none` the reason is the absent hash, not an absent blob.
+#[test]
+fn body_under_none_says_no_hash_was_recorded() {
+    let run = run_session("trace:\n  capture: none\n");
+
+    let assert = run
+        .mur_trace_show(&["--body", "system", "--turn", &run.sole_turn()])
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("E-TRC-001"), "{stderr}");
+    assert!(stderr.contains("recorded no content hashes"), "{stderr}");
+    assert!(stderr.contains("trace.capture: none"), "{stderr}");
+}
