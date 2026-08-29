@@ -716,7 +716,7 @@ the output pipes into `sha256sum` and matches the blob's own name. The bodies li
 | `<sha256>` | that hash — a full 64-character lowercase hex string, or a prefix of 8 or more characters naming exactly one hash anywhere in the trace, `session_start.system_prompt_sha256` included. Needs no `--turn` |
 
 ```bash
-mur trace show @1 --body system --turn 1 | sha256sum
+mur trace show --body system --turn 1 | sha256sum
 ```
 
 Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
@@ -732,9 +732,9 @@ Every `--body` failure exits non-zero with [`E-TRC-001`](diagnostics.md):
 | A prefix matching several hashes | The refusal lists every hash it matched |
 | `--turn` without `--body` | `--turn has no meaning without --body` |
 
-The **Tasks** section appears only for multi-task persistent capsule sessions. Single-task and legacy traces (no task events) are unaffected — their output is unchanged.
+The **Tasks** section appears only for sessions that ran more than one task.
 
-Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. Calls without a recorded input (older traces, or tools invoked with no arguments) show no input segment at all.
+Below the **Tool calls** summary line, each turn that made at least one tool call gets its own row: tool name, duration, a `✓`/`✗` status icon, and — when the call carried an `input` — its compact-JSON input, truncated to 120 characters with a trailing `…` if longer. A call with no recorded input shows no input segment at all.
 
 Example (single-task session — no Tasks section):
 
@@ -832,8 +832,8 @@ task tsk_11112222…  ctx_11112222…  (a2a)
   turn 2  end_turn
 ```
 
-A trace carrying no `event_id` on any line has no tree to walk, and renders one row per turn: turn
-number, decision, tool name, duration.
+A trace whose lines carry no `event_id` renders one row per turn: turn number, decision, tool
+name, duration.
 
 ```text
 Session ses_aaaaaaaaaaaa4aaa8aaa000000000001  (2 turns)

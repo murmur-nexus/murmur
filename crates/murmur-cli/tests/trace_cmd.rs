@@ -2520,12 +2520,12 @@ fn show_surfaces_reopen_events_and_count() {
         .stdout(predicate::str::contains("tests still fail"));
 }
 
-// ── the nine event types the reader used to drop ──────────────────────────────
+// ── the nine session-level event types ───────────────────────────────────────
 
 const SESSION_ID_NINE: &str = "ses_99999999999949998999000000000009";
 
-/// One session frame around one line of each event type the reader discarded before this
-/// slice, shaped as `docs/content/reference/observability-schemas.md` documents them.
+/// One session frame around one line of each session-level event type, shaped as
+/// `docs/content/reference/observability-schemas.md` documents them.
 fn nine_event_fixture() -> String {
     let s = SESSION_ID_NINE;
     [
@@ -2548,7 +2548,7 @@ fn nine_event_fixture() -> String {
         + "\n"
 }
 
-/// Every one of the nine event types the reader used to discard reaches the output.
+/// Every session-level event type reaches the output.
 #[test]
 fn show_names_every_previously_dropped_event_type() {
     let tmp = TempDir::new().unwrap();
@@ -2909,63 +2909,66 @@ fn body_under_capture_none_names_the_missing_hashes() {
 #[test]
 fn an_ambiguous_sha_prefix_lists_every_match() {
     let tmp = TempDir::new().unwrap();
-    // Two message bodies whose hashes share a prefix are not something a test can arrange,
-    // so ambiguity is shown the way an operator meets it: a prefix short enough to match
-    // more than one hash is refused with the full list.
+    // Real bodies never collide on eight hex characters, so the hashes are written by hand:
+    // ambiguity is resolved against what the trace names, before any blob is opened.
+    let s = SESSION_ID_WIRE;
+    let shas = [
+        "abcdef1200000000000000000000000000000000000000000000000000000001",
+        "abcdef1200000000000000000000000000000000000000000000000000000002",
+        "abcdef1200000000000000000000000000000000000000000000000000000003",
+    ];
+    let trace = [
+        format!("{{\"event_type\":\"session_start\",\"session_id\":\"{s}\",\"timestamp\":1000,\"capsule_name\":\"wire\",\"capsule_version\":\"0.1.0\",\"model\":\"m\",\"max_turns\":5}}"),
+        format!("{{\"event_type\":\"inference\",\"session_id\":\"{s}\",\"timestamp\":1100,\"turn\":1,\"input_tokens\":10,\"output_tokens\":2,\"decision\":\"end_turn\",\"tool_name\":null,\"system_sha\":\"{}\",\"tools_sha\":\"{}\",\"response_sha\":\"{}\",\"message_shas\":[]}}", shas[0], shas[1], shas[2]),
+        format!("{{\"event_type\":\"session_end\",\"session_id\":\"{s}\",\"timestamp\":1300,\"total_turns\":1,\"total_input_tokens\":10,\"total_output_tokens\":2,\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":300,\"exit_status\":\"ok\"}}"),
+    ]
+    .join("\n")
+        + "\n";
+    let path = write_fixture(tmp.path(), "ambiguous.jsonl", &trace);
+
+    let assert = mur()
+        .args([
+            "trace",
+            "show",
+            path.to_str().unwrap(),
+            "--body",
+            "abcdef12",
+        ])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        stderr.contains("abcdef12 matches 3 hashes in this trace — provide more characters"),
+        "{stderr}"
+    );
+    for sha in shas {
+        assert!(stderr.contains(sha), "{stderr}");
+    }
+}
+
+/// A sha the trace never names is reported as unmatched rather than as a missing file.
+#[test]
+fn a_sha_no_hash_matches_is_reported_as_unmatched() {
+    let tmp = TempDir::new().unwrap();
     let system = system_body();
     write_wire_session(tmp.path(), SESSION_ID_WIRE, &system, &MESSAGE_BODIES, true);
-    let shas: Vec<String> = MESSAGE_BODIES.iter().map(|m| sha(m)).collect();
-    // Find the shortest shared prefix between any two hashes in the trace, if there is one;
-    // otherwise assert the no-match arm, which is the same code path's other branch.
-    let ambiguous = shas
-        .iter()
-        .flat_map(|a| shas.iter().map(move |b| (a, b)))
-        .filter(|(a, b)| a != b)
-        .filter_map(|(a, b)| {
-            let common: String = a
-                .chars()
-                .zip(b.chars())
-                .take_while(|(x, y)| x == y)
-                .map(|(x, _)| x)
-                .collect();
-            (common.len() >= 8).then_some(common)
-        })
-        .next();
 
-    match ambiguous {
-        Some(prefix) => {
-            mur()
-                .args([
-                    "trace",
-                    "show",
-                    SESSION_ID_WIRE,
-                    "--workdir",
-                    tmp.path().to_str().unwrap(),
-                    "--body",
-                    &prefix,
-                ])
-                .assert()
-                .failure()
-                .stderr(predicate::str::contains("provide more characters"));
-        }
-        None => {
-            mur()
-                .args([
-                    "trace",
-                    "show",
-                    SESSION_ID_WIRE,
-                    "--workdir",
-                    tmp.path().to_str().unwrap(),
-                    "--body",
-                    "00000000000000000000000000000000",
-                ])
-                .assert()
-                .failure()
-                .stderr(predicate::str::contains(
-                    "no hash in this trace matches 00000000000000000000000000000000",
-                ));
-        }
-    }
+    mur()
+        .args([
+            "trace",
+            "show",
+            SESSION_ID_WIRE,
+            "--workdir",
+            tmp.path().to_str().unwrap(),
+            "--body",
+            "00000000000000000000000000000000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no hash in this trace matches 00000000000000000000000000000000",
+        ));
 }
 
 /// `--turn` names a turn no `inference` line covers.
@@ -3311,8 +3314,7 @@ fn steps_tree_verbose_appends_the_input_summary() {
         ));
 }
 
-/// A trace from before the identity fields existed has no tree to walk, and renders the
-/// flat table it always did.
+/// A trace carrying no identity fields has no tree to walk, and renders the flat table.
 #[test]
 fn steps_without_event_ids_renders_the_flat_table() {
     let tmp = TempDir::new().unwrap();

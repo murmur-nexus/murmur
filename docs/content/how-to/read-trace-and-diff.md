@@ -209,7 +209,9 @@ To visualise the same trace data as Grafana spans, see [Work with capsule trace 
 | Command | Use it for |
 |---|---|
 | `mur trace show [session]` | Quick health check of a single session: turns, tokens, tool errors, latency |
+| [`mur trace show --body`](../reference/cli.md#mur-trace-show-body) | Print the exact bytes of the system prompt, tool schemas, one message or the response a turn recorded |
 | `mur trace steps [session]` | Turn-by-turn breakdown of what the agent did, with per-call latency |
 | `mur trace diff [a] [b]` | Confirm a change improved (or didn't regress) key metrics; defaults to last two sessions |
+| [`mur trace diff` prefix divergence](../reference/cli.md#mur-trace-diff-divergence) | Find where two runs' requests stopped matching, when a provider-side prompt cache missed |
 | `mur trace report` | Spot high variance across runs, find outliers, check exit status distribution |
 | Raw `grep` + `jq` | Deep inspection of specific events — which tool calls failed, what commands ran, when compaction fired |

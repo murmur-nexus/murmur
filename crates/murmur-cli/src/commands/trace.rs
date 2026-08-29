@@ -1241,10 +1241,7 @@ const SHA_DISPLAY_LEN: usize = 12;
 /// A hash abbreviated for reading, with an ellipsis marking what was cut. Never the value a
 /// reader should copy back into `--body` blindly — though a 12-character prefix is accepted.
 fn fmt_sha_short(sha: &str) -> String {
-    match sha.char_indices().nth(SHA_DISPLAY_LEN) {
-        Some((i, _)) => format!("{}…", &sha[..i]),
-        None => sha.to_string(),
-    }
+    fmt_id_short(sha, SHA_DISPLAY_LEN)
 }
 
 /// An id abbreviated to `len` characters, with an ellipsis when anything was cut.
@@ -1937,8 +1934,7 @@ pub(crate) fn run_trace_steps(
         ));
     }
 
-    // A trace written before the identity fields existed carries no `event_id` on any line
-    // and has no tree to walk, so it renders exactly the flat table it always did.
+    // A trace carrying no `event_id` on any line has no tree to walk, so it renders flat.
     if records.iter().any(|r| r.identity.event_id.is_some()) {
         print_steps_tree(&records, verbose);
     } else {
@@ -2142,7 +2138,7 @@ fn walk_steps_tree(
     }
 }
 
-/// The turn-per-row table `steps` has always printed, for a trace with no identity fields.
+/// The turn-per-row table `steps` prints for a trace carrying no identity fields.
 fn print_steps_flat(records: &[TraceRecord], verbose: bool) {
     let mut session_id = String::new();
     let mut inferences: Vec<(u32, String, Option<String>)> = Vec::new();
