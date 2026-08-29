@@ -2200,7 +2200,7 @@ fn parse_peer_files_export(
 ///
 /// The plain `Option<serde_yaml::Value>` a `#[serde(default)]` field gets collapses `retain:`
 /// with nothing under it into the same `None` an absent key produces, and those two say opposite
-/// things: absent means "keep everything", and empty is the error this slice refuses.
+/// things: absent means "keep everything", and empty is refused.
 fn present_yaml_value<'de, D>(deserializer: D) -> Result<Option<serde_yaml::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3043,8 +3043,8 @@ const CONTEXT_RETAIN_KEYS: [&str; 2] = ["max_messages", "max_age"];
 
 /// What both `retain:` blocks say when they carry nothing. Stated once so the two errors, which
 /// travel through different `RuntimeManifestError` variants, cannot drift apart.
-const RETAIN_EMPTY_BLOCK: &str =
-    "must declare at least one key — omit the block entirely to keep everything, which is what      no policy means";
+const RETAIN_EMPTY_BLOCK: &str = "must declare at least one key — omit the block entirely to \
+                                  keep everything, which is what no policy means";
 
 /// One `retain:` block, reduced to its two recognized keys.
 ///
@@ -3096,7 +3096,8 @@ fn parse_retain_block(
             if parsed == 0 {
                 return Err(invalid(
                     field,
-                    "must be at least 1 — a limit of zero would delete what retention exists to                      keep; remove the key to leave it unbounded"
+                    "must be at least 1 — a limit of zero would delete what retention exists \
+                     to keep; remove the key to leave it unbounded"
                         .to_string(),
                 ));
             }
@@ -3435,9 +3436,9 @@ mod tests {
 
     // ── retain ───────────────────────────────────────────────────────────────
 
-    /// The whole slice's invariant at the manifest level: a `trace:` block with only `capture`
-    /// and a `context:` block with only `record` declare no retention at all, and the absent
-    /// `retain:` is what an upgrading capsule keeps.
+    /// A `trace:` block with only `capture` and a `context:` block with only `record` declare no
+    /// retention at all: an absent `retain:` is the only way to say "keep everything", and it is
+    /// what a capsule that never mentions retention gets.
     #[test]
     fn no_retain_block_anywhere_parses_as_no_policy() {
         let manifest = RuntimeManifest::from_yaml_str(
@@ -3490,8 +3491,8 @@ mod tests {
         );
     }
 
-    /// S13: an empty block is not a way to declare no policy — omitting the block is. Both
-    /// spellings of empty are refused, naming the block an operator has to go and change.
+    /// An empty block is not a way to declare no policy — omitting the block is. Both spellings
+    /// of empty are refused, naming the block an operator has to go and change.
     #[test]
     fn an_empty_retain_block_is_refused_naming_the_block() {
         for (yaml, expect_trace) in [
@@ -3535,7 +3536,7 @@ mod tests {
         }
     }
 
-    /// S13's other half: a limit of zero would delete what retention exists to keep, so it is
+    /// A limit of zero would delete what retention exists to keep, so it is
     /// refused naming the key rather than accepted as "keep nothing".
     #[test]
     fn a_zero_retain_limit_is_refused_naming_the_key() {

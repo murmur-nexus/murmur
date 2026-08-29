@@ -213,7 +213,7 @@ fn stdout_of(assert: Assert) -> String {
     String::from_utf8(assert.get_output().stdout.clone()).unwrap()
 }
 
-// ── S1: absent means unlimited ───────────────────────────────────────────────
+// ── Absent means unlimited ─────────────────────────────────────────────────
 
 /// The invariant the whole slice is judged against: a capsule with a `trace:` block carrying only
 /// `capture` and a `context:` block carrying only `record` deletes nothing, writes no header line
@@ -261,7 +261,7 @@ fn no_retain_block_anywhere_deletes_nothing() {
     drop(f.project);
 }
 
-// ── S2, S12: max_sessions ────────────────────────────────────────────────────
+// ── Max_sessions ───────────────────────────────────────────────────────────
 
 /// Six runs with `max_sessions: 3` leave the three lexically greatest `ses_` ids, the sixth run's
 /// own among them, and each removed directory goes whole — no orphaned `trace.jsonl`, no orphaned
@@ -298,7 +298,7 @@ fn max_sessions_leaves_exactly_the_newest_three_and_says_so_in_the_trace() {
         assert!(!dir.join("blobs").exists());
     }
 
-    // S12: the newest session's own trace names what it removed and why.
+    // the newest session's own trace names what it removed and why.
     let events = retention_events(&f.sessions_root().join(survivors.last().unwrap()));
     assert_eq!(
         events.len(),
@@ -341,7 +341,7 @@ fn max_sessions_leaves_exactly_the_newest_three_and_says_so_in_the_trace() {
     drop(f.project);
 }
 
-// ── S3: max_age reads the id ─────────────────────────────────────────────────
+// ── Max_age reads the id ───────────────────────────────────────────────────
 
 /// The two directories deleted here have the *freshest* mtimes in the fixture — they are created
 /// last, moments before the run — and their ids encode two hours ago. Deleting them anyway is
@@ -378,7 +378,7 @@ fn max_age_prunes_by_the_session_id_and_never_by_the_mtime() {
     drop(f.project);
 }
 
-// ── S4: both keys ANDed ──────────────────────────────────────────────────────
+// ── Both keys ANDed ────────────────────────────────────────────────────────
 
 /// A survivor has to be inside both limits: an old-id directory never survives on rank, and a
 /// recent-id directory outside the count does not survive on age.
@@ -432,7 +432,7 @@ fn both_trace_keys_keep_only_sessions_inside_both() {
     drop(f.project);
 }
 
-// ── S5: the current session is never a candidate ─────────────────────────────
+// ── The current session is never a candidate ───────────────────────────────
 
 /// `max_sessions: 1` and `max_age: 1s` against a run that takes longer than a second. The
 /// running session's own directory and `trace.jsonl` are still there when it exits — the hard
@@ -465,7 +465,7 @@ fn the_running_session_survives_a_policy_that_would_otherwise_delete_it() {
     drop(f.project);
 }
 
-// ── S6, S8, S12: max_messages ────────────────────────────────────────────────
+// ── Max_messages ───────────────────────────────────────────────────────────
 
 /// `max_messages` truncates the record this launch opens. The first run adopts the record with a
 /// header; from the second run on, the policy applies — leaving the newest N messages with the
@@ -531,7 +531,7 @@ fn max_messages_truncates_the_front_and_keeps_every_surviving_id() {
         "the event reports what this launch dropped, not the record's lifetime total"
     );
 
-    // S8: a dropped id reads as truncated, not as missing.
+    // a dropped id reads as truncated, not as missing.
     let dropped = &before[0];
     let out = stdout_of(conversation(&f.home, &["ls", "--message", dropped]).success());
     assert!(out.starts_with("truncated:"), "{out}");
@@ -558,7 +558,7 @@ fn max_messages_truncates_the_front_and_keeps_every_surviving_id() {
     drop(f.project);
 }
 
-// ── S9: context.retain.max_age ───────────────────────────────────────────────
+// ── Context.retain.max_age ─────────────────────────────────────────────────
 
 /// Age for a record is its last write. A context this capsule owns and has not written to inside
 /// the window is removed whole; the context the launch is using is never removed.
@@ -593,7 +593,7 @@ fn context_retain_max_age_drops_a_record_untouched_for_the_window() {
     drop(f.project);
 }
 
-// ── S10, S11: ownership ──────────────────────────────────────────────────────
+// ── Ownership ──────────────────────────────────────────────────────────────
 
 /// Two capsules pointed at one `record_store`, one with a policy. The one without a policy never
 /// has its history pruned by the other, because automatic pruning only touches a record whose
@@ -650,25 +650,28 @@ fn two_capsules_sharing_a_record_store_prune_only_their_own() {
     drop(f.project);
 }
 
-/// A record written before this slice carries no header, so automatic pruning skips it however
-/// old it is. The capsule that owns it adopts it on the next append — every pre-existing line
-/// surviving byte for byte — and the policy applies from then on.
+/// A record carrying no header is unowned, so automatic pruning skips it however old it is. The
+/// capsule that owns it adopts it on the launch that opens it — every pre-existing line surviving
+/// byte for byte — and `max_messages` applies to it from that same launch.
 #[test]
-fn a_pre_slice_record_is_skipped_until_it_is_adopted() {
+fn an_unowned_record_is_skipped_until_it_is_adopted() {
     let f = Fixture::new(
-        responses(1),
-        "context:\n  record: on\n  retain:\n    max_age: 1s\n",
+        responses(2),
+        "context:\n  record: on\n  retain:\n    max_age: 1s\n    max_messages: 2\n",
     );
 
-    // A record as an earlier release left it: message lines, no header.
-    let abandoned = f.record_path("ctx_pre_slice");
+    // A record with no header: message lines only.
+    let abandoned = f.record_path("ctx_unowned");
     fs::create_dir_all(abandoned.parent().unwrap()).unwrap();
-    let pre_slice = format!(
-        "{}\n",
-        json!({"role": "user", "content": [{"type": "text", "text": "old"}],
-               "id": "msg_00000000000000000000000000000001"})
-    );
-    fs::write(&abandoned, &pre_slice).unwrap();
+    let planted: Vec<String> = (1..=3)
+        .map(|n| {
+            json!({"role": "user", "content": [{"type": "text", "text": format!("old {n}")}],
+                   "id": format!("msg_{n:032}")})
+            .to_string()
+        })
+        .collect();
+    let headerless = format!("{}\n", planted.join("\n"));
+    fs::write(&abandoned, &headerless).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
 
     f.run(&["--context", CONTEXT_ID]).success();
@@ -677,20 +680,40 @@ fn a_pre_slice_record_is_skipped_until_it_is_adopted() {
         abandoned.exists(),
         "an unowned record is never pruned automatically, however old"
     );
-    assert_eq!(fs::read_to_string(&abandoned).unwrap(), pre_slice);
+    assert_eq!(
+        fs::read_to_string(&abandoned).unwrap(),
+        headerless,
+        "a record no launch opened is untouched, and still headerless"
+    );
 
     // The record this launch wrote is the one it adopted.
     let mine = f.record_path(CONTEXT_ID);
     let header: Value = serde_json::from_str(&record_lines(&mine)[0]).unwrap();
     assert_eq!(header["capsule"], CAPSULE_NAME);
 
-    // `mur conversation rm` is what reaches the unowned one.
-    conversation(&f.home, &["rm", "ctx_pre_slice"]).success();
+    // Opened by the capsule that owns it: adopted, and truncated to `max_messages` in the same
+    // rewrite, with this launch's own two messages appended after.
+    f.run(&["--context", "ctx_unowned"]).success();
+
+    let lines = record_lines(&abandoned);
+    let header: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(header["capsule"], CAPSULE_NAME);
+    assert_eq!(header["truncated"]["dropped"], 1);
+    let ids = record_message_ids(&abandoned);
+    assert_eq!(ids.len(), 4, "two kept plus this launch's two: {ids:?}");
+    assert_eq!(
+        &ids[..2],
+        &[format!("msg_{:032}", 2), format!("msg_{:032}", 3)],
+        "the newest two planted messages survived with their own ids"
+    );
+
+    // `mur conversation rm` is what reaches a record whose capsule has been retired.
+    conversation(&f.home, &["rm", "ctx_unowned"]).success();
     assert!(!abandoned.exists());
     drop(f.project);
 }
 
-// ── S14, S15: the commands ───────────────────────────────────────────────────
+// ── The commands ───────────────────────────────────────────────────────────
 
 /// `ls` lists every record and context with its counts, and `--json` prints the same values.
 #[test]
@@ -810,7 +833,7 @@ fn the_commands_refuse_ambiguity_and_absence_by_name() {
     drop(f.project);
 }
 
-// ── S16: a pruned session does not cost the conversation ─────────────────────
+// ── A pruned session does not cost the conversation ────────────────────────
 
 /// A session directory is a debugging artefact; the record is the agent's memory. After
 /// `max_sessions: 1` has removed the first of two runs, resuming that session is refused with a

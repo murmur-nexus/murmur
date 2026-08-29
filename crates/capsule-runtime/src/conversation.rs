@@ -74,12 +74,11 @@ pub struct TruncationMarker {
 
 /// The first line of a record: a JSON object with a `type` key and no `role`.
 ///
-/// Deliberately not a message, and deliberately not a sidecar. Not a message, because every
-/// reader of a record skips a line that is not a JSON object carrying a string `role`, so a
-/// header is invisible to `murmur:conversation/read`, to the `threaded` reload, and to the
-/// `total` a page reports. Not a sidecar, because a sidecar needs a second write that a crash
-/// could desynchronise from the rename — a header makes the whole truncation exactly one atomic
-/// rename of one file.
+/// Not a message: every reader of a record skips a line that is not a JSON object carrying a
+/// string `role`, so a header is invisible to `murmur:conversation/read`, to the `threaded`
+/// reload, and to the `total` a page reports. Not a sidecar: a sidecar needs a second write that
+/// a crash could desynchronise from the rename, where a header makes the whole truncation
+/// exactly one atomic rename of one file.
 ///
 /// [`Self::capsule`] is what makes automatic record pruning store-safe: two capsules pointed at
 /// one `context.record_store` each own only the records their own name is on.
@@ -90,8 +89,8 @@ pub struct RecordHeader {
     pub kind: String,
     /// The capsule that owns this record — `name:` from its manifest, never the record store.
     pub capsule: String,
-    /// When the header was written, in milliseconds since the epoch. On a record adopted from
-    /// before this slice, that is the adoption, not the conversation's first message.
+    /// When the header was written, in milliseconds since the epoch. On an adopted record, that
+    /// is the adoption, not the conversation's first message.
     pub created_ms: u64,
     /// Absent until this record has been truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,8 +105,8 @@ pub(crate) fn header_line(header: &RecordHeader) -> Result<String, String> {
     Ok(line)
 }
 
-/// The header `path` carries, or `None` for a record whose first line is not one — every record
-/// written before this slice, and every file that does not exist.
+/// The header `path` carries, or `None` for a record whose first line is not one — an unowned
+/// record, and every file that does not exist.
 pub(crate) fn read_header(path: &Path) -> Option<RecordHeader> {
     let raw = std::fs::read_to_string(path).ok()?;
     parse_header(raw.lines().next()?)
@@ -367,7 +366,7 @@ impl ConversationRecord {
     ///   original whole. Until that adoption the record is unowned and automatic pruning skips
     ///   it, however old it is.
     ///
-    /// Adoption is what makes retention apply to a pre-slice record without ever guessing at
+    /// Adoption is what brings a headerless record under a policy without ever guessing at
     /// ownership: the capsule that writes to a record is the capsule that owns it.
     fn ensure_header(&mut self) -> Result<(), String> {
         if self.header_ensured {
@@ -675,14 +674,14 @@ mod tests {
         let dir = root.join("ctx_1");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(RECORD_FILE_NAME);
-        let pre_slice = format!(
+        let headerless = format!(
             "{}
 {}
 ",
             serde_json::to_string(&message(&id_at(1), "user", "one")).unwrap(),
             serde_json::to_string(&message(&id_at(2), "assistant", "two")).unwrap()
         );
-        std::fs::write(&path, &pre_slice).unwrap();
+        std::fs::write(&path, &headerless).unwrap();
         assert!(read_header(&path).is_none(), "unowned before the append");
 
         let mut record =
@@ -692,8 +691,8 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(read_header(&path).unwrap().capsule, CAPSULE);
         assert!(
-            raw.contains(pre_slice.trim_end()),
-            "every pre-slice line survives byte for byte: {raw}"
+            raw.contains(headerless.trim_end()),
+            "every line it already held survives byte for byte: {raw}"
         );
         assert_eq!(raw.lines().count(), 4, "a header and three messages");
     }

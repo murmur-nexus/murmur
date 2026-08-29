@@ -51,8 +51,6 @@ pub struct PrunedRecord {
     pub context_id: String,
     /// The directory that was removed, whole.
     pub path: PathBuf,
-    /// Messages the removed record held, for the operator reading the trace event.
-    pub messages: u64,
     /// Always [`crate::trace::RETENTION_REASON_MAX_AGE`]: a record is never removed on a count.
     pub reason: &'static str,
 }
@@ -216,8 +214,7 @@ pub fn prune_sessions(
 
 /// Remove the context directories under `record_root` that `policy.max_age_secs` does not keep.
 ///
-/// Three things are never touched, and each is a decision this slice made rather than an
-/// oversight:
+/// Three things are never touched:
 ///
 /// * **The context this launch is using** (`current_context_id`) — retention must not delete the
 ///   conversation it is about to continue.
@@ -259,12 +256,10 @@ pub fn prune_records(
         if touched_ms >= floor_ms {
             continue;
         }
-        let messages = count_messages(&file);
         if std::fs::remove_dir_all(&dir).is_ok() {
             pruned.push(PrunedRecord {
                 context_id,
                 path: dir,
-                messages,
                 reason: crate::trace::RETENTION_REASON_MAX_AGE,
             });
         }
@@ -606,7 +601,7 @@ fn context_dirs(record_root: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// Message lines in `path`. The header line is not a message and is never counted, which is what
-/// keeps every existing reader's `total` unchanged by this slice.
+/// keeps it out of the `total` every reader of a record reports.
 fn count_messages(path: &Path) -> u64 {
     std::fs::read_to_string(path)
         .map(|raw| {
@@ -669,7 +664,7 @@ mod tests {
 
     const NOW: u64 = 1_756_400_000_000;
 
-    /// S2 at the unit level: the count is over every entry present, the running session included,
+    /// the count is over every entry present, the running session included,
     /// so `max_sessions: 3` leaves three directories and one of them is the current one. What went
     /// went whole — no orphaned `trace.jsonl`, no orphaned `blobs/`.
     #[test]
@@ -706,7 +701,7 @@ mod tests {
         }
     }
 
-    /// S3 at the unit level: the decision comes out of the id. Every directory here is created in
+    /// the decision comes out of the id. Every directory here is created in
     /// the same instant, so every mtime is equally fresh; the two whose ids encode two hours ago
     /// are the two that go.
     #[test]
@@ -743,7 +738,7 @@ mod tests {
         assert_eq!(names(root.path()), vec![recent, current]);
     }
 
-    /// S4: the two keys are ANDed. An old-id directory never survives on rank, and a recent-id
+    /// the two keys are ANDed. An old-id directory never survives on rank, and a recent-id
     /// directory outside the count does not survive on age.
     #[test]
     fn both_trace_keys_keep_only_sessions_inside_both() {
@@ -782,7 +777,7 @@ mod tests {
         }
     }
 
-    /// S5: the floor. Nothing at or after the current session's own id is ever a candidate, which
+    /// the floor. Nothing at or after the current session's own id is ever a candidate, which
     /// is also what keeps a sibling capsule's concurrently running session safe with no lock file.
     #[test]
     fn nothing_at_or_after_the_current_session_id_is_a_candidate() {
@@ -861,7 +856,7 @@ mod tests {
         path
     }
 
-    /// S6: the newest N survive with their ids intact, the file is a header plus exactly N
+    /// the newest N survive with their ids intact, the file is a header plus exactly N
     /// message lines, and every line parses.
     #[test]
     fn max_messages_leaves_the_newest_n_with_their_ids_intact() {
@@ -944,7 +939,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
-    /// S7: a crash mid-truncate leaves the original intact. The staged rewrite is a temp file in
+    /// a crash mid-truncate leaves the original intact. The staged rewrite is a temp file in
     /// the record's own directory — same filesystem, so the rename that commits it is atomic —
     /// and until that rename the original parses whole and holds its original message count.
     #[test]
@@ -983,7 +978,7 @@ mod tests {
 
     // ── Record pruning ───────────────────────────────────────────────────────
 
-    /// S10 and S11: automatic record pruning touches only a record whose header names this
+    /// automatic record pruning touches only a record whose header names this
     /// capsule. A record another capsule owns and a record no header owns both survive, however
     /// old they are — and the current launch's own context is never removed.
     #[test]
@@ -1009,12 +1004,11 @@ mod tests {
 
         assert_eq!(pruned.len(), 1, "{pruned:?}");
         assert_eq!(pruned[0].context_id, "mine");
-        assert_eq!(pruned[0].messages, 3);
         assert_eq!(pruned[0].reason, crate::trace::RETENTION_REASON_MAX_AGE);
         assert_eq!(names(root.path()), vec!["current", "theirs", "unowned"]);
     }
 
-    /// S9: a record inside the window stays. Age is last write, so a record written a moment ago
+    /// a record inside the window stays. Age is last write, so a record written a moment ago
     /// survives a 90-day policy however long ago its conversation started.
     #[test]
     fn a_record_written_inside_the_window_is_kept() {

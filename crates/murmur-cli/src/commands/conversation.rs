@@ -1,10 +1,10 @@
 //! `mur conversation`: what the record store holds, and what an operator can take out of it.
 //!
-//! A conversation record is the agent's memory — durable, outside every workdir, and until this
-//! command existed, invisible. `ls` is what makes a store an operator can reason about; `rm` and
-//! `truncate` are what makes one they can act on. Between them they are also the only way to
-//! reclaim a record no capsule owns: automatic retention skips a record whose header line names
-//! no capsule, so an abandoned pre-slice conversation is reachable here and nowhere else.
+//! A conversation record is the agent's memory — durable and outside every workdir. `ls` is what
+//! makes a store an operator can reason about; `rm` and `truncate` are what makes one they can
+//! act on. Between them they are also the only way to reclaim a record no capsule owns:
+//! automatic retention skips a record whose header line names no capsule, so an abandoned
+//! conversation is reachable here and nowhere else.
 
 use capsule_runtime::{
     list_records, locate_message, remove_record, truncate_record, MessageStatus, RecordSummary,

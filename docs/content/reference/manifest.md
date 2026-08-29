@@ -645,7 +645,7 @@ these fields are accepted and inert:
 | `context.record` { #context-record } | `on \| off` | no | Default: `on`. Whether the runtime keeps a [durable conversation record](workdir.md#the-conversation-record) for this capsule. `off` turns the mechanism off: nothing is created under `~/.murmur/conversations/`, and a hook granted `capabilities.conversation.read` reads an empty page. Inert under `transport: process`, which writes no record either way. |
 | `context.record_store` | string | no | Default: the capsule name. Directory under `~/.murmur/conversations/` this capsule's records live in. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011). Accepted and inert alongside `record: off`. |
 | `context.retain` { #context-retain } | block | no | What bounds this capsule's [conversation records](workdir.md#the-conversation-record). Omitted, nothing is ever deleted. See [Retention](#retention). |
-| `context.retain.max_messages` | integer ≥ 1 | no | Messages to keep. At each launch the record that launch opens is truncated to its newest N; the older ones are dropped and the [header line](workdir.md#record-header) records the drop. Applies only to a record this capsule owns. |
+| `context.retain.max_messages` | integer ≥ 1 | no | Messages to keep. At each launch, the record that launch opens — the context named by `mur run --context` — is truncated to its newest N; the older ones are dropped and the [header line](workdir.md#record-header) records the drop. A launch with no `--context` mints a context per task and opens no record to truncate; bound those with `context.retain.max_age`. |
 | `context.retain.max_age` | duration | no | Age beyond which a record this capsule owns is removed whole, measured from the last write to its `conversation.jsonl`. |
 
 #### `observability` { #field-observability }
@@ -1142,10 +1142,10 @@ it has always carried, and the [header line](workdir.md#record-header) records w
 
 | Never removed | Why |
 |---|---|
-| The running session's own directory, or any `ses_` id at or after it | The floor is the id itself, so a sibling capsule launched a moment ago is safe with no lock file. |
+| The running session's own directory, or any `ses_` id at or after it | A capsule launched while this one is running is inside the same workdir, and its session is not this session's to delete. |
 | The context the launch is using | Retention must not delete the conversation it is about to continue. |
-| A record whose header names another capsule | Two capsules sharing a `context.record_store` is a deliberate act; one pruning the other's history is not. |
-| A record with no header line | Every record written before `context.retain` existed is unowned. It is adopted — and the policy starts applying — the next time the capsule that owns it appends to it. [`mur conversation rm`](cli.md#mur-conversation-rm) is what reaches an abandoned one. |
+| A record whose header names another capsule | Two capsules can share a `context.record_store`; neither prunes the other's history. |
+| A record with no header line | A record written by a capsule that declares no `context.retain` is unowned, and the age sweep never removes it. It is adopted — and the policy starts applying — on the next launch that opens it under `--context`. [`mur conversation rm`](cli.md#mur-conversation-rm) is what reaches an abandoned one. |
 
 ---
 

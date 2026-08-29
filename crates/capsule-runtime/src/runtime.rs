@@ -1226,8 +1226,8 @@ pub fn launch_session(
             .filter(|a| !a.is_empty());
         let trace_capture = staged.trace_capture;
         // Retention inputs, taken before `staged` and `run_config` are moved into the agent loop.
-        // Both are `None` on a capsule that declared no `retain:` block, which is every capsule
-        // that existed before this slice — and `None` deletes nothing, ever.
+        // Both are `None` on a capsule that declared no `retain:` block, and `None` deletes
+        // nothing, ever.
         let trace_retain = staged.trace_retain;
         let context_retain = staged.context.as_ref().and_then(|context| context.retain);
         let retention_conversation_root = run_config.conversation_root.clone();
@@ -4635,16 +4635,18 @@ async fn apply_retention(
 
     // `max_messages` truncates the one record this launch opens, at the point it is opened: that
     // is where the growth is, it is O(one record) rather than O(every conversation), and it never
-    // rewrites a conversation this capsule is not touching. A record with no header is unowned
-    // and skipped — the append that adopts it comes later in this same launch, so the policy
-    // takes effect from the next one.
+    // rewrites a conversation this capsule is not touching. A launch that mints a context per
+    // task opens no record here, so it has nothing to truncate.
     let (Some(keep), Some(context_id)) = (policy.max_messages, context_id) else {
         return;
     };
     let path = crate::conversation::record_file(root, context_id);
     match crate::conversation::read_header(&path) {
-        Some(header) if header.capsule == capsule_name => {}
-        _ => return,
+        // A header naming another capsule is that capsule's record, whatever context id this
+        // launch was handed. An unowned record on this launch's own context is one this launch
+        // is about to append to and adopt, so the truncation adopts it in the same rewrite.
+        Some(header) if header.capsule != capsule_name => return,
+        _ => {}
     }
     match crate::retention::truncate_record(&path, keep, capsule_name) {
         Ok(outcome) if outcome.dropped > 0 => {

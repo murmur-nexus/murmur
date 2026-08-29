@@ -1241,14 +1241,6 @@ fn parse_since(s: &str) -> Result<u64, CliError> {
     Ok(n * multiplier)
 }
 
-fn session_id_timestamp_ms(ses_name: &str) -> Option<u64> {
-    let hex = ses_name.strip_prefix("ses_")?;
-    if hex.len() < 12 {
-        return None;
-    }
-    u64::from_str_radix(&hex[..12], 16).ok()
-}
-
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
 fn fmt_thousands(n: u64) -> String {
@@ -2930,7 +2922,7 @@ pub(crate) fn run_trace_report(
                 .as_millis() as u64;
             let cutoff_ms = now_ms.saturating_sub(duration_ms);
             entries.retain(|e| {
-                session_id_timestamp_ms(e)
+                capsule_runtime::retention::session_id_timestamp_ms(e)
                     .map(|ts| ts >= cutoff_ms)
                     .unwrap_or(false)
             });

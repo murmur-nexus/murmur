@@ -338,8 +338,7 @@ something, once per (`store`, `reason`) pair that removed anything
 | `messages_dropped` | u64 | Messages dropped from the front of the record. Written for `"max_messages"` only, and absent otherwise |
 
 Written immediately after `session_start`, in the trace of the session that performed the
-deletion — the only place the pruning of an earlier session can go. A launch that removed nothing
-writes no line.
+deletion. A launch that removed nothing writes no line.
 
 **`resource_list`** — written when the [resource plane](resource-plane.md) answers a `list`, served
 or refused

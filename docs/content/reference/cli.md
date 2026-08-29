@@ -688,7 +688,7 @@ Without `--message`, one row per context:
 
 ```
 RECORD                   CONTEXT                      MESSAGES       SIZE  LAST TOUCHED         TRUNCATED
-shey                     ctx_0199f2a1                       48    12.4 KiB  2026-08-29 09:14:02  500 dropped
+shey                     ctx_0199f2a1                       48   12.4 KiB  2026-08-29 09:14:02  500 dropped
 ```
 
 | Column | Contents |
@@ -721,9 +721,9 @@ Answers one of three things about a `msg_` id, which is what an artifact that st
 mur conversation rm <CONTEXT-ID> [--record <NAME>]
 ```
 
-Removes that context directory whole and reports the path and the message count it held. The only
-way to reclaim a record no capsule owns — [automatic retention](manifest.md#retention-never) skips
-one whose header line names no capsule.
+Removes that context directory whole and reports the path and the message count it held. This is
+how to reclaim a record whose capsule no longer runs: the
+[age sweep](manifest.md#retention-never) skips a record whose header line names no capsule.
 
 ### `mur conversation truncate` { #mur-conversation-truncate }
 

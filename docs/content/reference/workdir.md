@@ -198,15 +198,15 @@ The first line of a record whose capsule declares `context.retain`, and of any r
 |---|---|
 | `type` | Always `murmur.record`. A first line carrying anything else is not a header |
 | `capsule` | The capsule that owns this record — `name:` from its manifest, not the record store. What makes pruning safe when two capsules share one `context.record_store` |
-| `created_ms` | When the header was written. On a record adopted from before the header existed, that is the adoption |
+| `created_ms` | When the header was written. On an adopted record, that is the adoption, not the conversation's first message |
 | `truncated` | Absent until the record has been truncated. `dropped` is cumulative over the record's life; `last_dropped_id` is what [`mur conversation ls --message`](cli.md#mur-conversation-ls-message) classifies a missing id against |
 
 It is a JSON object with no `role`, so it is not a message: every reader of a record skips it, the
 `total` a [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread) page reports does
 not count it, and a `threaded` reload does not load it.
 
-A record with no header line is unowned. Automatic pruning skips it however old it is; the capsule
-that owns it writes the header the next time it appends, and the policy applies from then on.
+A record with no header line is unowned: the age sweep skips it however old it is. The next launch
+that opens it under `mur run --context` writes the header and applies its policy from that launch.
 
 ### What pruning removes { #what-pruning-removes }
 
