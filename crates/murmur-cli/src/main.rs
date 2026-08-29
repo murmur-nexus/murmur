@@ -7,7 +7,8 @@ mod source;
 
 use std::path::PathBuf;
 
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use capsule_runtime::ResumeMode;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 #[cfg(feature = "beta-mur-deploy")]
 use commands::deploy::run_deploy;
@@ -33,6 +34,25 @@ use commands::{
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
     watch::run_watch,
 };
+
+/// `--resume-mode`'s value vocabulary. Separate from [`ResumeMode`] so the runtime enum carries
+/// no clap derive and the CLI owns the spelling of its own values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+enum ResumeModeArg {
+    #[default]
+    Full,
+    Compact,
+}
+
+impl From<ResumeModeArg> for ResumeMode {
+    fn from(arg: ResumeModeArg) -> Self {
+        match arg {
+            ResumeModeArg::Full => ResumeMode::Full,
+            ResumeModeArg::Compact => ResumeMode::Compact,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -163,6 +183,26 @@ enum Commands {
         /// segment. Defaults to a fresh id per task.
         #[arg(long, value_name = "ID")]
         context: Option<String>,
+
+        /// Continue the conversation a previous session ran. Takes the same session address
+        /// `mur trace diff` does: a full ses_ id, a 4+-character suffix, an @N ordinal
+        /// (@1 = most recent), or a path to a session directory or its trace.jsonl.
+        /// Resolves that session's context id and runs under it, loading its conversation
+        /// record even when the capsule declares lifecycle.conversation: stateless.
+        /// Cannot be combined with --context, which names the same thing directly.
+        #[arg(long, value_name = "SESSION")]
+        resume: Option<String>,
+
+        /// How --resume puts the loaded conversation in front of the model
+        /// (full|compact, default: full).
+        /// full loads the record verbatim; compact runs the capsule's on-compaction hook over
+        /// it first and continues from the summary, which is the answer when the conversation
+        /// would not fit the context window at all.
+        /// full is often the cheaper of the two: a verbatim reload can hit the provider's
+        /// prompt cache, while compaction changes the prefix from the first altered token,
+        /// guarantees a cache miss, and costs an extra inference call to produce the summary.
+        #[arg(long, value_name = "MODE", requires = "resume")]
+        resume_mode: Option<ResumeModeArg>,
 
         /// Override manifest lifecycle.task_acceptance (none|single|queue)
         #[arg(long, value_name = "MODE")]
@@ -401,6 +441,8 @@ fn main() {
             task,
             system_prompt,
             context,
+            resume,
+            resume_mode,
             lifecycle_task_acceptance,
             lifecycle_after_task,
             workdir,
@@ -415,6 +457,8 @@ fn main() {
             task.as_deref(),
             system_prompt.as_deref(),
             context.as_deref(),
+            resume.as_deref(),
+            resume_mode.unwrap_or_default().into(),
             lifecycle_task_acceptance.as_deref(),
             lifecycle_after_task.as_deref(),
             workdir,

@@ -26,6 +26,7 @@ use crate::{
         TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
     },
     trace::{TraceWriter, WireCapture},
+    types::ResumeMode,
 };
 
 /// Output cap sent to the driver when `inference.max_tokens` is absent from the manifest.
@@ -60,6 +61,13 @@ pub(crate) struct AgentRunConfig {
     /// means this session keeps no durable record: `context.record: off`, a `process`-transport
     /// capsule, or a host whose home directory could not be resolved.
     pub conversation_root: Option<PathBuf>,
+    /// `mur run --resume`'s mode, or `None` on an ordinary launch.
+    ///
+    /// `Some(_)` is an operator override of `lifecycle.conversation`, launch-scoped: every task
+    /// of this launch loads the record, including under `stateless`. `Some(Compact)` additionally
+    /// runs the bound `on-compaction` hook over the loaded history once, before the task message
+    /// is minted and regardless of `inference.compaction.threshold`.
+    pub resume: Option<ResumeMode>,
 }
 
 /// How many multiples of the seed budget an overflow may reach before the seed is refused
@@ -227,6 +235,10 @@ pub(crate) async fn run_agent_loop(
     // prompt prefix on one machine, so the provider's cache entry is the one it lands on.
     let prompt_cache_key = build_prompt_cache_key(name, version, context_id.as_deref());
 
+    // `mur run --resume`'s mode for this launch, or `None` on an ordinary one. Launch-scoped:
+    // every task of a resumed launch loads the record, whatever `lifecycle.conversation` says.
+    let resume = run_config.resume;
+
     // The durable record this task appends to, opened before the first message exists so the
     // task user message is the first line a fresh conversation gets. `None` is a session that
     // keeps no record; every append below is then a no-op.
@@ -242,17 +254,14 @@ pub(crate) async fn run_agent_loop(
 
     // In threaded mode the task continues the record's conversation, so the message list starts
     // from what the record already holds — including messages written by an earlier session,
-    // with the ids those lines carry. Loaded messages are never appended again.
-    let mut messages: Vec<Value> = load_recorded_history(record.as_mut(), &mode);
-    let task_message = with_new_id(json!({
-        "role": "user",
-        "content": [{"type": "text", "text": task}],
-    }));
-    append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
-    messages.push(task_message);
+    // with the ids those lines carry. `mur run --resume` loads on the same terms whatever the
+    // capsule declared. Loaded messages are never appended again.
+    let mut messages: Vec<Value> = load_recorded_history(record.as_mut(), &mode, resume.is_some());
 
     // The one occupancy counter for this session — used both for the per-turn
-    // compaction-trigger input and for the recount after a replace-context commit.
+    // compaction-trigger input and for the recount after a replace-context commit. Built
+    // before the task message so `--resume-mode compact` can be measured and committed through
+    // it; it depends on nothing the task message contributes.
     let occupancy = ContextOccupancy {
         model: &inference.model,
         max_output_tokens: run_config.max_output_tokens,
@@ -266,6 +275,43 @@ pub(crate) async fn run_agent_loop(
     // commit recounts into, and is read by nothing else.
     let mut session_tokens: u32 = 0;
     let mut sse_event_id: u64 = 0;
+
+    // `--resume-mode compact`: the same hook, the same commit site and the same record rules the
+    // per-turn threshold trigger uses, reached from a second place — as the seed-overflow path
+    // already does. It runs at turn 0, ahead of the task message, so the summary stands for the
+    // resumed conversation alone and the new task is not folded into it. An explicit operator
+    // act, so `inference.compaction.threshold` gets no vote; a bound hook that declines to
+    // replace the context leaves the ordinary `compaction_declined` record and the launch
+    // continues on the verbatim history. Staging already refused a `compact` resume on a capsule
+    // with no hook bound to `on-compaction`.
+    if resume == Some(ResumeMode::Compact) && !messages.is_empty() {
+        session_tokens = occupancy.count(&messages);
+        try_compact_via_hooks(
+            &mut messages,
+            &mut session_tokens,
+            &occupancy,
+            store_state,
+            0,
+            run_config.context_window,
+            workdir,
+            hooks,
+            trace,
+            otel,
+            run_config.compaction_model.clone(),
+            run_config.compaction_system_prompt.clone(),
+            run_config.compaction_dump_summaries,
+            record.as_mut(),
+        )
+        .await
+        .map_err(RuntimeError::AgentLoopFailed)?;
+    }
+
+    let task_message = with_new_id(json!({
+        "role": "user",
+        "content": [{"type": "text", "text": task}],
+    }));
+    append_to_record(record.as_mut(), std::slice::from_ref(&task_message));
+    messages.push(task_message);
 
     // Applied after the message list exists and before the first turn, so a committed seed
     // sits at the head of the very first driver request — ahead of any loaded history and
@@ -1687,19 +1733,22 @@ pub(crate) fn seed_budget_tokens(context_window: u32, seed_budget: f32) -> u64 {
     (f64::from(context_window) * f64::from(seed_budget)).floor() as u64
 }
 
-/// The conversation this task continues, or an empty list when the capsule is not threaded or
-/// the record holds nothing yet.
+/// The conversation this task continues, or an empty list when nothing asks for it or the
+/// record holds nothing yet.
 ///
 /// `lifecycle.conversation` decides what a task *loads*, never what the record holds: a
 /// `stateless` capsule writes its record like any other and simply starts every task from
-/// nothing. Every loaded message keeps the `id` its record line carries, and the record does
-/// not write it again.
+/// nothing. `resume` is the operator's one-off override of exactly that policy — `mur run
+/// --resume` continues *this* conversation whatever the capsule declares — so either reason to
+/// load is enough. Every loaded message keeps the `id` its record line carries, and the record
+/// does not write it again.
 fn load_recorded_history(
     record: Option<&mut crate::conversation::ConversationRecord>,
     mode: &ConversationMode,
+    resume: bool,
 ) -> Vec<Value> {
     match record {
-        Some(record) if matches!(mode, ConversationMode::Threaded) => record.load(),
+        Some(record) if matches!(mode, ConversationMode::Threaded) || resume => record.load(),
         _ => Vec::new(),
     }
 }
@@ -1730,14 +1779,15 @@ pub(crate) fn prior_history_tokens(
     workdir: &Path,
     mode: &ConversationMode,
     context_id: Option<&str>,
+    resume: bool,
 ) -> u64 {
     let mut record = match (conversation_root, context_id) {
-        (Some(root), Some(context_id)) if matches!(mode, ConversationMode::Threaded) => {
+        (Some(root), Some(context_id)) if matches!(mode, ConversationMode::Threaded) || resume => {
             crate::conversation::ConversationRecord::open(root, context_id, workdir)
         }
         _ => None,
     };
-    let history = load_recorded_history(record.as_mut(), mode);
+    let history = load_recorded_history(record.as_mut(), mode, resume);
     if history.is_empty() {
         return 0;
     }
@@ -2680,6 +2730,8 @@ mod tests {
             murmur_artifact::TraceCapture::Content,
             None,
             false,
+            None,
+            None,
         )
         .await
         .unwrap()

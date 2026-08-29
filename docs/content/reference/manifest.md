@@ -1153,6 +1153,10 @@ record, which [`context.record`](#context-record) is what turns off.
 | `stateless` (default) | Every task starts with an empty message history. The `contextId` on the incoming message is recorded but has no effect on context. |
 | `threaded` | A task that arrives with a `contextId` starts from the whole [conversation record](workdir.md#the-conversation-record) for that context, including messages an earlier session wrote. Each completed task also writes a per-task result to `workdir/out/result_<taskId>.txt` alongside the shared `workdir/out/result.txt`. |
 
+This setting is the capsule's own policy, and
+[`mur run --resume <session>`](cli.md#mur-run) overrides it for one launch: that launch loads the
+record even under `stateless`.
+
 A conversation outlives the session that started it. Threaded tasks reaching one capsule over A2A
 need a long-running capsule (`task_acceptance: queue`, `after_task: sleep`), since with
 `task_acceptance: single` the capsule exits after the first task; two separate

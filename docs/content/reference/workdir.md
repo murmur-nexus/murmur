@@ -155,10 +155,12 @@ durable file:
 | Segment | Value |
 |---|---|
 | `<record>` | [`context.record_store`](manifest.md#field-context), defaulting to the capsule name |
-| `<context-id>` | The task's context id: the `contextId` an A2A client sent, or the value of [`mur run --context`](cli.md#mur-run), or a fresh `ctx_…` per task |
+| `<context-id>` | The task's context id: the `contextId` an A2A client sent, the value of [`mur run --context`](cli.md#mur-run), the id [`mur run --resume`](cli.md#mur-run) looked up from a previous session, or a fresh `ctx_…` per task |
 
 Two runs given the same context id continue one conversation, whether they arrive over A2A or from
-two `mur run --context <id>` launches with no session directory in common.
+two `mur run --context <id>` launches with no session directory in common. `mur run --resume
+<session>` reaches the same record without you having to know the id: it reads the context off that
+session's trace.
 
 One line is one message, as the runtime holds it:
 
@@ -185,7 +187,7 @@ record, and there is no retention or pruning mechanism.
 **`lifecycle.conversation` governs loading, not recording.** A `stateless` capsule appends to its
 record like any other and simply starts every task from nothing;
 [`threaded`](manifest.md#lifecycle-conversation) starts a task from the whole record for its
-context.
+context. [`mur run --resume`](cli.md#mur-run) loads the record either way, for that launch only.
 
 **Turning it off creates nothing.** [`context.record: off`](manifest.md#context-record) means no
 `~/.murmur/conversations/` directory at all. So does `inference.transport: process`, whose CLI owns

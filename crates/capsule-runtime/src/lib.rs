@@ -96,6 +96,6 @@ pub use state_store::{
 pub use trace::ResourceTraceAppender;
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
-    InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, StageRequest,
-    StagedSession,
+    InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, ResumeMode,
+    ResumeRequest, StageRequest, StagedSession,
 };
