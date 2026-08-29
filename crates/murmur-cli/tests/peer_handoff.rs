@@ -395,46 +395,6 @@ impl Drop for Capsule {
     }
 }
 
-/// A pinned port, claimed for the lifetime of the test process.
-///
-/// Deliberately **not** an OS-assigned `:0` port. Each capsule's manifest has to name the other's
-/// address, so the port must be known before either capsule launches — and an ephemeral port
-/// released to be named later can be handed straight back out, to another test in this binary or
-/// to one of this test's own scripted endpoints, in the window before the capsule binds it.
-///
-/// Candidates come from below the Linux ephemeral range (32768–60999), so no `:0` bind anywhere in
-/// the process can be assigned one, and a process-wide claim set keeps two tests from picking the
-/// same number.
-fn free_port() -> u16 {
-    use std::sync::OnceLock;
-
-    static CLAIMED: OnceLock<Mutex<(u16, HashSet<u16>)>> = OnceLock::new();
-    let claimed = CLAIMED.get_or_init(|| {
-        // Seeded from the pid so two concurrent `cargo test` invocations start in different
-        // places rather than racing over the same first candidate.
-        let seed = (std::process::id() % 8000) as u16;
-        Mutex::new((20_000 + seed, HashSet::new()))
-    });
-
-    let mut guard = claimed.lock().unwrap();
-    for _ in 0..4000 {
-        let candidate = guard.0;
-        guard.0 = if candidate >= 30_000 {
-            20_000
-        } else {
-            candidate + 1
-        };
-        if !guard.1.insert(candidate) {
-            continue;
-        }
-        // Bindable now, and nothing in this process can be handed it afterwards.
-        if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("no free pinned port in 20000..30000");
-}
-
 struct CapsuleSpec<'a> {
     name: &'a str,
     port: u16,
@@ -646,7 +606,7 @@ fn a_file_crosses_between_two_live_capsules_addressed_only_by_handle() {
     ) {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
 
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
@@ -784,7 +744,7 @@ fn the_handle_is_not_a_path_and_an_edited_handle_buys_nothing() {
     ) {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -882,7 +842,7 @@ fn without_exports_peer_files_nothing_mints_and_the_plane_denies() {
     ) {
         return;
     }
-    let port = free_port();
+    let port = common::free_port();
     let capsule = launch(CapsuleSpec {
         name: "producer",
         port,
@@ -937,7 +897,7 @@ fn without_peer_fetch_nothing_fetches_and_the_check_precedes_the_connection() {
     ) {
         return;
     }
-    let port = free_port();
+    let port = common::free_port();
     let undeclared = launch(CapsuleSpec {
         name: "reporter",
         port,
@@ -962,7 +922,7 @@ fn without_peer_fetch_nothing_fetches_and_the_check_precedes_the_connection() {
     drop(undeclared);
 
     // A capsule that declares `peer_fetch` for somewhere else, calling the real address.
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1019,7 +979,7 @@ fn the_agent_cannot_mint_outside_the_declared_subtree() {
     if common::skip_without_host_support("the_agent_cannot_mint_outside_the_declared_subtree") {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1115,7 +1075,11 @@ fn a_third_capsule_holding_the_handle_cannot_redeem_it() {
     if common::skip_without_host_support("a_third_capsule_holding_the_handle_cannot_redeem_it") {
         return;
     }
-    let (port_a, port_b, port_c) = (free_port(), free_port(), free_port());
+    let (port_a, port_b, port_c) = (
+        common::free_port(),
+        common::free_port(),
+        common::free_port(),
+    );
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1191,7 +1155,7 @@ fn a_rewritten_file_redeems_to_its_current_bytes_and_the_etag_says_so() {
     ) {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1295,7 +1259,7 @@ fn an_expired_handle_is_refused() {
     if common::skip_without_host_support("an_expired_handle_is_refused") {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1344,7 +1308,11 @@ fn a_handle_does_not_survive_the_instance_that_minted_it() {
     if common::skip_without_host_support("a_handle_does_not_survive_the_instance_that_minted_it") {
         return;
     }
-    let (port_a, port_b, port_b2) = (free_port(), free_port(), free_port());
+    let (port_a, port_b, port_b2) = (
+        common::free_port(),
+        common::free_port(),
+        common::free_port(),
+    );
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,
@@ -1453,7 +1421,7 @@ fn the_peer_plane_has_no_listing_verb_and_no_write_path() {
     if common::skip_without_host_support("the_peer_plane_has_no_listing_verb_and_no_write_path") {
         return;
     }
-    let (port_a, port_b) = (free_port(), free_port());
+    let (port_a, port_b) = (common::free_port(), common::free_port());
     let fetcher = launch(CapsuleSpec {
         name: "reporter",
         port: port_a,

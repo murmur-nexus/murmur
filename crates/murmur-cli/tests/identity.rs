@@ -3,9 +3,11 @@ mod common;
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader, ErrorKind, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
 
 use capsule_runtime::{
@@ -61,6 +63,15 @@ fn setup_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
 }
 
 fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedSession {
+    stage_agent_with_port(home, manifest_path, None)
+}
+
+/// Stage a session on `internal_port`, or on an OS-assigned ephemeral port when it is `None`.
+fn stage_agent_with_port(
+    home: &TempDir,
+    manifest_path: &Path,
+    internal_port: Option<u16>,
+) -> capsule_runtime::StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
     let mut allowlisted_tools = std::collections::HashSet::new();
     let mut requested_artifacts = Vec::new();
@@ -106,7 +117,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             trace: None,
             workdir: None,
             bind_addr: "127.0.0.1".to_string(),
-            internal_port: None,
+            internal_port,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
         },
@@ -344,16 +355,14 @@ fn http_server_not_reachable_after_session_ends() {
     }
     let server = end_turn_server("done");
     let (home, manifest_path) = setup_agent_project(&server.endpoint);
-    let staged = stage_agent(&home, &manifest_path);
+    // The capsule is staged on a port pinned from a process-wide claimed range below the Linux
+    // ephemeral range, so nothing in this process — no `:0` bind, no other test — can be handed
+    // that number once the session releases it. A connect that succeeds is therefore the capsule's
+    // own listener and nothing else.
+    let staged = stage_agent_with_port(&home, &manifest_path, Some(common::free_port()));
     let workdir_for_thread = staged.workdir.clone();
     fs::write(workdir_for_thread.join("task.md"), "shutdown test").unwrap();
 
-    // Capture the capsule URL before launching (via polling)
-    // We need to see MURMUR.md written from stage_session first (partial), then the final one.
-    // Simpler: run synchronously, then try to connect after launch completes.
-    // The port should be bound during launch and released after.
-
-    // Run synchronously: launch (which starts and stops the server), then try to connect.
     let staged_workdir = staged.workdir.clone();
     let launched = launch_session(staged, |_| {}).expect("launch should succeed");
 
@@ -361,11 +370,37 @@ fn http_server_not_reachable_after_session_ends() {
     let capsule_url =
         extract_capsule_url(&content).expect("MURMUR.md should contain a capsule_url after launch");
 
-    // The HTTP server should have shut down. Connecting should fail.
-    let connect_result = TcpStream::connect(&capsule_url);
+    // Closing the capsule's listener is not ordered against `launch_session` returning: a process
+    // forked elsewhere in this binary while that descriptor was open holds an inherited duplicate
+    // of it until it execs, and the socket stays in LISTEN — completing handshakes nothing will
+    // ever accept — for as long as that lasts. Pinning the port is what makes waiting it out
+    // sound, since no other binder can claim the number in the meantime.
+    //
+    // Only ECONNREFUSED proves the port is unbound. A listener nothing accepts on refuses nothing
+    // either: it completes handshakes until its backlog fills and then leaves connects hanging
+    // until the TCP retransmission timeout, so an unbounded `connect` that eventually errors is
+    // evidence the listener is *up*, not gone. Each attempt is bounded for the same reason.
+    let addr = capsule_url
+        .to_socket_addrs()
+        .expect("capsule_url should resolve")
+        .next()
+        .expect("capsule_url should resolve to at least one address");
+    let settle = Duration::from_secs(5);
+    let deadline = Instant::now() + settle;
+    let refused = loop {
+        let refused = matches!(
+            TcpStream::connect_timeout(&addr, Duration::from_millis(250)),
+            Err(ref e) if e.kind() == ErrorKind::ConnectionRefused
+        );
+        if refused || Instant::now() >= deadline {
+            break refused;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
     assert!(
-        connect_result.is_err(),
-        "TCP connection to {capsule_url} should fail after session ends, but it succeeded"
+        refused,
+        "{capsule_url} still had a listener {settle:?} after the session ended; \
+         the capsule's HTTP server should be gone"
     );
 
     let _ = staged_workdir;
