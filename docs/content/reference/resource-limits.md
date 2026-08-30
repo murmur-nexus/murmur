@@ -41,9 +41,10 @@ Both are reported distinctly from a plain crash — see [CLI error codes](diagno
 ## Host resource limits { #host-resource-limits }
 
 `capabilities.resources` bounds the operating-system processes the runtime spawns:
-`capabilities.shell.allow` and `capabilities.spawn.allow` binaries, and native-implementation tool
-artifacts. A capsule that cannot escape its containment can still wedge the host it runs on by
-forking, allocating, opening files or writing without bound; this block is what stops that.
+`capabilities.shell.allow` binaries, `capabilities.spawn.allow` sub-capsules, and
+native-implementation tool artifacts. A capsule that cannot escape its containment can still
+wedge the host it runs on by forking, allocating, opening files or writing without bound; this
+block is what stops that.
 
 ```yaml
 capabilities:
