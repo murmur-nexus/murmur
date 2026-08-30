@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use mur_roost::{handle_connection, State};
+use mur_roost::{authority::SpawnAuthority, handle_connection, State};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -82,10 +82,21 @@ fn main() {
         }
     };
 
+    // One authority per process. Its key never reaches disk, so every credential and approval this
+    // daemon issues dies with it — restarting is a complete revocation with no revocation list.
+    let authority = match SpawnAuthority::generate() {
+        Ok(authority) => Arc::new(authority),
+        Err(e) => {
+            eprintln!("mur-roost: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let state = Arc::new(State {
         jobs: Arc::new(Mutex::new(HashMap::new())),
         registry_path: args.registry_path,
         spawn_allow: args.spawn_allow,
+        authority,
     });
 
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", args.port)) {

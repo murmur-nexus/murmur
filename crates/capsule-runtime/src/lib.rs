@@ -19,6 +19,7 @@ pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub mod lanes;
 pub mod limits;
+pub mod mac_token;
 pub(crate) mod murmur_md;
 pub mod network_namespace;
 pub(crate) mod network_policy;
@@ -36,6 +37,7 @@ pub(crate) mod sandbox;
 pub mod sealed;
 pub mod security;
 pub(crate) mod shell;
+pub mod spawn_credential;
 pub mod spawn_envelope;
 pub mod staged_runtime;
 pub mod state_store;
@@ -104,6 +106,9 @@ pub use retention::{
 pub use runtime::{
     launch_session, stage_session, warn_on_interpreter_runtime_grants,
     warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
+};
+pub use spawn_credential::{
+    SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
 pub use spawn_envelope::{EnvelopeAxis, EnvelopeViolation, SpawnEnvelope};
 pub use staged_runtime::check_staged_runtime_floor;

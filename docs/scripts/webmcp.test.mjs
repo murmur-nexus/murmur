@@ -24,6 +24,10 @@ const BUNDLE = path.join(SITE, "assets", "agent", "webmcp.js");
 const registered = [];
 const fetched = [];
 const missing = [];
+// ask-docs posts to an absolute external URL (the shared murmur-ask-docs
+// Lambda), not a same-origin path — intercepted separately so it never
+// pollutes `fetched`/`missing`, which are about this site's own artifacts.
+const askDocsCalls = [];
 
 before(async () => {
   assert.ok(
@@ -33,8 +37,14 @@ before(async () => {
 
   // Serve from the built site the way CloudFront serves these same paths, so a
   // URL the site does not have shows up here as a 404 rather than as a pass.
-  globalThis.fetch = async (url) => {
-    const urlPath = String(url).replace(/^https?:\/\/[^/]+/, "");
+  globalThis.fetch = async (url, init) => {
+    const urlStr = String(url);
+    if (urlStr.startsWith("https://api.murmur.nexus/")) {
+      askDocsCalls.push({ url: urlStr, body: init?.body });
+      return { ok: true, status: 200, statusText: "OK", text: async () => "canned answer", json: async () => ({}) };
+    }
+
+    const urlPath = urlStr.replace(/^https?:\/\/[^/]+/, "");
     fetched.push(urlPath);
     const file = path.join(SITE, urlPath);
     try {
@@ -57,12 +67,8 @@ const tool = (name) => {
   return found;
 };
 
-test("registers exactly the client-side tools", () => {
-  assert.deepEqual(
-    registered.map((t) => t.name).sort(),
-    ["get-page", "search-docs"],
-    "ask-docs needs a server endpoint and must not be registered until one exists"
-  );
+test("registers exactly the expected tools", () => {
+  assert.deepEqual(registered.map((t) => t.name).sort(), ["ask-docs", "get-page", "search-docs"]);
 });
 
 test("registration performs no network I/O", () => {
@@ -96,6 +102,20 @@ test("get-page returns the markdown twin", async () => {
 test("the site root resolves", async () => {
   const page = await tool("get-page").execute({ urlPath: "/" }, {});
   assert.ok(page.length > 0);
+});
+
+test("ask-docs posts to this site's own path on the shared endpoint", async () => {
+  const result = await tool("ask-docs").execute({ question: "what is a capsule?" }, {});
+  assert.deepEqual(askDocsCalls, [
+    { url: "https://api.murmur.nexus/docs/ask", body: JSON.stringify({ question: "what is a capsule?" }) },
+  ]);
+  assert.equal(result, "canned answer");
+});
+
+test("ask-docs is read-only and takes only a question", () => {
+  const t = tool("ask-docs");
+  assert.equal(t.annotations?.readOnlyHint, true);
+  assert.deepEqual(t.inputSchema.required, ["question"]);
 });
 
 test("every URL the tools requested exists in the build", () => {

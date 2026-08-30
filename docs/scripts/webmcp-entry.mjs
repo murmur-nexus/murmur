@@ -3,20 +3,21 @@
  * every page (see hooks/agent_head.py).
  *
  * Registers read-only docs tools against `document.modelContext` so a browser
- * agent on docs.murmur.nexus can search and read pages through tool calls
- * instead of scraping the DOM. Both tools run entirely client-side against the
- * generated search artifacts — no backend.
+ * agent on docs.murmur.nexus can search, read, and ask questions about these
+ * docs through tool calls instead of scraping the DOM.
  *
- *   search-docs  BM25 query over the generated chunk index
- *   get-page     fetch one page's markdown twin
+ *   search-docs  BM25 query over the generated chunk index (client-side, no backend)
+ *   get-page     fetch one page's markdown twin (client-side, no backend)
+ *   ask-docs     natural-language answer via murmur-ask-docs (the one tool
+ *                here with a backend — see that repo for why)
  *
- * On browsers without WebMCP support this is a no-op: `registerDocsWebMcpTools`
+ * On browsers without WebMCP support this is a no-op: `registerWebMcpTools`
  * returns `{ supported: false }` rather than throwing.
  */
 
-import { registerDocsWebMcpTools } from "leadtype/webmcp";
+import { createDocsWebMcpTools, registerWebMcpTools } from "leadtype/webmcp";
 
-const registration = registerDocsWebMcpTools({
+const docsTools = createDocsWebMcpTools({
   // Artifacts sit at the site root, not under /docs — docs.murmur.nexus serves
   // the docs tree directly, so leadtype's default `/docs/...` paths don't apply.
   indexUrl: "/search-index.json",
@@ -25,42 +26,31 @@ const registration = registerDocsWebMcpTools({
   markdownUrl: (urlPath) => (urlPath === "/" ? "/index.md" : `${urlPath}.md`),
 });
 
-/*
- * ask-docs seam.
- *
- * A third tool — natural-language answers grounded in these docs — needs a
- * server: leadtype's `streamDocsAnswer` runs on the Vercel AI SDK and holds a
- * model API key, and docs.murmur.nexus is static S3 behind CloudFront with
- * nothing to run it. When an endpoint exists, add it here alongside the two
- * above:
- *
- *   import { createDocsWebMcpTools, registerWebMcpTools } from "leadtype/webmcp";
- *
- *   const askDocs = {
- *     name: "ask-docs",
- *     description: "Answer a question using the murmur documentation.",
- *     inputSchema: {
- *       type: "object",
- *       properties: { question: { type: "string" } },
- *       required: ["question"],
- *     },
- *     annotations: { readOnlyHint: true },
- *     execute: async ({ question }) => {
- *       const response = await fetch("/api/ask", {
- *         method: "POST",
- *         headers: { "content-type": "application/json" },
- *         body: JSON.stringify({ question }),
- *       });
- *       if (!response.ok) throw new Error(`ask-docs failed: ${response.status}`);
- *       return response.text();
- *     },
- *   };
- *
- *   registerWebMcpTools([...createDocsWebMcpTools(options), askDocs]);
- *
- * Registering it against a missing endpoint is worse than not registering it:
- * the agent sees a tool it can call and gets a 403 from CloudFront.
- */
+// Path-routed to this site's corpus on the shared murmur-ask-docs Lambda
+// (see that repo's README) — murmur.nexus posts to /landing/ask instead.
+// Routing by path, not a body field, so a client bug can't cross-answer from
+// the other site's corpus.
+const askDocs = {
+  name: "ask-docs",
+  description: "Answer a question using the murmur documentation.",
+  inputSchema: {
+    type: "object",
+    properties: { question: { type: "string" } },
+    required: ["question"],
+  },
+  annotations: { readOnlyHint: true },
+  execute: async ({ question }) => {
+    const response = await fetch("https://api.murmur.nexus/docs/ask", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!response.ok) throw new Error(`ask-docs failed: ${response.status}`);
+    return response.text();
+  },
+};
+
+const registration = registerWebMcpTools([...docsTools, askDocs]);
 
 if (typeof window !== "undefined") {
   window.addEventListener("pagehide", () => registration.unregister(), { once: true });
