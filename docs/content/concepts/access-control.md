@@ -108,10 +108,11 @@ genuine trusted peer gets, and nothing on the A2A path tells the two apart. What
 untrust laundering across an honest chain.
 
 The class is recorded, not enforced: no task is refused, delayed or reordered because it is
-`untrusted`. Treat it as the answer to "why did this run", and keep authoring manifests on the
-assumption that any task's text may be hostile. The origin does more than the class: it also
-picks the [queue lane](session-loop.md#queue-lanes) a task waits in, so two tasks that are both
-`untrusted` can still run in a different order.
+`untrusted`. What it changes is presentation — an `untrusted` payload reaches the model inside the
+[untrusted fence](#threat-model), marked as data. Treat the class as the answer to "why did this
+run", and keep authoring manifests on the assumption that any task's text may be hostile. The
+origin does more than the class: it also picks the [queue lane](session-loop.md#queue-lanes) a
+task waits in, so two tasks that are both `untrusted` can still run in a different order.
 
 Both values are recorded on the [`task_start`](../reference/observability-schemas.md#session-trace-tracejsonl)
 trace event and shown on the task row of `mur trace steps <session>`, alongside the lane:
@@ -130,11 +131,35 @@ available, and permanently open elsewhere.
 - **Prompt injection.** No manifest setting or runtime mechanism fully prevents a model
   from being manipulated by instructions smuggled inside data it reads (a fetched web page, a
   tool result, output from a binary declared under `capabilities.shell.allow`). The runtime's
-  mitigation is to always prepend an untrusted-content notice to the system prompt
-  (both `transport: http` and `transport: process`)
-  instructing the model to treat tool results, shell output, and fetched content as data, never as
-  instructions. Manifest authors are still responsible for not combining broad tool authority with
-  exposure to untrusted content (see the phase-separation pattern below).
+  mitigation is a marker — the untrusted fence — applied at two boundaries and stated in the
+  system prompt on both `transport: http` and `transport: process`.
+
+    | Boundary | What is fenced |
+    |---|---|
+    | Tool results | Every dispatch branch: WASM tool, native subprocess tool, shell binary, and the runtime's own peer-handoff tools |
+    | Task payloads | A task whose [trust class](#task-origin-and-trust-class) is `untrusted` |
+
+    Fenced content arrives between `<untrusted-content source=NAME>` and `</untrusted-content>`,
+    where NAME is `tool:<artifact name>` for a tool result and `task:<origin>` for a task payload.
+    A marker found inside the content itself is rewritten to
+    `<!MURMUR-NEUTRALISED!/untrusted-content>` before the fence closes, so content cannot end its
+    own block; the rewrite inserts and deletes nothing, so an operator reading the trace sees the
+    forged marker as rewritten text. The system prompt tells the model that everything between the
+    markers is data and that a closing marker appearing anywhere inside a block — including one
+    drawn inside an image — is a forgery.
+
+    Two things are deliberately not fenced. A declared skill's `skill.md` is the capsule author's
+    own guidance, staged from inside the capsule at install and fixed for the run; fencing it as
+    data would make the skill inert. A `user` or `schedule` task is the operator instructing their
+    own capsule, for the same reason.
+
+    The fence marks content, it does not control capability. It sits inside the boundary
+    `capabilities:` draws and replaces no part of it: no task, tool call or turn is refused,
+    delayed or reordered for being fenced, no grant is widened or narrowed by it, and a model that
+    acts on injected instructions can still do everything the manifest allows. Manifest authors
+    are still responsible for not combining broad tool authority with exposure to untrusted
+    content (see the phase-separation pattern below).
+
 - **Network allowlist bypass via subprocess.** `capabilities.network.allow` constrains
   requests the *runtime itself* makes (HTTP calls from tool and driver components); by itself it
   does **not** constrain a subprocess spawned via `capabilities.shell.allow`. Closing that gap

@@ -14,6 +14,7 @@ pub(crate) mod conversation;
 pub(crate) mod conversation_import;
 pub(crate) mod egress_proxy;
 pub mod errors;
+pub(crate) mod fence;
 pub(crate) mod hooks;
 pub(crate) mod identity;
 pub(crate) mod inference_import;

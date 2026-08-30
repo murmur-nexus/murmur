@@ -165,7 +165,7 @@ fn read_task_from_workdir(workdir: &Path) -> String {
 /// both. The value must nonetheless stay launch-invariant, for the same prompt caching reason
 /// as the http path: the CLI puts it at the head of the prompt, and every provider matches its
 /// cache on an exact prefix, so a per-launch value here would miss the cache on every request.
-fn build_process_system_prompt(system_prompt: Option<&str>) -> String {
+pub(super) fn build_process_system_prompt(system_prompt: Option<&str>) -> String {
     let notices = format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}");
     match system_prompt.filter(|sp| !sp.is_empty()) {
         Some(sp) => format!("{notices}\n\n{sp}"),
@@ -305,7 +305,12 @@ pub(crate) async fn run_process_inference_loop(
 
     // Same fix as the http-transport path in agent.rs: task.md lives in accessible_workdir
     // (where the agent's own tools are preopened), not the internal session workdir.
-    let task = read_task_from_workdir(accessible_workdir);
+    // Fenced on the same condition as the http path, from the same function, so the transport
+    // a capsule runs on does not decide whether an untrusted payload is marked.
+    let task = super::fence_task_payload(
+        store_state.current_task_provenance,
+        read_task_from_workdir(accessible_workdir),
+    );
 
     // Build subprocess arguments for the selected CLI dialect. Claude takes the task on stdin
     // as a JSON message; codex takes it as a positional prompt arg (stdin stays closed).

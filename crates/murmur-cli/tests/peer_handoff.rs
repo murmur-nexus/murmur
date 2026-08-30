@@ -279,8 +279,12 @@ fn end_turn_response(text: &str) -> String {
     .to_string()
 }
 
-/// The text of the tool result the runtime fed back for `tool_id` — the runtime sends
-/// `data || summary`, so for both peer tools this is the JSON object they returned.
+/// The text of the tool result the runtime fed back for `tool_id`, with the untrusted fence
+/// stripped — so for both peer tools this is the JSON object they returned.
+///
+/// Every tool result reaches the model inside the fence, the peer tools included; these tests
+/// are about what the peer plane answered, so the markers are checked and removed in one place
+/// here rather than at each caller. The fence itself is covered in `untrusted_fence.rs`.
 fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
     for request in requests {
         for message in request.get("messages")?.as_array()? {
@@ -298,12 +302,12 @@ fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
                 }
                 let content = block.get("content")?;
                 if let Some(text) = content.as_str() {
-                    return Some(text.to_string());
+                    return Some(unfence(text));
                 }
                 if let Some(items) = content.as_array() {
                     for item in items {
                         if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            return Some(text.to_string());
+                            return Some(unfence(text));
                         }
                     }
                 }
@@ -311,6 +315,25 @@ fn tool_result_text(requests: &[Value], tool_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Return what the fence wrapped, for a result that carries one.
+///
+/// A tool that ran carries a fence. A dispatch that never reached a tool — a refused handle, a
+/// peer outside `capabilities.peer_fetch.allow` — comes back as the runtime's own failure text
+/// and carries none, so that shape is passed through unchanged.
+fn unfence(text: &str) -> String {
+    let Some((open, rest)) = text.split_once('\n') else {
+        return text.to_string();
+    };
+    if !open.starts_with("<untrusted-content source=tool:") || !open.ends_with('>') {
+        return text.to_string();
+    }
+    rest.strip_suffix("\n</untrusted-content>")
+        .unwrap_or_else(|| {
+            panic!("a fenced tool result must end at the closing marker; got:\n{text}")
+        })
+        .to_string()
 }
 
 // ── Capsules ──────────────────────────────────────────────────────────────────

@@ -3472,6 +3472,26 @@ pub(crate) async fn invoke_tool_component(
     Ok(result)
 }
 
+/// Reduce a dispatched tool result to the one string the model will read, and fence it.
+///
+/// The `data` / `summary` reduction happens here, once, rather than at each model-facing caller,
+/// and both fields are consumed: `data` carries the fenced text afterwards and `summary` is left
+/// `None`, so the `data.or(summary)` both callers write has nothing unfenced to fall back to.
+///
+/// `status`, `data_path`, `truncated` and `metadata` are untouched: they are the tool's own
+/// declarations about the call, not content shown to the model.
+fn fence_tool_result(name: &str, result: &mut murmur::tool::run::ToolResult) {
+    let data = result.data.take();
+    let summary = result.summary.take();
+    let text = data
+        .or(summary)
+        .unwrap_or_else(|| "tool returned no data".to_string());
+    result.data = Some(crate::fence::wrap_untrusted(
+        &crate::fence::tool_source(name),
+        &text,
+    ));
+}
+
 impl CapsuleStoreState {
     /// Async WASM tool dispatch — used by the agent loop for drivers and WASM tools.
     pub(crate) async fn dispatch_tool_async(
@@ -3509,8 +3529,37 @@ impl CapsuleStoreState {
         .await
     }
 
-    /// Dispatch a tool call from the agent loop: native binary, shell, or WASM.
+    /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
+    /// whatever comes back.
+    ///
+    /// The single convergence point of every agent-facing tool call, on both invocation paths
+    /// (WASM component and native subprocess), which is why the fence is applied here rather
+    /// than at either of the two callers that turn a [`DispatchOutcome`] into model-facing text.
+    /// The reduction from `data`/`summary` to one string happens here too, so no unfenced tool
+    /// text is left on the outcome for a caller to reach for.
     pub(crate) async fn dispatch_agent_tool_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<DispatchOutcome, String> {
+        let mut outcome = self.dispatch_agent_tool_unfenced(name, input).await?;
+        // Every branch is fenced except the skill branch. A skill result is `skill.md`, read off
+        // disk from inside the capsule, staged at install and fixed for the whole run: it is the
+        // capsule author's own guidance and its entire purpose is to be followed as instruction,
+        // so fencing it as data would make a declared skill inert. Every other branch returns
+        // bytes produced at call time by something outside the capsule, and the runtime has no
+        // notion of a trusted tool, so the rule for them needs no judgement: all of them are
+        // fenced, unconditionally.
+        if !outcome.is_skill {
+            fence_tool_result(name, &mut outcome.result);
+        }
+        Ok(outcome)
+    }
+
+    /// [`Self::dispatch_agent_tool_async`]'s branches, before the fence. Private, and called
+    /// from exactly one place: a caller that reached this directly would hand the model
+    /// unfenced tool output.
+    async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
@@ -6357,6 +6406,98 @@ inference:
             outcome.fatal.is_none(),
             "a disallowed binary is the capsule's problem, not the session's"
         );
+    }
+
+    // ── the tool-result fence ───────────────────────────────────────────────
+
+    fn tool_result_with(
+        data: Option<&str>,
+        summary: Option<&str>,
+    ) -> murmur::tool::run::ToolResult {
+        murmur::tool::run::ToolResult {
+            status: murmur::tool::run::Status::Passed,
+            summary: summary.map(str::to_string),
+            data: data.map(str::to_string),
+            data_path: None,
+            truncated: false,
+            metadata: Vec::new(),
+        }
+    }
+
+    /// Every shape a dispatch branch can hand back — data, summary only, neither — is fenced
+    /// once. A second application anywhere would show up here as a second marker pair.
+    #[test]
+    fn fence_wraps_each_dispatch_result_shape_exactly_once() {
+        let shapes = [
+            tool_result_with(Some("stdout line"), Some("ran ok")),
+            tool_result_with(Some("stdout line"), None),
+            tool_result_with(None, Some("ran ok")),
+            tool_result_with(None, None),
+        ];
+        for mut result in shapes {
+            fence_tool_result("web-fetch", &mut result);
+            let text = result.data.expect("the fenced text lands in data");
+            assert_eq!(
+                text.matches("<untrusted-content source=tool:web-fetch>")
+                    .count(),
+                1,
+                "exactly one opening marker: {text}"
+            );
+            assert_eq!(
+                text.matches(crate::fence::FENCE_CLOSE).count(),
+                1,
+                "exactly one closing marker: {text}"
+            );
+        }
+    }
+
+    /// The reduction happens inside the dispatcher, so the `data.or(summary)` both model-facing
+    /// callers write has nothing unfenced left to fall back to.
+    #[test]
+    fn fence_moves_a_summary_only_result_into_fenced_data() {
+        let mut result = tool_result_with(None, Some("ran ok"));
+        fence_tool_result("probe", &mut result);
+        assert_eq!(
+            result.data.as_deref(),
+            Some("<untrusted-content source=tool:probe>\nran ok\n</untrusted-content>")
+        );
+        assert!(
+            result.summary.is_none(),
+            "no unfenced text may survive on the outcome"
+        );
+    }
+
+    /// A dispatch that produced nothing still reaches the model as a fenced block, so "the tool
+    /// said nothing" is not the one result that reads as the runtime's own voice.
+    #[test]
+    fn fence_wraps_the_empty_dispatch_result_too() {
+        let mut result = tool_result_with(None, None);
+        fence_tool_result("probe", &mut result);
+        assert_eq!(
+            result.data.as_deref(),
+            Some(
+                "<untrusted-content source=tool:probe>\ntool returned no data\n</untrusted-content>"
+            )
+        );
+    }
+
+    /// The fields the fence does not touch: everything the tool declared *about* the call, as
+    /// opposed to the content shown to the model.
+    #[test]
+    fn fence_leaves_the_declarative_tool_result_fields_alone() {
+        let mut result = murmur::tool::run::ToolResult {
+            status: murmur::tool::run::Status::Error,
+            summary: Some("failed".to_string()),
+            data: Some("boom".to_string()),
+            data_path: Some("out/log.txt".to_string()),
+            truncated: true,
+            metadata: vec![("state_effect".to_string(), "read".to_string())],
+        };
+        fence_tool_result("probe", &mut result);
+        assert!(matches!(result.status, murmur::tool::run::Status::Error));
+        assert_eq!(result.data_path.as_deref(), Some("out/log.txt"));
+        assert!(result.truncated);
+        assert_eq!(result.metadata.len(), 1);
     }
 
     /// The composed path, on real inputs and a real file: dispatch a real shell tool, then
