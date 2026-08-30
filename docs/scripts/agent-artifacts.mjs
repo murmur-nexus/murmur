@@ -17,7 +17,7 @@
  * this owns the agent surface.
  */
 
-import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -239,6 +239,27 @@ async function main() {
   const wellKnownDir = path.join(OUT_DIR, ".well-known");
   await mkdir(wellKnownDir, { recursive: true });
   await copyFile(CURATED_AI_CATALOG, path.join(wellKnownDir, "ai-catalog.json"));
+
+  // leadtype's generateAgentArtifacts hardcodes the api-catalog linkset's
+  // service-doc/service-desc hrefs to /docs/llms.txt and
+  // /docs/agent-readability.json (see renderApiCatalog in leadtype/llm) —
+  // defaults for a site mounted under a /docs/ URL prefix, which this one
+  // isn't (llms.txt and agent-readability.json are both at site root).
+  // There's no config option to override those paths (config.agents only
+  // recognizes robots/seo), so patch the two hrefs after the fact rather
+  // than fork the linkset renderer for two string replacements.
+  if (result.files.apiCatalog) {
+    const apiCatalog = JSON.parse(await readFile(result.files.apiCatalog, "utf8"));
+    for (const entry of apiCatalog.linkset ?? []) {
+      for (const link of entry["service-doc"] ?? []) {
+        link.href = link.href.replace(/\/docs\/llms\.txt$/, "/llms.txt");
+      }
+      for (const link of entry["service-desc"] ?? []) {
+        link.href = link.href.replace(/\/docs\/agent-readability\.json$/, "/agent-readability.json");
+      }
+    }
+    await writeFile(result.files.apiCatalog, `${JSON.stringify(apiCatalog, null, 2)}\n`);
+  }
 
   const rel = (file) => path.relative(DOCS_DIR, file);
   console.log(`agent-artifacts: ${pages.length} pages -> ${path.relative(DOCS_DIR, OUT_DIR)}/`);
