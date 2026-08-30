@@ -113,6 +113,39 @@ curl -s  https://docs.murmur.nexus/concepts/hooks?mode=agent | head -3        # 
 curl -s -H "Accept: text/markdown" https://docs.murmur.nexus/concepts/hooks | head -3
 ```
 
+## Link response header (one-time setup)
+
+`setup-link-header.sh` creates one CloudFront Response Headers Policy,
+`murmur-agent-link-header`, and attaches it to both `docs.murmur.nexus`
+(`E3SVCJVONCNVPZ`) and `murmur.nexus` (`E8I1RI0YU23W1`). It adds:
+
+```
+Link: </llms.txt>; rel="service-doc"
+```
+
+on every response — RFC 8288 header syntax, `service-doc` per RFC 9727 §3
+(a link to documentation intended for a human/agent audience). One policy
+works for both distributions because `/llms.txt` is a site-relative path, so
+the same header value resolves correctly against either domain — mirroring
+`murmur-index-rewrite`, a single shared piece of infra rather than one per
+site.
+
+```bash
+docs/infra/setup-link-header.sh
+```
+
+Idempotent — reuses the policy if it already exists, and skips a
+distribution that's already attached. Verify:
+
+```bash
+curl -sI https://docs.murmur.nexus/ | grep -i '^link:'
+curl -sI https://murmur.nexus/       | grep -i '^link:'
+```
+
+To roll back, detach the policy (`ResponseHeadersPolicyId` back to null) via
+`update-distribution` on either distribution, or delete the policy once
+detached from both.
+
 ## What you do NOT need
 
 **No cache policy changes.** A viewer-request function runs before the cache
