@@ -16,6 +16,9 @@ use crate::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
     sandbox,
     shell::{execute_shell, split_shell_words},
+    spawn_credential::{
+        SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
+    },
     types::CapabilityPolicy,
 };
 
@@ -80,6 +83,13 @@ pub struct SchedulerContext<'a> {
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
     pub current_session_id: Option<String>,
+    /// The credential this session presents to `mur-roost` when a `capsule` step delegates.
+    ///
+    /// `None` for every session that was not granted `capabilities.spawn.allow`, and a `capsule`
+    /// step in such a session fails before any request is made. The token is held here and read
+    /// exactly twice — into the two request headers below — so nothing that formats this context,
+    /// a step result or a trace record can carry it.
+    pub spawn_credential: Option<SpawnCredential>,
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
 }
 
@@ -579,13 +589,46 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
             )
         }
     };
+    let Some(credential) = ctx.spawn_credential.as_ref() else {
+        return failed(
+            &step.id,
+            "this session holds no spawn credential; a capsule step requires one, and mur-roost \
+             mints it only for a session whose manifest declares capabilities.spawn.allow",
+        );
+    };
     let version = ctx
         .capsule_versions
         .get(capsule)
         .cloned()
         .unwrap_or_else(|| "0.1.0".to_string());
+    let roost_url = roost_url.trim_end_matches('/').to_string();
 
-    // Step 1: Spawn child capsule via mur-roost. Input is NOT sent here.
+    // The credential's one reading, reused across both requests below. Every other route out of
+    // `SpawnCredential` is closed — no `Display`, no `Serialize`, redacted `Debug` — so the token
+    // cannot reach a step result, a trace or a workdir file by being formatted somewhere.
+    let credential_header = credential.expose();
+
+    // Step 1: ask mur-roost for permission. The daemon judges the session this credential names,
+    // runs the referee, and answers with an approval naming the exact artifact it resolved.
+    let delegate_body = json!({ "name": capsule, "version": version }).to_string();
+    let delegation = match http_json(
+        "POST",
+        &format!("{roost_url}/delegate"),
+        Some(&delegate_body),
+        &[(SPAWN_CREDENTIAL_HEADER, credential_header)],
+    ) {
+        Ok(value) => value,
+        Err(error) => return failed(&step.id, error),
+    };
+    let Some(approval) = delegation.get("approval").and_then(Value::as_str) else {
+        return failed(
+            &step.id,
+            "mur-roost delegate response missing approval".to_string(),
+        );
+    };
+    let approval = SpawnApproval::new(approval.to_string());
+
+    // Step 2: redeem it. Input is NOT sent here.
     let spawn_body = json!({
         "name": capsule,
         "version": version,
@@ -596,8 +639,12 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
 
     let spawn = match http_json(
         "POST",
-        &format!("{}/spawn", roost_url.trim_end_matches('/')),
+        &format!("{roost_url}/spawn"),
         Some(&spawn_body),
+        &[
+            (SPAWN_CREDENTIAL_HEADER, credential_header),
+            (SPAWN_APPROVAL_HEADER, approval.expose()),
+        ],
     ) {
         Ok(value) => value,
         Err(error) => return failed(&step.id, error),
@@ -611,7 +658,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     };
     let capsule_url = capsule_url.trim_end_matches('/').to_string();
 
-    // Step 2: Build the A2A message/send JSON-RPC body with the task input.
+    // Step 3: Build the A2A message/send JSON-RPC body with the task input.
     let input_text = capsule_step_input_text(input);
     let req_id = format!("plan-{}", step.id);
     let msg_id = format!("msg-{}", step.id);
@@ -629,11 +676,11 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     })
     .to_string();
 
-    // Step 3: POST message/send to the capsule with exponential backoff (100ms→2s, 30s max).
+    // Step 4: POST message/send to the capsule with exponential backoff (100ms→2s, 30s max).
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut delay_ms = 100u64;
     let send_response = loop {
-        match http_json("POST", &capsule_url, Some(&a2a_send_body)) {
+        match http_json("POST", &capsule_url, Some(&a2a_send_body), &[]) {
             Ok(resp) => break resp,
             Err(_) if std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(delay_ms));
@@ -660,7 +707,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     };
     let task_id = task_id.to_string();
 
-    // Step 4: Poll tasks/get until completed or failed.
+    // Step 5: Poll tasks/get until completed or failed.
     let tasks_get_body = json!({
         "jsonrpc": "2.0",
         "id": req_id,
@@ -671,7 +718,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
 
     loop {
         thread::sleep(Duration::from_millis(500));
-        let task = match http_json("POST", &capsule_url, Some(&tasks_get_body)) {
+        let task = match http_json("POST", &capsule_url, Some(&tasks_get_body), &[]) {
             Ok(v) => v,
             Err(e) => return failed(&step.id, e),
         };
@@ -823,7 +870,17 @@ fn read_optional_path(path: Option<&str>) -> Option<String> {
     path.and_then(|path| fs::read_to_string(path).ok())
 }
 
-fn http_json(method: &str, url: &str, body: Option<&str>) -> Result<Value, String> {
+/// One HTTP request, with `extra_headers` appended to the fixed set below.
+///
+/// The error this returns on a non-2xx carries the *response* headers and body. It must never
+/// grow to echo the request: `extra_headers` is where a spawn credential travels, and a step's
+/// error text reaches the model.
+fn http_json(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> Result<Value, String> {
     let url = Url::parse(url).map_err(|error| format!("invalid URL '{url}': {error}"))?;
     if url.scheme() != "http" {
         return Err(format!("unsupported URL scheme '{}'", url.scheme()));
@@ -844,13 +901,17 @@ fn http_json(method: &str, url: &str, body: Option<&str>) -> Result<Value, Strin
         None => url.path().to_string(),
     };
     let body = body.unwrap_or("");
+    let extra: String = extra_headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let request = if method == "POST" {
         format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
             body.len()
         )
     } else {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n")
     };
     stream
         .write_all(request.as_bytes())
@@ -906,6 +967,7 @@ mod tests {
             ]),
             capsule_versions: HashMap::new(),
             current_session_id: None,
+            spawn_credential: None,
             invoke_tool,
         }
     }

@@ -961,6 +961,7 @@ pub fn stage_session(
         exports_peer_files,
         registry,
         _epoch_ticker: epoch_ticker,
+        spawn_credential: None,
     })
 }
 
