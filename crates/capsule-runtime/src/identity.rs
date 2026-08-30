@@ -576,7 +576,6 @@ fn handle_jsonrpc(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_message_send(
     id: Value,
     params: &Value,

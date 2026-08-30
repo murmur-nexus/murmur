@@ -217,6 +217,7 @@ optional `context-id`, and the `text` — and returns the peer's `task-id`, `con
 |---|---|
 | Allowlist | The peer URL must appear in the sender's `capabilities.network.allow`. Otherwise the call returns `Err("network policy: '...' not in capabilities.network.allow")` and no connection is made. |
 | Tracing | With OTel configured, the runtime injects a W3C `traceparent` header so the peer's session span nests under the sender's. |
+| Origin | The runtime stamps `x-murmur-task-origin: peer` and the sending task's own `x-murmur-task-trust` on every request, so the receiving capsule inherits the sender's trust class. The `message` record has no field for either, so a capsule cannot set them. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class). |
 | Result state | `task-result.state` is the peer's response to the send: `submitted`, `working`, `input-required`, `completed`, `failed`, or `rejected`. Poll the peer's `tasks/get` endpoint for the final state. |
 
 ---

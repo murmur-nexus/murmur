@@ -6,8 +6,8 @@
 //! constructor that takes one on its own, so "derived, never declared" is a property of the type
 //! rather than a convention callers are asked to keep.
 //!
-//! Nothing in the runtime branches on trust yet. The value is recorded on `task_start` and made
-//! available to the loop; ordering by origin and fencing on trust are separate concerns.
+//! Nothing in the runtime branches on trust: the value is recorded on `task_start` and left on
+//! the store state for the task's duration, and no task is refused, delayed or reordered for it.
 
 /// Header carrying the sending runtime's origin claim on an inter-capsule request.
 ///
@@ -149,9 +149,9 @@ pub fn from_wire(origin_header: Option<&str>, trust_header: Option<&str>) -> Tas
 
 /// The provenance a runtime stamps on an outbound peer message, given its own current task.
 ///
-/// The origin is always [`TaskOrigin::Peer`] — nothing produces [`TaskOrigin::Completion`] yet —
-/// and the trust class is the sending task's own, so untrust survives the hop. `None`, meaning
-/// no task is in scope, stamps [`TrustClass::Untrusted`].
+/// The origin is always [`TaskOrigin::Peer`]; no sender emits [`TaskOrigin::Completion`], which
+/// the inbound rule nonetheless accepts. The trust class is the sending task's own, so untrust
+/// survives the hop. `None`, meaning no task is in scope, stamps [`TrustClass::Untrusted`].
 pub fn stamp_for_peer(sender_task: Option<TaskProvenance>) -> TaskProvenance {
     TaskProvenance::derive(TaskOrigin::Peer, sender_task.map(|task| task.trust()))
 }

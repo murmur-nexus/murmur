@@ -90,8 +90,7 @@ class.
 
 `peer` and `completion` inherit, so untrust cannot launder itself at the first hop: an untrusted
 webhook payload that reaches capsule A and is forwarded to capsule B arrives at B still
-untrusted. A message that carries no class at all is `untrusted` — the safe class, not the
-convenient one.
+untrusted. A message that carries no class at all is `untrusted`.
 
 The origin travels between capsules as two request headers, stamped by the sending runtime:
 
@@ -108,9 +107,17 @@ naming one of them, naming anything unrecognised, or absent entirely yields `eve
 genuine trusted peer gets, and nothing on the A2A path tells the two apart. What it closes is
 untrust laundering across an honest chain.
 
+The class is recorded, not enforced: no task is refused, delayed or reordered because it is
+`untrusted`. Treat it as the answer to "why did this run", and keep authoring manifests on the
+assumption that any task's text may be hostile.
+
 Both values are recorded on the [`task_start`](../reference/observability-schemas.md#session-trace-tracejsonl)
-trace event and rendered on the task row of `mur trace show <session> --steps`, so "why did this
-run" is answerable without reading the task text.
+trace event and shown on the task row of `mur trace steps <session>`:
+
+```
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted)
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (task_md, user/trusted)
+```
 
 ## Prompt injection and network-bypass posture { #threat-model }
 

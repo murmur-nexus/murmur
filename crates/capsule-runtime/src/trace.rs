@@ -1167,7 +1167,6 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_a2a_send(
         &mut self,
         peer_url: &str,

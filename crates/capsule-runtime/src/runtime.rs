@@ -2955,7 +2955,7 @@ impl send::Host for CapsuleStoreState {
         let traceparent = self.current_traceparent.clone();
         // The sending runtime's own current task, read off the store state the task loop writes
         // it to. `murmur:message/send` is linked only on the script-capsule path, which runs no
-        // task loop, so this is `None` today and stamps `untrusted`.
+        // task loop, so this is `None` there and stamps `untrusted`.
         let sender_task = self.current_task_provenance;
         let task = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(outgoing::send_a2a_message(
