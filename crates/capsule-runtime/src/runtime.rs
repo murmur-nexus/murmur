@@ -50,6 +50,7 @@ use crate::{
     },
     identity::{self, CapsuleIdentity},
     inference_import::HookInferenceCtx,
+    lanes::LaneQueue,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
     murmur_md,
     network_policy::{
@@ -1491,12 +1492,17 @@ pub fn launch_session(
 
                     let final_loop_result: Result<AgentLoopExit, RuntimeError>;
 
+                    // Tasks taken off the channel but not yet started. It outlives one iteration
+                    // because a task drained while another was running has to still be here when
+                    // that one finishes.
+                    let mut lanes = LaneQueue::new();
+
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
                     // Each iteration processes one task. Single/none modes break after
                     // the first iteration; queue+sleep iterates until channel closes.
                     'task_loop: loop {
                         // ── WAIT FOR NEXT TASK ──
-                        let incoming: IncomingTask = match effective_lifecycle.task_acceptance {
+                        let (incoming_lane, incoming) = match effective_lifecycle.task_acceptance {
                             TaskAcceptance::None => {
                                 // Does not accept incoming tasks; run from task.md if present
                                 if workdir_task_md.exists() {
@@ -1641,60 +1647,77 @@ pub fn launch_session(
                                     matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Queue)
                                     && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
 
-                                if is_queue_sleep {
-                                    match task_rx.recv().await {
-                                        Some(task) => task,
-                                        None => {
-                                            final_loop_result = Ok(AgentLoopExit::Ok);
-                                            break 'task_loop;
-                                        }
+                                loop {
+                                    // Everything already delivered goes into its lane before
+                                    // anything is chosen, so the choice is made over the whole
+                                    // backlog. A disconnected channel ends the drain and is
+                                    // handled by the blocking wait below, which sees `None`.
+                                    while let Ok(task) = task_rx.try_recv() {
+                                        lanes.push(task);
                                     }
-                                } else {
-                                    let idle_timeout_secs: u64 =
-                                        std::env::var("MURMUR_A2A_TIMEOUT_SECS")
-                                            .ok()
-                                            .and_then(|v| v.parse().ok())
-                                            .unwrap_or(30);
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(idle_timeout_secs),
-                                        task_rx.recv(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(task)) => task,
-                                        Ok(None) => {
-                                            final_loop_result = Ok(AgentLoopExit::Ok);
-                                            break 'task_loop;
-                                        }
-                                        Err(_elapsed) => {
-                                            eprintln!("[capsule-runtime] no A2A message received within timeout; running with empty task");
-                                            otel.begin_session(None);
-                                            state.current_traceparent = otel.outgoing_traceparent();
-                                            final_loop_result = agent::run_agent_loop(
-                                                &mut state,
-                                                &workdir,
-                                                inference,
-                                                system_prompt,
-                                                run_config,
-                                                &mut hooks,
-                                                &mut trace,
-                                                &mut otel,
-                                                None,
-                                                None,
-                                                &accessible_workdir,
-                                                &capsule_name,
-                                                &capsule_version,
-                                                conversation_mode.clone(),
-                                                None,
-                                                // No task was ever put in scope on this
-                                                // path, so `on-task-start` never fired and
-                                                // there is no seed to apply.
-                                                None,
-                                            )
-                                            .await;
-                                            break 'task_loop;
-                                        }
+                                    let active = task_registry.lock().unwrap().active_lane();
+                                    if let Some(selected) = lanes.next(active) {
+                                        break selected;
                                     }
+
+                                    let arrived = if is_queue_sleep {
+                                        match task_rx.recv().await {
+                                            Some(task) => task,
+                                            None => {
+                                                final_loop_result = Ok(AgentLoopExit::Ok);
+                                                break 'task_loop;
+                                            }
+                                        }
+                                    } else {
+                                        let idle_timeout_secs: u64 =
+                                            std::env::var("MURMUR_A2A_TIMEOUT_SECS")
+                                                .ok()
+                                                .and_then(|v| v.parse().ok())
+                                                .unwrap_or(30);
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(idle_timeout_secs),
+                                            task_rx.recv(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(task)) => task,
+                                            Ok(None) => {
+                                                final_loop_result = Ok(AgentLoopExit::Ok);
+                                                break 'task_loop;
+                                            }
+                                            Err(_elapsed) => {
+                                                eprintln!("[capsule-runtime] no A2A message received within timeout; running with empty task");
+                                                otel.begin_session(None);
+                                                state.current_traceparent = otel.outgoing_traceparent();
+                                                final_loop_result = agent::run_agent_loop(
+                                                    &mut state,
+                                                    &workdir,
+                                                    inference,
+                                                    system_prompt,
+                                                    run_config,
+                                                    &mut hooks,
+                                                    &mut trace,
+                                                    &mut otel,
+                                                    None,
+                                                    None,
+                                                    &accessible_workdir,
+                                                    &capsule_name,
+                                                    &capsule_version,
+                                                    conversation_mode.clone(),
+                                                    None,
+                                                    // No task was ever put in scope on this
+                                                    // path, so `on-task-start` never fired and
+                                                    // there is no seed to apply.
+                                                    None,
+                                                )
+                                                .await;
+                                                break 'task_loop;
+                                            }
+                                        }
+                                    };
+                                    // Back around the drain: a task that landed while this one
+                                    // was in flight is considered alongside it.
+                                    lanes.push(arrived);
                                 }
                             }
                         };
@@ -1702,7 +1725,11 @@ pub fn launch_session(
                         // ── ACTIVATE TASK ──
                         {
                             let mut reg = task_registry.lock().unwrap();
-                            reg.start_task(incoming.task_id.clone(), incoming.context_id.clone());
+                            reg.start_task(
+                                incoming.task_id.clone(),
+                                incoming.context_id.clone(),
+                                incoming_lane,
+                            );
                         }
                         if let Err(e) =
                             tokio::fs::write(&workdir_task_md, &incoming.message_text).await

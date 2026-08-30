@@ -17,6 +17,7 @@ pub mod errors;
 pub(crate) mod hooks;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
+pub mod lanes;
 pub mod limits;
 pub mod mac_token;
 pub(crate) mod murmur_md;
@@ -73,6 +74,7 @@ pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 // same facade shape `check_staged_runtime_floor` has, without making the module's internals
 // (`shebang_interpreter_name`, the probe, the prefix helpers) part of any crate's API.
 pub use errors::{RuntimeError, UnreachableEntrypoint};
+pub use lanes::TaskLane;
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
 // The types and header names are flat; `origin::from_wire` and `origin::stamp_for_peer` stay
