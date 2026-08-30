@@ -214,7 +214,7 @@ fn stage(home: &TempDir, project_dir: &Path, manifest_path: &Path) -> StagedSess
 
 /// The happy path: one declared WASM tool, one scripted call. The result reaches the model
 /// inside the fence, named by the tool it came from, with the tool's own bytes verbatim between
-/// the markers — and the `tool_result` block around it is shaped exactly as before.
+/// the markers — inside a `tool_result` block the fence does not reshape.
 #[test]
 fn wasm_tool_result_reaches_the_model_fenced_and_named() {
     let server = common::ScriptedServer::start(vec![
@@ -285,8 +285,7 @@ fn wasm_tool_result_reaches_the_model_fenced_and_named() {
     );
 }
 
-/// The acceptance case: a tool whose output spells the closing marker and then poses as a new
-/// instruction. The forged marker is rewritten before the fence closes, stays visible as
+/// A tool whose output spells the closing marker and then poses as a new instruction. The forged marker is rewritten before the fence closes, stays visible as
 /// rewritten text, and everything it was trying to escape stays inside the block.
 #[test]
 fn hostile_tool_output_cannot_close_the_fence_early() {

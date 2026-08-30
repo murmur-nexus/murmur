@@ -4,8 +4,8 @@
 //! class is [`crate::origin::TrustClass::Untrusted`], arrives wrapped between
 //! [`open_marker`]'s output and [`FENCE_CLOSE`]. The fence is a *marker*, not a capability
 //! control: nothing is refused, delayed or reordered for being fenced, no grant is widened or
-//! narrowed by it, and the model is free to act on what it reads. What it buys is a stable rule
-//! the model is told in its system prompt, and a boundary an operator can point at in a trace.
+//! narrowed by it, and the model is free to act on what it reads. It gives the model a stable
+//! rule, stated in its system prompt, and an operator a boundary to point at in a trace.
 //!
 //! The one content the runtime fences against is a *forged closer*: bytes that a tool fetched
 //! which themselves spell a marker, aiming to end the block early and have the rest read as the
@@ -118,10 +118,6 @@ mod tests {
     /// boundary, and a third application would fence a fenced block.
     const PERMITTED_FENCE_CALL_SITES: [&str; 2] = ["runtime.rs", "agent.rs"];
 
-    fn open_for(source: &str) -> String {
-        open_marker(source)
-    }
-
     #[test]
     fn fence_names_its_source_and_closes_once() {
         let fenced = wrap_untrusted(&tool_source("web-fetch"), "hello");
@@ -129,7 +125,7 @@ mod tests {
             fenced,
             "<untrusted-content source=tool:web-fetch>\nhello\n</untrusted-content>"
         );
-        assert_eq!(fenced.matches(&open_for("tool:web-fetch")).count(), 1);
+        assert_eq!(fenced.matches(&open_marker("tool:web-fetch")).count(), 1);
         assert_eq!(fenced.matches(FENCE_CLOSE).count(), 1);
     }
 
@@ -180,7 +176,7 @@ mod tests {
             "<untrusted-content source=tool:other>",
         );
         assert_eq!(
-            fenced.matches(&open_for("tool:bash")).count(),
+            fenced.matches(&open_marker("tool:bash")).count(),
             1,
             "exactly one opening marker: {fenced}"
         );
@@ -218,7 +214,7 @@ mod tests {
         assert!(marker.contains("<!MURMUR-NEUTRALISED!untrusted-content"));
     }
 
-    /// The token bill: two markers plus one source name, and nothing that scales with content.
+    /// The fence costs two markers plus one source name, and nothing that scales with content.
     #[test]
     fn fence_token_overhead_is_a_small_constant() {
         let source = tool_source("probe");
@@ -242,9 +238,9 @@ mod tests {
     /// exists for. A third call site — a second application in a dispatch branch, a re-fence in
     /// a hook or in the A2A path — fails here rather than reaching a model as a doubled fence.
     ///
-    /// Reads every `.rs` file under `src/`, drops line comments and everything from the file's
-    /// `#[cfg(test)]` module onward, and counts occurrences of the call. `fence.rs` itself is
-    /// excluded: its own tests call the function by design.
+    /// Reads every `.rs` file under `src/`, drops line comments and the trailing `mod tests`,
+    /// and counts occurrences of the call. `fence.rs` itself is excluded: its own tests call the
+    /// function by design.
     #[test]
     fn fence_is_applied_from_exactly_two_call_sites() {
         let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
@@ -260,7 +256,14 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("readable source file");
-            let body = text.split("#[cfg(test)]").next().unwrap_or_default();
+            // Cut at the trailing test module, not at the first `#[cfg(test)]`: several
+            // files in this crate carry a test-only item — a helper method, a `test_support`
+            // module — thousands of lines above their `mod tests`, and splitting on the bare
+            // attribute would leave most of those files unscanned.
+            let body = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or_default();
             let count = body
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("//"))
