@@ -1689,6 +1689,8 @@ dependencies = [
  "murmur-artifact",
  "serde",
  "serde_json",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]

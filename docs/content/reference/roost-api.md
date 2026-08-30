@@ -56,7 +56,7 @@ Resolve a capsule from the registry, stage it, and launch it. The response retur
 | `name` | string | yes | Capsule name; must be in the applicable allow list |
 | `version` | string | yes | Capsule version |
 | `workdir` | string | yes | Absolute path to an existing directory; used as the spawned capsule's session workdir |
-| `spawned_by` | string | no | Session ID of the capsule making the request. Selects which allow list applies — see [Per-session allow lists](#per-session-allow-lists) |
+| `spawned_by` | string | no | Session ID of the capsule making the request. Selects both the allow list that applies — see [Per-session allow lists](#per-session-allow-lists) — and the capability ceiling the spawned capsule is held to — see [Spawn envelope](#spawn-envelope) |
 
 **Success — `200 OK`**
 
@@ -75,6 +75,7 @@ Resolve a capsule from the registry, stage it, and launch it. The response retur
 |---|---|
 | `400 Bad Request` | Body is not valid JSON, or a required field is missing |
 | `403 Forbidden` | `name` is not in the applicable allow list, or `spawned_by` names a job the daemon does not know |
+| `403 Forbidden` | The capsule's manifest declares more capability than the spawning capsule holds — see [Spawn envelope](#spawn-envelope) |
 | `500 Internal Server Error` | The capsule could not be resolved from the registry, staged or launched, or it did not bind a port within 60 seconds |
 
 ---
@@ -123,8 +124,45 @@ A capsule that sets `spawned_by` can spawn only the names listed in its *own* ma
 
 A `spawned_by` the daemon does not recognise is refused with `403`; it falls back to no other list.
 
+---
+
+## Spawn envelope
+
+`spawned_by` selects two decisions, not one. The allow list above answers *which* capsules the spawning capsule may spawn. The envelope answers *how much* any of them may hold: the daemon lowers the child's registry manifest and refuses the request when the child would hold more capability than its parent on any axis.
+
+The comparison runs after the name check and before the child's workload is staged, created or launched. A refused spawn leaves no session directory, no trace and no job record.
+
+| Axis | Manifest key | Rule |
+|---|---|---|
+| Network allow | `capabilities.network.allow` | Every child entry is covered by a parent entry. A bare `example.com` covers `https://example.com`; a parent entry of `https://example.com` covers only that exact form, because the bare form spans both schemes and every port |
+| Unix sockets | `capabilities.network.unix_sockets` | A child `true` requires a parent `true` |
+| Peer-fetch allow | `capabilities.peer_fetch.allow` | The coverage rule above, applied to the separate list |
+| Shell allow | `capabilities.shell.allow` | Every child binary name appears in the parent's list |
+| Spawn allow | `capabilities.spawn.allow` | Every child capsule name appears in the parent's list |
+| Env allow | `capabilities.env.allow` | Every child variable name appears in the parent's list |
+| Filesystem scope | `capabilities.filesystem.scope` | A parent that declares no scope holds the whole workdir and covers anything. A parent that declares one covers a child scope equal to it or beneath it, and refuses a child that declares none |
+| Workdir exec | `capabilities.filesystem.workdir_exec` | A child `true` requires a parent `true` |
+| State stores | `capabilities.state.store` | Every store the child's artifacts would open is one the parent's artifacts also open. An artifact that declares `state:` without a `store:` opens a store named after its own capsule |
+| Containment | `capabilities.containment` | The child's floor is at or above the parent's |
+
+Containment is the one axis where a difference in the child's favour is allowed. A floor is a requirement rather than a grant, so it may only rise: a `scoped` parent may spawn a `sealed` child, and a child that declares `advisory` under a `scoped` parent is refused.
+
+A mismatch on any other axis is refused rather than narrowed to fit. Fix it by widening the parent's declaration or narrowing the child's.
+
+A refusal names the manifest key and the child declaration that exceeded:
+
+```json
+{
+  "error": "capabilities.network.allow: the child declares 'api.example.com', which its parent does not hold — a spawned capsule can never hold more capability than the capsule that spawned it"
+}
+```
+
+The grants compared are the ones in the manifest the daemon resolves from the registry. The request body carries no manifest and no capability declaration, and any extra keys in it are ignored.
+
+A request with no `spawned_by` has no parent to be within: the global `--spawn-allow` list is the only gate, and the capsule's own grants are compared against nothing.
+
 !!! note "Trust boundary"
-    Within a single-machine local deployment the process boundary is the trust boundary. A capsule can claim any known session ID as `spawned_by` and receive that session's allow list.
+    Within a single-machine local deployment the process boundary is the trust boundary. `spawned_by` is self-asserted: a capsule can claim any known session ID and receive both that session's allow list and, as its ceiling, that session's [spawn envelope](#spawn-envelope). A caller that names a better-provisioned session is compared against that session's grants, so the envelope bounds what a *named* parent holds rather than what the caller holds.
 
 ---
 
