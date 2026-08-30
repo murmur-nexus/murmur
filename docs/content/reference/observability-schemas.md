@@ -268,6 +268,7 @@ loop has exited, on every exit path
 | `task_id` | string | Task ID returned by the peer |
 | `context_id` | string | Context ID returned by the peer |
 | `traceparent` | string \| null | W3C `traceparent` injected on the outgoing request |
+| `trust` | string | `"trusted"` \| `"untrusted"` — the class the sending runtime stamped on `x-murmur-task-trust`, which is the class the sending capsule's own task ran under. The receiving capsule records the same value as `task_start.trust` |
 
 **`task_start`** — written at the start of each task, before the agent loop runs
 
@@ -275,7 +276,9 @@ loop has exited, on every exit path
 |---|---|---|
 | `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
 | `context_id` | string | Context UUID for this task |
-| `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path |
+| `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path — which door the task came through |
+| `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
+| `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for

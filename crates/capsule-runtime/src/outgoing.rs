@@ -2,6 +2,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::a2a::A2aTask;
+use crate::origin::{stamp_for_peer, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 
 pub(crate) struct OutgoingMessage {
     pub message_id: String,
@@ -13,10 +14,17 @@ pub(crate) struct OutgoingMessage {
 ///
 /// `peer_url` is in "localhost:{port}" or "http://localhost:{port}" format.
 /// `traceparent` is the W3C traceparent header value (omitted if None).
+///
+/// `sender_task` is the sending capsule's own current task, `None` when no task is in scope.
+/// Its trust class is stamped on the request so the receiver inherits it rather than reclassifying
+/// the message as fresh — that is what keeps untrust from evaporating at the first hop. `None`
+/// stamps `untrusted`, the safe class. The origin stamped is always `peer`; the guest supplies
+/// neither header and has no field in `murmur:message/send` to supply one from.
 pub(crate) async fn send_a2a_message(
     peer_url: &str,
     message: OutgoingMessage,
     traceparent: Option<String>,
+    sender_task: Option<TaskProvenance>,
 ) -> Result<A2aTask, String> {
     let addr = parse_host_port(peer_url)?;
 
@@ -47,6 +55,12 @@ pub(crate) async fn send_a2a_message(
     if let Some(ref tp) = traceparent {
         request.push_str(&format!("traceparent: {tp}\r\n"));
     }
+    let stamped = stamp_for_peer(sender_task);
+    request.push_str(&format!(
+        "{PEER_ORIGIN_HEADER}: {}\r\n{PEER_TRUST_HEADER}: {}\r\n",
+        stamped.origin().as_str(),
+        stamped.trust().as_str(),
+    ));
     request.push_str("\r\n");
     request.push_str(&body);
 
@@ -239,4 +253,88 @@ async fn read_raw_response(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::origin::{TaskOrigin, TrustClass};
+
+    /// Accept one connection, read the request head, and answer a minimal `message/send` result.
+    async fn capture_one_request(listener: tokio::net::TcpListener) -> String {
+        let (mut stream, _) = listener.accept().await.expect("peer should connect");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            match stream.read_exact(&mut byte).await {
+                Ok(_) => head.push(byte[0]),
+                Err(_) => break,
+            }
+        }
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "req_1",
+            "result": {
+                "id": "tsk_peer",
+                "contextId": "ctx_peer",
+                "status": {"state": "submitted"}
+            }
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    async fn request_head_for(sender_task: Option<TaskProvenance>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind an ephemeral port");
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(capture_one_request(listener));
+
+        let message = OutgoingMessage {
+            message_id: "msg_1".to_string(),
+            context_id: None,
+            text: "hello".to_string(),
+        };
+        send_a2a_message(&addr, message, None, sender_task)
+            .await
+            .expect("peer should answer with a task");
+        server.await.expect("capture task should not panic")
+    }
+
+    /// The sending runtime stamps the class of its own current task, and the guest has no say:
+    /// `murmur:message/send` carries no origin or trust field for a capsule author to set.
+    #[tokio::test]
+    async fn outbound_send_stamps_the_senders_own_trust_class() {
+        let cases = [
+            (
+                Some(TaskProvenance::derive(
+                    TaskOrigin::Event,
+                    Some(TrustClass::Untrusted),
+                )),
+                "untrusted",
+            ),
+            (
+                Some(TaskProvenance::derive(TaskOrigin::User, None)),
+                "trusted",
+            ),
+            (None, "untrusted"),
+        ];
+        for (sender_task, expected_trust) in cases {
+            let head = request_head_for(sender_task).await;
+            assert!(
+                head.contains(&format!("{PEER_ORIGIN_HEADER}: peer\r\n")),
+                "outbound origin must always be peer; head was:\n{head}"
+            );
+            assert!(
+                head.contains(&format!("{PEER_TRUST_HEADER}: {expected_trust}\r\n")),
+                "expected {expected_trust} for {sender_task:?}; head was:\n{head}"
+            );
+        }
+    }
 }

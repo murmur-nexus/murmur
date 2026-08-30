@@ -121,11 +121,25 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
 
 /// Send an HTTP POST with a JSON body; return the parsed JSON response body.
 fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
+    http_post_json_with_headers(addr, path, body, &[])
+}
+
+/// The same POST with extra request headers, for the two provenance headers the peer door reads.
+fn http_post_json_with_headers(
+    addr: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Value {
     let mut stream = TcpStream::connect(addr).expect("should connect");
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("\r\n{body}"));
     stream.write_all(request.as_bytes()).unwrap();
     stream.flush().unwrap();
 
@@ -310,6 +324,179 @@ fn a2a_second_message_send_is_rejected() {
     );
 
     handle.join().expect("launch thread should not panic");
+}
+
+/// The single `task_start` line a completed session wrote.
+fn task_start_line(workdir: &Path) -> Value {
+    let trace = fs::read_to_string(workdir.join("trace.jsonl")).expect("trace.jsonl should exist");
+    trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["event_type"] == "task_start")
+        .unwrap_or_else(|| panic!("no task_start event in:\n{trace}"))
+}
+
+/// Launch a capsule, POST one `message/send` carrying `headers`, and return its `task_start`.
+fn task_start_for_inbound_message(headers: &[(&str, &str)]) -> Value {
+    let server = end_turn_server("provenance probe done");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+    let staged = stage_agent(&home, &manifest_path);
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("timed out waiting for capsule_url");
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "message/send",
+        "params": {
+            "message": {
+                "messageId": "provenance-msg",
+                "role": "user",
+                "parts": [{"text": "classify me"}]
+            }
+        }
+    })
+    .to_string();
+    let response = http_post_json_with_headers(&capsule_url, "/", &body, headers);
+    assert_eq!(
+        response["result"]["status"]["state"], "submitted",
+        "an origin claim must not change the JSON-RPC response; got: {response}"
+    );
+
+    let launched = handle.join().expect("launch thread should not panic");
+    task_start_line(&launched.workdir)
+}
+
+/// A local `mur run` is a person handing the capsule an instruction, so `user` / `trusted` —
+/// and `source` keeps saying which door it came through.
+#[test]
+fn task_md_task_start_records_user_and_trusted() {
+    if common::skip_without_host_support("task_md_task_start_records_user_and_trusted") {
+        return;
+    }
+    let server = end_turn_server("task.md provenance");
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let staged = stage_agent(&home, &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "Run the fallback task").unwrap();
+
+    let launched = launch_session(staged, |_| {}).expect("launch with task.md should succeed");
+
+    let event = task_start_line(&launched.workdir);
+    assert_eq!(event["origin"], "user", "got: {event}");
+    assert_eq!(event["trust"], "trusted", "got: {event}");
+    assert_eq!(event["source"], "task_md", "got: {event}");
+    assert!(
+        event["context_id"].as_str().is_some_and(|c| !c.is_empty()),
+        "context_id should still be written; got: {event}"
+    );
+    assert!(
+        event["message_parts_bytes"].as_u64().is_some_and(|b| b > 0),
+        "message_parts_bytes should still be written; got: {event}"
+    );
+}
+
+/// A message with no origin claim carries third-party text as far as the runtime knows.
+#[test]
+fn inbound_message_without_headers_is_an_untrusted_event() {
+    if common::skip_without_host_support("inbound_message_without_headers_is_an_untrusted_event") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[]);
+    assert_eq!(event["origin"], "event", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
+    assert_eq!(event["source"], "a2a", "got: {event}");
+}
+
+/// The case the whole classification exists for: untrust survives the hop.
+#[test]
+fn inbound_untrusted_peer_message_stays_untrusted() {
+    if common::skip_without_host_support("inbound_untrusted_peer_message_stays_untrusted") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[
+        ("x-murmur-task-origin", "peer"),
+        ("x-murmur-task-trust", "untrusted"),
+    ]);
+    assert_eq!(event["origin"], "peer", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
+    assert_eq!(event["source"], "a2a", "got: {event}");
+}
+
+/// The receiver inherits rather than hard-coding a constant.
+#[test]
+fn inbound_trusted_peer_message_stays_trusted() {
+    if common::skip_without_host_support("inbound_trusted_peer_message_stays_trusted") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[
+        ("x-murmur-task-origin", "peer"),
+        ("x-murmur-task-trust", "trusted"),
+    ]);
+    assert_eq!(event["origin"], "peer", "got: {event}");
+    assert_eq!(event["trust"], "trusted", "got: {event}");
+}
+
+/// An absent claim is not a trusted one.
+#[test]
+fn inbound_peer_message_without_a_trust_header_is_untrusted() {
+    if common::skip_without_host_support("inbound_peer_message_without_a_trust_header_is_untrusted")
+    {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[("x-murmur-task-origin", "peer")]);
+    assert_eq!(event["origin"], "peer", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
+}
+
+/// `system` is enqueued by the runtime for itself and never arrives over the peer door, so a
+/// caller claiming it is classified as what it actually is: an untyped inbound event.
+#[test]
+fn inbound_claim_to_a_locally_only_origin_is_refused() {
+    if common::skip_without_host_support("inbound_claim_to_a_locally_only_origin_is_refused") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[
+        ("x-murmur-task-origin", "system"),
+        ("x-murmur-task-trust", "trusted"),
+    ]);
+    assert_eq!(event["origin"], "event", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
+}
+
+#[test]
+fn inbound_claim_to_user_origin_is_refused() {
+    if common::skip_without_host_support("inbound_claim_to_user_origin_is_refused") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[
+        ("x-murmur-task-origin", "user"),
+        ("x-murmur-task-trust", "trusted"),
+    ]);
+    assert_eq!(event["origin"], "event", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
+}
+
+#[test]
+fn inbound_unrecognised_origin_claim_is_refused() {
+    if common::skip_without_host_support("inbound_unrecognised_origin_claim_is_refused") {
+        return;
+    }
+    let event = task_start_for_inbound_message(&[
+        ("x-murmur-task-origin", "not-an-origin"),
+        ("x-murmur-task-trust", "trusted"),
+    ]);
+    assert_eq!(event["origin"], "event", "got: {event}");
+    assert_eq!(event["trust"], "untrusted", "got: {event}");
 }
 
 #[test]

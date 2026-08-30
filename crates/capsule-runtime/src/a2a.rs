@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use crate::origin::TaskProvenance;
+
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,6 +340,9 @@ pub(crate) struct IncomingTask {
     pub message_id: String,
     pub message_text: String,
     pub traceparent: Option<String>,
+    /// Why this task woke the capsule, classified at the door from the request headers. Every
+    /// inbound task has one: a caller that claims nothing is an untrusted `event`.
+    pub provenance: TaskProvenance,
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

@@ -57,6 +57,7 @@ use crate::{
         validate_filesystem_scope, HookCapabilityGrant, NetworkAllowRule, RequestTarget,
         ToolCapabilityGrant,
     },
+    origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
     outgoing, resources, sandbox,
     sealed::UsernsGrant,
@@ -1412,6 +1413,7 @@ pub fn launch_session(
                         capability_policy,
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
+                        current_task_provenance: None,
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                         a2a_task_id: None,
@@ -1503,9 +1505,12 @@ pub fn launch_session(
                                         .await
                                         .map(|m| m.len())
                                         .unwrap_or(0);
+                                    let provenance =
+                                        TaskProvenance::derive(TaskOrigin::User, None);
                                     let _ = trace
                                         .write_task_start(
-                                            &task_id, &context_id, "task_md", bytes,
+                                            &task_id, &context_id, "task_md", provenance,
+                                            bytes,
                                         )
                                         .await;
                                     let seed = hooks
@@ -1527,6 +1532,7 @@ pub fn launch_session(
                                         .await;
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
+                                    state.current_task_provenance = Some(provenance);
                                     // run_task_with_reopens fires on-task-end, honors any
                                     // reopen-task within budget, and writes the terminal
                                     // task_end (with reopen_count) itself.
@@ -1567,9 +1573,12 @@ pub fn launch_session(
                                         .await
                                         .map(|m| m.len())
                                         .unwrap_or(0);
+                                    let provenance =
+                                        TaskProvenance::derive(TaskOrigin::User, None);
                                     let _ = trace
                                         .write_task_start(
-                                            &task_id, &context_id, "task_md", bytes,
+                                            &task_id, &context_id, "task_md", provenance,
+                                            bytes,
                                         )
                                         .await;
                                     let seed = hooks
@@ -1591,6 +1600,7 @@ pub fn launch_session(
                                         .await;
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
+                                    state.current_task_provenance = Some(provenance);
                                     let result = run_task_with_reopens(
                                         &mut state,
                                         &workdir,
@@ -1713,6 +1723,7 @@ pub fn launch_session(
                                 &incoming.task_id,
                                 &incoming.context_id,
                                 "a2a",
+                                incoming.provenance,
                                 incoming.message_text.len() as u64,
                             )
                             .await;
@@ -1737,6 +1748,7 @@ pub fn launch_session(
                         // ── RUN AGENT LOOP ──
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
+                        state.current_task_provenance = Some(incoming.provenance);
                         state.a2a_task_id = Some(incoming.task_id.clone());
                         let loop_result = run_task_with_reopens(
                             &mut state,
@@ -1935,6 +1947,7 @@ pub fn launch_session(
         capability_policy: staged.capability_policy,
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent: None,
+        current_task_provenance: None,
         a2a_task_registry: None,
         a2a_sse: None,
         a2a_task_id: None,
@@ -2015,7 +2028,7 @@ pub fn launch_session(
             )
             .await
             {
-                for (peer_url, message_id, task_id, context_id, traceparent) in pending {
+                for (peer_url, message_id, task_id, context_id, traceparent, trust) in pending {
                     let _ = trace
                         .write_a2a_send(
                             &peer_url,
@@ -2023,6 +2036,7 @@ pub fn launch_session(
                             &task_id,
                             &context_id,
                             traceparent.as_deref(),
+                            trust,
                         )
                         .await;
                 }
@@ -2777,8 +2791,9 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) session_id: String,
     /// Buffered outgoing A2A send events — drained into trace.jsonl after the capsule run.
-    /// (peer_url, message_id, task_id, context_id, traceparent)
-    pub(crate) pending_a2a_events: Vec<(String, String, String, String, Option<String>)>,
+    /// (peer_url, message_id, task_id, context_id, traceparent, trust)
+    pub(crate) pending_a2a_events:
+        Vec<(String, String, String, String, Option<String>, TrustClass)>,
     pub(crate) capability_policy: CapabilityPolicy,
     /// Host-detected kernel enforcement tier + resolved network allowlist IPs for this
     /// session's shell subprocesses. Kept separate from `CapabilityPolicy` (which stays
@@ -2787,6 +2802,12 @@ pub(crate) struct CapsuleStoreState {
     /// W3C traceparent for outgoing murmur:message/send calls — set by the runtime loop
     /// after each begin_session so the active session span propagates to peer capsules.
     pub(crate) current_traceparent: Option<String>,
+    /// Why the task now in scope woke this capsule, set by the task loop beside
+    /// `current_traceparent`. An outgoing peer message stamps this task's trust class, so the
+    /// receiver inherits it instead of reclassifying the message as fresh. `None` on the
+    /// script-capsule path, which runs no task loop and so has no task in scope — that stamps
+    /// `untrusted`, the safe class.
+    pub(crate) current_task_provenance: Option<TaskProvenance>,
     // ── A2A request-input support ────────────────────────────────────────────────
     /// Shared task registry — Some in A2A mode, None for script capsules.
     pub(crate) a2a_task_registry: Option<Arc<Mutex<TaskRegistry>>>,
@@ -2932,11 +2953,16 @@ impl send::Host for CapsuleStoreState {
         // send_a2a_message is async; use block_in_place so we can call it from this sync
         // host function while inside a multi-thread Tokio runtime (script capsule path).
         let traceparent = self.current_traceparent.clone();
+        // The sending runtime's own current task, read off the store state the task loop writes
+        // it to. `murmur:message/send` is linked only on the script-capsule path, which runs no
+        // task loop, so this is `None` there and stamps `untrusted`.
+        let sender_task = self.current_task_provenance;
         let task = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(outgoing::send_a2a_message(
                 &peer_url,
                 outgoing_msg,
                 traceparent.clone(),
+                sender_task,
             ))
         })?;
 
@@ -2946,6 +2972,7 @@ impl send::Host for CapsuleStoreState {
             task.id.clone(),
             task.context_id.clone(),
             traceparent,
+            stamp_for_peer(sender_task).trust(),
         ));
         Ok(send::TaskResult {
             task_id: task.id,
@@ -5810,6 +5837,7 @@ inference:
             capability_policy: CapabilityPolicy::default(),
             shell_enforcement: sandbox::ShellEnforcement::environment_only(),
             current_traceparent: None,
+            current_task_provenance: None,
             a2a_task_registry: None,
             a2a_sse: None,
             a2a_task_id: None,
@@ -7248,7 +7276,13 @@ inference:
 
         // Caller resets per-task counters via write_task_start before the reopen loop.
         trace
-            .write_task_start("tsk_1", "ctx_1", "task_md", 8)
+            .write_task_start(
+                "tsk_1",
+                "ctx_1",
+                "task_md",
+                TaskProvenance::derive(TaskOrigin::User, None),
+                8,
+            )
             .await
             .unwrap();
 
@@ -7459,7 +7493,13 @@ inference:
         };
 
         trace
-            .write_task_start("tsk_1", "ctx_1", "task_md", 8)
+            .write_task_start(
+                "tsk_1",
+                "ctx_1",
+                "task_md",
+                TaskProvenance::derive(TaskOrigin::User, None),
+                8,
+            )
             .await
             .unwrap();
 
