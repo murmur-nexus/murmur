@@ -7,6 +7,10 @@ description = "HTTP host daemon that spawns and manages Murmur capsule worker se
 repository.workspace = true
 readme.workspace = true
 
+[lib]
+name = "mur_roost"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mur-roost"
 path = "src/main.rs"
@@ -16,3 +20,7 @@ capsule-runtime.workspace = true
 murmur-artifact.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
