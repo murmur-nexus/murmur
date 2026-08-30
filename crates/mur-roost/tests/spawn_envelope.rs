@@ -6,16 +6,21 @@
 //! refusal a caller receives.
 //!
 //! The parent's envelope is seeded straight into the job store, which is exactly where a real
-//! parent's envelope comes from: `spawned_by` is self-asserted and unauthenticated, so a test that
-//! writes the record directly is not weaker than one that spawns a parent first.
+//! parent's envelope comes from, and a credential is minted for it from the daemon's own
+//! authority — the same two facts a launched parent would leave behind. The referee itself now
+//! runs at `POST /delegate`, so [`Daemon::spawn`] performs the whole exchange and returns the
+//! first refusal it meets.
+//!
+//! What binds a caller to a session, and an approval to an artifact, is asserted in
+//! `spawn_binding.rs`. Here the question is only what the referee compares.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use capsule_runtime::SpawnEnvelope;
-use mur_roost::{JobRecord, JobStatus, State};
+use capsule_runtime::{SpawnEnvelope, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER};
+use mur_roost::{authority::SpawnAuthority, JobRecord, JobStatus, RequestHeaders, State};
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeManifest, RuntimeType};
 use tempfile::TempDir;
 
@@ -101,6 +106,7 @@ impl Daemon {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry.path().to_path_buf(),
             spawn_allow,
+            authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         Self {
             state,
@@ -123,18 +129,83 @@ impl Daemon {
         publish_capsule(self.registry.path(), name, body);
     }
 
+    /// A credential minted by this daemon for the named session, exactly as the session's own
+    /// runtime would have received it at launch.
+    fn credential(&self, session_id: &str) -> String {
+        self.state
+            .authority
+            .mint_credential_token(session_id)
+            .unwrap()
+    }
+
+    /// The whole exchange a runtime performs: `/delegate` for an approval, then `/spawn` to redeem
+    /// it. A refusal at either step is the response, so a test asserting the referee's wording
+    /// asserts what a caller actually receives.
+    ///
+    /// `spawned_by: None` is the operator's top-level path, which carries no headers at all.
     fn spawn(&self, name: &str, spawned_by: Option<&str>) -> Response {
+        let Some(session_id) = spawned_by else {
+            return self.post_spawn(&self.spawn_body(name, None), None, None);
+        };
+        let credential = self.credential(session_id);
+        let delegation = self.delegate(name, "0.1.0", Some(&credential));
+        if delegation.status != 200 {
+            return delegation;
+        }
+        let approval = delegation.body["approval"].as_str().unwrap().to_string();
+        self.post_spawn(
+            &self.spawn_body(name, Some(session_id)),
+            Some(&credential),
+            Some(&approval),
+        )
+    }
+
+    fn spawn_body(&self, name: &str, spawned_by: Option<&str>) -> String {
         let spawned_by = spawned_by
             .map(|id| format!(r#","spawned_by":"{id}""#))
             .unwrap_or_default();
-        self.post(&format!(
+        format!(
             r#"{{"name":"{name}","version":"0.1.0","workdir":{}{spawned_by}}}"#,
             serde_json::to_string(&self.workdir.path().display().to_string()).unwrap(),
+        )
+    }
+
+    fn delegate(&self, name: &str, version: &str, credential: Option<&str>) -> Response {
+        self.post_delegate(
+            &format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            credential,
+        )
+    }
+
+    fn post_delegate(&self, body: &str, credential: Option<&str>) -> Response {
+        let mut headers = RequestHeaders::new();
+        if let Some(credential) = credential {
+            headers.insert(SPAWN_CREDENTIAL_HEADER, credential);
+        }
+        Response::parse(&mur_roost::route(
+            "POST",
+            "/delegate",
+            &headers,
+            body,
+            &self.state,
         ))
     }
 
-    fn post(&self, body: &str) -> Response {
-        Response::parse(&mur_roost::route("POST", "/spawn", body, &self.state))
+    fn post_spawn(&self, body: &str, credential: Option<&str>, approval: Option<&str>) -> Response {
+        let mut headers = RequestHeaders::new();
+        if let Some(credential) = credential {
+            headers.insert(SPAWN_CREDENTIAL_HEADER, credential);
+        }
+        if let Some(approval) = approval {
+            headers.insert(SPAWN_APPROVAL_HEADER, approval);
+        }
+        Response::parse(&mur_roost::route(
+            "POST",
+            "/spawn",
+            &headers,
+            body,
+            &self.state,
+        ))
     }
 }
 
@@ -458,13 +529,14 @@ fn a_manifest_supplied_in_the_request_is_not_consulted() {
         "worker",
         "artifacts: []\ncapabilities:\n  network:\n    allow: [api.example.com]\n",
     );
+    let credential = daemon.credential(PARENT_SESSION);
 
-    let response = daemon.post(&format!(
-        r#"{{"name":"worker","version":"0.1.0","workdir":{},"spawned_by":"{PARENT_SESSION}",
-            "manifest":{{"name":"worker","version":"0.1.0","capabilities":{{"network":{{"allow":["registry.internal"]}}}}}},
-            "capabilities":{{"network":{{"allow":["registry.internal"]}}}}}}"#,
-        serde_json::to_string(&daemon.workdir.path().display().to_string()).unwrap(),
-    ));
+    let response = daemon.post_delegate(
+        r#"{"name":"worker","version":"0.1.0",
+            "manifest":{"name":"worker","version":"0.1.0","capabilities":{"network":{"allow":["registry.internal"]}}},
+            "capabilities":{"network":{"allow":["registry.internal"]}}}"#,
+        Some(&credential),
+    );
 
     assert_eq!(response.status, 403);
     assert!(

@@ -15,6 +15,7 @@ use crate::{
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
+    spawn_credential::SpawnCredential,
 };
 
 pub(crate) struct DispatchOutcome {
@@ -426,6 +427,25 @@ pub struct StagedSession {
     /// stops when the session's `StagedSession` drops. `launch_session` moves the other
     /// fields out one by one, which leaves this one in place until the session returns.
     pub(crate) _epoch_ticker: EpochTicker,
+    /// The credential this session presents when it asks `mur-roost` to spawn a capsule.
+    ///
+    /// `None` for every session that cannot delegate, which is nearly all of them. Set by the
+    /// caller between `stage_session` and `launch_session` rather than carried in
+    /// [`StageRequest`]: the credential names a session id, and `stage_session` is what mints one,
+    /// so it cannot exist before staging returns.
+    pub(crate) spawn_credential: Option<SpawnCredential>,
+}
+
+impl StagedSession {
+    /// Hands this session the credential it will present to the spawning daemon.
+    pub fn set_spawn_credential(&mut self, credential: SpawnCredential) {
+        self.spawn_credential = Some(credential);
+    }
+
+    /// The credential this session presents, if it was granted one.
+    pub fn spawn_credential(&self) -> Option<&SpawnCredential> {
+        self.spawn_credential.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

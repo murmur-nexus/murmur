@@ -1685,10 +1685,14 @@ dependencies = [
 name = "mur-roost"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "capsule-runtime",
+ "getrandom 0.4.2",
+ "hmac",
  "murmur-artifact",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "zip",
 ]

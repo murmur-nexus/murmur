@@ -15,10 +15,17 @@ use std::{
 use capsule_runtime::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
     plan::{self, SchedulerContext, StepStatus},
-    CapabilityPolicy,
+    CapabilityPolicy, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
+
+/// A credential distinctive enough that a substring search over a whole workdir tree, and over
+/// every step result, is a meaningful search.
+const TEST_CREDENTIAL: &str = "msc1.CREDENTIALmustNEVERleakZZZ99.testsignature";
+
+/// The session id the delegating context asks as.
+const TEST_SESSION: &str = "ses_00000000000000000000000000000test";
 
 /// The `shell_allow` grant below is what makes every test built on this context need a delegated
 /// cgroup v2 scope: `plan::execute` bounds the plan's whole subprocess tree before running a step,
@@ -41,7 +48,8 @@ fn ctx<'a>(
             "flaky".to_string(),
         ]),
         capsule_versions: HashMap::from([("worker".to_string(), "0.1.0".to_string())]),
-        current_session_id: None,
+        current_session_id: Some(TEST_SESSION.to_string()),
+        spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
         invoke_tool,
     }
 }
@@ -553,12 +561,212 @@ fn test_join_point_waits_for_multiple_upstreams() {
     assert_eq!(find(&report, "join").output.as_deref(), Some("joined"));
 }
 
+/// The two tokens a delegated spawn travels on reach the daemon in headers, in the right order,
+/// and the approval presented is the one the delegation returned.
+#[test]
+fn test_capsule_step_delegates_before_it_spawns() {
+    if capsule_runtime::skip_without_host_support("test_capsule_step_delegates_before_it_spawns") {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("unused".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    assert!(report.completed, "{report:?}");
+    let paths: Vec<String> = fake_roost
+        .requests()
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(paths, vec!["/delegate".to_string(), "/spawn".to_string()]);
+
+    // The delegation asks about one capsule, by name and version, and proves who is asking.
+    let delegate = fake_roost.request("/delegate");
+    assert_eq!(delegate.body["name"], "worker");
+    assert_eq!(delegate.body["version"], "0.1.0");
+    assert_eq!(
+        delegate
+            .headers
+            .get(SPAWN_CREDENTIAL_HEADER)
+            .map(String::as_str),
+        Some(TEST_CREDENTIAL)
+    );
+    assert!(!delegate.headers.contains_key(SPAWN_APPROVAL_HEADER));
+
+    // The launch re-presents the credential alongside the approval it just earned.
+    let spawn = fake_roost.request("/spawn");
+    assert_eq!(
+        spawn
+            .headers
+            .get(SPAWN_CREDENTIAL_HEADER)
+            .map(String::as_str),
+        Some(TEST_CREDENTIAL)
+    );
+    assert_eq!(
+        spawn.headers.get(SPAWN_APPROVAL_HEADER).map(String::as_str),
+        Some(TEST_APPROVAL)
+    );
+    assert_eq!(spawn.body["spawned_by"], TEST_SESSION);
+}
+
+/// A session that was never granted a credential cannot delegate, and says so before it opens a
+/// connection.
+#[test]
+fn test_capsule_step_without_a_credential_asks_for_nothing() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_without_a_credential_asks_for_nothing",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("unused".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
+    );
+
+    let mut context = ctx(dir.path().to_path_buf(), &invoke);
+    context.spawn_credential = None;
+    let report = plan::execute(&plan, &context);
+    std::env::remove_var("MURMUR_ROOST_URL");
+
+    assert!(!report.completed, "{report:?}");
+    let error = find(&report, "worker").error.clone().unwrap();
+    assert!(error.contains("holds no spawn credential"), "{error}");
+    assert!(error.contains("capabilities.spawn.allow"), "{error}");
+    assert!(
+        fake_roost.requests().is_empty(),
+        "{:?}",
+        fake_roost
+            .requests()
+            .into_iter()
+            .map(|request| request.path)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The credential the runtime presents is unreadable by the agent: it reaches no file under the
+/// workdir and no step result, on the success path and on the client's error path alike.
+#[test]
+fn test_the_spawn_credential_reaches_no_file_and_no_step_result() {
+    if capsule_runtime::skip_without_host_support(
+        "test_the_spawn_credential_reaches_no_file_and_no_step_result",
+    ) {
+        return;
+    }
+    assert_eq!(
+        format!("{:?}", SpawnCredential::new(TEST_CREDENTIAL.to_string())),
+        "SpawnCredential(<redacted>)"
+    );
+
+    for refuse_spawn in [false, true] {
+        let _guard = roost_env_lock().lock().unwrap();
+        let dir = tempdir().unwrap();
+        let fake_roost = if refuse_spawn {
+            FakeRoost::refusing_spawn()
+        } else {
+            FakeRoost::start()
+        };
+        std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+        let invoke = |_name: &str, _input: ToolInput| {
+            Ok(tool_result(
+                ToolStatus::Passed,
+                Some("unused".to_string()),
+                None,
+            ))
+        };
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id":"p",
+                "steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]
+            }),
+        );
+
+        let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+        std::env::remove_var("MURMUR_ROOST_URL");
+
+        assert_eq!(report.completed, !refuse_spawn, "{report:?}");
+        for result in &report.results {
+            for text in [result.output.as_deref(), result.error.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    !text.contains(TEST_CREDENTIAL) && !text.contains(TEST_APPROVAL),
+                    "a step result carried token material (refuse_spawn={refuse_spawn}): {text}",
+                );
+            }
+        }
+        for (path, contents) in read_tree(dir.path()) {
+            assert!(
+                !contents.contains(TEST_CREDENTIAL) && !contents.contains(TEST_APPROVAL),
+                "{} carried token material (refuse_spawn={refuse_spawn})",
+                path.display(),
+            );
+        }
+    }
+}
+
+/// Every file beneath `root`, read as lossy UTF-8 so a binary file is still searchable.
+fn read_tree(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(read_tree(&path));
+        } else if let Ok(bytes) = fs::read(&path) {
+            found.push((path, String::from_utf8_lossy(&bytes).to_string()));
+        }
+    }
+    found
+}
+
+/// The approval this fake's `/delegate` hands back, and therefore the value its `/spawn` must be
+/// presented with.
+const TEST_APPROVAL: &str = "msa1.APPROVALmustNEVERleakYY88.testsignature";
+
+/// One request the fake received, kept whole so a test can assert on headers as well as body.
+#[derive(Clone)]
+struct RecordedRequest {
+    path: String,
+    headers: HashMap<String, String>,
+    body: Value,
+}
+
 /// A stand-in for mur-roost *and* the capsule it spawns, served on one loopback listener.
 ///
-/// `dispatch_capsule_step` speaks two protocols against this, in order: `POST /spawn` to
-/// mur-roost, which answers with the URL of the now-live capsule, then A2A JSON-RPC against that
-/// URL — `message/send` to hand over the task, then `tasks/get` polled until the state is
-/// terminal. Both are served here, routed on the request path.
+/// `dispatch_capsule_step` speaks two protocols against this, in order: `POST /delegate` and then
+/// `POST /spawn` to mur-roost, which answers with the URL of the now-live capsule, then A2A
+/// JSON-RPC against that URL — `message/send` to hand over the task, then `tasks/get` polled until
+/// the state is terminal. All are served here, routed on the request path.
 ///
 /// The server loop polls for connections rather than parking in a blocking `accept`, and every
 /// read it makes is bounded, so `drop` can always stop it. A fake that could only be stopped by
@@ -567,7 +775,7 @@ fn test_join_point_waits_for_multiple_upstreams() {
 /// then joins a thread waiting on a connection that is never coming.
 struct FakeRoost {
     url: String,
-    spawn_body: Arc<Mutex<Option<Value>>>,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
     sent_text: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
@@ -575,18 +783,28 @@ struct FakeRoost {
 
 impl FakeRoost {
     fn start() -> Self {
+        Self::start_with(false)
+    }
+
+    /// A fake whose `/spawn` refuses with `403` and echoes the request it received back in the
+    /// body, so the client's error path carries as much of the exchange as it ever could.
+    fn refusing_spawn() -> Self {
+        Self::start_with(true)
+    }
+
+    fn start_with(refuse_spawn: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{addr}");
         let capsule_url = format!("{url}/capsule");
 
-        let spawn_body = Arc::new(Mutex::new(None));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let sent_text = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let join = thread::spawn({
-            let spawn_body = Arc::clone(&spawn_body);
+            let requests = Arc::clone(&requests);
             let sent_text = Arc::clone(&sent_text);
             let shutdown = Arc::clone(&shutdown);
             move || {
@@ -607,52 +825,84 @@ impl FakeRoost {
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
 
-                    let (path, body) = read_http_request(&mut stream);
+                    let (path, headers, body) = read_http_request(&mut stream);
                     let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                    let response = if path == "/spawn" {
-                        *spawn_body.lock().unwrap() = Some(request);
-                        json!({ "capsule_url": capsule_url })
-                    } else {
-                        let id = request.get("id").cloned().unwrap_or(Value::Null);
-                        match request.get("method").and_then(Value::as_str) {
-                            Some("message/send") => {
-                                *sent_text.lock().unwrap() = Some(
-                                    request["params"]["message"]["parts"][0]["text"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                );
-                                json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
-                            }
-                            Some("tasks/get") => json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "id": "task-1",
-                                    "status": {"state": "completed"},
-                                    "artifacts": [{"parts": [{"text": "worker-output"}]}]
-                                }
+                    if path == "/delegate" || path == "/spawn" {
+                        requests.lock().unwrap().push(RecordedRequest {
+                            path: path.clone(),
+                            headers,
+                            body: request.clone(),
+                        });
+                    }
+                    let (status, response) = match path.as_str() {
+                        "/delegate" => (
+                            200,
+                            json!({"approval": TEST_APPROVAL, "expires_at_ms": 1_u64 << 42}),
+                        ),
+                        "/spawn" if refuse_spawn => (
+                            403,
+                            json!({
+                                "error": "spawn refused by the fake",
+                                "request": {"path": path, "body": request},
                             }),
-                            other => panic!("unexpected request {other:?} at {path}"),
+                        ),
+                        "/spawn" => (200, json!({ "capsule_url": capsule_url })),
+                        _ => {
+                            let id = request.get("id").cloned().unwrap_or(Value::Null);
+                            let body = match request.get("method").and_then(Value::as_str) {
+                                Some("message/send") => {
+                                    *sent_text.lock().unwrap() = Some(
+                                        request["params"]["message"]["parts"][0]["text"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                    );
+                                    json!({"jsonrpc": "2.0", "id": id, "result": {"id": "task-1"}})
+                                }
+                                Some("tasks/get") => json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "id": "task-1",
+                                        "status": {"state": "completed"},
+                                        "artifacts": [{"parts": [{"text": "worker-output"}]}]
+                                    }
+                                }),
+                                other => panic!("unexpected request {other:?} at {path}"),
+                            };
+                            (200, body)
                         }
                     };
-                    write_http_json(&mut stream, &response);
+                    write_http_json(&mut stream, status, &response);
                 }
             }
         });
 
         Self {
             url,
-            spawn_body,
+            requests,
             sent_text,
             shutdown,
             join: Some(join),
         }
     }
 
+    /// Every `/delegate` and `/spawn` the fake received, in order.
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The one request the fake received at `path`.
+    fn request(&self, path: &str) -> RecordedRequest {
+        self.requests()
+            .into_iter()
+            .find(|request| request.path == path)
+            .unwrap_or_else(|| panic!("no {path} request was made"))
+    }
+
     /// The body of the `POST /spawn` that asked mur-roost for the capsule.
     fn spawn_request(&self) -> Value {
-        self.spawn_body.lock().unwrap().clone().unwrap()
+        self.request("/spawn").body
     }
 
     /// The task text the step handed to the capsule over A2A `message/send`, exactly as it
@@ -678,15 +928,16 @@ fn roost_env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Read one HTTP request, returning its request-target path and its body.
-fn read_http_request(stream: &mut TcpStream) -> (String, String) {
+/// Read one HTTP request, returning its request-target path, its headers (keyed lowercase) and
+/// its body.
+fn read_http_request(stream: &mut TcpStream) -> (String, HashMap<String, String>, String) {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end;
     loop {
         let read = stream.read(&mut chunk).unwrap();
         if read == 0 {
-            return (String::new(), String::new());
+            return (String::new(), HashMap::new(), String::new());
         }
         buffer.extend_from_slice(&chunk[..read]);
         if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -702,14 +953,17 @@ fn read_http_request(stream: &mut TcpStream) -> (String, String) {
         .and_then(|request_line| request_line.split_whitespace().nth(1))
         .unwrap_or_default()
         .to_string();
-    let content_length = headers
+    let header_map: HashMap<String, String> = headers
         .lines()
-        .find_map(|line| {
+        .skip(1)
+        .filter_map(|line| {
             let (key, value) = line.split_once(':')?;
-            (key.eq_ignore_ascii_case("content-length"))
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+            Some((key.trim().to_ascii_lowercase(), value.trim().to_string()))
         })
+        .collect();
+    let content_length = header_map
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
 
     let mut body = buffer[header_end + 4..].to_vec();
@@ -723,14 +977,15 @@ fn read_http_request(stream: &mut TcpStream) -> (String, String) {
 
     (
         path,
+        header_map,
         String::from_utf8_lossy(&body[..content_length]).to_string(),
     )
 }
 
-fn write_http_json(stream: &mut TcpStream, body: &Value) {
+fn write_http_json(stream: &mut TcpStream, status: u16, body: &Value) {
     let body = body.to_string();
     let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );
