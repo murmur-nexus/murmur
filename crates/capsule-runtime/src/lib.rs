@@ -21,6 +21,7 @@ pub mod limits;
 pub(crate) mod murmur_md;
 pub mod network_namespace;
 pub(crate) mod network_policy;
+pub mod origin;
 pub(crate) mod otel;
 pub(crate) mod outgoing;
 pub mod peer_handoff;
@@ -71,6 +72,11 @@ pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 pub use errors::{RuntimeError, UnreachableEntrypoint};
 pub use limits::ExecutionLimits;
 pub use murmur_artifact::{AfterTask, LifecycleConfig, LifecycleOverride, TaskAcceptance};
+// `origin` is a public module — later slices order lanes by [`origin::TaskOrigin`] and fence on
+// [`origin::TrustClass`] — and its three types are re-exported flat beside the rest of the
+// runtime's surface. `from_wire` stays module-qualified: it is the peer door's rule, and its name
+// says nothing about tasks on its own.
+pub use origin::{TaskOrigin, TaskProvenance, TrustClass, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 pub use peer_handoff::{
     audience_from_card, handle_id, handle_peer_request, is_peer_path, mint, stored_path_for,
     verify, HandleError, HandlePayload, MintedHandle, PeerError, PeerMintKey, PeerPlane,

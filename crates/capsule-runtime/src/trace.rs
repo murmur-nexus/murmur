@@ -11,7 +11,12 @@ use tokio::{
     io::{AsyncWriteExt, BufWriter},
 };
 
-use crate::{agent::DriverUsage, containment::ScopeReport, trace_blobs::BlobStore};
+use crate::{
+    agent::DriverUsage,
+    containment::ScopeReport,
+    origin::{TaskProvenance, TrustClass},
+    trace_blobs::BlobStore,
+};
 
 pub(crate) struct TraceWriter {
     writer: BufWriter<File>,
@@ -581,6 +586,9 @@ struct A2aSendEvent {
     task_id: String,
     context_id: String,
     traceparent: Option<String>,
+    /// The class this runtime stamped on the outgoing request, so a chain of capsules reads the
+    /// same way from the sending end as the receiving end's `task_start` reads it.
+    trust: String,
 }
 
 #[derive(Serialize)]
@@ -608,7 +616,11 @@ struct TaskStartEvent {
     timestamp: u64,
     task_id: String,
     context_id: String,
+    /// Which door the task came through. `source` and `origin` answer different questions —
+    /// `"a2a"` covers both a trusted peer and an untyped webhook.
     source: String,
+    origin: String,
+    trust: String,
     message_parts_bytes: u64,
 }
 
@@ -1155,6 +1167,7 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_a2a_send(
         &mut self,
         peer_url: &str,
@@ -1162,6 +1175,7 @@ impl TraceWriter {
         task_id: &str,
         context_id: &str,
         traceparent: Option<&str>,
+        trust: TrustClass,
     ) -> std::io::Result<()> {
         let event = A2aSendEvent {
             event_type: "a2a_send",
@@ -1174,6 +1188,7 @@ impl TraceWriter {
             task_id: task_id.to_string(),
             context_id: context_id.to_string(),
             traceparent: traceparent.map(str::to_string),
+            trust: trust.as_str().to_string(),
         };
         self.write_event(&event).await
     }
@@ -1183,6 +1198,7 @@ impl TraceWriter {
         task_id: &str,
         context_id: &str,
         source: &str,
+        provenance: TaskProvenance,
         message_parts_bytes: u64,
     ) -> std::io::Result<()> {
         // Reset per-task counters for this task
@@ -1207,6 +1223,8 @@ impl TraceWriter {
             task_id: task_id.to_string(),
             context_id: context_id.to_string(),
             source: source.to_string(),
+            origin: provenance.origin().as_str().to_string(),
+            trust: provenance.trust().as_str().to_string(),
             message_parts_bytes,
         };
         self.write_event(&event).await
@@ -1688,6 +1706,13 @@ mod tests {
     };
     use murmur_artifact::{InterpreterRuntimeDir, InterpreterRuntimeGrant};
     use serde_json::Value;
+
+    use crate::origin::TaskOrigin;
+
+    /// The class an A2A task carrying no origin claim resolves to.
+    fn event_provenance() -> TaskProvenance {
+        TaskProvenance::derive(TaskOrigin::Event, None)
+    }
 
     /// A [`ScopeReport`] built the way production builds one — through
     /// `containment::scope_report_for_tier` with an *explicit* tier, never a live probe, so these
@@ -2784,7 +2809,7 @@ mod tests {
     async fn task_end_carries_reopen_count() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_task_end("tsk_1", "ok", 2).await.unwrap();
@@ -2804,7 +2829,7 @@ mod tests {
     async fn task_reopened_names_hook_reason_and_ordinal() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_task_reopened("tsk_1", "gatekeeper", "tests still fail", 1)
@@ -2831,7 +2856,7 @@ mod tests {
     async fn task_turns_accessor_tracks_and_resets() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
@@ -2863,7 +2888,7 @@ mod tests {
         .unwrap();
         assert_eq!(w.task_turns(), 2);
         // A new task resets the per-task counter.
-        w.write_task_start("tsk_2", "ctx_2", "a2a", 3)
+        w.write_task_start("tsk_2", "ctx_2", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
@@ -2881,7 +2906,7 @@ mod tests {
         w.write_session_start(10, vec!["bash".to_string()])
             .await
             .unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_inference(
@@ -2975,7 +3000,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_inference(
@@ -3028,18 +3053,32 @@ mod tests {
     async fn a2a_send_parents_to_null_without_a_session_frame_and_to_it_with_one() {
         let bare = tempfile::tempdir().unwrap();
         let mut w = make_writer(bare.path()).await;
-        w.write_a2a_send("http://peer", "msg_1", "tsk_1", "ctx_1", None)
-            .await
-            .unwrap();
+        w.write_a2a_send(
+            "http://peer",
+            "msg_1",
+            "tsk_1",
+            "ctx_1",
+            None,
+            TrustClass::Untrusted,
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
         assert!(read_events(bare.path())[0]["parent_id"].is_null());
 
         let framed = tempfile::tempdir().unwrap();
         let mut w = make_writer(framed.path()).await;
         w.write_session_start(1, Vec::new()).await.unwrap();
-        w.write_a2a_send("http://peer", "msg_1", "tsk_1", "ctx_1", None)
-            .await
-            .unwrap();
+        w.write_a2a_send(
+            "http://peer",
+            "msg_1",
+            "tsk_1",
+            "ctx_1",
+            None,
+            TrustClass::Untrusted,
+        )
+        .await
+        .unwrap();
         w.flush().await.unwrap();
         let events = read_events(framed.path());
         assert_eq!(events[1]["parent_id"], events[0]["event_id"]);
@@ -3052,7 +3091,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_inference(
@@ -3153,7 +3192,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
             .await
             .unwrap();
         w.write_inference(

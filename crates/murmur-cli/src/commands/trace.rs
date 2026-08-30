@@ -245,13 +245,19 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
-    /// Rendered on the task row of the `steps` tree. Both default to the empty string so a
+    /// Rendered on the task row of the `steps` tree. All four default to the empty string so a
     /// trace written before they existed still parses — an empty `context_id` is also what
     /// `mur run --resume` reports as a session it cannot continue.
     #[serde(default)]
     context_id: String,
     #[serde(default)]
     source: String,
+    /// Why the task ran, and how far its content is trusted. Rendered together, inside the same
+    /// parentheses as `source`, since neither answers the other's question.
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    trust: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1943,17 +1949,32 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
     };
     Some(match &record.event {
         TraceEvent::TaskStart(e) => {
-            let source = if e.source.is_empty() {
+            let provenance = match (e.origin.is_empty(), e.trust.is_empty()) {
+                (true, true) => String::new(),
+                (false, false) => format!("{}/{}", e.origin, e.trust),
+                (false, true) => e.origin.clone(),
+                (true, false) => e.trust.clone(),
+            };
+            let annotations: Vec<&str> = [e.source.as_str(), provenance.as_str()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect();
+            let annotation = if annotations.is_empty() {
                 String::new()
             } else {
-                format!("  ({})", e.source)
+                format!("  ({})", annotations.join(", "))
             };
             let context = if e.context_id.is_empty() {
                 String::new()
             } else {
                 format!("  {}", fmt_id_short(&e.context_id, 12))
             };
-            format!("task {}{}{}", fmt_id_short(&e.task_id, 12), context, source)
+            format!(
+                "task {}{}{}",
+                fmt_id_short(&e.task_id, 12),
+                context,
+                annotation
+            )
         }
         TraceEvent::Inference(e) => match &e.origin {
             // A hook's completion is not a turn of the agent loop; it hangs off the turn it
@@ -2958,5 +2979,40 @@ mod tests {
             }
             other => panic!("expected a shell event, got {other:?}"),
         }
+    }
+
+    fn task_row(line: &str) -> String {
+        let record = TraceRecord {
+            identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+            event: serde_json::from_str::<TraceEvent>(line).expect("task_start should parse"),
+        };
+        steps_row(&record, false).expect("a task_start renders a row")
+    }
+
+    #[test]
+    fn task_row_names_the_origin_and_trust_class() {
+        let line = r#"{"event_type":"task_start","event_id":"evt_1","session_id":"s","timestamp":1,"task_id":"tsk_0a1b2c3d4e5f","context_id":"ctx_3c4d5e6f7a8b","source":"a2a","origin":"peer","trust":"untrusted","message_parts_bytes":9}"#;
+        assert_eq!(
+            task_row(line),
+            "task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted)"
+        );
+    }
+
+    /// A trace written before `origin` and `trust` existed renders its task row without them,
+    /// rather than inventing a class it has no record of.
+    #[test]
+    fn task_row_omits_provenance_a_trace_predates() {
+        let line = r#"{"event_type":"task_start","event_id":"evt_1","session_id":"s","timestamp":1,"task_id":"tsk_0a1b2c3d4e5f","context_id":"ctx_3c4d5e6f7a8b","source":"task_md","message_parts_bytes":9}"#;
+        assert_eq!(
+            task_row(line),
+            "task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (task_md)"
+        );
+        let session_dir = tempfile::tempdir().unwrap();
+        std::fs::write(session_dir.path().join("trace.jsonl"), format!("{line}\n")).unwrap();
+        assert_eq!(
+            first_task_context_id(session_dir.path()).unwrap(),
+            Some("ctx_3c4d5e6f7a8b".to_string()),
+            "an older trace must still resolve its context id for `mur run --resume`"
+        );
     }
 }
