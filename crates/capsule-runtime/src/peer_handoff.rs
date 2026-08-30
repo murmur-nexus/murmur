@@ -41,14 +41,12 @@ use std::{
     },
 };
 
-use base64::Engine as _;
-use hmac::{Hmac, Mac};
 use murmur_artifact::{ContainmentClass, PeerFilesExport};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 
 use crate::{
     identity::CapsuleIdentity,
+    mac_token::{self, MacTokenError, MintKey, NONCE_BYTES},
     outgoing::parse_host_port,
     resource_plane::{
         read_export_file_with_policy, resolve_relpath_beneath_root, symlink_policy, DeclaredExport,
@@ -73,85 +71,21 @@ const TOKEN_VERSION_TAG: &str = "mh1";
 /// The only payload version this runtime mints or accepts.
 const PAYLOAD_VERSION: u8 = 1;
 
-/// Domain separator prefixed to every MAC input, so a MAC over a peer handle can never be
-/// mistaken for a MAC this runtime computes over anything else.
+/// Domain separator mixed into every MAC input, so a MAC over a peer handle can never be mistaken
+/// for a MAC any other authority computes.
 const MAC_DOMAIN: &[u8] = b"murmur-peer-handle-v1";
-
-/// Separator between the MAC input's fields. ASCII unit separator: it cannot occur in base64url
-/// and cannot occur in an audience, so no pair of distinct (payload, audience) inputs can produce
-/// the same MAC input by moving the boundary between them.
-const MAC_FIELD_SEPARATOR: u8 = 0x1f;
-
-/// Nonce width in bytes. Two handles for the same file and audience are distinct and
-/// independently traceable.
-const NONCE_BYTES: usize = 16;
-
-/// Width of a `handle_id`, in lowercase hex characters.
-const HANDLE_ID_HEX_CHARS: usize = 16;
 
 /// Directory, relative to the accessible workdir, that fetched bytes land in.
 pub const PEER_INBOX_DIR: &str = "peer-in";
 
-/// The base64 alphabet used for both token segments: URL-safe, unpadded, so a whole token is
-/// safe in a request path without escaping and has no `=` for a transport to mangle.
-const B64: base64::engine::general_purpose::GeneralPurpose =
-    base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-type HmacSha256 = Hmac<Sha256>;
-
 // ── The minting key ───────────────────────────────────────────────────────────
 
-/// The 32-byte HMAC key one capsule *instance* mints and verifies with.
+/// The key one capsule *instance* mints and verifies handles with.
 ///
-/// Generated in `launch_session`, and only when `exports.peer_files` is declared. Never written
-/// to disk, never placed in an environment variable, and never copied out of this type: a key
-/// that reaches durable storage outlives the instance whose lifetime is the only revocation
-/// mechanism there is.
-pub struct PeerMintKey([u8; 32]);
-
-impl PeerMintKey {
-    /// 32 bytes from the operating system's CSPRNG.
-    pub fn generate() -> Result<Self, String> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes)
-            .map_err(|error| format!("failed to generate the peer mint key: {error}"))?;
-        Ok(Self(bytes))
-    }
-
-    /// Builds a fresh MAC context. Private: the key bytes never leave this type.
-    fn mac(&self) -> HmacSha256 {
-        HmacSha256::new_from_slice(&self.0).expect("HMAC-SHA256 accepts a key of any length")
-    }
-
-    /// Overwrites the key bytes with volatile writes.
-    ///
-    /// Volatile so the compiler cannot elide a write whose result is provably never read — which
-    /// is the whole of what the write is for.
-    #[allow(unsafe_code)]
-    fn zeroize(&mut self) {
-        for byte in self.0.iter_mut() {
-            // SAFETY: `byte` is a valid, aligned, exclusively-borrowed `u8` inside an array this
-            // value owns. `write_volatile` of a `u8` through such a reference is always defined.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
-        std::sync::atomic::compiler_fence(Ordering::SeqCst);
-    }
-}
-
-impl Drop for PeerMintKey {
-    /// When the session ends the key goes with it, and every outstanding handle becomes
-    /// unverifiable at once — revoke-all with no revocation list.
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-impl std::fmt::Debug for PeerMintKey {
-    /// Prints no key material. A key that can reach a log line is a key on disk by another route.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PeerMintKey(<redacted>)")
-    }
-}
+/// Generated in `launch_session`, and only when `exports.peer_files` is declared. When the session
+/// ends the key goes with it and every outstanding handle becomes unverifiable at once — the
+/// reason a handle minted by one session of a capsule does not redeem against the next.
+pub type PeerMintKey = MintKey;
 
 // ── The token ─────────────────────────────────────────────────────────────────
 
@@ -175,7 +109,7 @@ pub struct HandlePayload {
     pub p: String,
     /// Absolute expiry, in unix milliseconds.
     pub exp: u64,
-    /// [`NONCE_BYTES`] random bytes, lowercase hex.
+    /// Random bytes, lowercase hex, so two handles for the same file and audience are distinct.
     pub n: String,
 }
 
@@ -192,71 +126,41 @@ pub enum HandleError {
     Expired,
 }
 
-/// The stable identifier a mint, a redeem and a fetch are correlated by: the first
-/// [`HANDLE_ID_HEX_CHARS`] lowercase hex characters of `sha256(token)`.
+/// The stable identifier a mint, a redeem and a fetch are correlated by.
 ///
 /// This — never the token — is what appears in a trace, a log line or an error body.
 pub fn handle_id(token: &str) -> String {
-    murmur_artifact::sha256_hex(token.as_bytes())[..HANDLE_ID_HEX_CHARS].to_string()
+    mac_token::token_id(token)
 }
 
-/// The token's three segments, checked for shape alone.
-///
-/// Returns the payload segment as base64 text — decoded, but not parsed. Nothing here looks at
-/// what the payload *says*.
-fn split_token(token: &str) -> Result<(&str, Vec<u8>, Vec<u8>), HandleError> {
-    let mut segments = token.split('.');
-    let tag = segments.next().ok_or(HandleError::Malformed)?;
-    let payload_b64 = segments.next().ok_or(HandleError::Malformed)?;
-    let mac_b64 = segments.next().ok_or(HandleError::Malformed)?;
-    if segments.next().is_some() || tag != TOKEN_VERSION_TAG {
-        return Err(HandleError::Malformed);
-    }
-    let payload = B64
-        .decode(payload_b64)
-        .map_err(|_| HandleError::Malformed)?;
-    let mac = B64.decode(mac_b64).map_err(|_| HandleError::Malformed)?;
-    if payload.is_empty() || mac.is_empty() {
-        return Err(HandleError::Malformed);
-    }
-    Ok((payload_b64, payload, mac))
+/// Shape alone: `mh1.<base64url>.<base64url>`, with nothing read from the payload.
+fn check_shape(token: &str) -> Result<(), HandleError> {
+    mac_token::payload_segment(TOKEN_VERSION_TAG, token)?;
+    Ok(())
 }
 
-/// The bytes a handle's MAC is taken over.
-///
-/// `MAC_DOMAIN ‖ 0x1f ‖ <payload base64url> ‖ 0x1f ‖ <audience>`.
+/// Mints one token: `mh1.<base64url-nopad(payload JSON)>.<base64url-nopad(mac)>`.
 ///
 /// **The audience is covered by the MAC but is not carried in the token.** That is what makes a
 /// handle audience-scoped rather than pure bearer: a token scraped out of persisted message
 /// history is not by itself redeemable, because redemption also requires asserting the exact
 /// audience string it was minted for.
-fn mac_input(payload_b64: &str, audience: &str) -> Vec<u8> {
-    let mut input = Vec::with_capacity(MAC_DOMAIN.len() + payload_b64.len() + audience.len() + 2);
-    input.extend_from_slice(MAC_DOMAIN);
-    input.push(MAC_FIELD_SEPARATOR);
-    input.extend_from_slice(payload_b64.as_bytes());
-    input.push(MAC_FIELD_SEPARATOR);
-    input.extend_from_slice(audience.as_bytes());
-    input
-}
-
-/// Mints one token: `mh1.<base64url-nopad(payload JSON)>.<base64url-nopad(mac)>`.
 pub fn mint(key: &PeerMintKey, payload: &HandlePayload, audience: &str) -> Result<String, String> {
     let json = serde_json::to_vec(payload)
         .map_err(|error| format!("failed to serialize the handle payload: {error}"))?;
-    let payload_b64 = B64.encode(json);
-    let mut mac = key.mac();
-    mac.update(&mac_input(&payload_b64, audience));
-    let tag = B64.encode(mac.finalize().into_bytes());
-    Ok(format!("{TOKEN_VERSION_TAG}.{payload_b64}.{tag}"))
+    Ok(mac_token::seal(
+        key,
+        TOKEN_VERSION_TAG,
+        MAC_DOMAIN,
+        &json,
+        &[audience],
+    ))
 }
 
 /// Verifies one token against this instance's key and the audience the caller asserted.
 ///
 /// Check order is fixed and nothing downstream of the MAC is evaluated before it, so a caller
-/// that fails the MAC learns nothing about the file: shape → MAC → payload → expiry. The MAC
-/// comparison is `verify_slice`, which is constant-time; comparing decoded bytes with `==` would
-/// leak the tag one byte at a time.
+/// that fails the MAC learns nothing about the file: shape → MAC → payload → expiry.
 ///
 /// **[`HandleError::NotValid`] is deliberately one outcome.** A tampered payload, a handle minted
 /// by a different capsule instance, and a correct handle presented with the wrong audience are
@@ -276,12 +180,7 @@ pub fn verify(
     audience: &str,
     session_id: &str,
 ) -> Result<HandlePayload, HandleError> {
-    let (payload_b64, payload_bytes, mac_bytes) = split_token(token)?;
-
-    let mut mac = key.mac();
-    mac.update(&mac_input(payload_b64, audience));
-    mac.verify_slice(&mac_bytes)
-        .map_err(|_| HandleError::NotValid)?;
+    let payload_bytes = mac_token::open(key, TOKEN_VERSION_TAG, MAC_DOMAIN, token, &[audience])?;
 
     // Only now: the payload has been proven to be one this instance minted, so reading it is
     // reading our own record rather than trusting the caller's.
@@ -306,7 +205,7 @@ pub fn verify(
 /// prefixed with the `handle_id` and the basename is sanitised precisely because this is not a
 /// fact about anything.
 pub fn decode_payload_unverified(token: &str) -> Option<HandlePayload> {
-    let (_, payload_bytes, _) = split_token(token).ok()?;
+    let payload_bytes = mac_token::payload_segment(TOKEN_VERSION_TAG, token).ok()?;
     serde_json::from_slice(&payload_bytes).ok()
 }
 
@@ -390,15 +289,6 @@ pub(crate) fn redact_handles_in_json(value: &mut serde_json::Value) {
         }
         _ => {}
     }
-}
-
-fn random_hex(bytes: usize) -> Result<String, String> {
-    let mut buffer = vec![0u8; bytes];
-    getrandom::fill(&mut buffer).map_err(|error| format!("failed to generate a nonce: {error}"))?;
-    Ok(buffer
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>())
 }
 
 // ── The audience ──────────────────────────────────────────────────────────────
@@ -522,6 +412,15 @@ impl PeerError {
                 "the peer plane serves GET only; it has no write path and no list verb".to_string()
             }
             PeerError::IoError(detail) => format!("read failed: {detail}"),
+        }
+    }
+}
+
+impl From<MacTokenError> for HandleError {
+    fn from(error: MacTokenError) -> Self {
+        match error {
+            MacTokenError::Malformed => HandleError::Malformed,
+            MacTokenError::NotValid => HandleError::NotValid,
         }
     }
 }
@@ -672,7 +571,7 @@ impl PeerPlane {
             iss: self.session_id.clone(),
             p: canonical_relpath.clone(),
             exp: timestamp_ms().saturating_add(ttl.saturating_mul(1000)),
-            n: random_hex(NONCE_BYTES).map_err(PeerError::IoError)?,
+            n: mac_token::random_hex(NONCE_BYTES).map_err(PeerError::IoError)?,
         };
         let token = mint(&declared.key, &payload, audience).map_err(PeerError::IoError)?;
         Ok(MintedHandle {
@@ -699,7 +598,7 @@ impl PeerPlane {
 
         // Shape first, so a request that is not a token at all is told so without the audience
         // requirement standing in front of it.
-        split_token(token).map_err(PeerError::from)?;
+        check_shape(token).map_err(PeerError::from)?;
 
         let audience = audience
             .map(str::trim)
@@ -1109,11 +1008,7 @@ mod tests {
             b"not json".to_vec(),
             br#"{"v":2,"iss":"ses_1","p":"a","exp":99999999999999,"n":"00"}"#.to_vec(),
         ] {
-            let payload_b64 = B64.encode(&payload_json);
-            let mut mac = key.mac();
-            mac.update(&mac_input(&payload_b64, "a@b"));
-            let tag = B64.encode(mac.finalize().into_bytes());
-            let token = format!("mh1.{payload_b64}.{tag}");
+            let token = mac_token::seal(&key, "mh1", MAC_DOMAIN, &payload_json, &["a@b"]);
             assert_eq!(
                 verify(&key, &token, "a@b", "ses_1"),
                 Err(HandleError::Malformed)
@@ -1136,7 +1031,7 @@ mod tests {
             "the payload segment must not vary with the audience"
         );
         assert_ne!(one, two, "the MAC must vary with the audience");
-        let decoded = String::from_utf8(B64.decode(one_payload).unwrap()).unwrap();
+        let decoded = String::from_utf8(mac_token::payload_segment("mh1", &one).unwrap()).unwrap();
         assert!(
             !decoded.contains("reporter@localhost:1"),
             "the audience must not appear in the payload: {decoded}"
@@ -1146,8 +1041,8 @@ mod tests {
     #[test]
     fn two_handles_for_the_same_file_and_audience_are_distinct() {
         let key = key();
-        let plane_nonce_a = random_hex(NONCE_BYTES).unwrap();
-        let plane_nonce_b = random_hex(NONCE_BYTES).unwrap();
+        let plane_nonce_a = mac_token::random_hex(NONCE_BYTES).unwrap();
+        let plane_nonce_b = mac_token::random_hex(NONCE_BYTES).unwrap();
         assert_ne!(plane_nonce_a, plane_nonce_b);
         let mut first = payload_for("report.md", "ses_1", in_an_hour());
         first.n = plane_nonce_a;
@@ -1710,25 +1605,5 @@ mod tests {
         );
         assert_eq!(response.status, 410);
         assert_eq!(body_error(&response)["error"], "handle_expired");
-    }
-
-    /// `Drop` is `zeroize` and nothing else, so testing the helper tests the teardown guarantee
-    /// without reading memory the value has already released.
-    #[test]
-    fn zeroizing_clears_every_key_byte() {
-        let mut key = PeerMintKey([0xAB; 32]);
-        assert_ne!(key.0, [0u8; 32]);
-        key.zeroize();
-        assert_eq!(key.0, [0u8; 32]);
-    }
-
-    /// A generated key is not the all-zero array a zeroized one becomes, and two are distinct —
-    /// enough to catch a `generate` that stopped reaching the OS CSPRNG.
-    #[test]
-    fn a_generated_key_is_random() {
-        let one = key();
-        let two = key();
-        assert_ne!(one.0, [0u8; 32]);
-        assert_ne!(one.0, two.0);
     }
 }

@@ -30,7 +30,7 @@ const CAPSULE_COMPONENT: &str = "capsule-env-echo.wasm";
 const CALLER_SESSION: &str = "ses_00000000000000000000000000caller";
 
 /// A second, strictly wider session: it lists `worker-a` where [`POOR_SESSION`] does not. Naming
-/// it is the escalation this slice closes.
+/// it without holding its credential is the escalation the bindings refuse.
 const RICH_SESSION: &str = "ses_ric00000000000000000000000000rich";
 
 /// A session whose envelope lists nothing but `worker-c`.

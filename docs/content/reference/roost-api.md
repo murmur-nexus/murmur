@@ -229,7 +229,7 @@ A delegated spawn is a two-step exchange against two opaque, MAC'd tokens.
 | Credential | When a session whose manifest declares `capabilities.spawn.allow` is staged | The session it was minted for | The daemon process |
 | Approval | By `POST /delegate`, once the referee has passed | One session, and one artifact by name, version and content hash | 60 seconds, one redemption |
 
-The credential is handed to the session's *runtime* and lives in runtime memory. It is not written to the workdir, not placed in an environment variable, not returned in a tool result, and not rendered into an error the model sees — so the capsule's own code cannot read it and cannot call the daemon itself.
+The credential is handed to the session's *runtime* and stays in memory there. Nothing the capsule can read carries it: not the workdir, not an environment variable, not a tool result, not an error message. A capsule therefore cannot call the daemon itself; its runtime makes the two requests on its behalf.
 
 The approval binds a launch to the artifact the referee actually judged. A different name, a different version, or the same coordinates resolving to different bytes is refused. An approval is marked spent as soon as it verifies, before the artifact is compared, so presenting one for the wrong artifact consumes it.
 
@@ -247,7 +247,7 @@ Refusals split into two classes.
 }
 ```
 
-The message is identical in every case by design. Two requests differing only in whether the session they name exists get byte-identical responses, so the endpoint cannot be used to discover which sessions are running.
+Two requests differing only in whether the session they name exists get byte-identical responses — same status line, same headers, same body — so the endpoint cannot be used to discover which sessions are running.
 
 *Approval-state* failures answer `403` and say what went wrong, because reaching one requires already holding a valid credential:
 
@@ -270,4 +270,4 @@ The message is identical in every case by design. Two requests differing only in
 | `MURMUR_ROOST_URL` | The environment of the process that runs the capsule | Base URL a plan's `capsule` step calls to spawn its child. When it is unset or blank, the step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
 
-The spawn credential is deliberately not among them. A capsule cannot call `POST /delegate` or the delegated `POST /spawn` itself: those requests are made by its runtime, which holds the credential, and `MURMUR_SESSION_ID` alone authorises nothing.
+The spawn credential has no environment variable. `POST /delegate` and the delegated `POST /spawn` are made by the capsule's runtime, which holds the credential; `MURMUR_SESSION_ID` authorises nothing on its own.

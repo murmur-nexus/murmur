@@ -439,9 +439,10 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
         headers.get(SPAWN_APPROVAL_HEADER),
     ) {
         (None, None) => {
-            // The operator's own path. `spawned_by` here is a claim with nothing behind it, and it
-            // used to be enough to select another session's envelope — so a request that carries
-            // one and proves nothing is refused rather than quietly ignored.
+            // The operator's own path. `spawned_by` here is a claim with nothing behind it, so a
+            // request that carries one and proves nothing is refused rather than quietly ignored:
+            // ignoring it would launch under the operator's list a request that asked to be
+            // judged as somebody else.
             if req.spawned_by.is_some() {
                 return identity_refused();
             }

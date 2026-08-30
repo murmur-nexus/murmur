@@ -983,9 +983,10 @@ fn read_http_request(stream: &mut TcpStream) -> (String, HashMap<String, String>
 }
 
 fn write_http_json(stream: &mut TcpStream, status: u16, body: &Value) {
+    let reason = if status == 200 { "OK" } else { "Forbidden" };
     let body = body.to_string();
     let response = format!(
-        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
         body.len(),
         body
     );

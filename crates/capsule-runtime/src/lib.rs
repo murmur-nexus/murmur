@@ -18,6 +18,7 @@ pub(crate) mod hooks;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub mod limits;
+pub mod mac_token;
 pub(crate) mod murmur_md;
 pub mod network_namespace;
 pub(crate) mod network_policy;
