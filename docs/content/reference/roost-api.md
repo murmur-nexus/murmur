@@ -147,7 +147,7 @@ The comparison runs after the name check and before the child's workload is stag
 
 Containment is the one axis where a difference in the child's favour is allowed. A floor is a requirement rather than a grant, so it may only rise: a `scoped` parent may spawn a `sealed` child, and a child that declares `advisory` under a `scoped` parent is refused.
 
-A mismatch on any other axis is refused rather than narrowed to fit. The child capsule's manifest is the operator's own declaration, so a refusal names a line they can edit; a child that launched with grants silently removed would run and fail to do its job for no visible reason.
+A mismatch on any other axis is refused rather than narrowed to fit. Fix it by widening the parent's declaration or narrowing the child's.
 
 A refusal names the manifest key and the child declaration that exceeded:
 

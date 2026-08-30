@@ -8,7 +8,7 @@
 //! the whole workdir. [`SpawnEnvelope::contains`] is the comparison, and it names the axis and the
 //! exact entry that exceeded.
 //!
-//! **Refusing, not narrowing.** This is the deliberate opposite of
+//! **Refusing, not narrowing.** This is the opposite of
 //! [`crate::network_policy::ToolCapabilityGrant::derive`], which clamps a per-artifact allow-list
 //! to the capsule ceiling and reports the dropped entries as `W-SEC-007`. An artifact's declared
 //! capabilities are its *author's* wish list, so keeping the covered subset is right — the
@@ -130,9 +130,9 @@ impl fmt::Display for EnvelopeViolation {
 
 /// One capsule's declared capability surface, in the shape the spawn comparison needs.
 ///
-/// Deliberately narrower than [`crate::types::CapabilityPolicy`], and deliberately wider in one
-/// place. Narrower: limits, resources and the `shell_strip_env`/`baseline_env`/`interpreter_runtime`
-/// grants are bounds and plumbing rather than reach, so a child that sets them differently is not
+/// Narrower than [`crate::types::CapabilityPolicy`] on most axes, and wider on one. Narrower:
+/// limits, resources and the `shell_strip_env`/`baseline_env`/`interpreter_runtime` grants are
+/// bounds and plumbing rather than reach, so a child that sets them differently is not
 /// escalating. Wider: [`Self::state_stores`] is per *artifact*, so it is not on the capsule-wide
 /// policy at all, and a child whose artifacts open a store the parent's do not is reaching durable
 /// state outside every workdir that its parent cannot see.

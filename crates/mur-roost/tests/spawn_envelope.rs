@@ -20,8 +20,8 @@ use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeManifest, Ru
 use tempfile::TempDir;
 
 /// A script capsule that needs no artifacts and no host grants: it probes two environment
-/// variables and writes what it saw into its own preopen. Borrowed from `murmur-cli`'s fixtures
-/// rather than copied, so both suites launch the same component bytes.
+/// variables and writes what it saw into its own preopen. Read from `murmur-cli`'s fixture
+/// directory, so both suites launch the same component bytes.
 const CAPSULE_COMPONENT: &str = "capsule-env-echo.wasm";
 
 const PARENT_SESSION: &str = "ses_0000000000000000000000000000parent";
@@ -164,7 +164,7 @@ impl Response {
     }
 }
 
-/// A child within its parent on every axis spawns exactly as it did before the referee existed.
+/// A child within its parent on every axis is approved, and launches.
 #[test]
 fn a_child_within_its_parents_envelope_launches() {
     let daemon = Daemon::new();

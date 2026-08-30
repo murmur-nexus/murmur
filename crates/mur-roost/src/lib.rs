@@ -34,10 +34,10 @@ pub struct JobRecord {
     pub status: JobStatus,
     /// What this session holds, and therefore the ceiling every capsule it spawns must fit inside.
     ///
-    /// Lowered from the session's own manifest when it was staged. That is the seam a later slice
-    /// replaces: an envelope selected by a `spawned_by` the daemon does not authenticate is a
-    /// ceiling any caller can name, so the approval belongs on a credential minted at
-    /// *registration* rather than on a lookup in this map.
+    /// Lowered from the session's own manifest when it was staged. [`handle_spawn`] selects the
+    /// record by the request's `spawned_by`, which the daemon does not authenticate: any caller
+    /// that reaches the port can name a better-provisioned session and be judged against that
+    /// session's envelope rather than its own.
     pub envelope: SpawnEnvelope,
 }
 
@@ -242,8 +242,8 @@ fn handle_spawn(body: &str, state: &Arc<State>) -> String {
         }
     };
 
-    // Parse RuntimeManifest from an in-memory temp file (load_runtime_manifest reads from disk;
-    // use from_yaml_str directly from murmur-artifact's public API).
+    // `from_yaml_str` rather than `load_runtime_manifest`: the manifest comes out of the artifact
+    // zip in memory and is never written to disk.
     let manifest = match murmur_artifact::RuntimeManifest::from_yaml_str(&manifest_yaml) {
         Ok(m) => m,
         Err(e) => {
