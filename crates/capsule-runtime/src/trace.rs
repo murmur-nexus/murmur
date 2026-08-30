@@ -1228,8 +1228,8 @@ impl TraceWriter {
             source: source.to_string(),
             origin: provenance.origin().as_str().to_string(),
             trust: provenance.trust().as_str().to_string(),
-            // Derived here rather than passed in, so every call site records the lane the queue
-            // would have filed this provenance under and none can disagree with the selection.
+            // One rule for every call site, so the recorded lane cannot disagree with the lane
+            // `LaneQueue` filed the task under — both read the same provenance.
             lane: TaskLane::for_origin(provenance.origin())
                 .as_str()
                 .to_string(),

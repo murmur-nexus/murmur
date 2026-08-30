@@ -5,9 +5,8 @@
 //! task's own [`TaskOrigin`], so nothing declares a lane and nothing can be filed in one its
 //! origin does not name.
 //!
-//! For a capsule with a single source of tasks this changes nothing — every task lands in the
-//! same lane and comes back out in arrival order. It decides something only where two sources
-//! are in flight at once.
+//! A capsule with a single source of tasks sees every task land in the same lane and come back
+//! out in arrival order. Lanes decide something only where two sources are in flight at once.
 
 use std::collections::VecDeque;
 
@@ -54,8 +53,7 @@ impl TaskLane {
 /// The tasks a capsule has accepted but not yet started, one queue per lane.
 ///
 /// Admission is not this type's job: a task reaches [`Self::push`] only after the registry has
-/// counted it against `queue_depth`, and it stays counted until `start_task` runs. Filing a task
-/// in a lane neither accepts nor refuses anything.
+/// counted it against `queue_depth`, and it stays counted until `start_task` runs.
 pub(crate) struct LaneQueue {
     user: VecDeque<IncomingTask>,
     peer: VecDeque<IncomingTask>,
@@ -86,9 +84,9 @@ impl LaneQueue {
     /// whatever lanes hold tasks — and whenever every lane is empty. A refusal moves nothing: the
     /// task that would have been chosen is still at the front of its lane afterwards.
     ///
-    /// The single call site today asks only between tasks, so the refusal never fires there. It
-    /// is here so that a later call site which asks mid-task cannot introduce preemption by
-    /// accident.
+    /// That refusal is the only thing standing between this queue and preemption. A call site
+    /// must pass the real active lane; passing `None` to force a selection while a task runs
+    /// grants exactly the preemption the design excludes.
     pub(crate) fn next(&mut self, active: Option<TaskLane>) -> Option<(TaskLane, IncomingTask)> {
         if active.is_some() {
             return None;

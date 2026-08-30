@@ -144,9 +144,8 @@ pub(crate) enum TaskSlotState {
     Running {
         task_id: String,
         context_id: String,
-        /// The lane the queue chose this task out of. Lives inside the variant so it is set and
-        /// cleared by the two methods that already own `active_slot`'s lifecycle, and cannot
-        /// name a lane no task is running in.
+        /// The lane the queue chose this task out of. Set and cleared with the rest of the
+        /// variant, so it cannot name a lane no task is running in.
         lane: TaskLane,
     },
     Done {
@@ -223,8 +222,8 @@ impl TaskRegistry {
         );
     }
 
-    /// `lane` is the lane the queue selected this task out of, not a lane recomputed here, so
-    /// what the registry reports is what the selection actually did.
+    /// `lane` is the lane the queue selected this task out of, so what the registry reports is
+    /// what the selection did.
     pub(crate) fn start_task(&mut self, task_id: String, context_id: String, lane: TaskLane) {
         debug_assert!(self.pending_count > 0);
         self.pending_count -= 1;

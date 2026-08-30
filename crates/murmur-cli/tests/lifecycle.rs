@@ -142,34 +142,10 @@ fn stage_agent(
 }
 
 fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
-    let mut stream = TcpStream::connect(addr).expect("should connect");
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-
-    let mut reader = BufReader::new(&stream);
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-    let mut response_body = String::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap() == 0 {
-            break;
-        }
-        response_body.push_str(&line);
-    }
-    serde_json::from_str(&response_body)
-        .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
+    http_post_json_with_headers(addr, path, body, &[])
 }
 
+/// The same POST with extra request headers, for the two provenance headers the peer door reads.
 fn http_post_json_with_headers(
     addr: &str,
     path: &str,

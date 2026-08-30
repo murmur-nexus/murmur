@@ -109,14 +109,16 @@ untrust laundering across an honest chain.
 
 The class is recorded, not enforced: no task is refused, delayed or reordered because it is
 `untrusted`. Treat it as the answer to "why did this run", and keep authoring manifests on the
-assumption that any task's text may be hostile.
+assumption that any task's text may be hostile. The origin does more than the class: it also
+picks the [queue lane](session-loop.md#queue-lanes) a task waits in, so two tasks that are both
+`untrusted` can still run in a different order.
 
 Both values are recorded on the [`task_start`](../reference/observability-schemas.md#session-trace-tracejsonl)
-trace event and shown on the task row of `mur trace steps <session>`:
+trace event and shown on the task row of `mur trace steps <session>`, alongside the lane:
 
 ```
-task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted)
-task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (task_md, user/trusted)
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted, lane peer)
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (task_md, user/trusted, lane user)
 ```
 
 ## Prompt injection and network-bypass posture { #threat-model }

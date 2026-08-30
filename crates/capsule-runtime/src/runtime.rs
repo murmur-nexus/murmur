@@ -1649,10 +1649,8 @@ pub fn launch_session(
                                 loop {
                                     // Everything already delivered goes into its lane before
                                     // anything is chosen, so the choice is made over the whole
-                                    // backlog and not over whichever task the channel happens to
-                                    // hand back first. A disconnected channel ends the drain and
-                                    // is handled by the blocking wait below, which sees the same
-                                    // `None` it always has.
+                                    // backlog. A disconnected channel ends the drain and is
+                                    // handled by the blocking wait below, which sees `None`.
                                     while let Ok(task) = task_rx.try_recv() {
                                         lanes.push(task);
                                     }

@@ -170,7 +170,10 @@ any `peer` task, and every `peer` task before any `bg` task. Within one lane the
 A running task is never interrupted. A task that outranks it waits until it finishes, so lanes
 decide which task starts next and never which task stops.
 
-For a capsule with one source of tasks, lanes decide nothing — every task lands in the same lane
-and runs in arrival order. What they change grows with the number of sources a capsule takes work
-from at once. The lane each task ran in is on its `task_start` record and on the task row of
-`mur trace steps`.
+A capsule with one source of tasks puts every task in the same lane and runs them in arrival
+order; lanes matter in proportion to how many sources a capsule takes work from at once.
+
+Only `peer` and `completion` are accepted from an inbound request's `x-murmur-task-origin` header,
+so an HTTP caller cannot put itself in the `user` lane — a request claiming `user` is read as
+`event` and waits in `bg`. The lane each task ran in is on its `task_start` record and on the task
+row of `mur trace steps`.

@@ -8,6 +8,8 @@
 //!
 //! Nothing in the runtime branches on trust: the value is recorded on `task_start` and left on
 //! the store state for the task's duration, and no task is refused, delayed or reordered for it.
+//! The origin half is not inert — it picks the queue lane a task waits in, so two tasks with the
+//! same trust can still run in a different order. See [`crate::lanes`].
 
 /// Header carrying the sending runtime's origin claim on an inter-capsule request.
 ///
