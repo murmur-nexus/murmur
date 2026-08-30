@@ -1,0 +1,31 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "Murmur",
+    "identifier": "did:web:docs.murmur.nexus"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:docs.murmur.nexus:docs:llms-txt",
+      "displayName": "Murmur documentation (llms.txt)",
+      "type": "text/plain",
+      "url": "https://docs.murmur.nexus/llms.txt",
+      "representativeQueries": [
+        "what is a capsule in murmur?",
+        "how do I install the murmur CLI?",
+        "what artifacts does murmur support?"
+      ]
+    },
+    {
+      "identifier": "urn:air:docs.murmur.nexus:api:ask-docs",
+      "displayName": "Ask Murmur Docs",
+      "type": "application/vnd.oai.openapi",
+      "url": "https://api.murmur.nexus/openapi.yaml",
+      "representativeQueries": [
+        "what is a capsule?",
+        "how does murmur sandbox network access?",
+        "how do I define a hook artifact?"
+      ]
+    }
+  ]
+}
