@@ -12,11 +12,12 @@
  * `generateAgentArtifacts()`.
  *
  * Writes into `site/`: llms.txt, .well-known/llms.txt, .well-known/api-catalog,
- * one `.md` mirror per page, sitemap.xml, sitemap.md, robots.txt, and
- * agent-readability.json. MkDocs owns the HTML; this owns the agent surface.
+ * .well-known/ai-catalog.json, one `.md` mirror per page, sitemap.xml,
+ * sitemap.md, robots.txt, and agent-readability.json. MkDocs owns the HTML;
+ * this owns the agent surface.
  */
 
-import { readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,6 +42,9 @@ const EXPORT_FILE = path.join(DOCS_DIR, ".agent-export", "pages.json");
 const OUT_DIR = path.join(DOCS_DIR, "site");
 // Hand-curated; the build copies it over leadtype's generated llms.txt.
 const CURATED_LLMS_TXT = path.join(DOCS_DIR, "llms.txt");
+// Hand-curated ARD manifest (agenticresourcediscovery.org) — leadtype doesn't
+// generate this, so it's a plain copy, same pattern as CURATED_LLMS_TXT.
+const CURATED_AI_CATALOG = path.join(DOCS_DIR, "ai-catalog.json");
 
 // Identity that isn't derivable from mkdocs.yml. Everything else — site name,
 // description, base URL, repo — comes from the MkDocs config.
@@ -232,6 +236,10 @@ async function main() {
 
   const webmcp = await bundleWebMcp({ outDir: OUT_DIR });
 
+  const wellKnownDir = path.join(OUT_DIR, ".well-known");
+  await mkdir(wellKnownDir, { recursive: true });
+  await copyFile(CURATED_AI_CATALOG, path.join(wellKnownDir, "ai-catalog.json"));
+
   const rel = (file) => path.relative(DOCS_DIR, file);
   console.log(`agent-artifacts: ${pages.length} pages -> ${path.relative(DOCS_DIR, OUT_DIR)}/`);
   console.log(`  ${result.files.markdown.length} markdown mirrors`);
@@ -241,6 +249,7 @@ async function main() {
     `  ${rel(search.indexFile)} (${search.docs} docs, ${search.chunks} chunks)`
   );
   console.log(`  ${rel(webmcp.outfile)} (${Math.round(webmcp.bytes / 1024)} kB)`);
+  console.log(`  ${rel(path.join(wellKnownDir, "ai-catalog.json"))}`);
   if (result.files.sitemapXml) console.log(`  ${rel(result.files.sitemapXml)}`);
   if (result.files.robotsTxt) console.log(`  ${rel(result.files.robotsTxt)}`);
 

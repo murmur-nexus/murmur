@@ -113,38 +113,67 @@ curl -s  https://docs.murmur.nexus/concepts/hooks?mode=agent | head -3        # 
 curl -s -H "Accept: text/markdown" https://docs.murmur.nexus/concepts/hooks | head -3
 ```
 
-## Link response header (one-time setup)
+## Shared agent-discovery response headers (one-time setup)
 
-`setup-link-header.sh` creates one CloudFront Response Headers Policy,
+`setup-response-headers.sh` creates one CloudFront Response Headers Policy,
 `murmur-agent-link-header`, and attaches it to both `docs.murmur.nexus`
-(`E3SVCJVONCNVPZ`) and `murmur.nexus` (`E8I1RI0YU23W1`). It adds:
+(`E3SVCJVONCNVPZ`) and `murmur.nexus` (`E8I1RI0YU23W1`). It adds, on every
+response from either distribution:
 
 ```
 Link: </llms.txt>; rel="service-doc"
+Access-Control-Allow-Origin: *          (only echoed back when the request sends an Origin header — standard CORS behavior)
 ```
 
-on every response — RFC 8288 header syntax, `service-doc` per RFC 9727 §3
-(a link to documentation intended for a human/agent audience). One policy
-works for both distributions because `/llms.txt` is a site-relative path, so
-the same header value resolves correctly against either domain — mirroring
-`murmur-index-rewrite`, a single shared piece of infra rather than one per
-site.
+The `Link` header is RFC 8288 syntax, `service-doc` per RFC 9727 §3 (a link
+to documentation intended for a human/agent audience). The CORS header is
+what [ARD](https://agenticresourcediscovery.org/)'s manifest at
+`/.well-known/ai-catalog.json` requires — see below — set via the policy's
+`CorsConfig` (CloudFront rejects a bare CORS header name inside
+`CustomHeadersConfig`). Both are safe to apply site-wide: these are fully
+public static sites with no auth/cookies, so allowing cross-origin JS to
+*read* a response changes nothing about who can already reach it over plain
+HTTP. One policy works for both distributions because `/llms.txt` is a
+site-relative path, so the same `Link` value resolves correctly against
+either domain — mirroring `murmur-index-rewrite`, a single shared piece of
+infra rather than one per site.
 
 ```bash
-docs/infra/setup-link-header.sh
+docs/infra/setup-response-headers.sh
 ```
 
-Idempotent — reuses the policy if it already exists, and skips a
-distribution that's already attached. Verify:
+Idempotent — creates the policy if missing, updates it in place if the
+header set has changed since it was created, and skips a distribution
+that's already attached. Verify (the CORS header only shows with an `Origin`
+request header, matching real cross-origin fetch behavior):
 
 ```bash
 curl -sI https://docs.murmur.nexus/ | grep -i '^link:'
 curl -sI https://murmur.nexus/       | grep -i '^link:'
+curl -sI -H 'Origin: https://example.com' https://docs.murmur.nexus/.well-known/ai-catalog.json | grep -i '^access-control'
 ```
 
 To roll back, detach the policy (`ResponseHeadersPolicyId` back to null) via
 `update-distribution` on either distribution, or delete the policy once
 detached from both.
+
+## ARD manifest (`/.well-known/ai-catalog.json`)
+
+Each site publishes its own [Agentic Resource Discovery](https://agenticresourcediscovery.org/)
+manifest — a JSON document listing the site's real, callable
+agent-facing capabilities, so a registry can index them without crawling.
+
+Hand-curated at `docs/ai-catalog.json` (repo root, same pattern as
+`docs/llms.txt`), copied verbatim into `site/.well-known/ai-catalog.json` by
+`scripts/agent-artifacts.mjs` — leadtype doesn't generate this format, so
+there's no generated version to seed from or overwrite. Two entries: the
+site's own `llms.txt`, and the shared `ask-docs` API (its OpenAPI document is
+served by the `murmur-ask-docs` repo at `https://api.murmur.nexus/openapi.yaml`).
+
+Deliberately does **not** claim an MCP server or an A2A agent card — this
+site doesn't run either (WebMCP is browser-side JS, not a network protocol
+server), and an ARD entry is a claim that a real callable resource exists at
+that URL with that type.
 
 ## What you do NOT need
 
