@@ -31,6 +31,7 @@ import {
 } from "./lib/material-markdown.mjs";
 import {
   applyCuratedLlmsTxt,
+  fixApiCatalogLinkset,
   seedCuratedLlmsTxt,
   writeLlmsFullTxt,
   writeSearchIndex,
@@ -240,24 +241,9 @@ async function main() {
   await mkdir(wellKnownDir, { recursive: true });
   await copyFile(CURATED_AI_CATALOG, path.join(wellKnownDir, "ai-catalog.json"));
 
-  // leadtype's generateAgentArtifacts hardcodes the api-catalog linkset's
-  // service-doc/service-desc hrefs to /docs/llms.txt and
-  // /docs/agent-readability.json (see renderApiCatalog in leadtype/llm) —
-  // defaults for a site mounted under a /docs/ URL prefix, which this one
-  // isn't (llms.txt and agent-readability.json are both at site root).
-  // There's no config option to override those paths (config.agents only
-  // recognizes robots/seo), so patch the two hrefs after the fact rather
-  // than fork the linkset renderer for two string replacements.
+  // See fixApiCatalogLinkset's own comment for why this rewrite is needed.
   if (result.files.apiCatalog) {
-    const apiCatalog = JSON.parse(await readFile(result.files.apiCatalog, "utf8"));
-    for (const entry of apiCatalog.linkset ?? []) {
-      for (const link of entry["service-doc"] ?? []) {
-        link.href = link.href.replace(/\/docs\/llms\.txt$/, "/llms.txt");
-      }
-      for (const link of entry["service-desc"] ?? []) {
-        link.href = link.href.replace(/\/docs\/agent-readability\.json$/, "/agent-readability.json");
-      }
-    }
+    const apiCatalog = fixApiCatalogLinkset(JSON.parse(await readFile(result.files.apiCatalog, "utf8")));
     await writeFile(result.files.apiCatalog, `${JSON.stringify(apiCatalog, null, 2)}\n`);
   }
 

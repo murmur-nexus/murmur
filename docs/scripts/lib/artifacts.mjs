@@ -129,6 +129,27 @@ async function mkdtempAgent() {
  * version from the nav; this overwrites it with `docs/llms.txt`, keeping the
  * `.well-known` discovery copy in sync.
  */
+/**
+ * leadtype's generateAgentArtifacts hardcodes the api-catalog linkset's
+ * service-doc/service-desc hrefs to /docs/llms.txt and
+ * /docs/agent-readability.json — defaults for a site mounted under a /docs/
+ * URL prefix. This site isn't (both files are at site root), and
+ * generateAgentArtifacts exposes no option to override those paths
+ * (config.agents only recognizes robots/seo), so this rewrites the two
+ * hrefs post-generation. Mutates and returns the same object.
+ */
+export function fixApiCatalogLinkset(apiCatalog) {
+  for (const entry of apiCatalog.linkset ?? []) {
+    for (const link of entry["service-doc"] ?? []) {
+      link.href = link.href.replace(/\/docs\/llms\.txt$/, "/llms.txt");
+    }
+    for (const link of entry["service-desc"] ?? []) {
+      link.href = link.href.replace(/\/docs\/agent-readability\.json$/, "/agent-readability.json");
+    }
+  }
+  return apiCatalog;
+}
+
 export async function applyCuratedLlmsTxt({ outDir, sourceFile }) {
   if (!existsSync(sourceFile)) return { applied: false };
 
