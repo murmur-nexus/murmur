@@ -152,3 +152,25 @@ than holding an OS thread. `session-start`/`session-end` still fire once per cap
 as shown in the session loop diagram above; it's `task-start`/`task-end` that fire once per
 task iteration, and a capsule's hook components are loaded once at startup and reused across
 all task iterations.
+
+### Queue lanes
+
+A queued task waits in one of three lanes, read off its
+[origin](access-control.md#task-origin-and-trust-class):
+
+| Lane | Origins | What is waiting on the task |
+|---|---|---|
+| `user` | `user` | A person |
+| `peer` | `peer` | Another capsule, with a task of its own blocked on the answer |
+| `bg` | `schedule`, `event`, `completion`, `system` | Nothing |
+
+The runtime takes the front of the highest non-empty lane: every waiting `user` task runs before
+any `peer` task, and every `peer` task before any `bg` task. Within one lane the order is arrival.
+
+A running task is never interrupted. A task that outranks it waits until it finishes, so lanes
+decide which task starts next and never which task stops.
+
+For a capsule with one source of tasks, lanes decide nothing — every task lands in the same lane
+and runs in arrival order. What they change grows with the number of sources a capsule takes work
+from at once. The lane each task ran in is on its `task_start` record and on the task row of
+`mur trace steps`.

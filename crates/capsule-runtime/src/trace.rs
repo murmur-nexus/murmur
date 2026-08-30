@@ -14,6 +14,7 @@ use tokio::{
 use crate::{
     agent::DriverUsage,
     containment::ScopeReport,
+    lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
 };
@@ -621,6 +622,9 @@ struct TaskStartEvent {
     source: String,
     origin: String,
     trust: String,
+    /// The queue lane this task waited in, derived from `origin`. Recorded so the order two
+    /// tasks ran in is answerable from the trace alone.
+    lane: String,
     message_parts_bytes: u64,
 }
 
@@ -1224,6 +1228,11 @@ impl TraceWriter {
             source: source.to_string(),
             origin: provenance.origin().as_str().to_string(),
             trust: provenance.trust().as_str().to_string(),
+            // Derived here rather than passed in, so every call site records the lane the queue
+            // would have filed this provenance under and none can disagree with the selection.
+            lane: TaskLane::for_origin(provenance.origin())
+                .as_str()
+                .to_string(),
             message_parts_bytes,
         };
         self.write_event(&event).await

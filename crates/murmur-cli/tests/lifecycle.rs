@@ -170,6 +170,44 @@ fn http_post_json(addr: &str, path: &str, body: &str) -> Value {
         .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
 }
 
+fn http_post_json_with_headers(
+    addr: &str,
+    path: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+) -> Value {
+    let mut stream = TcpStream::connect(addr).expect("should connect");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("\r\n{body}"));
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(&stream);
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+    let mut response_body = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        response_body.push_str(&line);
+    }
+    serde_json::from_str(&response_body)
+        .unwrap_or_else(|_| serde_json::json!({"_raw": response_body}))
+}
+
 fn message_send_body(message_id: &str, text: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -370,6 +408,203 @@ fn assert_one_session_frame_over_two_tasks(trace: &str) {
             end_index > last_task_end,
             "session_end must not close the frame before the second task_end"
         );
+    }
+}
+
+/// Five tasks, one lane apart: a `peer` task that arrives fourth runs second.
+///
+/// Task A is held by the scripted inference delay, so B, C, D and E all queue behind a running
+/// task. E is the only one carrying peer headers, and it is the only one that jumps the queue —
+/// past B, C and D, but not past A, which was already running.
+#[test]
+fn lifecycle_queue_runs_the_peer_lane_before_the_background_lane() {
+    let server = common::ScriptedServer::start_with_delay(
+        (1..=5)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("msg_{i}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "test-model",
+                    "content": [{"type": "text", "text": format!("task {i} done")}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })
+                .to_string()
+            })
+            .collect(),
+        std::time::Duration::from_secs(2),
+    );
+    let (home, manifest_path) = setup_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Sleep,
+            queue_depth: 8,
+            input_timeout_secs: None,
+            ..Default::default()
+        }),
+        None,
+    );
+    let workdir_for_thread = staged.workdir.clone();
+    let trace_path = workdir_for_thread.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        })
+        .expect("launch should succeed")
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .expect("timed out waiting for capsule_url");
+
+    let submitted = |response: &Value, label: &str| -> String {
+        assert_eq!(
+            response["result"]["status"]["state"], "submitted",
+            "task {label} should be submitted; got: {response}"
+        );
+        response["result"]["id"]
+            .as_str()
+            .expect("a submitted task carries its id")
+            .to_string()
+    };
+
+    // A goes in alone and starts running; the 2 s inference delay holds it there.
+    let task_a = submitted(
+        &http_post_json(&capsule_url, "/", &message_send_body("task-a", "task a")),
+        "A",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+        if trace.lines().any(|l| l.contains("\"task_start\"")) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for task A to start; trace:\n{trace}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // B, C and D claim nothing, so they are untrusted events — the background lane. E claims
+    // `peer`, the highest lane an inbound request can reach.
+    let task_b = submitted(
+        &http_post_json(&capsule_url, "/", &message_send_body("task-b", "task b")),
+        "B",
+    );
+    let task_c = submitted(
+        &http_post_json(&capsule_url, "/", &message_send_body("task-c", "task c")),
+        "C",
+    );
+    let task_d = submitted(
+        &http_post_json(&capsule_url, "/", &message_send_body("task-d", "task d")),
+        "D",
+    );
+    let task_e = submitted(
+        &http_post_json_with_headers(
+            &capsule_url,
+            "/",
+            &message_send_body("task-e", "task e"),
+            &[
+                ("x-murmur-task-origin", "peer"),
+                ("x-murmur-task-trust", "trusted"),
+            ],
+        ),
+        "E",
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let trace = loop {
+        let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+        if trace.lines().filter(|l| l.contains("\"task_end\"")).count() >= 5 {
+            break trace;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for all five tasks to complete; trace:\n{trace}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+
+    let events: Vec<Value> = trace
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("every trace line must be valid JSON"))
+        .collect();
+    let task_starts: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["event_type"] == "task_start")
+        .collect();
+
+    let ran: Vec<&str> = task_starts
+        .iter()
+        .map(|e| e["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ran,
+        vec![
+            task_a.as_str(),
+            task_e.as_str(),
+            task_b.as_str(),
+            task_c.as_str(),
+            task_d.as_str()
+        ],
+        "the peer task must run after the one already running and before the queued \
+         background ones; trace:\n{trace}"
+    );
+
+    let lanes: Vec<&str> = task_starts
+        .iter()
+        .map(|e| {
+            e["lane"]
+                .as_str()
+                .expect("every task_start records its lane")
+        })
+        .collect();
+    assert_eq!(
+        lanes,
+        vec!["bg", "peer", "bg", "bg", "bg"],
+        "each task_start must name the lane it was selected from; trace:\n{trace}"
+    );
+
+    assert_no_two_tasks_overlap(&events, &trace);
+
+    // The capsule is still alive (queue+sleep). Drop the join handle without waiting.
+    drop(handle);
+}
+
+/// One active task at a time: in file order, every `task_start` after the first is preceded by
+/// the previous task's `task_end`. A task that outranks the running one waits; it never
+/// interleaves with it.
+fn assert_no_two_tasks_overlap(events: &[Value], trace: &str) {
+    let mut open: Option<&str> = None;
+    for event in events {
+        match event["event_type"].as_str() {
+            Some("task_start") => {
+                assert!(
+                    open.is_none(),
+                    "task {} started while {} was still running; trace:\n{trace}",
+                    event["task_id"],
+                    open.unwrap_or_default()
+                );
+                open = event["task_id"].as_str();
+            }
+            Some("task_end") => {
+                assert_eq!(
+                    open,
+                    event["task_id"].as_str(),
+                    "task_end must close the task that opened the frame; trace:\n{trace}"
+                );
+                open = None;
+            }
+            _ => {}
+        }
     }
 }
 

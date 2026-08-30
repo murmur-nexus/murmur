@@ -245,7 +245,7 @@ struct SessionEndEvent {
 #[derive(Debug, Deserialize)]
 struct TaskStartEvent {
     task_id: String,
-    /// Rendered on the task row of the `steps` tree. All four default to the empty string so a
+    /// Rendered on the task row of the `steps` tree. All five default to the empty string so a
     /// trace written before they existed still parses — an empty `context_id` is also what
     /// `mur run --resume` reports as a session it cannot continue.
     #[serde(default)]
@@ -258,6 +258,9 @@ struct TaskStartEvent {
     origin: String,
     #[serde(default)]
     trust: String,
+    /// The queue lane the task waited in, which is what decided it ran when it did.
+    #[serde(default)]
+    lane: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1955,7 +1958,12 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
                 (false, true) => e.origin.clone(),
                 (true, false) => e.trust.clone(),
             };
-            let annotations: Vec<&str> = [e.source.as_str(), provenance.as_str()]
+            let lane = if e.lane.is_empty() {
+                String::new()
+            } else {
+                format!("lane {}", e.lane)
+            };
+            let annotations: Vec<&str> = [e.source.as_str(), provenance.as_str(), lane.as_str()]
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .collect();
@@ -2995,6 +3003,15 @@ mod tests {
         assert_eq!(
             task_row(line),
             "task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted)"
+        );
+    }
+
+    #[test]
+    fn task_row_names_the_lane_the_task_waited_in() {
+        let line = r#"{"event_type":"task_start","event_id":"evt_1","session_id":"s","timestamp":1,"task_id":"tsk_0a1b2c3d4e5f","context_id":"ctx_3c4d5e6f7a8b","source":"a2a","origin":"peer","trust":"trusted","lane":"peer","message_parts_bytes":9}"#;
+        assert_eq!(
+            task_row(line),
+            "task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/trusted, lane peer)"
         );
     }
 

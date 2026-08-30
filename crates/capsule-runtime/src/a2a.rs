@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::origin::TaskProvenance;
+use crate::{lanes::TaskLane, origin::TaskProvenance};
 
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
 
@@ -141,8 +141,17 @@ pub(crate) enum TaskState {
 #[derive(Debug, Clone)]
 pub(crate) enum TaskSlotState {
     Empty,
-    Running { task_id: String, context_id: String },
-    Done { task_id: String },
+    Running {
+        task_id: String,
+        context_id: String,
+        /// The lane the queue chose this task out of. Lives inside the variant so it is set and
+        /// cleared by the two methods that already own `active_slot`'s lifecycle, and cannot
+        /// name a lane no task is running in.
+        lane: TaskLane,
+    },
+    Done {
+        task_id: String,
+    },
 }
 
 // ── TaskRegistry — multi-task history tracker ─────────────────────────────────
@@ -214,7 +223,9 @@ impl TaskRegistry {
         );
     }
 
-    pub(crate) fn start_task(&mut self, task_id: String, context_id: String) {
+    /// `lane` is the lane the queue selected this task out of, not a lane recomputed here, so
+    /// what the registry reports is what the selection actually did.
+    pub(crate) fn start_task(&mut self, task_id: String, context_id: String, lane: TaskLane) {
         debug_assert!(self.pending_count > 0);
         self.pending_count -= 1;
         self.history
@@ -222,13 +233,26 @@ impl TaskRegistry {
         self.active_slot = TaskSlotState::Running {
             task_id,
             context_id,
+            lane,
         };
+    }
+
+    /// The lane of the task the capsule is running, or `None` when no task is running.
+    ///
+    /// `Some` is what stops the lane queue yielding anything, so a `Done` or `Empty` slot must
+    /// answer `None`.
+    pub(crate) fn active_lane(&self) -> Option<TaskLane> {
+        match self.active_slot {
+            TaskSlotState::Running { lane, .. } => Some(lane),
+            TaskSlotState::Empty | TaskSlotState::Done { .. } => None,
+        }
     }
 
     pub(crate) fn finish_task(&mut self, final_state: TaskState) {
         if let TaskSlotState::Running {
             ref task_id,
             ref context_id,
+            ..
         } = self.active_slot
         {
             let (tid, cid) = (task_id.clone(), context_id.clone());
@@ -358,7 +382,7 @@ mod tests {
     fn running_registry(task_id: &str) -> TaskRegistry {
         let mut r = make_registry();
         r.enqueue(task_id, "ctx_001");
-        r.start_task(task_id.to_string(), "ctx_001".to_string());
+        r.start_task(task_id.to_string(), "ctx_001".to_string(), TaskLane::Bg);
         r
     }
 
