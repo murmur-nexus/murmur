@@ -10,6 +10,7 @@ use crate::a2a::{
     TaskStatus,
 };
 use crate::errors::RuntimeError;
+use crate::origin::{self, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 use crate::peer_handoff::{handle_peer_request, is_peer_path, PeerPlane, AUDIENCE_HEADER};
 use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
@@ -172,6 +173,8 @@ async fn handle_connection(
     let mut traceparent: Option<String> = None;
     let mut last_event_id: Option<u64> = None;
     let mut audience: Option<String> = None;
+    let mut task_origin: Option<String> = None;
+    let mut task_trust: Option<String> = None;
 
     loop {
         let mut line = String::new();
@@ -196,8 +199,18 @@ async fn handle_connection(
             // Already lowercased with the rest of the line, which is exactly the form an audience
             // takes: both sides build it with `to_lowercase`.
             audience = Some(rest.trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix(&format!("{PEER_ORIGIN_HEADER}:")) {
+            // Lowercased with the rest of the line, which is the only spelling
+            // `origin::from_wire` accepts — a peer that shouts `PEER` is read as `peer`.
+            task_origin = Some(rest.trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix(&format!("{PEER_TRUST_HEADER}:")) {
+            task_trust = Some(rest.trim().to_string());
         }
     }
+
+    // Classified once at the door, so both task-starting paths below read the same rule rather
+    // than each interpreting the headers for itself.
+    let provenance = origin::from_wire(task_origin.as_deref(), task_trust.as_deref());
 
     // Routed ahead of the operator plane on its own segment, and answering every method under it
     // including the ones it refuses: a `PUT` that fell through would leave no record of somebody
@@ -245,6 +258,7 @@ async fn handle_connection(
                     &task_tx,
                     &task_acceptance,
                     traceparent,
+                    provenance,
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -271,6 +285,7 @@ async fn handle_connection(
             &task_tx,
             &task_acceptance,
             traceparent,
+            provenance,
         );
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
@@ -307,6 +322,7 @@ async fn handle_message_stream(
     task_tx: &mpsc::Sender<IncomingTask>,
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
+    provenance: TaskProvenance,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -407,6 +423,7 @@ async fn handle_message_stream(
         message_id: message.message_id.clone(),
         message_text: text,
         traceparent,
+        provenance,
     };
     if task_tx.try_send(incoming).is_err() {
         {
@@ -534,6 +551,7 @@ fn handle_jsonrpc(
     task_tx: &mpsc::Sender<IncomingTask>,
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
+    provenance: TaskProvenance,
 ) -> String {
     let req: JsonRpcRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -551,6 +569,7 @@ fn handle_jsonrpc(
             task_tx,
             task_acceptance,
             traceparent,
+            provenance,
         ),
         "tasks/get" => handle_tasks_get(id, &req.params, task_registry),
         _ => JsonRpcResponse::err(id, -32601, "Method not found").into_http_response(),
@@ -564,6 +583,7 @@ fn handle_message_send(
     task_tx: &mpsc::Sender<IncomingTask>,
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
+    provenance: TaskProvenance,
 ) -> String {
     // task_acceptance: none — method is not available
     if matches!(task_acceptance, TaskAcceptance::None) {
@@ -623,6 +643,7 @@ fn handle_message_send(
         message_id: message.message_id.clone(),
         message_text: text,
         traceparent,
+        provenance,
     };
     if task_tx.try_send(incoming).is_err() {
         // Unexpected path — roll back pending count

@@ -73,6 +73,52 @@ sanitizes them (collapsing newlines, stripping control characters, truncating le
 rendering, and `MURMUR.md` states explicitly that this file is machine-generated inventory
 data, never instructions.
 
+## Task origin and trust class
+
+Every task the runtime runs carries an **origin** — why it woke the capsule — set by whoever
+enqueued it, and a **trust class** derived from that origin. A sender never declares its own
+class.
+
+| Origin | Set by | Trust |
+|---|---|---|
+| `user` | A person handing the capsule an instruction — a local `mur run`, a `task.md` | `trusted` |
+| `schedule` | A timer | `trusted` |
+| `system` | The runtime enqueuing work for itself, with no person in the loop | `trusted` |
+| `event` | A webhook, a chat message, a PR comment — third-party text | `untrusted` |
+| `peer` | A message from another capsule | The sending capsule's own class |
+| `completion` | A sub-capsule or detached shell reporting that its work finished | The sending capsule's own class |
+
+`peer` and `completion` inherit, so untrust cannot launder itself at the first hop: an untrusted
+webhook payload that reaches capsule A and is forwarded to capsule B arrives at B still
+untrusted. A message that carries no class at all is `untrusted`.
+
+The origin travels between capsules as two request headers, stamped by the sending runtime:
+
+| Header | Values |
+|---|---|
+| `x-murmur-task-origin` | `peer` or `completion` |
+| `x-murmur-task-trust` | `trusted` or `untrusted` |
+
+`murmur:message/send` carries no origin or trust field, so a capsule author has nothing to assert
+a class with. Only `peer` and `completion` are accepted from the wire; the other four origins are
+enqueued locally and never legitimately arrive over HTTP. An inbound `x-murmur-task-origin`
+naming one of them, naming anything unrecognised, or absent entirely yields `event` /
+`untrusted`. This is not authentication: a caller that claims `peer` + `trusted` gets what a
+genuine trusted peer gets, and nothing on the A2A path tells the two apart. What it closes is
+untrust laundering across an honest chain.
+
+The class is recorded, not enforced: no task is refused, delayed or reordered because it is
+`untrusted`. Treat it as the answer to "why did this run", and keep authoring manifests on the
+assumption that any task's text may be hostile.
+
+Both values are recorded on the [`task_start`](../reference/observability-schemas.md#session-trace-tracejsonl)
+trace event and shown on the task row of `mur trace steps <session>`:
+
+```
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (a2a, peer/untrusted)
+task tsk_0a1b2c3d…  ctx_3c4d5e6f…  (task_md, user/trusted)
+```
+
 ## Prompt injection and network-bypass posture { #threat-model }
 
 Two gaps shape how you should author manifests, not just what the runtime enforces. The first

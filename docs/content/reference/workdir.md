@@ -108,8 +108,9 @@ goes over A2A, with a grant on both ends. Declaring the same `store:` name in tw
 one way to point them at one directory, and it has to be written in both manifests.
 
 **WASM tools, drivers and hooks reach the store; native subprocesses do not.** Under the `sealed`
-containment class the store is absent from the capsule's composed root, so an allowlisted binary
-spawned through `capabilities.shell.allow` or `capabilities.spawn.allow` cannot open it.
+containment class the store is absent from the capsule's composed root, so neither a binary
+allowlisted by `capabilities.shell.allow` nor a sub-capsule allowlisted by
+`capabilities.spawn.allow` can open it.
 
 ### What belongs in the workdir instead
 
