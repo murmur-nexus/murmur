@@ -258,6 +258,14 @@ pub enum HookCommitPolicy {
     /// first message list, under the `context.seed_budget` ceiling. Valid only with
     /// on-task-start.
     SeedContext,
+    /// `"deny"` — the hook decides, immediately before the call is dispatched, whether the
+    /// call happens at all. Valid only with on-shell and on-tool-call, and only with an
+    /// explicit `binding:` naming one of them.
+    ///
+    /// The only policy that *subtracts*: every other value commits something the hook
+    /// produced, this one refuses something the capsule asked for. It narrows the manifest's
+    /// grant and can never widen it.
+    Deny,
 }
 
 impl HookCommitPolicy {
@@ -270,6 +278,7 @@ impl HookCommitPolicy {
             Self::WriteManifests => "write-manifests",
             Self::ReopenTask => "reopen-task",
             Self::SeedContext => "seed-context",
+            Self::Deny => "deny",
         }
     }
 }
@@ -333,8 +342,12 @@ impl Default for HookConfig {
 /// produces — which `hook-output` arm the runtime commits for each event. Two bindings
 /// return `None` for different reasons, and the distinction matters:
 ///
-/// - `on-session-start`, `on-tool-call`, `on-shell`, `on-session-end` honor no arm at
-///   all; every output from them is discarded.
+/// - `on-session-start` and `on-session-end` honor no arm at all; every output from them
+///   is discarded.
+/// - `on-tool-call` and `on-shell` honor `deny`, and only at their decision-point dispatch
+///   — the one that runs before the call. Their post-call observation dispatch honors
+///   nothing, which is why the runtime's table is keyed on the dispatch phase as well as
+///   the event name.
 /// - `on-inference` *does* honor an arm (`artifact`), but that arm has no
 ///   `commit_policy` spelling — [`HookCommitPolicy`] has no `Artifact` variant — so no
 ///   non-`none` policy is declarable for it either.
@@ -342,7 +355,8 @@ impl Default for HookConfig {
 /// [`HookBinding::All`] (an omitted `binding:`) also returns `None`, and that is a third
 /// reason again: an `All`-bound hook is dispatched to *every* event, so there is no single
 /// honored policy to name. It is deliberately **not** validated against this function —
-/// [`parse_hook_config_from_yaml`] accepts every `commit_policy` for it.
+/// [`parse_hook_config_from_yaml`] accepts every `commit_policy` for it, with the single
+/// exception of [`HookCommitPolicy::Deny`], which that function rejects outright for `All`.
 #[must_use]
 pub fn commit_policy_for_binding(binding: &HookBinding) -> Option<HookCommitPolicy> {
     match binding {
@@ -350,10 +364,9 @@ pub fn commit_policy_for_binding(binding: &HookBinding) -> Option<HookCommitPoli
         HookBinding::OnCompaction => Some(HookCommitPolicy::ReplaceContext),
         HookBinding::OnTaskEnd => Some(HookCommitPolicy::ReopenTask),
         HookBinding::OnTaskStart => Some(HookCommitPolicy::SeedContext),
+        HookBinding::OnToolCall | HookBinding::OnShell => Some(HookCommitPolicy::Deny),
         HookBinding::OnSessionStart
         | HookBinding::OnInference
-        | HookBinding::OnToolCall
-        | HookBinding::OnShell
         | HookBinding::OnSessionEnd
         | HookBinding::All => None,
     }
@@ -372,6 +385,14 @@ pub fn read_hook_config(artifact_manifest_path: &Path) -> Result<HookConfig, Run
 }
 
 /// Parse hook behavioral contract from an in-memory manifest YAML string.
+///
+/// `commit_policy: deny` is the one policy an omitted `binding:` cannot carry. Every other
+/// policy is accepted for [`HookBinding::All`] because an `All`-bound hook reaches every
+/// event and the runtime simply discards what a given event does not honor. `deny` is not
+/// discardable in that way: it is answered at a *decision point* standing in front of a call,
+/// and an `All`-bound hook would be asked to decide on shell and tool calls it was never
+/// written to judge — with every failure to answer, including a trap or a timeout, refusing
+/// the call. The binding is therefore required to name which of the two events the hook gates.
 pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
     let v: serde_yaml::Value =
         serde_yaml::from_str(yaml).map_err(|e| format!("YAML parse error: {e}"))?;
@@ -422,9 +443,10 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
             "write-manifests" => Ok(HookCommitPolicy::WriteManifests),
             "reopen-task" => Ok(HookCommitPolicy::ReopenTask),
             "seed-context" => Ok(HookCommitPolicy::SeedContext),
+            "deny" => Ok(HookCommitPolicy::Deny),
             other => Err(format!(
                 "unknown commit_policy '{other}'; expected: none, replace-context, write-manifests, \
-                 reopen-task, seed-context"
+                 reopen-task, seed-context, deny"
             )),
         })
         .transpose()?
@@ -445,10 +467,21 @@ pub fn parse_hook_config_from_yaml(yaml: &str) -> Result<HookConfig, String> {
                 .to_string(),
         );
     }
+    // The one policy `All` cannot carry: a hook that does not name which of the two gated
+    // events it decides on would be dispatched at decision points it was never written for,
+    // and every non-`none` answer there refuses a call.
+    if binding == HookBinding::All && commit_policy == HookCommitPolicy::Deny {
+        return Err(
+            "commit_policy 'deny' requires an explicit binding: 'on-shell' or 'on-tool-call'; \
+             a hook with no binding: is dispatched at every event, including decision points \
+             it was not written to decide"
+                .to_string(),
+        );
+    }
     // `binding` is the single source of truth for what the runtime commits; a declared
     // `commit_policy` the binding can never honor is a mistake that is fully knowable here,
     // at staging time, rather than mid-session as a `hook_dispatch_error`. An omitted
-    // `binding:` (`All`) reaches every event, so every policy stays valid for it.
+    // `binding:` (`All`) reaches every event, so every other policy stays valid for it.
     if binding != HookBinding::All && commit_policy != HookCommitPolicy::None {
         let honored = commit_policy_for_binding(&binding);
         if honored.as_ref() != Some(&commit_policy) {
@@ -6245,6 +6278,57 @@ context:
         assert!(err.contains("reopen-task"), "error was: {err}");
     }
 
+    #[test]
+    fn hook_config_parses_deny_commit_policy_for_both_gated_bindings() {
+        for binding in ["on-shell", "on-tool-call"] {
+            let yaml =
+                format!("name: policy\nruntime: hook\nbinding: {binding}\ncommit_policy: deny\n");
+            let config = parse_hook_config_from_yaml(&yaml).unwrap();
+            assert_eq!(config.commit_policy, HookCommitPolicy::Deny);
+        }
+        assert_eq!(HookCommitPolicy::Deny.as_str(), "deny");
+    }
+
+    /// `deny` is the one policy an omitted `binding:` cannot carry: a hook that does not name
+    /// which of the two gated events it decides on would be asked at both.
+    #[test]
+    fn hook_config_deny_without_a_binding_is_rejected() {
+        let yaml = "name: policy\nruntime: hook\ncommit_policy: deny\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(
+            err.contains("requires an explicit binding"),
+            "error was: {err}"
+        );
+        assert!(err.contains("on-shell"), "error was: {err}");
+        assert!(err.contains("on-tool-call"), "error was: {err}");
+    }
+
+    /// Every other binding refuses `deny` through the existing binding-mismatch check.
+    #[test]
+    fn hook_config_deny_on_an_ungated_binding_is_rejected() {
+        let yaml = "name: policy\nruntime: hook\nbinding: on-compaction\ncommit_policy: deny\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(err.contains("is not valid for binding"), "error was: {err}");
+        assert!(err.contains("replace-context"), "error was: {err}");
+    }
+
+    /// The unchanged async/commit check covers `deny` for free; this pins that it does.
+    #[test]
+    fn hook_config_async_deny_is_rejected() {
+        let yaml =
+            "name: policy\nruntime: hook\nbinding: on-shell\nexecution_mode: async\ncommit_policy: deny\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(err.contains("async-with-commit"), "error was: {err}");
+        assert!(err.contains("deny"), "error was: {err}");
+    }
+
+    #[test]
+    fn hook_config_unknown_commit_policy_lists_deny() {
+        let yaml = "name: gate\nruntime: hook\ncommit_policy: on-nonsense\n";
+        let err = parse_hook_config_from_yaml(yaml).unwrap_err();
+        assert!(err.contains("deny"), "error was: {err}");
+    }
+
     /// The existing, unmodified async/commit validation must also reject
     /// `commit_policy: reopen-task` combined with `execution_mode: async`.
     #[test]
@@ -6257,17 +6341,12 @@ context:
 
     // ── binding is the single source of truth for what a hook commits ─────────────
 
-    /// The four bindings whose events honor no `hook-output` arm at all cannot declare
+    /// The two bindings whose events honor no `hook-output` arm at all cannot declare
     /// any non-`none` `commit_policy`. The error names the binding, the declared policy,
     /// and `none` as what the binding honors.
     #[test]
     fn hook_config_non_committing_binding_rejects_any_commit_policy() {
-        for binding in [
-            "on-session-start",
-            "on-tool-call",
-            "on-shell",
-            "on-session-end",
-        ] {
+        for binding in ["on-session-start", "on-session-end"] {
             let yaml = format!(
                 "name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: replace-context\n"
             );
@@ -6290,6 +6369,8 @@ context:
             ("on-compaction", "write-manifests", "replace-context"),
             ("on-task-end", "replace-context", "reopen-task"),
             ("on-task-start", "replace-context", "seed-context"),
+            ("on-shell", "replace-context", "deny"),
+            ("on-tool-call", "replace-context", "deny"),
         ] {
             let yaml = format!(
                 "name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: {declared}\n"
@@ -6326,8 +6407,8 @@ context:
         }
     }
 
-    /// A binding declaring exactly the policy it honors is accepted, for all three
-    /// representable pairs.
+    /// A binding declaring exactly the policy it honors is accepted, for every
+    /// representable pair.
     #[test]
     fn hook_config_matching_binding_and_commit_policy_is_valid() {
         for (binding, policy, expected) in [
@@ -6342,6 +6423,8 @@ context:
                 HookCommitPolicy::ReplaceContext,
             ),
             ("on-task-end", "reopen-task", HookCommitPolicy::ReopenTask),
+            ("on-shell", "deny", HookCommitPolicy::Deny),
+            ("on-tool-call", "deny", HookCommitPolicy::Deny),
         ] {
             let yaml =
                 format!("name: gate\nruntime: hook\nbinding: {binding}\ncommit_policy: {policy}\n");
@@ -6374,7 +6457,8 @@ context:
 
     /// Resolved ambiguity: an omitted `binding:` is `HookBinding::All`, which is dispatched
     /// to every event — including all four that honor an arm — so every `commit_policy` is
-    /// accepted for it. Deliberate: no narrowing for `All`.
+    /// accepted for it. Deliberate: no narrowing for `All`. `deny` is the one exception,
+    /// covered by [`hook_config_deny_without_a_binding_is_rejected`].
     #[test]
     fn hook_config_omitted_binding_accepts_every_commit_policy() {
         for (policy, expected) in [
@@ -6485,13 +6569,20 @@ context:
             commit_policy_for_binding(&HookBinding::OnTaskStart),
             Some(HookCommitPolicy::SeedContext)
         );
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnToolCall),
+            Some(HookCommitPolicy::Deny)
+        );
+        assert_eq!(
+            commit_policy_for_binding(&HookBinding::OnShell),
+            Some(HookCommitPolicy::Deny)
+        );
         // `on-inference` honors `artifact`, which has no `commit_policy` spelling; the
-        // other four honor nothing. `All` is unconstrained by design.
+        // other two honor nothing. `All` is unconstrained by design, apart from the `deny`
+        // carve-out the parser applies.
         for binding in [
             HookBinding::OnSessionStart,
             HookBinding::OnInference,
-            HookBinding::OnToolCall,
-            HookBinding::OnShell,
             HookBinding::OnSessionEnd,
             HookBinding::All,
         ] {

@@ -728,6 +728,7 @@ async fn read_process_output(
                                     turn: pending.turn,
                                     tool_name: pending.name,
                                     input_bytes: pending.input_bytes,
+                                    input: pending.input.to_string(),
                                     output_bytes,
                                     duration_ms,
                                     status: status.to_string(),
@@ -864,9 +865,8 @@ async fn read_codex_output(
                             .unwrap_or("<unknown>")
                             .to_string();
                         let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                        let input_bytes = serde_json::to_string(&input)
-                            .map(|s| s.len() as u64)
-                            .unwrap_or(0);
+                        let input_json = input.to_string();
+                        let input_bytes = input_json.len() as u64;
                         let is_error = item.get("error").map(|e| !e.is_null()).unwrap_or(false);
                         let status = if is_error { "error" } else { "ok" };
                         let output = tool_result_text(item.get("result").unwrap_or(&Value::Null));
@@ -920,6 +920,7 @@ async fn read_codex_output(
                                     turn: turns - 1,
                                     tool_name,
                                     input_bytes,
+                                    input: input_json,
                                     output_bytes,
                                     duration_ms: 0,
                                     status: status.to_string(),

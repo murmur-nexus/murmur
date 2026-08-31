@@ -15,7 +15,8 @@ use wasmtime_wasi_http::{
 };
 
 use murmur_artifact::{
-    HookBinding, HookConfig, HookExecutionMode, HookOverflowPolicy, PACKED_MANIFEST_ENTRY,
+    HookBinding, HookCommitPolicy, HookConfig, HookExecutionMode, HookOverflowPolicy,
+    PACKED_MANIFEST_ENTRY,
 };
 use tokio::sync::mpsc;
 
@@ -23,7 +24,7 @@ use crate::{
     artifact_config::ARTIFACT_CONFIG_ENV,
     bindings::hook::exports::murmur::hook::lifecycle::{
         CompactionEvent, HookOutput, InferenceEvent, Message, SessionContext, SessionEndEvent,
-        ShellEvent, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent,
+        ShellEvent, ShellOutcome, StageEvent, TaskEndEvent, TaskStartEvent, ToolEvent, ToolOutcome,
     },
     conversation_import::{add_conversation_to_linker, ConversationState},
     errors::RuntimeError,
@@ -41,7 +42,7 @@ use crate::{
 /// `murmur:hook` version declared in `wit/`. The host keeps no compatibility
 /// fallback: a hook compiled against any other version does not resolve, so a
 /// WIT bump requires every hook artifact to be rebuilt (see `wit/VERSIONING.md`).
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.6.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.7.0";
 
 /// Resolve the lifecycle instance export. `None` means the component does not
 /// export [`LIFECYCLE_IFACE`], which surfaces as a missing-export error at the
@@ -137,6 +138,11 @@ pub(crate) struct HookRuntime {
     /// `run-inference` records (see [`Self::drain_inference_records`]). Faults raised off
     /// this path arrive through [`Self::fault_tx`] instead.
     dispatch_faults: Vec<DispatchFault>,
+    /// Whether any staged blocking hook is a *policy* hook — `commit_policy: deny` bound to
+    /// `on-shell` or `on-tool-call`. Computed once at [`HookRuntime::new`] and read as a single
+    /// boolean by the agent loop before every tool call, so a capsule with no policy hook does
+    /// no call resolution and no extra dispatch at all.
+    gates_calls: bool,
     started: Instant,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -161,9 +167,13 @@ const REQUIRED_HOOK_FNS: [&str; 6] = [
 const OPTIONAL_HOOK_FNS: [&str; 2] = ["on-task-start", "on-task-end"];
 
 /// Single source of truth for which `hook-output` arm each of the nine lifecycle
-/// events honors. Keyed by the WIT function name; the value is the one non-`none`
-/// arm the runtime commits for that event, or `None` when the event honors nothing
-/// beyond the always-silent `none`.
+/// events honors at its [`DispatchPhase::Observe`] dispatch. Keyed by the WIT function
+/// name; the value is the one non-`none` arm the runtime commits for that event, or
+/// `None` when the event honors nothing beyond the always-silent `none`.
+///
+/// `deny` appears in no row here, and that is what makes it a fault from every observation
+/// dispatch — including the observation dispatch of the two events that *do* honor it before
+/// the call. See [`HONORED_DECISION_ARM`] for that phase.
 ///
 /// Both dispatch paths consult this table — the shared [`call_hook`] path (for the
 /// eight events routed through [`HookRuntime::dispatch`]) and the separate
@@ -184,12 +194,42 @@ const HONORED_OUTPUT_ARM: &[(&str, Option<&str>)] = &[
     ("on-session-end", None),
 ];
 
-/// The `hook-output` arm `event` (a WIT lifecycle function name) honors beyond the
+/// The honored-arm table for the *decision-point* dispatch, the sibling of
+/// [`HONORED_OUTPUT_ARM`] and deliberately separate from it.
+///
+/// Only the two gated events appear, and only with `deny`. The seven other events have no
+/// decision-point dispatch at all, so "a hook returning `deny` from anything else is a fault"
+/// is a consequence of the tables rather than a special case written anywhere: `deny` is
+/// absent from every row of [`HONORED_OUTPUT_ARM`], and every event but these two is absent
+/// from this table.
+const HONORED_DECISION_ARM: &[(&str, Option<&str>)] =
+    &[("on-tool-call", Some("deny")), ("on-shell", Some("deny"))];
+
+/// Which of an event's two dispatches this is.
+///
+/// The two gated events are dispatched twice over their lifetime — once to decide, once to
+/// observe — and the two phases honor different arms, so the honored-arm decision is keyed on
+/// the phase as well as the event name. Every other event has an [`Observe`](Self::Observe)
+/// dispatch only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchPhase {
+    /// After the call, reporting what happened. The event carries `outcome: some(...)`, and
+    /// nothing a hook returns can change what already ran.
+    Observe,
+    /// Before the call, deciding whether it happens. The event carries `outcome: none`.
+    Decide,
+}
+
+/// The `hook-output` arm `event` (a WIT lifecycle function name) honors at `phase` beyond the
 /// always-silent `none`, or `None` if it honors nothing else. Looks the event up in
-/// [`HONORED_OUTPUT_ARM`]; an unknown name (which cannot occur for the nine declared
-/// events) also yields `None`.
-fn honored_arm(event: &str) -> Option<&'static str> {
-    HONORED_OUTPUT_ARM
+/// [`HONORED_OUTPUT_ARM`] or [`HONORED_DECISION_ARM`] as the phase selects; an event absent
+/// from the phase's table also yields `None`.
+fn honored_arm(phase: DispatchPhase, event: &str) -> Option<&'static str> {
+    let table = match phase {
+        DispatchPhase::Observe => HONORED_OUTPUT_ARM,
+        DispatchPhase::Decide => HONORED_DECISION_ARM,
+    };
+    table
         .iter()
         .find(|(name, _)| *name == event)
         .and_then(|(_, arm)| *arm)
@@ -206,6 +246,7 @@ fn output_arm_name(output: &HookOutput) -> Option<&'static str> {
         HookOutput::Artifact(_) => Some("artifact"),
         HookOutput::ReopenTask(_) => Some("reopen-task"),
         HookOutput::SeedContext(_) => Some("seed-context"),
+        HookOutput::Deny(_) => Some("deny"),
     }
 }
 
@@ -223,11 +264,11 @@ enum OutputDisposition {
     Fault(&'static str),
 }
 
-/// Classify `output` for `event` against the single honored-arm table.
-fn classify_output(event: &str, output: &HookOutput) -> OutputDisposition {
+/// Classify `output` for `event` at `phase` against that phase's honored-arm table.
+fn classify_output(phase: DispatchPhase, event: &str, output: &HookOutput) -> OutputDisposition {
     match output_arm_name(output) {
         None => OutputDisposition::Ignore,
-        Some(arm) if Some(arm) == honored_arm(event) => OutputDisposition::Honored,
+        Some(arm) if Some(arm) == honored_arm(phase, event) => OutputDisposition::Honored,
         Some(arm) => OutputDisposition::Fault(arm),
     }
 }
@@ -387,6 +428,8 @@ pub(crate) enum HookEvent {
         turn: u32,
         tool_name: String,
         input_bytes: u64,
+        /// The exact tool input JSON the call received, untruncated.
+        input: String,
         output_bytes: u64,
         duration_ms: u64,
         status: String,
@@ -397,6 +440,11 @@ pub(crate) enum HookEvent {
         /// (else the bare invoked name).
         binary: String,
         command: String,
+        /// The exact argument list handed to the executable, untruncated — unlike `command`,
+        /// which is clipped for display.
+        argv: Vec<String>,
+        /// The `-c` body for the interpreter form, `None` for every other form.
+        script: Option<String>,
         exit_code: i32,
         stdout: String,
         stderr: String,
@@ -529,6 +577,11 @@ pub(crate) struct ShellDispatchInfo {
     /// which carries the argument list alone and therefore never names the binary.
     pub binary: String,
     pub command: String,
+    /// The argument list `execute_shell` was handed, as resolved by
+    /// `runtime::resolve_shell_call` — the same value a policy hook was shown before the call.
+    pub argv: Vec<String>,
+    /// The `-c` body for the interpreter form, `None` otherwise.
+    pub script: Option<String>,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -539,6 +592,61 @@ pub(crate) struct ShellDispatchInfo {
     /// names exactly one. Carried alongside `exit_code` rather than folded into it because a
     /// signal-killed process has no exit code to fold it into.
     pub resource_limit: Option<String>,
+}
+
+/// What is about to run, resolved by the runtime from the tool name and its input. The hook
+/// holds no filesystem grant and cannot resolve any of this itself.
+///
+/// Built by `CapsuleStoreState::resolve_call` from the same resolver the spawn path uses, so
+/// the argv a policy hook decides on is the argv the executable receives.
+pub(crate) enum ResolvedCall {
+    Shell {
+        binary: String,
+        command: String,
+        argv: Vec<String>,
+        script: Option<String>,
+    },
+    Tool {
+        tool_name: String,
+        input: String,
+        input_bytes: u64,
+    },
+}
+
+impl ResolvedCall {
+    /// The WIT lifecycle function whose decision point gates this call.
+    pub(crate) fn event_name(&self) -> &'static str {
+        match self {
+            Self::Shell { .. } => "on-shell",
+            Self::Tool { .. } => "on-tool-call",
+        }
+    }
+
+    /// What a denial names as the thing refused: the resolved executable for a shell call, the
+    /// tool name for everything else.
+    pub(crate) fn target(&self) -> &str {
+        match self {
+            Self::Shell { binary, .. } => binary,
+            Self::Tool { tool_name, .. } => tool_name,
+        }
+    }
+
+    /// The binding a hook must declare to be asked about this call.
+    fn binding(&self) -> HookBinding {
+        match self {
+            Self::Shell { .. } => HookBinding::OnShell,
+            Self::Tool { .. } => HookBinding::OnToolCall,
+        }
+    }
+}
+
+/// The outcome of the decision-point dispatch. Two variants and no more: there is no arm that
+/// permits, and `Denied` carries no capability, path, grant or policy value. A hook can only
+/// subtract from what the manifest already granted, and this type is where that is made
+/// unrepresentable rather than merely intended.
+pub(crate) enum CallDecision {
+    Proceed,
+    Denied { hook_name: String, reason: String },
 }
 
 /// Env vars injected into every hook's WASI context. Group avoids a >7-arg constructor.
@@ -587,7 +695,7 @@ pub(crate) fn dispatch_stage(
                 // unsupported-arm fault here is logged but never traced — unlike the
                 // shared `dispatch` path. The honored arm is decided by the same
                 // `HONORED_OUTPUT_ARM` table via `classify_output`.
-                Ok(output) => match classify_output("on-stage", &output) {
+                Ok(output) => match classify_output(DispatchPhase::Observe, "on-stage", &output) {
                     OutputDisposition::Honored => {
                         // `on-stage` honors only `write-manifests`.
                         if let HookOutput::WriteManifests(manifests) = output {
@@ -810,6 +918,14 @@ impl HookRuntime {
             }
         }
 
+        let gates_calls = blocking_hooks.iter().any(|hook| {
+            hook.config.commit_policy == HookCommitPolicy::Deny
+                && matches!(
+                    hook.config.binding,
+                    HookBinding::OnShell | HookBinding::OnToolCall
+                )
+        });
+
         Ok(Self {
             workdir: workdir.to_path_buf(),
             blocking_hooks,
@@ -821,6 +937,7 @@ impl HookRuntime {
             task_io: host_state.task_io,
             conversation: host_state.conversation,
             dispatch_faults: Vec::new(),
+            gates_calls,
             started: Instant::now(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -964,6 +1081,157 @@ impl HookRuntime {
     /// An empty `Vec` means no hook produced an artifact for this event.
     pub(crate) async fn emit(&mut self, workdir: &Path, event: HookEvent) -> Vec<HookArtifact> {
         self.dispatch(workdir, event).await.artifacts
+    }
+
+    /// Whether this session has a policy hook bound at all — a blocking hook declaring
+    /// `commit_policy: deny` on `on-shell` or `on-tool-call`.
+    ///
+    /// A single boolean read, computed once at [`Self::new`]. `false` is the whole of the
+    /// non-gated path: the agent loop resolves nothing, dispatches nothing and allocates
+    /// nothing extra before a tool call.
+    pub(crate) fn gates_calls(&self) -> bool {
+        self.gates_calls
+    }
+
+    /// Ask every bound policy hook whether `call` may run, and stop at the first refusal.
+    ///
+    /// The decision point. It sits inside the already-granted path — after the manifest
+    /// capability check and immediately before the call is dispatched — and its only possible
+    /// effect on the runtime is to *skip* work. It takes no capability policy and returns no
+    /// grant: [`CallDecision`] has no arm that permits, so nothing here can widen what the
+    /// manifest allowed.
+    ///
+    /// **Fail-closed, and not configurable.** The call proceeds only on a clean
+    /// `hook-output::none`. Every other outcome refuses it:
+    ///
+    /// | hook outcome | result |
+    /// | --- | --- |
+    /// | `Ok(none)` | proceed |
+    /// | `Ok(deny(reason))`, `reason` non-blank | deny, with the hook's reason verbatim |
+    /// | `Ok(deny(reason))`, `reason` blank | deny, with a runtime reason naming the defect |
+    /// | `Ok(<any other arm>)` | deny, and a [`DispatchFault`] is recorded for that arm |
+    /// | `Err(msg)` — trap, panic, epoch deadline, memory-limit kill, lift failure | deny, carrying `msg` |
+    /// | function absent from the component | deny |
+    ///
+    /// There is no manifest field, environment variable, CLI flag or config key that changes
+    /// any row of it, and that absence is deliberate: the inversion of the "hook errors are
+    /// non-fatal" default is the whole point of a policy hook, and an escape hatch would make
+    /// a broken hook silently permissive. The observation dispatch of these same two events
+    /// keeps the non-fatal default, unchanged.
+    ///
+    /// The last row cannot be reached in practice — both gated functions are in
+    /// [`REQUIRED_HOOK_FNS`], so a component missing either fails to instantiate — and is
+    /// written as a refusal rather than left to that fact.
+    pub(crate) async fn decide(
+        &mut self,
+        workdir: &Path,
+        turn: u32,
+        call: &ResolvedCall,
+    ) -> CallDecision {
+        let event_fn = call.event_name();
+        let binding = call.binding();
+        let mut decision = CallDecision::Proceed;
+        // Buffered and applied after the loop: it holds `&mut self.blocking_hooks`, so nothing
+        // else on `self` can be touched while it runs.
+        let mut faults: Vec<DispatchFault> = Vec::new();
+
+        for hook in &mut self.blocking_hooks {
+            if hook.config.commit_policy != HookCommitPolicy::Deny || hook.config.binding != binding
+            {
+                continue;
+            }
+            let name = hook.name.clone();
+            let called = match call {
+                ResolvedCall::Shell {
+                    binary,
+                    command,
+                    argv,
+                    script,
+                } => {
+                    let evt = ShellEvent {
+                        turn,
+                        binary: binary.clone(),
+                        command: command.chars().take(200).collect(),
+                        argv: argv.clone(),
+                        script: script.clone(),
+                        // `none` is what tells the hook this call has not run, and is the only
+                        // dispatch at which its `deny` is honored.
+                        outcome: None,
+                    };
+                    call_typed(hook, event_fn, evt).await
+                }
+                ResolvedCall::Tool {
+                    tool_name,
+                    input,
+                    input_bytes,
+                } => {
+                    let evt = ToolEvent {
+                        turn,
+                        tool_name: tool_name.clone(),
+                        input_bytes: *input_bytes,
+                        input: input.clone(),
+                        outcome: None,
+                    };
+                    call_typed(hook, event_fn, evt).await
+                }
+            };
+
+            let reason = match called {
+                Ok(Some(output)) => match classify_output(DispatchPhase::Decide, event_fn, &output)
+                {
+                    OutputDisposition::Ignore => continue,
+                    OutputDisposition::Honored => match output {
+                        HookOutput::Deny(reason) if !reason.trim().is_empty() => reason,
+                        // A refusal the agent cannot act on is still a refusal; the runtime
+                        // supplies the reason the hook did not.
+                        _ => format!(
+                            "policy hook '{name}' refused this call from '{event_fn}' but \
+                             returned an empty reason"
+                        ),
+                    },
+                    OutputDisposition::Fault(arm) => {
+                        log_hook_error(
+                            workdir,
+                            &name,
+                            &format_dispatch_fault(&name, event_fn, arm),
+                        )
+                        .await;
+                        faults.push(DispatchFault {
+                            hook_name: name.clone(),
+                            event: event_fn.to_string(),
+                            arm: arm.to_string(),
+                        });
+                        format!(
+                            "policy hook '{name}' returned hook-output arm '{arm}' from the \
+                             '{event_fn}' decision point; only 'deny' or 'none' is answerable \
+                             there, so the call was refused"
+                        )
+                    }
+                },
+                // Unreachable: `on-shell` and `on-tool-call` are both required exports.
+                Ok(None) => format!(
+                    "policy hook '{name}' does not export '{event_fn}'; a policy hook must \
+                     export the function it gates, so the call was refused"
+                ),
+                // `classify_guest_failure` has already made `error` name the limit that fired,
+                // for a trap, an epoch-deadline expiry or a memory-limit kill alike.
+                Err(error) => {
+                    log_hook_error(workdir, &name, &error).await;
+                    format!(
+                        "policy hook '{name}' failed at the '{event_fn}' decision point: {error}"
+                    )
+                }
+            };
+
+            decision = CallDecision::Denied {
+                hook_name: name,
+                reason,
+            };
+            break;
+        }
+
+        self.dispatch_faults.append(&mut faults);
+        decision
     }
 
     /// Buffer a fault the runtime itself raised about a hook, for the same drain the
@@ -1515,6 +1783,7 @@ async fn call_hook(
             turn,
             tool_name,
             input_bytes,
+            input,
             output_bytes,
             duration_ms,
             status,
@@ -1523,9 +1792,14 @@ async fn call_hook(
                 turn: *turn,
                 tool_name: tool_name.clone(),
                 input_bytes: *input_bytes,
-                output_bytes: *output_bytes,
-                duration_ms: *duration_ms,
-                status: status.clone(),
+                input: input.clone(),
+                // `some` is what makes this the observation dispatch: the call has run, and
+                // nothing the hook returns can unmake it.
+                outcome: Some(ToolOutcome {
+                    output_bytes: *output_bytes,
+                    duration_ms: *duration_ms,
+                    status: status.clone(),
+                }),
             };
             call_typed(hook, "on-tool-call", evt).await?
         }
@@ -1533,6 +1807,8 @@ async fn call_hook(
             turn,
             binary,
             command,
+            argv,
+            script,
             exit_code,
             stdout,
             stderr,
@@ -1540,18 +1816,22 @@ async fn call_hook(
             stderr_bytes,
             duration_ms,
         } => {
-            // `binary` is not truncated the way `command` is — a clipped path names a
-            // different file, or none.
+            // `binary`, `argv` and `script` are not truncated the way `command` is — a clipped
+            // path names a different file, or none, and a clipped argv names a different call.
             let evt = ShellEvent {
                 turn: *turn,
                 binary: binary.clone(),
                 command: command.chars().take(200).collect(),
-                exit_code: *exit_code,
-                stdout: stdout.clone(),
-                stderr: stderr.clone(),
-                stdout_bytes: *stdout_bytes,
-                stderr_bytes: *stderr_bytes,
-                duration_ms: *duration_ms,
+                argv: argv.clone(),
+                script: script.clone(),
+                outcome: Some(ShellOutcome {
+                    exit_code: *exit_code,
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                    stdout_bytes: *stdout_bytes,
+                    stderr_bytes: *stderr_bytes,
+                    duration_ms: *duration_ms,
+                }),
             };
             call_typed(hook, "on-shell", evt).await?
         }
@@ -1606,7 +1886,7 @@ async fn call_hook(
         // Optional function absent from this component — never a fault; the hook
         // simply is not dispatched for this event.
         None => HookCallResult::None,
-        Some(out) => match classify_output(event_fn, &out) {
+        Some(out) => match classify_output(DispatchPhase::Observe, event_fn, &out) {
             OutputDisposition::Ignore => HookCallResult::None,
             OutputDisposition::Honored => match out {
                 HookOutput::Artifact(payload) => HookCallResult::Artifact(HookArtifact {
@@ -1629,7 +1909,11 @@ async fn call_hook(
                 // `write-manifests` is honored only by `on-stage`, which is never
                 // dispatched through `call_hook`, so it cannot reach this arm as
                 // `Honored`; `none` classifies as `Ignore` before it gets here.
-                HookOutput::WriteManifests(_) | HookOutput::None => HookCallResult::None,
+                // `deny` is honored only at the decision point, which never routes through
+                // `call_hook`; from here it has already classified as a fault.
+                HookOutput::WriteManifests(_) | HookOutput::Deny(_) | HookOutput::None => {
+                    HookCallResult::None
+                }
             },
             OutputDisposition::Fault(arm) => HookCallResult::UnsupportedArm {
                 event: event_fn.to_string(),
@@ -1844,7 +2128,7 @@ mod tests {
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
     /// instance name, so tests can build a component that exports the versioned
-    /// (`murmur:hook/lifecycle@0.6.0`), the legacy unversioned, or a
+    /// (`murmur:hook/lifecycle@0.7.0`), the legacy unversioned, or a
     /// deliberately-unmatched name to exercise `resolve_lifecycle_iface` and its
     /// hard-error path.
     fn hook_double_iface(engine: &wasmtime::Engine, iface: &str, fn_names: &[&str]) -> Component {
@@ -2228,7 +2512,7 @@ mod tests {
     }
 
     /// A hook component built against the *current* versioned
-    /// `murmur:hook/lifecycle@0.6.0` interface (the name a freshly-compiled hook
+    /// `murmur:hook/lifecycle@0.7.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
     /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
@@ -2389,7 +2673,8 @@ mod tests {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
@@ -2457,7 +2742,8 @@ mod tests {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $compaction-event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
@@ -2878,19 +3164,18 @@ mod tests {
 
     // ---- shell-event: `binary` (added by the `@0.5.0` bump) ----
 
-    /// A double whose `on-shell` declares the **current** 9-field `shell-event`, and which
-    /// verifies what it was handed rather than merely accepting it: the core function
-    /// byte-compares the incoming `binary` string against `expect_binary` and traps on any
-    /// difference. So "zero lines in the hook log" here means the guest received exactly
-    /// the value the host claims it sent — a weaker double could pass while `binary`
-    /// carried garbage.
+    /// A double whose `on-shell` declares the **current** `shell-event`, and which verifies
+    /// what it was handed rather than merely accepting it: the core function byte-compares
+    /// the incoming `binary` string against `expect_binary` and traps on any difference. So
+    /// "zero lines in the hook log" here means the guest received exactly the value the host
+    /// claims it sent — a weaker double could pass while `binary` carried garbage.
     ///
-    /// `on-shell`'s flat params are fixed by the canonical ABI lowering of the 9-field
-    /// record: `u32` + three `string`s (2 each, in field order `binary`, `command`,
-    /// `stdout`, `stderr` — four strings, 8 i32) + `s32` + three `u64`. Unlike the
-    /// constant-pointer `realloc` the other doubles use, this one bump-allocates: four
-    /// strings lowered to the same address would clobber each other, and `binary` is
-    /// lowered first.
+    /// `shell-event` flattens to 19 core values, past the canonical ABI's 16-parameter
+    /// limit, so the record arrives **indirectly**: one `i32` pointing at the lowered record
+    /// in guest memory. Its field offsets are `turn` 0, `binary` ptr/len 4/8, `command`
+    /// ptr/len 12/16, `argv` ptr/len 20/24, `script` disc/ptr/len 28/32/36, `outcome`
+    /// disc 40. The `realloc` bump-allocates because the host lowers the record and every
+    /// string it points at into that memory.
     ///
     /// The expected bytes live at offset 0 and the `result<hook-output, string>` return
     /// area at 128, so `expect_binary` must stay well under 128 bytes.
@@ -2918,12 +3203,14 @@ mod tests {
       (local.set $at (global.get $next))
       (global.set $next (i32.add (local.get $at) (local.get $size)))
       (local.get $at))
-    (func (export "onshell")
-      (param $turn i32) (param $binp i32) (param $binlen i32)
-      (param i32) (param i32) (param i32) (param i32) (param i32) (param i32) (param i32)
-      (param i64) (param i64) (param i64) (result i32)
+    (func (export "onshell") (param $event i32) (result i32)
+      (local $binp i32)
       (local $i i32)
-      (if (i32.ne (local.get $binlen) (i32.const {expect_len})) (then unreachable))
+      (local.set $binp (i32.load (i32.add (local.get $event) (i32.const 4))))
+      (if (i32.ne
+            (i32.load (i32.add (local.get $event) (i32.const 8)))
+            (i32.const {expect_len}))
+        (then unreachable))
       (block $done
         (loop $l
           (br_if $done (i32.ge_u (local.get $i) (i32.const {expect_len})))
@@ -2954,17 +3241,22 @@ mod tests {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
-  (type $shell-event (record
-    (field "turn" u32)
-    (field "binary" string)
-    (field "command" string)
+    (case "seed-context" (list $message))
+    (case "deny" string)))
+  (type $shell-outcome (record
     (field "exit-code" s32)
     (field "stdout" string)
     (field "stderr" string)
     (field "stdout-bytes" u64)
     (field "stderr-bytes" u64)
     (field "duration-ms" u64)))
+  (type $shell-event (record
+    (field "turn" u32)
+    (field "binary" string)
+    (field "command" string)
+    (field "argv" (list string))
+    (field "script" (option string))
+    (field "outcome" (option $shell-outcome))))
   (type $ft (func (param "event" $shell-event) (result (result $hook-output (error string)))))
 
   (func $sh (type $ft)
@@ -2975,6 +3267,7 @@ mod tests {
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
+    (export "shell-outcome" (type $shell-outcome))
     (export "shell-event" (type $shell-event))
     (export "on-shell" (func $sh))
 {stubs}
@@ -3015,6 +3308,8 @@ mod tests {
                     turn: 1,
                     binary: binary.to_string(),
                     command: "-q tests/".to_string(),
+                    argv: vec!["-q".to_string(), "tests/".to_string()],
+                    script: None,
                     exit_code: 0,
                     stdout: "ok".to_string(),
                     stderr: String::new(),
@@ -3026,7 +3321,7 @@ mod tests {
             .await;
     }
 
-    /// A current-version hook receives the 9-field `shell-event`, and the `binary` it
+    /// A current-version hook receives the current `shell-event`, and the `binary` it
     /// observes is byte-for-byte what the host sent — the whole point of the `@0.5.0`
     /// bump. The double traps on any mismatch, so an empty log is the assertion.
     #[test]
@@ -3286,7 +3581,8 @@ mod tests {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $inference-event (record
     (field "turn" u32)
     (field "input-tokens" u64)
@@ -3468,7 +3764,8 @@ mod tests {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
@@ -4500,7 +4797,7 @@ artifacts:
     (memory (export "memory") 1)
     (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 512)
     (func (export "ontool")
-      (param i32 i32 i32 i64 i64 i64 i32 i32) (result i32)
+      (param i32 i32 i32 i64 i32 i32 i32 i64 i64 i32 i32) (result i32)
       (i32.store (i32.const 128) (i32.const 0))
       (i32.store (i32.const 132) (i32.const {arm_disc}))
       (i32.store (i32.const 136) (i32.const 0))
@@ -4524,14 +4821,18 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
+  (type $tool-outcome (record
+    (field "output-bytes" u64)
+    (field "duration-ms" u64)
+    (field "status" string)))
   (type $tool-event (record
     (field "turn" u32)
     (field "tool-name" string)
     (field "input-bytes" u64)
-    (field "output-bytes" u64)
-    (field "duration-ms" u64)
-    (field "status" string)))
+    (field "input" string)
+    (field "outcome" (option $tool-outcome))))
   (type $ft (func (param "event" $tool-event) (result (result $hook-output (error string)))))
 
   (func $ot (type $ft)
@@ -4542,6 +4843,7 @@ artifacts:
     (export "message" (type $message))
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
+    (export "tool-outcome" (type $tool-outcome))
     (export "tool-event" (type $tool-event))
     (export "on-tool-call" (func $ot))
 {stubs}
@@ -4553,7 +4855,7 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
-    /// A *current-version* (`@0.6.0`, 6-case `hook-output`) `on-task-end` double that
+    /// A *current-version* (`@0.7.0`, 7-case `hook-output`) `on-task-end` double that
     /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
     /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
     /// offset 300 so the host lifts the real bytes the guest declared, exercising the
@@ -4604,7 +4906,8 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $task-end-event (record
     (field "task-id" string)
     (field "exit-status" string)))
@@ -4711,7 +5014,7 @@ artifacts:
     }
 
     /// Invariant: `reopen-task` returned from any event other than `on-task-end` is a
-    /// dispatch fault, not a silent grant. Bind the same 6-case double to `on-tool-call`
+    /// dispatch fault, not a silent grant. Bind the same 7-case double to `on-tool-call`
     /// (its `on-tool-call` export is a bare stub, so dispatching it fails `.typed()` —
     /// but the point tested here is the honored-arm *table*: `on-tool-call` honors no
     /// arm, so even if it returned `reopen-task` it would be classified `Fault`, exactly
@@ -4802,7 +5105,8 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $task-start-event (record
     (field "task-id" string)
     (field "context-id" string)
@@ -5057,7 +5361,8 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $stage-event (record (field "shell-allow" (list string))))
   (type $ft (func (param "event" $stage-event) (result (result $hook-output (error string)))))
 
@@ -5085,6 +5390,7 @@ artifacts:
             turn: 0,
             tool_name: "bash".to_string(),
             input_bytes: 0,
+            input: String::new(),
             output_bytes: 0,
             duration_ms: 0,
             status: "ok".to_string(),
@@ -5443,7 +5749,8 @@ artifacts:
             HookBinding::OnSessionEnd,
         ] {
             let event = binding.as_str();
-            let arm = honored_arm(event);
+            let arm = honored_arm(DispatchPhase::Observe, event);
+            let decision_arm = honored_arm(DispatchPhase::Decide, event);
             let policy = murmur_artifact::commit_policy_for_binding(&binding);
 
             if binding == HookBinding::OnInference {
@@ -5452,18 +5759,93 @@ artifacts:
                 // so no non-`none` policy is declarable for this binding, and the parser
                 // rejects every one.
                 assert_eq!(arm, Some("artifact"), "{event}");
+                assert_eq!(decision_arm, None, "{event}");
                 assert_eq!(policy, None, "{event}");
                 continue;
             }
 
-            // Everywhere else the two tables must say the same thing: the arm the runtime
-            // commits is exactly the policy a hook may declare, and an event that honors
-            // nothing admits no policy but `none`.
+            // An event honors an arm at exactly one of its two phases, so the union is the
+            // whole of what a hook may declare for that binding. The two gated events sit on
+            // the `Decide` side (`deny`); every other event sits on the `Observe` side.
+            assert!(
+                arm.is_none() || decision_arm.is_none(),
+                "{event}: an event must honor an arm at one phase, not both"
+            );
+            let honored = arm.or(decision_arm);
+
+            // The arm the runtime commits is exactly the policy a hook may declare, and an
+            // event that honors nothing admits no policy but `none`.
             assert_eq!(
-                arm,
+                honored,
                 policy.as_ref().map(HookCommitPolicy::as_str),
                 "{event}: honored arm and declarable commit_policy disagree"
             );
+        }
+
+        // Spelled out rather than left to the loop, because these two are the whole of what
+        // this slice added and a table edit that silently drops one would still pass above.
+        assert_eq!(honored_arm(DispatchPhase::Decide, "on-shell"), Some("deny"));
+        assert_eq!(
+            honored_arm(DispatchPhase::Decide, "on-tool-call"),
+            Some("deny")
+        );
+        assert_eq!(honored_arm(DispatchPhase::Observe, "on-shell"), None);
+        assert_eq!(honored_arm(DispatchPhase::Observe, "on-tool-call"), None);
+    }
+
+    /// `deny` is honored at exactly one place, and the tables are what say so: from the
+    /// observation dispatch of any of the nine events it is an unsupported arm, including the
+    /// two events whose decision point does honor it.
+    #[test]
+    fn deny_is_a_fault_at_every_observation_dispatch() {
+        for binding in [
+            HookBinding::OnStage,
+            HookBinding::OnSessionStart,
+            HookBinding::OnTaskStart,
+            HookBinding::OnInference,
+            HookBinding::OnToolCall,
+            HookBinding::OnShell,
+            HookBinding::OnCompaction,
+            HookBinding::OnTaskEnd,
+            HookBinding::OnSessionEnd,
+        ] {
+            let event = binding.as_str();
+            let output = HookOutput::Deny("no".to_string());
+            assert!(
+                matches!(
+                    classify_output(DispatchPhase::Observe, event, &output),
+                    OutputDisposition::Fault("deny")
+                ),
+                "{event}: deny must be a fault at the observation dispatch"
+            );
+        }
+    }
+
+    /// The decision point honors `deny` and nothing else: `none` is silent, and every other
+    /// arm is a fault there too.
+    #[test]
+    fn only_deny_is_honored_at_a_decision_point() {
+        for event in ["on-shell", "on-tool-call"] {
+            assert!(matches!(
+                classify_output(
+                    DispatchPhase::Decide,
+                    event,
+                    &HookOutput::Deny("no".to_string())
+                ),
+                OutputDisposition::Honored
+            ));
+            assert!(matches!(
+                classify_output(DispatchPhase::Decide, event, &HookOutput::None),
+                OutputDisposition::Ignore
+            ));
+            assert!(matches!(
+                classify_output(
+                    DispatchPhase::Decide,
+                    event,
+                    &HookOutput::Artifact("{}".to_string())
+                ),
+                OutputDisposition::Fault("artifact")
+            ));
         }
     }
 
@@ -5559,7 +5941,7 @@ artifacts:
     (func (export "onstart") (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)
       (call $mark (i32.const 83))
       (call $ok))
-    (func (export "ontool") (param i32 i32 i32 i64 i64 i64 i32 i32) (result i32)
+    (func (export "ontool") (param i32 i32 i32 i64 i32 i32 i32 i64 i64 i32 i32) (result i32)
       (call $mark (i32.const 84))
       (call $ok))
     ;; err(<history>): discriminant 1 at 128, string (ptr,len) at 132/136.
@@ -5587,20 +5969,24 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)
     (field "session-id" string)
     (field "model" string)
     (field "capabilities" (list string))))
+  (type $tool-outcome (record
+    (field "output-bytes" u64)
+    (field "duration-ms" u64)
+    (field "status" string)))
   (type $tool-event (record
     (field "turn" u32)
     (field "tool-name" string)
     (field "input-bytes" u64)
-    (field "output-bytes" u64)
-    (field "duration-ms" u64)
-    (field "status" string)))
+    (field "input" string)
+    (field "outcome" (option $tool-outcome))))
   (type $session-end-event (record
     (field "total-turns" u32)
     (field "total-input-tokens" u64)
@@ -5626,6 +6012,7 @@ artifacts:
     (export "tool-manifest" (type $tool-manifest))
     (export "hook-output" (type $hook-output))
     (export "session-context" (type $session-context))
+    (export "tool-outcome" (type $tool-outcome))
     (export "tool-event" (type $tool-event))
     (export "session-end-event" (type $session-end-event))
     (export "on-session-start" (func $os))
@@ -5805,7 +6192,8 @@ artifacts:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $session-context (record
     (field "capsule-name" string)
     (field "capsule-version" string)

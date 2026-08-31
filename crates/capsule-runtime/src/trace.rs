@@ -729,6 +729,29 @@ struct TaskReopenedEvent {
     reopen_number: u32,
 }
 
+/// A policy hook refused a call before it ran. The one record that says a call the model asked
+/// for never happened — there is no `tool_call` or `shell` line for a denied call, because
+/// nothing ran.
+#[derive(Serialize)]
+struct CallDeniedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    /// The gated lifecycle function whose decision point refused: `"on-shell"` or
+    /// `"on-tool-call"`.
+    event: String,
+    /// Manifest name of the policy hook that refused.
+    hook_name: String,
+    /// What was refused: the resolved executable path for a shell call, the tool name
+    /// otherwise.
+    target: String,
+    /// The hook's own reason, or the runtime's when the hook supplied none it could use.
+    reason: String,
+}
+
 #[derive(Serialize)]
 struct HookDispatchErrorEvent {
     event_type: &'static str,
@@ -1568,6 +1591,29 @@ impl TraceWriter {
     /// drained just before `session_end`. Non-fatal: the session already continued as
     /// if the hook had returned `none`; this only makes the discard visible to
     /// `mur trace show` and anything reading the session trace.
+    pub(crate) async fn write_call_denied(
+        &mut self,
+        turn: u32,
+        event: &str,
+        hook_name: &str,
+        target: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = CallDeniedEvent {
+            event_type: "call_denied",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            event: event.to_string(),
+            hook_name: hook_name.to_string(),
+            target: target.to_string(),
+            reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
     pub(crate) async fn write_hook_dispatch_error(
         &mut self,
         hook_name: &str,

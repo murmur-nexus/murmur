@@ -17,7 +17,9 @@ use serde_json::{json, Value};
 use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput},
     errors::RuntimeError,
-    hooks::{DispatchFault, HookEvent, HookRuntime, HookSeed, FAULT_ARM_SEED_REJECTED},
+    hooks::{
+        CallDecision, DispatchFault, HookEvent, HookRuntime, HookSeed, FAULT_ARM_SEED_REJECTED,
+    },
     murmur_md::MURMUR_MD_TRUST_NOTICE,
     origin::{TaskProvenance, TrustClass},
     otel::OtelEmitter,
@@ -772,11 +774,62 @@ pub(crate) async fn run_agent_loop(
 
                     let started = Instant::now();
                     let input_bytes = input_json.len() as u64;
+
+                    // The decision point: after the manifest's capability check has already
+                    // decided what this capsule may do, and immediately before the call is
+                    // dispatched. A policy hook can only subtract from here — its one possible
+                    // effect on the loop is that the call does not happen.
+                    //
+                    // Gated on a single boolean, so a capsule with no policy hook resolves
+                    // nothing and dispatches nothing extra.
+                    if hooks.gates_calls() {
+                        let resolved = store_state.resolve_call(
+                            &tool_name,
+                            &ToolInput {
+                                data: Some(input_json.clone()),
+                                log_path: None,
+                            },
+                        );
+                        if let CallDecision::Denied { hook_name, reason } =
+                            hooks.decide(workdir, turn_u32, &resolved).await
+                        {
+                            // Nothing ran, so nothing is recorded as having run: no observation
+                            // event, no `tool_call` record and no `shell` record for this call.
+                            trace
+                                .write_call_denied(
+                                    turn_u32,
+                                    resolved.event_name(),
+                                    &hook_name,
+                                    resolved.target(),
+                                    &reason,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    RuntimeError::AgentLoopFailed(format!(
+                                        "trace write failed: {e}"
+                                    ))
+                                })?;
+                            // An unsupported arm returned at the decision point is a fault as
+                            // well as a refusal; drain it now so both reach the trace.
+                            flush_hook_dispatch_faults(hooks, trace).await;
+                            tool_messages.push(with_new_id(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "is_error": true,
+                                "content": [{
+                                    "type": "text",
+                                    "text": denial_tool_result(&hook_name, &reason),
+                                }],
+                            })));
+                            continue;
+                        }
+                    }
+
                     let (is_error, text) = match store_state
                         .dispatch_agent_tool_async(
                             &tool_name,
                             ToolInput {
-                                data: Some(input_json),
+                                data: Some(input_json.clone()),
                                 log_path: None,
                             },
                         )
@@ -808,6 +861,7 @@ pub(crate) async fn run_agent_loop(
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
                                         input_bytes,
+                                        input: input_json.clone(),
                                         output_bytes,
                                         duration_ms,
                                         status: status.clone(),
@@ -868,6 +922,8 @@ pub(crate) async fn run_agent_loop(
                                             turn: turn_u32,
                                             binary: shell.binary.clone(),
                                             command: shell.command.clone(),
+                                            argv: shell.argv.clone(),
+                                            script: shell.script.clone(),
                                             exit_code: shell.exit_code,
                                             stdout: shell.stdout.clone(),
                                             stderr: shell.stderr.clone(),
@@ -957,6 +1013,7 @@ pub(crate) async fn run_agent_loop(
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
                                         input_bytes,
+                                        input: input_json.clone(),
                                         output_bytes,
                                         duration_ms,
                                         status: "error".to_string(),
@@ -1218,6 +1275,18 @@ async fn flush_hook_inference_records(
 /// `session_end`/`session_end_if_not_ended` write, so no fault produced during the
 /// run is lost regardless of which exit path the session takes. A no-op when the
 /// buffer is empty (the common case), so calling it at every exit is free.
+/// What the agent is handed in place of a call a policy hook refused.
+///
+/// The second line is load-bearing. A model shown an opaque failure retries the same call, and
+/// retrying is exactly the behaviour a policy hook exists to stop; saying so plainly is what
+/// turns a refusal into information the model can act on.
+fn denial_tool_result(hook_name: &str, reason: &str) -> String {
+    format!(
+        "Refused by policy hook '{hook_name}': {reason}\n\n\
+         This call did not run. Retrying it unchanged will be refused again."
+    )
+}
+
 pub(crate) async fn flush_hook_dispatch_faults(hooks: &mut HookRuntime, trace: &mut TraceWriter) {
     for fault in hooks.drain_dispatch_faults() {
         let _ = trace
@@ -2509,6 +2578,17 @@ fn extract_text_content(content: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal the agent reads, pinned verbatim: it names the hook, carries the hook's
+    /// reason, and says the retry will fail. A model shown only "error" retries.
+    #[test]
+    fn denial_tool_result_names_the_hook_and_refuses_a_retry() {
+        assert_eq!(
+            denial_tool_result("branch-policy", "protected branch"),
+            "Refused by policy hook 'branch-policy': protected branch\n\n\
+             This call did not run. Retrying it unchanged will be refused again."
+        );
+    }
 
     #[test]
     fn augmented_system_prompt_carries_trust_notice_with_no_custom_prompt() {

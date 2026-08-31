@@ -46,8 +46,8 @@ use crate::{
     detached::{demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry},
     errors::RuntimeError,
     hooks::{
-        dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, SessionContextData,
-        ShellDispatchInfo, TaskReopen,
+        dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
+        SessionContextData, ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
     inference_import::HookInferenceCtx,
@@ -3665,6 +3665,51 @@ impl CapsuleStoreState {
         .await
     }
 
+    /// Resolve what a tool call is about to run, for the policy decision point.
+    ///
+    /// Routes exactly as [`Self::dispatch_agent_tool_unfenced`] does, in the same order, so the
+    /// hook is shown the branch that will actually be taken. Everything that is not a shell
+    /// call — a runtime peer-handoff tool, a native artifact binary, a skill, a WASM tool —
+    /// resolves to [`ResolvedCall::Tool`] carrying the exact input JSON.
+    ///
+    /// Read-only and side-effect free: it decides nothing and grants nothing, and the capability
+    /// checks it routes past are still performed by the dispatch path itself.
+    pub(crate) fn resolve_call(
+        &self,
+        name: &str,
+        input: &murmur::tool::run::ToolInput,
+    ) -> ResolvedCall {
+        let as_tool = || {
+            let json = input.data.clone().unwrap_or_default();
+            ResolvedCall::Tool {
+                tool_name: name.to_string(),
+                input_bytes: json.len() as u64,
+                input: json,
+            }
+        };
+        if name == SHARE_FILE_TOOL || name == FETCH_PEER_FILE_TOOL {
+            return as_tool();
+        }
+        let native_bin = self.workdir.join("tools").join(name).join(name);
+        if native_bin.exists() && !self.tool_components.contains_key(name) {
+            return as_tool();
+        }
+        match resolve_shell_call(name, input, &self.capability_policy) {
+            Some(ResolvedShellCall {
+                binary,
+                command,
+                argv,
+                script,
+            }) => ResolvedCall::Shell {
+                binary,
+                command,
+                argv,
+                script,
+            },
+            None => as_tool(),
+        }
+    }
+
     /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
     /// whatever comes back.
     ///
@@ -4653,6 +4698,68 @@ fn dispatch_native_tool(
     }
 }
 
+/// What a shell tool call will actually run, resolved from the tool name and its input.
+///
+/// One value produced by one function, handed to both the policy decision point and the spawn,
+/// so what a hook is asked to approve and what `execute_shell` is given cannot drift apart.
+pub(crate) struct ResolvedShellCall {
+    /// The program that will be invoked, canonicalized against the host `PATH` where that
+    /// resolves and the bare name otherwise — the same value the post-call `shell-event`
+    /// carries.
+    pub binary: String,
+    /// The `command` string as the tool received it, untruncated. A display value; `argv` and
+    /// `script` are what identify the call.
+    pub command: String,
+    /// The exact argument list handed to the executable.
+    pub argv: Vec<String>,
+    /// The `-c` body for the interpreter form, `None` for every other form.
+    pub script: Option<String>,
+}
+
+/// Resolve what a shell tool call will run, or `None` when `name` is not a declared shell
+/// binary or its input carries no usable `command`.
+///
+/// The decision point's view of a call. It performs no capability decision of its own: the
+/// `shell_allow` test here is the routing question "is this name a shell tool at all", and the
+/// enforcing check stays where it was, at the top of `execute_shell`.
+pub(crate) fn resolve_shell_call(
+    name: &str,
+    input: &murmur::tool::run::ToolInput,
+    policy: &CapabilityPolicy,
+) -> Option<ResolvedShellCall> {
+    resolve_shell_call_inner(name, input, policy).ok()
+}
+
+/// [`resolve_shell_call`] keeping the diagnostic, for the dispatch path that reports it to the
+/// model. The two must stay one function: an argv computed twice is an argv that can be
+/// approved in one form and executed in another.
+fn resolve_shell_call_inner(
+    name: &str,
+    input: &murmur::tool::run::ToolInput,
+    policy: &CapabilityPolicy,
+) -> Result<ResolvedShellCall, String> {
+    if !policy.shell_allow.iter().any(|allowed| allowed == name) {
+        return Err(format!(
+            "binary '{name}' is not in capabilities.shell.allow"
+        ));
+    }
+    let command = extract_shell_command(input)?;
+    let (argv, script) = if is_shell_interpreter(name) {
+        (
+            vec!["-c".to_string(), command.clone()],
+            Some(command.clone()),
+        )
+    } else {
+        (split_shell_words(&command), None)
+    };
+    Ok(ResolvedShellCall {
+        binary: crate::sandbox::resolve_invoked_binary_path(name),
+        command,
+        argv,
+        script,
+    })
+}
+
 /// `detach` is what decides whether a slow command can be demoted. `None` runs it to completion
 /// in the foreground — the only shape available to a caller with no task loop to deliver a
 /// completion to.
@@ -4665,8 +4772,8 @@ fn dispatch_shell_tool(
     enforcement: &sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
-    let command = match extract_shell_command(&input) {
-        Ok(command) => command,
+    let resolved = match resolve_shell_call_inner(name, &input, policy) {
+        Ok(resolved) => resolved,
         Err(error) => {
             return DispatchOutcome::tool(murmur::tool::run::ToolResult {
                 status: murmur::tool::run::Status::Error,
@@ -4678,14 +4785,13 @@ fn dispatch_shell_tool(
             });
         }
     };
-
-    let split_args: Vec<String>;
-    let args: Vec<&str> = if is_shell_interpreter(name) {
-        vec!["-c", command.as_str()]
-    } else {
-        split_args = split_shell_words(&command);
-        split_args.iter().map(String::as_str).collect()
-    };
+    let ResolvedShellCall {
+        command,
+        argv,
+        script,
+        ..
+    } = resolved;
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
 
     let detach = detach.map(|detach| DetachPolicy {
         command: command.clone(),
@@ -4707,6 +4813,8 @@ fn dispatch_shell_tool(
                 // exposed as its own tool), resolved to a path by `execute_shell`.
                 binary: result.binary.clone(),
                 command: command.clone(),
+                argv: argv.clone(),
+                script: script.clone(),
                 exit_code: result.exit_code,
                 stdout: result.stdout.clone(),
                 stderr: result.stderr.clone(),
@@ -6567,6 +6675,94 @@ inference:
         assert_eq!(shell.exit_code, 0);
     }
 
+    /// The argv a policy hook decides on and the argv the spawn receives come from one
+    /// resolution, not two: `resolve_shell_call` is what `dispatch_shell_tool` uses, so a
+    /// drift between the approved call and the executed one is not expressible.
+    #[test]
+    fn resolve_shell_call_and_dispatch_shell_tool_agree_on_argv() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let input = murmur::tool::run::ToolInput {
+            data: Some(r#"{"command":"echo one 'two three'"}"#.to_string()),
+            log_path: None,
+        };
+
+        let resolved = resolve_shell_call("bash", &input, &policy).expect("bash resolves");
+        let outcome = dispatch_shell_tool(
+            "bash",
+            input,
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+
+        let shell = outcome
+            .shell
+            .expect("a successful shell call reports itself");
+        assert_eq!(resolved.argv, shell.argv);
+        assert_eq!(resolved.script, shell.script);
+        assert_eq!(
+            resolved.argv,
+            vec!["-c".to_string(), "echo one 'two three'".to_string()],
+            "an interpreter takes the whole command as one -c body"
+        );
+    }
+
+    /// A non-interpreter binary is word-split and carries no script.
+    #[test]
+    fn resolve_shell_call_splits_a_non_interpreter_and_reports_no_script() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["curl".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let resolved = resolve_shell_call(
+            "curl",
+            &murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"-s http://example.com"}"#.to_string()),
+                log_path: None,
+            },
+            &policy,
+        )
+        .expect("curl resolves");
+
+        assert_eq!(resolved.argv, vec!["-s", "http://example.com"]);
+        assert_eq!(resolved.script, None);
+    }
+
+    /// Nothing resolves for a name the manifest never declared, and nothing resolves for input
+    /// carrying no command — the two cases that make the decision point see a tool call rather
+    /// than a shell call.
+    #[test]
+    fn resolve_shell_call_declines_an_undeclared_binary_and_unusable_input() {
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        assert!(resolve_shell_call(
+            "curl",
+            &murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"--version"}"#.to_string()),
+                log_path: None,
+            },
+            &policy,
+        )
+        .is_none());
+        assert!(resolve_shell_call(
+            "bash",
+            &murmur::tool::run::ToolInput {
+                data: Some(r#"{"nope":1}"#.to_string()),
+                log_path: None,
+            },
+            &policy,
+        )
+        .is_none());
+    }
+
     /// The dispatch-layer half of the composed-root failure path: a sealed session whose root
     /// could not be built does not come back as an ordinary failed tool call the capsule gets
     /// another turn to react to. The tool result is still filled in (so the trace records the
@@ -7491,7 +7687,7 @@ inference:
         script
     }
 
-    /// A current-version (`@0.6.0`, 6-case `hook-output`) `on-task-end` hook double that
+    /// A current-version (`@0.7.0`, 7-case `hook-output`) `on-task-end` hook double that
     /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
     /// mutable core global that persists across a blocking hook's reused store) and `none`
     /// thereafter. `reopen_limit` large ⇒ "always reopen".
@@ -7550,7 +7746,8 @@ inference:
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $task-end-event (record
     (field "task-id" string)
     (field "exit-status" string)))
@@ -7568,7 +7765,7 @@ inference:
     (export "on-task-end" (func $te))
 {stubs}
   )
-  (export "murmur:hook/lifecycle@0.6.0" (instance $lc))
+  (export "murmur:hook/lifecycle@0.7.0" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");

@@ -1,4 +1,4 @@
-package murmur:hook@0.6.0;
+package murmur:hook@0.7.0;
 
 interface lifecycle {
     record message {
@@ -72,6 +72,19 @@ interface lifecycle {
         /// overflowing front through the compaction hook, or refuse it entirely.
         /// A refusal never fails the task.
         seed-context(list<message>),
+        /// Refuse the call this event is about to make. Honored only at the decision-point
+        /// dispatch of `on-tool-call` and `on-shell` — the dispatch whose event carries
+        /// `outcome: none`. Returned from any other event, or from the post-call observation
+        /// dispatch of these two, it is a non-fatal dispatch fault: nothing is refused, because
+        /// the call has already happened or there is no call to refuse.
+        ///
+        /// The string is the reason the agent is shown. It must be non-empty; an empty reason
+        /// still denies, with a runtime-supplied reason naming the defect.
+        ///
+        /// A deny can only narrow. There is no arm that permits a call, and refusing one grants
+        /// nothing: the capability was already decided by the manifest, and this is a second,
+        /// stricter gate standing in front of it.
+        deny(string),
     }
 
     record session-context {
@@ -127,13 +140,36 @@ interface lifecycle {
         tools: option<string>,
     }
 
+    /// What a completed tool call produced. Carried on `tool-event.outcome` at the
+    /// post-call observation dispatch, and absent at the decision point.
+    record tool-outcome {
+        output-bytes: u64,
+        duration-ms: u64,
+        status: string,
+    }
+
     record tool-event {
         turn: u32,
         tool-name: string,
         input-bytes: u64,
-        output-bytes: u64,
+        /// The exact tool input JSON the tool will receive, never truncated. A policy
+        /// hook must decide on this field and not on any summary of it.
+        input: string,
+        /// `none` means **this call has not run**. That is the decision point, the one
+        /// dispatch at which a returned `deny` is honored. `some(...)` is the post-call
+        /// observation: the call has already happened and nothing can be refused.
+        outcome: option<tool-outcome>,
+    }
+
+    /// What a completed shell call produced. Carried on `shell-event.outcome` at the
+    /// post-call observation dispatch, and absent at the decision point.
+    record shell-outcome {
+        exit-code: s32,
+        stdout: string,
+        stderr: string,
+        stdout-bytes: u64,
+        stderr-bytes: u64,
         duration-ms: u64,
-        status: string,
     }
 
     record shell-event {
@@ -148,13 +184,28 @@ interface lifecycle {
         /// The argument list the shell tool received — never the binary name
         /// itself. For a shell interpreter (`bash`/`sh`/...) this is the script
         /// text passed via `-c`.
+        ///
+        /// Truncated to 200 characters, and a display string only. A policy must
+        /// decide on `argv` and `script` and must never match against `command`.
         command: string,
-        exit-code: s32,
-        stdout: string,
-        stderr: string,
-        stdout-bytes: u64,
-        stderr-bytes: u64,
-        duration-ms: u64,
+        /// The exact argument list the runtime will pass to the executable, never
+        /// truncated. For a shell interpreter this is `["-c", <script>]`.
+        ///
+        /// It names what will actually run, which is what a policy has to decide on:
+        /// `command` is clipped and `binary` alone does not say what the program was
+        /// asked to do. Recipes belonging to a build tool (`make <target>`,
+        /// `just <recipe>`, `npm run <script>`) are **not** resolved into their
+        /// bodies — a hook gating `just build` is deciding on the argv `["build"]`
+        /// and the resolved path of `just`, and no more.
+        argv: list<string>,
+        /// The `-c` body when the interpreter form is used, never truncated, and
+        /// `none` for every other form. A policy must decide on this field rather
+        /// than on `command`.
+        script: option<string>,
+        /// `none` means **this call has not run**. That is the decision point, the one
+        /// dispatch at which a returned `deny` is honored. `some(...)` is the post-call
+        /// observation: the call has already happened and nothing can be refused.
+        outcome: option<shell-outcome>,
     }
 
     record compaction-event {
