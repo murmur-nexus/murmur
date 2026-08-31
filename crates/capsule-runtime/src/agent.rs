@@ -861,7 +861,7 @@ pub(crate) async fn run_agent_loop(
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
                                         input_bytes,
-                                        input: input_json.clone(),
+                                        input: input_json,
                                         output_bytes,
                                         duration_ms,
                                         status: status.clone(),
@@ -1013,7 +1013,7 @@ pub(crate) async fn run_agent_loop(
                                         turn: turn_u32,
                                         tool_name: tool_name.clone(),
                                         input_bytes,
-                                        input: input_json.clone(),
+                                        input: input_json,
                                         output_bytes,
                                         duration_ms,
                                         status: "error".to_string(),
@@ -1270,16 +1270,10 @@ async fn flush_hook_inference_records(
     }
 }
 
-/// Drain every unsupported-arm fault a blocking hook buffered and write each one to
-/// `trace.jsonl` as a `hook_dispatch_error` event. Called immediately before every
-/// `session_end`/`session_end_if_not_ended` write, so no fault produced during the
-/// run is lost regardless of which exit path the session takes. A no-op when the
-/// buffer is empty (the common case), so calling it at every exit is free.
 /// What the agent is handed in place of a call a policy hook refused.
 ///
-/// The second line is load-bearing. A model shown an opaque failure retries the same call, and
-/// retrying is exactly the behaviour a policy hook exists to stop; saying so plainly is what
-/// turns a refusal into information the model can act on.
+/// The no-retry sentence is load-bearing: a model shown an opaque failure retries the same
+/// call, which is the behaviour a policy hook exists to stop.
 fn denial_tool_result(hook_name: &str, reason: &str) -> String {
     format!(
         "Refused by policy hook '{hook_name}': {reason}\n\n\
@@ -1287,6 +1281,11 @@ fn denial_tool_result(hook_name: &str, reason: &str) -> String {
     )
 }
 
+/// Drain every unsupported-arm fault a blocking hook buffered and write each one to
+/// `trace.jsonl` as a `hook_dispatch_error` event. Called immediately before every
+/// `session_end`/`session_end_if_not_ended` write, so no fault produced during the
+/// run is lost regardless of which exit path the session takes. A no-op when the
+/// buffer is empty (the common case), so calling it at every exit is free.
 pub(crate) async fn flush_hook_dispatch_faults(hooks: &mut HookRuntime, trace: &mut TraceWriter) {
     for fault in hooks.drain_dispatch_faults() {
         let _ = trace

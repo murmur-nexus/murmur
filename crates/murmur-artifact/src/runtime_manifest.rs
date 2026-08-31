@@ -6456,7 +6456,7 @@ context:
     }
 
     /// Resolved ambiguity: an omitted `binding:` is `HookBinding::All`, which is dispatched
-    /// to every event — including all four that honor an arm — so every `commit_policy` is
+    /// to every event — including every one that honors an arm — so every `commit_policy` is
     /// accepted for it. Deliberate: no narrowing for `All`. `deny` is the one exception,
     /// covered by [`hook_config_deny_without_a_binding_is_rejected`].
     #[test]

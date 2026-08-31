@@ -4720,8 +4720,8 @@ pub(crate) struct ResolvedShellCall {
 /// binary or its input carries no usable `command`.
 ///
 /// The decision point's view of a call. It performs no capability decision of its own: the
-/// `shell_allow` test here is the routing question "is this name a shell tool at all", and the
-/// enforcing check stays where it was, at the top of `execute_shell`.
+/// `shell_allow` test here is the routing question "is this name a shell tool at all"; the
+/// enforcing check is at the top of `execute_shell`.
 pub(crate) fn resolve_shell_call(
     name: &str,
     input: &murmur::tool::run::ToolInput,

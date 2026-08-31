@@ -98,10 +98,10 @@ returns.
 
 **A policy hook that fails refuses.** This is the inversion of the non-fatal default that governs
 every other hook, and it is the rule a policy hook exists to provide: a gate that opens when it
-breaks is not a gate. The call proceeds only on a clean `none`. A returned `deny`, a trap, a
-panic, a call that outruns its deadline, a memory-limit kill, a return the runtime cannot read, a
-`deny` with an empty reason, and any other `hook-output` arm all refuse the call, with a reason
-naming the hook and the defect. Nothing in the manifest, the environment or the CLI changes this.
+breaks is not a gate. The call proceeds only on a clean `none`. A returned `deny`, a crash, a
+call that outruns its deadline, a memory-limit kill, a return the runtime cannot read, a `deny`
+with an empty reason, and any other `hook-output` arm all refuse the call, with a reason naming
+the hook and the defect. Nothing in the manifest, the environment or the CLI changes this.
 
 The inversion applies at the decision point alone. The observation dispatch of the same two
 events keeps the non-fatal default: a `deny` returned there is a dispatch fault, logged and traced

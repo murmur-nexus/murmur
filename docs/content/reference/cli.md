@@ -926,6 +926,14 @@ task 2  d014bbd7  turns: 1  in: 39  out: 20  ok  2ms
 
 Each task row shows the first 8 characters of the `task_id`, per-task turns, input tokens, output tokens, exit status, and duration.
 
+A `── Denied calls ──` section is printed when a [policy hook](../concepts/hooks.md#policy-hooks)
+refused a shell command or tool call, one line per refusal:
+
+```text
+── Denied calls ─────────────────────────────────
+turn 0  on-shell  /usr/bin/bash  by branch-policy  “protected branch”
+```
+
 ### `mur trace steps`
 
 Print what the agent did, turn by turn.
@@ -954,6 +962,14 @@ task tsk_11112222…  ctx_11112222…  (a2a)
     tool_call  bash  120ms  ✓
     shell      /usr/bin/bash  exit 0  50ms
   turn 2  end_turn
+```
+
+A call a policy hook refused has no `tool_call` or `shell` row, because nothing ran. It renders
+as a `call_denied` row under its turn instead:
+
+```text
+  turn 0  tool_call  bash
+    call_denied on-shell  /usr/bin/bash  denied by branch-policy
 ```
 
 A trace whose lines carry no `event_id` renders one row per turn: turn number, decision, tool

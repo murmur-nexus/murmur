@@ -372,7 +372,7 @@ refuses a shell command or tool call before it runs
 | `event` | string | `"on-shell"` \| `"on-tool-call"` — the gated lifecycle function whose decision point refused |
 | `hook_name` | string | Manifest name of the policy hook that refused |
 | `target` | string | What was refused: the resolved executable path for a shell call, the tool name otherwise |
-| `reason` | string | The hook's own reason, or the runtime's when the hook returned none it could use — a trap, a deadline, an unsupported arm, an empty reason |
+| `reason` | string | The hook's own reason, or the runtime's when the hook returned none it could use — a crash, a deadline, an unsupported arm, an empty reason |
 
 No `tool_call` or `shell` event accompanies it: the call did not run, so there is nothing to
 record about a run. A refusal is not a session failure and the turn continues. An unsupported arm

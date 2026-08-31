@@ -205,6 +205,12 @@ const HONORED_OUTPUT_ARM: &[(&str, Option<&str>)] = &[
 const HONORED_DECISION_ARM: &[(&str, Option<&str>)] =
     &[("on-tool-call", Some("deny")), ("on-shell", Some("deny"))];
 
+/// Characters of `shell-event.command` a hook is shown. Both dispatches of `on-shell` clip to
+/// the same width, so a hook cannot tell the decision point from the observation by the length
+/// of a display string. `argv` and `script` carry the untruncated call, and are what a policy
+/// must decide on — the WIT doc comment on `command` says so.
+const SHELL_COMMAND_DISPLAY_CHARS: usize = 200;
+
 /// Which of an event's two dispatches this is.
 ///
 /// The two gated events are dispatched twice over their lifetime — once to decide, once to
@@ -1151,7 +1157,7 @@ impl HookRuntime {
                     let evt = ShellEvent {
                         turn,
                         binary: binary.clone(),
-                        command: command.chars().take(200).collect(),
+                        command: command.chars().take(SHELL_COMMAND_DISPLAY_CHARS).collect(),
                         argv: argv.clone(),
                         script: script.clone(),
                         // `none` is what tells the hook this call has not run, and is the only
@@ -1821,7 +1827,7 @@ async fn call_hook(
             let evt = ShellEvent {
                 turn: *turn,
                 binary: binary.clone(),
-                command: command.chars().take(200).collect(),
+                command: command.chars().take(SHELL_COMMAND_DISPLAY_CHARS).collect(),
                 argv: argv.clone(),
                 script: script.clone(),
                 outcome: Some(ShellOutcome {
@@ -5782,8 +5788,8 @@ artifacts:
             );
         }
 
-        // Spelled out rather than left to the loop, because these two are the whole of what
-        // this slice added and a table edit that silently drops one would still pass above.
+        // Spelled out rather than left to the loop: a table edit that silently dropped one of
+        // these two rows would still pass the union check above.
         assert_eq!(honored_arm(DispatchPhase::Decide, "on-shell"), Some("deny"));
         assert_eq!(
             honored_arm(DispatchPhase::Decide, "on-tool-call"),
@@ -5846,6 +5852,65 @@ artifacts:
                 ),
                 OutputDisposition::Fault("artifact")
             ));
+        }
+    }
+
+    /// A policy hook can only subtract. [`CallDecision`] has exactly two variants, `Proceed`
+    /// carries nothing and `Denied` carries only the hook's name and its reason — no
+    /// capability, path, grant or policy value — so a decision that widens the manifest's
+    /// grant is not expressible. The exhaustive destructuring match is the assertion: adding a
+    /// third variant, or a payload field to `Denied`, stops this compiling.
+    #[test]
+    fn a_call_decision_has_two_variants_and_carries_no_grant() {
+        for decision in [
+            CallDecision::Proceed,
+            CallDecision::Denied {
+                hook_name: "policy".to_string(),
+                reason: "no".to_string(),
+            },
+        ] {
+            match decision {
+                CallDecision::Proceed => {}
+                CallDecision::Denied { hook_name, reason } => {
+                    assert_eq!(hook_name, "policy");
+                    assert_eq!(reason, "no");
+                }
+            }
+        }
+    }
+
+    /// `gates_calls` is the branch that decides whether the agent loop resolves a call at all.
+    /// It is `true` only for a blocking hook declaring `commit_policy: deny` on one of the two
+    /// gated bindings: an observer bound to the same event does not turn it on, and neither
+    /// does a `deny` the parser would have refused on an ungated binding.
+    #[test]
+    fn gates_calls_is_true_only_for_a_bound_policy_hook() {
+        let session = TempDir::new().unwrap();
+        let accessible = TempDir::new().unwrap();
+        let engine = hook_test_engine();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        for (binding, commit_policy, expected) in [
+            (HookBinding::OnShell, HookCommitPolicy::Deny, true),
+            (HookBinding::OnToolCall, HookCommitPolicy::Deny, true),
+            (HookBinding::OnShell, HookCommitPolicy::None, false),
+            (HookBinding::OnToolCall, HookCommitPolicy::None, false),
+            (HookBinding::OnCompaction, HookCommitPolicy::Deny, false),
+            (HookBinding::All, HookCommitPolicy::None, false),
+        ] {
+            let label = format!("{binding:?} with {commit_policy:?}");
+            let mut staged =
+                staged_double_named("probe", binding, hook_double(&engine, &REQUIRED_HOOK_FNS));
+            staged.config.commit_policy = commit_policy;
+            let hooks = rt
+                .block_on(new_with_hooks(
+                    &engine,
+                    session.path(),
+                    accessible.path(),
+                    vec![staged],
+                ))
+                .expect("the probe double instantiates");
+            assert_eq!(hooks.gates_calls(), expected, "{label}");
         }
     }
 

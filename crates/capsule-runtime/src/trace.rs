@@ -1586,11 +1586,9 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
-    /// Record that a hook returned a `hook-output` arm the lifecycle event does not
-    /// honor. Written by the agent loop from a buffered [`crate::hooks::DispatchFault`]
-    /// drained just before `session_end`. Non-fatal: the session already continued as
-    /// if the hook had returned `none`; this only makes the discard visible to
-    /// `mur trace show` and anything reading the session trace.
+    /// Record that a policy hook refused a call before it ran. The only account of a call the
+    /// model asked for and never got: nothing ran, so no `tool_call` or `shell` record
+    /// accompanies it.
     pub(crate) async fn write_call_denied(
         &mut self,
         turn: u32,
@@ -1614,6 +1612,11 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// Record that a hook returned a `hook-output` arm the lifecycle event does not
+    /// honor. Written by the agent loop from a buffered [`crate::hooks::DispatchFault`]
+    /// drained just before `session_end`. Non-fatal: the session already continued as
+    /// if the hook had returned `none`; this only makes the discard visible to
+    /// `mur trace show` and anything reading the session trace.
     pub(crate) async fn write_hook_dispatch_error(
         &mut self,
         hook_name: &str,

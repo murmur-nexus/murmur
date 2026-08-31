@@ -262,7 +262,7 @@ apart:
 
 The decision point runs only for a hook whose own `murmur.yaml` declares
 `commit_policy: deny` on `binding: on-shell` or `binding: on-tool-call`. Every other hook sees
-the observation dispatch alone, exactly as before.
+the observation dispatch alone.
 
 ### What each handler can commit
 
