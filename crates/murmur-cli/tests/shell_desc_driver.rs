@@ -108,6 +108,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .expect("stage_session should succeed");
@@ -209,6 +210,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -314,6 +316,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .expect("stage_session should succeed");

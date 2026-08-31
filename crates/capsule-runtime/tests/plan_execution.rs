@@ -212,6 +212,7 @@ fn test_capsule_step_sends_objective_as_plain_text() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -256,6 +257,7 @@ fn test_capsule_step_passes_unmodelled_input_through_as_json() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -292,6 +294,7 @@ fn test_capsule_step_objective_survives_an_unmodelled_companion_key() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -330,6 +333,7 @@ fn test_capsule_step_instructions_force_json_passthrough() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -561,16 +565,22 @@ fn test_join_point_waits_for_multiple_upstreams() {
     assert_eq!(find(&report, "join").output.as_deref(), Some("joined"));
 }
 
-/// The two tokens a delegated spawn travels on reach the daemon in headers, in the right order,
-/// and the approval presented is the one the delegation returned.
+/// A capsule step asks the daemon once, and then launches the child itself.
+///
+/// The credential reaches the daemon in a header; the approval reaches the child on its standard
+/// input and nowhere else, because the argument vector and the environment of a process are
+/// readable through `/proc` by anything running as the same user.
 #[test]
-fn test_capsule_step_delegates_before_it_spawns() {
-    if capsule_runtime::skip_without_host_support("test_capsule_step_delegates_before_it_spawns") {
+fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
+    if capsule_runtime::skip_without_host_support(
+        "test_capsule_step_asks_permission_then_launches_the_child_itself",
+    ) {
         return;
     }
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -588,28 +598,18 @@ fn test_capsule_step_delegates_before_it_spawns() {
     std::env::remove_var("MURMUR_ROOST_URL");
 
     assert!(report.completed, "{report:?}");
+
+    // One request to the daemon, and it asks about one capsule by name and version while proving
+    // who is asking.
     let paths: Vec<String> = fake_roost
         .requests()
         .into_iter()
         .map(|request| request.path)
         .collect();
-    assert_eq!(paths, vec!["/delegate".to_string(), "/spawn".to_string()]);
-
-    // The delegation asks about one capsule, by name and version, and proves who is asking.
-    let delegate = fake_roost.request("/delegate");
-    assert_eq!(delegate.body["name"], "worker");
-    assert_eq!(delegate.body["version"], "0.1.0");
-    assert_eq!(
-        delegate
-            .headers
-            .get(SPAWN_CREDENTIAL_HEADER)
-            .map(String::as_str),
-        Some(TEST_CREDENTIAL)
-    );
-    assert!(!delegate.headers.contains_key(SPAWN_APPROVAL_HEADER));
-
-    // The launch re-presents the credential alongside the approval it just earned.
+    assert_eq!(paths, vec!["/spawn".to_string()]);
     let spawn = fake_roost.request("/spawn");
+    assert_eq!(spawn.body["name"], "worker");
+    assert_eq!(spawn.body["version"], "0.1.0");
     assert_eq!(
         spawn
             .headers
@@ -617,11 +617,40 @@ fn test_capsule_step_delegates_before_it_spawns() {
             .map(String::as_str),
         Some(TEST_CREDENTIAL)
     );
-    assert_eq!(
-        spawn.headers.get(SPAWN_APPROVAL_HEADER).map(String::as_str),
-        Some(TEST_APPROVAL)
+    // The approval is not presented to the daemon at all: the child redeems it when it registers.
+    assert!(!spawn.headers.contains_key(SPAWN_APPROVAL_HEADER));
+
+    // The child was started by this runtime, on the argument vector the launcher builds.
+    let argv = _stub.recorded("argv.txt");
+    let child_dir = dir.path().join(".murmur").join("children");
+    assert!(
+        argv.starts_with("run --capsule worker --capsule-version 0.1.0 --workdir "),
+        "{argv}"
     );
-    assert_eq!(spawn.body["spawned_by"], TEST_SESSION);
+    assert!(argv.contains(&child_dir.display().to_string()), "{argv}");
+    assert!(
+        argv.ends_with(" --json --no-env-file --spawn-grant-stdin"),
+        "{argv}"
+    );
+    assert_eq!(_stub.recorded("cwd.txt").trim(), {
+        let cwd = _stub.recorded("argv.txt");
+        cwd.split(" --workdir ")
+            .nth(1)
+            .unwrap()
+            .split(" --json")
+            .next()
+            .unwrap()
+            .to_string()
+    });
+
+    // The grant travelled on standard input, and on nothing else.
+    assert_eq!(_stub.recorded("grant.txt"), TEST_APPROVAL);
+    assert!(!argv.contains(TEST_APPROVAL), "{argv}");
+    assert!(!argv.contains(TEST_CREDENTIAL), "{argv}");
+    let env = _stub.recorded("env.txt");
+    assert!(!env.contains(TEST_APPROVAL), "{env}");
+    assert!(!env.contains(TEST_CREDENTIAL), "{env}");
+    assert!(env.contains("MURMUR_ROOST_URL="), "{env}");
 }
 
 /// A session that was never granted a credential cannot delegate, and says so before it opens a
@@ -636,6 +665,7 @@ fn test_capsule_step_without_a_credential_asks_for_nothing() {
     let _guard = roost_env_lock().lock().unwrap();
     let dir = tempdir().unwrap();
     let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
@@ -691,6 +721,7 @@ fn test_the_spawn_credential_reaches_no_file_and_no_step_result() {
         } else {
             FakeRoost::start()
         };
+        let _stub = StubMur::install(fake_roost.authority());
         std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
         let invoke = |_name: &str, _input: ToolInput| {
             Ok(tool_result(
@@ -749,9 +780,63 @@ fn read_tree(root: &Path) -> Vec<(PathBuf, String)> {
     found
 }
 
-/// The approval this fake's `/delegate` hands back, and therefore the value its `/spawn` must be
-/// presented with.
+/// The approval this fake's `/spawn` hands back, and therefore the value the launched child must
+/// be handed on its standard input.
 const TEST_APPROVAL: &str = "msa1.APPROVALmustNEVERleakYY88.testsignature";
+
+/// A stand-in for the `mur` binary the parent's runtime launches a child with.
+///
+/// The child half of a capsule step is a real subprocess started by
+/// `child_launch::launch_child_capsule`: this is the program it starts. It reads the one line of
+/// standard input the parent writes, records that line, its argument vector, its environment and
+/// its working directory beside itself — outside the plan's workdir, so a test that scans the
+/// workdir for token material is scanning what a capsule could actually reach — and prints the
+/// `--json` launch line the parent parses, naming the fake daemon's `/capsule` path as its own
+/// address.
+struct StubMur {
+    dir: tempfile::TempDir,
+}
+
+impl StubMur {
+    /// Installs the stub and points `MURMUR_MUR_BINARY` at it. Every caller already holds
+    /// [`roost_env_lock`], which is what keeps the process-wide variable to one test at a time.
+    fn install(capsule_authority: &str) -> Self {
+        let dir = tempdir().unwrap();
+        let record = dir.path().display().to_string();
+        let binary = dir.path().join("mur");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n\
+                 read -r grant\n\
+                 printf '%s' \"$grant\" > '{record}/grant.txt'\n\
+                 printf '%s' \"$*\" > '{record}/argv.txt'\n\
+                 env > '{record}/env.txt'\n\
+                 pwd > '{record}/cwd.txt'\n\
+                 printf '{{\"url\":\"{capsule_authority}/capsule\",\"session_id\":\"ses_stub00000000000000000000000\"}}\\n'\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("MURMUR_MUR_BINARY", &binary);
+        Self { dir }
+    }
+
+    fn recorded(&self, name: &str) -> String {
+        fs::read_to_string(self.dir.path().join(name))
+            .unwrap_or_else(|error| panic!("the stub recorded no {name}: {error}"))
+    }
+}
+
+impl Drop for StubMur {
+    fn drop(&mut self) {
+        std::env::remove_var("MURMUR_MUR_BINARY");
+    }
+}
 
 /// One request the fake received, kept whole so a test can assert on headers as well as body.
 #[derive(Clone)]
@@ -761,12 +846,13 @@ struct RecordedRequest {
     body: Value,
 }
 
-/// A stand-in for mur-roost *and* the capsule it spawns, served on one loopback listener.
+/// A stand-in for mur-roost *and* for the child capsule, served on one loopback listener.
 ///
-/// `dispatch_capsule_step` speaks two protocols against this, in order: `POST /delegate` and then
-/// `POST /spawn` to mur-roost, which answers with the URL of the now-live capsule, then A2A
-/// JSON-RPC against that URL — `message/send` to hand over the task, then `tasks/get` polled until
-/// the state is terminal. All are served here, routed on the request path.
+/// `dispatch_capsule_step` speaks two protocols against this: one `POST /spawn` to mur-roost,
+/// which answers with permission and nothing else, then A2A JSON-RPC against the child this
+/// runtime launched — `message/send` to hand over the task, then `tasks/get` polled until the
+/// state is terminal. The child itself is [`StubMur`], which reports this fake's `/capsule` path
+/// as its address, so both halves are served here and routed on the request path.
 ///
 /// The server loop polls for connections rather than parking in a blocking `accept`, and every
 /// read it makes is bounded, so `drop` can always stop it. A fake that could only be stopped by
@@ -797,7 +883,6 @@ impl FakeRoost {
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{addr}");
-        let capsule_url = format!("{url}/capsule");
 
         let requests = Arc::new(Mutex::new(Vec::new()));
         let sent_text = Arc::new(Mutex::new(None));
@@ -827,7 +912,7 @@ impl FakeRoost {
 
                     let (path, headers, body) = read_http_request(&mut stream);
                     let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                    if path == "/delegate" || path == "/spawn" {
+                    if path == "/spawn" {
                         requests.lock().unwrap().push(RecordedRequest {
                             path: path.clone(),
                             headers,
@@ -835,10 +920,6 @@ impl FakeRoost {
                         });
                     }
                     let (status, response) = match path.as_str() {
-                        "/delegate" => (
-                            200,
-                            json!({"approval": TEST_APPROVAL, "expires_at_ms": 1_u64 << 42}),
-                        ),
                         "/spawn" if refuse_spawn => (
                             403,
                             json!({
@@ -846,7 +927,16 @@ impl FakeRoost {
                                 "request": {"path": path, "body": request},
                             }),
                         ),
-                        "/spawn" => (200, json!({ "capsule_url": capsule_url })),
+                        "/spawn" => (
+                            200,
+                            json!({
+                                "approval": TEST_APPROVAL,
+                                "name": "worker",
+                                "version": "0.1.0",
+                                "sha256": "0".repeat(64),
+                                "expires_at_ms": 1_u64 << 42,
+                            }),
+                        ),
                         _ => {
                             let id = request.get("id").cloned().unwrap_or(Value::Null);
                             let body = match request.get("method").and_then(Value::as_str) {
@@ -887,7 +977,12 @@ impl FakeRoost {
         }
     }
 
-    /// Every `/delegate` and `/spawn` the fake received, in order.
+    /// Host and port only, for a child that has to report an address on this listener.
+    fn authority(&self) -> &str {
+        self.url.trim_start_matches("http://")
+    }
+
+    /// Every `/spawn` the fake received, in order.
     fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -900,14 +995,14 @@ impl FakeRoost {
             .unwrap_or_else(|| panic!("no {path} request was made"))
     }
 
-    /// The body of the `POST /spawn` that asked mur-roost for the capsule.
+    /// The body of the `POST /spawn` that asked mur-roost for permission.
     fn spawn_request(&self) -> Value {
         self.request("/spawn").body
     }
 
     /// The task text the step handed to the capsule over A2A `message/send`, exactly as it
     /// travelled in the single text part. This is where a capsule step's input lives — the spawn
-    /// call above carries only the capsule's identity and workdir. Returned unparsed: what the
+    /// call above carries only the capsule's name and version. Returned unparsed: what the
     /// child's model receives is this string, so that is what the tests assert on.
     fn sent_text(&self) -> String {
         self.sent_text.lock().unwrap().clone().unwrap()

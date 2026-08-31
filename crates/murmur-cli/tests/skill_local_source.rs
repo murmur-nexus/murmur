@@ -106,6 +106,7 @@ fn local_source_file_path_installs_skill_md() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap();
@@ -168,6 +169,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap();
@@ -241,6 +243,7 @@ fn local_source_coexists_with_registry_skill() {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap();

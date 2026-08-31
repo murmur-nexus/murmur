@@ -48,6 +48,7 @@ beta-mur-topology = ["beta"]
 # beta-dag-topology = ["beta"]
 
 [dev-dependencies]
+mur-roost = { path = "../mur-roost" }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

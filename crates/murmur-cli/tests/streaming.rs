@@ -156,6 +156,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap()
@@ -642,6 +643,7 @@ fn stage_streaming_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtim
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap()

@@ -323,7 +323,7 @@ One `session_start` / `session_end` pair frames the whole launch, however many t
 
 ## Step 7 — shutdown
 
-A `queue+sleep` capsule waits indefinitely after the last task completes. It does not self-terminate — shutdown is external, driven by the host (mur-roost closes the task channel) or by a `SIGTERM` when the process is stopped directly.
+A `queue+sleep` capsule waits indefinitely after the last task completes. It does not self-terminate — shutdown is external. A capsule run directly stops on a `SIGTERM`. A capsule launched as a child of another capsule stops when its parent's runtime terminates it, which the parent does when it shuts the child down and when the parent itself ends. `mur-roost` never stops a capsule: it referees which capsules may be spawned and holds no process.
 
 `MURMUR_A2A_TIMEOUT_SECS` does **not** apply in `queue+sleep` mode. It only takes effect when `after_task: exit` or `task_acceptance: single`, where self-termination after an idle period is the intended behavior.
 

@@ -268,6 +268,7 @@ fn stage_fixture_tool_session(
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap()

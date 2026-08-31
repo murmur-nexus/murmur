@@ -9,6 +9,7 @@ pub mod artifact;
 pub mod artifact_config;
 pub mod bindings;
 pub(crate) mod cgroup;
+pub mod child_launch;
 pub mod containment;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
@@ -17,6 +18,7 @@ pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;
 pub(crate) mod hooks;
+pub(crate) mod http_client;
 pub(crate) mod identity;
 pub(crate) mod inference_import;
 pub mod lanes;
@@ -31,6 +33,7 @@ pub(crate) mod outgoing;
 pub mod peer_handoff;
 pub mod plan;
 pub(crate) mod reachability;
+pub mod registration;
 pub mod resource_plane;
 pub mod resources;
 pub mod retention;
@@ -71,6 +74,9 @@ pub use sealed::{
 // `murmur-cli`'s integration tests as well as from this crate's own, so they are re-exported here
 // rather than duplicating the delegation probe once per crate that has to skip on it.
 pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
+pub use child_launch::{
+    child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
+};
 // `reachability` is a private module, but both of its entry points are consumed from
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the
 // same facade shape `check_staged_runtime_floor` has, without making the module's internals
@@ -91,6 +97,7 @@ pub use reachability::{
     check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
     ToolchainHelperWarning,
 };
+pub use registration::{deregister_session, register_session, SessionOutcome};
 pub use resource_plane::{
     check_export_root, check_peer_files_root, handle_resource_request, reason_phrase,
     symlink_policy, DeclaredExport, ListEntry, ListResponse, ReadResponse, ResourceError,

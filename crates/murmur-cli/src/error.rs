@@ -34,6 +34,7 @@ pub const E_RUN_015: &str = "E-RUN-015"; // --resume and --context both given
 pub const E_RUN_016: &str = "E-RUN-016"; // the resumed session's trace holds no task_start carrying a context id
 pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversation record on disk
 pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
+pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -427,6 +428,13 @@ impl From<RuntimeError> for CliError {
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,
                 format!("agent loop failed: {message}"),
+            ),
+            error @ RuntimeError::SpawnRegistrationFailed { .. } => CliError::with_hint(
+                E_RUN_019,
+                error.to_string(),
+                "start the daemon the capsule registers with — `mur-roost --port 7700 \
+                 --registry-path <store>` — and set MURMUR_ROOST_URL to its base URL, or drop \
+                 capabilities.spawn.allow from the manifest if this capsule spawns nothing",
             ),
             RuntimeError::PortInUse { port } => CliError::with_hint(
                 E_RUN_010,
