@@ -12,9 +12,9 @@
  * `generateAgentArtifacts()`.
  *
  * Writes into `site/`: llms.txt, .well-known/llms.txt, .well-known/api-catalog,
- * .well-known/ai-catalog.json, one `.md` mirror per page, sitemap.xml,
- * sitemap.md, robots.txt, and agent-readability.json. MkDocs owns the HTML;
- * this owns the agent surface.
+ * .well-known/ai-catalog.json, .well-known/agent-skills/index.json plus
+ * skills/*.md, one `.md` mirror per page, sitemap.xml, sitemap.md, robots.txt,
+ * and agent-readability.json. MkDocs owns the HTML; this owns the agent surface.
  */
 
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -37,6 +37,7 @@ import {
   writeSearchIndex,
 } from "./lib/artifacts.mjs";
 import { bundleWebMcp } from "./lib/webmcp-bundle.mjs";
+import { writeSkillsIndex } from "./lib/skills.mjs";
 
 const DOCS_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const EXPORT_FILE = path.join(DOCS_DIR, ".agent-export", "pages.json");
@@ -46,6 +47,10 @@ const CURATED_LLMS_TXT = path.join(DOCS_DIR, "llms.txt");
 // Hand-curated ARD manifest (agenticresourcediscovery.org) — leadtype doesn't
 // generate this, so it's a plain copy, same pattern as CURATED_LLMS_TXT.
 const CURATED_AI_CATALOG = path.join(DOCS_DIR, "ai-catalog.json");
+// Agent Skills, one <name>/SKILL.md per directory. Kept out of content/ so
+// MkDocs doesn't render them as doc pages — they're artifacts for agents to
+// fetch, not pages for humans to browse.
+const SKILLS_DIR = path.join(DOCS_DIR, "skills");
 
 // Identity that isn't derivable from mkdocs.yml. Everything else — site name,
 // description, base URL, repo — comes from the MkDocs config.
@@ -241,6 +246,12 @@ async function main() {
   await mkdir(wellKnownDir, { recursive: true });
   await copyFile(CURATED_AI_CATALOG, path.join(wellKnownDir, "ai-catalog.json"));
 
+  const skills = await writeSkillsIndex({
+    outDir: OUT_DIR,
+    skillsDir: SKILLS_DIR,
+    baseUrl: exported.siteUrl,
+  });
+
   // See fixApiCatalogLinkset's own comment for why this rewrite is needed.
   if (result.files.apiCatalog) {
     const apiCatalog = fixApiCatalogLinkset(JSON.parse(await readFile(result.files.apiCatalog, "utf8")));
@@ -257,6 +268,9 @@ async function main() {
   );
   console.log(`  ${rel(webmcp.outfile)} (${Math.round(webmcp.bytes / 1024)} kB)`);
   console.log(`  ${rel(path.join(wellKnownDir, "ai-catalog.json"))}`);
+  if (skills.indexFile) {
+    console.log(`  ${rel(skills.indexFile)} (${skills.skills.length} skills)`);
+  }
   if (result.files.sitemapXml) console.log(`  ${rel(result.files.sitemapXml)}`);
   if (result.files.robotsTxt) console.log(`  ${rel(result.files.robotsTxt)}`);
 

@@ -17,6 +17,17 @@
       ]
     },
     {
+      "identifier": "urn:air:docs.murmur.nexus:skills:index",
+      "displayName": "Murmur Agent Skills",
+      "type": "application/json",
+      "url": "https://docs.murmur.nexus/.well-known/agent-skills/index.json",
+      "representativeQueries": [
+        "how do I write a murmur.yaml manifest?",
+        "how do I lock down a murmur capsule's permissions?",
+        "why did my murmur capsule fail to launch?"
+      ]
+    },
+    {
       "identifier": "urn:air:docs.murmur.nexus:api:ask-docs",
       "displayName": "Ask Murmur Docs",
       "type": "application/vnd.oai.openapi",
