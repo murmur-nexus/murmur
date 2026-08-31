@@ -175,6 +175,58 @@ site doesn't run either (WebMCP is browser-side JS, not a network protocol
 server), and an ARD entry is a claim that a real callable resource exists at
 that URL with that type.
 
+## Agent Skills index (`/.well-known/agent-skills/index.json`)
+
+Publishes murmur's skills for discovery per the [Agent Skills Discovery
+RFC](https://github.com/cloudflare/agent-skills-discovery-rfc) v0.2.0. Each
+skill's markdown is served at `/skills/<name>.md` and listed in the index
+with a sha256 digest, so a client can verify it fetched what was advertised.
+
+**`docs/skills/` in this repo is the source of truth.** Skills authored
+elsewhere (e.g. a local agent workspace) must be copied here — the docs
+deploy runs in GitHub Actions, which can only see the repo.
+
+To add a skill, create `docs/skills/<name>/SKILL.md` with frontmatter:
+
+```markdown
+---
+name: <name>
+description: What it does. When to use it; when not to.
+---
+```
+
+`scripts/lib/skills.mjs` does the rest on the next build. Two things it
+guarantees, both covered by `scripts/lib/skills.test.mjs`:
+
+- **The digest is of the bytes actually served**, not the source file — a
+  digest derived from the source would silently stop matching if the copy
+  ever transformed anything, quietly falsifying the index's one integrity
+  claim.
+- **A malformed skill fails the build**, rather than being skipped. Missing
+  frontmatter, a missing `name`/`description`, a `name` that disagrees with
+  its directory, or a name outside `[a-z0-9-]` all throw. A skill silently
+  absent from the index is indistinguishable from one that was never
+  written.
+
+Skills live outside `content/` on purpose: they're artifacts for agents to
+fetch, not pages for humans to browse, so MkDocs never renders them and they
+stay out of the nav, sitemap, search index, `llms.txt` and
+`agent-readability.json`. The only place they appear is the index that must
+reference them.
+
+Only `type: "skill-md"` is published. Murmur's `.mur.zip` packaging maps onto
+the RFC's `"archive"` type, but a `.mur.zip` is installed by the murmur
+runtime rather than fetched and read by an arbitrary agent — indexing one
+would advertise something most clients can't consume.
+
+Verify:
+
+```bash
+curl -s https://docs.murmur.nexus/.well-known/agent-skills/index.json
+# then confirm a published digest matches what is actually served:
+curl -s https://docs.murmur.nexus/skills/secure-murmur-capsule.md | shasum -a 256
+```
+
 ## What you do NOT need
 
 **No cache policy changes.** A viewer-request function runs before the cache

@@ -6,7 +6,7 @@
   "scripts": {
     "build": "mkdocs build --strict && node scripts/agent-artifacts.mjs",
     "agent-artifacts": "node scripts/agent-artifacts.mjs",
-    "test": "node --test scripts/webmcp.test.mjs infra/cloudfront-agent-negotiation.test.mjs scripts/lib/artifacts.test.mjs scripts/ai-catalog.test.mjs"
+    "test": "node --test scripts/webmcp.test.mjs infra/cloudfront-agent-negotiation.test.mjs scripts/lib/artifacts.test.mjs scripts/lib/skills.test.mjs scripts/ai-catalog.test.mjs"
   },
   "dependencies": {
     "leadtype": "^0.4.3"
