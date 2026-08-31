@@ -691,6 +691,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.input_timeout_secs` | integer | no | Maximum seconds to wait for a `message/send` reply after a tool component calls `request-input`. Absent means wait indefinitely — see [`lifecycle.input_timeout_secs`](#lifecycle-input-timeout-secs). |
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
+| `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
 
 #### `exports` { #field-exports }
 
@@ -1161,6 +1162,7 @@ lifecycle:
   queue_depth: 1
   conversation: stateless
   max_task_reopens: 1
+  shell_grace_secs: 10
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }
@@ -1198,6 +1200,39 @@ lifecycle:
 
 See [request-input WIT import](wit-interfaces.md#murmurtasktask) and
 [Pause the agent loop for human input](../how-to/hitl-request-input.md).
+
+### `lifecycle.shell_grace_secs` { #lifecycle-shell-grace-secs }
+
+How long a shell command runs in the foreground before the runtime demotes it to the background.
+The capsule declares no flag and the model predicts no duration: every command starts in the
+foreground and the clock decides.
+
+| Value | Behaviour |
+|---|---|
+| `10` (default) | A command exiting within 10 seconds returns its output to the turn. One that does not is demoted. |
+| `N` (positive integer) | The same, with an `N`-second window. |
+| `0` | Every command is demoted, at the first check after it is spawned. |
+
+A demoted command hands the turn a handle of the form `wrk_<id>` and the fact that it is still
+running. Its output never enters the conversation: the full stdout and stderr are written to
+`logs/<work_id>.log` under the [capsule workdir](workdir.md), and the completion names that file.
+
+The handle cannot be polled. No tool, host import or CLI subcommand takes a work id — the result
+arrives on its own, as a task with [origin](../concepts/access-control.md#task-origin-and-trust-class)
+`completion` in the `bg` lane, carrying the exit code and the output path.
+
+That completion is only delivered to a capsule that outlives the task which started the command.
+Under the default `after_task: exit` the session ends when the task does, and a command still
+running is recorded as
+`shell_abandoned` and lost. A capsule that means to
+receive completions declares `task_acceptance: queue` and `after_task: sleep`.
+
+```yaml
+lifecycle:
+  task_acceptance: queue
+  after_task: sleep
+  shell_grace_secs: 2
+```
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 

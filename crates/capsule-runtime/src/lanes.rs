@@ -123,6 +123,7 @@ mod tests {
             message_text: id.to_string(),
             traceparent: None,
             provenance: TaskProvenance::derive(origin, None),
+            source: crate::a2a::SOURCE_A2A,
         }
     }
 

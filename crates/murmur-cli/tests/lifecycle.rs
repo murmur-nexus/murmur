@@ -657,3 +657,275 @@ fn lifecycle_none_exits_immediately_without_input() {
         "task_acceptance: none with no task.md should exit in < 5s (got {elapsed:?})"
     );
 }
+
+// ── Detached shell completions ────────────────────────────────────────────────
+
+/// `setup_agent_project` for a capsule that may run `bash` and `sleep`.
+///
+/// Nothing else is declared: on a kernel-enforcement host only the allowlisted binaries are
+/// executable, so a command reaching for anything else fails rather than running.
+fn setup_shell_agent_project(endpoint: &str) -> (TempDir, PathBuf) {
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = common::create_driver_artifact(
+        artifacts.path(),
+        DRIVER_NAME,
+        DRIVER_VERSION,
+        &common::fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    fs::write(
+        project.path().join("murmur.yaml"),
+        format!(
+            "name: lifecycle-agent\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\n  shell:\n    allow:\n      - bash\n      - sleep\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+        ),
+    )
+    .unwrap();
+
+    (home, project.keep().join("murmur.yaml"))
+}
+
+fn bash_call_response(id: &str, tool_use_id: &str, command: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{
+            "type": "tool_use",
+            "id": tool_use_id,
+            "name": "bash",
+            "input": {"command": command}
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+fn end_turn_response(id: &str, text: &str) -> String {
+    serde_json::json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
+        "model": "test-model",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1}
+    })
+    .to_string()
+}
+
+fn read_trace(trace_path: &Path) -> Vec<Value> {
+    fs::read_to_string(trace_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("every trace line is valid JSON"))
+        .collect()
+}
+
+/// Block until `predicate` holds over the trace, or fail naming what was there.
+fn wait_for_trace(
+    trace_path: &Path,
+    seconds: u64,
+    what: &str,
+    predicate: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let events = read_trace(trace_path);
+        if predicate(&events) {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}; trace holds: {:?}",
+            events
+                .iter()
+                .map(|e| e["event_type"].as_str().unwrap_or("?").to_string())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn events_named<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|event| event["event_type"] == event_type)
+        .collect()
+}
+
+/// A demoted command's result comes back as a `completion`-origin task in the `bg` lane, under
+/// the context id of the conversation it was started from, and the trace joins the two ends.
+#[test]
+fn lifecycle_a_detached_command_completes_as_a_background_task() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_a_detached_command_completes_as_a_background_task",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        bash_call_response("msg_1", "toolu_build", "sleep 4; echo built"),
+        end_turn_response("msg_2", "build started"),
+        end_turn_response("msg_3", "noted the build result"),
+    ]);
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Sleep,
+            queue_depth: 4,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    let response = http_post_json(
+        &capsule_url,
+        "/",
+        &message_send_body("task-build", "run the build"),
+    );
+    let first_task_id = response["result"]["id"]
+        .as_str()
+        .expect("a submitted task carries its id")
+        .to_string();
+
+    let events = wait_for_trace(&trace_path, 120, "the completion task to start", |events| {
+        events_named(events, "task_start").len() >= 2
+    });
+
+    let starts = events_named(&events, "task_start");
+    assert_eq!(starts[0]["task_id"], Value::String(first_task_id.clone()));
+    let completion_start = starts[1];
+    assert_eq!(completion_start["origin"], "completion");
+    assert_eq!(completion_start["lane"], "bg");
+    assert_eq!(completion_start["source"], "detached_shell");
+    assert_eq!(
+        completion_start["context_id"], starts[0]["context_id"],
+        "the completion joins the conversation the command was started from"
+    );
+
+    let detached = events_named(&events, "shell_detached");
+    assert_eq!(detached.len(), 1);
+    let completed = events_named(&events, "shell_completed");
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0]["work_id"], detached[0]["work_id"]);
+    assert_eq!(
+        completed[0]["completion_task_id"], completion_start["task_id"],
+        "shell_completed names the task it enqueued"
+    );
+    assert_eq!(completed[0]["exit_code"], 0);
+    assert_eq!(completed[0]["status"], "ok");
+    assert_eq!(
+        completed[0]["output_path"],
+        Value::String(format!(
+            "logs/{}.log",
+            detached[0]["work_id"].as_str().unwrap()
+        ))
+    );
+}
+
+/// A person's request is not made to wait behind a completion: the peer task runs first even
+/// though the completion was pushed onto the queue before it.
+#[test]
+fn lifecycle_a_completion_waits_behind_a_peer_request() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_a_completion_waits_behind_a_peer_request",
+    ) {
+        return;
+    }
+    // Every response is held for two seconds, so the first task is still running when both the
+    // peer request and the detached command's completion land.
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            bash_call_response("msg_1", "toolu_build", "sleep 2; echo built"),
+            bash_call_response("msg_2", "toolu_echo", "echo second"),
+            end_turn_response("msg_3", "first task done"),
+            end_turn_response("msg_4", "peer task done"),
+            end_turn_response("msg_5", "completion task done"),
+        ],
+        std::time::Duration::from_secs(2),
+    );
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Sleep,
+            queue_depth: 8,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    let trace_path = staged.workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    let first = http_post_json(
+        &capsule_url,
+        "/",
+        &message_send_body("task-first", "run the build"),
+    );
+    let first_task_id = first["result"]["id"].as_str().unwrap().to_string();
+
+    // The peer request is delivered while the first task is still in its opening turn, so it is
+    // waiting in the channel before the completion is ever drained.
+    wait_for_trace(&trace_path, 60, "the first task to start", |events| {
+        !events_named(events, "task_start").is_empty()
+    });
+    let peer = http_post_json_with_headers(
+        &capsule_url,
+        "/",
+        &message_send_body("task-peer", "a peer is asking"),
+        &[
+            ("x-murmur-task-origin", "peer"),
+            ("x-murmur-task-trust", "trusted"),
+        ],
+    );
+    let peer_task_id = peer["result"]["id"].as_str().unwrap().to_string();
+
+    let events = wait_for_trace(&trace_path, 180, "all three tasks to start", |events| {
+        events_named(events, "task_start").len() >= 3
+    });
+    let starts = events_named(&events, "task_start");
+
+    assert_eq!(starts[0]["task_id"], Value::String(first_task_id));
+    assert_eq!(starts[1]["task_id"], Value::String(peer_task_id));
+    assert_eq!(starts[1]["origin"], "peer");
+    assert_eq!(
+        starts[2]["origin"], "completion",
+        "the completion runs last, behind the peer request"
+    );
+    assert_eq!(starts[2]["lane"], "bg");
+}

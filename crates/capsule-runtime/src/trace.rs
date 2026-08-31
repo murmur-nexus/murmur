@@ -460,6 +460,68 @@ struct ShellEvent {
     resource_limit: Option<String>,
 }
 
+/// A shell command that outran its grace period and moved to the background. Hangs off the turn
+/// that started it, so `mur trace steps` shows it where the model saw it.
+#[derive(Serialize)]
+struct ShellDetachedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    work_id: String,
+    binary: String,
+    command: String,
+    /// The `lifecycle.shell_grace_secs` in force, in milliseconds — what this command outran.
+    grace_ms: u64,
+}
+
+/// A detached command finishing, written where the task loop drains it. Hangs off the session
+/// rather than a turn: by the time it lands, the turn that started the command is over.
+#[derive(Serialize)]
+struct ShellCompletedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    work_id: String,
+    binary: String,
+    command: String,
+    exit_code: i32,
+    duration_ms: u64,
+    /// Workdir-relative path of the file holding the command's full stdout and stderr.
+    output_path: String,
+    output_bytes: u64,
+    /// Attributed the same way [`ShellEvent::resource_limit`] is, and omitted on the same terms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_limit: Option<String>,
+    /// `"ok"` or `"error"` — the field that tells a failed background command from a successful
+    /// one without reading its prose.
+    status: String,
+    /// The `completion`-origin task this completion was enqueued as, which is what makes "which
+    /// command produced this task" answerable from `trace.jsonl` alone.
+    completion_task_id: String,
+}
+
+/// A detached command still running when its session ended. Its result is lost; this record and
+/// the stderr line beside it are what keep the loss visible.
+#[derive(Serialize)]
+struct ShellAbandonedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    work_id: String,
+    binary: String,
+    command: String,
+    /// How long the command had been running when the session gave up on it.
+    running_ms: u64,
+}
+
 #[derive(Serialize)]
 struct CompactionEvent {
     event_type: &'static str,
@@ -1148,6 +1210,97 @@ impl TraceWriter {
         self.total_shell_calls = self.total_shell_calls.saturating_add(1);
         self.task_shell_calls = self.task_shell_calls.saturating_add(1);
         Ok(())
+    }
+
+    /// A command demoted to the background, written from the agent loop at the moment of
+    /// demotion.
+    ///
+    /// Counts as this session's shell call, exactly as a foreground one does — the pair with
+    /// [`Self::write_shell_completed`], which deliberately does not count, so `mur trace show`
+    /// reports each shell command once whichever way it ran.
+    pub(crate) async fn write_shell_detached(
+        &mut self,
+        turn: u32,
+        work_id: &str,
+        binary: &str,
+        command: &str,
+        grace_ms: u64,
+    ) -> std::io::Result<()> {
+        let event = ShellDetachedEvent {
+            event_type: "shell_detached",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            work_id: work_id.to_string(),
+            binary: binary.to_string(),
+            command: command.to_string(),
+            grace_ms,
+        };
+        self.write_event(&event).await?;
+        self.total_shell_calls = self.total_shell_calls.saturating_add(1);
+        self.task_shell_calls = self.task_shell_calls.saturating_add(1);
+        Ok(())
+    }
+
+    /// A detached command finishing, written by the task loop as it turns the completion into a
+    /// task. `completion_task_id` is that task's id, so the two records join.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_shell_completed(
+        &mut self,
+        work_id: &str,
+        binary: &str,
+        command: &str,
+        exit_code: i32,
+        duration_ms: u64,
+        output_path: &str,
+        output_bytes: u64,
+        resource_limit: Option<String>,
+        status: &str,
+        completion_task_id: &str,
+    ) -> std::io::Result<()> {
+        let event = ShellCompletedEvent {
+            event_type: "shell_completed",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            work_id: work_id.to_string(),
+            binary: binary.to_string(),
+            command: command.to_string(),
+            exit_code,
+            duration_ms,
+            output_path: output_path.to_string(),
+            output_bytes,
+            resource_limit,
+            status: status.to_string(),
+            completion_task_id: completion_task_id.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// A detached command the session ended without waiting for.
+    pub(crate) async fn write_shell_abandoned(
+        &mut self,
+        work_id: &str,
+        binary: &str,
+        command: &str,
+        running_ms: u64,
+    ) -> std::io::Result<()> {
+        let event = ShellAbandonedEvent {
+            event_type: "shell_abandoned",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            work_id: work_id.to_string(),
+            binary: binary.to_string(),
+            command: command.to_string(),
+            running_ms,
+        };
+        self.write_event(&event).await
     }
 
     pub(crate) async fn write_a2a_task_received(

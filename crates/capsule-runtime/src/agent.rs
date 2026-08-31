@@ -898,6 +898,25 @@ pub(crate) async fn run_agent_loop(
                                 otel.emit_shell(&shell.command, shell.exit_code, shell.duration_ms)
                                     .await;
                             }
+                            // No `HookEvent` fires here. `HookEvent::Shell` carries an exit code
+                            // and a demoted command has none yet; a hook learns about one when
+                            // its completion arrives as a task, like the model does.
+                            if let Some(detached) = outcome.detached {
+                                trace
+                                    .write_shell_detached(
+                                        turn_u32,
+                                        &detached.work_id,
+                                        &detached.binary,
+                                        &detached.command,
+                                        detached.grace_ms,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        RuntimeError::AgentLoopFailed(format!(
+                                            "trace write failed: {e}"
+                                        ))
+                                    })?;
+                            }
                             // Emit artifact event after tool call returns
                             if task_id.is_some() {
                                 emit_sse(

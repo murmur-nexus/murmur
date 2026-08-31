@@ -366,7 +366,17 @@ pub(crate) struct IncomingTask {
     /// Why this task woke the capsule, classified at the door from the request headers. Every
     /// inbound task has one: a caller that claims nothing is an untrusted `event`.
     pub provenance: TaskProvenance,
+    /// Where the task came from, as it appears on its `task_start` record: `"a2a"` for anything
+    /// that arrived over the peer door, `"detached_shell"` for a completion the runtime produced
+    /// locally. The `a2a_task_received` record is written only for the former.
+    pub source: &'static str,
 }
+
+/// The `source` of a task that arrived over the A2A door.
+pub(crate) const SOURCE_A2A: &str = "a2a";
+
+/// The `source` of a task the runtime enqueued for itself when a demoted shell command finished.
+pub(crate) const SOURCE_DETACHED_SHELL: &str = "detached_shell";
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

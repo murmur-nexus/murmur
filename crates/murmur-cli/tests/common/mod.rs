@@ -264,7 +264,9 @@ pub fn stage_agent_session(
             eval_config_json: None,
             case_id: None,
             dataset_id: None,
-            lifecycle: None,
+            // The manifest's own block, exactly as `mur run` passes it, so a test capsule
+            // declaring `lifecycle:` gets the lifecycle it declared rather than the default.
+            lifecycle: runtime_manifest.lifecycle.clone(),
             lifecycle_override: None,
             // Carried through the same way `mur run` carries it, so a test manifest's `trace:`
             // block reaches the session's writer instead of being silently dropped.

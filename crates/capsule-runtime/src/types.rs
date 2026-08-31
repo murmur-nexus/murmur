@@ -21,6 +21,10 @@ use crate::{
 pub(crate) struct DispatchOutcome {
     pub result: ToolResult,
     pub shell: Option<ShellDispatchInfo>,
+    /// Set instead of [`Self::shell`] when the command outran its grace period and was demoted
+    /// to the background. The two are never both `Some`: a demoted command has no exit code yet,
+    /// which is exactly why `HookEvent::Shell` does not fire for one.
+    pub detached: Option<crate::detached::DetachedDispatchInfo>,
     /// True when the dispatch was served by reading a skill.md file rather than running
     /// a binary or WASM component. Used by the agent loop to write a `skill_call` trace
     /// event instead of a `tool_call` event.
@@ -43,6 +47,7 @@ impl DispatchOutcome {
         Self {
             result,
             shell: None,
+            detached: None,
             is_skill: false,
             fatal: None,
         }
@@ -52,6 +57,7 @@ impl DispatchOutcome {
         Self {
             result,
             shell: None,
+            detached: None,
             is_skill: true,
             fatal: None,
         }

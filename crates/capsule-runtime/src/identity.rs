@@ -424,6 +424,7 @@ async fn handle_message_stream(
         message_text: text,
         traceparent,
         provenance,
+        source: crate::a2a::SOURCE_A2A,
     };
     if task_tx.try_send(incoming).is_err() {
         {
@@ -644,6 +645,7 @@ fn handle_message_send(
         message_text: text,
         traceparent,
         provenance,
+        source: crate::a2a::SOURCE_A2A,
     };
     if task_tx.try_send(incoming).is_err() {
         // Unexpected path — roll back pending count
