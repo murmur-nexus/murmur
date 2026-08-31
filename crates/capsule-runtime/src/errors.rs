@@ -397,6 +397,24 @@ pub enum RuntimeError {
     #[error("internal_port {port} is already bound; choose another port or omit internal_port to use an OS-assigned port")]
     PortInUse { port: u16 },
 
+    /// A session whose manifest declares `capabilities.spawn.allow` could not register with
+    /// `mur-roost`, so the daemon does not hold the grants it would referee that session's
+    /// delegations against.
+    ///
+    /// Fatal rather than a warning: a capsule that can delegate but is unknown to the daemon is a
+    /// capsule running outside the only thing that bounds what it may spawn. A capsule that
+    /// declares no spawn capability never registers and never reaches this.
+    ///
+    /// `reason` is the transport or daemon-side failure verbatim. Neither this nor anything
+    /// derived from it carries a credential or an approval: the registration request's tokens
+    /// travel in headers, and the HTTP client never puts a request header into an error.
+    #[error(
+        "failed to register this session with mur-roost at {roost_url}: {reason}; a capsule \
+         declaring capabilities.spawn.allow must be known to the daemon that referees its \
+         spawns, so the launch is refused rather than run unrefereed"
+    )]
+    SpawnRegistrationFailed { roost_url: String, reason: String },
+
     #[error("runtime failure: {0}")]
     Runtime(String),
 }

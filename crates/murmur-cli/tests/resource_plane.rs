@@ -306,6 +306,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: runtime_manifest.exports.clone(),
+            spawn_grant: None,
         },
     )
     .expect("staging should succeed");

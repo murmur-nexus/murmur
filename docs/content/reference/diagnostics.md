@@ -63,6 +63,7 @@ section that explains it.
 | `E-RUN-016` | The session `--resume` named records no `task_start` carrying a context id | [E-RUN-016](#e-run-016) |
 | `E-RUN-017` | The context `--resume` resolved to kept no conversation record | [E-RUN-017](#e-run-017) |
 | `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
+| `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -227,6 +228,26 @@ error[E-RUN-018]: --resume-mode compact needs a hook bound to on-compaction; thi
 `--resume-mode full` is often the cheaper mode anyway: a verbatim reload can hit the provider's
 prompt cache, while compaction changes the prefix from the first altered token, guarantees a cache
 miss, and costs an extra inference call to produce the summary.
+
+### E-RUN-019 — the session could not register with mur-roost { #e-run-019 }
+
+A capsule whose manifest declares `capabilities.spawn.allow` is refereed by `mur-roost` every time
+it asks to spawn something, and the daemon can only referee a session whose grants it holds. The
+session announces itself at launch (see
+[`POST /register`](roost-api.md#post-register)); a registration it cannot complete refuses the
+launch rather than leaving a capsule that can delegate running outside the knowledge of the daemon
+that bounds it:
+
+```text
+error[E-RUN-019]: failed to register this session with mur-roost at http://127.0.0.1:7700: failed to connect to 127.0.0.1:7700: Connection refused (os error 111); a capsule declaring capabilities.spawn.allow must be known to the daemon that referees its spawns, so the launch is refused rather than run unrefereed
+  hint: start the daemon the capsule registers with — `mur-roost --port 7700 --registry-path <store>` — and set MURMUR_ROOST_URL to its base URL, or drop capabilities.spawn.allow from the manifest if this capsule spawns nothing
+```
+
+`MURMUR_ROOST_URL` unset or blank reports the same code with `MURMUR_ROOST_URL is not set` as the
+reason. The message names the daemon and the reason, never a token.
+
+A capsule that declares no spawn capability never reaches this — it opens no connection to the
+daemon at all, and `mur run` succeeds with nothing listening.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

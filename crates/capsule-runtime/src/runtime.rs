@@ -61,12 +61,15 @@ use crate::{
     },
     origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
-    outgoing, resources, sandbox,
+    outgoing,
+    registration::SessionOutcome,
+    resources, sandbox,
     sealed::UsernsGrant,
     shell::{
         build_shell_env, build_wasi_env_allowlist, is_shell_interpreter, run_shell,
         shell_tool_manifest_yaml, split_shell_words, ShellOutcome, ShellResult,
     },
+    spawn_credential::SpawnCredential,
     state_store::STATE_PREOPEN_NAME,
     streaming::{
         emit_chunk_sse, emit_sse, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
@@ -963,7 +966,10 @@ pub fn stage_session(
         exports_peer_files,
         registry,
         _epoch_ticker: epoch_ticker,
+        // Minted by the daemon at registration, which `launch_session` performs — it names a
+        // session id, and staging is what mints one.
         spawn_credential: None,
+        spawn_grant: request.spawn_grant,
     })
 }
 
@@ -976,6 +982,12 @@ pub fn launch_session(
     on_url: impl FnOnce(&str),
 ) -> Result<LaunchResult, RuntimeError> {
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
+
+    // Before any WASM is instantiated and before any subprocess is bounded: a session that can
+    // delegate announces itself to the daemon that will referee those delegations, and takes the
+    // credential it will present. A session that cannot delegate does none of this — it opens no
+    // connection, needs no daemon, and is unaffected by there being none.
+    let mut roost_session = RoostSession::register(&mut staged)?;
 
     // --- Host-process bounding, before any WASM is instantiated ------------------------------
     //
@@ -2007,6 +2019,7 @@ pub fn launch_session(
 
         loop_result?;
 
+        roost_session.complete();
         return Ok(LaunchResult {
             session_id: session_id_ret,
             workdir: workdir_ret,
@@ -2200,10 +2213,82 @@ pub fn launch_session(
     // Notify the caller that the capsule has started (no URL for script capsules).
     on_url("");
 
+    roost_session.complete();
     Ok(LaunchResult {
         session_id: staged.session_id,
         workdir: staged.workdir,
     })
+}
+
+/// This session's registration with `mur-roost`, for exactly as long as the session runs.
+///
+/// Registration is one call and deregistration is its mirror; holding them in a guard is what
+/// makes the pair total. `launch_session` has one `?` per staging step and two success returns,
+/// and a session that ended without retiring its registration would leave a credential that still
+/// verifies and a job the daemon still reports as `running`.
+struct RoostSession {
+    /// `None` for every session that declares no `capabilities.spawn.allow`, which registers
+    /// nothing and therefore has nothing to retire.
+    registered: Option<(String, SpawnCredential)>,
+    outcome: SessionOutcome,
+}
+
+impl RoostSession {
+    /// Registers `staged` and hands it the credential the daemon minted, or returns the refusal
+    /// that stops the launch.
+    fn register(staged: &mut StagedSession) -> Result<Self, RuntimeError> {
+        // Two reasons to register, and a session with neither never opens a connection at all.
+        //
+        // A session that declares `capabilities.spawn.allow` must, because the daemon has to hold
+        // its ceiling before it can referee anything it asks for. A session launched with a grant
+        // must too, whatever it declares: presenting the approval is what marks it spent, and an
+        // approval that is never presented would cover as many launches as a parent cared to make
+        // from it.
+        if staged.capability_policy.spawn_allow.is_empty() && staged.spawn_grant.is_none() {
+            return Ok(Self {
+                registered: None,
+                // Never read: a session with nothing registered deregisters nothing.
+                outcome: SessionOutcome::Failed,
+            });
+        }
+
+        let roost_url = match std::env::var("MURMUR_ROOST_URL") {
+            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => {
+                return Err(RuntimeError::SpawnRegistrationFailed {
+                    roost_url: "<unset>".to_string(),
+                    reason: "MURMUR_ROOST_URL is not set".to_string(),
+                })
+            }
+        };
+
+        let credential = crate::registration::register_session(
+            &roost_url,
+            &staged.session_id,
+            &staged.capsule_name,
+            &staged.capsule_version,
+            staged.spawn_grant.as_ref(),
+        )?;
+        staged.set_spawn_credential(credential.clone());
+        Ok(Self {
+            // A session that fails between here and a success return is reported as `failed`,
+            // which is what a reader of `GET /status` would otherwise have to infer from silence.
+            registered: Some((roost_url, credential)),
+            outcome: SessionOutcome::Failed,
+        })
+    }
+
+    fn complete(&mut self) {
+        self.outcome = SessionOutcome::Complete;
+    }
+}
+
+impl Drop for RoostSession {
+    fn drop(&mut self) {
+        if let Some((roost_url, credential)) = self.registered.take() {
+            crate::registration::deregister_session(&roost_url, &credential, self.outcome);
+        }
+    }
 }
 
 /// Reads a manifest-relative prompt file, returning the resolved path alongside any I/O
@@ -5772,6 +5857,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -5862,6 +5948,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -5940,6 +6027,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -6017,6 +6105,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -6170,6 +6259,7 @@ inference:
             internal_port: None,
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         };
 
         let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();

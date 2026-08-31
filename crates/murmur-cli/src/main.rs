@@ -167,6 +167,30 @@ enum Commands {
         #[arg(long, default_value = "./murmur.yaml")]
         manifest: PathBuf,
 
+        /// Run an installed registry artifact by name instead of a project directory.
+        /// Requires --capsule-version. The capsule is resolved from the project store, then
+        /// the global store, and staged from the artifact bytes in memory: --workdir is the
+        /// only directory involved, and no murmur.yaml is read from disk.
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "capsule_version",
+            conflicts_with = "manifest"
+        )]
+        capsule: Option<String>,
+
+        /// Version of the --capsule artifact to run. Required with --capsule.
+        #[arg(long, value_name = "VERSION", requires = "capsule")]
+        capsule_version: Option<String>,
+
+        /// Read one line from standard input as this launch's spawn approval.
+        /// Set by a parent capsule's runtime when it launches a delegated child; the approval is
+        /// presented once when the session registers with mur-roost. Standard input is used
+        /// rather than an argument or an environment variable, both of which a process running
+        /// as the same user can read out of /proc.
+        #[arg(long)]
+        spawn_grant_stdin: bool,
+
         /// File path or inline text to write as task.md in the capsule workdir.
         /// If the value is the path to an existing file its contents are copied;
         /// otherwise the value itself is written as UTF-8 text.
@@ -448,6 +472,9 @@ fn main() {
         ),
         Commands::Run {
             manifest,
+            capsule,
+            capsule_version,
+            spawn_grant_stdin,
             task,
             system_prompt,
             context,
@@ -464,6 +491,9 @@ fn main() {
             explain_scope,
         } => run_run(
             &manifest,
+            capsule.as_deref(),
+            capsule_version.as_deref(),
+            spawn_grant_stdin,
             task.as_deref(),
             system_prompt.as_deref(),
             context.as_deref(),

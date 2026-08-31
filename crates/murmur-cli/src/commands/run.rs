@@ -21,7 +21,10 @@ use murmur_artifact::{
 use crate::{
     commands::trace::{first_task_context_id, resolve_session_dir},
     config::load_effective_mur_config_if_any_exists,
-    error::{CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008, E_RUN_015, E_RUN_016},
+    error::{
+        CliError, E_IO_003, E_RUN_003, E_RUN_004, E_RUN_006, E_RUN_008, E_RUN_015, E_RUN_016,
+        E_RUN_019,
+    },
     registry_client::FallbackRegistry,
 };
 
@@ -104,6 +107,9 @@ fn resolve_resume(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_run(
     manifest_arg: &Path,
+    capsule_arg: Option<&str>,
+    capsule_version_arg: Option<&str>,
+    spawn_grant_stdin: bool,
     task_arg: Option<&str>,
     system_prompt_arg: Option<&str>,
     context_id_arg: Option<&str>,
@@ -124,35 +130,72 @@ pub(crate) fn run_run(
         .unwrap_or_else(|_| PathBuf::from("/"))
         .join("workdir");
 
-    let manifest_path = if manifest_arg.is_absolute() {
-        manifest_arg.to_path_buf()
-    } else {
-        let cwd = std::env::current_dir().map_err(|source| {
-            fail(
-                &session_id,
-                &workdir,
-                CliError::new(
-                    E_IO_003,
-                    format!("failed to determine current working directory: {source}"),
-                ),
-                json,
-            )
-        })?;
-        cwd.join(manifest_arg)
-    };
+    // `--capsule NAME --capsule-version VERSION` runs an installed artifact rather than a project
+    // directory: nothing is read from disk beside the artifact itself, and the only directory
+    // involved is the workdir. It is the path a delegated child is launched on.
+    let installed_capsule = capsule_arg.zip(capsule_version_arg);
 
-    let project_dir = manifest_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| {
-            fail(
-                &session_id,
-                &workdir,
-                CliError::new(E_IO_003, "failed to determine manifest directory"),
-                json,
-            )
-        })?;
+    let (manifest_path, project_dir) = match installed_capsule {
+        Some(_) => {
+            let dir = match workdir_arg.as_deref() {
+                Some(dir) => absolutise(dir),
+                None => std::env::current_dir().map_err(|source| {
+                    fail(
+                        &session_id,
+                        &workdir,
+                        CliError::new(
+                            E_IO_003,
+                            format!("failed to determine current working directory: {source}"),
+                        ),
+                        json,
+                    )
+                })?,
+            };
+            // Never read; the manifest comes out of the artifact. Kept so the two modes share one
+            // `manifest_dir`, which is what a manifest-relative system prompt resolves against.
+            (dir.join("murmur.yaml"), dir)
+        }
+        None => {
+            let manifest_path = if manifest_arg.is_absolute() {
+                manifest_arg.to_path_buf()
+            } else {
+                let cwd = std::env::current_dir().map_err(|source| {
+                    fail(
+                        &session_id,
+                        &workdir,
+                        CliError::new(
+                            E_IO_003,
+                            format!("failed to determine current working directory: {source}"),
+                        ),
+                        json,
+                    )
+                })?;
+                cwd.join(manifest_arg)
+            };
+            let project_dir = manifest_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| {
+                    fail(
+                        &session_id,
+                        &workdir,
+                        CliError::new(E_IO_003, "failed to determine manifest directory"),
+                        json,
+                    )
+                })?;
+            (manifest_path, project_dir)
+        }
+    };
     workdir = project_dir.join("workdir");
+
+    // Read before anything else this launch does, and read exactly once: the parent's runtime
+    // writes one line and closes the pipe, so a launch that deferred the read past a refusal
+    // would leave the parent blocked on a reader that never arrives.
+    let spawn_grant = if spawn_grant_stdin {
+        Some(read_spawn_grant().map_err(|error| fail(&session_id, &workdir, error, json))?)
+    } else {
+        None
+    };
 
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
@@ -196,14 +239,39 @@ pub(crate) fn run_run(
         })?;
     }
 
-    let runtime_manifest = load_runtime_manifest(&manifest_path).map_err(|err| {
-        fail(
-            &session_id,
-            &workdir,
-            runtime_manifest_error_to_cli(err),
-            json,
-        )
-    })?;
+    // In `--capsule` mode the artifact's own bytes are the manifest *and* the component, read in
+    // memory: a capsule launched by name is staged from exactly what the registry holds rather
+    // than from a directory somebody laid out.
+    let (runtime_manifest, installed_bytes) = match installed_capsule {
+        Some((name, version)) => {
+            let resolved = resolve_installed_capsule(&project_dir, name, version)
+                .map_err(|error| fail(&session_id, &workdir, error, json))?;
+            let manifest_yaml =
+                capsule_runtime::artifact::extract_manifest_yaml(name, version, &resolved.bytes)
+                    .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+            let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(&manifest_yaml)
+                .map_err(|err| {
+                    fail(
+                        &session_id,
+                        &workdir,
+                        runtime_manifest_error_to_cli(err),
+                        json,
+                    )
+                })?;
+            (manifest, Some(resolved.bytes))
+        }
+        None => {
+            let manifest = load_runtime_manifest(&manifest_path).map_err(|err| {
+                fail(
+                    &session_id,
+                    &workdir,
+                    runtime_manifest_error_to_cli(err),
+                    json,
+                )
+            })?;
+            (manifest, None)
+        }
+    };
 
     // Warn if the manifest pins a different mur version than is currently running.
     // Do not abort — local development routinely runs ahead of a pinned version.
@@ -337,59 +405,65 @@ pub(crate) fn run_run(
     }
 
     let lock_path = project_dir.join("murmur.lock");
+    // An installed capsule carries no project directory, so there is no lockfile to honour and
+    // none to write: its artifact set is whatever the published manifest declares.
     let (staged_artifacts, lock_expectations, write_lock_after_stage) =
-        match read_lockfile(&lock_path) {
-            Ok(lock) => {
-                let mut pinned_artifacts = Vec::with_capacity(requested_artifacts.len());
-                let mut expectations = Vec::with_capacity(requested_artifacts.len());
-                for artifact in &requested_artifacts {
-                    // Local-source skills are not registry-resolved and not locked — pass
-                    // them through untouched without requiring a lockfile entry.
-                    if artifact.source.is_some() {
-                        pinned_artifacts.push(artifact.clone());
-                        continue;
-                    }
+        if installed_capsule.is_some() {
+            (requested_artifacts, None, false)
+        } else {
+            match read_lockfile(&lock_path) {
+                Ok(lock) => {
+                    let mut pinned_artifacts = Vec::with_capacity(requested_artifacts.len());
+                    let mut expectations = Vec::with_capacity(requested_artifacts.len());
+                    for artifact in &requested_artifacts {
+                        // Local-source skills are not registry-resolved and not locked — pass
+                        // them through untouched without requiring a lockfile entry.
+                        if artifact.source.is_some() {
+                            pinned_artifacts.push(artifact.clone());
+                            continue;
+                        }
 
-                    let entry = lock.artifact_for(&artifact.name).ok_or_else(|| {
-                        fail(
-                            &session_id,
-                            &workdir,
-                            CliError::new(
-                                E_RUN_003,
-                                format!(
-                                    "murmur.lock missing artifact entry for '{}'",
-                                    artifact.name
+                        let entry = lock.artifact_for(&artifact.name).ok_or_else(|| {
+                            fail(
+                                &session_id,
+                                &workdir,
+                                CliError::new(
+                                    E_RUN_003,
+                                    format!(
+                                        "murmur.lock missing artifact entry for '{}'",
+                                        artifact.name
+                                    ),
                                 ),
-                            ),
-                            json,
-                        )
-                    })?;
+                                json,
+                            )
+                        })?;
 
-                    pinned_artifacts.push(ArtifactRequest {
-                        name: artifact.name.clone(),
-                        version: entry.resolved_version.clone(),
-                        runtime: artifact.runtime.clone(),
-                        source: None,
-                        on_overflow: artifact.on_overflow,
-                        config: artifact.config.clone(),
-                        capabilities: artifact.capabilities.clone(),
-                    });
-                    expectations.push(LockExpectation {
-                        name: artifact.name.clone(),
-                        resolved_version: entry.resolved_version.clone(),
-                        sha256_wasm: entry.sha256.wasm.clone(),
-                    });
+                        pinned_artifacts.push(ArtifactRequest {
+                            name: artifact.name.clone(),
+                            version: entry.resolved_version.clone(),
+                            runtime: artifact.runtime.clone(),
+                            source: None,
+                            on_overflow: artifact.on_overflow,
+                            config: artifact.config.clone(),
+                            capabilities: artifact.capabilities.clone(),
+                        });
+                        expectations.push(LockExpectation {
+                            name: artifact.name.clone(),
+                            resolved_version: entry.resolved_version.clone(),
+                            sha256_wasm: entry.sha256.wasm.clone(),
+                        });
+                    }
+                    (pinned_artifacts, Some(expectations), false)
                 }
-                (pinned_artifacts, Some(expectations), false)
-            }
-            Err(LockfileError::NotFound(_)) => (requested_artifacts, None, true),
-            Err(error) => {
-                return Err(fail(
-                    &session_id,
-                    &workdir,
-                    lockfile_error_to_cli(error),
-                    json,
-                ));
+                Err(LockfileError::NotFound(_)) => (requested_artifacts, None, true),
+                Err(error) => {
+                    return Err(fail(
+                        &session_id,
+                        &workdir,
+                        lockfile_error_to_cli(error),
+                        json,
+                    ));
+                }
             }
         };
 
@@ -401,9 +475,16 @@ pub(crate) fn run_run(
         .map_err(|error| fail(&session_id, &workdir, error, json))?;
 
     // Agent capsules are manifest-only — no WASM component to discover.
-    // Script capsules require exactly one root *.wasm file in the project directory.
+    // Script capsules require exactly one root *.wasm file in the project directory, or, in
+    // `--capsule` mode, the root component of the artifact archive.
     let capsule_component_bytes = if runtime_manifest.inference.is_some() {
         Vec::new()
+    } else if let Some((name, version)) = installed_capsule {
+        let bytes = installed_bytes
+            .as_deref()
+            .expect("installed capsule mode always resolves artifact bytes");
+        capsule_runtime::artifact::extract_root_wasm(name, version, bytes)
+            .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?
     } else {
         let capsule_path = discover_capsule_component(&project_dir)
             .map_err(|error| fail(&session_id, &workdir, error, json))?;
@@ -469,6 +550,7 @@ pub(crate) fn run_run(
             .and_then(|n| n.internal_port),
         declared_containment_floor,
         exports: runtime_manifest.exports.clone(),
+        spawn_grant,
     };
 
     // Stage against project-then-global, the same order `check_artifacts_installed` just
@@ -821,6 +903,57 @@ fn find_workspace_root(start: &Path) -> PathBuf {
 
         current = parent.to_path_buf();
     }
+}
+
+/// One line of standard input, as this launch's spawn approval.
+///
+/// The grant travels on a pipe rather than on the argument vector or in the environment: both of
+/// those are readable through `/proc/<pid>` by any process running as the same user, which is
+/// exactly what a sibling capsule's shell tool is.
+fn read_spawn_grant() -> Result<capsule_runtime::SpawnApproval, CliError> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).map_err(|source| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to read the spawn grant from standard input: {source}"),
+        )
+    })?;
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(CliError::with_hint(
+            E_RUN_019,
+            "--spawn-grant-stdin was given but standard input carried no grant",
+            "the launching runtime writes one line and closes the pipe; run without \
+             --spawn-grant-stdin to launch this capsule directly",
+        ));
+    }
+    Ok(capsule_runtime::SpawnApproval::new(line.to_string()))
+}
+
+/// Resolve an installed capsule from the project store, then the global one.
+///
+/// The same order `check_artifacts_installed` and staging use for every other artifact, so a
+/// capsule published to either store runs by name. Through [`FallbackRegistry`], so that only a
+/// *missing* artifact falls through to the global store: an artifact the project store holds but
+/// cannot read is that error, not a lookup somewhere else.
+fn resolve_installed_capsule(
+    project_dir: &Path,
+    name: &str,
+    version: &str,
+) -> Result<ResolvedArtifact, CliError> {
+    FallbackRegistry {
+        primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
+        secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
+    }
+    .resolve_with_platform(name, version, Some(current_platform()))
+    .map_err(|source| {
+        CliError::with_hint(
+            E_RUN_008,
+            format!("capsule '{name}@{version}' is not installed: {source}"),
+            "publish or install it first — `mur install <artifact>.mur.zip` — then run \
+             `mur list` to confirm the coordinate",
+        )
+    })
 }
 
 fn discover_capsule_component(project_dir: &Path) -> Result<PathBuf, CliError> {

@@ -15,7 +15,7 @@ use crate::{
     hooks::ShellDispatchInfo,
     limits::{EpochTicker, ExecutionLimits},
     network_policy::{HookCapabilityGrant, ToolCapabilityGrant},
-    spawn_credential::SpawnCredential,
+    spawn_credential::{SpawnApproval, SpawnCredential},
 };
 
 pub(crate) struct DispatchOutcome {
@@ -347,6 +347,13 @@ pub struct StageRequest {
     /// operator makes, not a capability the guest holds, and nothing derived from this field ever
     /// reaches the achieved containment class.
     pub exports: Option<murmur_artifact::Exports>,
+    /// The approval a delegated child was handed by its parent, presented once at registration.
+    ///
+    /// `None` for every top-level launch, which the daemon admits against its own `--spawn-allow`
+    /// instead. Unlike [`StagedSession::spawn_credential`], this exists before staging: it names
+    /// an artifact rather than a session, and the parent already held it when it started this
+    /// process.
+    pub spawn_grant: Option<SpawnApproval>,
 }
 
 pub struct StagedSession {
@@ -440,6 +447,9 @@ pub struct StagedSession {
     /// [`StageRequest`]: the credential names a session id, and `stage_session` is what mints one,
     /// so it cannot exist before staging returns.
     pub(crate) spawn_credential: Option<SpawnCredential>,
+    /// Copied from [`StageRequest::spawn_grant`]. Read by `launch_session`, which presents it at
+    /// `POST /register` and never again — an approval covers one launch.
+    pub(crate) spawn_grant: Option<SpawnApproval>,
 }
 
 impl StagedSession {

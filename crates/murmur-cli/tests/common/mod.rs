@@ -276,6 +276,7 @@ pub fn stage_agent_session(
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap()

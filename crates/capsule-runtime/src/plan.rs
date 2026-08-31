@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{Read, Write},
-    net::TcpStream,
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -10,15 +8,14 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use url::Url;
 
 use crate::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
+    child_launch::{launch_child_capsule, ChildLaunchRequest},
+    http_client::http_json,
     sandbox,
     shell::{execute_shell, split_shell_words},
-    spawn_credential::{
-        SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
-    },
+    spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER},
     types::CapabilityPolicy,
 };
 
@@ -603,60 +600,61 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         .unwrap_or_else(|| "0.1.0".to_string());
     let roost_url = roost_url.trim_end_matches('/').to_string();
 
-    // The credential's one reading, reused across both requests below. Every other route out of
-    // `SpawnCredential` is closed — no `Display`, no `Serialize`, redacted `Debug` — so the token
-    // cannot reach a step result, a trace or a workdir file by being formatted somewhere.
+    // The credential's one reading. Every other route out of `SpawnCredential` is closed — no
+    // `Display`, no `Serialize`, redacted `Debug` — so the token cannot reach a step result, a
+    // trace or a workdir file by being formatted somewhere.
     let credential_header = credential.expose();
 
-    // Step 1: ask mur-roost for permission. The daemon judges the session this credential names,
-    // runs the referee, and answers with an approval naming the exact artifact it resolved.
-    let delegate_body = json!({ "name": capsule, "version": version }).to_string();
-    let delegation = match http_json(
+    // Step 1: ask mur-roost whether this session may spawn that capsule. One request, and the only
+    // one: the daemon judges the session this credential names, runs the referee, and answers with
+    // an approval naming the exact artifact it resolved. It launches nothing.
+    let spawn_body = json!({ "name": capsule, "version": version }).to_string();
+    let permission = match http_json(
         "POST",
-        &format!("{roost_url}/delegate"),
-        Some(&delegate_body),
+        &format!("{roost_url}/spawn"),
+        Some(&spawn_body),
         &[(SPAWN_CREDENTIAL_HEADER, credential_header)],
     ) {
         Ok(value) => value,
         Err(error) => return failed(&step.id, error),
     };
-    let Some(approval) = delegation.get("approval").and_then(Value::as_str) else {
+    let Some(approval) = permission.get("approval").and_then(Value::as_str) else {
         return failed(
             &step.id,
-            "mur-roost delegate response missing approval".to_string(),
+            "mur-roost spawn response missing approval".to_string(),
         );
     };
-    let approval = SpawnApproval::new(approval.to_string());
+    let grant = SpawnApproval::new(approval.to_string());
 
-    // Step 2: redeem it. Input is NOT sent here.
-    let spawn_body = json!({
-        "name": capsule,
-        "version": version,
-        "workdir": ctx.workdir,
-        "spawned_by": ctx.current_session_id,
-    })
-    .to_string();
-
-    let spawn = match http_json(
-        "POST",
-        &format!("{roost_url}/spawn"),
-        Some(&spawn_body),
-        &[
-            (SPAWN_CREDENTIAL_HEADER, credential_header),
-            (SPAWN_APPROVAL_HEADER, approval.expose()),
-        ],
-    ) {
-        Ok(value) => value,
-        Err(error) => return failed(&step.id, error),
+    // Step 2: launch it here, in this runtime, as a process of its own. `child` owns that process:
+    // dropping it at the end of this step — including on an early return below — terminates and
+    // reaps the child rather than leaving it holding a port.
+    //
+    // `child_env_allow` is empty because a plan step knows the capsule's name and version and
+    // nothing else about its manifest; a child launched from a plan therefore sees no host
+    // variables beyond the three every child gets. Deriving it would take the child's manifest,
+    // which this scheduler has no registry to resolve.
+    let child = match launch_child_capsule(ChildLaunchRequest {
+        parent_accessible_workdir: ctx.workdir.clone(),
+        capsule_name: capsule.to_string(),
+        capsule_version: version.clone(),
+        grant,
+        child_env_allow: Vec::new(),
+        roost_url: roost_url.clone(),
+    }) {
+        Ok(child) => child,
+        Err(error) => return failed(&step.id, error.to_string()),
     };
-
-    let Some(capsule_url) = spawn.get("capsule_url").and_then(Value::as_str) else {
+    if child.capsule_url.is_empty() {
         return failed(
             &step.id,
-            format!("mur-roost spawn response missing capsule_url: {spawn}"),
+            format!(
+                "capsule '{capsule}' bound no address, so it cannot be sent a task; a capsule step \
+                 needs a capsule that serves A2A"
+            ),
         );
-    };
-    let capsule_url = capsule_url.trim_end_matches('/').to_string();
+    }
+    let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
 
     // Step 3: Build the A2A message/send JSON-RPC body with the task input.
     let input_text = capsule_step_input_text(input);
@@ -868,66 +866,6 @@ fn parse_reference(reference: &str) -> Option<(&str, &str)> {
 
 fn read_optional_path(path: Option<&str>) -> Option<String> {
     path.and_then(|path| fs::read_to_string(path).ok())
-}
-
-/// One HTTP request, with `extra_headers` appended to the fixed set below.
-///
-/// The error this returns on a non-2xx carries the *response* headers and body. It must never
-/// grow to echo the request: `extra_headers` is where a spawn credential travels, and a step's
-/// error text reaches the model.
-fn http_json(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    extra_headers: &[(&str, &str)],
-) -> Result<Value, String> {
-    let url = Url::parse(url).map_err(|error| format!("invalid URL '{url}': {error}"))?;
-    if url.scheme() != "http" {
-        return Err(format!("unsupported URL scheme '{}'", url.scheme()));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| format!("URL '{url}' has no host"))?;
-    let port = url.port_or_known_default().unwrap_or(80);
-    let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|error| format!("failed to connect to {addr}: {error}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| error.to_string())?;
-
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-    let body = body.unwrap_or("");
-    let extra: String = extra_headers
-        .iter()
-        .map(|(name, value)| format!("{name}: {value}\r\n"))
-        .collect();
-    let request = if method == "POST" {
-        format!(
-            "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
-            body.len()
-        )
-    } else {
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n")
-    };
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("failed to write HTTP request: {error}"))?;
-
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("failed to read HTTP response: {error}"))?;
-    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
-        return Err("invalid HTTP response".to_string());
-    };
-    if !headers.starts_with("HTTP/1.1 2") && !headers.starts_with("HTTP/1.0 2") {
-        return Err(format!("HTTP request failed: {headers}; body: {body}"));
-    }
-    serde_json::from_str(body).map_err(|error| format!("failed to parse HTTP JSON: {error}"))
 }
 
 #[cfg(test)]

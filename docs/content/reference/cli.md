@@ -473,6 +473,9 @@ mur run [--manifest <path>] [--task <path-or-text>] [--json]
 | Flag | Default | Description |
 |---|---|---|
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest |
+| `--capsule` | — | Run an installed registry artifact by name instead of a project directory. Requires `--capsule-version`, and cannot be combined with an explicitly given `--manifest`. The capsule is resolved from the project store and then the global store, and staged from the artifact bytes in memory: no `murmur.yaml` is read from disk, and no `murmur.lock` is read or written. This is the form a parent capsule's runtime launches a delegated child on |
+| `--capsule-version` | — | Version of the `--capsule` artifact. Required with `--capsule` |
+| `--spawn-grant-stdin` | off | Read one line from standard input as this launch's spawn approval, and present it when the session registers with `mur-roost`. Set by a parent capsule's runtime when it launches a delegated child. Standard input rather than an argument or an environment variable, both of which any process running as the same user can read out of `/proc` |
 | `--task` | — | Written to the capsule workdir as `task.md` before launch. An existing file path is copied; any other value is written verbatim as UTF-8 text |
 | `--context` | a fresh `ctx_…` per task | Context id this run's task runs under. Two runs given the same id continue one [conversation record](workdir.md#the-conversation-record), whichever session directory each got. One path segment: no `/`, no `.` or `..`, not absolute, not starting with a dot — anything else refuses the launch with [`E-CAP-011`](diagnostics.md#e-cap-011) |
 | `--resume` | `@1` when the flag is given with no value | Session whose conversation this run continues, as a [session address](#session-addresses). Resolves that session's context id and runs under it, so it is `--context` with the id looked up for you. Loads the [conversation record](workdir.md#the-conversation-record) even when the capsule declares `lifecycle.conversation: stateless`. Passing it together with `--context` refuses the launch with [`E-RUN-015`](diagnostics.md#e-run-015) |
@@ -492,7 +495,14 @@ For the output modes, the read-only pre-flight checks and driving a capsule over
 [Run a capsule from the CLI or from another program](../how-to/different-ways-to-run-murmur.md).
 
 - Auto-loads `.env` from nearest workspace containing `murmur.yaml`, unless `--no-env-file` is passed
-- Creates/uses `murmur.lock` in manifest directory
+- Creates/uses `murmur.lock` in manifest directory, except under `--capsule`, which has no project directory to hold one
+
+**Registration.** A capsule whose manifest declares `capabilities.spawn.allow`, and any capsule
+launched with `--spawn-grant-stdin`, registers with the daemon named by `MURMUR_ROOST_URL` at
+launch and is retired from it when the session ends. A registration that cannot be completed
+refuses the launch with [`E-RUN-019`](diagnostics.md#e-run-019). Every other capsule opens no
+connection at all and needs no daemon running. See
+[the mur-roost HTTP API](roost-api.md#post-register).
 
 **Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]` and a `mur install` hint. Run `mur install` first to fetch missing artifacts.
 
@@ -504,6 +514,7 @@ Current runtime constraints:
 - Capsule component discovery:
   - prefers `capsule.wasm`
   - otherwise requires exactly one root `*.wasm`
+  - under `--capsule`, the root component of the artifact archive, with no project directory searched
 - Agent capsules require either `transport: http` (with `inference.driver.artifact`) or `transport: process` (with `inference.command`) in `murmur.yaml`; missing driver config exits with `error[E-RUN-005]` or `error[E-RUN-006]` respectively
 
 ---

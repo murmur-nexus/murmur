@@ -3,7 +3,7 @@ name = "mur-roost"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP host daemon that spawns and manages Murmur capsule worker sessions."
+description = "Loopback daemon that referees which Murmur capsules may spawn which other capsules."
 repository.workspace = true
 readme.workspace = true
 

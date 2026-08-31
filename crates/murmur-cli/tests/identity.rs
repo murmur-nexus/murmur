@@ -120,6 +120,7 @@ fn stage_agent_with_port(
             internal_port,
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
+            spawn_grant: None,
         },
     )
     .unwrap()

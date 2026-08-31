@@ -8,8 +8,8 @@
 //!   declares `capabilities.spawn.allow` is staged, and it is the only thing that answers *which
 //!   session is asking*.
 //! * An **approval** binds a token to a session id, one artifact — by name, version and content
-//!   hash — an absolute expiry and one `jti`. `POST /delegate` mints one after the referee has
-//!   passed; `POST /spawn` redeems it, once.
+//!   hash — an absolute expiry and one `jti`. `POST /spawn` mints one after the referee has
+//!   passed; the `POST /register` of the child that was launched with it redeems it, once.
 //!
 //! **The key is process-scoped.** 32 bytes from the OS at startup, held only in memory, zeroed on
 //! drop. A credential minted by a previous daemon verifies against nothing, which is what makes
@@ -61,7 +61,7 @@ const APPROVAL_MAC_DOMAIN: &[u8] = b"murmur-spawn-approval-v1";
 struct CredentialPayload {
     /// Payload version. Only [`PAYLOAD_VERSION`] is minted or accepted.
     v: u8,
-    /// The session this credential names — the id `stage_session` minted for it.
+    /// The session this credential names — the id its runtime minted when it staged the session.
     sid: String,
     /// [`NONCE_BYTES`] random bytes, lowercase hex, so two credentials for the same session are
     /// distinct and independently correlatable.
@@ -73,12 +73,13 @@ struct CredentialPayload {
 pub struct ApprovalPayload {
     /// Payload version. Only [`PAYLOAD_VERSION`] is minted or accepted.
     pub v: u8,
-    /// The session that earned this approval. Redemption requires the credential naming this same
-    /// session, so an approval is not redeemable by whichever session finds it.
+    /// The session that earned this approval. Checked by the caller after redemption: the
+    /// session named here must still be running, so an approval does not outlive the parent that
+    /// asked for it.
     pub sid: String,
-    /// The artifact name the daemon resolved at `/delegate`.
+    /// The artifact name the daemon resolved at `/spawn`.
     pub name: String,
-    /// The artifact version the daemon resolved at `/delegate`.
+    /// The artifact version the daemon resolved at `/spawn`.
     pub version: String,
     /// The resolved artifact's sha256, lowercase hex. This is what makes the approval name an
     /// artifact rather than a coordinate: the same name and version resolving to different bytes
@@ -196,7 +197,7 @@ impl SpawnAuthority {
         )?))
     }
 
-    /// The same approval as wire text, for the `POST /delegate` response body.
+    /// The same approval as wire text, for the `POST /spawn` response body.
     pub fn mint_approval_token(
         &self,
         session_id: &str,
@@ -219,20 +220,22 @@ impl SpawnAuthority {
         Ok(self.seal(APPROVAL_VERSION_TAG, APPROVAL_MAC_DOMAIN, &json))
     }
 
-    /// Verifies one approval against `session_id` and marks it spent.
+    /// Verifies one approval and marks it spent, returning what it approved.
     ///
-    /// Shape → MAC → payload → session binding → expiry → replay, and the `jti` is recorded as
-    /// spent the moment all of those pass. The caller's artifact check runs *after* this returns,
-    /// so an approval presented for the wrong artifact is spent rather than retryable: an approval
-    /// names one artifact, and presenting it for another is an error rather than a near-miss.
-    pub fn redeem_approval(
-        &self,
-        token: &str,
-        session_id: &str,
-    ) -> Result<ApprovalPayload, AuthorityError> {
+    /// Shape → MAC → payload → version → expiry → replay, and the `jti` is recorded as spent the
+    /// moment all of those pass. Every remaining check is the caller's and runs *after* this
+    /// returns — which session earned it, and which artifact it named — so an approval presented
+    /// for the wrong session or the wrong artifact is spent rather than retryable: an approval
+    /// covers one launch, and presenting it wrongly is an error rather than a near-miss.
+    ///
+    /// The session binding is returned rather than asserted here, because the party that redeems
+    /// an approval is the *child* the parent was approved to launch, and a child does not hold
+    /// its parent's credential. `ApprovalPayload::sid` still names the session that earned it, and
+    /// the caller checks that session is running.
+    pub fn redeem_approval(&self, token: &str) -> Result<ApprovalPayload, AuthorityError> {
         let payload: ApprovalPayload =
             self.open(APPROVAL_VERSION_TAG, APPROVAL_MAC_DOMAIN, token)?;
-        if payload.v != PAYLOAD_VERSION || payload.sid != session_id {
+        if payload.v != PAYLOAD_VERSION {
             return Err(AuthorityError::Unauthenticated);
         }
         let now = now_ms();
