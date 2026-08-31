@@ -121,20 +121,24 @@ curl -s -H "Accept: text/markdown" https://docs.murmur.nexus/concepts/hooks | he
 response from either distribution:
 
 ```
-Link: </llms.txt>; rel="service-doc"
+Link: </llms.txt>; rel="service-doc", </.well-known/api-catalog>; rel="api-catalog"
 Access-Control-Allow-Origin: *          (only echoed back when the request sends an Origin header — standard CORS behavior)
 ```
 
-The `Link` header is RFC 8288 syntax, `service-doc` per RFC 9727 §3 (a link
-to documentation intended for a human/agent audience). The CORS header is
-what [ARD](https://agenticresourcediscovery.org/)'s manifest at
+The `Link` header is RFC 8288 syntax carrying two RFC 9727 §3 relations:
+`service-doc` (documentation for a human/agent audience) and `api-catalog`
+(the linkset at `/.well-known/api-catalog`). Both domains serve both
+targets — murmur.nexus generates its own catalog in the
+`murmur-nexus-landing` repo — so one header value is correct for both.
+
+The CORS header is what [ARD](https://agenticresourcediscovery.org/)'s manifest at
 `/.well-known/ai-catalog.json` requires — see below — set via the policy's
 `CorsConfig` (CloudFront rejects a bare CORS header name inside
 `CustomHeadersConfig`). Both are safe to apply site-wide: these are fully
 public static sites with no auth/cookies, so allowing cross-origin JS to
 *read* a response changes nothing about who can already reach it over plain
-HTTP. One policy works for both distributions because `/llms.txt` is a
-site-relative path, so the same `Link` value resolves correctly against
+HTTP. One policy works for both distributions because both `Link` targets
+are site-relative paths, so the same value resolves correctly against
 either domain — mirroring `murmur-index-rewrite`, a single shared piece of
 infra rather than one per site.
 

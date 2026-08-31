@@ -2,15 +2,17 @@
 # One-time setup: attach a shared CloudFront Response Headers Policy, applied
 # to both docs.murmur.nexus and murmur.nexus, that adds:
 #
-#   Link: </llms.txt>; rel="service-doc"          (RFC 8288 / RFC 9727 sec 3)
+#   Link: </llms.txt>; rel="service-doc",          (RFC 8288 / RFC 9727 sec 3)
+#         </.well-known/api-catalog>; rel="api-catalog"
 #   Access-Control-Allow-Origin: *                 (required by the ARD manifest
 #                                                    at /.well-known/ai-catalog.json)
 #
-# One policy for both distributions — /llms.txt is a site-relative path, so
-# the same Link value is correct on both domains. The CORS header is safe to
-# apply site-wide: both sites are fully public static content with no
-# auth/cookies, so allowing cross-origin JS to *read* responses changes
-# nothing about who can already reach them over plain HTTP.
+# One policy for both distributions — both Link targets are site-relative
+# paths that exist on each domain, so the same header value is correct on
+# both. The CORS header is safe to apply site-wide: both sites are fully
+# public static content with no auth/cookies, so allowing cross-origin JS to
+# *read* responses changes nothing about who can already reach them over
+# plain HTTP.
 #
 # Idempotent: creates the policy if missing, updates it in place if the
 # header set has changed (e.g. a header was added since it was first
@@ -30,7 +32,7 @@ DESIRED_CONFIG=$(jq -n --arg name "$POLICY_NAME" '{
   CustomHeadersConfig: {
     Quantity: 1,
     Items: [
-      { Header: "Link", Value: "</llms.txt>; rel=\"service-doc\"", Override: true }
+      { Header: "Link", Value: "</llms.txt>; rel=\"service-doc\", </.well-known/api-catalog>; rel=\"api-catalog\"", Override: true }
     ]
   },
   CorsConfig: {
