@@ -29,13 +29,19 @@ jobs:
   cargo-test:
     name: cargo-test
     runs-on: ubuntu-latest
-    # Compilation, not the suite, is what the ceiling has to accommodate; it is here so a hung
-    # test fails the job rather than burning the runner's own limit.
+    # The ceiling covers the whole job -- compile, link and run -- and is here so a hung test
+    # fails the job rather than burning the runner's own limit.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      # Compilation dominates this job: the suite itself runs in about five minutes, and
-      # `timeout-minutes` is sized against the total, not against that.
+      # The job runs at roughly twelve minutes. How that divides between compiling, linking and
+      # running the suite has NOT been measured -- an earlier version of this comment asserted a
+      # five-minute suite, which was already stale by the time anyone read it, so do not put a
+      # number here that nobody re-derived. What would settle it: `finished in Xs` per test binary
+      # from the `--nocapture` output below, against a timed `cargo build --workspace --all-targets`.
+      # Each crate with a `tests/` directory is a separate link unit that statically links wasmtime,
+      # so adding one is not free even when its tests are fast. Four arrived in a single day with
+      # the delegation slices, and `capsule-runtime/tests/child_launch.rs` alone runs 42-45s.
       - uses: Swatinem/rust-cache@v2
       - name: Install libseccomp
         # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
