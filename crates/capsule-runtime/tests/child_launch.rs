@@ -189,8 +189,8 @@ impl Parent {
             .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
     }
 
-    /// Launch a `capsule-path-reader` child with `input` placed in its directory as
-    /// `input.txt`, ask it to read `targets`, and return it alongside one outcome per target.
+    /// Launch a `capsule-path-reader` child, run `place` on the directory the runtime made for
+    /// it, ask it to read `targets`, and return it alongside one outcome per target.
     ///
     /// The placing runs beside the launch rather than before it because composing the child's
     /// directory, creating it and starting the child are one call: the directory does not exist
@@ -199,8 +199,8 @@ impl Parent {
     fn launch_reading(
         &self,
         name: &str,
-        input: &str,
         targets: &[String],
+        place: impl FnOnce(&Path),
     ) -> (LaunchedChild, Vec<String>) {
         let children = self.dir().join(".murmur").join("children");
         let before = dirs_under(&children);
@@ -208,7 +208,7 @@ impl Parent {
         let child = std::thread::scope(|scope| {
             let launch = scope.spawn(|| self.launch(name, &[]));
             if let Some(dir) = wait_for_new_dir(&children, &before) {
-                std::fs::write(dir.join("input.txt"), input).unwrap();
+                place(&dir);
                 // Renamed into place, so the child that is polling for the list never reads half
                 // of one.
                 std::fs::write(dir.join("targets.part"), targets.join("\n")).unwrap();
@@ -445,32 +445,67 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
     assert_eq!(child.workdir.parent(), escaping_dir.parent());
     assert!(child.workdir.join("out").join("result.txt").is_file());
 
-    // And reads run the same way round. A third child is pointed at three existing files: its own
-    // input, the parent's secret and the sibling's. Only the one in its own directory is served.
+    // And reads run the same way round. A third child is pointed at existing files: its own input,
+    // the parent's secret and the sibling's. Only the one in its own directory is served.
     let sibling_dir = sibling.workdir.file_name().unwrap().to_string_lossy();
-    let (reader, outcomes) = parent.launch_reading(
-        "child-reader",
-        "placed by the parent",
-        &[
-            "./input.txt".to_string(),
-            "../../../parent-secret.txt".to_string(),
-            format!("../{sibling_dir}/sibling-secret.txt"),
-        ],
-    );
+    let mut targets = vec![
+        "./input.txt".to_string(),
+        "../../../parent-secret.txt".to_string(),
+        format!("../{sibling_dir}/sibling-secret.txt"),
+    ];
+    let mut expected = vec!["served placed by the parent", "blocked", "blocked"];
+
+    // Symlinks are the other way out of a preopen, and a trailing slash on one is the shape
+    // RUSTSEC-2026-0269 escaped through, so both forms are attempted alongside the plain
+    // traversals above.
+    #[cfg(unix)]
+    {
+        targets.extend([
+            "secret-link".to_string(),
+            "secret-link/".to_string(),
+            "root-link/parent-secret.txt".to_string(),
+        ]);
+        expected.extend(["blocked", "blocked", "blocked"]);
+    }
+
+    let (reader, outcomes) = parent.launch_reading("child-reader", &targets, |dir| {
+        std::fs::write(dir.join("input.txt"), "placed by the parent").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                parent.dir().join("parent-secret.txt"),
+                dir.join("secret-link"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(parent.dir(), dir.join("root-link")).unwrap();
+        }
+    });
     assert_eq!(
-        outcomes,
-        ["served placed by the parent", "blocked", "blocked"],
+        outcomes, expected,
         "reader in {}",
         reader.workdir.display()
     );
-    // Both refused paths name files that are really there — resolved from the reader's own
-    // directory they are the parent's secret and the sibling's — so `blocked` is a refusal and
-    // not a miss.
+
+    // Every refused path names content that is really there: resolved from the reader's own
+    // directory, or followed from the links planted in it, they are the parent's secret and the
+    // sibling's. So `blocked` is a refusal and not a miss.
     assert!(reader.workdir.join("../../../parent-secret.txt").is_file());
     assert!(reader
         .workdir
         .join(format!("../{sibling_dir}/sibling-secret.txt"))
         .is_file());
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            std::fs::read_to_string(reader.workdir.join("secret-link")).unwrap(),
+            "parent only"
+        );
+        assert_eq!(
+            std::fs::read_to_string(reader.workdir.join("root-link").join("parent-secret.txt"))
+                .unwrap(),
+            "parent only"
+        );
+    }
 }
 
 // ── 4. A directory per delegation ─────────────────────────────────────────────
@@ -482,7 +517,9 @@ fn each_delegation_gets_a_directory_of_its_own() {
     let parent = Parent::new();
 
     let (first, first_read) =
-        parent.launch_reading("child-repeat", "first only", &["./input.txt".to_string()]);
+        parent.launch_reading("child-repeat", &["./input.txt".to_string()], |dir| {
+            std::fs::write(dir.join("input.txt"), "first only").unwrap();
+        });
     std::fs::write(first.workdir.join("placed-by-the-parent.txt"), "kept").unwrap();
 
     let first_dir = first
@@ -493,11 +530,13 @@ fn each_delegation_gets_a_directory_of_its_own() {
         .to_string();
     let (second, second_read) = parent.launch_reading(
         "child-repeat",
-        "second only",
         &[
             "./input.txt".to_string(),
             format!("../{first_dir}/input.txt"),
         ],
+        |dir| {
+            std::fs::write(dir.join("input.txt"), "second only").unwrap();
+        },
     );
 
     // What the parent put in each directory belongs to that delegation alone: each child was
