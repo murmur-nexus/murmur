@@ -322,14 +322,15 @@ loop has exited, on every exit path
 |---|---|---|
 | `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
 | `context_id` | string | Context UUID for this task |
-| `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path — which door the task came through |
+| `source` | string | Which door the task came through: `"a2a"` for a task from a peer, `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished |
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
-`task.md` tasks.
+`task.md` tasks. A `"detached_shell"` task follows the `shell_completed` line that enqueued it and
+has no `a2a_task_received` line, having never crossed the peer door.
 
 **`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
 for every task, on every exit path

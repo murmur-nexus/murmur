@@ -1203,29 +1203,31 @@ See [request-input WIT import](wit-interfaces.md#murmurtasktask) and
 
 ### `lifecycle.shell_grace_secs` { #lifecycle-shell-grace-secs }
 
-How long a shell command runs in the foreground before the runtime demotes it to the background.
-The capsule declares no flag and the model predicts no duration: every command starts in the
-foreground and the clock decides.
+How long a shell command runs in the foreground before the runtime moves it to the background.
+Every command starts in the foreground and the clock decides.
 
 | Value | Behaviour |
 |---|---|
-| `10` (default) | A command exiting within 10 seconds returns its output to the turn. One that does not is demoted. |
+| `10` (default) | A command exiting within 10 seconds returns its output to the turn. One that runs longer moves to the background. |
 | `N` (positive integer) | The same, with an `N`-second window. |
-| `0` | Every command is demoted, at the first check after it is spawned. |
+| `0` | The first check after the spawn moves the command to the background, unless it has already exited by then. |
 
-A demoted command hands the turn a handle of the form `wrk_<id>` and the fact that it is still
-running. Its output never enters the conversation: the full stdout and stderr are written to
-`logs/<work_id>.log` under the [capsule workdir](workdir.md), and the completion names that file.
+A backgrounded command hands the turn a handle of the form `wrk_<id>` and the fact that it is
+still running. Its full stdout and stderr are written to `logs/<work_id>.log` under the
+[capsule workdir](workdir.md), and stay there — the turn is told the path, never the contents.
 
-The handle cannot be polled. No tool, host import or CLI subcommand takes a work id — the result
-arrives on its own, as a task with [origin](../concepts/access-control.md#task-origin-and-trust-class)
-`completion` in the `bg` lane, carrying the exit code and the output path.
+Nothing accepts a work id, so the handle cannot be used to ask after the command. The result
+arrives on its own, as a task with
+[origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg`
+lane, carrying the exit code and the output path. A non-zero exit, a signal kill and a
+[resource limit](resource-limits.md#which-limit) all arrive the same way, told apart by the
+`status` field on the command's
+[`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record.
 
-That completion is only delivered to a capsule that outlives the task which started the command.
-Under the default `after_task: exit` the session ends when the task does, and a command still
-running is recorded as
-`shell_abandoned` and lost. A capsule that means to
-receive completions declares `task_acceptance: queue` and `after_task: sleep`.
+That completion reaches only a capsule that outlives the task which started the command. Under
+the default `after_task: exit` the session ends when the task does, and a command still running
+is recorded as `shell_abandoned` and its result is lost. A capsule that means to receive
+completions declares `task_acceptance: queue` and `after_task: sleep`:
 
 ```yaml
 lifecycle:

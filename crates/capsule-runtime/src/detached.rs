@@ -219,10 +219,9 @@ impl DetachedRegistry {
 
 /// Supplied by a dispatch that is allowed to demote.
 ///
-/// `None` at a call site means the command runs to completion in the foreground, exactly as
-/// every call did before demotion existed. That is what keeps `plan.rs` and the script-capsule
-/// store state foreground-only: neither runs a task loop, so neither has anywhere to deliver a
-/// completion.
+/// `None` at a call site means the command runs to completion in the foreground. That is what
+/// keeps `plan.rs` and the script-capsule store state foreground-only: neither runs a task loop,
+/// so neither has anywhere to deliver a completion.
 pub(crate) struct DetachPolicy {
     pub grace: Duration,
     pub registry: Arc<DetachedRegistry>,
@@ -396,7 +395,7 @@ mod tests {
         );
     }
 
-    /// A command that beats the grace period behaves exactly as it did before demotion existed.
+    /// A command that beats the grace period returns its result to the turn and registers nothing.
     #[test]
     fn a_fast_command_finishes_in_the_foreground() {
         let workdir = tempfile::tempdir().unwrap();
@@ -494,7 +493,7 @@ mod tests {
         );
     }
 
-    /// The rule the slice is built on, checked against the source rather than trusted.
+    /// The no-polling rule, checked against the source rather than trusted.
     ///
     /// A demoted command is learned about through its completion and no other way: no tool name,
     /// host import or manifest-visible entry point takes a work id as an argument, and

@@ -375,10 +375,9 @@ fn events_of_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> {
         .collect()
 }
 
-/// The whole argument of the slice, stated as a measurement: a command that outruns the grace
-/// period hands the turn a handle, the turn keeps going and dispatches a second command while
-/// the first is still running, and none of the first command's 200 000 output bytes reach the
-/// conversation.
+/// Demotion, stated as a measurement: a command that outruns the grace period hands the turn a
+/// handle, the turn keeps going and dispatches a second command while the first is still
+/// running, and none of the first command's 200 000 output bytes reach the conversation.
 #[test]
 fn shell_detaches_a_slow_command_and_the_turn_continues() {
     if common::skip_without_host_support("shell_detaches_a_slow_command_and_the_turn_continues") {
@@ -563,9 +562,6 @@ fn shell_records_work_abandoned_when_the_session_ends() {
         "stderr must name the abandoned work id {work_id}:\n{stderr}"
     );
 
-    for e in &events {
-        eprintln!("DIAG {} {}", e["event_type"], e["timestamp"]);
-    }
     let session_end = events_of_type(&events, "session_end");
     assert_eq!(session_end.len(), 1, "the session still ends normally");
     assert_eq!(

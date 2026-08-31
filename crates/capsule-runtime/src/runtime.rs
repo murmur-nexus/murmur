@@ -1942,12 +1942,15 @@ pub fn launch_session(
 
                     // Work this session started and is not waiting for. Nothing here waits on a
                     // detached command — that is the point of having detached it — but the loss
-                    // of its result is recorded rather than passed over in silence. Pending-work
-                    // markers that would let it survive a restart are a later card.
-                    let abandoned_at_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|since| since.as_millis() as u64)
-                        .unwrap_or_default();
+                    // of its result is recorded rather than passed over in silence: a demoted
+                    // command lives entirely in process memory, so nothing of it survives here.
+                    let abandoned_at_ms = crate::trace::timestamp_ms();
+                    // Outstanding work first, then the channel. `complete` removes a work id
+                    // before it sends, so a command finishing during this teardown is briefly in
+                    // neither place; reading `outstanding` first and draining second means it is
+                    // seen in one or the other rather than falling between them. A command
+                    // caught in both is recorded once.
+                    let mut recorded: Vec<String> = Vec::new();
                     for work in detached.outstanding() {
                         eprintln!(
                             "[capsule-runtime] detached shell command {} ({}) is still running at session end; its result is lost",
@@ -1961,6 +1964,28 @@ pub fn launch_session(
                                 abandoned_at_ms.saturating_sub(work.started_at_ms),
                             )
                             .await;
+                        recorded.push(work.work_id);
+                    }
+                    // A command that finished after the task loop stopped reading. Its result
+                    // exists, but no task will ever carry it, so it is lost on the same terms as
+                    // one still running and is recorded the same way.
+                    while let Ok(completion) = completion_rx.try_recv() {
+                        if recorded.contains(&completion.work_id) {
+                            continue;
+                        }
+                        eprintln!(
+                            "[capsule-runtime] detached shell command {} ({}) finished after the session stopped accepting work; its result is lost",
+                            completion.work_id, completion.binary
+                        );
+                        let _ = trace
+                            .write_shell_abandoned(
+                                &completion.work_id,
+                                &completion.binary,
+                                &completion.command,
+                                completion.duration_ms,
+                            )
+                            .await;
+                        recorded.push(completion.work_id);
                     }
 
                     let _ = trace

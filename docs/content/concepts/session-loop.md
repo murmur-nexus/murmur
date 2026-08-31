@@ -180,28 +180,23 @@ row of `mur trace steps`.
 
 ### Detached shell
 
-A shell command that takes longer than
+A shell command that runs longer than
 [`lifecycle.shell_grace_secs`](../reference/manifest.md#lifecycle-shell-grace-secs) — 10 seconds
-by default — is demoted to the background and the turn carries on without it. There is no flag
-and the model predicts no duration: every command starts in the foreground, and one that finishes
-inside the grace period behaves exactly as it always has.
+by default — moves to the background and the turn carries on. The turn receives a handle of the
+form `wrk_<id>` and the fact that the command is still running; the command's stdout and stderr
+go to a file under the [capsule workdir](../reference/workdir.md) instead of into the
+conversation, so a long command costs the same handful of tokens whatever it prints.
 
-A demoted command hands the turn a handle of the form `wrk_<id>` and the fact that it is still
-running. Its output is not in the turn and never will be: the full stdout and stderr go to
-`logs/<work_id>.log` under the [capsule workdir](../reference/workdir.md).
+Every command starts in the foreground and the clock decides, so the model chooses nothing here
+and a command that finishes inside the grace period returns its output to the turn.
 
-The handle cannot be polled. No tool, host import or CLI subcommand takes a work id. When the
-command finishes, the runtime enqueues a task on the capsule itself with origin `completion`,
-carrying the exit code and the output path, under the same `contextId` the command was started
-from. It waits in the `bg` lane like any other completion, so a person's request or a peer's
-never queues behind it.
+The handle is a label, not an address: nothing accepts a work id, so a capsule cannot spend turns
+asking whether the command is done. When the command finishes, the runtime enqueues a task on the
+capsule itself with origin `completion` under the `contextId` the command was started from, so
+the result rejoins the conversation that asked for it. That task waits in the `bg` lane, behind
+every `user` and `peer` task, and a failure arrives on the same path as a success.
 
-A failure arrives the same way a success does. A non-zero exit, a signal kill and an attributed
-resource limit all produce a completion, told apart by the `status` field on the
-[`shell_completed`](../reference/observability-schemas.md#session-trace-tracejsonl) record.
-
-Only a capsule that outlives the task which started the command receives its completion. Under
-the default `after_task: exit` the session ends with the task, and a command still running is
-recorded as `shell_abandoned` — once in `trace.jsonl` and once on stderr — and its result is
-lost. Nothing survives a restart yet: `queue` + `sleep` is what keeps a capsule around long
-enough to hear back.
+Delivery depends on the capsule still being alive. Under the default `after_task: exit` the
+session ends with the task that started the command, and a command still running is recorded as
+`shell_abandoned` — once in `trace.jsonl` and once on stderr — with its result lost. A capsule
+that means to hear back runs `task_acceptance: queue` with `after_task: sleep`.

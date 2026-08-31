@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -213,9 +213,8 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Run a shell command, demoting it to the background if it outruns `detach`'s grace period.
 ///
 /// With `detach: None` the child is waited for with a plain blocking wait and nothing is polled —
-/// the path every call took before demotion existed, and the path `plan.rs` and the
-/// script-capsule store state still take, because neither runs a task loop and so neither has
-/// anywhere to deliver a completion.
+/// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
+/// and so neither has anywhere to deliver a completion.
 ///
 /// With `detach: Some`, the child is polled until it exits or the deadline passes. On the
 /// deadline the child, its two pipe readers, its own egress-proxy supervisor and the metadata
@@ -367,7 +366,7 @@ pub(crate) fn run_shell(
         );
         full_output_path = Some(write_shell_output_log(
             workdir,
-            &format!("shell-{}", unix_millis()),
+            &format!("shell-{}", crate::trace::timestamp_ms()),
             binary,
             args,
             exit_code,
@@ -509,7 +508,7 @@ fn demote(
             work_id: work_id.clone(),
             binary: context.resolved_binary.clone(),
             command: context.policy.command.clone(),
-            started_at_ms: unix_millis(),
+            started_at_ms: crate::trace::timestamp_ms(),
         });
 
     let provenance = context.policy.completion_provenance();
@@ -586,17 +585,6 @@ fn demote(
     });
 
     info
-}
-
-/// Milliseconds since the Unix epoch, for the two ids built from wall-clock time: a truncation
-/// log's `shell-<ms>` stem and a demoted command's `started_at_ms`.
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 /// Exit code for a finished subprocess, keeping the signal that killed it legible.
