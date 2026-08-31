@@ -868,11 +868,6 @@ fn read_optional_path(path: Option<&str>) -> Option<String> {
     path.and_then(|path| fs::read_to_string(path).ok())
 }
 
-/// One HTTP request, with `extra_headers` appended to the fixed set below.
-///
-/// The error this returns on a non-2xx carries the *response* headers and body. It must never
-/// grow to echo the request: `extra_headers` is where a spawn credential travels, and a step's
-/// error text reaches the model.
 #[cfg(test)]
 mod tests {
     use std::{

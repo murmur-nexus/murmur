@@ -101,8 +101,8 @@ pub const PLAIN_WORKER_BODY: &str =
 pub struct Daemon {
     pub state: Arc<State>,
     pub registry: TempDir,
-    /// A directory the daemon is never told about and must never write to. Asserted empty by
-    /// every case that used to watch a launch create a session directory here.
+    /// A directory the daemon is never told about and must never write to. Cases that grant or
+    /// refuse a spawn assert it stays empty, which is what "the daemon creates nothing" means.
     pub workdir: TempDir,
     next_child: AtomicUsize,
 }

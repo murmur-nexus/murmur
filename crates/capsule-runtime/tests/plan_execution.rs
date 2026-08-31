@@ -798,7 +798,7 @@ struct StubMur {
 }
 
 impl StubMur {
-    /// Installs the stub and points `MURMUR_MUR_BINARY` at it. Every caller already holds
+    /// Installs the stub and points [`MUR_BINARY_ENV`] at it. Every caller already holds
     /// [`roost_env_lock`], which is what keeps the process-wide variable to one test at a time.
     fn install(capsule_authority: &str) -> Self {
         let dir = tempdir().unwrap();
@@ -822,7 +822,7 @@ impl StubMur {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        std::env::set_var("MURMUR_MUR_BINARY", &binary);
+        std::env::set_var(capsule_runtime::MUR_BINARY_ENV, &binary);
         Self { dir }
     }
 
@@ -834,7 +834,7 @@ impl StubMur {
 
 impl Drop for StubMur {
     fn drop(&mut self) {
-        std::env::remove_var("MURMUR_MUR_BINARY");
+        std::env::remove_var(capsule_runtime::MUR_BINARY_ENV);
     }
 }
 

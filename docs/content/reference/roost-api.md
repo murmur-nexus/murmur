@@ -91,9 +91,7 @@ hash. `name`, `version` and `sha256` are that artifact, echoed so the caller lau
 the referee judged. `expires_at_ms` is the approval's absolute expiry in unix milliseconds, 60
 seconds after it was granted.
 
-The response carries no `capsule_url` and no `session_id`, because nothing was started. After it,
-the daemon's job map holds only the calling session's record, no session directory exists anywhere,
-no `trace.jsonl` was written, and no process was created.
+The response carries no `capsule_url` and no `session_id`, because nothing was started.
 
 **Error responses**
 
@@ -300,8 +298,7 @@ than its parent on any axis.
 
 The comparison runs at `POST /spawn`, after the name check, and it runs exactly once per
 delegation: the approval it grants names the resolved artifact by content hash, and that hash
-determines the manifest the comparison read. A refused request leaves no session directory, no
-trace, no job record and no process.
+determines the manifest the comparison read.
 
 | Axis | Manifest key | Rule |
 |---|---|---|

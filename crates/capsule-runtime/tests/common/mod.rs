@@ -15,6 +15,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
+use capsule_runtime::MUR_BINARY_ENV;
 use mur_roost::{authority::SpawnAuthority, JobStatus, State};
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeType};
 use serde_json::{json, Value};
@@ -41,11 +42,11 @@ pub fn component(name: &str) -> PathBuf {
 /// unrunnable, and a *stale* one would make it pass against last week's runtime. The build runs
 /// once per test process and is a no-op when nothing changed.
 ///
-/// `MURMUR_MUR_BINARY` overrides it, for a harness that has already built one.
+/// [`MUR_BINARY_ENV`] overrides it, for a harness that has already built one.
 pub fn mur_binary() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY.get_or_init(|| {
-        if let Some(path) = std::env::var_os("MURMUR_MUR_BINARY") {
+        if let Some(path) = std::env::var_os(MUR_BINARY_ENV) {
             return PathBuf::from(path);
         }
         // .../target/<profile>/deps/<test binary>

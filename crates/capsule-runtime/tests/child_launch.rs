@@ -76,18 +76,17 @@ fn suite() -> &'static Suite {
                  network:\n    allow: [{endpoint}]\n  \
                  env:\n    allow: [{A_ONLY}, {B_ONLY}, GITHUB_TOKEN, MURMUR_TEST_ALLOWED_VAR]\n  \
                  spawn:\n    allow: [child-agent, child-a, child-b, child-escape, child-sealed, \
-                 child-leak, child-repeat]\n",
+                 child-leak, child-reader, child-repeat]\n",
                 endpoint = inference.authority(),
             ),
             Some(&component("capsule-env-echo.wasm")),
         );
 
-        // Script children: they write into their own directory and try to leave it.
-        for name in ["child-a", "child-b", "child-repeat"] {
+        // Script children that write into their own directory and try to leave it.
+        for name in ["child-a", "child-b"] {
             let allow = match name {
                 "child-a" => format!("  env:\n    allow: [{A_ONLY}]\n"),
-                "child-b" => format!("  env:\n    allow: [{B_ONLY}]\n"),
-                _ => String::new(),
+                _ => format!("  env:\n    allow: [{B_ONLY}]\n"),
             };
             common::publish_capsule(
                 &registry_path,
@@ -104,6 +103,18 @@ fn suite() -> &'static Suite {
             "artifacts: []\n",
             Some(&component("capsule-filesystem-escape.wasm")),
         );
+
+        // Script children that read the paths their parent named, and report what each attempt
+        // was served.
+        for name in ["child-reader", "child-repeat"] {
+            common::publish_capsule(
+                &registry_path,
+                name,
+                "0.1.0",
+                "artifacts: []\n",
+                Some(&component("capsule-path-reader.wasm")),
+            );
+        }
         common::publish_capsule(
             &registry_path,
             "child-leak",
@@ -134,7 +145,7 @@ fn suite() -> &'static Suite {
         // The parent's own registration: this is where its credential comes from, exactly as a
         // real parent's runtime would have obtained it at launch.
         let credential = roost.register(PARENT_SESSION, PARENT_CAPSULE, "0.1.0");
-        std::env::set_var("MURMUR_MUR_BINARY", mur_binary());
+        std::env::set_var(capsule_runtime::MUR_BINARY_ENV, mur_binary());
 
         Suite {
             roost,
@@ -178,6 +189,40 @@ impl Parent {
             .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
     }
 
+    /// Launch a `capsule-path-reader` child with `input` placed in its directory as
+    /// `input.txt`, ask it to read `targets`, and return it alongside one outcome per target.
+    ///
+    /// The placing runs beside the launch rather than before it because composing the child's
+    /// directory, creating it and starting the child are one call: the directory does not exist
+    /// until that call is under way. The child waits for `targets.txt`, which goes in last, so
+    /// what it reports is what the parent placed rather than what it raced.
+    fn launch_reading(
+        &self,
+        name: &str,
+        input: &str,
+        targets: &[String],
+    ) -> (LaunchedChild, Vec<String>) {
+        let children = self.dir().join(".murmur").join("children");
+        let before = dirs_under(&children);
+
+        let child = std::thread::scope(|scope| {
+            let launch = scope.spawn(|| self.launch(name, &[]));
+            if let Some(dir) = wait_for_new_dir(&children, &before) {
+                std::fs::write(dir.join("input.txt"), input).unwrap();
+                // Renamed into place, so the child that is polling for the list never reads half
+                // of one.
+                std::fs::write(dir.join("targets.part"), targets.join("\n")).unwrap();
+                std::fs::rename(dir.join("targets.part"), dir.join("targets.txt")).unwrap();
+            }
+            launch.join().unwrap()
+        });
+
+        let report = std::fs::read_to_string(child.workdir.join("out").join("result.txt"))
+            .unwrap_or_else(|error| panic!("'{name}' wrote no result file: {error}"));
+        let outcomes = report.lines().map(str::to_string).collect();
+        (child, outcomes)
+    }
+
     fn try_launch(
         &self,
         name: &str,
@@ -205,6 +250,29 @@ fn wait_for(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("timed out waiting for {what}");
+}
+
+/// The directories directly under `parent`, or none if it does not exist yet.
+fn dirs_under(parent: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|entry| entry.path()).collect()
+}
+
+/// The one directory under `parent` that was not there in `before`.
+fn wait_for_new_dir(parent: &Path, before: &[PathBuf]) -> Option<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if let Some(fresh) = dirs_under(parent)
+            .into_iter()
+            .find(|dir| !before.contains(dir))
+        {
+            return Some(fresh);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
 }
 
 fn trace_of(child: &LaunchedChild) -> PathBuf {
@@ -372,15 +440,37 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
         "parent only"
     );
 
-    // What the parent places in *this* child's directory is inside the child's reach: the child's
-    // own output landed beside it, in the same preopen root.
+    // The child's own directory is the preopen it does reach: its output landed there, written
+    // from inside the guest, while the traversal above was refused.
     assert_eq!(child.workdir.parent(), escaping_dir.parent());
-    std::fs::write(child.workdir.join("input.txt"), "for the child").unwrap();
-    assert!(child
+    assert!(child.workdir.join("out").join("result.txt").is_file());
+
+    // And reads run the same way round. A third child is pointed at three existing files: its own
+    // input, the parent's secret and the sibling's. Only the one in its own directory is served.
+    let sibling_dir = sibling.workdir.file_name().unwrap().to_string_lossy();
+    let (reader, outcomes) = parent.launch_reading(
+        "child-reader",
+        "placed by the parent",
+        &[
+            "./input.txt".to_string(),
+            "../../../parent-secret.txt".to_string(),
+            format!("../{sibling_dir}/sibling-secret.txt"),
+        ],
+    );
+    assert_eq!(
+        outcomes,
+        ["served placed by the parent", "blocked", "blocked"],
+        "reader in {}",
+        reader.workdir.display()
+    );
+    // Both refused paths name files that are really there — resolved from the reader's own
+    // directory they are the parent's secret and the sibling's — so `blocked` is a refusal and
+    // not a miss.
+    assert!(reader.workdir.join("../../../parent-secret.txt").is_file());
+    assert!(reader
         .workdir
-        .join("out")
-        .join("result.txt")
-        .starts_with(&child.workdir));
+        .join(format!("../{sibling_dir}/sibling-secret.txt"))
+        .is_file());
 }
 
 // ── 4. A directory per delegation ─────────────────────────────────────────────
@@ -391,9 +481,35 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
 fn each_delegation_gets_a_directory_of_its_own() {
     let parent = Parent::new();
 
-    let first = parent.launch("child-repeat", &[]);
+    let (first, first_read) =
+        parent.launch_reading("child-repeat", "first only", &["./input.txt".to_string()]);
     std::fs::write(first.workdir.join("placed-by-the-parent.txt"), "kept").unwrap();
-    let second = parent.launch("child-repeat", &[]);
+
+    let first_dir = first
+        .workdir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let (second, second_read) = parent.launch_reading(
+        "child-repeat",
+        "second only",
+        &[
+            "./input.txt".to_string(),
+            format!("../{first_dir}/input.txt"),
+        ],
+    );
+
+    // What the parent put in each directory belongs to that delegation alone: each child was
+    // served its own input, and the second was refused the first's.
+    assert_eq!(first_read, ["served first only"]);
+    assert_eq!(second_read, ["served second only", "blocked"]);
+    // The first child's input is still on disk where the second was pointed at it, so the second
+    // was refused a file rather than sent after one that had gone.
+    assert!(second
+        .workdir
+        .join(format!("../{first_dir}/input.txt"))
+        .is_file());
 
     assert_ne!(first.workdir, second.workdir);
     assert_ne!(first.workdir, parent.dir());

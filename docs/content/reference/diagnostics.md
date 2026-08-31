@@ -244,8 +244,7 @@ error[E-RUN-019]: failed to register this session with mur-roost at http://127.0
 ```
 
 `MURMUR_ROOST_URL` unset or blank reports the same code with `MURMUR_ROOST_URL is not set` as the
-reason. The message names the daemon and the reason and never a token: the credential and the
-approval travel in request headers, and nothing that formats an error reads one.
+reason. The message names the daemon and the reason, never a token.
 
 A capsule that declares no spawn capability never reaches this — it opens no connection to the
 daemon at all, and `mur run` succeeds with nothing listening.

@@ -127,8 +127,8 @@ fn a_replayed_approval_is_refused() {
     assert!(!daemon.session_ids().contains(&second_child));
 }
 
-/// One registration, then the session is visible and delegating. This is what replaces the
-/// daemon's own knowledge of a session it used to stage itself.
+/// One registration, then the session is visible and delegating: registering is the only way the
+/// daemon comes to know a session at all.
 #[test]
 fn a_registered_session_is_running_and_can_delegate() {
     let daemon = Daemon::with_spawn_allow(vec!["parent".to_string()]);

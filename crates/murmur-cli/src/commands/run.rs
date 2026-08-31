@@ -239,9 +239,9 @@ pub(crate) fn run_run(
         })?;
     }
 
-    // In `--capsule` mode the artifact's own bytes are the manifest *and* the component: the same
-    // in-memory path the spawning daemon used to take, so a capsule launched by name is staged
-    // from exactly what the registry holds rather than from a directory somebody laid out.
+    // In `--capsule` mode the artifact's own bytes are the manifest *and* the component, read in
+    // memory: a capsule launched by name is staged from exactly what the registry holds rather
+    // than from a directory somebody laid out.
     let (runtime_manifest, installed_bytes) = match installed_capsule {
         Some((name, version)) => {
             let resolved = resolve_installed_capsule(&project_dir, name, version)
@@ -933,28 +933,27 @@ fn read_spawn_grant() -> Result<capsule_runtime::SpawnApproval, CliError> {
 /// Resolve an installed capsule from the project store, then the global one.
 ///
 /// The same order `check_artifacts_installed` and staging use for every other artifact, so a
-/// capsule published to either store runs by name.
+/// capsule published to either store runs by name. Through [`FallbackRegistry`], so that only a
+/// *missing* artifact falls through to the global store: an artifact the project store holds but
+/// cannot read is that error, not a lookup somewhere else.
 fn resolve_installed_capsule(
     project_dir: &Path,
     name: &str,
     version: &str,
 ) -> Result<ResolvedArtifact, CliError> {
-    let project_store = LocalRegistry::new(project_dir.join(".murmur").join("artifacts"));
-    let platform = Some(current_platform());
-    if let Ok(resolved) = project_store.resolve_with_platform(name, version, platform) {
-        return Ok(resolved);
+    FallbackRegistry {
+        primary: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
+        secondary: LocalRegistry::from_default_home().map_err(CliError::from)?,
     }
-    LocalRegistry::from_default_home()
-        .map_err(CliError::from)?
-        .resolve_with_platform(name, version, platform)
-        .map_err(|source| {
-            CliError::with_hint(
-                E_RUN_008,
-                format!("capsule '{name}@{version}' is not installed: {source}"),
-                "publish or install it first — `mur install <artifact>.mur.zip` — then run \
-                 `mur list` to confirm the coordinate",
-            )
-        })
+    .resolve_with_platform(name, version, Some(current_platform()))
+    .map_err(|source| {
+        CliError::with_hint(
+            E_RUN_008,
+            format!("capsule '{name}@{version}' is not installed: {source}"),
+            "publish or install it first — `mur install <artifact>.mur.zip` — then run \
+             `mur list` to confirm the coordinate",
+        )
+    })
 }
 
 fn discover_capsule_component(project_dir: &Path) -> Result<PathBuf, CliError> {

@@ -1,7 +1,7 @@
 //! What a session tells `mur-roost` about itself at launch, and what it is handed back.
 //!
-//! The daemon no longer launches anything, so it cannot know what a session holds by having
-//! staged it. A session that declares `capabilities.spawn.allow` registers instead: it names
+//! The daemon referees; it stages nothing, so what a session holds is not something it can know
+//! by having launched it. A session that declares `capabilities.spawn.allow` registers: it names
 //! which artifact is running under which session id, and the daemon resolves that artifact from
 //! its *own* registry and lowers the manifest into a [`crate::SpawnEnvelope`] itself. The
 //! registrant never states its grants — a registrant that could would be a registrant that could

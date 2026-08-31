@@ -1,6 +1,6 @@
 //! Which sessions announce themselves to `mur-roost`, and what happens when they cannot.
 //!
-//! Registration is what replaces the daemon's own knowledge of a session it used to stage itself.
+//! Registering is the only way the daemon comes to know a session.
 //! A session that declares `capabilities.spawn.allow` must register, because the daemon has to
 //! hold that session's ceiling before it can referee anything the session asks for — so a
 //! registration it cannot complete refuses the launch. A session that declares no spawn capability
