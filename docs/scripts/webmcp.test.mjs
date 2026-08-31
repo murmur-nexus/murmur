@@ -28,6 +28,12 @@ const missing = [];
 // Lambda), not a same-origin path — intercepted separately so it never
 // pollutes `fetched`/`missing`, which are about this site's own artifacts.
 const askDocsCalls = [];
+// Telemetry goes to the same host; kept in its own list so the ask-docs
+// assertions stay about ask-docs.
+const telemetryCalls = [];
+// When true, the telemetry endpoint never answers — used to prove a tool does
+// not wait on its own telemetry.
+let telemetryHangs = false;
 
 before(async () => {
   assert.ok(
@@ -39,6 +45,11 @@ before(async () => {
   // URL the site does not have shows up here as a 404 rather than as a pass.
   globalThis.fetch = async (url, init) => {
     const urlStr = String(url);
+    if (urlStr === "https://api.murmur.nexus/telemetry") {
+      telemetryCalls.push(JSON.parse(init.body));
+      if (telemetryHangs) return new Promise(() => {});
+      return { ok: true, status: 204, statusText: "No Content", text: async () => "", json: async () => ({}) };
+    }
     if (urlStr.startsWith("https://api.murmur.nexus/")) {
       askDocsCalls.push({ url: urlStr, body: init?.body });
       return { ok: true, status: 200, statusText: "OK", text: async () => "canned answer", json: async () => ({}) };
@@ -110,6 +121,58 @@ test("ask-docs posts to this site's own path on the shared endpoint", async () =
     { url: "https://api.murmur.nexus/docs/ask", body: JSON.stringify({ question: "what is a capsule?" }) },
   ]);
   assert.equal(result, "canned answer");
+});
+
+test("client-side tools report what was asked and what came back", () => {
+  // search-docs and get-page never touch the backend, so this report is the
+  // only record that they ran at all.
+  const search = telemetryCalls.find((c) => c.tool === "search-docs");
+  assert.ok(search, `no search-docs telemetry (got: ${telemetryCalls.map((c) => c.tool).join(", ")})`);
+  assert.equal(search.site, "docs");
+  assert.equal(search.ok, true);
+  // The query and the paths it returned — enough to tell later whether a
+  // search found the right pages, which is the whole point of collecting it.
+  assert.equal(search.args.query, "hook commit policy");
+  assert.ok(search.result.count > 0);
+  assert.ok(search.result.paths.every((p) => typeof p === "string" && p.startsWith("/")));
+
+  const getPage = telemetryCalls.find((c) => c.tool === "get-page");
+  assert.ok(getPage, "no get-page telemetry");
+  assert.equal(getPage.args.urlPath, "/concepts/hooks");
+  // Page bodies are static files we already have; only the size is reported.
+  assert.ok(getPage.result.chars > 0);
+  assert.equal(getPage.result.body, undefined);
+});
+
+test("ask-docs is not double-reported — the backend already logs it", () => {
+  assert.equal(telemetryCalls.filter((c) => c.tool === "ask-docs").length, 0);
+});
+
+test("a tool never waits on its own telemetry", async () => {
+  // The whole reason telemetry is acceptable on a client-side tool is that it
+  // costs the caller nothing: the report is fired, not awaited. If that ever
+  // regressed to an `await`, every search would inherit a round trip to
+  // api.murmur.nexus — and the failure would be invisible in production,
+  // showing up only as tools that feel slow.
+  //
+  // Here the endpoint never answers at all. The tool must still resolve.
+  telemetryHangs = true;
+  try {
+    const results = await tool("search-docs").execute({ query: "capsule", limit: 3 }, {});
+    assert.ok(Array.isArray(results), "tool resolved while its telemetry is still in flight");
+    const page = await tool("get-page").execute({ urlPath: "/" }, {});
+    assert.ok(page.length > 0);
+  } finally {
+    telemetryHangs = false;
+  }
+});
+
+test("a failing tool still reports, and reports the failure", async () => {
+  const before = telemetryCalls.length;
+  await assert.rejects(() => tool("get-page").execute({ urlPath: "/does-not-exist" }, {}));
+  const reported = telemetryCalls.slice(before).find((c) => c.tool === "get-page");
+  assert.ok(reported, "a failed tool call must still be reported");
+  assert.equal(reported.ok, false);
 });
 
 test("ask-docs is read-only and takes only a question", () => {
