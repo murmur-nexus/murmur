@@ -214,6 +214,36 @@ struct ShellEvent {
     binary: Option<String>,
 }
 
+/// A shell command that outran `lifecycle.shell_grace_secs` and moved to the background.
+#[derive(Debug, Deserialize)]
+struct ShellDetachedEvent {
+    work_id: String,
+    #[serde(default)]
+    binary: Option<String>,
+    grace_ms: u64,
+}
+
+/// That command finishing, carrying the same `work_id` and the id of the task it was enqueued as.
+#[derive(Debug, Deserialize)]
+struct ShellCompletedEvent {
+    work_id: String,
+    #[serde(default)]
+    binary: Option<String>,
+    exit_code: i32,
+    duration_ms: u64,
+    output_path: String,
+    status: String,
+}
+
+/// That command still running when the session ended, so its result was lost.
+#[derive(Debug, Deserialize)]
+struct ShellAbandonedEvent {
+    work_id: String,
+    #[serde(default)]
+    binary: Option<String>,
+    running_ms: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct CompactionEvent {
     turn: u32,
@@ -356,6 +386,9 @@ enum TraceEvent {
     ToolCall(ToolCallEvent),
     SkillCall(SkillCallEvent),
     Shell(ShellEvent),
+    ShellDetached(ShellDetachedEvent),
+    ShellCompleted(ShellCompletedEvent),
+    ShellAbandoned(ShellAbandonedEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
     ContextSeed(ContextSeedEvent),
@@ -903,6 +936,15 @@ fn compute_metrics(
                 shell_latencies.push(e.duration_ms);
                 *shell_exit_codes.entry(e.exit_code).or_insert(0) += 1;
             }
+            // A demoted command's exit code and duration exist only on its completion, so that
+            // is where its latency and exit code are counted — once, as a foreground command is
+            // counted once from its own `shell` record. A command abandoned at session end
+            // contributes neither, because it never produced either.
+            TraceEvent::ShellCompleted(e) => {
+                shell_latencies.push(e.duration_ms);
+                *shell_exit_codes.entry(e.exit_code).or_insert(0) += 1;
+            }
+            TraceEvent::ShellDetached(_) | TraceEvent::ShellAbandoned(_) => {}
             TraceEvent::Compaction(e) => {
                 compaction = Some(CompactionRecord {
                     turn: e.turn,
@@ -2022,6 +2064,30 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.exit_code,
             fmt_dur(e.duration_ms)
         ),
+        TraceEvent::ShellDetached(e) => format!(
+            "{}{}  {}  detached after {}",
+            kind("shell_detached"),
+            e.binary.as_deref().unwrap_or("—"),
+            fmt_id_short(&e.work_id, 12),
+            fmt_dur(e.grace_ms)
+        ),
+        TraceEvent::ShellCompleted(e) => format!(
+            "{}{}  {}  exit {} {}  {}  {}",
+            kind("shell_completed"),
+            e.binary.as_deref().unwrap_or("—"),
+            fmt_id_short(&e.work_id, 12),
+            e.exit_code,
+            if e.status == "ok" { "✓" } else { "✗" },
+            fmt_dur(e.duration_ms),
+            e.output_path
+        ),
+        TraceEvent::ShellAbandoned(e) => format!(
+            "{}{}  {}  still running after {}  result lost",
+            kind("shell_abandoned"),
+            e.binary.as_deref().unwrap_or("—"),
+            fmt_id_short(&e.work_id, 12),
+            fmt_dur(e.running_ms)
+        ),
         TraceEvent::SkillCall(e) => format!(
             "{}{}  {}  {}",
             kind("skill_call"),
@@ -3031,5 +3097,54 @@ mod tests {
             Some("ctx_3c4d5e6f7a8b".to_string()),
             "an older trace must still resolve its context id for `mur run --resume`"
         );
+    }
+
+    /// One row for any record `steps_row` renders, so the detached-shell rows below are pinned
+    /// exactly as the task rows above are.
+    fn row(line: &str) -> String {
+        let record = TraceRecord {
+            identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+            event: serde_json::from_str::<TraceEvent>(line).expect("the record should parse"),
+        };
+        steps_row(&record, false).expect("the record renders a row")
+    }
+
+    #[test]
+    fn shell_detached_row_names_the_work_id_and_the_grace_it_outran() {
+        let line = r#"{"event_type":"shell_detached","event_id":"evt_1","session_id":"s","timestamp":1,"turn":2,"task_id":"tsk_1","work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","grace_ms":10000}"#;
+        assert_eq!(
+            row(line),
+            "shell_detached /usr/bin/bash  wrk_0a1b2c3d…  detached after 10.0s"
+        );
+    }
+
+    #[test]
+    fn shell_completed_row_names_the_work_id_the_exit_code_and_the_output_path() {
+        let line = r#"{"event_type":"shell_completed","event_id":"evt_2","session_id":"s","timestamp":2,"work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","exit_code":0,"duration_ms":42000,"output_path":"logs/wrk_0a1b2c3d4e5f6a7b.log","output_bytes":900,"status":"ok","completion_task_id":"tsk_2"}"#;
+        assert_eq!(
+            row(line),
+            "shell_completed /usr/bin/bash  wrk_0a1b2c3d…  exit 0 ✓  42.0s  logs/wrk_0a1b2c3d4e5f6a7b.log"
+        );
+    }
+
+    #[test]
+    fn shell_abandoned_row_says_the_result_is_lost() {
+        let line = r#"{"event_type":"shell_abandoned","event_id":"evt_3","session_id":"s","timestamp":3,"work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","running_ms":30000}"#;
+        assert_eq!(
+            row(line),
+            "shell_abandoned /usr/bin/bash  wrk_0a1b2c3d…  still running after 30.0s  result lost"
+        );
+    }
+
+    /// A trace holding none of the three new records renders exactly as it did before they
+    /// existed: the reader skips what it does not know rather than failing the parse.
+    #[test]
+    fn an_unknown_event_type_still_renders_nothing() {
+        let line = r#"{"event_type":"not_an_event_this_reader_knows","event_id":"evt_4","session_id":"s","timestamp":4}"#;
+        let record = TraceRecord {
+            identity: serde_json::from_str::<EventIdentity>(line).unwrap_or_default(),
+            event: serde_json::from_str::<TraceEvent>(line).expect("an unknown type still parses"),
+        };
+        assert!(steps_row(&record, false).is_none());
     }
 }

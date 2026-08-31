@@ -1,12 +1,16 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use crate::{artifact_config::ARTIFACT_CONFIG_ENV, types::CapabilityPolicy};
+use crate::{
+    artifact_config::ARTIFACT_CONFIG_ENV,
+    detached::{DetachPolicy, DetachedDispatchInfo},
+    types::CapabilityPolicy,
+};
 
 const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 
@@ -191,14 +195,43 @@ pub(crate) fn shell_tool_manifest_yaml(binary: &str) -> String {
     )
 }
 
-pub(crate) fn execute_shell(
+/// Whether a shell command finished inside its grace period or was demoted to the background.
+#[derive(Debug)]
+pub(crate) enum ShellOutcome {
+    Finished(ShellResult),
+    Detached(DetachedDispatchInfo),
+}
+
+/// How often the grace-period wait checks on a child it cannot block for.
+///
+/// `wait_with_output` has no pollable form, so a command that may be demoted is waited for by
+/// polling. Short enough that a command finishing just inside the grace period is not held past
+/// it by a noticeable margin, long enough that a one-minute grace costs a few thousand
+/// non-blocking syscalls rather than a busy loop.
+const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Run a shell command, demoting it to the background if it outruns `detach`'s grace period.
+///
+/// With `detach: None` the child is waited for with a plain blocking wait and nothing is polled —
+/// the path `plan.rs` and the script-capsule store state take, because neither runs a task loop
+/// and so neither has anywhere to deliver a completion.
+///
+/// With `detach: Some`, the child is polled until it exits or the deadline passes. On the
+/// deadline the child, its two pipe readers, its own egress-proxy supervisor and the metadata
+/// needed to describe it all move to one plain OS thread — not a `spawn_blocking` task — so
+/// runtime teardown never waits on it and a session can exit while it runs.
+///
+/// Everything before the spawn is identical on both paths, including the whole spawn-failure
+/// arm: a spawn failure happens inside the grace window and stays a foreground error.
+pub(crate) fn run_shell(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
     workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
-) -> Result<ShellResult, ShellExecError> {
+    detach: Option<DetachPolicy>,
+) -> Result<ShellOutcome, ShellExecError> {
     if !policy.shell_allow.iter().any(|allowed| allowed == binary) {
         return Err(ShellExecError::Failed(format!(
             "binary '{binary}' is not in capabilities.shell.allow"
@@ -238,7 +271,7 @@ pub(crate) fn execute_shell(
         .as_ref()
         .map(|scope| scope.event_counters());
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             // A failure inside the `pre_exec` enforcement setup reaches us here only as a bare
@@ -264,42 +297,85 @@ pub(crate) fn execute_shell(
             });
         }
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|error| error.to_string())?;
+
+    // `wait_with_output` reads both pipes and waits in one uninterruptible step, so it cannot be
+    // given a deadline. Draining each pipe on its own thread separates reading from waiting,
+    // which is what lets the wait below be either blocking or polled.
+    let readers = OutputReaders::spawn(&mut child);
+
+    let status = match &detach {
+        None => child.wait().map_err(|error| error.to_string())?,
+        Some(policy) => {
+            let deadline = started + policy.grace;
+            loop {
+                match child.try_wait().map_err(|error| error.to_string())? {
+                    Some(status) => break status,
+                    None => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            // A zero grace demotes here, at the first poll after the spawn.
+                            return Ok(ShellOutcome::Detached(demote(
+                                child,
+                                readers,
+                                supervisor,
+                                DemotionContext {
+                                    policy: detach.expect("the detach policy was matched above"),
+                                    workdir: workdir.to_path_buf(),
+                                    invoked_binary: binary.to_string(),
+                                    resolved_binary,
+                                    args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                                    started,
+                                    cgroup_scope: enforcement.cgroup_scope.clone(),
+                                    cgroup_counters_before,
+                                },
+                            )));
+                        }
+                        std::thread::sleep(remaining.min(DETACH_POLL_INTERVAL));
+                    }
+                }
+            }
+        }
+    };
+    let (stdout_bytes, stderr_bytes) = readers.join();
     supervisor.join_best_effort();
     let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     let resource_limit_hit = classify_resource_limit(
-        &output.status,
+        &status,
         enforcement.cgroup_scope.as_deref(),
         cgroup_counters_before,
     );
-    let exit_code = exit_code_of(&output.status);
+    let exit_code = exit_code_of(&status);
 
-    let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
     let mut truncated = false;
     let mut full_output_path = None;
 
-    if output.stdout.len() > MAX_SHELL_OUTPUT_BYTES || output.stderr.len() > MAX_SHELL_OUTPUT_BYTES
-    {
+    if stdout_bytes.len() > MAX_SHELL_OUTPUT_BYTES || stderr_bytes.len() > MAX_SHELL_OUTPUT_BYTES {
         truncated = true;
-        let stdout_cut = output.stdout.len().min(MAX_SHELL_OUTPUT_BYTES);
-        let stderr_cut = output.stderr.len().min(MAX_SHELL_OUTPUT_BYTES);
-        stdout = String::from_utf8_lossy(&output.stdout[..stdout_cut]).to_string();
-        stderr = String::from_utf8_lossy(&output.stderr[..stderr_cut]).to_string();
-        full_output_path = Some(write_full_shell_output_log(
+        let stdout_cut = stdout_bytes.len().min(MAX_SHELL_OUTPUT_BYTES);
+        let stderr_cut = stderr_bytes.len().min(MAX_SHELL_OUTPUT_BYTES);
+        let full_stdout = std::mem::replace(
+            &mut stdout,
+            String::from_utf8_lossy(&stdout_bytes[..stdout_cut]).to_string(),
+        );
+        let full_stderr = std::mem::replace(
+            &mut stderr,
+            String::from_utf8_lossy(&stderr_bytes[..stderr_cut]).to_string(),
+        );
+        full_output_path = Some(write_shell_output_log(
             workdir,
+            &format!("shell-{}", crate::trace::timestamp_ms()),
             binary,
             args,
             exit_code,
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
+            &full_stdout,
+            &full_stderr,
         )?);
     }
 
-    Ok(ShellResult {
+    Ok(ShellOutcome::Finished(ShellResult {
         binary: resolved_binary,
         exit_code,
         stdout,
@@ -308,7 +384,207 @@ pub(crate) fn execute_shell(
         truncated,
         full_output_path,
         resource_limit_hit,
-    })
+    }))
+}
+
+/// [`run_shell`] with no demotion: the command runs to completion in the foreground.
+///
+/// Kept at its original signature and return type because most callers cannot take a completion
+/// and every one of them should keep reading exactly as it did.
+pub(crate) fn execute_shell(
+    binary: &str,
+    args: &[&str],
+    env_overrides: &[(String, String)],
+    workdir: &Path,
+    policy: &CapabilityPolicy,
+    enforcement: &crate::sandbox::ShellEnforcement,
+) -> Result<ShellResult, ShellExecError> {
+    match run_shell(
+        binary,
+        args,
+        env_overrides,
+        workdir,
+        policy,
+        enforcement,
+        None,
+    )? {
+        ShellOutcome::Finished(result) => Ok(result),
+        // Unreachable: demotion is reached only from the `Some(policy)` wait arm above. Reported
+        // rather than panicked, so a future edit that broke that invariant would fail one tool
+        // call instead of taking the session down.
+        ShellOutcome::Detached(info) => Err(ShellExecError::Failed(format!(
+            "shell command was demoted to the background as {} on a call site that cannot receive a completion",
+            info.work_id
+        ))),
+    }
+}
+
+/// The two pipe-draining threads for one child.
+///
+/// Both must be running before the child is waited for: a child writing more than a pipe buffer
+/// holds while nobody reads deadlocks, which is the reason `wait_with_output` reads and waits
+/// together in the first place.
+struct OutputReaders {
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+}
+
+impl OutputReaders {
+    fn spawn(child: &mut std::process::Child) -> Self {
+        fn drain(
+            pipe: Option<impl std::io::Read + Send + 'static>,
+        ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+            let mut pipe = pipe?;
+            Some(std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                // A read error loses whatever was not yet read and keeps what was; there is no
+                // better outcome available, and failing the whole call over it would throw away
+                // the command's exit status too.
+                let _ = pipe.read_to_end(&mut buffer);
+                buffer
+            }))
+        }
+
+        Self {
+            stdout: drain(child.stdout.take()),
+            stderr: drain(child.stderr.take()),
+        }
+    }
+
+    /// `(stdout, stderr)`, waiting for both pipes to reach EOF. A reader thread that panicked
+    /// yields empty bytes rather than propagating.
+    fn join(self) -> (Vec<u8>, Vec<u8>) {
+        let take = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            handle
+                .map(|handle| handle.join().unwrap_or_default())
+                .unwrap_or_default()
+        };
+        (take(self.stdout), take(self.stderr))
+    }
+}
+
+/// Everything the background thread needs to describe the command it is finishing.
+struct DemotionContext {
+    policy: DetachPolicy,
+    workdir: PathBuf,
+    /// The name as invoked, which is what the log header records.
+    invoked_binary: String,
+    /// The same name resolved to a path where the host `PATH` named one — what the trace and the
+    /// completion report, matching [`ShellResult::binary`].
+    resolved_binary: String,
+    args: Vec<String>,
+    started: Instant,
+    cgroup_scope: Option<std::sync::Arc<crate::cgroup::CgroupScope>>,
+    cgroup_counters_before: Option<crate::cgroup::CgroupEventCounters>,
+}
+
+/// Hand a still-running command to a thread of its own and return the handle for it.
+///
+/// The work is registered before this returns, so the session-end sweep can never miss work that
+/// finished being registered after it looked.
+fn demote(
+    mut child: std::process::Child,
+    readers: OutputReaders,
+    supervisor: crate::sandbox::SupervisorHandle,
+    context: DemotionContext,
+) -> DetachedDispatchInfo {
+    let work_id = crate::detached::new_work_id();
+    let info = DetachedDispatchInfo {
+        work_id: work_id.clone(),
+        binary: context.resolved_binary.clone(),
+        command: context.policy.command.clone(),
+        grace_ms: context
+            .policy
+            .grace
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    };
+
+    context
+        .policy
+        .registry
+        .register(crate::detached::DetachedWork {
+            work_id: work_id.clone(),
+            binary: context.resolved_binary.clone(),
+            command: context.policy.command.clone(),
+            started_at_ms: crate::trace::timestamp_ms(),
+        });
+
+    let provenance = context.policy.completion_provenance();
+    let DemotionContext {
+        policy,
+        workdir,
+        invoked_binary,
+        resolved_binary,
+        args,
+        started,
+        cgroup_scope,
+        cgroup_counters_before,
+    } = context;
+
+    std::thread::spawn(move || {
+        let waited = child.wait();
+        let (stdout_bytes, stderr_bytes) = readers.join();
+        // This command's own egress proxy, torn down with the command it served. Each
+        // `prepare_enforcement` call starts its own, so a foreground command finishing in the
+        // meantime cannot have taken this one down.
+        supervisor.join_best_effort();
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+
+        let (exit_code, resource_limit, mut error) = match waited {
+            Ok(status) => (
+                exit_code_of(&status),
+                classify_resource_limit(&status, cgroup_scope.as_deref(), cgroup_counters_before),
+                None,
+            ),
+            Err(failure) => (
+                -1,
+                None,
+                Some(format!("waiting for the command failed: {failure}")),
+            ),
+        };
+
+        let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output_path = crate::detached::output_path_for(&work_id);
+        if let Err(failure) = write_shell_output_log(
+            &workdir,
+            &work_id,
+            &invoked_binary,
+            &arg_refs,
+            exit_code,
+            &stdout,
+            &stderr,
+        ) {
+            error = Some(match error {
+                Some(existing) => format!("{existing}; {failure}"),
+                None => failure,
+            });
+        }
+        let output_bytes = std::fs::metadata(workdir.join(&output_path))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        policy
+            .registry
+            .complete(crate::detached::DetachedCompletion {
+                work_id,
+                binary: resolved_binary,
+                command: policy.command.clone(),
+                exit_code,
+                duration_ms,
+                output_path,
+                output_bytes,
+                resource_limit,
+                context_id: policy.context_id.clone(),
+                provenance,
+                error,
+            });
+    });
+
+    info
 }
 
 /// Exit code for a finished subprocess, keeping the signal that killed it legible.
@@ -475,8 +751,15 @@ fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
     pattern == key
 }
 
-fn write_full_shell_output_log(
+/// Write one command's full stdout and stderr to `logs/<file_stem>.log`, returning the
+/// workdir-relative path.
+///
+/// Two callers, one content format: a foreground command whose output exceeded
+/// [`MAX_SHELL_OUTPUT_BYTES`] passes a `shell-<ms>` stem, and a demoted command passes its work
+/// id. A reader that finds either file reads the same header, `Stdout:` and `Stderr:` sections.
+fn write_shell_output_log(
     workdir: &Path,
+    file_stem: &str,
     binary: &str,
     args: &[&str],
     exit_code: i32,
@@ -487,11 +770,7 @@ fn write_full_shell_output_log(
     fs::create_dir_all(&logs_dir)
         .map_err(|error| format!("failed to create shell logs directory: {error}"))?;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    let filename = format!("shell-{timestamp}.log");
+    let filename = format!("{file_stem}.log");
     let relative_path = format!("logs/{filename}");
     let path = logs_dir.join(&filename);
 

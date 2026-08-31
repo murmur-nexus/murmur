@@ -54,6 +54,12 @@ pub struct LifecycleConfig {
     /// never grants turns past `inference.max_turns` — the two budgets share one
     /// cumulative turn count.
     pub max_task_reopens: u32,
+    /// How long a shell command runs in the foreground before it is demoted to the background.
+    /// Defaults to 10 seconds. A command that exits inside this window returns its output to the
+    /// turn as it always has; one that outruns it hands the turn a handle, keeps running, and
+    /// reports back later as a `completion`-origin task. `0` demotes at the first poll after the
+    /// spawn, so effectively every command detaches.
+    pub shell_grace_secs: u64,
 }
 
 impl Default for LifecycleConfig {
@@ -65,6 +71,7 @@ impl Default for LifecycleConfig {
             input_timeout_secs: None,
             conversation_mode: ConversationMode::Stateless,
             max_task_reopens: 1,
+            shell_grace_secs: 10,
         }
     }
 }
@@ -1420,6 +1427,8 @@ struct RawLifecycleConfig {
     conversation: Option<ConversationMode>,
     #[serde(default)]
     max_task_reopens: Option<u32>,
+    #[serde(default)]
+    shell_grace_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2078,6 +2087,7 @@ impl RuntimeManifest {
                 input_timeout_secs: raw_lc.input_timeout_secs,
                 conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
                 max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
+                shell_grace_secs: raw_lc.shell_grace_secs.unwrap_or(defaults.shell_grace_secs),
             }
         });
 
@@ -6650,6 +6660,66 @@ context:
     }
 
     /// A `lifecycle:` block that says nothing about the budget still permits one reopen.
+    #[test]
+    fn lifecycle_shell_grace_secs_lowers_the_declared_value() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  shell_grace_secs: 45\n",
+        )
+        .unwrap();
+        let lifecycle = manifest.lifecycle.unwrap();
+        assert_eq!(lifecycle.shell_grace_secs, 45);
+        // Every other lifecycle field is untouched by declaring this one.
+        assert_eq!(
+            lifecycle.task_acceptance,
+            LifecycleConfig::default().task_acceptance
+        );
+        assert_eq!(lifecycle.after_task, LifecycleConfig::default().after_task);
+        assert_eq!(
+            lifecycle.queue_depth,
+            LifecycleConfig::default().queue_depth
+        );
+        assert_eq!(lifecycle.input_timeout_secs, None);
+        assert_eq!(
+            lifecycle.conversation_mode,
+            LifecycleConfig::default().conversation_mode
+        );
+        assert_eq!(
+            lifecycle.max_task_reopens,
+            LifecycleConfig::default().max_task_reopens
+        );
+    }
+
+    #[test]
+    fn lifecycle_shell_grace_secs_defaults_to_10() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
+        )
+        .unwrap();
+        let lifecycle = manifest.lifecycle.unwrap();
+        assert_eq!(lifecycle.shell_grace_secs, 10);
+        assert_eq!(lifecycle.queue_depth, 3);
+
+        let without_block =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(without_block.effective_lifecycle().shell_grace_secs, 10);
+    }
+
+    /// `0` is a valid explicit value, not an absent one: it demotes at the first poll after the
+    /// spawn, so effectively every command detaches.
+    #[test]
+    fn lifecycle_shell_grace_secs_zero_is_accepted() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  shell_grace_secs: 0\n",
+        )
+        .unwrap();
+        let lifecycle = manifest.lifecycle.unwrap();
+        assert_eq!(lifecycle.shell_grace_secs, 0);
+        assert_eq!(
+            lifecycle.max_task_reopens,
+            LifecycleConfig::default().max_task_reopens
+        );
+    }
+
     #[test]
     fn lifecycle_max_task_reopens_defaults_to_1() {
         let manifest = RuntimeManifest::from_yaml_str(

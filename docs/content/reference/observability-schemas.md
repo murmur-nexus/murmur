@@ -32,8 +32,9 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_start` | The session node. Its `event_id` is the task node |
 | `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
-| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
+| `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
@@ -176,6 +177,51 @@ Skill calls are counted separately from tool calls: they never raise `total_tool
 | `duration_ms` | u64 | |
 | `resource_limit` | string | The `capabilities.resources` field this subprocess hit — `cpu_seconds`, `max_file_size_bytes`, `cgroup_memory_bytes` or `cgroup_pids_max`. Written only when the kernel's own evidence names exactly one limit, and omitted from the line otherwise — see [Which limit a subprocess hit](resource-limits.md#which-limit) |
 
+**`shell_detached`** — written when a command outruns
+[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) and moves to the
+background, in place of that command's `shell` line
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `task_id` | string \| null | The task this command belongs to. `null` when no task is in scope |
+| `work_id` | string | `wrk_` followed by a UUID v7 in undashed lowercase hex. The same id appears on this command's `shell_completed` or `shell_abandoned` line |
+| `binary` | string | As on `shell` |
+| `command` | string | As on `shell` |
+| `grace_ms` | u64 | The grace period this command outran, in milliseconds |
+
+A demoted command raises `total_shell_calls` and its task's `shell_calls` here, and its
+`shell_completed` line does not, so each shell command is counted exactly once whichever way it
+ran.
+
+**`shell_completed`** — written when a demoted command finishes and the runtime enqueues its
+result as a task
+
+| Field | Type | Notes |
+|---|---|---|
+| `work_id` | string | The `shell_detached` line's `work_id` |
+| `binary` | string | As on `shell` |
+| `command` | string | As on `shell` |
+| `exit_code` | i32 | `128 + signal` for a signal kill |
+| `duration_ms` | u64 | From spawn to exit, foreground portion included |
+| `output_path` | string | Where the command's full stdout and stderr were written, relative to the [capsule workdir](workdir.md): always `logs/<work_id>.log` |
+| `output_bytes` | u64 | Size of that file. `0` when it could not be written |
+| `resource_limit` | string | As on `shell`, and omitted on the same terms |
+| `status` | string | `"ok"` \| `"error"`. `"error"` for a non-zero exit, a signal kill, an attributed `resource_limit`, or a wait that itself failed |
+| `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it |
+
+**`shell_abandoned`** — written once per demoted command still running when the session ends
+
+| Field | Type | Notes |
+|---|---|---|
+| `work_id` | string | The `shell_detached` line's `work_id` |
+| `binary` | string | As on `shell` |
+| `command` | string | As on `shell` |
+| `running_ms` | u64 | How long the command had been running when the session gave up on it |
+
+The command's result is lost. The session does not wait for it, and the same line is announced on
+the process's stderr.
+
 **`compaction`** — written when context compaction fires
 
 | Field | Type | Notes |
@@ -246,7 +292,7 @@ loop has exited, on every exit path
 | `total_input_tokens` | u64 | |
 | `total_output_tokens` | u64 | |
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
-| `total_shell_calls` | u32 | Equals the count of `shell` lines |
+| `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
 | `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` — the last task's own terminal outcome |
 
@@ -276,14 +322,15 @@ loop has exited, on every exit path
 |---|---|---|
 | `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
 | `context_id` | string | Context UUID for this task |
-| `source` | string | `"a2a"` for A2A tasks; `"task_md"` for the task.md path — which door the task came through |
+| `source` | string | Which door the task came through: `"a2a"` for a task from a peer, `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished |
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
-`task.md` tasks.
+`task.md` tasks. A `"detached_shell"` task follows the `shell_completed` line that enqueued it and
+has no `a2a_task_received` line, having never crossed the peer door.
 
 **`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
 for every task, on every exit path

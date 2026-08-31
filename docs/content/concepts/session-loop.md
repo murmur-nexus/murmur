@@ -177,3 +177,26 @@ Only `peer` and `completion` are accepted from an inbound request's `x-murmur-ta
 so an HTTP caller cannot put itself in the `user` lane — a request claiming `user` is read as
 `event` and waits in `bg`. The lane each task ran in is on its `task_start` record and on the task
 row of `mur trace steps`.
+
+### Detached shell
+
+A shell command that runs longer than
+[`lifecycle.shell_grace_secs`](../reference/manifest.md#lifecycle-shell-grace-secs) — 10 seconds
+by default — moves to the background and the turn carries on. The turn receives a handle of the
+form `wrk_<id>` and the fact that the command is still running; the command's stdout and stderr
+go to a file under the [capsule workdir](../reference/workdir.md) instead of into the
+conversation, so a long command costs the same handful of tokens whatever it prints.
+
+Every command starts in the foreground and the clock decides, so the model chooses nothing here
+and a command that finishes inside the grace period returns its output to the turn.
+
+The handle is a label, not an address: nothing accepts a work id, so a capsule cannot spend turns
+asking whether the command is done. When the command finishes, the runtime enqueues a task on the
+capsule itself with origin `completion` under the `contextId` the command was started from, so
+the result rejoins the conversation that asked for it. That task waits in the `bg` lane, behind
+every `user` and `peer` task, and a failure arrives on the same path as a success.
+
+Delivery depends on the capsule still being alive. Under the default `after_task: exit` the
+session ends with the task that started the command, and a command still running is recorded as
+`shell_abandoned` — once in `trace.jsonl` and once on stderr — with its result lost. A capsule
+that means to hear back runs `task_acceptance: queue` with `after_task: sleep`.

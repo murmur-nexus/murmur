@@ -12,6 +12,7 @@ pub(crate) mod cgroup;
 pub mod containment;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
+pub mod detached;
 pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;

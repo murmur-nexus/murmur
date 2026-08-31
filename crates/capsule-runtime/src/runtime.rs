@@ -43,6 +43,7 @@ use crate::{
     },
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
+    detached::{demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, SessionContextData,
@@ -63,8 +64,8 @@ use crate::{
     outgoing, resources, sandbox,
     sealed::UsernsGrant,
     shell::{
-        build_shell_env, build_wasi_env_allowlist, execute_shell, is_shell_interpreter,
-        shell_tool_manifest_yaml, split_shell_words, ShellResult,
+        build_shell_env, build_wasi_env_allowlist, is_shell_interpreter, run_shell,
+        shell_tool_manifest_yaml, split_shell_words, ShellOutcome, ShellResult,
     },
     state_store::STATE_PREOPEN_NAME,
     streaming::{
@@ -1164,6 +1165,10 @@ pub fn launch_session(
         )));
         let (task_tx, mut task_rx) = tokio::sync::mpsc::channel::<IncomingTask>(queue_capacity);
 
+        // Demoted shell commands and the channel their completions come back on. Unbounded, so
+        // the OS thread running a detached command never blocks handing its result over.
+        let (detached, mut completion_rx) = DetachedRegistry::new();
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // SSE broadcast channel and replay buffer for SSE clients
@@ -1416,6 +1421,9 @@ pub fn launch_session(
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
+                        current_context_id: None,
+                        detached: Some(Arc::clone(&detached)),
+                        shell_grace_secs: effective_lifecycle.shell_grace_secs,
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
                         a2a_sse: Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
                         a2a_task_id: None,
@@ -1540,6 +1548,7 @@ pub fn launch_session(
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
                                     state.current_task_provenance = Some(provenance);
+                                    state.current_context_id = Some(context_id.clone());
                                     // run_task_with_reopens fires on-task-end, honors any
                                     // reopen-task within budget, and writes the terminal
                                     // task_end (with reopen_count) itself.
@@ -1608,6 +1617,7 @@ pub fn launch_session(
                                     otel.begin_session(None);
                                     state.current_traceparent = otel.outgoing_traceparent();
                                     state.current_task_provenance = Some(provenance);
+                                    state.current_context_id = Some(context_id.clone());
                                     let result = run_task_with_reopens(
                                         &mut state,
                                         &workdir,
@@ -1648,6 +1658,19 @@ pub fn launch_session(
                                     && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
 
                                 loop {
+                                    // Detached shell commands that finished are turned into
+                                    // tasks first, so a completion delivered while the previous
+                                    // task was running is in its lane before anything is chosen
+                                    // — behind everything a person or a peer is waiting for.
+                                    while let Ok(completion) = completion_rx.try_recv() {
+                                        enqueue_detached_completion(
+                                            completion,
+                                            &task_registry,
+                                            &mut lanes,
+                                            &mut trace,
+                                        )
+                                        .await;
+                                    }
                                     // Everything already delivered goes into its lane before
                                     // anything is chosen, so the choice is made over the whole
                                     // backlog. A disconnected channel ends the drain and is
@@ -1661,11 +1684,28 @@ pub fn launch_session(
                                     }
 
                                     let arrived = if is_queue_sleep {
-                                        match task_rx.recv().await {
-                                            Some(task) => task,
-                                            None => {
-                                                final_loop_result = Ok(AgentLoopExit::Ok);
-                                                break 'task_loop;
+                                        // A completion is a second thing worth waking for, so
+                                        // the indefinite wait covers both channels. The
+                                        // completion sender lives as long as the registry does,
+                                        // so only `task_rx` can close, and it still ends the
+                                        // loop when it does.
+                                        tokio::select! {
+                                            arrived = task_rx.recv() => match arrived {
+                                                Some(task) => task,
+                                                None => {
+                                                    final_loop_result = Ok(AgentLoopExit::Ok);
+                                                    break 'task_loop;
+                                                }
+                                            },
+                                            Some(completion) = completion_rx.recv() => {
+                                                enqueue_detached_completion(
+                                                    completion,
+                                                    &task_registry,
+                                                    &mut lanes,
+                                                    &mut trace,
+                                                )
+                                                .await;
+                                                continue;
                                             }
                                         }
                                     } else {
@@ -1674,14 +1714,37 @@ pub fn launch_session(
                                                 .ok()
                                                 .and_then(|v| v.parse().ok())
                                                 .unwrap_or(30);
+                                        // The timeout is on the whole wait, not on the task
+                                        // channel alone: a completion is a second thing worth
+                                        // waking for, and one that arrives inside the window
+                                        // must not be left sitting until the window expires.
                                         match tokio::time::timeout(
                                             std::time::Duration::from_secs(idle_timeout_secs),
-                                            task_rx.recv(),
+                                            async {
+                                                tokio::select! {
+                                                    arrived = task_rx.recv() => Woke::Task(arrived),
+                                                    Some(completion) = completion_rx.recv() => {
+                                                        Woke::Completion(completion)
+                                                    }
+                                                }
+                                            },
                                         )
                                         .await
                                         {
-                                            Ok(Some(task)) => task,
-                                            Ok(None) => {
+                                            // Filed and reconsidered on the next pass around the
+                                            // drain, alongside anything else queued.
+                                            Ok(Woke::Completion(completion)) => {
+                                                enqueue_detached_completion(
+                                                    completion,
+                                                    &task_registry,
+                                                    &mut lanes,
+                                                    &mut trace,
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                            Ok(Woke::Task(Some(task))) => task,
+                                            Ok(Woke::Task(None)) => {
                                                 final_loop_result = Ok(AgentLoopExit::Ok);
                                                 break 'task_loop;
                                             }
@@ -1738,19 +1801,24 @@ pub fn launch_session(
                                 "[capsule-runtime] failed to write A2A message to task.md: {e}"
                             );
                         }
-                        let _ = trace
-                            .write_a2a_task_received(
-                                &incoming.task_id,
-                                &incoming.context_id,
-                                &incoming.message_id,
-                                incoming.traceparent.as_deref(),
-                            )
-                            .await;
+                        // Only a task that actually arrived over the peer door gets the
+                        // received record; a completion the runtime produced for itself never
+                        // crossed that boundary.
+                        if incoming.source == crate::a2a::SOURCE_A2A {
+                            let _ = trace
+                                .write_a2a_task_received(
+                                    &incoming.task_id,
+                                    &incoming.context_id,
+                                    &incoming.message_id,
+                                    incoming.traceparent.as_deref(),
+                                )
+                                .await;
+                        }
                         let _ = trace
                             .write_task_start(
                                 &incoming.task_id,
                                 &incoming.context_id,
-                                "a2a",
+                                incoming.source,
                                 incoming.provenance,
                                 incoming.message_text.len() as u64,
                             )
@@ -1759,7 +1827,7 @@ pub fn launch_session(
                             .dispatch_task_start(
                                 incoming.task_id.clone(),
                                 incoming.context_id.clone(),
-                                "a2a".to_string(),
+                                incoming.source.to_string(),
                                 incoming.message_text.len() as u64,
                                 seed_budget_tokens,
                                 u64::from(context_window),
@@ -1777,6 +1845,7 @@ pub fn launch_session(
                         otel.begin_session(incoming.traceparent.as_deref());
                         state.current_traceparent = otel.outgoing_traceparent();
                         state.current_task_provenance = Some(incoming.provenance);
+                        state.current_context_id = Some(incoming.context_id.clone());
                         state.a2a_task_id = Some(incoming.task_id.clone());
                         let loop_result = run_task_with_reopens(
                             &mut state,
@@ -1870,6 +1939,55 @@ pub fn launch_session(
                     // fault, which is why this runs *before* the flush below.
                     hooks.drain_async_hooks().await;
                     agent::flush_hook_dispatch_faults(&mut hooks, &mut trace).await;
+
+                    // Work this session started and is not waiting for. Nothing here waits on a
+                    // detached command — that is the point of having detached it — but the loss
+                    // of its result is recorded rather than passed over in silence: a demoted
+                    // command lives entirely in process memory, so nothing of it survives here.
+                    let abandoned_at_ms = crate::trace::timestamp_ms();
+                    // Outstanding work first, then the channel. `complete` removes a work id
+                    // before it sends, so a command finishing during this teardown is briefly in
+                    // neither place; reading `outstanding` first and draining second means it is
+                    // seen in one or the other rather than falling between them. A command
+                    // caught in both is recorded once.
+                    let mut recorded: Vec<String> = Vec::new();
+                    for work in detached.outstanding() {
+                        eprintln!(
+                            "[capsule-runtime] detached shell command {} ({}) is still running at session end; its result is lost",
+                            work.work_id, work.binary
+                        );
+                        let _ = trace
+                            .write_shell_abandoned(
+                                &work.work_id,
+                                &work.binary,
+                                &work.command,
+                                abandoned_at_ms.saturating_sub(work.started_at_ms),
+                            )
+                            .await;
+                        recorded.push(work.work_id);
+                    }
+                    // A command that finished after the task loop stopped reading. Its result
+                    // exists, but no task will ever carry it, so it is lost on the same terms as
+                    // one still running and is recorded the same way.
+                    while let Ok(completion) = completion_rx.try_recv() {
+                        if recorded.contains(&completion.work_id) {
+                            continue;
+                        }
+                        eprintln!(
+                            "[capsule-runtime] detached shell command {} ({}) finished after the session stopped accepting work; its result is lost",
+                            completion.work_id, completion.binary
+                        );
+                        let _ = trace
+                            .write_shell_abandoned(
+                                &completion.work_id,
+                                &completion.binary,
+                                &completion.command,
+                                completion.duration_ms,
+                            )
+                            .await;
+                        recorded.push(completion.work_id);
+                    }
+
                     let _ = trace
                         .write_session_end_if_not_ended(session_exit_status)
                         .await;
@@ -1976,6 +2094,12 @@ pub fn launch_session(
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent: None,
         current_task_provenance: None,
+        current_context_id: None,
+        // The script-capsule path runs no task loop, so a demoted command's completion would
+        // have nowhere to be delivered: every command it dispatches runs to completion in the
+        // foreground.
+        detached: None,
+        shell_grace_secs: 0,
         a2a_task_registry: None,
         a2a_sse: None,
         a2a_task_id: None,
@@ -2836,6 +2960,18 @@ pub(crate) struct CapsuleStoreState {
     /// script-capsule path, which runs no task loop and so has no task in scope — that stamps
     /// `untrusted`, the safe class.
     pub(crate) current_task_provenance: Option<TaskProvenance>,
+    /// The conversation the task now in scope runs under, set beside `current_task_provenance`
+    /// at every task-activation site. A demoted command's completion is enqueued under this id,
+    /// so the result joins the conversation the command was started from.
+    pub(crate) current_context_id: Option<String>,
+    // ── Detached shell ───────────────────────────────────────────────────────────
+    /// Where a demoted command registers itself and delivers its completion. `None` is what
+    /// keeps a call site foreground-only: the script-capsule path and every test construction
+    /// run no task loop, so a completion would have nowhere to land.
+    pub(crate) detached: Option<Arc<DetachedRegistry>>,
+    /// `lifecycle.shell_grace_secs`: how long a shell command runs in the foreground before it
+    /// is demoted. Read from the resolved lifecycle once per launch.
+    pub(crate) shell_grace_secs: u64,
     // ── A2A request-input support ────────────────────────────────────────────────
     /// Shared task registry — Some in A2A mode, None for script capsules.
     pub(crate) a2a_task_registry: Option<Arc<Mutex<TaskRegistry>>>,
@@ -3610,6 +3746,20 @@ impl CapsuleStoreState {
             let env_overrides = self.inference_env.clone();
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
+            // Both halves are required. Without a registry there is no task loop to deliver a
+            // completion to; without a context id there is no conversation for the completion to
+            // join, and a completion that opened its own would be a result nobody asked for.
+            // `command` is filled in by `dispatch_shell_tool`, which is where it is parsed.
+            let detach = match (&self.detached, &self.current_context_id) {
+                (Some(registry), Some(context_id)) => Some(DetachPolicy {
+                    grace: std::time::Duration::from_secs(self.shell_grace_secs),
+                    registry: Arc::clone(registry),
+                    command: String::new(),
+                    context_id: context_id.clone(),
+                    provenance: self.current_task_provenance,
+                }),
+                _ => None,
+            };
             return tokio::task::spawn_blocking(move || {
                 dispatch_shell_tool(
                     &name,
@@ -3618,6 +3768,7 @@ impl CapsuleStoreState {
                     &env_overrides,
                     &policy,
                     &enforcement,
+                    detach,
                 )
             })
             .await
@@ -4502,6 +4653,9 @@ fn dispatch_native_tool(
     }
 }
 
+/// `detach` is what decides whether a slow command can be demoted. `None` runs it to completion
+/// in the foreground — the only shape available to a caller with no task loop to deliver a
+/// completion to.
 fn dispatch_shell_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
@@ -4509,6 +4663,7 @@ fn dispatch_shell_tool(
     env_overrides: &[(String, String)],
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
+    detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
     let command = match extract_shell_command(&input) {
         Ok(command) => command,
@@ -4532,8 +4687,21 @@ fn dispatch_shell_tool(
         split_args.iter().map(String::as_str).collect()
     };
 
-    match execute_shell(name, &args, env_overrides, workdir, policy, enforcement) {
-        Ok(result) => {
+    let detach = detach.map(|detach| DetachPolicy {
+        command: command.clone(),
+        ..detach
+    });
+
+    match run_shell(
+        name,
+        &args,
+        env_overrides,
+        workdir,
+        policy,
+        enforcement,
+        detach,
+    ) {
+        Ok(ShellOutcome::Finished(result)) => {
             let shell = ShellDispatchInfo {
                 // `name` is the invoked binary (each `capabilities.shell.allow` entry is
                 // exposed as its own tool), resolved to a path by `execute_shell`.
@@ -4550,10 +4718,21 @@ fn dispatch_shell_tool(
             DispatchOutcome {
                 result: shell_result_to_tool_result(&command, result),
                 shell: Some(shell),
+                detached: None,
                 is_skill: false,
                 fatal: None,
             }
         }
+        // A demoted command has no exit code, no output and no duration yet, so it fills none of
+        // the fields `ShellDispatchInfo` exists to carry — hence `shell: None`, and hence no
+        // `HookEvent::Shell`. What it did produce is the handle.
+        Ok(ShellOutcome::Detached(info)) => DispatchOutcome {
+            result: demotion_tool_result(&info.work_id),
+            shell: None,
+            detached: Some(info),
+            is_skill: false,
+            fatal: None,
+        },
         Err(error) => DispatchOutcome {
             // The tool result is filled in either way, so the trace records the call that was
             // attempted; `fatal` is what tells the agent turn loop that this particular failure
@@ -4567,6 +4746,7 @@ fn dispatch_shell_tool(
                 metadata: Vec::new(),
             },
             shell: None,
+            detached: None,
             is_skill: false,
             fatal: error.session_fatal(),
         },
@@ -4803,6 +4983,62 @@ where
     }
 
     dispatch()
+}
+
+/// What ended the task loop's bounded wait: a task arriving (or its channel closing) or a
+/// detached command reporting back.
+enum Woke {
+    Task(Option<IncomingTask>),
+    Completion(DetachedCompletion),
+}
+
+/// Turn a finished detached command into a queued `completion`-origin task and record the join
+/// between the two in the trace.
+///
+/// `can_accept` is deliberately not consulted. A completion is work the capsule already admitted
+/// when it admitted the task that started the command, so refusing it would drop a result the
+/// capsule asked for. The `enqueue` is not optional either: `start_task` asserts a positive
+/// pending count, so a task pushed onto the queue without one would trip that assertion. The
+/// consequence is deliberate — an outstanding completion counts against `queue_depth`, so a
+/// capsule with detached work in flight has less room for new inbound requests.
+async fn enqueue_detached_completion(
+    completion: DetachedCompletion,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    lanes: &mut LaneQueue,
+    trace: &mut TraceWriter,
+) {
+    let task = IncomingTask {
+        task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+        context_id: completion.context_id.clone(),
+        message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+        message_text: completion.message_text(),
+        provenance: completion.provenance,
+        // Nothing propagated a trace context to a background command: the turn that started it
+        // is over, and inventing a parent span would attribute the completion to it.
+        traceparent: None,
+        source: crate::a2a::SOURCE_DETACHED_SHELL,
+    };
+
+    let _ = trace
+        .write_shell_completed(
+            &completion.work_id,
+            &completion.binary,
+            &completion.command,
+            completion.exit_code,
+            completion.duration_ms,
+            &completion.output_path,
+            completion.output_bytes,
+            completion.resource_limit.clone(),
+            completion.status(),
+            &task.task_id,
+        )
+        .await;
+
+    task_registry
+        .lock()
+        .unwrap()
+        .enqueue(&task.task_id, &task.context_id);
+    lanes.push(task);
 }
 
 fn generate_session_id() -> String {
@@ -5915,6 +6151,9 @@ inference:
             shell_enforcement: sandbox::ShellEnforcement::environment_only(),
             current_traceparent: None,
             current_task_provenance: None,
+            current_context_id: None,
+            detached: None,
+            shell_grace_secs: 0,
             a2a_task_registry: None,
             a2a_sse: None,
             a2a_task_id: None,
@@ -6310,6 +6549,7 @@ inference:
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
+            None,
         );
 
         let shell = outcome
@@ -6360,6 +6600,7 @@ inference:
             &[],
             &policy,
             &sandbox::sealed_test_enforcement(),
+            None,
         );
 
         assert!(
@@ -6396,6 +6637,7 @@ inference:
             // Empty allowlist: `execute_shell` refuses before spawning anything.
             &CapabilityPolicy::default(),
             &sandbox::ShellEnforcement::environment_only(),
+            None,
         );
 
         assert!(matches!(
@@ -6526,6 +6768,7 @@ inference:
                 &[],
                 &policy,
                 &sandbox::ShellEnforcement::environment_only(),
+                None,
             );
             let shell = outcome.shell.expect("the shell call reports itself");
 

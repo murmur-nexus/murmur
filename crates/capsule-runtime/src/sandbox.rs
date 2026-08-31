@@ -2084,10 +2084,10 @@ pub(crate) enum SupervisorHandle {
 }
 
 impl SupervisorHandle {
-    /// Shuts the session's egress proxy down, with a short bound so `execute_shell` never hangs.
+    /// Shuts the session's egress proxy down, with a short bound so the shell call never hangs.
     /// In practice the receive returns immediately: the thread's only blocking step is the
     /// namespace-socket hand-off, which completed before the child could `execve` at all — long
-    /// before `wait_with_output` (called by `execute_shell` right before this) returned.
+    /// before the caller finished waiting on the child.
     ///
     /// A proxy outliving its namespace would be serving sockets whose peers no longer exist, so
     /// this is the teardown, not merely a thread join.
@@ -3861,9 +3861,10 @@ mod linux_enforce {
     /// The child sends exactly one `SCM_RIGHTS` batch over this socketpair, from
     /// `create_capsule_netns` — the first thing its `pre_exec` window does. The thread finishes as
     /// soon as the proxy is up and hands the live handle back over `proxy_rx` for
-    /// [`SupervisorHandle::join_best_effort`] to shut down, so the proxy stops when
-    /// `execute_shell` has finished waiting on the subprocess tree. `wait_with_output` reads
-    /// stdout to EOF and so waits for every descendant holding the pipe.
+    /// [`SupervisorHandle::join_best_effort`] to shut down, so the proxy stops when the shell
+    /// call has finished waiting on the subprocess tree. Both the foreground path and a demoted
+    /// command's own thread drain the child's pipes to EOF before that shutdown, which is what
+    /// makes them wait for every descendant holding the pipe.
     ///
     /// If the sockets never arrive (e.g. `fork()` itself failed, or the child's `pre_exec` closure
     /// errored before reaching the send), there is no live child left unserved:
