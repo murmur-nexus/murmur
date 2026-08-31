@@ -39,8 +39,14 @@ pub fn component(name: &str) -> PathBuf {
 ///
 /// `cargo test -p capsule-runtime` builds this crate and not another package's binary, so a suite
 /// whose whole subject is launching `mur` has to ask for it: an absent binary would make the suite
-/// unrunnable, and a *stale* one would make it pass against last week's runtime. The build runs
-/// once per test process and is a no-op when nothing changed.
+/// unrunnable.
+///
+/// **Only when it is absent.** `cargo build -p murmur-cli --bin mur` uplifts over
+/// `target/<profile>/mur`, the one path every suite in the workspace reads, and it carries no
+/// Cargo features. A workspace run has already put a binary there built with whatever features
+/// that run asked for — `--features "beta-mur-topology beta-mur-deploy"` on CI — so building
+/// unconditionally would replace it with a featureless one, and every suite ordered after this
+/// crate would find a `mur` whose gated subcommands had gone.
 ///
 /// [`MUR_BINARY_ENV`] overrides it, for a harness that has already built one.
 pub fn mur_binary() -> &'static Path {
@@ -56,12 +62,14 @@ pub fn mur_binary() -> &'static Path {
             .and_then(Path::parent)
             .expect("the test binary lives under target/<profile>/deps")
             .to_path_buf();
-        let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-            .args(["build", "-p", "murmur-cli", "--bin", "mur"])
-            .status()
-            .expect("cargo build -p murmur-cli must run");
-        assert!(status.success(), "failed to build the mur binary");
         let candidate = profile_dir.join("mur");
+        if !candidate.is_file() {
+            let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+                .args(["build", "-p", "murmur-cli", "--bin", "mur"])
+                .status()
+                .expect("cargo build -p murmur-cli must run");
+            assert!(status.success(), "failed to build the mur binary");
+        }
         assert!(
             candidate.is_file(),
             "cargo built murmur-cli but {} is missing",

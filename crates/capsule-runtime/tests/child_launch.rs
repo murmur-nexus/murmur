@@ -480,11 +480,7 @@ fn a_child_cannot_reach_its_parents_workdir_or_its_siblings() {
             std::os::unix::fs::symlink(parent.dir(), dir.join("root-link")).unwrap();
         }
     });
-    assert_eq!(
-        outcomes, expected,
-        "reader in {}",
-        reader.workdir.display()
-    );
+    assert_eq!(outcomes, expected, "reader in {}", reader.workdir.display());
 
     // Every refused path names content that is really there: resolved from the reader's own
     // directory, or followed from the links planted in it, they are the parent's secret and the
