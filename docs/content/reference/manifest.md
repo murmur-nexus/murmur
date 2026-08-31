@@ -978,7 +978,7 @@ operator cannot change them by editing their own manifest.
 |---|---|---|---|
 | `binding` | `on-stage`, `on-session-start`, `on-task-start`, `on-inference`, `on-tool-call`, `on-shell`, `on-compaction`, `on-task-end`, `on-session-end` | absent — the hook receives every event | Which lifecycle event(s) the hook is dispatched for. |
 | `execution_mode` | `blocking`, `async` | `blocking` | Whether the agent loop waits for the hook. A binding that commits an arm must be `blocking`, so `async` requires `commit_policy: none`. `on-stage` must be `blocking`. |
-| `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task`, `seed-context` | `none` | What the runtime does with the hook's successful output. |
+| `commit_policy` | `none`, `write-manifests`, `replace-context`, `reopen-task`, `seed-context`, `deny` | `none` | What the runtime does with the hook's successful output. |
 
 **`binding` is the single source of truth for what a hook can commit**, and `commit_policy` is
 checked against it when the capsule is staged. Each binding honors exactly one output, so it admits
@@ -990,9 +990,11 @@ exactly one `commit_policy` — plus `none`, which is always valid and means the
 | `on-compaction` | `replace-context` or `none` |
 | `on-task-end` | `reopen-task` or `none` |
 | `on-task-start` | `seed-context` or `none` |
+| `on-shell` | `deny` or `none` |
+| `on-tool-call` | `deny` or `none` |
 | `on-inference` | `none` only — `on-inference` commits an `artifact` output, which has no `commit_policy` spelling |
-| `on-session-start`, `on-tool-call`, `on-shell`, `on-session-end` | `none` only — these events commit nothing |
-| absent (all events) | any value — the hook receives every event, including all five that commit something |
+| `on-session-start`, `on-session-end` | `none` only — these events commit nothing |
+| absent (all events) | any value except `deny` |
 
 Declaring a `commit_policy` the `binding` cannot honor is an error at capsule-staging time, before
 the hook component is compiled or run. For example `binding: on-task-end` with
@@ -1002,6 +1004,24 @@ the hook component is compiled or run. For example `binding: on-task-end` with
 hook my-hook@1.0.0 invalid config: commit_policy 'replace-context' is not valid for binding
 'on-task-end'; binding 'on-task-end' honors commit_policy 'reopen-task'
 ```
+
+`commit_policy: deny` additionally requires an explicit `binding:` of `on-shell` or
+`on-tool-call`. It is the one policy an omitted `binding:` cannot carry: `deny` is answered at a
+decision point standing in front of a call, and a hook that does not name which of the two events
+it gates would be asked to decide on calls it was never written to judge. Omitting `binding:` with
+`commit_policy: deny` fails with:
+
+```
+hook my-hook@1.0.0 invalid config: commit_policy 'deny' requires an explicit binding: 'on-shell'
+or 'on-tool-call'; a hook with no binding: is dispatched at every event, including decision
+points it was not written to decide
+```
+
+A hook declaring `commit_policy: deny` is a **policy hook**. It is called immediately before the
+call it gates is dispatched, is handed the resolved identity of what is about to run, and returning
+`deny(reason)` means the call does not happen. See
+[Policy hooks](../concepts/hooks.md#policy-hooks) for what a policy hook decides on and what
+happens when one fails.
 
 See [What each handler can commit](wit-interfaces.md#what-each-handler-can-commit) for the runtime
 side of the same table.

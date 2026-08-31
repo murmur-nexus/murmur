@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.6.0`  |
+| `murmur:hook`            | `0.7.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -102,10 +102,30 @@ its own, with no bump already being paid for elsewhere, so the rule below applie
 and the `murmur:runtime@0.3.0` exception recorded above does not: folding it into
 `murmur:runtime` would have renamed `murmur:runtime/inference@0.3.0` and
 `murmur:runtime/tokens@0.3.0`, forcing a rebuild of every published hook to buy
-nothing. `read` *uses* `murmur:hook/lifecycle@0.6.0`'s `message` record, which is
-a reference and not a change: `murmur:hook` stays at `0.6.0`, and the only edit
+nothing. `read` *uses* `murmur:hook/lifecycle`'s `message` record, which is
+a reference and not a change: `murmur:hook` did not move for it, and the only edit
 to it in the same step was the doc comment on `message.id`, a patch-tier change
 that moves no version.
+
+`murmur:hook` then went to `0.7.0` carrying the two shape changes a *decision-point*
+dispatch of `on-tool-call` and `on-shell` needs, bundled so the ecosystem pays for one
+rebuild window rather than two. `hook-output` gained a seventh case, `deny(string)`,
+**appended** so the existing discriminants `0`–`5` keep their indices; and `shell-event`
+and `tool-event` were each restructured around an `outcome: option<...>` field, whose
+`none` is what tells a hook the call it is being shown has not run yet. The same step
+moved every post-call field of those two records into the new `shell-outcome` and
+`tool-outcome` records, and added `argv`/`script` to `shell-event` and `input` to
+`tool-event` — the untruncated identity of what is about to run, which a policy hook must
+decide on because `command` is a clipped display string. Each of these is independently a
+breaking change under the rule below. Hooks built against `@0.6.0` or earlier stopped
+resolving at this bump and had to be rebuilt.
+
+The `deny` arm is the one `hook-output` case whose contract is *subtractive*: it can only
+stop a call the manifest already permitted, and there is deliberately no arm that permits
+one. Widening the variant with a permitting case would be a different kind of change from
+every bump recorded above — it would let an artifact grant authority a manifest withheld —
+and this entry records that no such case exists so a later bump does not add one by
+analogy.
 
 **A wholly new interface added to a package that already has published
 consumers goes in a new package at `0.1.0`.** No existing instance name changes,

@@ -355,6 +355,20 @@ struct RetentionEvent {
     messages_dropped: Option<u64>,
 }
 
+/// A policy hook refused a call before it ran. Rendered where it cannot be scrolled past:
+/// there is no `tool_call` or `shell` line for a denied call, so this record is the only
+/// account of a call the model asked for and never got.
+#[derive(Debug, Deserialize)]
+struct CallDeniedEvent {
+    turn: u32,
+    /// `"on-shell"` or `"on-tool-call"`.
+    event: String,
+    hook_name: String,
+    /// The resolved executable path for a shell call, the tool name otherwise.
+    target: String,
+    reason: String,
+}
+
 /// A hook call that failed in a way the session survived. Rendered where it cannot be
 /// scrolled past, because nothing else in the session says the hook did not run.
 #[derive(Debug, Deserialize)]
@@ -396,6 +410,7 @@ enum TraceEvent {
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
+    CallDenied(CallDeniedEvent),
     HookDispatchError(HookDispatchErrorEvent),
     Retention(RetentionEvent),
     ResourceList(OutcomeEvent),
@@ -560,6 +575,8 @@ struct TraceMetrics {
     reopens: Vec<ReopenRecord>,
     /// Every `context_seed` record, in file order — one per seeded task.
     context_seeds: Vec<ContextSeedRecord>,
+    /// Every `call_denied` record, in file order — one per call a policy hook refused.
+    denials: Vec<DenialRecord>,
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
@@ -588,6 +605,15 @@ struct RetentionRecord {
 struct ReopenRecord {
     reopen_number: u32,
     hook_name: String,
+    reason: String,
+}
+
+/// One `call_denied` trace record, surfaced in `mur trace show`.
+struct DenialRecord {
+    turn: u32,
+    event: String,
+    hook_name: String,
+    target: String,
     reason: String,
 }
 
@@ -840,6 +866,7 @@ fn compute_metrics(
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
+    let mut denials: Vec<DenialRecord> = Vec::new();
     let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
     let mut retentions: Vec<RetentionRecord> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
@@ -994,6 +1021,15 @@ fn compute_metrics(
                     message_ids: e.message_ids,
                 });
             }
+            TraceEvent::CallDenied(e) => {
+                denials.push(DenialRecord {
+                    turn: e.turn,
+                    event: e.event,
+                    hook_name: e.hook_name,
+                    target: e.target,
+                    reason: e.reason,
+                });
+            }
             TraceEvent::HookDispatchError(e) => {
                 hook_failures.push(HookFailureRecord {
                     hook_name: e.hook_name,
@@ -1073,6 +1109,7 @@ fn compute_metrics(
             compactions_declined,
             reopens,
             context_seeds,
+            denials,
             hook_failures,
             retentions,
             resource_lists,
@@ -1566,6 +1603,18 @@ fn print_show(m: &TraceMetrics) {
             println!(
                 "reopen {}  by {}  “{}”",
                 r.reopen_number, r.hook_name, reason
+            );
+        }
+    }
+
+    if !m.denials.is_empty() {
+        println!();
+        println!("── Denied calls ─────────────────────────────────");
+        for d in &m.denials {
+            let reason: String = d.reason.chars().take(80).collect();
+            println!(
+                "turn {}  {}  {}  by {}  “{}”",
+                d.turn, d.event, d.target, d.hook_name, reason
             );
         }
     }
@@ -2119,6 +2168,13 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             kind("task_reopened"),
             e.hook_name,
             e.reopen_number
+        ),
+        TraceEvent::CallDenied(e) => format!(
+            "{}{}  {}  denied by {}",
+            kind("call_denied"),
+            e.event,
+            e.target,
+            e.hook_name
         ),
         _ => return None,
     })

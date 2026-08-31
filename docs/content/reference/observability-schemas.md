@@ -33,6 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `call_denied` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
@@ -361,6 +362,21 @@ the reopen is granted
 Appears zero or more times per task, always before the task's terminal `task_end`. See [Task
 reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task) for the full
 mechanism.
+
+**`call_denied`**{ #call-denied } — written when a [policy hook](../concepts/hooks.md#policy-hooks)
+refuses a shell command or tool call before it runs
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn the refused call was requested in |
+| `event` | string | `"on-shell"` \| `"on-tool-call"` — the gated lifecycle function whose decision point refused |
+| `hook_name` | string | Manifest name of the policy hook that refused |
+| `target` | string | What was refused: the resolved executable path for a shell call, the tool name otherwise |
+| `reason` | string | The hook's own reason, or the runtime's when the hook returned none it could use — a crash, a deadline, an unsupported arm, an empty reason |
+
+No `tool_call` or `shell` event accompanies it: the call did not run, so there is nothing to
+record about a run. A refusal is not a session failure and the turn continues. An unsupported arm
+returned at the decision point produces a `hook_dispatch_error` alongside this line.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 

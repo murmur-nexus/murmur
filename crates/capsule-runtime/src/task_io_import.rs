@@ -224,10 +224,10 @@ pub(crate) mod test_support {
     use super::TASK_IO_IFACE_VERSIONED;
     use wasmtime::component::Component;
 
-    /// One row per `murmur:hook/lifecycle@0.6.0` function: the WIT name, the WIT type of its
+    /// One row per `murmur:hook/lifecycle@0.7.0` function: the WIT name, the WIT type of its
     /// event parameter, and the core-function signature the canonical ABI flattens that type
-    /// to. `on-inference`'s record flattens to 17 values, past the 16-parameter limit, so it
-    /// is passed indirectly as a single pointer.
+    /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 19, both past
+    /// the 16-parameter limit, so each is passed indirectly as a single pointer.
     const LIFECYCLE_FNS: &[(&str, &str, &str)] = &[
         ("on-stage", "$stage-event", "i32 i32"),
         (
@@ -244,13 +244,9 @@ pub(crate) mod test_support {
         (
             "on-tool-call",
             "$tool-event",
-            "i32 i32 i32 i64 i64 i64 i32 i32",
+            "i32 i32 i32 i64 i32 i32 i32 i64 i64 i32 i32",
         ),
-        (
-            "on-shell",
-            "$shell-event",
-            "i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i64 i64 i64",
-        ),
+        ("on-shell", "$shell-event", "i32"),
         (
             "on-compaction",
             "$compaction-event",
@@ -367,7 +363,8 @@ pub(crate) mod test_support {
     (case "write-manifests" (list $tool-manifest))
     (case "artifact" string)
     (case "reopen-task" string)
-    (case "seed-context" (list $message))))
+    (case "seed-context" (list $message))
+    (case "deny" string)))
   (type $stage-event (record (field "shell-allow" (list string))))
   (type $session-context (record
     (field "capsule-name" string)
@@ -392,23 +389,30 @@ pub(crate) mod test_support {
     (field "prompt" (option string))
     (field "output" (option string))
     (field "tools" (option string))))
+  (type $tool-outcome (record
+    (field "output-bytes" u64)
+    (field "duration-ms" u64)
+    (field "status" string)))
   (type $tool-event (record
     (field "turn" u32)
     (field "tool-name" string)
     (field "input-bytes" u64)
-    (field "output-bytes" u64)
-    (field "duration-ms" u64)
-    (field "status" string)))
-  (type $shell-event (record
-    (field "turn" u32)
-    (field "binary" string)
-    (field "command" string)
+    (field "input" string)
+    (field "outcome" (option $tool-outcome))))
+  (type $shell-outcome (record
     (field "exit-code" s32)
     (field "stdout" string)
     (field "stderr" string)
     (field "stdout-bytes" u64)
     (field "stderr-bytes" u64)
     (field "duration-ms" u64)))
+  (type $shell-event (record
+    (field "turn" u32)
+    (field "binary" string)
+    (field "command" string)
+    (field "argv" (list string))
+    (field "script" (option string))
+    (field "outcome" (option $shell-outcome))))
   (type $compaction-event (record
     (field "messages" (list $message))
     (field "session-tokens" u64)
@@ -431,7 +435,9 @@ pub(crate) mod test_support {
     /// The types every lifecycle instance re-exports alongside its functions.
     const TYPE_EXPORTS: &str = "    (export \"message\" (type $message))\n    \
                                 (export \"tool-manifest\" (type $tool-manifest))\n    \
-                                (export \"hook-output\" (type $hook-output))\n";
+                                (export \"hook-output\" (type $hook-output))\n    \
+                                (export \"tool-outcome\" (type $tool-outcome))\n    \
+                                (export \"shell-outcome\" (type $shell-outcome))\n";
 
     /// Assemble a component from a core body plus the lift and instance-export lines its
     /// lifecycle functions need.
@@ -443,7 +449,7 @@ pub(crate) mod test_support {
              (export \"rin\" (func $rin_l))\n      (export \"olen\" (func $olen_l))\n      \
              (export \"rout\" (func $rout_l))))))\n{LIFECYCLE_TYPES}\n{lifts}\n  \
              (instance $lc\n{TYPE_EXPORTS}{exports}  )\n  \
-             (export \"murmur:hook/lifecycle@0.6.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.7.0\" (instance $lc))\n)",
             preamble = preamble(),
         );
         let bytes = wat::parse_str(&wat).expect("task-io double WAT parses");

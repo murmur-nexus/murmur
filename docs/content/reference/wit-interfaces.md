@@ -235,8 +235,8 @@ runtime has no other way back under the token budget.
 | `on-session-start` | Once per capsule launch, before the first task's work begins |
 | `on-task-start` | Once per task, before that task's first inference turn |
 | `on-inference` | After each inference driver response is parsed |
-| `on-tool-call` | After each model-requested tool invocation returns or errors |
-| `on-shell` | After each allowed shell command returns |
+| `on-tool-call` | Twice per model-requested tool invocation: once before it is dispatched, once after it returns or errors |
+| `on-shell` | Twice per allowed shell command: once before it is dispatched, once after it returns |
 | `on-compaction` | When the session token threshold is reached, before any history is replaced |
 | `on-task-end` | Once per task, immediately after that task's agent loop returns |
 | `on-session-end` | Once per capsule launch, after the task loop exits |
@@ -250,6 +250,20 @@ simply never dispatched for them. The six session handlers are required — a co
 fails to load with an error naming it. A missing `on-stage` is logged rather than fatal, and
 staging continues.
 
+### The two dispatches of a gated event
+
+`on-tool-call` and `on-shell` are each dispatched twice, and `outcome` is what tells the two
+apart:
+
+| `outcome` | Dispatch | Meaning |
+|---|---|---|
+| `none` | Decision point, before the call | The call has not run. A returned `deny` refuses it. |
+| `some(...)` | Observation, after the call | The call has run. Nothing returned can change that. |
+
+The decision point runs only for a hook whose own `murmur.yaml` declares
+`commit_policy: deny` on `binding: on-shell` or `binding: on-tool-call`. Every other hook sees
+the observation dispatch alone.
+
 ### What each handler can commit
 
 A handler may return any `hook-output` arm, but the runtime commits only one arm per event:
@@ -261,6 +275,7 @@ A handler may return any `hook-output` arm, but the runtime commits only one arm
 | `on-compaction` | `replace-context` |
 | `on-task-end` | `reopen-task` |
 | `on-task-start` | `seed-context` |
+| `on-shell`, `on-tool-call` | `deny`, at the decision point only |
 | All others | none — only `none` is silent |
 
 This table is also enforced ahead of time. A hook artifact declares in its own `murmur.yaml`
@@ -297,6 +312,15 @@ compaction hook, or refuses it; every outcome is recorded as a
 Returning it from any other handler is the same loud-but-non-fatal fault as any other unhonored
 arm. Only `binding: on-task-start` accepts it as a `commit_policy`.
 
+`deny` is a control arm honored at the decision-point dispatch of `on-shell` and `on-tool-call`
+alone: the call is not made, the agent is handed a result naming the hook and the reason, and a
+[`call_denied`](observability-schemas.md#call-denied) event is written. It only narrows — there is
+no arm that permits a call, and the manifest's own capability check still runs first, so a hook
+can never make a capsule able to do something its manifest did not allow. Returning it from any
+other handler, or from the observation dispatch of these two, is the same loud-but-non-fatal fault
+as any other unhonored arm. See [Policy hooks](../concepts/hooks.md#policy-hooks) for the
+fail-closed rule that governs a policy hook's failures.
+
 ### Event field notes
 
 - `compaction-event.model` and `compaction-event.system-prompt` carry
@@ -324,11 +348,21 @@ arm. Only `binding: on-task-start` accepts it as a `commit_policy`.
   load under [`lifecycle.conversation: threaded`](manifest.md#lifecycle-conversation), and `0`
   under every other conversation mode. Read `0` as "the runtime has not computed this" and
   decline, rather than as an unbounded budget.
-- `shell-event.binary` is the program the shell tool actually invoked — a canonicalized absolute
-  path (for example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the
-  bare invoked name when nothing resolved. `shell-event.command` carries the argument list alone
-  (for a shell interpreter, the script text passed via `-c`), so read `binary` to recognize what
-  ran.
+- `shell-event.binary` is the program the shell tool invoked — a canonicalized absolute path (for
+  example `/usr/bin/pytest`) when the runtime resolved the name against `PATH`, and the bare
+  invoked name when nothing resolved.
+- `shell-event.command` carries the argument list alone (for a shell interpreter, the script text
+  passed via `-c`), truncated to 200 characters. It is a display string. `shell-event.argv` is the
+  exact argument list the runtime passes to the executable and `shell-event.script` is the `-c`
+  body (absent for every other form), both untruncated — a policy must decide on those two and on
+  `binary`, never on `command`. Recipes belonging to a build tool (`make <target>`,
+  `just <recipe>`, `npm run <script>`) are not resolved into their bodies: a hook gating
+  `just build` decides on the argv `["build"]` and the resolved path of `just`.
+- `tool-event.input` is the exact tool input JSON the tool will receive, untruncated, and is what
+  a policy decides on.
+- `shell-event.outcome` and `tool-event.outcome` carry what the call produced, and are absent at
+  the decision point — see [The two dispatches of a gated
+  event](#the-two-dispatches-of-a-gated-event).
 
 ---
 
@@ -513,7 +547,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:task-io` | `0.1.0` |
 | `murmur:conversation` | `0.1.0` |
 | `murmur:text` | `0.1.0` |
-| `murmur:hook` | `0.6.0` |
+| `murmur:hook` | `0.7.0` |
 | `murmur:runtime` | `0.3.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |

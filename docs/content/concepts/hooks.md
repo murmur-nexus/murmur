@@ -13,8 +13,8 @@ non-fatal — failures are logged to `workdir/logs/hook-<name>.log` and the sess
 | `on-session-start` | After staging, before the first task's work begins. Once per capsule launch. |
 | `on-task-start` | Before that task's first inference turn. Once per task. |
 | `on-inference` | After each inference response is received. |
-| `on-tool-call` | After each tool invocation returns. |
-| `on-shell` | After each shell command returns. |
+| `on-tool-call` | Before each tool invocation is dispatched, and again after it returns. |
+| `on-shell` | Before each shell command is dispatched, and again after it returns. |
 | `on-compaction` | When session tokens reach the [compaction threshold](context.md). |
 | `on-task-end` | Immediately after that task's agent loop returns. Once per task. |
 | `on-session-end` | After the task loop exits (idle timeout, shutdown, or explicit exit). Once per capsule launch. |
@@ -37,12 +37,14 @@ ends. See [Async hook execution](../reference/manifest.md#hook-overflow) for ove
 | `write-manifests` | Writes tool manifest records to `workdir/tools/<binary>/murmur.yaml`, overwriting any existing file | Shell tool enrichment during staging |
 | `reopen-task` | Re-runs the task's agent loop with the hook's feedback instead of finalizing it — see [Task reopening](session-loop.md#task-reopening-commit_policy-reopen-task) | Review and retry hooks |
 | `seed-context` | Places the hook's messages at the head of the task's first message list, under the [`context.seed_budget`](../reference/manifest.md#field-context) ceiling — see [Context seeding](session-loop.md#context-seeding-commit_policy-seed-context) | Memory |
+| `deny` | Refuses the shell command or tool call the hook was asked about, before it runs — see [Policy hooks](#policy-hooks) | Guardrails |
 
 `binding` is the single source of truth for what a hook commits: each binding honors exactly one
 arm, so it admits that one policy plus `none`, and a `commit_policy` the binding cannot honor fails
 at capsule-staging time — before the hook component is compiled — with an error naming the binding,
 the declared policy, and the policy the binding honors. A hook with no `binding:` receives every
-event, so any policy is valid for it — see [Hook contract
+event, so any policy is valid for it — with the single exception of `deny`, which requires an
+explicit `binding:` of `on-shell` or `on-tool-call`. See [Hook contract
 fields](../reference/manifest.md#hook-contract-fields).
 
 The two fields meet in one rule: a binding that commits an arm must be blocking, because every
@@ -61,9 +63,50 @@ version: 1.0.0
 runtime: hook
 binding: on-compaction           # when it fires
 execution_mode: blocking         # blocking or async
-commit_policy: replace-context   # none, replace-context, write-manifests, reopen-task, seed-context
+commit_policy: replace-context   # none, replace-context, write-manifests, reopen-task, seed-context, deny
 description: "Hook description."
 ```
 
 A hook's capability grant is read from the capsule's manifest, not from the hook's own — see
 [Hook capabilities](access-control.md#hook-capabilities).
+
+## Policy hooks { #policy-hooks }
+
+A hook declaring `commit_policy: deny` on `binding: on-shell` or `binding: on-tool-call` is a
+**policy hook**. Every other hook is an observer.
+
+| | Observer hook | Policy hook |
+|---|---|---|
+| When it is called | After the call, with what the call produced | Before the call, with what the call is about to do |
+| `outcome` on the event | Present | Absent |
+| What its answer changes | Nothing about the call — it has already run | Whether the call happens at all |
+| A failure means | The session continues, the failure is logged | The call is refused |
+
+A policy hook is called at a decision point placed after the manifest's capability check and
+immediately before the call is dispatched. It is handed the resolved identity of what is about to
+run: the resolved absolute path of the executable, the exact untruncated argument list, the `-c`
+script body, and for a tool call the exact input JSON. Returning `deny(reason)` means the call is
+not made. The agent is handed a result naming the hook and its reason, and stating that retrying
+the same call unchanged will be refused again. A [`call_denied`](../reference/observability-schemas.md#call-denied)
+event records the refusal; no `tool_call` or `shell` event is written, because nothing ran.
+
+**A policy hook only narrows.** There is no arm that permits a call. The manifest decided what the
+capsule may do, and a policy hook is a second, stricter gate standing in front of that decision —
+so a hook can never make a capsule able to do something its manifest did not allow. A shell binary
+missing from `capabilities.shell.allow` is still refused with the same message whatever the hook
+returns.
+
+**A policy hook that fails refuses.** This is the inversion of the non-fatal default that governs
+every other hook, and it is the rule a policy hook exists to provide: a gate that opens when it
+breaks is not a gate. The call proceeds only on a clean `none`. A returned `deny`, a crash, a
+call that outruns its deadline, a memory-limit kill, a return the runtime cannot read, a `deny`
+with an empty reason, and any other `hook-output` arm all refuse the call, with a reason naming
+the hook and the defect. Nothing in the manifest, the environment or the CLI changes this.
+
+The inversion applies at the decision point alone. The observation dispatch of the same two
+events keeps the non-fatal default: a `deny` returned there is a dispatch fault, logged and traced
+and honored by nothing, because the call has already happened.
+
+A policy decides on `argv`, `script` and `input`, never on `command` — `command` is truncated for
+display. The runtime does not resolve a build tool's recipe into its body, so a policy gating
+`just build` is deciding on the argv `["build"]` and the resolved path of `just`.
