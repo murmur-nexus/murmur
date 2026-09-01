@@ -16,7 +16,7 @@ mod common;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use capsule_runtime::delegation::{DelegationStatus, Reporter, SpawnerHandle, SPAWNER_ENV};
@@ -40,6 +40,9 @@ const DRIVER_VERSION: &str = "0.1.4";
 /// child that writes it into `out/result.txt` wrote something no runtime composed.
 const MARKER_VAR: &str = "MURMUR_TEST_ALLOWED_VAR";
 const MARKER: &str = "child-result-marker-91f3";
+
+/// How much of a parent's stderr is kept, to quote back when it never reports a launch line.
+const PARENT_STDERR_TAIL_LINES: usize = 20;
 
 struct Suite {
     roost: Roost,
@@ -180,9 +183,24 @@ impl RunningParent {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("MURMUR_ROOST_URL", &suite.roost.url)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("the parent capsule process starts");
+
+        // Retained rather than inherited: a parent that dies before it reports says why on its
+        // stderr, and inheriting scatters that across every other case running at the same time.
+        let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stderr = process.stderr.take().expect("the parent's stderr is piped");
+        let collector = Arc::clone(&stderr_tail);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut tail = collector.lock().unwrap_or_else(|e| e.into_inner());
+                if tail.len() == PARENT_STDERR_TAIL_LINES {
+                    tail.remove(0);
+                }
+                tail.push(line);
+            }
+        });
 
         let stdout = process.stdout.take().expect("the parent reports on stdout");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -200,11 +218,35 @@ impl RunningParent {
                 rest.clear();
             }
         });
-        let line = rx
-            .recv_timeout(Duration::from_secs(180))
-            .ok()
-            .flatten()
-            .expect("the parent prints its --json launch line");
+        // Three different failures, told apart: a parent that died, a parent still running that
+        // never reported, and a pipe that broke. Collapsing them into one message costs the only
+        // evidence there is — most usefully when the `mur` binary itself is unrunnable, which
+        // fails every case here at once and says nothing about itself.
+        let tail = || {
+            let lines = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+            if lines.is_empty() {
+                "(its stderr was empty)".to_string()
+            } else {
+                format!("its last stderr lines were:\n{}", lines.join("\n"))
+            }
+        };
+        let line = match rx.recv_timeout(Duration::from_secs(180)) {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                let status = match process.wait() {
+                    Ok(status) => status.to_string(),
+                    Err(error) => format!("its status could not be read: {error}"),
+                };
+                panic!(
+                    "the parent exited without printing its --json launch line ({status}); {}",
+                    tail()
+                )
+            }
+            Err(_) => panic!(
+                "the parent printed no --json launch line within 180s and is still running; {}",
+                tail()
+            ),
+        };
         let report: Value = serde_json::from_str(&line).unwrap_or_else(|error| {
             panic!("the parent's launch line did not parse: {error}: {line}")
         });
