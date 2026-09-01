@@ -45,7 +45,9 @@ use crate::{
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
     delegation::SpawnerHandle,
-    detached::{demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry},
+    detached::{
+        demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry, DetachedReport,
+    },
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1175,6 +1177,9 @@ pub fn launch_session(
             .resume
             .as_ref()
             .map(|resume| resume.from_session.clone());
+        // The same value, read again below by the reconciliation step, which needs the directory
+        // name after `TraceWriter::open` has taken the one above.
+        let reconcile_from_session = trace_resumed_from.clone();
         let trace_context_id = supplied_context_id.clone();
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
@@ -1522,301 +1527,367 @@ pub fn launch_session(
                     // session boundary that the per-task on-task-start events nest inside.
                     hooks.emit(&workdir, HookEvent::SessionStart).await;
 
-                    let final_loop_result: Result<AgentLoopExit, RuntimeError>;
+                    // Seeded rather than assigned on every exit path: an iteration that only
+                    // closes out work already in a lane can end without a result of its own, and
+                    // then the last real task's outcome is the launch's outcome.
+                    let mut final_loop_result: Result<AgentLoopExit, RuntimeError> =
+                        Ok(AgentLoopExit::Ok);
+
+                    // Set once the loop has stopped taking new work and is running only what is
+                    // already in a lane. A task the runtime generated for itself never crossed
+                    // the peer door, so `task_acceptance` does not gate it: without this,
+                    // `single` and `none` would run the `task.md` task and leave a reconciled
+                    // loss report unread with its marker already written, which is the one
+                    // outcome reconciliation exists to prevent. Neither channel is read here, so
+                    // nothing new can arrive and the loop still ends after one pass.
+                    let mut closing_out = false;
 
                     // Tasks taken off the channel but not yet started. It outlives one iteration
                     // because a task drained while another was running has to still be here when
                     // that one finishes.
                     let mut lanes = LaneQueue::new();
 
+                    // Demoted commands the resumed-from session never accounted for. Only a
+                    // resume does this, and it costs one read of a file `--resume` has already
+                    // read; a launch that resumes nothing does no work here at all.
+                    //
+                    // An unmatched `shell_detached` can only mean the teardown sweep below never
+                    // ran, because that sweep writes `shell_abandoned` for everything outstanding
+                    // on every clean exit. The one over-report is a graceful exit whose own
+                    // `write_shell_abandoned` failed, which reads here as unplanned death; for
+                    // accounting that is the right direction to be wrong in.
+                    if let (Some(from_session), Some(sessions_root)) =
+                        (reconcile_from_session.as_deref(), workdir.parent())
+                    {
+                        if let Some(report) =
+                            crate::detached_reconcile::reconcile_prior_session(
+                                sessions_root,
+                                from_session,
+                                &session_id,
+                                &task_context_id(supplied_context_id.as_deref()),
+                            )
+                            .await
+                        {
+                            enqueue_detached_report(
+                                DetachedReport::Lost(report),
+                                &task_registry,
+                                &mut lanes,
+                                &mut trace,
+                            )
+                            .await;
+                        }
+                    }
+
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
                     // Each iteration processes one task. Single/none modes break after
                     // the first iteration; queue+sleep iterates until channel closes.
                     'task_loop: loop {
                         // ── WAIT FOR NEXT TASK ──
-                        let (incoming_lane, incoming) = match effective_lifecycle.task_acceptance {
-                            TaskAcceptance::None => {
-                                // Does not accept incoming tasks; run from task.md if present
-                                if workdir_task_md.exists() {
-                                    let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                    let context_id = task_context_id(supplied_context_id.as_deref());
-                                    let bytes = tokio::fs::metadata(&workdir_task_md)
-                                        .await
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
-                                    let provenance =
-                                        TaskProvenance::derive(TaskOrigin::User, None);
-                                    let _ = trace
-                                        .write_task_start(
-                                            &task_id,
-                                            &context_id,
-                                            "task_md",
-                                            provenance,
-                                            // A `task.md` task is a person's instruction, not a
-                                            // child reporting back.
-                                            None,
-                                            bytes,
-                                        )
-                                        .await;
-                                    let seed = hooks
-                                        .dispatch_task_start(
-                                            task_id.clone(),
-                                            context_id.clone(),
-                                            "task_md".to_string(),
-                                            bytes,
-                                            seed_budget_tokens,
-                                            u64::from(context_window),
-                                            agent::prior_history_tokens(
-                                                run_config.conversation_root.as_deref(),
-                                                &workdir,
-                                                &conversation_mode,
-                                                Some(&context_id),
-                                                run_config.resume.is_some(),
-                                            ),
-                                        )
-                                        .await;
-                                    otel.begin_session(None);
-                                    state.current_traceparent = otel.outgoing_traceparent();
-                                    state.current_task_provenance = Some(provenance);
-                                    state.current_context_id = Some(context_id.clone());
-                                    // run_task_with_reopens fires on-task-end, honors any
-                                    // reopen-task within budget, and writes the terminal
-                                    // task_end (with reopen_count) itself.
-                                    let result = run_task_with_reopens(
-                                        &mut state,
-                                        &workdir,
-                                        inference,
-                                        effective_lifecycle.max_task_reopens,
-                                        system_prompt,
-                                        run_config,
-                                        &mut hooks,
-                                        &mut trace,
-                                        &mut otel,
-                                        None,
-                                        None,
-                                        &accessible_workdir,
-                                        &capsule_name,
-                                        &capsule_version,
-                                        conversation_mode.clone(),
-                                        Some(context_id.clone()),
-                                        &task_id,
-                                        seed,
-                                    )
-                                    .await;
-                                    final_loop_result = result;
-                                    break 'task_loop;
-                                } else {
-                                    final_loop_result = Ok(AgentLoopExit::Ok);
-                                    break 'task_loop;
-                                }
+                        let (incoming_lane, incoming) = if closing_out {
+                            let active = task_registry.lock().unwrap().active_lane();
+                            match lanes.next(active) {
+                                Some(selected) => selected,
+                                None => break 'task_loop,
                             }
-                            TaskAcceptance::Single | TaskAcceptance::Queue => {
-                                if workdir_task_md.exists() {
-                                    // Backward compat: existing task.md → single run, no A2A
-                                    let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
-                                    let context_id = task_context_id(supplied_context_id.as_deref());
-                                    let bytes = tokio::fs::metadata(&workdir_task_md)
-                                        .await
-                                        .map(|m| m.len())
-                                        .unwrap_or(0);
-                                    let provenance =
-                                        TaskProvenance::derive(TaskOrigin::User, None);
-                                    let _ = trace
-                                        .write_task_start(
-                                            &task_id,
-                                            &context_id,
-                                            "task_md",
-                                            provenance,
-                                            // A `task.md` task is a person's instruction, not a
-                                            // child reporting back.
-                                            None,
-                                            bytes,
-                                        )
-                                        .await;
-                                    let seed = hooks
-                                        .dispatch_task_start(
-                                            task_id.clone(),
-                                            context_id.clone(),
-                                            "task_md".to_string(),
-                                            bytes,
-                                            seed_budget_tokens,
-                                            u64::from(context_window),
-                                            agent::prior_history_tokens(
-                                                run_config.conversation_root.as_deref(),
-                                                &workdir,
-                                                &conversation_mode,
-                                                Some(&context_id),
-                                                run_config.resume.is_some(),
-                                            ),
-                                        )
-                                        .await;
-                                    otel.begin_session(None);
-                                    state.current_traceparent = otel.outgoing_traceparent();
-                                    state.current_task_provenance = Some(provenance);
-                                    state.current_context_id = Some(context_id.clone());
-                                    let result = run_task_with_reopens(
-                                        &mut state,
-                                        &workdir,
-                                        inference,
-                                        effective_lifecycle.max_task_reopens,
-                                        system_prompt.clone(),
-                                        run_config.clone(),
-                                        &mut hooks,
-                                        &mut trace,
-                                        &mut otel,
-                                        None,
-                                        None,
-                                        &accessible_workdir,
-                                        &capsule_name,
-                                        &capsule_version,
-                                        conversation_mode.clone(),
-                                        Some(context_id.clone()),
-                                        &task_id,
-                                        seed,
-                                    )
-                                    .await;
-                                    let _ = trace.flush().await;
-                                    if matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Single) || result.is_err() {
-                                        final_loop_result = result;
-                                        break 'task_loop;
-                                    }
-                                    // Queue mode: remove task.md so the next iteration
-                                    // falls through to task_rx.recv() for queued subtasks.
-                                    let _ = tokio::fs::remove_file(&workdir_task_md).await;
-                                    continue 'task_loop;
-                                }
-                                // Wait for the next task from the mpsc channel.
-                                // queue+sleep mode waits indefinitely — no self-terminating
-                                // timeout. The host (mur-roost) is responsible for shutdown.
-                                // All other modes apply MURMUR_A2A_TIMEOUT_SECS (default 30 s).
-                                let is_queue_sleep =
-                                    matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Queue)
-                                    && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
-
-                                loop {
-                                    // Detached shell commands that finished are turned into
-                                    // tasks first, so a completion delivered while the previous
-                                    // task was running is in its lane before anything is chosen
-                                    // — behind everything a person or a peer is waiting for.
-                                    while let Ok(completion) = completion_rx.try_recv() {
-                                        enqueue_detached_completion(
-                                            completion,
-                                            &task_registry,
-                                            &mut lanes,
+                        } else {
+                            match effective_lifecycle.task_acceptance {
+                                TaskAcceptance::None => {
+                                    // Does not accept incoming tasks; run from task.md if present
+                                    if workdir_task_md.exists() {
+                                        let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
+                                        let context_id = task_context_id(supplied_context_id.as_deref());
+                                        let bytes = tokio::fs::metadata(&workdir_task_md)
+                                            .await
+                                            .map(|m| m.len())
+                                            .unwrap_or(0);
+                                        let provenance =
+                                            TaskProvenance::derive(TaskOrigin::User, None);
+                                        let _ = trace
+                                            .write_task_start(
+                                                &task_id,
+                                                &context_id,
+                                                "task_md",
+                                                provenance,
+                                                // A `task.md` task is a person's instruction, not a
+                                                // child reporting back.
+                                                None,
+                                                bytes,
+                                            )
+                                            .await;
+                                        let seed = hooks
+                                            .dispatch_task_start(
+                                                task_id.clone(),
+                                                context_id.clone(),
+                                                "task_md".to_string(),
+                                                bytes,
+                                                seed_budget_tokens,
+                                                u64::from(context_window),
+                                                agent::prior_history_tokens(
+                                                    run_config.conversation_root.as_deref(),
+                                                    &workdir,
+                                                    &conversation_mode,
+                                                    Some(&context_id),
+                                                    run_config.resume.is_some(),
+                                                ),
+                                            )
+                                            .await;
+                                        otel.begin_session(None);
+                                        state.current_traceparent = otel.outgoing_traceparent();
+                                        state.current_task_provenance = Some(provenance);
+                                        state.current_context_id = Some(context_id.clone());
+                                        // run_task_with_reopens fires on-task-end, honors any
+                                        // reopen-task within budget, and writes the terminal
+                                        // task_end (with reopen_count) itself.
+                                        let result = run_task_with_reopens(
+                                            &mut state,
+                                            &workdir,
+                                            inference,
+                                            effective_lifecycle.max_task_reopens,
+                                            system_prompt.clone(),
+                                            run_config.clone(),
+                                            &mut hooks,
                                             &mut trace,
+                                            &mut otel,
+                                            None,
+                                            None,
+                                            &accessible_workdir,
+                                            &capsule_name,
+                                            &capsule_version,
+                                            conversation_mode.clone(),
+                                            Some(context_id.clone()),
+                                            &task_id,
+                                            seed,
                                         )
                                         .await;
+                                        let failed = result.is_err();
+                                        final_loop_result = result;
+                                        if failed {
+                                            break 'task_loop;
+                                        }
+                                        closing_out = true;
+                                        continue 'task_loop;
+                                    } else {
+                                        closing_out = true;
+                                        continue 'task_loop;
                                     }
-                                    // Everything already delivered goes into its lane before
-                                    // anything is chosen, so the choice is made over the whole
-                                    // backlog. A disconnected channel ends the drain and is
-                                    // handled by the blocking wait below, which sees `None`.
-                                    while let Ok(task) = task_rx.try_recv() {
-                                        lanes.push(task);
+                                }
+                                TaskAcceptance::Single | TaskAcceptance::Queue => {
+                                    if workdir_task_md.exists() {
+                                        // Backward compat: existing task.md → single run, no A2A
+                                        let task_id = format!("tsk_{}", uuid::Uuid::now_v7().simple());
+                                        let context_id = task_context_id(supplied_context_id.as_deref());
+                                        let bytes = tokio::fs::metadata(&workdir_task_md)
+                                            .await
+                                            .map(|m| m.len())
+                                            .unwrap_or(0);
+                                        let provenance =
+                                            TaskProvenance::derive(TaskOrigin::User, None);
+                                        let _ = trace
+                                            .write_task_start(
+                                                &task_id,
+                                                &context_id,
+                                                "task_md",
+                                                provenance,
+                                                // A `task.md` task is a person's instruction, not a
+                                                // child reporting back.
+                                                None,
+                                                bytes,
+                                            )
+                                            .await;
+                                        let seed = hooks
+                                            .dispatch_task_start(
+                                                task_id.clone(),
+                                                context_id.clone(),
+                                                "task_md".to_string(),
+                                                bytes,
+                                                seed_budget_tokens,
+                                                u64::from(context_window),
+                                                agent::prior_history_tokens(
+                                                    run_config.conversation_root.as_deref(),
+                                                    &workdir,
+                                                    &conversation_mode,
+                                                    Some(&context_id),
+                                                    run_config.resume.is_some(),
+                                                ),
+                                            )
+                                            .await;
+                                        otel.begin_session(None);
+                                        state.current_traceparent = otel.outgoing_traceparent();
+                                        state.current_task_provenance = Some(provenance);
+                                        state.current_context_id = Some(context_id.clone());
+                                        let result = run_task_with_reopens(
+                                            &mut state,
+                                            &workdir,
+                                            inference,
+                                            effective_lifecycle.max_task_reopens,
+                                            system_prompt.clone(),
+                                            run_config.clone(),
+                                            &mut hooks,
+                                            &mut trace,
+                                            &mut otel,
+                                            None,
+                                            None,
+                                            &accessible_workdir,
+                                            &capsule_name,
+                                            &capsule_version,
+                                            conversation_mode.clone(),
+                                            Some(context_id.clone()),
+                                            &task_id,
+                                            seed,
+                                        )
+                                        .await;
+                                        let _ = trace.flush().await;
+                                        let failed = result.is_err();
+                                        let single = matches!(
+                                            effective_lifecycle.task_acceptance,
+                                            TaskAcceptance::Single
+                                        );
+                                        if single || failed {
+                                            final_loop_result = result;
+                                            if failed {
+                                                break 'task_loop;
+                                            }
+                                            closing_out = true;
+                                            continue 'task_loop;
+                                        }
+                                        // Queue mode: remove task.md so the next iteration
+                                        // falls through to task_rx.recv() for queued subtasks.
+                                        let _ = tokio::fs::remove_file(&workdir_task_md).await;
+                                        continue 'task_loop;
                                     }
-                                    let active = task_registry.lock().unwrap().active_lane();
-                                    if let Some(selected) = lanes.next(active) {
-                                        break selected;
-                                    }
+                                    // Wait for the next task from the mpsc channel.
+                                    // queue+sleep mode waits indefinitely — no self-terminating
+                                    // timeout. The host (mur-roost) is responsible for shutdown.
+                                    // All other modes apply MURMUR_A2A_TIMEOUT_SECS (default 30 s).
+                                    let is_queue_sleep =
+                                        matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Queue)
+                                        && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
 
-                                    let arrived = if is_queue_sleep {
-                                        // A completion is a second thing worth waking for, so
-                                        // the indefinite wait covers both channels. The
-                                        // completion sender lives as long as the registry does,
-                                        // so only `task_rx` can close, and it still ends the
-                                        // loop when it does.
-                                        tokio::select! {
-                                            arrived = task_rx.recv() => match arrived {
-                                                Some(task) => task,
-                                                None => {
+                                    loop {
+                                        // Detached shell commands that finished are turned into
+                                        // tasks first, so a completion delivered while the previous
+                                        // task was running is in its lane before anything is chosen
+                                        // — behind everything a person or a peer is waiting for.
+                                        while let Ok(completion) = completion_rx.try_recv() {
+                                            enqueue_detached_report(
+                                                DetachedReport::Completed(completion),
+                                                &task_registry,
+                                                &mut lanes,
+                                                &mut trace,
+                                            )
+                                            .await;
+                                        }
+                                        // Everything already delivered goes into its lane before
+                                        // anything is chosen, so the choice is made over the whole
+                                        // backlog. A disconnected channel ends the drain and is
+                                        // handled by the blocking wait below, which sees `None`.
+                                        while let Ok(task) = task_rx.try_recv() {
+                                            lanes.push(task);
+                                        }
+                                        let active = task_registry.lock().unwrap().active_lane();
+                                        if let Some(selected) = lanes.next(active) {
+                                            break selected;
+                                        }
+
+                                        let arrived = if is_queue_sleep {
+                                            // A completion is a second thing worth waking for, so
+                                            // the indefinite wait covers both channels. The
+                                            // completion sender lives as long as the registry does,
+                                            // so only `task_rx` can close, and it still ends the
+                                            // loop when it does.
+                                            tokio::select! {
+                                                arrived = task_rx.recv() => match arrived {
+                                                    Some(task) => task,
+                                                    None => {
+                                                        final_loop_result = Ok(AgentLoopExit::Ok);
+                                                        break 'task_loop;
+                                                    }
+                                                },
+                                                Some(completion) = completion_rx.recv() => {
+                                                    enqueue_detached_report(
+                                                        DetachedReport::Completed(completion),
+                                                        &task_registry,
+                                                        &mut lanes,
+                                                        &mut trace,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            let idle_timeout_secs: u64 =
+                                                std::env::var("MURMUR_A2A_TIMEOUT_SECS")
+                                                    .ok()
+                                                    .and_then(|v| v.parse().ok())
+                                                    .unwrap_or(30);
+                                            // The timeout is on the whole wait, not on the task
+                                            // channel alone: a completion is a second thing worth
+                                            // waking for, and one that arrives inside the window
+                                            // must not be left sitting until the window expires.
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(idle_timeout_secs),
+                                                async {
+                                                    tokio::select! {
+                                                        arrived = task_rx.recv() => Woke::Task(arrived),
+                                                        Some(completion) = completion_rx.recv() => {
+                                                            Woke::Completion(completion)
+                                                        }
+                                                    }
+                                                },
+                                            )
+                                            .await
+                                            {
+                                                // Filed and reconsidered on the next pass around the
+                                                // drain, alongside anything else queued.
+                                                Ok(Woke::Completion(completion)) => {
+                                                    enqueue_detached_report(
+                                                        DetachedReport::Completed(completion),
+                                                        &task_registry,
+                                                        &mut lanes,
+                                                        &mut trace,
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+                                                Ok(Woke::Task(Some(task))) => task,
+                                                Ok(Woke::Task(None)) => {
                                                     final_loop_result = Ok(AgentLoopExit::Ok);
                                                     break 'task_loop;
                                                 }
-                                            },
-                                            Some(completion) = completion_rx.recv() => {
-                                                enqueue_detached_completion(
-                                                    completion,
-                                                    &task_registry,
-                                                    &mut lanes,
-                                                    &mut trace,
-                                                )
-                                                .await;
-                                                continue;
-                                            }
-                                        }
-                                    } else {
-                                        let idle_timeout_secs: u64 =
-                                            std::env::var("MURMUR_A2A_TIMEOUT_SECS")
-                                                .ok()
-                                                .and_then(|v| v.parse().ok())
-                                                .unwrap_or(30);
-                                        // The timeout is on the whole wait, not on the task
-                                        // channel alone: a completion is a second thing worth
-                                        // waking for, and one that arrives inside the window
-                                        // must not be left sitting until the window expires.
-                                        match tokio::time::timeout(
-                                            std::time::Duration::from_secs(idle_timeout_secs),
-                                            async {
-                                                tokio::select! {
-                                                    arrived = task_rx.recv() => Woke::Task(arrived),
-                                                    Some(completion) = completion_rx.recv() => {
-                                                        Woke::Completion(completion)
-                                                    }
+                                                Err(_elapsed) => {
+                                                    eprintln!("[capsule-runtime] no A2A message received within timeout; running with empty task");
+                                                    otel.begin_session(None);
+                                                    state.current_traceparent = otel.outgoing_traceparent();
+                                                    final_loop_result = agent::run_agent_loop(
+                                                        &mut state,
+                                                        &workdir,
+                                                        inference,
+                                                        system_prompt,
+                                                        run_config,
+                                                        &mut hooks,
+                                                        &mut trace,
+                                                        &mut otel,
+                                                        None,
+                                                        None,
+                                                        &accessible_workdir,
+                                                        &capsule_name,
+                                                        &capsule_version,
+                                                        conversation_mode.clone(),
+                                                        None,
+                                                        // No task was ever put in scope on this
+                                                        // path, so `on-task-start` never fired and
+                                                        // there is no seed to apply.
+                                                        None,
+                                                    )
+                                                    .await;
+                                                    break 'task_loop;
                                                 }
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            // Filed and reconsidered on the next pass around the
-                                            // drain, alongside anything else queued.
-                                            Ok(Woke::Completion(completion)) => {
-                                                enqueue_detached_completion(
-                                                    completion,
-                                                    &task_registry,
-                                                    &mut lanes,
-                                                    &mut trace,
-                                                )
-                                                .await;
-                                                continue;
                                             }
-                                            Ok(Woke::Task(Some(task))) => task,
-                                            Ok(Woke::Task(None)) => {
-                                                final_loop_result = Ok(AgentLoopExit::Ok);
-                                                break 'task_loop;
-                                            }
-                                            Err(_elapsed) => {
-                                                eprintln!("[capsule-runtime] no A2A message received within timeout; running with empty task");
-                                                otel.begin_session(None);
-                                                state.current_traceparent = otel.outgoing_traceparent();
-                                                final_loop_result = agent::run_agent_loop(
-                                                    &mut state,
-                                                    &workdir,
-                                                    inference,
-                                                    system_prompt,
-                                                    run_config,
-                                                    &mut hooks,
-                                                    &mut trace,
-                                                    &mut otel,
-                                                    None,
-                                                    None,
-                                                    &accessible_workdir,
-                                                    &capsule_name,
-                                                    &capsule_version,
-                                                    conversation_mode.clone(),
-                                                    None,
-                                                    // No task was ever put in scope on this
-                                                    // path, so `on-task-start` never fired and
-                                                    // there is no seed to apply.
-                                                    None,
-                                                )
-                                                .await;
-                                                break 'task_loop;
-                                            }
-                                        }
-                                    };
-                                    // Back around the drain: a task that landed while this one
-                                    // was in flight is considered alongside it.
-                                    lanes.push(arrived);
+                                        };
+                                        // Back around the drain: a task that landed while this one
+                                        // was in flight is considered alongside it.
+                                        lanes.push(arrived);
+                                    }
                                 }
                             }
                         };
@@ -1925,6 +1996,12 @@ pub fn launch_session(
                         }
 
                         // ── DECIDE WHETHER TO CONTINUE ──
+                        // Closing out runs down whatever is already in a lane and then ends the
+                        // loop, whatever `after_task` says: nothing can arrive to extend it.
+                        if closing_out {
+                            final_loop_result = loop_result;
+                            continue 'task_loop;
+                        }
                         match effective_lifecycle.after_task {
                             AfterTask::Exit => {
                                 final_loop_result = loop_result;
@@ -5312,50 +5389,71 @@ enum Woke {
     Completion(DetachedCompletion),
 }
 
-/// Turn a finished detached command into a queued `completion`-origin task and record the join
-/// between the two in the trace.
+/// Turn a report about detached work into a queued `completion`-origin task, and record whatever
+/// join the report needs in the trace.
 ///
-/// `can_accept` is deliberately not consulted. A completion is work the capsule already admitted
-/// when it admitted the task that started the command, so refusing it would drop a result the
-/// capsule asked for. The `enqueue` is not optional either: `start_task` asserts a positive
-/// pending count, so a task pushed onto the queue without one would trip that assertion. The
-/// consequence is deliberate — an outstanding completion counts against `queue_depth`, so a
-/// capsule with detached work in flight has less room for new inbound requests.
-async fn enqueue_detached_completion(
-    completion: DetachedCompletion,
+/// `can_accept` is not consulted, on either arm. A completion is work the capsule already
+/// admitted when it admitted the task that started the command, and a loss report is the only
+/// account anything will ever give of that work; refusing either would drop the result this path
+/// exists to deliver. The `enqueue` is not optional either: `start_task` asserts a positive
+/// pending count, so a task pushed onto the queue without one would trip that assertion. An
+/// outstanding report therefore counts against `queue_depth`, and a capsule with detached work in
+/// flight has less room for new inbound requests. A loss report costs exactly one pending item
+/// however many work ids it names, and the drain loop clears it on its first pass.
+async fn enqueue_detached_report(
+    report: DetachedReport,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     lanes: &mut LaneQueue,
     trace: &mut TraceWriter,
 ) {
-    let task = IncomingTask {
-        task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
-        context_id: completion.context_id.clone(),
-        message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
-        message_text: completion.message_text(),
-        provenance: completion.provenance,
-        // Nothing propagated a trace context to a background command: the turn that started it
-        // is over, and inventing a parent span would attribute the completion to it.
-        traceparent: None,
-        source: crate::a2a::SOURCE_DETACHED_SHELL,
-        // A demoted shell command reports on a work id, not on a delegation: no sub-capsule was
-        // launched, so there is no delegation for the trace to join this task to.
-        delegation_id: None,
+    let task = match report {
+        DetachedReport::Completed(completion) => {
+            let task = IncomingTask {
+                task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+                context_id: completion.context_id.clone(),
+                message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+                message_text: completion.message_text(),
+                provenance: completion.provenance,
+                // Nothing propagated a trace context to a background command: the turn that
+                // started it is over, and inventing a parent span would attribute the completion
+                // to it.
+                traceparent: None,
+                source: crate::a2a::SOURCE_DETACHED_SHELL,
+                // A demoted shell command reports on a work id, not on a delegation: no
+                // sub-capsule was launched, so there is no delegation for the trace to join this
+                // task to.
+                delegation_id: None,
+            };
+            let _ = trace
+                .write_shell_completed(
+                    &completion.work_id,
+                    &completion.binary,
+                    &completion.command,
+                    completion.exit_code,
+                    completion.duration_ms,
+                    &completion.output_path,
+                    completion.output_bytes,
+                    completion.resource_limit.clone(),
+                    completion.status(),
+                    &task.task_id,
+                )
+                .await;
+            task
+        }
+        // Nothing is written to this session's trace beyond the `task_start` the loop writes when
+        // it starts the task: the `shell_lost` markers are already in the trace of the session
+        // that started the work, which is the file that has to hold them for the marker to clear.
+        DetachedReport::Lost(report) => IncomingTask {
+            task_id: report.task_id.clone(),
+            context_id: report.context_id.clone(),
+            message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+            message_text: report.message_text(),
+            provenance: report.provenance,
+            traceparent: None,
+            source: crate::a2a::SOURCE_DETACHED_LOST,
+            delegation_id: None,
+        },
     };
-
-    let _ = trace
-        .write_shell_completed(
-            &completion.work_id,
-            &completion.binary,
-            &completion.command,
-            completion.exit_code,
-            completion.duration_ms,
-            &completion.output_path,
-            completion.output_bytes,
-            completion.resource_limit.clone(),
-            completion.status(),
-            &task.task_id,
-        )
-        .await;
 
     task_registry
         .lock()

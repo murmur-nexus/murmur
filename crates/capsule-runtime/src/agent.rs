@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput},
+    detached::DetachedDispatchInfo,
     errors::RuntimeError,
     hooks::{
         CallDecision, DispatchFault, HookEvent, HookRuntime, HookSeed, FAULT_ARM_SEED_REJECTED,
@@ -958,20 +959,7 @@ pub(crate) async fn run_agent_loop(
                             // and a demoted command has none yet; a hook learns about one when
                             // its completion arrives as a task, like the model does.
                             if let Some(detached) = outcome.detached {
-                                trace
-                                    .write_shell_detached(
-                                        turn_u32,
-                                        &detached.work_id,
-                                        &detached.binary,
-                                        &detached.command,
-                                        detached.grace_ms,
-                                    )
-                                    .await
-                                    .map_err(|e| {
-                                        RuntimeError::AgentLoopFailed(format!(
-                                            "trace write failed: {e}"
-                                        ))
-                                    })?;
+                                record_demotion(trace, turn_u32, &detached).await;
                             }
                             // Emit artifact event after tool call returns
                             if task_id.is_some() {
@@ -1279,6 +1267,51 @@ fn denial_tool_result(hook_name: &str, reason: &str) -> String {
         "Refused by policy hook '{hook_name}': {reason}\n\n\
          This call did not run. Retrying it unchanged will be refused again."
     )
+}
+
+/// Record a demotion, and let the demotion stand when the record cannot be written.
+///
+/// Fail open, which is the inverse of the fail-closed rule governing the deny arm of a shell or
+/// tool call. There, a call whose refusal cannot be recorded is refused anyway, because an
+/// unrecorded call is an unaudited one. Here the command is already running: refusing would end
+/// the session over one file write and still leave it running, and it would cost the capsule the
+/// ability to detach at all in exchange for the ability to report a loss.
+///
+/// The `shell_detach_unrecorded` attempt goes to the file that just failed, so it usually fails
+/// too. Stderr is what a reader gets when it does, and the consequence to state there is the one
+/// that outlives the session: with no `shell_detached` line, a later resume has nothing to find
+/// and this command's loss is never reported.
+pub(crate) async fn record_demotion(
+    trace: &mut TraceWriter,
+    turn: u32,
+    detached: &DetachedDispatchInfo,
+) {
+    let Err(error) = trace
+        .write_shell_detached(
+            turn,
+            &detached.work_id,
+            &detached.binary,
+            &detached.command,
+            detached.grace_ms,
+        )
+        .await
+    else {
+        return;
+    };
+    eprintln!(
+        "[capsule-runtime] could not record the demotion of shell command {} ({}) in trace.jsonl \
+         ({error}); the command keeps running in the background and its loss will not be \
+         reportable on a later resume",
+        detached.work_id, detached.binary
+    );
+    let _ = trace
+        .write_shell_detach_unrecorded(
+            turn,
+            &detached.work_id,
+            &detached.binary,
+            &error.to_string(),
+        )
+        .await;
 }
 
 /// Drain every unsupported-arm fault a blocking hook buffered and write each one to

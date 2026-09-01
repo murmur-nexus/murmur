@@ -577,3 +577,376 @@ fn shell_records_work_abandoned_when_the_session_ends() {
         ended_at - detached_at
     );
 }
+
+/// Sessions of `project_dir`, newest last. The launch writes one directory per run under
+/// `<manifest dir>/workdir`, which is where `--resume` looks for the one it names.
+fn session_dirs(project_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(project_dir.join("workdir"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_dir()
+                        && path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with("ses_"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
+}
+
+fn session_name(dir: &Path) -> String {
+    dir.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+/// `mur run` as a child process, with its output redirected to files under `project_dir` so a
+/// process that is killed still leaves what it printed behind.
+fn spawn_mur_run(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    args: &[&str],
+    tag: &str,
+) -> std::process::Child {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"));
+    command
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        // The idle wait after a queue capsule's `task.md` task, kept short so a resume with
+        // nothing left to report ends in seconds rather than the 30-second default.
+        .env("MURMUR_A2A_TIMEOUT_SECS", "2")
+        .arg("run")
+        .arg("--manifest")
+        .arg(manifest_path)
+        .args(args)
+        .stdout(std::fs::File::create(project_dir.join(format!("{tag}-stdout.txt"))).unwrap())
+        .stderr(std::fs::File::create(project_dir.join(format!("{tag}-stderr.txt"))).unwrap());
+    command.spawn().expect("mur run should execute")
+}
+
+/// Block until `predicate` holds over the newest session's trace, or fail.
+fn await_trace<F: Fn(&[Value]) -> bool>(project_dir: &Path, what: &str, predicate: F) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        if let Some(dir) = session_dirs(project_dir).last() {
+            if predicate(&trace_events(dir)) {
+                return dir.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// A demoted command whose runtime is killed outright is reported by the next resume, as a loss
+/// and never as a result — and reported once, because the marker that reports it also clears it.
+#[test]
+fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
+    if common::skip_without_host_support(
+        "shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume",
+    ) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        bash_call("msg_1", "toolu_build", "sleep 60; echo never-seen"),
+        end_turn("msg_2", "Started the build."),
+        end_turn("msg_3", "Continued once."),
+        end_turn("msg_4", "Noted the lost work."),
+        end_turn("msg_5", "Continued twice."),
+        end_turn("msg_6", "Nothing outstanding."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    // `after_task: sleep` holds the first run open after its task, so the kill lands while the
+    // demoted command is still outstanding rather than racing the session's own exit.
+    let killed_manifest = create_agent_project_with_lifecycle(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+        "lifecycle:\n  shell_grace_secs: 1\n  task_acceptance: queue\n  after_task: sleep\n",
+    );
+
+    let mut killed = spawn_mur_run(
+        &home,
+        project.path(),
+        &killed_manifest,
+        &["--task", "Start a long build.", "--json"],
+        "killed",
+    );
+    // Both, not just the demotion: the task has to be over for the run to have reached the wait
+    // the kill interrupts.
+    let killed_dir = await_trace(
+        project.path(),
+        "the first run to demote and finish its task",
+        |events| {
+            !events_of_type(events, "shell_detached").is_empty()
+                && !events_of_type(events, "task_end").is_empty()
+        },
+    );
+    killed.kill().expect("SIGKILL reaches the run");
+    killed.wait().expect("the killed run is reaped");
+
+    let killed_events = trace_events(&killed_dir);
+    let detached = events_of_type(&killed_events, "shell_detached");
+    assert_eq!(detached.len(), 1, "exactly one command was demoted");
+    let work_id = detached[0]["work_id"].as_str().unwrap().to_string();
+    let detached_at_ms = detached[0]["timestamp"].as_u64().unwrap();
+    let binary = detached[0]["binary"].as_str().unwrap().to_string();
+    assert!(
+        events_of_type(&killed_events, "session_end").is_empty(),
+        "a killed runtime writes no session_end, which is what leaves the demotion unaccounted"
+    );
+
+    // ── First resume: the loss is reported ──
+    // No `lifecycle:` block at all, so the resume runs on the defaults — `task_acceptance:
+    // single`, one task and out. The report is not an incoming task, so it still runs.
+    let resume_manifest = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash", "sleep"],
+    );
+    let killed_session = session_name(&killed_dir);
+    let status = spawn_mur_run(
+        &home,
+        project.path(),
+        &resume_manifest,
+        &["--resume", &killed_session, "--task", "Carry on.", "--json"],
+        "resume-1",
+    )
+    .wait()
+    .unwrap();
+    let resume_stderr = fs::read_to_string(project.path().join("resume-1-stderr.txt")).unwrap();
+    assert!(status.success(), "the resume failed:\n{resume_stderr}");
+
+    let resumed_dir = session_dirs(project.path())
+        .into_iter()
+        .find(|dir| dir != &killed_dir)
+        .expect("the resume opened its own session");
+    let resumed_events = trace_events(&resumed_dir);
+    let reports: Vec<&Value> = events_of_type(&resumed_events, "task_start")
+        .into_iter()
+        .filter(|event| event["source"] == "detached_lost")
+        .collect();
+    assert_eq!(reports.len(), 1, "one task reports the whole loss");
+    assert_eq!(reports[0]["origin"], "completion");
+    assert_eq!(reports[0]["lane"], "bg");
+
+    // The lanes path writes the task's own message to task.md before running it, so this is the
+    // text the agent was handed.
+    let message = fs::read_to_string(resumed_dir.join("task.md")).unwrap();
+    for named in [
+        work_id.as_str(),
+        binary.as_str(),
+        "sleep 60; echo never-seen",
+        &detached_at_ms.to_string(),
+    ] {
+        assert!(
+            message.contains(named),
+            "the report must name {named}:\n{message}"
+        );
+    }
+    assert!(
+        !message.starts_with("Background shell command finished."),
+        "the report must not open like a completion:\n{message}"
+    );
+    assert!(
+        !message.contains(&format!("logs/{work_id}.log")),
+        "no log file exists, so the report names none:\n{message}"
+    );
+
+    let resumed_session = session_name(&resumed_dir);
+    let killed_events = trace_events(&killed_dir);
+    let lost = events_of_type(&killed_events, "shell_lost");
+    assert_eq!(lost.len(), 1, "one marker accounts for the demotion");
+    assert_eq!(lost[0]["work_id"], work_id.as_str());
+    assert_eq!(lost[0]["session_id"], killed_session.as_str());
+    assert_eq!(lost[0]["reconciled_by_session"], resumed_session.as_str());
+    assert_eq!(lost[0]["detached_at_ms"], detached_at_ms);
+    for absent in ["exit_code", "status", "duration_ms", "output_path"] {
+        assert!(
+            lost[0].get(absent).is_none(),
+            "a lost command has no {absent}: {}",
+            lost[0]
+        );
+    }
+    for events in [&killed_events, &resumed_events] {
+        for event_type in ["shell_completed", "shell_abandoned"] {
+            assert!(
+                events_of_type(events, event_type)
+                    .iter()
+                    .all(|event| event["work_id"] != work_id.as_str()),
+                "{work_id} must never be reported as a {event_type}"
+            );
+        }
+    }
+    assert!(
+        !resumed_dir.join(format!("logs/{work_id}.log")).exists(),
+        "a killed runtime writes no output log"
+    );
+
+    // ── Second resume: the marker has cleared it ──
+    let status = spawn_mur_run(
+        &home,
+        project.path(),
+        &resume_manifest,
+        &[
+            "--resume",
+            &killed_session,
+            "--task",
+            "Carry on again.",
+            "--json",
+        ],
+        "resume-2",
+    )
+    .wait()
+    .unwrap();
+    let second_stderr = fs::read_to_string(project.path().join("resume-2-stderr.txt")).unwrap();
+    assert!(
+        status.success(),
+        "the second resume failed:\n{second_stderr}"
+    );
+
+    let second_dir = session_dirs(project.path())
+        .into_iter()
+        .find(|dir| dir != &killed_dir && dir != &resumed_dir)
+        .expect("the second resume opened its own session");
+    assert!(
+        events_of_type(&trace_events(&second_dir), "task_start")
+            .iter()
+            .all(|event| event["source"] != "detached_lost"),
+        "a marked work id is not reported again"
+    );
+    assert_eq!(
+        events_of_type(&trace_events(&killed_dir), "shell_lost").len(),
+        1,
+        "a second resume adds no second marker"
+    );
+}
+
+/// A prior trace that cannot be read, and one whose writer was killed mid-line, both leave the
+/// resume running: reconciliation reports nothing rather than refusing the launch.
+#[test]
+fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
+    if common::skip_without_host_support(
+        "a_resume_over_an_unreadable_prior_trace_still_runs_its_task",
+    ) {
+        return;
+    }
+    let server = ScriptedServer::start(vec![
+        end_turn("msg_1", "First run."),
+        end_turn("msg_2", "Resumed over a torn trace."),
+        end_turn("msg_3", "Noted the record above the tear."),
+        end_turn("msg_4", "Resumed over an unreadable trace."),
+    ]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    let manifest_path = create_agent_project(
+        project.path(),
+        &server.endpoint,
+        DRIVER_ANTHROPIC_NAME,
+        &["bash"],
+    );
+
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "Say something.").unwrap();
+    let first = launch_session(staged, |_| {}).expect("the first launch should succeed");
+    let first_session = session_name(&first.workdir);
+    let context_id = trace_events(&first.workdir)
+        .iter()
+        .find(|event| event["event_type"] == "task_start")
+        .and_then(|event| event["context_id"].as_str().map(str::to_string))
+        .expect("the first run recorded a context id");
+
+    // A trace whose writer was killed mid-record: a complete `shell_detached` line followed by a
+    // partial one.
+    let trace_path = first.workdir.join("trace.jsonl");
+    let mut torn = fs::read_to_string(&trace_path).unwrap();
+    torn.push_str(
+        "{\"event_type\":\"shell_detached\",\"event_id\":\"evt_torn\",\"session_id\":\"s\",\"timestamp\":1750,\"turn\":1,\"task_id\":\"tsk_x\",\"work_id\":\"wrk_torn\",\"binary\":\"/usr/bin/bash\",\"command\":\"sleep 60\",\"grace_ms\":1000}\n{\"event_type\":\"shell_com",
+    );
+    fs::write(&trace_path, &torn).unwrap();
+
+    let staged = common::stage_agent_session_resuming(
+        &home,
+        project.path(),
+        &manifest_path,
+        &first_session,
+        &context_id,
+    );
+    fs::write(staged.workdir.join("task.md"), "Continue.").unwrap();
+    let resumed =
+        launch_session(staged, |_| {}).expect("a torn prior trace must not fail a resume");
+    assert!(
+        resumed.workdir.join("out/result.txt").exists(),
+        "the resumed session still ran its task"
+    );
+    // Read leniently: this file ends mid-record, which is the shape the scan has to tolerate.
+    let torn_events: Vec<Value> = fs::read_to_string(&trace_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        events_of_type(&torn_events, "shell_lost").len(),
+        1,
+        "the complete record above the tear is still accounted for"
+    );
+    // This manifest declares no `lifecycle:` block, so the resume runs on the defaults. The
+    // report still reaches the agent: a marker is only written for a loss that gets reported.
+    assert_eq!(
+        events_of_type(&trace_events(&resumed.workdir), "task_start")
+            .iter()
+            .filter(|event| event["source"] == "detached_lost")
+            .count(),
+        1,
+        "a default capsule reports the loss as well as marking it"
+    );
+
+    // Unreadable rather than unparseable: the read itself fails, and the launch still runs.
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&trace_path, fs::Permissions::from_mode(0o000)).unwrap();
+    let staged = common::stage_agent_session_resuming(
+        &home,
+        project.path(),
+        &manifest_path,
+        &first_session,
+        &context_id,
+    );
+    fs::write(staged.workdir.join("task.md"), "Continue again.").unwrap();
+    let resumed =
+        launch_session(staged, |_| {}).expect("an unreadable prior trace must not fail a resume");
+    assert!(
+        resumed.workdir.join("out/result.txt").exists(),
+        "the resumed session still ran its task"
+    );
+    fs::set_permissions(&trace_path, fs::Permissions::from_mode(0o644)).unwrap();
+}

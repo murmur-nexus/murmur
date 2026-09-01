@@ -1256,6 +1256,25 @@ lifecycle:
   shell_grace_secs: 2
 ```
 
+#### What a backgrounded command costs when the host dies
+
+A backgrounded command outlives the runtime that started it. If the runtime is killed — `SIGKILL`,
+an out-of-memory kill, a host that goes away — the command keeps running with nothing reading its
+output, and nothing of its result survives: no exit code, no `logs/<work_id>.log`, no record of
+whether it finished. The work is a full run's compute spent for nothing, so `lifecycle.shell_grace_secs` is
+also a decision about how much compute one lost host can waste.
+
+The record of the demotion does survive. The `shell_detached` line is written and flushed at the
+moment the command moves to the background, so a `SIGKILL` or a process crash keeps it, and
+`mur run --resume <session>` reports every such command that has no matching completion as a loss
+— once, naming the work id, the binary, the command and when it was detached. A host power loss
+is the case that does not hold: the line is flushed, not synced to the disk, so the last few
+seconds of the file can go with the machine.
+
+A demotion whose own record cannot be written does not fail the command or the session. The
+command runs, the turn keeps its handle, and the failure is announced on stderr — with the
+consequence that a later resume has nothing to find and that command's loss is never reported.
+
 ### `lifecycle.conversation` { #lifecycle-conversation }
 
 Controls whether a task starts from the conversation its `contextId` already has. It governs what

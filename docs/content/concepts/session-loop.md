@@ -200,3 +200,24 @@ Delivery depends on the capsule still being alive. Under the default `after_task
 session ends with the task that started the command, and a command still running is recorded as
 `shell_abandoned` — once in `trace.jsonl` and once on stderr — with its result lost. A capsule
 that means to hear back runs `task_acceptance: queue` with `after_task: sleep`.
+
+### What a resume reports about the session before it
+
+Ending a session cleanly accounts for every command it backgrounded: each one gets a
+`shell_completed` or a `shell_abandoned`. A runtime that is killed outright writes neither, and
+leaves its `shell_detached` lines standing on their own.
+
+`mur run --resume <session>` reads the resumed-from session's `trace.jsonl` and reports every such
+command as one task with origin `completion` in the `bg` lane, naming the work id, the binary, the
+command and when it was detached. It is a report of loss, not a result: there is no exit code, no
+output and no log file for a command whose runtime died, and whether the command itself finished
+is unknown. Nothing is recovered, nothing is adopted, and the command — which the kernel does not
+kill along with the runtime — is left to run out on its own.
+
+The report is a task the capsule generated for itself, so `lifecycle.task_acceptance` does not
+gate it: a resume delivers it under `none`, `single` and `queue` alike, after the task the resume
+was launched for.
+
+Each reported command is marked `shell_lost` in the trace of the session that started it, so a
+second resume of the same session reports nothing. A session that ended cleanly has nothing to
+report either way.

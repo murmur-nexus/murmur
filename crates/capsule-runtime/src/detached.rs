@@ -246,6 +246,91 @@ impl DetachPolicy {
     }
 }
 
+// -- Work a dead session left unaccounted ------------------------------------
+
+/// A demoted command whose session died before anything could be recorded about it.
+///
+/// Reconstructed from the prior session's `shell_detached` line, which is the only trace of it
+/// that survives: [`DetachedRegistry`] lives in process memory, and [`crate::shell`] writes the
+/// output log from a runtime thread after `child.wait()` returns, so a runtime killed with
+/// `SIGKILL` leaves no `logs/<work id>.log` even for a command that ran to a clean exit.
+#[derive(Debug, Clone)]
+pub(crate) struct LostWork {
+    pub work_id: String,
+    /// As [`DetachedWork::binary`].
+    pub binary: String,
+    /// As [`DetachedWork::command`].
+    pub command: String,
+    /// The `shell_detached` line's own timestamp — the demotion instant, which is the start
+    /// instant plus the grace period the command outran.
+    pub detached_at_ms: u64,
+}
+
+/// Every unaccounted command of one prior session, reported as one task.
+///
+/// One report per resume rather than one per work id: enqueuing raises `pending_count` and so
+/// counts against `lifecycle.queue_depth`, and a session that lost ten commands must not cost ten
+/// pending slots to say so.
+#[derive(Debug, Clone)]
+pub(crate) struct LostReport {
+    /// The session that started the work, and whose `trace.jsonl` holds both the unmatched
+    /// `shell_detached` lines and the `shell_lost` lines that account for them.
+    pub started_in_session: String,
+    /// Non-empty by construction: a report with nothing in it is never built.
+    pub lost: Vec<LostWork>,
+    /// The conversation the resume runs under, so the report joins that thread.
+    pub context_id: String,
+    /// [`TaskOrigin::Completion`] carrying the lowest trust across [`Self::lost`] — one untrusted
+    /// command makes the whole report untrusted.
+    pub provenance: TaskProvenance,
+    /// The task this report is enqueued as. Minted before the `shell_lost` markers are appended,
+    /// because each marker names it as `reconciled_task_id`.
+    pub task_id: String,
+}
+
+impl LostReport {
+    /// The `IncomingTask.message_text` the agent reads: the work id, the binary, the command and
+    /// the demotion instant of each lost command, and the statement that nothing about them is
+    /// recoverable.
+    ///
+    /// Shares no opening line with [`DetachedCompletion::message_text`]. A model that cannot tell
+    /// "it failed" from "nobody knows" retries, and the retry is the cost demotion exists to
+    /// remove. Names no output path, quotes no byte count and asserts no exit code, because none
+    /// of the three exists.
+    pub(crate) fn message_text(&self) -> String {
+        let mut text = format!(
+            "Background shell commands from an earlier session were never accounted for.\n\
+             \n\
+             Session {} ended without recording what became of the commands below; they were \
+             running in the background at the time. Nothing about them was recovered and nothing \
+             can be: no exit code, no output and no log file exists for any of them, and whether \
+             each command finished at all is unknown.\n",
+            self.started_in_session
+        );
+        for work in &self.lost {
+            text.push_str(&format!(
+                "\nwork_id: {}\nbinary: {}\ncommand: {}\ndetached_at_ms: {}\n",
+                work.work_id, work.binary, work.command, work.detached_at_ms
+            ));
+        }
+        text.push_str(
+            "\nNone of these is known to have succeeded and none is known to have failed. Treat \
+             each as unknown, and start the work again only if it still matters.",
+        );
+        text
+    }
+}
+
+/// What the task loop turns into a `completion`-origin task.
+///
+/// One enum rather than two enqueue paths: an authority reporting on work it started is the same
+/// shape whether the work finished under this runtime or was left unaccounted by one that died.
+#[derive(Debug, Clone)]
+pub(crate) enum DetachedReport {
+    Completed(DetachedCompletion),
+    Lost(LostReport),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

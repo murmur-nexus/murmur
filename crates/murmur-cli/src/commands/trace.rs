@@ -244,6 +244,17 @@ struct ShellAbandonedEvent {
     running_ms: u64,
 }
 
+/// A demoted command a later resume found unaccounted for, appended to the trace of the session
+/// that started it. Carries no exit code, duration or output path, because none exists.
+#[derive(Debug, Deserialize)]
+struct ShellLostEvent {
+    work_id: String,
+    #[serde(default)]
+    binary: Option<String>,
+    detached_at_ms: u64,
+    reconciled_by_session: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct CompactionEvent {
     turn: u32,
@@ -407,6 +418,7 @@ enum TraceEvent {
     ShellDetached(ShellDetachedEvent),
     ShellCompleted(ShellCompletedEvent),
     ShellAbandoned(ShellAbandonedEvent),
+    ShellLost(ShellLostEvent),
     Compaction(CompactionEvent),
     CompactionDeclined(CompactionDeclinedEvent),
     ContextSeed(ContextSeedEvent),
@@ -969,13 +981,16 @@ fn compute_metrics(
             }
             // A demoted command's exit code and duration exist only on its completion, so that
             // is where its latency and exit code are counted — once, as a foreground command is
-            // counted once from its own `shell` record. A command abandoned at session end
-            // contributes neither, because it never produced either.
+            // counted once from its own `shell` record. A command abandoned at session end, and
+            // one a later resume found unaccounted for, contribute neither, because neither ever
+            // produced either.
             TraceEvent::ShellCompleted(e) => {
                 shell_latencies.push(e.duration_ms);
                 *shell_exit_codes.entry(e.exit_code).or_insert(0) += 1;
             }
-            TraceEvent::ShellDetached(_) | TraceEvent::ShellAbandoned(_) => {}
+            TraceEvent::ShellDetached(_)
+            | TraceEvent::ShellAbandoned(_)
+            | TraceEvent::ShellLost(_) => {}
             TraceEvent::Compaction(e) => {
                 compaction = Some(CompactionRecord {
                     turn: e.turn,
@@ -2150,6 +2165,14 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             fmt_id_short(&e.work_id, 12),
             fmt_dur(e.running_ms)
         ),
+        TraceEvent::ShellLost(e) => format!(
+            "{}{}  {}  detached at {}  no result, reported by {}",
+            kind("shell_lost"),
+            e.binary.as_deref().unwrap_or("—"),
+            fmt_id_short(&e.work_id, 12),
+            e.detached_at_ms,
+            fmt_id_short(&e.reconciled_by_session, 12)
+        ),
         TraceEvent::SkillCall(e) => format!(
             "{}{}  {}  {}",
             kind("skill_call"),
@@ -3205,8 +3228,24 @@ mod tests {
         );
     }
 
-    /// A trace holding none of the three new records renders exactly as it did before they
-    /// existed: the reader skips what it does not know rather than failing the parse.
+    /// A lost command's row shares no shape with a completion's: no exit code, no status mark,
+    /// no duration and no output path, because a lost command produced none of them.
+    #[test]
+    fn shell_lost_row_says_no_result_exists_and_names_who_reported_it() {
+        let line = r#"{"event_type":"shell_lost","event_id":"evt_5","session_id":"ses_0a1b2c3d4e5f6a7b","timestamp":5,"work_id":"wrk_0a1b2c3d4e5f6a7b","binary":"/usr/bin/bash","command":"make -j8","detached_at_ms":1750,"reconciled_by_session":"ses_9f8e7d6c5b4a3210","reconciled_task_id":"tsk_3"}"#;
+        let rendered = row(line);
+        assert_eq!(
+            rendered,
+            "shell_lost /usr/bin/bash  wrk_0a1b2c3d…  detached at 1750  no result, reported by ses_9f8e7d6c…"
+        );
+        assert!(
+            !rendered.contains("exit"),
+            "a lost command asserts no exit code: {rendered}"
+        );
+    }
+
+    /// A trace holding none of these records renders exactly as it did without them: the reader
+    /// skips what it does not know rather than failing the parse.
     #[test]
     fn an_unknown_event_type_still_renders_nothing() {
         let line = r#"{"event_type":"not_an_event_this_reader_knows","event_id":"evt_4","session_id":"s","timestamp":4}"#;

@@ -522,6 +522,60 @@ struct ShellAbandonedEvent {
     running_ms: u64,
 }
 
+/// A demoted command a later launch found unaccounted for, appended to the `trace.jsonl` of the
+/// session that started it.
+///
+/// Carries no `exit_code`, no `status`, no `duration_ms`, no `output_path` and no `output_bytes`:
+/// none of them exists for a command whose runtime died, and a record that named any of them
+/// would be readable as a result. The event type is the whole discriminator against
+/// [`ShellCompletedEvent`].
+///
+/// Its presence is also what stops the same work id being reported by a second resume, so this
+/// line and the `shell_detached` it answers live in the same file and are pruned together by
+/// [`crate::retention::prune_sessions`].
+#[derive(Serialize)]
+struct ShellLostEvent {
+    event_type: &'static str,
+    event_id: String,
+    /// The prior session's own `session_start` node. Omitted from the line when that record could
+    /// not be read back — a line must never name a parent the file does not hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<String>,
+    /// The prior session's id, not the resuming one's, so the file stays internally consistent.
+    session_id: String,
+    timestamp: u64,
+    work_id: String,
+    binary: String,
+    command: String,
+    /// The `shell_detached` line's own timestamp.
+    detached_at_ms: u64,
+    /// The session that found the work unaccounted for and reported it.
+    reconciled_by_session: String,
+    /// The `completion`-origin task that session enqueued to report it, which is what makes "which
+    /// task reported this loss" answerable from the two files alone.
+    reconciled_task_id: String,
+}
+
+/// A demotion whose own `shell_detached` line could not be written.
+///
+/// Best-effort and usually absent: it goes to the file that just failed. When it does land, it is
+/// the record that the work id below has no `shell_detached` line and so will never be reported
+/// as lost.
+#[derive(Serialize)]
+struct ShellDetachUnrecordedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    work_id: String,
+    binary: String,
+    /// The write error, as the operating system reported it.
+    reason: String,
+}
+
 #[derive(Serialize)]
 struct CompactionEvent {
     event_type: &'static str,
@@ -1331,6 +1385,29 @@ impl TraceWriter {
         self.write_event(&event).await
     }
 
+    /// A demotion the trace could not record, written where the failure was seen.
+    pub(crate) async fn write_shell_detach_unrecorded(
+        &mut self,
+        turn: u32,
+        work_id: &str,
+        binary: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = ShellDetachUnrecordedEvent {
+            event_type: "shell_detach_unrecorded",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            work_id: work_id.to_string(),
+            binary: binary.to_string(),
+            reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
     pub(crate) async fn write_a2a_task_received(
         &mut self,
         task_id: &str,
@@ -1905,6 +1982,104 @@ impl ResourceTraceAppender {
     }
 }
 
+// -- Prior-session appender ---------------------------------------------------
+
+/// An `O_APPEND` handle to a *previous* session's `trace.jsonl`, opened by a resuming launch to
+/// account for demoted commands that session left unreported.
+///
+/// The marker goes in the file that holds the unmatched `shell_detached` line rather than in the
+/// resuming session's own trace, which keeps clearing O(1) instead of a scan of every sibling
+/// session, and means [`crate::retention::prune_sessions`] removes a marker and the work it
+/// accounts for together.
+///
+/// Writing to another session's trace is safe because that session's writer is dead — that is the
+/// precondition for there being anything unaccounted — and because this obeys the same rule
+/// [`ResourceTraceAppender`] does: one complete line per `write_all`, then flush, which `O_APPEND`
+/// makes atomic against any other writer.
+pub(crate) struct PriorSessionTraceAppender {
+    file: File,
+    /// The prior session's id, which is what its own lines carry.
+    session_id: String,
+    /// That session's `session_start` node, read back from the same file.
+    session_event_id: Option<String>,
+    /// Whether the file's last record is unterminated, which a writer killed mid-`write_all`
+    /// leaves behind. The first appended line opens with a newline when it is, so the marker is
+    /// a line of its own rather than spliced onto the torn one.
+    terminate_torn_tail: bool,
+}
+
+impl PriorSessionTraceAppender {
+    /// `trace_path` is the prior session's `trace.jsonl`. Errors when it cannot be opened for
+    /// appending, which the caller reports rather than reporting work it could not mark.
+    pub(crate) async fn open(
+        trace_path: &Path,
+        session_id: String,
+        session_event_id: Option<String>,
+    ) -> std::io::Result<Self> {
+        let terminate_torn_tail = !ends_with_newline(trace_path)?;
+        let file = OpenOptions::new().append(true).open(trace_path).await?;
+        Ok(Self {
+            file,
+            session_id,
+            session_event_id,
+            terminate_torn_tail,
+        })
+    }
+
+    /// Records one demoted command as lost, and reports whether the line landed.
+    ///
+    /// The result is not swallowed: a work id whose marker did not land must be dropped from the
+    /// report rather than reported unmarked, because an unmarked work id is reported again by
+    /// every later resume of the same session.
+    pub(crate) async fn write_shell_lost(
+        &mut self,
+        work: &crate::detached::LostWork,
+        reconciled_by_session: &str,
+        reconciled_task_id: &str,
+    ) -> std::io::Result<()> {
+        let event = ShellLostEvent {
+            event_type: "shell_lost",
+            event_id: new_event_id(),
+            parent_id: self.session_event_id.clone(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            work_id: work.work_id.clone(),
+            binary: work.binary.clone(),
+            command: work.command.clone(),
+            detached_at_ms: work.detached_at_ms,
+            reconciled_by_session: reconciled_by_session.to_string(),
+            reconciled_task_id: reconciled_task_id.to_string(),
+        };
+        let mut line = if self.terminate_torn_tail {
+            "\n".to_string()
+        } else {
+            String::new()
+        };
+        line.push_str(&serde_json::to_string(&event).map_err(std::io::Error::other)?);
+        line.push('\n');
+        self.file.write_all(line.as_bytes()).await?;
+        self.file.flush().await?;
+        self.terminate_torn_tail = false;
+        Ok(())
+    }
+}
+
+/// Whether the file's last byte is a newline. An empty file counts as terminated: there is no
+/// record for an appended line to run into.
+fn ends_with_newline(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
 pub(crate) fn timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1952,6 +2127,68 @@ mod tests {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    fn demotion_info() -> crate::detached::DetachedDispatchInfo {
+        crate::detached::DetachedDispatchInfo {
+            work_id: "wrk_0a1b2c3d4e5f6a7b".to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "make -j8".to_string(),
+            grace_ms: 1_000,
+        }
+    }
+
+    /// A demotion whose marker cannot be written stands anyway: the write failure is reported and
+    /// swallowed, and the session carries on with the command running in the background.
+    #[tokio::test]
+    async fn a_demotion_marker_that_cannot_be_written_does_not_fail_the_demotion() {
+        let dir = tempfile::tempdir().unwrap();
+        // `/dev/full` opens and fails every write with `ENOSPC`, which is the one way to get a
+        // trace handle that is valid and unwritable without root.
+        std::os::unix::fs::symlink("/dev/full", dir.path().join("trace.jsonl")).unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        let info = demotion_info();
+
+        assert!(
+            writer
+                .write_shell_detached(1, &info.work_id, &info.binary, &info.command, info.grace_ms)
+                .await
+                .is_err(),
+            "the sink under this writer must be unwritable for the claim below to mean anything"
+        );
+        crate::agent::record_demotion(&mut writer, 1, &info).await;
+    }
+
+    /// The ordinary path writes one `shell_detached` and nothing else.
+    #[tokio::test]
+    async fn a_recorded_demotion_writes_only_its_own_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        crate::agent::record_demotion(&mut writer, 3, &demotion_info()).await;
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "shell_detached");
+        assert_eq!(events[0]["work_id"], "wrk_0a1b2c3d4e5f6a7b");
+        assert_eq!(events[0]["turn"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_demotion_names_the_work_id_and_the_write_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        writer
+            .write_shell_detach_unrecorded(2, "wrk_0a1b", "/usr/bin/bash", "No space left")
+            .await
+            .unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "shell_detach_unrecorded");
+        assert_eq!(events[0]["turn"], 2);
+        assert_eq!(events[0]["work_id"], "wrk_0a1b");
+        assert_eq!(events[0]["binary"], "/usr/bin/bash");
+        assert_eq!(events[0]["reason"], "No space left");
     }
 
     async fn make_writer(dir: &std::path::Path) -> TraceWriter {
