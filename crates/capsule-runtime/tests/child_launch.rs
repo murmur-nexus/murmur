@@ -236,8 +236,7 @@ impl Parent {
             grant,
             child_env_allow: env_allow.iter().map(|name| name.to_string()).collect(),
             roost_url: suite().roost.url.clone(),
-            // Nothing in this suite delegates: no handle is injected and no watcher runs, which
-            // is what makes these cases the unchanged launch path.
+            // Nothing in this suite delegates: no handle is injected and no watcher runs.
             spawner: None,
         })
     }

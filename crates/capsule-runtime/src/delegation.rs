@@ -3,7 +3,7 @@
 //! A child launched by [`crate::child_launch`] knows its spawner from one injected environment
 //! variable, [`SPAWNER_ENV`], and from nothing it inherited: the parent's launcher composes a
 //! [`SpawnerHandle`] and applies it in the runtime-owned tail of the child's environment. A
-//! capsule launched any other way has no handle, contacts nothing, and behaves as it did.
+//! capsule launched any other way has no handle and contacts nothing.
 //!
 //! **The completion names the delegation; it never carries the child's output.** Every field of
 //! [`DelegationOutcome`] is composed by a runtime — ids, a status word, a path, a duration — and

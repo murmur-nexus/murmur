@@ -312,6 +312,17 @@ fn uuid_hex() -> String {
 
 // ── Launching children ────────────────────────────────────────────────────────
 
+/// One agent child stages at a time.
+///
+/// A spawn approval is valid for 60 seconds from the `POST /spawn` that granted it, and an agent
+/// child spends that window staging a driver and binding a port. Two of them doing it at once on a
+/// loaded machine can outlast the approval they were launched under, and the child is then refused
+/// at registration rather than run unrefereed. Script children are cheap and take no slot.
+fn agent_child_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// `POST /spawn`, then a launch — the part the model-facing delegate tool will play later.
 fn launch(
     parent_dir: &Path,
@@ -338,24 +349,39 @@ fn launch(
     .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
 }
 
-/// The child's own record of how it ended, once it exists.
+/// The child's own record of how it ended, once the delivery it describes has settled.
+///
+/// A reporter writes the file before it posts and rewrites it with the result, so the record is
+/// briefly readable in a state that says neither that the completion arrived nor why it did not.
+/// Waiting for the settled one is what stops a case reading that intermediate write.
 fn wait_for_completion(child: &LaunchedChild) -> Value {
     let path = child.workdir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(raw) = std::fs::read_to_string(&path) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
-                return parsed;
+                if is_settled(&parsed) {
+                    return parsed;
+                }
             }
         }
         assert!(
             Instant::now() < deadline,
-            "no {} appeared for the child at {}",
+            "no settled {} appeared for the child at {}; what is there: {}",
             "completion.json",
-            child.workdir.display()
+            child.workdir.display(),
+            std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Whether a completion record says what became of the delivery: it arrived, it was refused for a
+/// named reason, or it was a `terminated` delegation, which is posted to nobody.
+fn is_settled(completion: &Value) -> bool {
+    completion["delivered"] == Value::Bool(true)
+        || !completion["delivery_error"].is_null()
+        || completion["status"] == DelegationStatus::Terminated.as_str()
 }
 
 fn wait_for(what: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
@@ -575,12 +601,15 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
-    let child = launch(
-        parent_dir.path(),
-        "slow-worker",
-        &[],
-        Some(parent.spawner(TrustClass::Trusted)),
-    );
+    let child = {
+        let _slot = agent_child_slot();
+        launch(
+            parent_dir.path(),
+            "slow-worker",
+            &[],
+            Some(parent.spawner(TrustClass::Trusted)),
+        )
+    };
     let delegation_id = child
         .delegation_id
         .clone()
@@ -799,12 +828,15 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
-    let mut child = launch(
-        parent_dir.path(),
-        "slow-worker",
-        &[],
-        Some(parent.spawner(TrustClass::Trusted)),
-    );
+    let mut child = {
+        let _slot = agent_child_slot();
+        launch(
+            parent_dir.path(),
+            "slow-worker",
+            &[],
+            Some(parent.spawner(TrustClass::Trusted)),
+        )
+    };
     let delegation_id = child.delegation_id.clone().expect("a delegated launch");
     let workdir = child.workdir.clone();
     child.shutdown().expect("the parent ends the delegation");

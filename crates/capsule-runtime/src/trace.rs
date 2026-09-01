@@ -688,9 +688,8 @@ struct TaskStartEvent {
     /// tasks ran in is answerable from the trace alone.
     lane: String,
     /// The delegation whose completion this task is, for a `completion`-origin task that arrived
-    /// from a child this capsule launched. Omitted from the record entirely for every other task
-    /// — the field is absent, not null — so a capsule that never delegates writes what it always
-    /// wrote.
+    /// from a child this capsule launched. Omitted from the record entirely for every other task:
+    /// the field is absent, not null.
     #[serde(skip_serializing_if = "Option::is_none")]
     delegation_id: Option<String>,
     message_parts_bytes: u64,

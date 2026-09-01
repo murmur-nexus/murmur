@@ -308,6 +308,15 @@ that wants it reads the file deliberately through an ordinary tool call.
 | `duration_ms` | How long the child ran |
 | `detail` | The exit status and the child's last stderr lines, on a `crashed` or `terminated` outcome |
 
+The same fields are written to `completion.json` in the child's own directory, with three more that
+describe the delivery rather than the outcome.
+
+| Field of `completion.json` only | Meaning |
+|---|---|
+| `reported_by` | `child` or `launcher` — which of the two reporters built the record |
+| `delivered` | Whether the notification reached the parent's door |
+| `delivery_error` | Why delivery failed, when one was attempted and refused |
+
 ### How it travels
 
 One JSON-RPC `message/send` to the parent's `POST /`, carrying the fields above as its message
@@ -334,19 +343,19 @@ other path.
 | The child's process ended without recording a completion | The parent's launcher | `crashed` |
 | The parent ended the delegation itself | The parent's launcher, recorded and posted to nobody | `terminated` |
 
-Both reporters write the outcome to `completion.json` in the child's own directory before posting
-it, and rewrite the file with what the posting did. A completion that could not be delivered is
-recorded there with `delivered: false` and the refusal's reason, and one line goes to stderr; the
-launcher retries an undelivered completion once, and after that the file and the line are the
-record. A delivery that fails does not fail the child's own session — the work was done, and where
-it went is what could not be said.
+Both reporters write the outcome to `completion.json` before posting it, and rewrite the file with
+what the posting did. Between those two writes the record reads `delivered: false` with no
+`delivery_error`, so a reader polling the file should wait for one of the two to be set. A
+completion that could not be delivered is recorded with `delivered: false` and the refusal's
+reason, and one line goes to stderr; the launcher retries an undelivered completion once, and after
+that the file and the line are the record. A failed delivery does not fail the child's own session:
+`status` still records how that session ended.
 
-The launcher reads `completion.json` before reporting anything, so a child that already delivered
-is never reported twice.
+A delegation is never reported twice, whichever reporter gets there first.
 
-!!! note "Nothing survives a host restart"
-    Both reporters live in processes a restart kills, and there is no pending-work marker to resume
-    from. A parent that sleeps while a child works loses the child entirely if the host restarts.
+!!! note "A host restart loses a delegation in flight"
+    A parent that sleeps while a child works loses the child entirely if the host restarts: no
+    completion arrives at the parent, and none is written to `completion.json` afterwards.
 
 ---
 

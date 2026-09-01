@@ -382,8 +382,8 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         format!("http://{url}")
     };
 
-    // Started only for a launch somebody wants told about: a `capsule` plan step passes no
-    // spawner, so it starts no watcher and behaves exactly as it did.
+    // Started only for a launch somebody wants told about: a launch with no spawner starts no
+    // watcher.
     if let Some(handle) = handle {
         watch_for_completion(
             &launched,
@@ -504,8 +504,9 @@ fn watch_for_completion(
 ///
 /// `capabilities.env.allow` is the child's own, not the parent's: a sibling's declaration reaches
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
-/// The three runtime-owned names are applied last, so a child cannot displace the daemon URL it is
-/// required to register with by allowlisting its name.
+/// The runtime-owned names — `PATH`, `HOME`, `MURMUR_ROOST_URL`, and [`SPAWNER_ENV`] on a
+/// delegated launch — are applied last, so a child cannot displace the daemon URL it is required
+/// to register with, or the handle it reports its outcome to, by allowlisting the name.
 fn child_environment(
     request: &ChildLaunchRequest,
     handle: Option<&SpawnerHandle>,
