@@ -62,12 +62,12 @@ pub use containment::{
     detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, ScopeReport,
     StateStoreReport,
 };
-// `sandbox` is a private module; `HostProbe` is re-exported because the freshness of a session's
-// host reading is asserted from integration tests outside this crate.
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,
 };
+// `sandbox` is a private module; `HostProbe` is re-exported because the freshness of a session's
+// host reading is asserted from integration tests outside this crate.
 pub use sandbox::HostProbe;
 pub use sealed::{
     classify_installed_profile, inspect_installed_profile, InstalledProfileState, SealedBlocker,
