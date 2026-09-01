@@ -10,7 +10,7 @@ Current versions:
 
 | Package                  | Version  |
 | ------------------------ | -------- |
-| `murmur:hook`            | `0.7.0`  |
+| `murmur:hook`            | `0.8.0`  |
 | `murmur:tool`            | `0.1.0`  |
 | `murmur:capsule`         | `0.1.0`  |
 | `murmur:tool-registry`   | `0.1.0`  |
@@ -119,6 +119,26 @@ moved every post-call field of those two records into the new `shell-outcome` an
 decide on because `command` is a clipped display string. Each of these is independently a
 breaking change under the rule below. Hooks built against `@0.6.0` or earlier stopped
 resolving at this bump and had to be rebuilt.
+
+`murmur:hook` then went to `0.8.0` when `shell-event` gained
+`recipe: option<string>` — the body of the recipe a build-tool invocation names,
+read out of the capsule's workdir by the runtime for `make <target>`,
+`just <recipe>` and `npm run <script>`. Without it a policy gating `just build`
+was deciding on a name, and a name can be redefined underneath the approval by
+editing `justfile`. The field sits between `script` and `outcome`, which keeps
+the identity fields together and keeps `outcome` last as the field that tells the
+decision-point dispatch from the observation one. Adding a field to an existing
+record is always a breaking change under the rule below. Hooks built against
+`@0.7.0` or earlier stopped resolving at this bump and had to be rebuilt.
+
+That field is the whole of this bump. Nothing else was bundled with it because
+nothing else was pending: the `0.6.0` entry above records why a bundle is worth
+paying for when several shape changes are already wanted, and equally why a bump
+whose contents are open is a bump nobody can finish paying for. `murmur:runtime`
+and `murmur:conversation` did not move. Both merely `use` `murmur:hook`'s
+`message` record, which does not change shape here, so the `use` lines were
+retargeted at `@0.8.0` and the packages themselves stayed where they were —
+the same precedent the `murmur:conversation` entry above records.
 
 The `deny` arm is the one `hook-output` case whose contract is *subtractive*: it can only
 stop a call the manifest already permitted, and there is deliberately no arm that permits

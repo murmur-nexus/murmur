@@ -42,7 +42,7 @@ use crate::{
 /// `murmur:hook` version declared in `wit/`. The host keeps no compatibility
 /// fallback: a hook compiled against any other version does not resolve, so a
 /// WIT bump requires every hook artifact to be rebuilt (see `wit/VERSIONING.md`).
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.7.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.8.0";
 
 /// Resolve the lifecycle instance export. `None` means the component does not
 /// export [`LIFECYCLE_IFACE`], which surfaces as a missing-export error at the
@@ -451,6 +451,9 @@ pub(crate) enum HookEvent {
         argv: Vec<String>,
         /// The `-c` body for the interpreter form, `None` for every other form.
         script: Option<String>,
+        /// The build-tool recipe body the call's own resolution read, `None` when it named
+        /// none the runtime could resolve.
+        recipe: Option<String>,
         exit_code: i32,
         stdout: String,
         stderr: String,
@@ -588,6 +591,9 @@ pub(crate) struct ShellDispatchInfo {
     pub argv: Vec<String>,
     /// The `-c` body for the interpreter form, `None` otherwise.
     pub script: Option<String>,
+    /// The build-tool recipe body the same resolution read, so the observation event carries
+    /// what the decision point was shown.
+    pub recipe: Option<String>,
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
@@ -611,6 +617,7 @@ pub(crate) enum ResolvedCall {
         command: String,
         argv: Vec<String>,
         script: Option<String>,
+        recipe: Option<String>,
     },
     Tool {
         tool_name: String,
@@ -1153,6 +1160,7 @@ impl HookRuntime {
                     command,
                     argv,
                     script,
+                    recipe,
                 } => {
                     let evt = ShellEvent {
                         turn,
@@ -1160,6 +1168,7 @@ impl HookRuntime {
                         command: command.chars().take(SHELL_COMMAND_DISPLAY_CHARS).collect(),
                         argv: argv.clone(),
                         script: script.clone(),
+                        recipe: recipe.clone(),
                         // `none` is what tells the hook this call has not run, and is the only
                         // dispatch at which its `deny` is honored.
                         outcome: None,
@@ -1815,6 +1824,7 @@ async fn call_hook(
             command,
             argv,
             script,
+            recipe,
             exit_code,
             stdout,
             stderr,
@@ -1830,6 +1840,7 @@ async fn call_hook(
                 command: command.chars().take(SHELL_COMMAND_DISPLAY_CHARS).collect(),
                 argv: argv.clone(),
                 script: script.clone(),
+                recipe: recipe.clone(),
                 outcome: Some(ShellOutcome {
                     exit_code: *exit_code,
                     stdout: stdout.clone(),
@@ -2134,7 +2145,7 @@ mod tests {
 
     /// Like [`hook_double`] but the exported lifecycle instance carries the given
     /// instance name, so tests can build a component that exports the versioned
-    /// (`murmur:hook/lifecycle@0.7.0`), the legacy unversioned, or a
+    /// (`murmur:hook/lifecycle@0.8.0`), the legacy unversioned, or a
     /// deliberately-unmatched name to exercise `resolve_lifecycle_iface` and its
     /// hard-error path.
     fn hook_double_iface(engine: &wasmtime::Engine, iface: &str, fn_names: &[&str]) -> Component {
@@ -2518,7 +2529,7 @@ mod tests {
     }
 
     /// A hook component built against the *current* versioned
-    /// `murmur:hook/lifecycle@0.7.0` interface (the name a freshly-compiled hook
+    /// `murmur:hook/lifecycle@0.8.0` interface (the name a freshly-compiled hook
     /// carries) instantiates and registers every required and optional function.
     /// The current versioned name is the one `resolve_lifecycle_iface` probes first.
     #[test]
@@ -3176,12 +3187,12 @@ mod tests {
     /// "zero lines in the hook log" here means the guest received exactly the value the host
     /// claims it sent — a weaker double could pass while `binary` carried garbage.
     ///
-    /// `shell-event` flattens to 19 core values, past the canonical ABI's 16-parameter
+    /// `shell-event` flattens to 22 core values, past the canonical ABI's 16-parameter
     /// limit, so the record arrives **indirectly**: one `i32` pointing at the lowered record
     /// in guest memory. Its field offsets are `turn` 0, `binary` ptr/len 4/8, `command`
-    /// ptr/len 12/16, `argv` ptr/len 20/24, `script` disc/ptr/len 28/32/36, `outcome`
-    /// disc 40. The `realloc` bump-allocates because the host lowers the record and every
-    /// string it points at into that memory.
+    /// ptr/len 12/16, `argv` ptr/len 20/24, `script` disc/ptr/len 28/32/36, `recipe`
+    /// disc/ptr/len 40/44/48, `outcome` disc 56. The `realloc` bump-allocates because the
+    /// host lowers the record and every string it points at into that memory.
     ///
     /// The expected bytes live at offset 0 and the `result<hook-output, string>` return
     /// area at 128, so `expect_binary` must stay well under 128 bytes.
@@ -3262,6 +3273,7 @@ mod tests {
     (field "command" string)
     (field "argv" (list string))
     (field "script" (option string))
+    (field "recipe" (option string))
     (field "outcome" (option $shell-outcome))))
   (type $ft (func (param "event" $shell-event) (result (result $hook-output (error string)))))
 
@@ -3316,6 +3328,7 @@ mod tests {
                     command: "-q tests/".to_string(),
                     argv: vec!["-q".to_string(), "tests/".to_string()],
                     script: None,
+                    recipe: None,
                     exit_code: 0,
                     stdout: "ok".to_string(),
                     stderr: String::new(),
@@ -4861,7 +4874,7 @@ artifacts:
         Component::new(engine, &bytes).expect("tool-call component double compiles")
     }
 
-    /// A *current-version* (`@0.7.0`, 7-case `hook-output`) `on-task-end` double that
+    /// A *current-version* (`@0.8.0`, 7-case `hook-output`) `on-task-end` double that
     /// returns `ok(<arm>)`. `arm_disc` selects the variant: `0` = `none`, `4` =
     /// `reopen-task(reason)`. The `reopen-task` payload is a static string at guest
     /// offset 300 so the host lifts the real bytes the guest declared, exercising the

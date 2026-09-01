@@ -9,7 +9,7 @@ package murmur:runtime@0.3.0;
 /// separate credential path: the host reuses the driver-component invocation it
 /// already performs for an ordinary turn.
 interface inference {
-    use murmur:hook/lifecycle@0.7.0.{message};
+    use murmur:hook/lifecycle@0.8.0.{message};
 
     /// One completion request.
     ///

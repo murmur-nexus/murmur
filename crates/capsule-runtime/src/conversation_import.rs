@@ -159,7 +159,7 @@ pub(crate) mod test_support {
     ///   (`message-page`).
     fn preamble() -> String {
         format!(
-            r#"  (import "murmur:hook/lifecycle@0.7.0" (instance $lct
+            r#"  (import "murmur:hook/lifecycle@0.8.0" (instance $lct
     (type $o (option string))
     (type $m (record (field "role" string) (field "content" string) (field "id" $o) (field "source-id" $o)))
     (export "message" (type (eq $m)))
@@ -329,7 +329,7 @@ pub(crate) mod test_support {
              (export \"hook-output\" (type $hook-output))\n    \
              (export \"task-end-event\" (type $task-end-event))\n    \
              (export \"on-task-end\" (func $ontaskend))\n{stubs}  )\n  \
-             (export \"murmur:hook/lifecycle@0.7.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.8.0\" (instance $lc))\n)",
             preamble = preamble(),
             stubs = [
                 "on-session-start",

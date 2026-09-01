@@ -1,4 +1,4 @@
-package murmur:hook@0.7.0;
+package murmur:hook@0.8.0;
 
 interface lifecycle {
     record message {
@@ -193,15 +193,25 @@ interface lifecycle {
         ///
         /// It names what will actually run, which is what a policy has to decide on:
         /// `command` is clipped and `binary` alone does not say what the program was
-        /// asked to do. Recipes belonging to a build tool (`make <target>`,
-        /// `just <recipe>`, `npm run <script>`) are **not** resolved into their
-        /// bodies — a hook gating `just build` is deciding on the argv `["build"]`
-        /// and the resolved path of `just`, and no more.
+        /// asked to do.
         argv: list<string>,
         /// The `-c` body when the interpreter form is used, never truncated, and
         /// `none` for every other form. A policy must decide on this field rather
         /// than on `command`.
         script: option<string>,
+        /// The body of the recipe this call names, for the build tools the runtime
+        /// resolves: `make <target>`, `just <recipe>` and `npm run <script>`. A hook
+        /// gating `just build` decides on the text the justfile gives `build`, not on
+        /// the name alone.
+        ///
+        /// The runtime reads the recipe file out of the workdir it holds the grant on;
+        /// the hook never reads it and is handed no filesystem grant by this field.
+        ///
+        /// `none` when the call names no recipe, or when the runtime could not resolve
+        /// one — no recipe file, an unparseable one, a target that is not defined, or a
+        /// shape the parser does not model. Reading is best-effort: an absent body is
+        /// not an error, and it is never a signal that the call is safe.
+        recipe: option<string>,
         /// `none` means **this call has not run**. That is the decision point, the one
         /// dispatch at which a returned `deny` is honored. `some(...)` is the post-call
         /// observation: the call has already happened and nothing can be refused.

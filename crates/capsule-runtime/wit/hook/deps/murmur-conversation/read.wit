@@ -40,7 +40,7 @@ package murmur:conversation@0.1.0;
 /// receives on `murmur:hook/lifecycle`'s `message` — one encoding, in both
 /// places.
 interface read {
-    use murmur:hook/lifecycle@0.7.0.{message};
+    use murmur:hook/lifecycle@0.8.0.{message};
 
     /// One page of the record, newest first.
     record message-page {

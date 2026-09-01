@@ -108,5 +108,7 @@ events keeps the non-fatal default: a `deny` returned there is a dispatch fault,
 and honored by nothing, because the call has already happened.
 
 A policy decides on `argv`, `script` and `input`, never on `command` — `command` is truncated for
-display. The runtime does not resolve a build tool's recipe into its body, so a policy gating
-`just build` is deciding on the argv `["build"]` and the resolved path of `just`.
+display. For `make <target>`, `just <recipe>` and `npm run <script>` the runtime reads the named
+recipe out of the capsule's workdir and carries its body on `shell-event.recipe`, so a policy
+gating `just build` decides on the text the justfile gives `build`. An absent `recipe` means the
+runtime resolved no body, and says nothing about the call.

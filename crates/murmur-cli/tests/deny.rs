@@ -662,9 +662,10 @@ fn the_hook_is_shown_what_will_actually_run() {
     );
 
     let reason = session.denial()["reason"].as_str().unwrap().to_string();
-    let mut parts = reason.splitn(3, '|');
+    let mut parts = reason.splitn(4, '|');
     let binary = parts.next().unwrap();
     let seen_script = parts.next().unwrap();
+    let recipe = parts.next().unwrap();
     let argv = parts.next().unwrap();
 
     assert!(
@@ -672,6 +673,7 @@ fn the_hook_is_shown_what_will_actually_run() {
         "binary is a resolved absolute path: {binary}"
     );
     assert_eq!(seen_script, script, "the script body arrives untruncated");
+    assert_eq!(recipe, "", "an interpreter form names no recipe");
     assert_eq!(argv.trim_end(), format!("-c {script}"), "argv is exact");
 }
 

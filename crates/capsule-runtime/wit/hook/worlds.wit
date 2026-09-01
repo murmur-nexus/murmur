@@ -15,5 +15,5 @@ world hook {
   import tokens;
   import murmur:task-io/read@0.1.0;
   import murmur:conversation/read@0.1.0;
-  export murmur:hook/lifecycle@0.7.0;
+  export murmur:hook/lifecycle@0.8.0;
 }
