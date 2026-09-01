@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -717,11 +717,55 @@ struct TaskMetrics {
 /// holds no `task_start` carrying one — a session that never ran a task, or one written by a
 /// runtime that predates the key, which reaches `task_start.context_id` as the empty string.
 pub(crate) fn first_task_context_id(session_dir: &Path) -> Result<Option<String>, CliError> {
-    let events = parse_trace_file(&session_dir.join("trace.jsonl"))?;
-    Ok(events.into_iter().find_map(|event| match event {
-        TraceEvent::TaskStart(task) if !task.context_id.is_empty() => Some(task.context_id),
-        _ => None,
-    }))
+    let path = session_dir.join("trace.jsonl");
+    let file = fs::File::open(&path).map_err(|e| trace_read_error(&path, &e))?;
+
+    // Read no further than the answer. The runtime appends one whole record per `write_all`
+    // under `O_APPEND`, so a writer killed mid-write leaves a truncated *tail* and nothing
+    // else — and a resolver that has already found its `task_start` never reaches it. That
+    // narrower appetite is this caller's alone: [`parse_trace_records`] takes the whole file as
+    // its subject and a torn line there stays `E-TRC-001`.
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| trace_read_error(&path, &e))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TraceEvent>(line) {
+            Ok(TraceEvent::TaskStart(task)) if !task.context_id.is_empty() => {
+                return Ok(Some(task.context_id));
+            }
+            Ok(_) => {}
+            // Before the answer there is nothing to weigh an unreadable line against, and no
+            // killed writer produces one there anyway.
+            Err(err) => {
+                return Err(CliError::new(
+                    E_TRC_001,
+                    format!("{}:{}: {err}", path.display(), i + 1),
+                ));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// The diagnostic for a trace file that could not be opened or read.
+///
+/// Shared so that reaching the same file by different routes — streamed by
+/// [`first_task_context_id`], read whole by [`parse_trace_records`] — cannot report an absent or
+/// unreadable trace two different ways.
+fn trace_read_error(path: &Path, err: &std::io::Error) -> CliError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => CliError::new(
+            E_IO_001,
+            format!("trace file not found: {}", path.display()),
+        ),
+        _ => CliError::new(
+            E_IO_003,
+            format!("failed to read {}: {err}", path.display()),
+        ),
+    }
 }
 
 fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
@@ -737,13 +781,7 @@ fn parse_trace_file(path: &Path) -> Result<Vec<TraceEvent>, CliError> {
 /// ignored, an unknown event type becomes [`TraceEvent::Unknown`], and a line that is not
 /// valid JSON aborts with `E-TRC-001` naming `file:line`.
 fn parse_trace_records(path: &Path) -> Result<Vec<TraceRecord>, CliError> {
-    let content = fs::read_to_string(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => CliError::new(
-            E_IO_001,
-            format!("trace file not found: {}", path.display()),
-        ),
-        _ => CliError::new(E_IO_003, format!("failed to read {}: {e}", path.display())),
-    })?;
+    let content = fs::read_to_string(path).map_err(|e| trace_read_error(path, &e))?;
 
     let mut events = Vec::new();
     for (i, line) in content.lines().enumerate() {
