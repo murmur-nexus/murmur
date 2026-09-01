@@ -269,6 +269,60 @@ without any grant saying so.
 
 ---
 
+## The delegation tool
+
+A capsule whose manifest names at least one capsule in `capabilities.spawn.allow` gains one tool,
+`delegate-task`. The grant governs the tool's existence: where the list is empty, the tool is
+missing from the capsule's directory, from `session_start`'s `tools_declared` and from the
+inventory its model is shown, so the model has nothing to call.
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `capsule` | yes | The sub-capsule's name. The schema's `enum` holds exactly this capsule's `capabilities.spawn.allow`, so the granted names are the only names the model can supply |
+| `version` | yes | That capsule's exact version. `latest`, `stable` and `edge` are reserved words that resolve to no artifact |
+| `task` | yes | The whole of what the sub-capsule is told. It arrives as the child's first user message |
+
+Those three strings are the whole of what the agent supplies. The daemon's address, this session's
+credential, the approval, the child's directory, the child's process and the A2A conversation with
+it are composed by the capsule's own runtime, so **a delegating capsule needs no
+`capabilities.network.allow` entry for the daemon** and never sees a token.
+
+### What the call returns
+
+The call returns when the child finishes, not when it starts. A successful result is a JSON object:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` |
+| `session_id` | string | `ses_…`, the child's own session |
+| `capsule`, `version` | string | The artifact that ran |
+| `status` | string | `completed`, `failed` or `timed_out` |
+| `output` | string | The child's answer, read from the result file its own runtime wrote. Cut at 64 KiB, with the cut marked and the tool result flagged `truncated` |
+| `result_path` | string | Where the answer is on disk, relative to the delegating capsule's accessible workdir. Absent when the child wrote no result file |
+
+A refusal comes back instead as a plain sentence naming the manifest key and the entry that failed,
+with no JSON around it. The delegating capsule's own run carries on: a refused delegation is a
+failed tool call, and the session continues.
+
+### Bounds
+
+| Bound | Value | What it covers |
+|---|---|---|
+| Launch | 180s | From starting the child process to its first `--json` line |
+| Delivery | 30s | Retrying the task delivery while the child's listener comes up |
+| Answer | 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | Waiting for the child's task to reach a terminal state. On expiry the child is killed and reaped and the call returns `timed_out` |
+
+There is no depth cap, no concurrency cap and no total cap. A capsule that can delegate can
+delegate without limit, and a capsule whose `capabilities.spawn.allow` names itself can recurse
+until the host runs out of processes.
+
+**A delegated capsule must still be listening when its answer is read.** The answer is read after
+an A2A `tasks/get` reports the task complete, so a sub-capsule that exits the moment it finishes
+can leave the delegation with nothing to read. Declare `lifecycle.after_task: sleep` on a capsule
+meant to be delegated to.
+
+---
+
 ## The completion path
 
 A delegated child tells its parent that it finished. The parent's runtime injects one variable at
@@ -504,6 +558,7 @@ The name-list refusals are their own, and name the list an operator has to edit:
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
 | `MURMUR_SPAWNER` | The parent capsule's runtime, on a delegated child only | Where the child reports its outcome, and under which delegation id — see [The completion path](#the-completion-path). A value that is not a spawner handle refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) |
 | `MURMUR_MUR_BINARY` | The environment of the process that runs the capsule | The `mur` binary a parent starts its children from. Defaults to the running executable, which in production is `mur` itself |
+| `MURMUR_DELEGATION_TIMEOUT_SECS` | The environment of the process that runs the capsule | Whole seconds a `delegate-task` call waits for the sub-capsule's answer. Default 600. A value that is not a positive integer is ignored |
 
 The spawn credential and the spawn approval have no environment variable. Every request to this
 daemon is made by the capsule's runtime, which holds them; `MURMUR_SESSION_ID` authorises nothing

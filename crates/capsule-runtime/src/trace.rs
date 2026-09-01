@@ -930,6 +930,34 @@ struct PeerFileFetchEvent {
     reason: Option<String>,
 }
 
+/// One `delegate-task` call, written when the delegation ends.
+///
+/// One line per call whatever happened, including a call the daemon refused: a delegation that was
+/// asked for and not made is as much a fact of the run as one that produced an answer. Carries
+/// neither the task text nor the child's answer — both are the agent's own conversation, which the
+/// `tool_call` line for the same call already records under the session's `trace.capture` setting.
+#[derive(Serialize)]
+struct DelegationEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The sub-capsule the agent named, and the exact version it named.
+    capsule: String,
+    version: String,
+    /// The `dlg_` id naming this delegation. `null` on a `refused` outcome, which made none.
+    delegation_id: Option<String>,
+    /// The child's own session id, so its trace is findable. `null` when no child ran.
+    child_session_id: Option<String>,
+    /// Wall-clock time from the first request to the daemon until the delegation ended.
+    duration_ms: u64,
+    /// `completed`, `failed`, `timed_out` or `refused` — `DelegationStatus::as_str`.
+    outcome: String,
+    /// `null` on `completed`. On every other outcome, the same sentence the model was given.
+    reason: Option<String>,
+}
+
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
@@ -1964,6 +1992,36 @@ impl ResourceTraceAppender {
             stored_path,
             bytes,
             sha256,
+            outcome: outcome.to_string(),
+            reason,
+        };
+        self.append(&event).await;
+    }
+
+    /// Records one delegation. `delegation_id` and `child_session_id` are `None` when no child was
+    /// launched — a refused delegation names no id, and an audit record must not imply one exists.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_delegation(
+        &self,
+        capsule: &str,
+        version: &str,
+        delegation_id: Option<String>,
+        child_session_id: Option<String>,
+        duration_ms: u64,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = DelegationEvent {
+            event_type: "delegation",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            delegation_id,
+            child_session_id,
+            duration_ms,
             outcome: outcome.to_string(),
             reason,
         };

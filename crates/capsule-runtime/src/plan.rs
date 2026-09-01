@@ -3,19 +3,17 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
 };
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
-    child_launch::{launch_child_capsule, ChildLaunchRequest},
-    http_client::http_json,
+    delegation_plane::{DelegationPlane, DelegationRequest, DelegationStatus},
     sandbox,
     shell::{execute_shell, split_shell_words},
-    spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER},
+    spawn_credential::SpawnCredential,
     types::CapabilityPolicy,
 };
 
@@ -594,180 +592,32 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
              mints it only for a session whose manifest declares capabilities.spawn.allow",
         );
     };
-    let version = ctx
-        .capsule_versions
-        .get(capsule)
-        .cloned()
-        .unwrap_or_else(|| "0.1.0".to_string());
-    let roost_url = roost_url.trim_end_matches('/').to_string();
 
-    // The credential's one reading. Every other route out of `SpawnCredential` is closed — no
-    // `Display`, no `Serialize`, redacted `Debug` — so the token cannot reach a step result, a
-    // trace or a workdir file by being formatted somewhere.
-    let credential_header = credential.expose();
+    // Everything a delegation is — the referee's approval, the child's process, the task delivery
+    // and the bounded wait — belongs to `DelegationPlane`, and a capsule step is input and output
+    // marshalling around it. The agent-facing `delegate-task` tool calls the same code, so there
+    // is one delegation mechanism in this crate rather than two that drift.
+    let plane = DelegationPlane::new(roost_url, credential.clone(), ctx.workdir.clone());
+    let result = plane.delegate(&DelegationRequest {
+        capsule: capsule.to_string(),
+        // A plan names a capsule; the version comes from the context the plan was validated
+        // against, and a context that names none means `0.1.0`.
+        version: ctx
+            .capsule_versions
+            .get(capsule)
+            .cloned()
+            .unwrap_or_else(|| "0.1.0".to_string()),
+        task: capsule_step_input_text(input),
+    });
 
-    // Step 1: ask mur-roost whether this session may spawn that capsule. One request, and the only
-    // one: the daemon judges the session this credential names, runs the referee, and answers with
-    // an approval naming the exact artifact it resolved. It launches nothing.
-    let spawn_body = json!({ "name": capsule, "version": version }).to_string();
-    let permission = match http_json(
-        "POST",
-        &format!("{roost_url}/spawn"),
-        Some(&spawn_body),
-        &[(SPAWN_CREDENTIAL_HEADER, credential_header)],
-    ) {
-        Ok(value) => value,
-        Err(error) => return failed(&step.id, error),
-    };
-    let Some(approval) = permission.get("approval").and_then(Value::as_str) else {
-        return failed(
-            &step.id,
-            "mur-roost spawn response missing approval".to_string(),
-        );
-    };
-    let grant = SpawnApproval::new(approval.to_string());
-
-    // Step 2: launch it here, in this runtime, as a process of its own. `child` owns that process:
-    // dropping it at the end of this step — including on an early return below — terminates and
-    // reaps the child rather than leaving it holding a port.
-    //
-    // `child_env_allow` is empty because a plan step knows the capsule's name and version and
-    // nothing else about its manifest; a child launched from a plan therefore sees no host
-    // variables beyond the three every child gets. Deriving it would take the child's manifest,
-    // which this scheduler has no registry to resolve.
-    let child = match launch_child_capsule(ChildLaunchRequest {
-        parent_accessible_workdir: ctx.workdir.clone(),
-        capsule_name: capsule.to_string(),
-        capsule_version: version.clone(),
-        grant,
-        child_env_allow: Vec::new(),
-        roost_url: roost_url.clone(),
-        // A plan step waits for its child's answer on the connection it opened, so there is
-        // nothing for a completion to tell it. No spawner means no injected handle and no
-        // watcher.
-        spawner: None,
-    }) {
-        Ok(child) => child,
-        Err(error) => return failed(&step.id, error.to_string()),
-    };
-    if child.capsule_url.is_empty() {
-        return failed(
-            &step.id,
-            format!(
-                "capsule '{capsule}' bound no address, so it cannot be sent a task; a capsule step \
-                 needs a capsule that serves A2A"
-            ),
-        );
-    }
-    let capsule_url = child.capsule_url.trim_end_matches('/').to_string();
-
-    // Step 3: Build the A2A message/send JSON-RPC body with the task input.
-    let input_text = capsule_step_input_text(input);
-    let req_id = format!("plan-{}", step.id);
-    let msg_id = format!("msg-{}", step.id);
-    let a2a_send_body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "message/send",
-        "params": {
-            "message": {
-                "messageId": msg_id,
-                "role": "user",
-                "parts": [{"text": input_text}]
-            }
-        }
-    })
-    .to_string();
-
-    // Step 4: POST message/send to the capsule with exponential backoff (100ms→2s, 30s max).
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut delay_ms = 100u64;
-    let send_response = loop {
-        match http_json("POST", &capsule_url, Some(&a2a_send_body), &[]) {
-            Ok(resp) => break resp,
-            Err(_) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms = (delay_ms * 2).min(2000);
-            }
-            Err(e) => {
-                return failed(
-                    &step.id,
-                    format!("capsule at {capsule_url} did not become ready within 30s: {e}"),
-                )
-            }
-        }
-    };
-
-    let Some(task_id) = send_response
-        .get("result")
-        .and_then(|r| r.get("id"))
-        .and_then(Value::as_str)
-    else {
-        return failed(
-            &step.id,
-            format!("A2A message/send response missing result.id: {send_response}"),
-        );
-    };
-    let task_id = task_id.to_string();
-
-    // Step 5: Poll tasks/get until completed or failed.
-    let tasks_get_body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tasks/get",
-        "params": { "id": task_id }
-    })
-    .to_string();
-
-    loop {
-        thread::sleep(Duration::from_millis(500));
-        let task = match http_json("POST", &capsule_url, Some(&tasks_get_body), &[]) {
-            Ok(v) => v,
-            Err(e) => return failed(&step.id, e),
-        };
-        let state = task
-            .get("result")
-            .and_then(|r| r.get("status"))
-            .and_then(|s| s.get("state"))
-            .and_then(Value::as_str);
-        match state {
-            Some("submitted" | "working" | "input-required") => continue,
-            Some("completed") => {
-                let text = task
-                    .get("result")
-                    .and_then(|r| r.get("artifacts"))
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|a| a.get("parts"))
-                    .and_then(Value::as_array)
-                    .and_then(|p| p.first())
-                    .and_then(|p| p.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                return StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Success,
-                    output: Some(text),
-                    error: None,
-                };
-            }
-            Some("failed" | "rejected") => {
-                let msg = task
-                    .get("result")
-                    .and_then(|r| r.get("status"))
-                    .and_then(|s| s.get("message"))
-                    .and_then(|m| m.get("parts"))
-                    .and_then(Value::as_array)
-                    .and_then(|p| p.first())
-                    .and_then(|p| p.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("capsule task failed")
-                    .to_string();
-                return failed(&step.id, msg);
-            }
-            other => return failed(&step.id, format!("unknown A2A task state: {other:?}")),
-        }
+    match result.status {
+        DelegationStatus::Completed => StepResult {
+            step_id: step.id.clone(),
+            status: StepStatus::Success,
+            output: Some(result.output),
+            error: None,
+        },
+        _ => failed(&step.id, result.output),
     }
 }
 
@@ -883,6 +733,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
