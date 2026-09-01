@@ -687,6 +687,12 @@ struct TaskStartEvent {
     /// The queue lane this task waited in, derived from `origin`. Recorded so the order two
     /// tasks ran in is answerable from the trace alone.
     lane: String,
+    /// The delegation whose completion this task is, for a `completion`-origin task that arrived
+    /// from a child this capsule launched. Omitted from the record entirely for every other task
+    /// — the field is absent, not null — so a capsule that never delegates writes what it always
+    /// wrote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegation_id: Option<String>,
     message_parts_bytes: u64,
 }
 
@@ -1378,6 +1384,7 @@ impl TraceWriter {
         context_id: &str,
         source: &str,
         provenance: TaskProvenance,
+        delegation_id: Option<&str>,
         message_parts_bytes: u64,
     ) -> std::io::Result<()> {
         // Reset per-task counters for this task
@@ -1409,6 +1416,7 @@ impl TraceWriter {
             lane: TaskLane::for_origin(provenance.origin())
                 .as_str()
                 .to_string(),
+            delegation_id: delegation_id.map(str::to_string),
             message_parts_bytes,
         };
         self.write_event(&event).await
@@ -3019,7 +3027,7 @@ mod tests {
     async fn task_end_carries_reopen_count() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_task_end("tsk_1", "ok", 2).await.unwrap();
@@ -3039,7 +3047,7 @@ mod tests {
     async fn task_reopened_names_hook_reason_and_ordinal() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_task_reopened("tsk_1", "gatekeeper", "tests still fail", 1)
@@ -3066,7 +3074,7 @@ mod tests {
     async fn task_turns_accessor_tracks_and_resets() {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
@@ -3098,7 +3106,7 @@ mod tests {
         .unwrap();
         assert_eq!(w.task_turns(), 2);
         // A new task resets the per-task counter.
-        w.write_task_start("tsk_2", "ctx_2", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_2", "ctx_2", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         assert_eq!(w.task_turns(), 0);
@@ -3116,7 +3124,7 @@ mod tests {
         w.write_session_start(10, vec!["bash".to_string()])
             .await
             .unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_inference(
@@ -3210,7 +3218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_inference(
@@ -3301,7 +3309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_inference(
@@ -3402,7 +3410,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut w = make_writer(dir.path()).await;
         w.write_session_start(10, Vec::new()).await.unwrap();
-        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), 3)
+        w.write_task_start("tsk_1", "ctx_1", "a2a", event_provenance(), None, 3)
             .await
             .unwrap();
         w.write_inference(

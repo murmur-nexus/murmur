@@ -642,6 +642,10 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         grant,
         child_env_allow: Vec::new(),
         roost_url: roost_url.clone(),
+        // A plan step waits for its child's answer on the connection it opened, so there is
+        // nothing for a completion to tell it. No spawner means no injected handle and no
+        // watcher: this step launches exactly what it always launched.
+        spawner: None,
     }) {
         Ok(child) => child,
         Err(error) => return failed(&step.id, error.to_string()),

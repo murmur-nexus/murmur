@@ -22,10 +22,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::delegation::{
+    self, DelegationOutcome, DelegationStatus, Reporter, Spawner, SpawnerHandle, SPAWNER_ENV,
+};
 use crate::errors::RuntimeError;
 use crate::mac_token;
 use crate::spawn_credential::SpawnApproval;
@@ -56,6 +59,13 @@ const CHILD_DIR_MODE: u32 = 0o700;
 /// before dying does not turn into an unbounded error string.
 const CHILD_STDERR_TAIL_LINES: usize = 20;
 
+/// How often the completion watcher asks whether the child is still running.
+///
+/// It polls rather than blocking on `wait`, because the process handle is shared with
+/// [`LaunchedChild::shutdown`] and [`Drop`]: a watcher blocked inside `wait` would hold the lock
+/// those need, and a second `wait` on one child is not a thing two owners can both do.
+const CHILD_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
 /// What the parent's runtime needs in order to start one approved child.
 ///
 /// Carries no manifest and no capability declaration: what the child holds is decided by the
@@ -76,6 +86,77 @@ pub struct ChildLaunchRequest {
     pub child_env_allow: Vec<String>,
     /// Base URL of the daemon the child registers with.
     pub roost_url: String,
+    /// Where this child reports its outcome, or `None` for a launch nobody wants told.
+    ///
+    /// `Some` is what turns the launch into a delegation: the launcher mints a delegation id,
+    /// injects a [`SpawnerHandle`] as [`SPAWNER_ENV`], and starts the watcher that reports for a
+    /// child that could not report for itself. `None` injects nothing and starts nothing.
+    pub spawner: Option<Spawner>,
+}
+
+/// How a child's process ended, as the watcher sees it.
+enum Ending {
+    /// The process exited on its own. `None` when it was reaped by someone who did not keep the
+    /// status.
+    Exited(Option<ExitStatus>),
+    /// The parent ended the delegation itself, through [`LaunchedChild::shutdown`] or `Drop`.
+    Deliberate,
+}
+
+/// The one owner of the child's process handle.
+///
+/// Shared behind a lock between [`LaunchedChild`] — which kills and reaps — and the completion
+/// watcher, which only ever asks whether the process is still there. Single ownership of the
+/// `Child` is what keeps `pid()`, `shutdown()` and `Drop` behaving as they did: nothing else
+/// takes the handle, and nothing else waits on it.
+struct ChildProcess {
+    /// `None` once [`LaunchedChild::shutdown`] or `Drop` has reaped the process.
+    child: Option<Child>,
+    /// Set before the kill by whoever ended the delegation on purpose, so the watcher can tell a
+    /// termination the parent chose from a crash it did not.
+    deliberate: bool,
+    /// The exit status, once anyone has observed it.
+    status: Option<ExitStatus>,
+}
+
+impl ChildProcess {
+    /// How the process ended, or `None` while it is still running.
+    ///
+    /// Reaps a process that exited on its own, which is what makes a later `wait` in `shutdown`
+    /// return the cached status rather than block.
+    fn poll(&mut self) -> Option<Ending> {
+        if self.deliberate {
+            return Some(Ending::Deliberate);
+        }
+        let Some(child) = self.child.as_mut() else {
+            // Reaped by neither `shutdown` nor `Drop`, which both set `deliberate` first: this
+            // is unreachable, and reporting the exit is the harmless reading of it.
+            return Some(Ending::Exited(self.status));
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.status = Some(status);
+                Some(Ending::Exited(Some(status)))
+            }
+            Ok(None) => None,
+            // The handle is unusable; treating the child as gone is the only outcome that lets
+            // the delegation be reported at all.
+            Err(_) => Some(Ending::Exited(self.status)),
+        }
+    }
+
+    /// Kill and reap. Idempotent.
+    fn end(&mut self) -> Result<(), std::io::Error> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        // `kill` on an already-exited process is not an error worth surfacing — the wait below is
+        // what actually retires the entry in the process table.
+        let _ = child.kill();
+        let status = child.wait()?;
+        self.status = Some(status);
+        Ok(())
+    }
 }
 
 /// A running child capsule and the handles to end it.
@@ -96,8 +177,16 @@ pub struct LaunchedChild {
     /// The complete environment the parent built for this child, in insertion order. Also carries
     /// no token.
     pub env: Vec<(String, String)>,
-    /// `None` once [`LaunchedChild::shutdown`] has reaped the process.
-    child: Option<Child>,
+    /// The id this launch's completion reports under, `None` when no spawner was supplied.
+    ///
+    /// Minted here, injected into the child as part of [`SPAWNER_ENV`], and echoed back on the
+    /// completion — the one value that joins a delegation to the task it produces at the parent.
+    pub delegation_id: Option<String>,
+    process: Arc<Mutex<ChildProcess>>,
+    /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, retained so a crash can say why.
+    stderr_tail: Arc<Mutex<Vec<String>>>,
+    /// When the child process was started, for the completion's `duration_ms`.
+    started: Instant,
 }
 
 impl std::fmt::Debug for LaunchedChild {
@@ -106,7 +195,8 @@ impl std::fmt::Debug for LaunchedChild {
             .field("workdir", &self.workdir)
             .field("session_id", &self.session_id)
             .field("capsule_url", &self.capsule_url)
-            .field("pid", &self.child.as_ref().map(Child::id))
+            .field("delegation_id", &self.delegation_id)
+            .field("pid", &self.pid())
             .finish()
     }
 }
@@ -114,19 +204,30 @@ impl std::fmt::Debug for LaunchedChild {
 impl LaunchedChild {
     /// The child's operating-system process id. `0` once it has been reaped.
     pub fn pid(&self) -> u32 {
-        self.child.as_ref().map(Child::id).unwrap_or(0)
+        lock(&self.process)
+            .child
+            .as_ref()
+            .map(Child::id)
+            .unwrap_or(0)
+    }
+
+    /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, oldest first.
+    ///
+    /// The same lines a crash completion quotes back, exposed so a caller can read what the child
+    /// said without scraping the stderr they were already echoed to.
+    pub fn stderr_tail(&self) -> Vec<String> {
+        lock(&self.stderr_tail).clone()
     }
 
     /// Terminate the child and reap it. Idempotent: a second call, or a call after `Drop` has
     /// already run, does nothing.
+    ///
+    /// Marks the ending as deliberate, so the watcher records the delegation as `terminated` and
+    /// posts nothing: the only party that would be told is the party that did it.
     pub fn shutdown(&mut self) -> Result<(), RuntimeError> {
-        let Some(mut child) = self.child.take() else {
-            return Ok(());
-        };
-        // `kill` on an already-exited process is not an error worth surfacing — the wait below is
-        // what actually retires the entry in the process table.
-        let _ = child.kill();
-        child.wait().map(|_| ()).map_err(|error| {
+        let mut process = lock(&self.process);
+        process.deliberate = true;
+        process.end().map_err(|error| {
             RuntimeError::Runtime(format!("failed to reap child capsule: {error}"))
         })
     }
@@ -134,13 +235,21 @@ impl LaunchedChild {
 
 impl Drop for LaunchedChild {
     /// Terminates and reaps, so a parent that returns early — including by panicking — leaves no
-    /// orphaned capsule process behind holding a port and a directory.
+    /// orphaned capsule process behind holding a port and a directory. Deliberate on the same
+    /// terms as [`LaunchedChild::shutdown`].
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let mut process = lock(&self.process);
+        process.deliberate = true;
+        let _ = process.end();
     }
+}
+
+/// A mutex this crate holds only for the length of one field access, so a poisoned lock is
+/// recovered from rather than turned into a panic in a `Drop`.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Where a child of this parent goes: `<parent accessible workdir>/.murmur/children/<name>-<16 hex>`.
@@ -186,7 +295,14 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         "--no-env-file".to_string(),
         "--spawn-grant-stdin".to_string(),
     ];
-    let env = child_environment(&request);
+    // Minted here, once per launch: a caller holding one `Spawner` that delegates twice gets two
+    // delegation ids, and neither child can report under the other's.
+    let handle = request
+        .spawner
+        .as_ref()
+        .map(|spawner| SpawnerHandle::for_delegation(spawner, delegation::new_delegation_id()));
+    let env = child_environment(&request, handle.as_ref());
+    let started = Instant::now();
 
     let mut command = Command::new(&binary);
     command
@@ -225,7 +341,14 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         capsule_url: String::new(),
         argv,
         env,
-        child: Some(child),
+        delegation_id: handle.as_ref().map(|handle| handle.delegation_id.clone()),
+        process: Arc::new(Mutex::new(ChildProcess {
+            child: Some(child),
+            deliberate: false,
+            status: None,
+        })),
+        stderr_tail: Arc::clone(&stderr_tail),
+        started,
     };
     if let Err(reason) = write_result {
         return Err(RuntimeError::Runtime(reason));
@@ -258,7 +381,123 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
     } else {
         format!("http://{url}")
     };
+
+    // Started only for a launch somebody wants told about: a `capsule` plan step passes no
+    // spawner, so it starts no watcher and behaves exactly as it did.
+    if let Some(handle) = handle {
+        watch_for_completion(
+            &launched,
+            handle,
+            &request.capsule_name,
+            &request.capsule_version,
+        );
+    }
     Ok(launched)
+}
+
+/// Report for a child that ended without reporting for itself.
+///
+/// Polls the shared process handle rather than blocking on `wait`, so it never contends with
+/// [`LaunchedChild::shutdown`] or `Drop` for ownership of the `Child`. What it does when the
+/// process ends is decided by what the child left behind:
+///
+/// * A completion the child already delivered is left alone — exactly one completion per
+///   delegation reaches the parent.
+/// * A completion the child recorded but could not deliver is retried once, and the file is
+///   rewritten with the result. Nothing is retried after that.
+/// * No completion at all means the child died without a word: the watcher builds one with
+///   `status: crashed`, carrying the exit status and the child's bounded stderr tail, and posts
+///   it in the child's place.
+/// * An ending the parent chose is recorded as `terminated` and posted to nobody.
+fn watch_for_completion(
+    launched: &LaunchedChild,
+    handle: SpawnerHandle,
+    capsule_name: &str,
+    capsule_version: &str,
+) {
+    let process = Arc::clone(&launched.process);
+    let stderr_tail = Arc::clone(&launched.stderr_tail);
+    let workdir = launched.workdir.clone();
+    let session_id = launched.session_id.clone();
+    let capsule_name = capsule_name.to_string();
+    let capsule_version = capsule_version.to_string();
+    let started = launched.started;
+
+    std::thread::spawn(move || {
+        let ending = loop {
+            if let Some(ending) = lock(&process).poll() {
+                break ending;
+            }
+            std::thread::sleep(CHILD_WATCH_INTERVAL);
+        };
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+
+        if let Some(recorded) = delegation::read_completion(&workdir) {
+            if recorded.delivered {
+                return;
+            }
+            let retried = delegation::report_completion(&handle, recorded, &workdir);
+            if !retried.delivered {
+                // One retry, then the file and the line above it are the record.
+                eprintln!(
+                    "[capsule-runtime] delegation {}: the child's completion is undelivered after one retry",
+                    handle.delegation_id
+                );
+            }
+            return;
+        }
+
+        let outcome = |status: DelegationStatus, detail: String| DelegationOutcome {
+            delegation_id: handle.delegation_id.clone(),
+            capsule_name: capsule_name.clone(),
+            capsule_version: capsule_version.clone(),
+            session_id: session_id.clone(),
+            status,
+            // The launcher reports for a child that recorded nothing, so it makes no claim about
+            // a result file it never saw named.
+            result_path: None,
+            workdir: workdir.display().to_string(),
+            duration_ms,
+            detail: Some(detail),
+            reported_by: Reporter::Launcher,
+            delivered: false,
+            delivery_error: None,
+        };
+
+        match ending {
+            Ending::Deliberate => {
+                delegation::record_terminated(
+                    &workdir,
+                    outcome(
+                        DelegationStatus::Terminated,
+                        "the parent ended this delegation".to_string(),
+                    ),
+                );
+            }
+            Ending::Exited(status) => {
+                let status_text = match status {
+                    Some(status) => status.to_string(),
+                    None => "unknown exit status".to_string(),
+                };
+                let tail = lock(&stderr_tail).join("\n");
+                let detail = if tail.is_empty() {
+                    format!(
+                        "the child process ended without recording a completion ({status_text})"
+                    )
+                } else {
+                    format!(
+                        "the child process ended without recording a completion ({status_text}); \
+                         its last stderr lines were:\n{tail}"
+                    )
+                };
+                delegation::report_completion(
+                    &handle,
+                    outcome(DelegationStatus::Crashed, detail),
+                    &workdir,
+                );
+            }
+        }
+    });
 }
 
 /// The child's complete environment, built from a cleared one.
@@ -267,14 +506,19 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 /// nothing here, and a variable the parent holds but the child did not declare is simply absent.
 /// The three runtime-owned names are applied last, so a child cannot displace the daemon URL it is
 /// required to register with by allowlisting its name.
-fn child_environment(request: &ChildLaunchRequest) -> Vec<(String, String)> {
+fn child_environment(
+    request: &ChildLaunchRequest,
+    handle: Option<&SpawnerHandle>,
+) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     for key in &request.child_env_allow {
         if let Ok(value) = std::env::var(key) {
             env.push((key.clone(), value));
         }
     }
-    env.retain(|(key, _)| !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL"));
+    env.retain(|(key, _)| {
+        !matches!(key.as_str(), "PATH" | "HOME" | "MURMUR_ROOST_URL") && key != SPAWNER_ENV
+    });
 
     if let Ok(path) = std::env::var("PATH") {
         env.push(("PATH".to_string(), path));
@@ -283,6 +527,12 @@ fn child_environment(request: &ChildLaunchRequest) -> Vec<(String, String)> {
         env.push(("HOME".to_string(), home));
     }
     env.push(("MURMUR_ROOST_URL".to_string(), request.roost_url.clone()));
+    // Last, with the other runtime-owned names, and only for a launch that has a spawner: a child
+    // nobody wants told holds no handle at all, whatever this process's own environment carries
+    // and whatever the child declared.
+    if let Some(handle) = handle {
+        env.push((SPAWNER_ENV.to_string(), handle.to_env_value()));
+    }
     env
 }
 
@@ -349,7 +599,7 @@ fn first_json_line(
     launched: &mut LaunchedChild,
     stderr_tail: &Arc<Mutex<Vec<String>>>,
 ) -> Result<String, RuntimeError> {
-    let stdout = launched
+    let stdout = lock(&launched.process)
         .child
         .as_mut()
         .and_then(|child| child.stdout.take())
@@ -381,7 +631,7 @@ fn first_json_line(
     match rx.recv_timeout(CHILD_READY_TIMEOUT) {
         Ok(Some(line)) => Ok(line),
         Ok(None) => {
-            let status = launched
+            let status = lock(&launched.process)
                 .child
                 .as_mut()
                 .and_then(|child| child.wait().ok())
@@ -434,20 +684,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_childs_environment_is_built_from_its_own_declaration() {
-        std::env::set_var("MURMUR_CHILD_LAUNCH_TEST_A", "a");
-        std::env::set_var("MURMUR_CHILD_LAUNCH_TEST_B", "b");
-        let request = ChildLaunchRequest {
+    fn request(env_allow: &[&str], spawner: Option<Spawner>) -> ChildLaunchRequest {
+        ChildLaunchRequest {
             parent_accessible_workdir: PathBuf::from("/tmp/parent"),
             capsule_name: "worker".to_string(),
             capsule_version: "0.1.0".to_string(),
             grant: SpawnApproval::new("msa1.token".to_string()),
-            child_env_allow: vec!["MURMUR_CHILD_LAUNCH_TEST_A".to_string()],
+            child_env_allow: env_allow.iter().map(|name| name.to_string()).collect(),
             roost_url: "http://127.0.0.1:7700".to_string(),
-        };
+            spawner,
+        }
+    }
 
-        let env = child_environment(&request);
+    fn spawner() -> Spawner {
+        Spawner {
+            url: "http://127.0.0.1:7000".to_string(),
+            session_id: "ses_parent".to_string(),
+            context_id: "ctx_parent".to_string(),
+            trust: crate::origin::TrustClass::Trusted,
+        }
+    }
+
+    #[test]
+    fn a_childs_environment_is_built_from_its_own_declaration() {
+        std::env::set_var("MURMUR_CHILD_LAUNCH_TEST_A", "a");
+        std::env::set_var("MURMUR_CHILD_LAUNCH_TEST_B", "b");
+
+        let env = child_environment(&request(&["MURMUR_CHILD_LAUNCH_TEST_A"], None), None);
         let names: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
 
         assert!(names.contains(&"MURMUR_CHILD_LAUNCH_TEST_A"));
@@ -459,16 +722,8 @@ mod tests {
     #[test]
     fn a_runtime_owned_name_cannot_be_displaced_by_a_declaration() {
         std::env::set_var("MURMUR_ROOST_URL", "http://127.0.0.1:1");
-        let request = ChildLaunchRequest {
-            parent_accessible_workdir: PathBuf::from("/tmp/parent"),
-            capsule_name: "worker".to_string(),
-            capsule_version: "0.1.0".to_string(),
-            grant: SpawnApproval::new("msa1.token".to_string()),
-            child_env_allow: vec!["MURMUR_ROOST_URL".to_string()],
-            roost_url: "http://127.0.0.1:7700".to_string(),
-        };
 
-        let env = child_environment(&request);
+        let env = child_environment(&request(&["MURMUR_ROOST_URL"], None), None);
         let urls: Vec<&String> = env
             .iter()
             .filter(|(key, _)| key == "MURMUR_ROOST_URL")
@@ -476,5 +731,41 @@ mod tests {
             .collect();
 
         assert_eq!(urls, vec!["http://127.0.0.1:7700"]);
+    }
+
+    /// The injected handle is the one the parent composed, whatever this process's own
+    /// environment holds and whatever the child declared.
+    #[test]
+    fn the_spawner_handle_is_injected_last_and_cannot_be_displaced() {
+        std::env::set_var(SPAWNER_ENV, "decoy");
+        let handle = SpawnerHandle::for_delegation(&spawner(), "dlg_0001".to_string());
+
+        let env = child_environment(&request(&[SPAWNER_ENV], Some(spawner())), Some(&handle));
+        let injected: Vec<&String> = env
+            .iter()
+            .filter(|(key, _)| key == SPAWNER_ENV)
+            .map(|(_, value)| value)
+            .collect();
+
+        assert_eq!(injected.len(), 1, "{env:?}");
+        assert_eq!(
+            SpawnerHandle::parse(injected[0]).expect("the injected value is a handle"),
+            handle
+        );
+        assert_eq!(
+            env.last().map(|(key, _)| key.as_str()),
+            Some(SPAWNER_ENV),
+            "the handle is applied in the runtime-owned tail: {env:?}"
+        );
+    }
+
+    /// A launch with no spawner injects nothing, even from a decoy the launching process holds.
+    #[test]
+    fn a_launch_without_a_spawner_injects_no_handle() {
+        std::env::set_var(SPAWNER_ENV, "decoy");
+
+        let env = child_environment(&request(&[SPAWNER_ENV], None), None);
+
+        assert!(!env.iter().any(|(key, _)| key == SPAWNER_ENV), "{env:?}");
     }
 }

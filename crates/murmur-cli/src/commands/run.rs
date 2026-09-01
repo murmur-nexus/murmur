@@ -197,6 +197,15 @@ pub(crate) fn run_run(
         None
     };
 
+    // Read here, ahead of staging, for the same reason the grant is: a child that cannot read
+    // the handle its parent injected cannot report its outcome to anybody, and running it would
+    // produce work whose result reaches nobody. Refusing before `stage_session` leaves no session
+    // directory and no trace behind. The value itself is read a second time by `launch_session`,
+    // which holds the reporting guard.
+    if let Err(error) = capsule_runtime::SpawnerHandle::from_env() {
+        return Err(fail(&session_id, &workdir, CliError::from(error), json));
+    }
+
     // Resolved here, ahead of everything staging does, for two reasons: `stage_session` is what
     // creates this launch's `ses_*` directory, so `@1` must be read while the most recent session
     // is still the *previous* run; and a refusal must leave nothing behind to clean up.

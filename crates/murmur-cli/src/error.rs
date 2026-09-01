@@ -35,6 +35,7 @@ pub const E_RUN_016: &str = "E-RUN-016"; // the resumed session's trace holds no
 pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversation record on disk
 pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
 pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
+pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -435,6 +436,12 @@ impl From<RuntimeError> for CliError {
                 "start the daemon the capsule registers with — `mur-roost --port 7700 \
                  --registry-path <store>` — and set MURMUR_ROOST_URL to its base URL, or drop \
                  capabilities.spawn.allow from the manifest if this capsule spawns nothing",
+            ),
+            error @ RuntimeError::SpawnerHandleUnreadable { .. } => CliError::with_hint(
+                E_RUN_020,
+                error.to_string(),
+                "MURMUR_SPAWNER is injected by a parent capsule's runtime at launch; unset it to \
+                 run this capsule directly",
             ),
             RuntimeError::PortInUse { port } => CliError::with_hint(
                 E_RUN_010,

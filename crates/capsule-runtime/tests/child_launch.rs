@@ -236,6 +236,9 @@ impl Parent {
             grant,
             child_env_allow: env_allow.iter().map(|name| name.to_string()).collect(),
             roost_url: suite().roost.url.clone(),
+            // Nothing in this suite delegates: no handle is injected and no watcher runs, which
+            // is what makes these cases the unchanged launch path.
+            spawner: None,
         })
     }
 }
@@ -599,6 +602,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
             "MURMUR_TEST_ALLOWED_VAR".to_string(),
         ],
         roost_url: suite.roost.url.clone(),
+        spawner: None,
     })
     .expect("the leak fixture launches");
 
@@ -652,6 +656,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         grant: SpawnApproval::new(approval.clone()),
         child_env_allow: Vec::new(),
         roost_url: "http://127.0.0.1:1".to_string(),
+        spawner: None,
     })
     .expect_err("a child cannot register with a daemon that is not listening");
     let message = error.to_string();

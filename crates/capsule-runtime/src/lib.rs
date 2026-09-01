@@ -13,6 +13,7 @@ pub mod child_launch;
 pub mod containment;
 pub(crate) mod conversation;
 pub(crate) mod conversation_import;
+pub mod delegation;
 pub mod detached;
 pub(crate) mod egress_proxy;
 pub mod errors;
@@ -80,6 +81,10 @@ pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
 };
+// The delegation types and constants stay module-qualified beyond these: `Spawner` and
+// `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the
+// module — the outcome, the file, the two headers — is read by name from `delegation::`.
+pub use delegation::{Spawner, SpawnerHandle};
 // `reachability` is a private module, but both of its entry points are consumed from
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the
 // same facade shape `check_staged_runtime_floor` has, without making the module's internals
