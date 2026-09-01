@@ -37,7 +37,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation` | The session node |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
 a file that has no session frame — writes `parent_id: null` on every line, rather than naming a
@@ -519,6 +519,22 @@ refused
 `peer_handle_mint` and `peer_file_fetch` come from the agent loop; `peer_handle_redeem` is written
 by the listener, concurrently with any running task. All three are written at the moment of the
 event.
+
+**`delegation`** — written by the `delegate-task` tool when a delegation ends, whatever ended it
+
+| Field | Type | Notes |
+|---|---|---|
+| `capsule` | string | The sub-capsule the agent named |
+| `version` | string | The version the agent named |
+| `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` on `"refused"` — a delegation the daemon refused was never made |
+| `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
+| `duration_ms` | u64 | From the first request to the daemon until the delegation ended |
+| `outcome` | string | `"completed"`, `"failed"`, `"timed_out"` or `"refused"` |
+| `reason` | string \| null | `null` on `"completed"`; otherwise the same sentence the model was given |
+
+One line per call. It carries neither the task text nor the child's answer — both are the agent's
+own conversation, which the `tool_call` line for the same call already records under the session's
+`trace.capture` setting.
 
 **The handle itself never appears in a trace, on either side.** Where a token would otherwise reach
 one — most obviously as the recorded `handle` argument of a `fetch-peer-file` `tool_call` — it is

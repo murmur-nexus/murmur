@@ -19,7 +19,9 @@
 //! reaches a trace, a log line or a tool result the moment one of those exists — the formatting
 //! call site does not have to be about the token for the token to end up in the record. Reading one
 //! takes the deliberate step of calling [`SpawnCredential::expose`] or [`SpawnApproval::expose`],
-//! and those have exactly one call site each: the request headers in `plan::dispatch_capsule_step`.
+//! and those have exactly one call site each: `delegation_plane::DelegationPlane::delegate`, which
+//! puts the credential in one request header, and `child_launch::launch_child_capsule`, which
+//! writes the approval to one closed pipe.
 
 /// Request header carrying the credential that names the calling session. Required on
 /// `POST /delegate` and on any `POST /spawn` that redeems an approval.
