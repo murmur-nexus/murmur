@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use assert_cmd::Command;
-use mur_roost::{authority::SpawnAuthority, JobStatus, State};
+use mur_roost::{authority::now_ms, authority::SpawnAuthority, JobStatus, State};
 use tempfile::TempDir;
 
 /// A real `mur-roost` on a loopback port, counting every connection it accepts.
@@ -40,6 +40,8 @@ impl CountingRoost {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry.path().to_path_buf(),
             spawn_allow: vec!["capsule".to_string()],
+            max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+            max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -66,6 +68,29 @@ impl CountingRoost {
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// A running session seeded straight into the job store, holding a stated delegation budget —
+    /// the record a parent partway down a chain leaves.
+    fn seed_parent(&self, session_id: &str, capsule: &str, depth_remaining: u32) {
+        let manifest = format!("name: {capsule}\nversion: 0.0.1\n{SPAWN_CAPABILITIES}");
+        self.state.jobs.lock().unwrap().insert(
+            session_id.to_string(),
+            mur_roost::JobRecord {
+                status: JobStatus::Running,
+                envelope: capsule_runtime::SpawnEnvelope::from_runtime_manifest(
+                    &murmur_artifact::RuntimeManifest::from_yaml_str(&manifest).unwrap(),
+                ),
+                depth_remaining,
+                parent_session: None,
+                pending: Vec::new(),
+            },
+        );
+    }
+
+    /// The record the daemon holds for one session.
+    fn record(&self, session_id: &str) -> mur_roost::JobRecord {
+        self.state.jobs.lock().unwrap()[session_id].clone()
     }
 
     fn sessions(&self) -> Vec<(String, JobStatus)> {
@@ -325,4 +350,75 @@ fn copy_tree(from: &Path, to: &Path) {
             fs::copy(entry.path(), &target).unwrap();
         }
     }
+}
+
+/// The delegation budget reaches a real child process, one lower than its parent's, with no party
+/// between them stating it.
+///
+/// The parent's runtime never sees the number: it is sealed into the approval at `POST /spawn`,
+/// carried to the child on standard input, and read back out of the approval when the child's own
+/// `mur` process registers.
+#[test]
+fn a_launched_child_registers_one_level_below_its_parent() {
+    if capsule_runtime::skip_without_host_support(
+        "a_launched_child_registers_one_level_below_its_parent",
+    ) {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let store = home.path().join(".murmur").join("artifacts");
+    fs::create_dir_all(&store).unwrap();
+
+    let roost = CountingRoost::start();
+    roost.publish("capsule", "0.0.1", SPAWN_CAPABILITIES);
+    // The same bytes in the store the child resolves through, so the approval's digest matches on
+    // both sides.
+    copy_tree(&roost.state.registry_path, &store);
+
+    const PARENT: &str = "ses_00000000000000000000000000parent";
+    roost.seed_parent(PARENT, "capsule", 2);
+    let digest = murmur_artifact::Registry::resolve(
+        &murmur_artifact::LocalRegistry::new(roost.state.registry_path.clone()),
+        "capsule",
+        "0.0.1",
+    )
+    .unwrap()
+    .sha256;
+    let approval = roost
+        .state
+        .authority
+        .mint_approval_token(PARENT, "capsule", "0.0.1", &digest, 1, now_ms() + 60_000)
+        .unwrap();
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .env("MURMUR_ROOST_URL", &roost.url)
+        .args([
+            "run",
+            "--capsule",
+            "capsule",
+            "--capsule-version",
+            "0.0.1",
+            "--workdir",
+            workdir.path().to_str().unwrap(),
+            "--json",
+            "--no-env-file",
+            "--spawn-grant-stdin",
+        ])
+        .write_stdin(format!("{approval}\n"))
+        .assert()
+        .success();
+
+    let child = roost
+        .sessions()
+        .into_iter()
+        .map(|(id, _)| id)
+        .find(|id| id != PARENT)
+        .expect("the launched process registered a session of its own");
+    let record = roost.record(&child);
+    assert_eq!(record.depth_remaining, 1);
+    assert_eq!(record.parent_session.as_deref(), Some(PARENT));
 }

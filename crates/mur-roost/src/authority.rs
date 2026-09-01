@@ -86,6 +86,15 @@ pub struct ApprovalPayload {
     /// is a different artifact and a different manifest, and therefore a decision the referee
     /// never made.
     pub digest: String,
+    /// The delegation depth budget the approved child will hold: one less than what the session
+    /// named by `sid` held when it asked.
+    ///
+    /// Required rather than optional, and sealed rather than sent: the child reads its budget back
+    /// out of this payload at `POST /register`, so the only party that ever states the number is
+    /// the daemon that computed it. A payload without this field fails to deserialize and is
+    /// refused as unauthenticated, which is safe because the minting key is process-scoped and no
+    /// approval outlives the daemon that minted it.
+    pub depth: u32,
     /// Absolute expiry, in unix milliseconds.
     pub exp: u64,
     /// [`NONCE_BYTES`] random bytes, lowercase hex. The daemon marks this spent on redemption,
@@ -186,6 +195,7 @@ impl SpawnAuthority {
         name: &str,
         version: &str,
         digest: &str,
+        depth: u32,
         expires_at_ms: u64,
     ) -> Result<SpawnApproval, String> {
         Ok(SpawnApproval::new(self.mint_approval_token(
@@ -193,6 +203,7 @@ impl SpawnAuthority {
             name,
             version,
             digest,
+            depth,
             expires_at_ms,
         )?))
     }
@@ -204,20 +215,44 @@ impl SpawnAuthority {
         name: &str,
         version: &str,
         digest: &str,
+        depth: u32,
         expires_at_ms: u64,
     ) -> Result<String, String> {
+        Ok(self
+            .mint_approval_payload(session_id, name, version, digest, depth, expires_at_ms)?
+            .0)
+    }
+
+    /// The wire text and the payload sealed inside it.
+    ///
+    /// The daemon reserves a concurrency slot against the approval's `jti`, which is minted here
+    /// and readable nowhere else without redeeming the approval — and redeeming it is the child's
+    /// single use of it.
+    pub fn mint_approval_payload(
+        &self,
+        session_id: &str,
+        name: &str,
+        version: &str,
+        digest: &str,
+        depth: u32,
+        expires_at_ms: u64,
+    ) -> Result<(String, ApprovalPayload), String> {
         let payload = ApprovalPayload {
             v: PAYLOAD_VERSION,
             sid: session_id.to_string(),
             name: name.to_string(),
             version: version.to_string(),
             digest: digest.to_string(),
+            depth,
             exp: expires_at_ms,
             jti: mac_token::random_hex(NONCE_BYTES)?,
         };
         let json = serde_json::to_vec(&payload)
             .map_err(|error| format!("failed to serialize the approval payload: {error}"))?;
-        Ok(self.seal(APPROVAL_VERSION_TAG, APPROVAL_MAC_DOMAIN, &json))
+        Ok((
+            self.seal(APPROVAL_VERSION_TAG, APPROVAL_MAC_DOMAIN, &json),
+            payload,
+        ))
     }
 
     /// Verifies one approval and marks it spent, returning what it approved.

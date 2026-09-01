@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use capsule_runtime::{SpawnEnvelope, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER};
+use mur_roost::bounds::{DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
 use mur_roost::{authority::SpawnAuthority, JobRecord, JobStatus, RequestHeaders, State};
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeManifest, RuntimeType};
 use tempfile::TempDir;
@@ -115,12 +116,19 @@ impl Daemon {
     }
 
     pub fn with_spawn_allow(spawn_allow: Vec<String>) -> Self {
+        Self::bounded(spawn_allow, DEFAULT_MAX_DEPTH, DEFAULT_MAX_CONCURRENT)
+    }
+
+    /// A daemon with the operator's delegation bounds set explicitly.
+    pub fn bounded(spawn_allow: Vec<String>, max_depth: u32, max_concurrent: u32) -> Self {
         let registry = TempDir::new().unwrap();
         let workdir = TempDir::new().unwrap();
         let state = Arc::new(State {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry.path().to_path_buf(),
             spawn_allow,
+            max_depth,
+            max_concurrent,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         Self {
@@ -134,11 +142,20 @@ impl Daemon {
     /// A running session with the given capabilities, seeded straight into the job store — which
     /// is exactly where a registered session's envelope comes from.
     pub fn seed(&self, session_id: &str, body: &str) {
+        self.seed_at_depth(session_id, body, self.state.max_depth);
+    }
+
+    /// The same seeded session, holding a stated delegation budget rather than the daemon's
+    /// `--max-depth` — the shape a session registered partway down a chain has.
+    pub fn seed_at_depth(&self, session_id: &str, body: &str, depth_remaining: u32) {
         self.state.jobs.lock().unwrap().insert(
             session_id.to_string(),
             JobRecord {
                 status: JobStatus::Running,
                 envelope: envelope_from("session", body),
+                depth_remaining,
+                parent_session: None,
+                pending: Vec::new(),
             },
         );
     }

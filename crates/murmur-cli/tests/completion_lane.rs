@@ -348,6 +348,8 @@ impl CountingRoost {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry.path().to_path_buf(),
             spawn_allow: Vec::new(),
+            max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+            max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
