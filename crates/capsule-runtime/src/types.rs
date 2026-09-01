@@ -423,6 +423,11 @@ pub struct StagedSession {
     /// is `scope_report.achieved_containment`, and keeping a second copy beside it only created a
     /// way for the two to drift.
     pub(crate) scope_report: crate::containment::ScopeReport,
+    /// The single host reading this session was staged against, taken at the top of
+    /// `runtime::stage_session`. `launch_session` passes it to `sandbox::ShellEnforcement::resolve`
+    /// rather than taking a new one, so the mechanisms installed at launch are the ones
+    /// [`Self::scope_report`] already claims.
+    pub(crate) host_probe: crate::sandbox::HostProbe,
     /// The declared read-only file surface, with its root already checked against this session's
     /// accessible workdir by `stage_session` — a root that resolves outside it refuses the launch
     /// rather than being served. `None` means no resource plane.
@@ -461,6 +466,11 @@ impl StagedSession {
     /// The credential this session presents, if it was granted one.
     pub fn spawn_credential(&self) -> Option<&SpawnCredential> {
         self.spawn_credential.as_ref()
+    }
+
+    /// The grant set this session was staged with, as written to the trace.
+    pub fn scope_report(&self) -> &crate::containment::ScopeReport {
+        &self.scope_report
     }
 }
 

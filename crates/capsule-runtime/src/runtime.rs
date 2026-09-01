@@ -389,15 +389,16 @@ pub fn stage_session(
     // host is *reported* to provide — the cap can only ever subtract (see
     // `containment::achieved_containment_class`).
     let workdir_exec = request.capability_policy.workdir_exec_allowed;
-    // Both host probes happen exactly once per session, right here, and every later consumer —
-    // the refusal below and the `ScopeReport` recorded in the trace — reads these two bindings.
-    // A second probe could read differently from the first (an AppArmor profile loaded, a
-    // container's capabilities changed), and the trace would then describe a session that never
-    // ran under what it claims.
-    let enforcement_tier = sandbox::detect_enforcement_tier();
-    // Probed only so the refusal can name *which* part of the sealed mechanism is missing —
+    // The host is probed exactly once per session, right here, and every later consumer — the
+    // refusal below, the `ScopeReport` recorded in the trace, and the tier `launch_session`
+    // installs — reads this one value. A second probe could read differently from the first (an
+    // AppArmor profile loaded, a container's capabilities changed), and the trace would then
+    // describe a session that never ran under what it claims.
+    let host_probe = sandbox::HostProbe::probe();
+    let enforcement_tier = host_probe.tier();
+    // Derived only so the refusal can name *which* part of the sealed mechanism is missing —
     // the AppArmor profile, `CAP_SYS_ADMIN` inside a container, or the kernel itself.
-    let sealed_blocker = crate::containment::detect_sealed_blocker();
+    let sealed_blocker = host_probe.sealed_blocker();
     let achieved_containment = achieved_containment_class(enforcement_tier, workdir_exec);
     check_containment_floor(
         request.declared_containment_floor,
@@ -407,7 +408,7 @@ pub fn stage_session(
     )?;
     // The complete grant set this session is about to run under, in exactly the shape
     // `mur run --explain-scope --json` prints — same builder, same policy, same declared floor,
-    // and the same two probes taken above. Computed once here rather than at trace-open time so
+    // and the same probe taken above. Computed once here rather than at trace-open time so
     // the record cannot drift from the decision that let the session start.
     let exports_files = request
         .exports
@@ -458,7 +459,7 @@ pub fn stage_session(
         request.declared_containment_floor,
         enforcement_tier,
         sealed_blocker,
-        crate::containment::detect_userns_grant(),
+        host_probe.userns_grant(),
         request.exports.as_ref(),
         state_stores,
         configured_artifacts,
@@ -958,6 +959,7 @@ pub fn stage_session(
             .map(|t| t.capture)
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
+        host_probe,
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
@@ -1020,6 +1022,7 @@ pub fn launch_session(
     let shell_enforcement = sandbox::ShellEnforcement::resolve(
         &staged.capability_policy,
         staged.declared_containment_floor,
+        staged.host_probe,
     )
     .map_err(RuntimeError::Runtime)?
     .with_host_bounding(cgroup_scope, workdir_guard);
