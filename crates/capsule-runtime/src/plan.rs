@@ -601,7 +601,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     let result = plane.delegate(&DelegationRequest {
         capsule: capsule.to_string(),
         // A plan names a capsule; the version comes from the context the plan was validated
-        // against, and `0.1.0` is what a context that names none has always meant here.
+        // against, and a context that names none means `0.1.0`.
         version: ctx
             .capsule_versions
             .get(capsule)

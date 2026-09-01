@@ -9,16 +9,13 @@
 //!
 //! **The wait ends when the child finishes.** A delegation made through this plane injects no
 //! [`crate::delegation::Spawner`], so the child reports to nobody and the answer arrives on the
-//! connection the parent already holds. That is the simpler half of the choice: a variant that
-//! returned as soon as the child *started* would hand the agent a handle whose result comes back
-//! later as a `completion`-origin task, which is [`crate::delegation`]'s business and a different
-//! shape of tool. The seam for it is [`DelegationPlane::delegate`]'s `spawner: None`.
+//! connection the parent already holds, rather than as a `completion`-origin task in
+//! [`crate::delegation`]'s lane.
 //!
-//! Two costs of waiting are designed for rather than ignored. The whole plane is blocking, so its
-//! caller runs it on a blocking thread and the delegating capsule's own A2A listener keeps
-//! answering while the child runs. And the poll for the child's answer is bounded by
-//! [`DelegationPlane::result_timeout`], so a child that never answers fails the call instead of
-//! holding its parent open forever.
+//! Waiting costs two things. The whole plane is blocking, so its caller runs it on a blocking
+//! thread and the delegating capsule's own A2A listener keeps answering while the child runs. And
+//! the poll for the child's answer is bounded by [`DelegationPlane::result_timeout`], so a child
+//! that never answers fails the call instead of holding its parent open forever.
 //!
 //! **Nothing here formats a token.** The credential is read once, into a request header; the
 //! approval is moved into [`ChildLaunchRequest`] without ever being turned into a string. The
@@ -60,10 +57,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Ceiling on the answer text a delegation returns to the model.
 ///
-/// The answer is what the call was for, so this is generous rather than protective — but it is a
-/// ceiling, because a child that produced a hundred megabytes must not be able to spend its
-/// parent's whole context by being asked one question. Past it, the text is cut and
-/// [`DelegationResult::result_path`] is how the parent reads the rest.
+/// A child that produced a hundred megabytes must not be able to spend its parent's whole context
+/// by being asked one question. Past this, the text is cut and [`DelegationResult::result_path`]
+/// is how the parent reads the rest.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// The three strings an agent supplies for one delegation, and the whole of what it supplies.
@@ -138,15 +134,20 @@ pub struct DelegationResult {
 impl DelegationResult {
     /// A result that names no child, for a delegation that was never made.
     fn refused(request: &DelegationRequest, reason: String) -> Self {
+        let truncated = reason.len() > MAX_OUTPUT_BYTES;
         Self {
             delegation_id: String::new(),
             session_id: String::new(),
             capsule: request.capsule.clone(),
             version: request.version.clone(),
             status: DelegationStatus::Refused,
-            output: reason,
+            output: if truncated {
+                bound_output(reason)
+            } else {
+                reason
+            },
             result_path: None,
-            truncated: false,
+            truncated,
         }
     }
 }
@@ -237,16 +238,25 @@ impl DelegationPlane {
         // manifest, which only the daemon has resolved.
         let delegation_id = crate::delegation::new_delegation_id();
         // Every result this call can produce, built from one place so the delegation id, the
-        // capsule and the version cannot disagree between two of them.
-        let outcome = |status, session_id: &str, output: String| DelegationResult {
-            delegation_id: delegation_id.clone(),
-            session_id: session_id.to_string(),
-            capsule: request.capsule.clone(),
-            version: request.version.clone(),
-            status,
-            output,
-            result_path: None,
-            truncated: false,
+        // capsule and the version cannot disagree between two of them — and so [`MAX_OUTPUT_BYTES`]
+        // bounds every branch. A child's *failure* message is as much its own text as its answer
+        // is, so it is cut on the same terms.
+        let outcome = |status, session_id: &str, output: String| {
+            let truncated = output.len() > MAX_OUTPUT_BYTES;
+            DelegationResult {
+                delegation_id: delegation_id.clone(),
+                session_id: session_id.to_string(),
+                capsule: request.capsule.clone(),
+                version: request.version.clone(),
+                status,
+                output: if truncated {
+                    bound_output(output)
+                } else {
+                    output
+                },
+                result_path: None,
+                truncated,
+            }
         };
 
         let child = match launch_child_capsule(ChildLaunchRequest {
@@ -257,8 +267,7 @@ impl DelegationPlane {
             child_env_allow: Vec::new(),
             roost_url: self.roost_url.clone(),
             // The answer arrives on the connection this plane opened, so there is nothing for a
-            // completion to tell it. No spawner means no injected handle and no watcher — and it
-            // is the seam a start-returning variant would fill.
+            // completion to tell it. No spawner means no injected handle and no watcher.
             spawner: None,
         }) {
             Ok(child) => child,
@@ -382,10 +391,6 @@ impl DelegationPlane {
                             .or_else(|| found.as_ref().map(|(_, text)| text.clone()))
                             .unwrap_or_default(),
                     );
-                    result.truncated = result.output.len() > MAX_OUTPUT_BYTES;
-                    if result.truncated {
-                        result.output = bound_output(result.output);
-                    }
                     result.result_path = found.and_then(|(path, _)| {
                         path.strip_prefix(&self.accessible_workdir)
                             .ok()
@@ -454,8 +459,13 @@ fn bound_output(output: String) -> String {
 /// The bound this process delegates under: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
 /// number of seconds, and [`DELEGATION_RESULT_TIMEOUT`] otherwise.
 fn configured_result_timeout() -> Duration {
-    std::env::var(DELEGATION_TIMEOUT_ENV)
-        .ok()
+    result_timeout_from(std::env::var(DELEGATION_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// [`configured_result_timeout`]'s rule, without the environment read, so it is testable without
+/// mutating process-wide state that every other test in this binary shares.
+fn result_timeout_from(value: Option<&str>) -> Duration {
+    value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
@@ -519,17 +529,56 @@ mod tests {
         assert_eq!(daemon_refusal(unparseable), unparseable);
     }
 
-    /// The bound is the constant unless the environment names another, and a value that is not a
-    /// positive number of seconds is not one.
+    /// The bound is the constant unless the override names another, and a value that is not a
+    /// positive number of seconds does not name one.
     #[test]
     fn the_result_timeout_reads_its_override() {
+        assert_eq!(result_timeout_from(Some(" 20 ")), Duration::from_secs(20));
+        for ignored in [None, Some(""), Some("0"), Some("-5"), Some("later")] {
+            assert_eq!(
+                result_timeout_from(ignored),
+                DELEGATION_RESULT_TIMEOUT,
+                "{ignored:?} is not a positive number of seconds"
+            );
+        }
+    }
+
+    /// The ceiling holds on every status, not only on an answer: a child's failure message and a
+    /// daemon's refusal reach the same model context an answer does.
+    #[test]
+    fn the_output_ceiling_bounds_a_refusal_too() {
+        let request = DelegationRequest {
+            capsule: "worker".to_string(),
+            version: "0.1.0".to_string(),
+            task: "t".to_string(),
+        };
+        let result = DelegationResult::refused(&request, "x".repeat(MAX_OUTPUT_BYTES + 4096));
+        assert!(result.truncated);
+        assert!(result.output.len() <= MAX_OUTPUT_BYTES + " […]".len());
+        assert!(result.output.ends_with(" […]"));
+
+        let short = DelegationResult::refused(&request, "no".to_string());
+        assert!(!short.truncated);
+        assert_eq!(short.output, "no");
+    }
+
+    /// A cut lands on a character boundary rather than splitting a multi-byte character.
+    #[test]
+    fn a_cut_answer_stays_valid_utf8() {
+        let output = "é".repeat(MAX_OUTPUT_BYTES);
+        let bounded = bound_output(output);
+        assert!(bounded.ends_with(" […]"));
+        assert!(bounded.len() <= MAX_OUTPUT_BYTES + " […]".len());
+    }
+
+    /// The trailing slash is taken off once, so no request is built against `//spawn`.
+    #[test]
+    fn a_trailing_slash_on_the_daemon_url_is_trimmed_once() {
         let plane = DelegationPlane::new(
             "http://127.0.0.1:7700/".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
             PathBuf::from("/tmp"),
         );
-        assert_eq!(plane.result_timeout(), DELEGATION_RESULT_TIMEOUT);
-        // The trailing slash is taken off once, so no request is built against `//spawn`.
         assert_eq!(plane.roost_url, "http://127.0.0.1:7700");
     }
 }

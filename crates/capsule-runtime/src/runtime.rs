@@ -3256,9 +3256,9 @@ pub(crate) struct CapsuleStoreState {
     /// boundary.
     pub(crate) peer_trace: Option<Arc<crate::trace::ResourceTraceAppender>>,
     /// This session's authority to delegate. `None` — no `capabilities.spawn.allow`, so no
-    /// registration and no credential — means no `delegate-task` tool manifest was written, so
-    /// this is the belt to that braces: the dispatch branch refuses rather than assuming the tool
-    /// could not have been called.
+    /// registration and no credential — means no `delegate-task` tool manifest was written. The
+    /// dispatch branch still refuses on `None` rather than assuming the tool could not have been
+    /// called.
     pub(crate) delegation: Option<Arc<crate::delegation_plane::DelegationPlane>>,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) engine: Engine,
@@ -4307,7 +4307,6 @@ impl CapsuleStoreState {
         // weaker one and let a capsule self-authorise its own spawn rights.
         let plane = Arc::clone(plane);
         let started = std::time::Instant::now();
-        let asked = request.clone();
         let result = tokio::task::spawn_blocking(move || plane.delegate(&request))
             .await
             .map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
@@ -4341,8 +4340,8 @@ impl CapsuleStoreState {
         let completed = result.status == crate::delegation_plane::DelegationStatus::Completed;
         let summary = format!(
             "Delegated to {}@{}: {}",
-            asked.capsule,
-            asked.version,
+            result.capsule,
+            result.version,
             result.status.as_str()
         );
         let mut data = serde_json::json!({

@@ -272,8 +272,9 @@ without any grant saying so.
 ## The delegation tool
 
 A capsule whose manifest names at least one capsule in `capabilities.spawn.allow` gains one tool,
-`delegate-task`. A capsule that names none is not written the tool: it is absent from the workdir,
-absent from `session_start`'s `tools_declared` and absent from the model's inventory.
+`delegate-task`. The grant governs the tool's existence: where the list is empty, the tool is
+missing from the capsule's directory, from `session_start`'s `tools_declared` and from the
+inventory its model is shown, so the model has nothing to call.
 
 | Argument | Required | Meaning |
 |---|---|---|
@@ -299,9 +300,9 @@ The call returns when the child finishes, not when it starts. A successful resul
 | `output` | string | The child's answer, read from the result file its own runtime wrote. Cut at 64 KiB, with the cut marked and the tool result flagged `truncated` |
 | `result_path` | string | Where the answer is on disk, relative to the delegating capsule's accessible workdir. Absent when the child wrote no result file |
 
-A referee's refusal is not that object. It comes back as the referee's own sentence — the manifest
-key and the entry that failed, and nothing else — and the delegating capsule's own run carries on:
-a refused delegation is a failed tool call, not a failed session.
+A refusal comes back instead as a plain sentence naming the manifest key and the entry that failed,
+with no JSON around it. The delegating capsule's own run carries on: a refused delegation is a
+failed tool call, and the session continues.
 
 ### Bounds
 
