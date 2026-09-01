@@ -291,6 +291,10 @@ struct TaskStartEvent {
     /// The queue lane the task waited in, which is what decided it ran when it did.
     #[serde(default)]
     lane: String,
+    /// The delegation whose completion this task is. Absent on every task but a completion from
+    /// a child this capsule launched, so it is rendered only when the record carries one.
+    #[serde(default)]
+    delegation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2054,10 +2058,19 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             } else {
                 format!("lane {}", e.lane)
             };
-            let annotations: Vec<&str> = [e.source.as_str(), provenance.as_str(), lane.as_str()]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect();
+            let delegation = match &e.delegation_id {
+                Some(id) if !id.is_empty() => format!("delegation {id}"),
+                _ => String::new(),
+            };
+            let annotations: Vec<&str> = [
+                e.source.as_str(),
+                provenance.as_str(),
+                lane.as_str(),
+                delegation.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect();
             let annotation = if annotations.is_empty() {
                 String::new()
             } else {

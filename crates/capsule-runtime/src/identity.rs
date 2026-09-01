@@ -9,8 +9,9 @@ use crate::a2a::{
     A2aMessage, A2aTask, IncomingTask, JsonRpcRequest, JsonRpcResponse, TaskRegistry, TaskState,
     TaskStatus,
 };
+use crate::delegation::{COMPLETION_SESSION_HEADER, DELEGATION_ID_HEADER};
 use crate::errors::RuntimeError;
-use crate::origin::{self, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
+use crate::origin::{self, TaskOrigin, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 use crate::peer_handoff::{handle_peer_request, is_peer_path, PeerPlane, AUDIENCE_HEADER};
 use crate::resource_plane::{
     handle_resource_request, reason_phrase, ResourcePlane, ResourceResponse, RESOURCE_PATH_PREFIX,
@@ -103,6 +104,10 @@ pub(crate) async fn serve_http(
     conversation_mode: ConversationMode,
     resource_plane: Arc<ResourcePlane>,
     peer_plane: Arc<PeerPlane>,
+    // This capsule's own session id. The door refuses a completion addressed to any other
+    // session, which is what stops a child's outcome landing on whatever session answers the
+    // parent's old address after a restart.
+    session_id: String,
 ) {
     let conversation_mode_str = match conversation_mode {
         ConversationMode::Stateless => "stateless",
@@ -123,8 +128,9 @@ pub(crate) async fn serve_http(
                         let mode_str = conversation_mode_str.to_string();
                         let plane = Arc::clone(&resource_plane);
                         let peer = Arc::clone(&peer_plane);
+                        let session = session_id.clone();
                         tokio::task::spawn_local(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer).await;
+                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session).await;
                         });
                     }
                     Err(e) => {
@@ -151,6 +157,7 @@ async fn handle_connection(
     conversation_mode_str: String,
     resource_plane: Arc<ResourcePlane>,
     peer_plane: Arc<PeerPlane>,
+    session_id: String,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -175,6 +182,8 @@ async fn handle_connection(
     let mut audience: Option<String> = None;
     let mut task_origin: Option<String> = None;
     let mut task_trust: Option<String> = None;
+    let mut delegation_id: Option<String> = None;
+    let mut completion_session: Option<String> = None;
 
     loop {
         let mut line = String::new();
@@ -205,12 +214,23 @@ async fn handle_connection(
             task_origin = Some(rest.trim().to_string());
         } else if let Some(rest) = lower.strip_prefix(&format!("{PEER_TRUST_HEADER}:")) {
             task_trust = Some(rest.trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix(&format!("{DELEGATION_ID_HEADER}:")) {
+            // Both id spellings are lowercase hex, so lowercasing the whole line loses nothing.
+            delegation_id = Some(rest.trim().to_string());
+        } else if let Some(rest) = lower.strip_prefix(&format!("{COMPLETION_SESSION_HEADER}:")) {
+            completion_session = Some(rest.trim().to_string());
         }
     }
 
     // Classified once at the door, so both task-starting paths below read the same rule rather
     // than each interpreting the headers for itself.
     let provenance = origin::from_wire(task_origin.as_deref(), task_trust.as_deref());
+
+    // Both delegation headers mean something only on the completion path. On every other path
+    // they are ignored rather than carried: a `peer` message claiming a delegation id would put a
+    // value on the receiver's `task_start` that no delegation of its own produced.
+    let is_completion = provenance.origin() == TaskOrigin::Completion;
+    let delegation_id = if is_completion { delegation_id } else { None };
 
     // Routed ahead of the operator plane on its own segment, and answering every method under it
     // including the ones it refuses: a `PUT` that fell through would leave no record of somebody
@@ -248,6 +268,29 @@ async fn handle_connection(
         }
         let body_str = String::from_utf8_lossy(&body).to_string();
 
+        // A completion is addressed to one session, and this door answers for one session. An
+        // address that has outlived the session that made the delegation — a parent that
+        // restarted onto the same port — is refused here rather than delivered to whoever
+        // answers now. The refusal names the addressed session and not this one: a caller that
+        // guessed wrong learns nothing about who is actually here.
+        if is_completion && completion_session.as_deref() != Some(session_id.as_str()) {
+            let id = serde_json::from_str::<JsonRpcRequest>(&body_str)
+                .map(|req| req.id)
+                .unwrap_or(Value::Null);
+            let addressed = completion_session.as_deref().unwrap_or("<unaddressed>");
+            let response = JsonRpcResponse::err(
+                id,
+                -32004,
+                &format!(
+                    "completion is addressed to session {addressed}, which is not the session \
+                     running here"
+                ),
+            )
+            .into_http_response();
+            let _ = writer_half.write_all(response.as_bytes()).await;
+            return;
+        }
+
         // Peek at method to route SSE endpoints before full dispatch
         if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&body_str) {
             if req.method == "message/stream" {
@@ -259,6 +302,7 @@ async fn handle_connection(
                     &task_acceptance,
                     traceparent,
                     provenance,
+                    delegation_id,
                     last_event_id,
                     sse_tx,
                     sse_buffer,
@@ -286,6 +330,7 @@ async fn handle_connection(
             &task_acceptance,
             traceparent,
             provenance,
+            delegation_id,
         );
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
@@ -323,6 +368,7 @@ async fn handle_message_stream(
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
+    delegation_id: Option<String>,
     last_event_id: Option<u64>,
     sse_tx: SseBroadcast,
     sse_buffer: Arc<Mutex<SseEventBuffer>>,
@@ -425,6 +471,7 @@ async fn handle_message_stream(
         traceparent,
         provenance,
         source: crate::a2a::SOURCE_A2A,
+        delegation_id,
     };
     if task_tx.try_send(incoming).is_err() {
         {
@@ -546,6 +593,7 @@ async fn handle_stream_watch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_jsonrpc(
     body: &str,
     task_registry: &Arc<Mutex<TaskRegistry>>,
@@ -553,6 +601,7 @@ fn handle_jsonrpc(
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
+    delegation_id: Option<String>,
 ) -> String {
     let req: JsonRpcRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -571,12 +620,14 @@ fn handle_jsonrpc(
             task_acceptance,
             traceparent,
             provenance,
+            delegation_id,
         ),
         "tasks/get" => handle_tasks_get(id, &req.params, task_registry),
         _ => JsonRpcResponse::err(id, -32601, "Method not found").into_http_response(),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_message_send(
     id: Value,
     params: &Value,
@@ -585,6 +636,7 @@ fn handle_message_send(
     task_acceptance: &TaskAcceptance,
     traceparent: Option<String>,
     provenance: TaskProvenance,
+    delegation_id: Option<String>,
 ) -> String {
     // task_acceptance: none — method is not available
     if matches!(task_acceptance, TaskAcceptance::None) {
@@ -646,6 +698,7 @@ fn handle_message_send(
         traceparent,
         provenance,
         source: crate::a2a::SOURCE_A2A,
+        delegation_id,
     };
     if task_tx.try_send(incoming).is_err() {
         // Unexpected path — roll back pending count

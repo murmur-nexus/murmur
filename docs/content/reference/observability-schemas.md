@@ -327,6 +327,7 @@ loop has exited, on every exit path
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
+| `delegation_id` | string | `dlg_…` — the delegation whose completion this task is, for a `"completion"`-origin task from a sub-capsule this session launched. Written only then; the field is absent from every other line rather than written as `null`. It is the value that joins a completion to the delegation that produced it, and it is the id the child's own `completion.json` carries. See [The completion path](roost-api.md#the-completion-path) |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for

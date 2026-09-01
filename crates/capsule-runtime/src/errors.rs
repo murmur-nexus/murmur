@@ -415,6 +415,18 @@ pub enum RuntimeError {
     )]
     SpawnRegistrationFailed { roost_url: String, reason: String },
 
+    /// `MURMUR_SPAWNER` was set to something that is not a spawner handle.
+    ///
+    /// `reason` names what about the value could not be read, and nothing derived from it carries
+    /// the value itself: a handle names a parent's address and session, which is not this
+    /// process's to print back out.
+    #[error(
+        "MURMUR_SPAWNER does not carry a readable spawner handle: {reason}; a delegated child \
+         must be able to tell its spawner that it finished, so the launch is refused rather than \
+         run unreportable"
+    )]
+    SpawnerHandleUnreadable { reason: String },
+
     #[error("runtime failure: {0}")]
     Runtime(String),
 }

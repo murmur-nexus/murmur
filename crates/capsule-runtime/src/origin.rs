@@ -151,11 +151,23 @@ pub fn from_wire(origin_header: Option<&str>, trust_header: Option<&str>) -> Tas
 
 /// The provenance a runtime stamps on an outbound peer message, given its own current task.
 ///
-/// The origin is always [`TaskOrigin::Peer`]; no sender emits [`TaskOrigin::Completion`], which
-/// the inbound rule nonetheless accepts. The trust class is the sending task's own, so untrust
-/// survives the hop. `None`, meaning no task is in scope, stamps [`TrustClass::Untrusted`].
+/// The origin is always [`TaskOrigin::Peer`]; a completion is stamped by
+/// [`stamp_for_completion`] instead, which is the other origin the inbound rule accepts. The
+/// trust class is the sending task's own, so untrust survives the hop. `None`, meaning no task is
+/// in scope, stamps [`TrustClass::Untrusted`].
 pub fn stamp_for_peer(sender_task: Option<TaskProvenance>) -> TaskProvenance {
     TaskProvenance::derive(TaskOrigin::Peer, sender_task.map(|task| task.trust()))
+}
+
+/// The provenance a runtime stamps on a completion it posts to the capsule that delegated to it.
+///
+/// `inherited` is the trust class of the parent task that made the delegation, carried to the
+/// child in its [`crate::delegation::SpawnerHandle`]. It is not a second decision about trust:
+/// the class was derived when the delegating task arrived, and this hands the same class back so
+/// the completion inherits it rather than being reclassified as fresh. `None` stamps
+/// [`TrustClass::Untrusted`], the safe class.
+pub fn stamp_for_completion(inherited: Option<TrustClass>) -> TaskProvenance {
+    TaskProvenance::derive(TaskOrigin::Completion, inherited)
 }
 
 #[cfg(test)]
@@ -325,6 +337,18 @@ mod tests {
             let stamped = stamp_for_peer(Some(TaskProvenance::derive(sender, None)));
             assert_eq!(stamped.origin(), TaskOrigin::Peer);
             assert_eq!(stamped.trust(), expected);
+        }
+    }
+
+    /// A completion inherits the delegating task's class and decides nothing of its own.
+    #[test]
+    fn stamp_for_completion_carries_the_delegating_tasks_class() {
+        assert_eq!(stamp_for_completion(None).origin(), TaskOrigin::Completion);
+        assert_eq!(stamp_for_completion(None).trust(), TrustClass::Untrusted);
+        for trust in [TrustClass::Trusted, TrustClass::Untrusted] {
+            let stamped = stamp_for_completion(Some(trust));
+            assert_eq!(stamped.origin(), TaskOrigin::Completion);
+            assert_eq!(stamped.trust(), trust);
         }
     }
 

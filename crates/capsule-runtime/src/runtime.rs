@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
+    time::Instant,
 };
 
 use murmur_artifact::{
@@ -43,6 +44,7 @@ use crate::{
     },
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
+    delegation::SpawnerHandle,
     detached::{demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry},
     errors::RuntimeError,
     hooks::{
@@ -991,6 +993,12 @@ pub fn launch_session(
     // connection, needs no daemon, and is unaffected by there being none.
     let mut roost_session = RoostSession::register(&mut staged)?;
 
+    // Beside the registration and on the same terms: a session that was delegated to must be
+    // able to say how it ended, so the handle is read before anything is instantiated and the
+    // report is a guard rather than a line at each success return. A session nobody delegated
+    // reads an absent variable and does nothing further.
+    let mut delegation = DelegationReport::open(&staged)?;
+
     // --- Host-process bounding, before any WASM is instantiated ------------------------------
     //
     // A capsule that can reach a native subprocess by any route (`shell.allow`, `spawn.allow`,
@@ -1383,6 +1391,7 @@ pub fn launch_session(
                             conversation_mode.clone(),
                             std::sync::Arc::clone(&resource_plane),
                             std::sync::Arc::clone(&peer_plane),
+                            session_id.clone(),
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -1539,7 +1548,13 @@ pub fn launch_session(
                                         TaskProvenance::derive(TaskOrigin::User, None);
                                     let _ = trace
                                         .write_task_start(
-                                            &task_id, &context_id, "task_md", provenance,
+                                            &task_id,
+                                            &context_id,
+                                            "task_md",
+                                            provenance,
+                                            // A `task.md` task is a person's instruction, not a
+                                            // child reporting back.
+                                            None,
                                             bytes,
                                         )
                                         .await;
@@ -1608,7 +1623,13 @@ pub fn launch_session(
                                         TaskProvenance::derive(TaskOrigin::User, None);
                                     let _ = trace
                                         .write_task_start(
-                                            &task_id, &context_id, "task_md", provenance,
+                                            &task_id,
+                                            &context_id,
+                                            "task_md",
+                                            provenance,
+                                            // A `task.md` task is a person's instruction, not a
+                                            // child reporting back.
+                                            None,
                                             bytes,
                                         )
                                         .await;
@@ -1835,6 +1856,7 @@ pub fn launch_session(
                                 &incoming.context_id,
                                 incoming.source,
                                 incoming.provenance,
+                                incoming.delegation_id.as_deref(),
                                 incoming.message_text.len() as u64,
                             )
                             .await;
@@ -2022,6 +2044,7 @@ pub fn launch_session(
 
         loop_result?;
 
+        delegation.complete();
         roost_session.complete();
         return Ok(LaunchResult {
             session_id: session_id_ret,
@@ -2216,6 +2239,7 @@ pub fn launch_session(
     // Notify the caller that the capsule has started (no URL for script capsules).
     on_url("");
 
+    delegation.complete();
     roost_session.complete();
     Ok(LaunchResult {
         session_id: staged.session_id,
@@ -2291,6 +2315,106 @@ impl Drop for RoostSession {
         if let Some((roost_url, credential)) = self.registered.take() {
             crate::registration::deregister_session(&roost_url, &credential, self.outcome);
         }
+    }
+}
+
+/// This session's obligation to tell the capsule that delegated to it how it ended.
+///
+/// The mirror of [`RoostSession`], and a guard for the same reason: `launch_session` has one `?`
+/// per staging step and two success returns, and a delegated child that ended without reporting
+/// would leave a parent holding a delegation nothing ever closes. Defaults to
+/// [`DelegationStatus::Error`] and is promoted by [`Self::complete`] at each success return, so
+/// every path that is not a success reports as one that failed.
+///
+/// `max_turns_reached` is not distinguishable from here: the agent path collapses it into `Ok`
+/// before the value leaves its async block, so a session that spent its turn budget reports `ok`.
+/// The child's own trace holds the precise exit status, at a path the completion names.
+struct DelegationReport {
+    /// `None` for every capsule nobody delegated, which reports to nobody.
+    handle: Option<SpawnerHandle>,
+    capsule_name: String,
+    capsule_version: String,
+    session_id: String,
+    /// The child's own directory — where `completion.json` goes, and the root the completion's
+    /// `result_path` is relative to.
+    accessible_workdir: PathBuf,
+    /// This session's directory beneath it, the other place the runtime writes `out/result.txt`.
+    session_workdir: PathBuf,
+    started: Instant,
+    status: crate::delegation::DelegationStatus,
+}
+
+impl DelegationReport {
+    /// Read this process's spawner handle, or refuse the launch when it cannot be read.
+    fn open(staged: &StagedSession) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            handle: SpawnerHandle::from_env()?,
+            capsule_name: staged.capsule_name.clone(),
+            capsule_version: staged.capsule_version.clone(),
+            session_id: staged.session_id.clone(),
+            accessible_workdir: staged.accessible_workdir.clone(),
+            session_workdir: staged.workdir.clone(),
+            started: Instant::now(),
+            status: crate::delegation::DelegationStatus::Error,
+        })
+    }
+
+    fn complete(&mut self) {
+        self.status = crate::delegation::DelegationStatus::Ok;
+    }
+
+    /// Where this session's result text landed, relative to the directory the completion names.
+    ///
+    /// Two places, one rule: a script capsule writes into its own preopen, which is the
+    /// accessible workdir, and the agent loop writes into this session's directory beneath it.
+    /// `None` when neither exists — a terminal path that failed without result text legitimately
+    /// writes no file.
+    fn result_path(&self) -> Option<String> {
+        let relative = Path::new("out").join("result.txt");
+        if self.accessible_workdir.join(&relative).is_file() {
+            return Some("out/result.txt".to_string());
+        }
+        let session_result = self.session_workdir.join(&relative);
+        if session_result.is_file() {
+            return session_result
+                .strip_prefix(&self.accessible_workdir)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+        }
+        None
+    }
+}
+
+impl Drop for DelegationReport {
+    /// Writes `completion.json` into this capsule's own directory and posts the notification to
+    /// the address its parent injected. A delivery that fails is recorded in that file and on
+    /// stderr; it never fails this session, whose work was already done.
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let outcome = crate::delegation::DelegationOutcome {
+            delegation_id: handle.delegation_id.clone(),
+            capsule_name: self.capsule_name.clone(),
+            capsule_version: self.capsule_version.clone(),
+            session_id: self.session_id.clone(),
+            status: self.status,
+            result_path: self.result_path(),
+            workdir: self.accessible_workdir.display().to_string(),
+            duration_ms: self
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+            // Reserved for a `crashed` or `terminated` outcome, neither of which a session can
+            // report about itself.
+            detail: None,
+            reported_by: crate::delegation::Reporter::Child,
+            delivered: false,
+            delivery_error: None,
+        };
+        crate::delegation::report_completion(&handle, outcome, &self.accessible_workdir);
     }
 }
 
@@ -5213,6 +5337,9 @@ async fn enqueue_detached_completion(
         // is over, and inventing a parent span would attribute the completion to it.
         traceparent: None,
         source: crate::a2a::SOURCE_DETACHED_SHELL,
+        // A demoted shell command reports on a work id, not on a delegation: no sub-capsule was
+        // launched, so there is no delegation for the trace to join this task to.
+        delegation_id: None,
     };
 
     let _ = trace
@@ -7983,6 +8110,7 @@ inference:
                 "ctx_1",
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
+                None,
                 8,
             )
             .await
@@ -8200,6 +8328,7 @@ inference:
                 "ctx_1",
                 "task_md",
                 TaskProvenance::derive(TaskOrigin::User, None),
+                None,
                 8,
             )
             .await

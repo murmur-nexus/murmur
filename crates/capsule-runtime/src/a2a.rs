@@ -370,6 +370,11 @@ pub(crate) struct IncomingTask {
     /// that arrived over the peer door, `"detached_shell"` for a completion the runtime produced
     /// locally. The `a2a_task_received` record is written only for the former.
     pub source: &'static str,
+    /// The delegation this task reports the completion of, for a task the door classified
+    /// `completion` and carrying [`crate::delegation::DELEGATION_ID_HEADER`]. `None` for every
+    /// other task, including a locally produced detached-shell completion, which reports on a
+    /// work id rather than a delegation.
+    pub delegation_id: Option<String>,
 }
 
 /// The `source` of a task that arrived over the A2A door.

@@ -64,6 +64,7 @@ section that explains it.
 | `E-RUN-017` | The context `--resume` resolved to kept no conversation record | [E-RUN-017](#e-run-017) |
 | `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
+| `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle | [E-RUN-020](#e-run-020) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -248,6 +249,25 @@ reason. The message names the daemon and the reason, never a token.
 
 A capsule that declares no spawn capability never reaches this — it opens no connection to the
 daemon at all, and `mur run` succeeds with nothing listening.
+
+### E-RUN-020 — the spawner handle could not be read { #e-run-020 }
+
+A capsule launched as a delegated child is handed `MURMUR_SPAWNER`, which names where its outcome
+is reported and under which delegation id (see
+[The completion path](roost-api.md#the-completion-path)). A child that cannot read it can tell
+nobody that it finished, so the launch is refused before a session is staged:
+
+```text
+error[E-RUN-020]: MURMUR_SPAWNER does not carry a readable spawner handle: it is not JSON: expected value at line 1 column 1; a delegated child must be able to tell its spawner that it finished, so the launch is refused rather than run unreportable
+  hint: MURMUR_SPAWNER is injected by a parent capsule's runtime at launch; unset it to run this capsule directly
+```
+
+The reason names what about the value could not be read — that it is not JSON, that a field is
+missing, or that `trust` is not a trust class — and never the value itself, which names another
+capsule's address and session.
+
+An unset or blank `MURMUR_SPAWNER` is not this error: it is the ordinary case of a capsule nobody
+delegated, which reports to nobody and runs exactly as it would have.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

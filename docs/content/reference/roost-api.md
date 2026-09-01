@@ -269,6 +269,96 @@ without any grant saying so.
 
 ---
 
+## The completion path
+
+A delegated child tells its parent that it finished. The parent's runtime injects one variable at
+launch, the child posts one message back at the end of its session, and the outcome arrives at the
+parent as a task with `completion` origin in the background lane — behind anything a person or a
+peer is waiting for.
+
+### What is injected
+
+| Field of `MURMUR_SPAWNER` | Meaning |
+|---|---|
+| `url` | The parent's own A2A endpoint, `http://host:port` |
+| `session_id` | The parent's session. A completion addressed anywhere else is refused |
+| `context_id` | The conversation the delegation was made from. The completion task runs under it |
+| `trust` | `trusted` or `untrusted` — the trust class of the parent task that made the delegation |
+| `delegation_id` | `dlg_…`, minted by the parent's launcher, one per launch |
+
+The value is compact JSON, applied last in the child's environment alongside `MURMUR_ROOST_URL`, so
+a child cannot displace it by listing the name in `capabilities.env.allow`. A capsule nobody
+delegated has no `MURMUR_SPAWNER` at all and contacts nobody. A capsule whose `MURMUR_SPAWNER`
+cannot be read refuses to launch with [`E-RUN-020`](diagnostics.md#e-run-020).
+
+### What the completion carries
+
+The delegation's identity, the outcome and where the result is — never the child's output. The
+result stays in the child's own directory, which is inside the parent's single preopen, so a parent
+that wants it reads the file deliberately through an ordinary tool call.
+
+| Field | Meaning |
+|---|---|
+| `delegation_id` | The id the parent's launcher minted, echoed back |
+| `capsule_name`, `capsule_version` | Which capsule ran |
+| `session_id` | The child's own session, so its trace is findable |
+| `status` | `ok`, `error`, `crashed` or `terminated` |
+| `result_path` | Workdir-relative path to the result, absent when the child wrote none |
+| `workdir` | The child's directory, absolute — the root `result_path` is relative to |
+| `duration_ms` | How long the child ran |
+| `detail` | The exit status and the child's last stderr lines, on a `crashed` or `terminated` outcome |
+
+The same fields are written to `completion.json` in the child's own directory, with three more that
+describe the delivery rather than the outcome.
+
+| Field of `completion.json` only | Meaning |
+|---|---|
+| `reported_by` | `child` or `launcher` — which of the two reporters built the record |
+| `delivered` | Whether the notification reached the parent's door |
+| `delivery_error` | Why delivery failed, when one was attempted and refused |
+
+### How it travels
+
+One JSON-RPC `message/send` to the parent's `POST /`, carrying the fields above as its message
+text, with four request headers.
+
+| Header | Value |
+|---|---|
+| `x-murmur-task-origin` | `completion` |
+| `x-murmur-task-trust` | The `trust` of the injected handle |
+| `x-murmur-delegation-id` | The `delegation_id` of the injected handle |
+| `x-murmur-completion-session` | The `session_id` of the injected handle |
+
+The parent's door refuses a completion whose `x-murmur-completion-session` is not the session
+running there — the shape a parent that restarted onto the same address leaves behind — with the
+JSON-RPC error `completion is addressed to session <id>, which is not the session running here`.
+Both delegation headers are read only for a request classified `completion`, and ignored on every
+other path.
+
+### Who reports, and what happens when nobody can
+
+| Situation | Reporter | `status` |
+|---|---|---|
+| The child's session ended | The child, at the end of its own session | `ok` or `error` |
+| The child's process ended without recording a completion | The parent's launcher | `crashed` |
+| The parent ended the delegation itself | The parent's launcher, recorded and posted to nobody | `terminated` |
+
+Both reporters write the outcome to `completion.json` before posting it, and rewrite the file with
+what the posting did. Between those two writes the record reads `delivered: false` with no
+`delivery_error`, so a reader polling the file should wait for one of the two to be set. A
+completion that could not be delivered is recorded with `delivered: false` and the refusal's
+reason, and one line goes to stderr; the launcher retries an undelivered completion once, and after
+that the file and the line are the record. A failed delivery does not fail the child's own session:
+`status` still records how that session ended.
+
+A delegation is never reported twice, whichever reporter gets there first.
+
+!!! note "A host restart loses a delegation in flight"
+    A parent that sleeps while a child works loses the child entirely if the host restarts: no
+    completion arrives at the parent, and none is written to `completion.json` afterwards.
+
+---
+
 ## Per-session allow lists
 
 `mur-roost` keeps two levels of capsule allow list, and how a session was launched selects between
@@ -412,6 +502,7 @@ The name-list refusals are their own, and name the list an operator has to edit:
 |---|---|---|
 | `MURMUR_ROOST_URL` | The environment of the process that runs the capsule; set on a child by its parent's runtime | Base URL the runtime registers at, and the base URL a plan's `capsule` step asks permission at. When it is unset or blank, a capsule that declares `capabilities.spawn.allow` refuses to launch with [`E-RUN-019`](diagnostics.md#e-run-019), and a `capsule` step fails with `MURMUR_ROOST_URL is not set; capsule steps require mur-roost` |
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
+| `MURMUR_SPAWNER` | The parent capsule's runtime, on a delegated child only | Where the child reports its outcome, and under which delegation id — see [The completion path](#the-completion-path). A value that is not a spawner handle refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) |
 | `MURMUR_MUR_BINARY` | The environment of the process that runs the capsule | The `mur` binary a parent starts its children from. Defaults to the running executable, which in production is `mur` itself |
 
 The spawn credential and the spawn approval have no environment variable. Every request to this
