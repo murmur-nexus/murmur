@@ -2,13 +2,16 @@
 //!
 //! Every case here drives the two-request exchange a real launch makes — `POST /spawn` with the
 //! parent's credential, then `POST /register` with the approval it granted — against real
-//! artifacts in a real registry and real MAC'd approvals. None of them inspects a counter
-//! directly: what a bound is worth is what a caller receives from an endpoint.
+//! artifacts in a real registry and real MAC'd approvals. No case inspects a counter directly;
+//! each asserts the response a caller receives.
 
 #[path = "common/mod.rs"]
 mod common;
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use common::{Daemon, IDENTITY_REFUSAL, PLAIN_WORKER_BODY};
 use mur_roost::authority::{now_ms, SpawnAuthority};
@@ -98,7 +101,7 @@ fn a_capsule_that_names_itself_terminates_at_the_declared_depth() {
 }
 
 /// The budget is the daemon's, sealed into the approval. Nothing the registrant sends can raise it,
-/// and an approval whose payload was edited to raise it is not an approval any more.
+/// and an approval whose payload is edited to raise it fails its MAC.
 #[test]
 fn a_child_cannot_claim_more_depth_than_its_parent_had() {
     let daemon = Daemon::new();
@@ -296,7 +299,7 @@ fn a_bound_that_cannot_be_evaluated_refuses() {
     assert_eq!(orphaned.error(), IDENTITY_REFUSAL);
     assert_eq!(daemon.session_ids(), vec![parent]);
 
-    // (c) An approval carrying a perfectly well-formed depth, minted by a key this daemon has
+    // (c) An approval carrying a well-formed depth, minted by a key this daemon has
     // never held.
     let daemon = Daemon::new();
     daemon.seed_caller(PARENT_SESSION);
@@ -329,8 +332,8 @@ fn a_bound_that_cannot_be_evaluated_refuses() {
 
 // ── 5. No total cap ───────────────────────────────────────────────────────────
 
-/// There is no `--max-total`, and an operator who reaches for one is told so rather than handed a
-/// number the daemon cannot honestly enforce across a restart.
+/// `--max-total` is not a flag: the daemon holds no total cap, and rejects the argument at
+/// startup.
 #[test]
 fn there_is_no_total_cap_to_set() {
     let registry = tempfile::TempDir::new().unwrap();
@@ -348,8 +351,7 @@ fn there_is_no_total_cap_to_set() {
     assert!(stderr.contains("unknown argument: --max-total"), "{stderr}");
 }
 
-/// The flags that do exist take a value and reject one that is not a number, in the same shape
-/// `--port` does.
+/// `--max-depth` and `--max-concurrent` reject a value that is not a number, as `--port` does.
 #[test]
 fn the_bound_flags_reject_a_value_that_is_not_a_number() {
     let registry = tempfile::TempDir::new().unwrap();
@@ -381,4 +383,43 @@ fn a_registration_with_no_approval_starts_from_max_depth() {
     assert_eq!(status.body["status"], "running");
     assert_eq!(status.body["depth_remaining"], 2);
     assert_eq!(status.body["live_children"], 0);
+}
+
+/// The count and the reservation happen under one lock hold, so a parent asking from several
+/// threads at once cannot take more slots than the operator allows.
+///
+/// The daemon serves each connection on its own thread. A check that released the lock before
+/// recording its reservation would let every one of these asks read the same count and pass.
+#[test]
+fn concurrent_asks_cannot_take_more_slots_than_the_bound() {
+    let daemon = Arc::new(Daemon::bounded(Vec::new(), 3, 1));
+    daemon.seed_caller(PARENT_SESSION);
+    daemon.publish("worker-a", "0.1.0");
+    let credential = daemon.credential(PARENT_SESSION);
+
+    let granted = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(8));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let daemon = Arc::clone(&daemon);
+        let granted = Arc::clone(&granted);
+        let start = Arc::clone(&start);
+        let credential = credential.clone();
+        threads.push(thread::spawn(move || {
+            start.wait();
+            if daemon
+                .permission("worker-a", "0.1.0", Some(&credential))
+                .status
+                == 200
+            {
+                granted.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+
+    assert_eq!(granted.load(Ordering::SeqCst), 1);
+    assert_eq!(daemon.status(PARENT_SESSION).body["live_children"], 1);
 }

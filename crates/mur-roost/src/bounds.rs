@@ -5,16 +5,13 @@
 //! chain terminates after `--max-depth` links whatever the manifests say. Concurrency is a census:
 //! how many children of one session are live right now, counted against `--max-concurrent`.
 //!
-//! **The depth budget rides the approval.** `POST /spawn` seals the child's remaining depth into
-//! the MAC'd approval it mints, and the child's `POST /register` reads it back out. Nothing between
-//! the two states a number: the parent cannot compose one, the child cannot claim one, and the
-//! request bodies carry no field for either to put it in.
+//! The depth budget rides the approval: `POST /spawn` seals the child's remaining depth into the
+//! MAC'd approval it mints, and `POST /register` reads it back out. No request body carries a depth
+//! field, so neither capsule can state the number.
 //!
-//! **A child occupies a slot from approval, not from registration.** An approved child that has not
-//! registered yet is still a child its parent is about to have, so [`live_children`] counts the
-//! parent's unredeemed [`crate::PendingApproval`]s alongside its running children. Counting only
-//! registrations would let a parent hold two approvals at once under a cap of one, because at the
-//! moment of the second `POST /spawn` neither child exists.
+//! [`live_children`] counts a parent's unredeemed [`crate::PendingApproval`]s alongside its running
+//! children. Counting only registrations would let a parent hold two approvals at once under a cap
+//! of one, because at the moment of the second `POST /spawn` neither child exists.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -23,8 +20,7 @@ use crate::{JobRecord, JobStatus};
 
 /// Links a delegation chain may have below a session that registered with no approval.
 ///
-/// Not unlimited, and there is no value meaning unlimited: an operator who never reads the
-/// reference gets a chain that terminates.
+/// There is no value meaning unlimited, so every chain terminates.
 pub const DEFAULT_MAX_DEPTH: u32 = 3;
 
 /// Children one session may have live at once.

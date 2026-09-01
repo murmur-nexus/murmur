@@ -59,9 +59,8 @@ pub struct JobRecord {
     ///
     /// `state.max_depth` for a session that registered with no approval; for every other session,
     /// the number sealed into the approval it registered with, which is one less than what its
-    /// parent held. A plain count with no value meaning unlimited: a session at `0` is refused
-    /// every spawn it asks for, which is what terminates a capsule whose
-    /// `capabilities.spawn.allow` names itself.
+    /// parent held. A session at `0` is refused every spawn it asks for, which is what terminates
+    /// a capsule whose `capabilities.spawn.allow` names itself.
     pub depth_remaining: u32,
     /// The session whose approval admitted this one, and therefore the session this one is counted
     /// against for concurrency. `None` for a session that registered with no approval.
@@ -73,8 +72,8 @@ pub struct JobRecord {
 
 /// An approval minted for a session, held by the daemon until the child it approves registers.
 ///
-/// The token itself is not here and never is: the daemon needs only enough to recognise the
-/// approval when it comes back and to know when it stops mattering.
+/// Holds no token bytes: the `jti` and the expiry are enough to match a redemption and to free
+/// the slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
     /// The `jti` of the approval, matched against [`authority::ApprovalPayload::jti`] on
@@ -369,8 +368,8 @@ fn resolve_capsule(
 ///
 /// The two questions this answers — is the credential one of ours, and is the session it names
 /// running — collapse into one outcome on purpose: a caller learns nothing about which sessions
-/// exist. Every figure a delegation bound is decided from is read from the record this returns, so
-/// a session that cannot be found is a bound that cannot be evaluated, and the request is refused.
+/// exist. Both delegation bounds are decided from the record this returns, so a session that
+/// cannot be found is refused rather than judged against a default.
 fn session_record(state: &Arc<State>, session_id: &str) -> Result<JobRecord, String> {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(session_id) {
@@ -462,8 +461,7 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     }
 
     let expires_at_ms = now_ms() + SPAWN_APPROVAL_TTL_SECS * 1_000;
-    // One less than the asking session holds. Sealed into the approval rather than sent beside it,
-    // so the child reads its budget from a payload only this daemon can have written.
+    // One less than the asking session holds, sealed into the approval rather than sent beside it.
     let child_depth = parent.depth_remaining - 1;
     let (approval, payload) = match state.authority.mint_approval_payload(
         &session_id,
@@ -483,11 +481,27 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
         }
     };
 
-    // The slot is taken here, not at the child's registration: between the two the child exists
-    // only as this approval, and a parent granted two approvals under a cap of one would have
-    // passed both checks before either child registered.
+    // The slot is taken at approval, not at the child's registration — see
+    // [`bounds::live_children`].
+    //
+    // The count is taken again here, under the same lock hold that records the reservation. The
+    // check above is the one an ordinary refusal comes from, but it releases the lock before the
+    // registry is read, so two requests from one session can both pass it; only a count and a push
+    // that cannot be interleaved keep a parent from taking every slot at once.
     {
         let mut jobs = state.jobs.lock().unwrap();
+        let live = live_children(&jobs, &session_id, now_ms());
+        if live >= state.max_concurrent {
+            return err(
+                403,
+                "Forbidden",
+                &BoundRefusal::ConcurrencyReached {
+                    max_concurrent: state.max_concurrent,
+                    live,
+                }
+                .to_string(),
+            );
+        }
         match jobs.get_mut(&session_id) {
             Some(job) if job.status == JobStatus::Running => job.pending.push(PendingApproval {
                 jti: payload.jti,
@@ -588,8 +602,8 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
             (approved.depth, Some(approved.sid), Some(approved.jti))
         }
         // No approval: there is no parent to have been approved by, so the operator who started
-        // the daemon is the only authority, and their list is the only gate. This is the top of a
-        // chain, and the whole of `--max-depth` is what it has to spend.
+        // the daemon is the only authority, and their list is the only gate. The top of a chain
+        // starts from `--max-depth`.
         None => {
             if !state.spawn_allow.contains(&req.name) {
                 return err(
@@ -624,8 +638,8 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
     };
 
     let mut jobs = state.jobs.lock().unwrap();
-    // The reservation this registration fulfils is released in the same breath it is taken over
-    // by a running record, so a child is counted once rather than twice.
+    // Dropping the reservation and inserting the running record under one lock hold keeps the
+    // child counted once rather than twice.
     if let (Some(parent), Some(jti)) = (parent_session.as_deref(), redeemed_jti) {
         if let Some(job) = jobs.get_mut(parent) {
             job.pending.retain(|pending| pending.jti != jti);

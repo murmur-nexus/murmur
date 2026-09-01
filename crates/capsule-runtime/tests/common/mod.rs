@@ -175,8 +175,7 @@ impl Roost {
             spawn_allow: spawn_allow.iter().map(|name| name.to_string()).collect(),
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             // One parent session serves every case in a suite, so the children this daemon counts
-            // are the suite's rather than one delegation's. What the concurrency bound refuses is
-            // asserted in `mur-roost`'s own `delegation_bounds` suite.
+            // are the suite's rather than one delegation's.
             max_concurrent: u32::MAX,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });

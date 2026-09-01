@@ -89,11 +89,9 @@ pub struct ApprovalPayload {
     /// The delegation depth budget the approved child will hold: one less than what the session
     /// named by `sid` held when it asked.
     ///
-    /// Required rather than optional, and sealed rather than sent: the child reads its budget back
-    /// out of this payload at `POST /register`, so the only party that ever states the number is
-    /// the daemon that computed it. A payload without this field fails to deserialize and is
-    /// refused as unauthenticated, which is safe because the minting key is process-scoped and no
-    /// approval outlives the daemon that minted it.
+    /// Sealed rather than sent: the child reads its budget out of this payload at `POST /register`,
+    /// so the daemon that computed the number is the only party that states it. A payload missing
+    /// this field fails to deserialize and is refused as unauthenticated.
     pub depth: u32,
     /// Absolute expiry, in unix milliseconds.
     pub exp: u64,
@@ -112,13 +110,6 @@ pub enum AuthorityError {
     Expired,
     /// The MAC verified, the approval is live, and its `jti` was already redeemed.
     AlreadyRedeemed,
-}
-
-/// The stable identifier a mint and a redemption are correlated by.
-///
-/// This — never the token — is what may appear in a log line, a trace or an error body.
-pub fn token_id(token: &str) -> String {
-    mac_token::token_id(token)
 }
 
 // ── The authority ─────────────────────────────────────────────────────────────
@@ -225,9 +216,8 @@ impl SpawnAuthority {
 
     /// The wire text and the payload sealed inside it.
     ///
-    /// The daemon reserves a concurrency slot against the approval's `jti`, which is minted here
-    /// and readable nowhere else without redeeming the approval — and redeeming it is the child's
-    /// single use of it.
+    /// The payload comes back alongside the wire text because the caller reserves a concurrency
+    /// slot against the `jti`, which is otherwise readable only by redeeming the approval.
     pub fn mint_approval_payload(
         &self,
         session_id: &str,

@@ -231,15 +231,9 @@ Poll a registered session.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `status` | string | `running`, `complete` or `failed` |
-| `depth_remaining` | number | Levels of delegation still available below this session |
+| `status` | string | `running` — registered and not yet retired; `complete` or `failed` — the session deregistered reporting that outcome |
+| `depth_remaining` | number | Levels of delegation still available below this session, against `--max-depth` |
 | `live_children` | number | Children this session holds right now, counting one it has been approved to launch and has not launched yet |
-
-| `status` | Meaning |
-|---|---|
-| `running` | Registered and not yet retired |
-| `complete` | The session deregistered reporting `complete` |
-| `failed` | The session deregistered reporting `failed` |
 
 **Error — `404 Not Found`**
 
@@ -578,8 +572,8 @@ than from anything a capsule says about itself.
 | Depth | `--max-depth` | `3` | Levels of delegation below a capsule that registered with no approval |
 | Concurrency | `--max-concurrent` | `4` | Children one session holds live at once |
 
-Both are checked at `POST /spawn`, after the name check and before the registry is read, so a
-refused spawn resolves no artifact and leaves no record anywhere.
+Both are checked at `POST /spawn`, after the name check, and a refused spawn leaves no record
+anywhere — no session, no workdir and no trace.
 
 ### The depth budget
 
@@ -617,9 +611,8 @@ so an operator reading it knows what to raise and what it is being raised past:
 }
 ```
 
-A child occupies a slot from the moment its parent is approved to launch it, not from the moment it
-registers. Counting only registrations would let two rapid asks under a cap of one both pass,
-because at the second `POST /spawn` neither child exists yet.
+A child occupies a slot from the moment its parent is approved to launch it, so `live_children`
+can exceed the number of sessions that have registered.
 
 | Event | Effect on the parent's count |
 |---|---|
@@ -645,14 +638,10 @@ refused on that ground.
 There is no cap on the total number of delegations, and no `--max-total` flag. An operator who
 tries to set one gets `unknown argument: --max-total` and the daemon exits.
 
-That is an absence rather than an oversight. The job store is held in memory: restarting the daemon
-discards every registration and therefore every count a total would be kept in. A total would reset
-silently at each restart while continuing to read as a limit, which is worse than no total at all —
-so it is documented here rather than shipped.
-
-Depth and concurrency do not have that problem. Both are decided from the sessions the daemon is
-currently tracking, and a restart that discards those sessions also discards every credential and
-approval that could have been used to delegate under them.
+The job store is held in memory, so restarting the daemon discards every registration and every
+count a total would be kept in. `--max-depth` and `--max-concurrent` are unaffected: both are
+decided from the sessions the daemon is currently tracking, and a restart that discards those
+sessions also discards every credential and approval that could delegate under them.
 
 ---
 
