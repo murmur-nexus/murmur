@@ -145,6 +145,15 @@ impl From<RuntimeError> for CliError {
                  capabilities.resources in murmur.yaml if the work genuinely needs more, or fix \
                  the runaway that hit it",
             ),
+            // Carries no code of its own: the plan scheduler this refusal comes from has no `mur`
+            // subcommand behind it, so it reaches a person only through the generic run failure.
+            error @ RuntimeError::ToolDataPathRefused { .. } => CliError::with_hint(
+                E_RUN_001,
+                error.to_string(),
+                "a tool answered with a file the host may not read — data_path is resolved beneath \
+                 the session workdir and symlinks out of it are refused; have the tool write its \
+                 output under that workdir",
+            ),
             error @ RuntimeError::CgroupDelegationUnavailable { .. } => CliError::with_hint(
                 E_RUN_012,
                 error.to_string(),

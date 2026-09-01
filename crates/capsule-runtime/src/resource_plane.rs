@@ -608,6 +608,32 @@ pub(crate) fn read_export_file_with_policy(
     })
 }
 
+/// Serves one file named by a relative path beneath `root`, with no manifest export behind it.
+///
+/// The entry point for a host-process read of a path some *other* party chose — the plan
+/// scheduler dereferencing a tool's `data_path`. The host holds ambient filesystem authority, so
+/// `root` is the whole of the caller's boundary: the path is lowered, canonicalised and required
+/// to land beneath `root` by [`resolve_relpath_beneath_root`], the same predicate the resource
+/// plane's reader and the peer plane's mint use, and refusals come back with the same
+/// [`ResourceError::code`] vocabulary.
+///
+/// `policy` is a parameter of the caller's boundary, not of a containment class: pass
+/// [`SymlinkPolicy::Refuse`] unless the reader is inside the sandbox that owns `root`.
+pub(crate) fn read_file_beneath_root(
+    root: &Path,
+    relpath: &str,
+    max_bytes: u64,
+    policy: SymlinkPolicy,
+) -> Result<ReadResponse, ResourceError> {
+    let export = DeclaredExport {
+        declared_root: ".".to_string(),
+        root: root.to_path_buf(),
+        mode: ExportMode::ReadOnly,
+        max_bytes,
+    };
+    read_export_file_with_policy(&export, relpath, policy)
+}
+
 // ── list ──────────────────────────────────────────────────────────────────────
 
 /// Every regular file under the export root, sorted by path.

@@ -65,6 +65,18 @@ fn tool_result(status: ToolStatus, data: Option<String>, summary: Option<String>
     }
 }
 
+/// [`tool_result`] for a tool that answers out of band, naming a file instead of carrying bytes.
+fn tool_result_with_path(data: Option<String>, data_path: &str) -> ToolResult {
+    ToolResult {
+        status: ToolStatus::Passed,
+        summary: None,
+        data,
+        data_path: Some(data_path.to_string()),
+        truncated: false,
+        metadata: Vec::new(),
+    }
+}
+
 fn write_plan(workdir: &Path, plan: Value) -> PathBuf {
     let path = workdir.join("plan.json");
     fs::write(&path, serde_json::to_string(&plan).unwrap()).unwrap();
@@ -1122,4 +1134,167 @@ fn test_cycle_is_reported_without_running_steps() {
     assert_eq!(report.failed_step.as_deref(), Some("a"));
     assert_eq!(find(&report, "a").status, StepStatus::Failed);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_tool_data_path_reads_file_beneath_workdir() {
+    if capsule_runtime::skip_without_host_support("test_tool_data_path_reads_file_beneath_workdir")
+    {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("out")).unwrap();
+    fs::write(dir.path().join("out/full.txt"), "the whole result").unwrap();
+    let invoke = |_name: &str, _input: ToolInput| Ok(tool_result_with_path(None, "out/full.txt"));
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+
+    assert!(report.completed, "{report:?}");
+    assert_eq!(find(&report, "a").status, StepStatus::Success);
+    assert_eq!(
+        find(&report, "a").output.as_deref(),
+        Some("the whole result")
+    );
+}
+
+#[test]
+fn test_tool_data_path_absolute_is_refused() {
+    if capsule_runtime::skip_without_host_support("test_tool_data_path_absolute_is_refused") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| Ok(tool_result_with_path(None, "/etc/passwd"));
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+
+    let step = find(&report, "a");
+    assert_eq!(step.status, StepStatus::Failed);
+    assert_eq!(step.output, None);
+    let error = step.error.as_deref().unwrap();
+    assert!(error.contains("outside_root"), "{error}");
+    assert!(
+        error.contains("echo") && error.contains("/etc/passwd"),
+        "{error}"
+    );
+    assert!(!format!("{report:?}").contains("root:x:"), "{report:?}");
+}
+
+#[test]
+fn test_tool_data_path_parent_escape_is_refused() {
+    if capsule_runtime::skip_without_host_support("test_tool_data_path_parent_escape_is_refused") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("secret.txt"), "SECRETcontentsZZZ").unwrap();
+    let workdir = dir.path().join("session");
+    fs::create_dir_all(&workdir).unwrap();
+    let invoke = |_name: &str, _input: ToolInput| Ok(tool_result_with_path(None, "../secret.txt"));
+    let plan = write_plan(
+        &workdir,
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(workdir.clone(), &invoke));
+
+    let step = find(&report, "a");
+    assert_eq!(step.status, StepStatus::Failed);
+    assert_eq!(step.output, None);
+    assert!(
+        step.error.as_deref().unwrap().contains("outside_root"),
+        "{step:?}"
+    );
+    assert!(
+        !format!("{report:?}").contains("SECRETcontentsZZZ"),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn test_tool_data_path_symlink_escape_is_refused() {
+    if capsule_runtime::skip_without_host_support("test_tool_data_path_symlink_escape_is_refused") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("secret.txt"), "SECRETcontentsZZZ").unwrap();
+    let workdir = dir.path().join("session");
+    fs::create_dir_all(workdir.join("out")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("secret.txt"), workdir.join("out/leak.txt"))
+        .unwrap();
+    let invoke = |_name: &str, _input: ToolInput| Ok(tool_result_with_path(None, "out/leak.txt"));
+    let plan = write_plan(
+        &workdir,
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(workdir.clone(), &invoke));
+
+    let step = find(&report, "a");
+    assert_eq!(step.status, StepStatus::Failed);
+    assert_eq!(step.output, None);
+    assert!(
+        step.error.as_deref().unwrap().contains("symlink_refused"),
+        "{step:?}"
+    );
+    assert!(
+        !format!("{report:?}").contains("SECRETcontentsZZZ"),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn test_tool_in_band_data_wins_over_data_path() {
+    if capsule_runtime::skip_without_host_support("test_tool_in_band_data_wins_over_data_path") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result_with_path(
+            Some("in-band".to_string()),
+            "/etc/passwd",
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+
+    let step = find(&report, "a");
+    assert_eq!(step.status, StepStatus::Success);
+    assert_eq!(step.output.as_deref(), Some("in-band"));
+    assert!(!format!("{report:?}").contains("root:x:"), "{report:?}");
+}
+
+#[test]
+fn test_tool_data_path_missing_file_fails_step() {
+    if capsule_runtime::skip_without_host_support("test_tool_data_path_missing_file_fails_step") {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("out")).unwrap();
+    let invoke =
+        |_name: &str, _input: ToolInput| Ok(tool_result_with_path(None, "out/missing.txt"));
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+
+    let step = find(&report, "a");
+    assert_eq!(step.status, StepStatus::Failed);
+    assert_eq!(step.output, None);
+    assert!(
+        step.error.as_deref().unwrap().contains("not_found"),
+        "{step:?}"
+    );
 }
