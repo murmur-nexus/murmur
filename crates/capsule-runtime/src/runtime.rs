@@ -875,6 +875,11 @@ pub fn stage_session(
         !request.capability_policy.peer_fetch_allow.is_empty(),
     )?;
 
+    // And the delegation tool, on the same terms again. Its schema is built rather than fixed:
+    // the `capsule` property's `enum` is this capsule's own `capabilities.spawn.allow`, so the
+    // model is offered the names the operator granted and cannot name anything else.
+    write_delegate_task_tool_manifest(&workdir, &request.capability_policy.spawn_allow)?;
+
     // Dispatch on-stage hooks synchronously now that manifests are in place.
     let stage_env = HookEnvVars::default();
     dispatch_stage(
@@ -1237,6 +1242,18 @@ pub fn launch_session(
         let peer_fetch_rules =
             parse_network_allow_rules(&staged.capability_policy.peer_fetch_allow)?;
 
+        // The delegating side of the same registration `RoostSession` opened. Built for every
+        // registered session, because the credential is what a delegation is made with and a
+        // session holds one exactly when the daemon minted it — the `delegate-task` manifest was
+        // written from the same declaration, so the tool and the plane appear together.
+        let delegation_plane = roost_session.endpoint().map(|(roost_url, credential)| {
+            std::sync::Arc::new(crate::delegation_plane::DelegationPlane::new(
+                roost_url.to_string(),
+                credential,
+                accessible_workdir.clone(),
+            ))
+        });
+
         // Capture staged fields that move into the async block
         let hook_components = staged.hook_components;
         let tool_components = staged.tool_components;
@@ -1436,6 +1453,7 @@ pub fn launch_session(
                         peer_plane: Some(std::sync::Arc::clone(&peer_plane)),
                         peer_own_audience: own_peer_audience,
                         peer_trace: resource_trace,
+                        delegation: delegation_plane,
                         inference_env: all_env,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
@@ -2196,6 +2214,11 @@ pub fn launch_session(
         peer_plane: None,
         peer_own_audience: String::new(),
         peer_trace: None,
+        // Nor a delegation surface: `delegate-task` is an agent-loop tool and no WIT import
+        // exposes delegation to a wasm component. A script capsule that declares
+        // `capabilities.spawn.allow` still registers, and its credential is still what a
+        // `capsule` plan step would delegate with — it simply has no tool to call.
+        delegation: None,
         inference_env,
         engine: staged.engine.clone(),
         workdir: staged.workdir.clone(),
@@ -2380,6 +2403,18 @@ impl RoostSession {
             registered: Some((roost_url, credential)),
             outcome: SessionOutcome::Failed,
         })
+    }
+
+    /// The daemon and the credential this session presents to it, for the one other thing a
+    /// registration is for: delegating.
+    ///
+    /// `None` for a session that registered nothing. The credential is cloned rather than
+    /// borrowed because the plane outlives this guard's borrow, and it is still the same closed
+    /// type — no `Display`, no `Serialize`, redacted `Debug`.
+    fn endpoint(&self) -> Option<(&str, SpawnCredential)> {
+        self.registered
+            .as_ref()
+            .map(|(url, credential)| (url.as_str(), credential.clone()))
     }
 
     fn complete(&mut self) {
@@ -3220,6 +3255,11 @@ pub(crate) struct CapsuleStoreState {
     /// so a mint and a fetch land at the moment of the event rather than at the next task
     /// boundary.
     pub(crate) peer_trace: Option<Arc<crate::trace::ResourceTraceAppender>>,
+    /// This session's authority to delegate. `None` — no `capabilities.spawn.allow`, so no
+    /// registration and no credential — means no `delegate-task` tool manifest was written. The
+    /// dispatch branch still refuses on `None` rather than assuming the tool could not have been
+    /// called.
+    pub(crate) delegation: Option<Arc<crate::delegation_plane::DelegationPlane>>,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) engine: Engine,
     pub(crate) workdir: PathBuf,
@@ -3976,7 +4016,7 @@ impl CapsuleStoreState {
                 input: json,
             }
         };
-        if name == SHARE_FILE_TOOL || name == FETCH_PEER_FILE_TOOL {
+        if name == SHARE_FILE_TOOL || name == FETCH_PEER_FILE_TOOL || name == DELEGATE_TASK_TOOL {
             return as_tool();
         }
         let native_bin = self.workdir.join("tools").join(name).join(name);
@@ -4047,6 +4087,12 @@ impl CapsuleStoreState {
         if name == FETCH_PEER_FILE_TOOL {
             return self
                 .dispatch_fetch_peer_file(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == DELEGATE_TASK_TOOL {
+            return self
+                .dispatch_delegate_task(input)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -4225,6 +4271,104 @@ impl CapsuleStoreState {
                 ))
             }
         }
+    }
+
+    /// `delegate-task`: hand one task to one sub-capsule and return its answer.
+    ///
+    /// The agent names a capsule, a version and a task. Everything else — the daemon's address,
+    /// this session's credential, the approval, the child's directory, the child's process and the
+    /// A2A conversation with it — is composed by [`crate::delegation_plane::DelegationPlane`] and
+    /// never enters the model's context. That is why a delegating capsule needs no
+    /// `capabilities.network.allow` entry for the daemon: it never addresses it.
+    ///
+    /// Run on a blocking thread, exactly as the shell branch is: the plane waits for the child's
+    /// whole run, and the parent's own A2A listener shares this `LocalSet`.
+    async fn dispatch_delegate_task(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        let args = parse_tool_json_input(DELEGATE_TASK_TOOL, &input)?;
+        let request = crate::delegation_plane::DelegationRequest {
+            capsule: required_string_arg(DELEGATE_TASK_TOOL, &args, "capsule")?,
+            version: required_string_arg(DELEGATE_TASK_TOOL, &args, "version")?,
+            task: required_string_arg(DELEGATE_TASK_TOOL, &args, "task")?,
+        };
+
+        let Some(plane) = self.delegation.as_ref() else {
+            return Err(format!(
+                "'{DELEGATE_TASK_TOOL}' needs a capabilities.spawn.allow list in murmur.yaml; \
+                 this capsule declares none"
+            ));
+        };
+
+        // Which capsules may be delegated to is the daemon's question, not this runtime's: the
+        // referee holds the parent's envelope and answers with a sentence naming the manifest key
+        // and the entry that failed. Pre-empting it here would replace that sentence with a
+        // weaker one and let a capsule self-authorise its own spawn rights.
+        let plane = Arc::clone(plane);
+        let started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || plane.delegate(&request))
+            .await
+            .map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
+
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let refused = result.status == crate::delegation_plane::DelegationStatus::Refused;
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_delegation(
+                    &result.capsule,
+                    &result.version,
+                    Some(result.delegation_id.clone()).filter(|id| !id.is_empty()),
+                    Some(result.session_id.clone()).filter(|id| !id.is_empty()),
+                    duration_ms,
+                    result.status.as_str(),
+                    match result.status {
+                        crate::delegation_plane::DelegationStatus::Completed => None,
+                        _ => Some(result.output.clone()),
+                    },
+                )
+                .await;
+        }
+
+        // A refusal is the referee's own sentence and nothing else. The operator reading it has to
+        // see which manifest key and which entry to edit, not the HTTP transcript that carried it,
+        // and not this runtime's opinion wrapped around it.
+        if refused {
+            return Err(result.output);
+        }
+
+        let completed = result.status == crate::delegation_plane::DelegationStatus::Completed;
+        let summary = format!(
+            "Delegated to {}@{}: {}",
+            result.capsule,
+            result.version,
+            result.status.as_str()
+        );
+        let mut data = serde_json::json!({
+            "delegation_id": result.delegation_id,
+            "session_id": result.session_id,
+            "capsule": result.capsule,
+            "version": result.version,
+            "status": result.status.as_str(),
+            "output": result.output,
+        });
+        // Present only when the child left a result file, so the parent can read the untruncated
+        // answer through an ordinary tool call. Omitted rather than null when there is none.
+        if let Some(path) = &result.result_path {
+            data["result_path"] = serde_json::Value::String(path.clone());
+        }
+        Ok(murmur::tool::run::ToolResult {
+            status: if completed {
+                murmur::tool::run::Status::Passed
+            } else {
+                murmur::tool::run::Status::Failed
+            },
+            summary: Some(summary),
+            data: Some(data.to_string()),
+            data_path: None,
+            truncated: result.truncated,
+            metadata: Vec::new(),
+        })
     }
 
     /// The audience a handle for `peer` must be minted for, read off that peer's own agent card.
@@ -4814,6 +4958,54 @@ const FETCH_PEER_FILE_TOOL_MANIFEST: &str = concat!(
     r#"{"type":"object","properties":{"peer":{"type":"string"},"handle":{"type":"string"}},"required":["peer","handle"]}"#,
     "'\n",
 );
+
+/// Writes the delegation tool's synthetic manifest, only for a capsule that declares at least one
+/// name in `capabilities.spawn.allow`.
+///
+/// A capsule that declares none gets no file, so `delegate-task` is absent from its tool inventory
+/// and from `session_start`'s `tools_declared` — the grant governs the tool's existence rather
+/// than its success.
+fn write_delegate_task_tool_manifest(
+    workdir: &Path,
+    spawn_allow: &[String],
+) -> Result<(), RuntimeError> {
+    if spawn_allow.is_empty() {
+        return Ok(());
+    }
+    write_tool_manifest(
+        workdir,
+        DELEGATE_TASK_TOOL,
+        &delegate_task_tool_manifest(spawn_allow),
+    )
+}
+
+/// Tool a capsule gains from `capabilities.spawn.allow`.
+pub(crate) const DELEGATE_TASK_TOOL: &str = "delegate-task";
+
+/// `delegate-task`'s manifest, with the granted capsule names built into its schema.
+///
+/// The description tells the model the three things the schema cannot: that the call does not
+/// return until the sub-capsule has finished, that `version` is exact because there is no `latest`
+/// anywhere in this system, and that the task text is the whole of what the sub-capsule is told.
+fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
+    let allowed = serde_json::to_string(spawn_allow).unwrap_or_else(|_| "[]".to_string());
+    let schema = format!(
+        r#"{{"type":"object","properties":{{"capsule":{{"type":"string","enum":{allowed}}},"version":{{"type":"string"}},"task":{{"type":"string"}}}},"required":["capsule","version","task"]}}"#
+    );
+    format!(
+        "name: {DELEGATE_TASK_TOOL}\n\
+         version: 0.0.0\n\
+         runtime: tool\n\
+         implementation: native\n\
+         description: \"Hand one task to one sub-capsule and wait for its answer. `capsule` must \
+         be one of the names this capsule is allowed to delegate to; `version` is that capsule's \
+         exact version, because there is no latest or stable alias; `task` is the whole of what \
+         the sub-capsule is told, so state the objective in full. The sub-capsule runs as its own \
+         process with its own workdir and this call does not return until it has finished. \
+         Returns its answer text.\"\n\
+         input_schema: '{schema}'\n",
+    )
+}
 
 fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<(), RuntimeError> {
     for binary in shell_allow {
@@ -5484,6 +5676,61 @@ fn resolve_lifecycle(
 
 #[cfg(test)]
 mod tests {
+
+    // ── delegate-task's synthetic manifest ───────────────────────────────────
+
+    /// The tool's contract, pinned: the model reads this manifest, and the `enum` is the whole of
+    /// what stops it naming a capsule the operator never granted.
+    #[test]
+    fn the_delegation_manifest_carries_the_granted_names_and_nothing_else() {
+        let manifest =
+            super::delegate_task_tool_manifest(&["worker".to_string(), "reviewer".to_string()]);
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(&manifest).expect("the generated manifest is YAML");
+        assert_eq!(parsed["name"].as_str(), Some("delegate-task"));
+        assert_eq!(parsed["runtime"].as_str(), Some("tool"));
+        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
+                .expect("the schema is JSON");
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["capsule", "version", "task"])
+        );
+        assert_eq!(
+            schema["properties"]["capsule"]["enum"],
+            serde_json::json!(["worker", "reviewer"]),
+            "the enum is the capsule's own spawn.allow, in declaration order"
+        );
+        // No URL, no credential, no workdir, no capability: the runtime composes all four.
+        for absent in ["roost", "url", "credential", "approval", "workdir"] {
+            assert!(
+                !schema["properties"]
+                    .as_object()
+                    .expect("an object")
+                    .contains_key(absent),
+                "'{absent}' must not be an argument the agent supplies"
+            );
+        }
+    }
+
+    /// A capsule that declares no `capabilities.spawn.allow` gets no file, so the tool is absent
+    /// from its inventory rather than present and failing.
+    #[test]
+    fn an_ungranted_capsule_is_written_no_delegation_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        super::write_delegate_task_tool_manifest(dir.path(), &[]).unwrap();
+        assert!(!dir.path().join("tools").join("delegate-task").exists());
+
+        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        assert!(dir
+            .path()
+            .join("tools")
+            .join("delegate-task")
+            .join(PACKED_MANIFEST_ENTRY)
+            .exists());
+    }
 
     // ── task-start-event.context-window ──────────────────────────────────────
 
@@ -6563,6 +6810,7 @@ inference:
             peer_plane: None,
             peer_own_audience: String::new(),
             peer_trace: None,
+            delegation: None,
             inference_env: Vec::new(),
             engine,
             workdir: workdir.clone(),
