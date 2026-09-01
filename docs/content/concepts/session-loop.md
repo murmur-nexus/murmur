@@ -214,6 +214,10 @@ output and no log file for a command whose runtime died, and whether the command
 is unknown. Nothing is recovered, nothing is adopted, and the command — which the kernel does not
 kill along with the runtime — is left to run out on its own.
 
+The report is a task the capsule generated for itself, so `lifecycle.task_acceptance` does not
+gate it: a resume delivers it under `none`, `single` and `queue` alike, after the task the resume
+was launched for.
+
 Each reported command is marked `shell_lost` in the trace of the session that started it, so a
 second resume of the same session reports nothing. A session that ended cleanly has nothing to
 report either way.

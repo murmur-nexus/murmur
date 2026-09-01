@@ -1258,10 +1258,10 @@ lifecycle:
 
 #### What a backgrounded command costs when the host dies
 
-A backgrounded command is not supervised. If the runtime is killed — `SIGKILL`, an out-of-memory
-kill, a host that goes away — the command keeps running with nothing reading its output, and
-nothing of its result survives: no exit code, no `logs/<work_id>.log`, no record of whether it
-finished. The work is a full run's compute spent for nothing, so `lifecycle.shell_grace_secs` is
+A backgrounded command outlives the runtime that started it. If the runtime is killed — `SIGKILL`,
+an out-of-memory kill, a host that goes away — the command keeps running with nothing reading its
+output, and nothing of its result survives: no exit code, no `logs/<work_id>.log`, no record of
+whether it finished. The work is a full run's compute spent for nothing, so `lifecycle.shell_grace_secs` is
 also a decision about how much compute one lost host can waste.
 
 The record of the demotion does survive. The `shell_detached` line is written and flushed at the
