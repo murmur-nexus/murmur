@@ -728,8 +728,8 @@ fn a_value_after_bare_resume_is_read_as_an_address() {
 
 /// A trace that ends mid-record is what a `SIGKILL`ed writer leaves: records are appended whole
 /// under `O_APPEND`, so the only line a kill can tear is the last one. The context id the resume
-/// needs sits in the first `task_start`, far behind that tail, and reading to the end of the file
-/// to answer a question settled at its start is what used to refuse the launch.
+/// needs sits in the first `task_start`, far behind that tail, so the resume resolves it without
+/// ever reaching the torn line.
 #[test]
 fn a_torn_final_trace_line_still_resumes() {
     let f = fixture(
@@ -755,8 +755,8 @@ fn a_torn_final_trace_line_still_resumes() {
         "run 1's conversation must be in front of the model: {second}"
     );
 
-    // The reader's contract is untouched: a command whose subject *is* the whole file still
-    // refuses the same trace, naming the line it tore on.
+    // The resolver's early stop does not soften `parse_trace_records`: a command whose subject
+    // *is* the whole file refuses the same trace, naming the line it tore on.
     let show = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", f.home.path())
