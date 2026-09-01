@@ -469,7 +469,8 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 }
 
 /// Builds a [`ScopeReport`] for `policy` against this host, with `declared` as the already-
-/// combined floor. Probes the host tier once and reads nothing else.
+/// combined floor. Takes one [`crate::sandbox::HostProbe`], so the tier, the blocker and the
+/// grant it reports all describe one host at one moment.
 ///
 /// `state_stores` and `configured_artifacts` are resolved by the caller (from the manifest's
 /// artifact entries, via [`crate::state_store::state_store_reports`] and
@@ -483,12 +484,13 @@ pub fn explain_scope(
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
 ) -> ScopeReport {
+    let probe = crate::sandbox::HostProbe::probe();
     scope_report_for_tier(
         policy,
         declared,
-        detect_enforcement_tier(),
-        detect_sealed_blocker(),
-        detect_userns_grant(),
+        probe.tier(),
+        probe.sealed_blocker(),
+        probe.userns_grant(),
         exports,
         state_stores,
         configured_artifacts,

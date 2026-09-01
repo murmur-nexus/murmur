@@ -174,6 +174,7 @@ fn execute_inner(
     let shell_enforcement = match sandbox::ShellEnforcement::resolve(
         &ctx.capability_policy,
         ctx.capability_policy.containment_floor,
+        sandbox::HostProbe::probe(),
     ) {
         Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {

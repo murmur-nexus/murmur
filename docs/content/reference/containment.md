@@ -22,6 +22,10 @@ declared under `capabilities.shell.allow`. The probe is a live capability test �
 ruleset really constructed, a namespace really created in a forked child — never a kernel version
 string.
 
+The reading is taken once per capsule run. A process that runs several capsules in turn — `mur
+eval`, which runs one per dataset case — reads the host again for each, so a host you fix between
+cases takes effect without restarting.
+
 The probe sets the ceiling. A capsule then runs on the strongest tier that is both within that
 ceiling and no stronger than its declared [containment class](#field-containment): the Sealed tier
 is applied only to a capsule that declares `capabilities.containment: sealed`, and every other

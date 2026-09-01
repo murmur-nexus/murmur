@@ -75,7 +75,8 @@
 //! construction, inspect the resulting `RulesetStatus`; fork a child and really call
 //! `unshare(CLONE_NEWUSER | CLONE_NEWNS)` followed by a `mount(2)`) — never a hardcoded
 //! kernel-version string parse, which is fragile against distro backports, and never a config
-//! file. The probes run once per process and are cached; see `host_probe`.
+//! file. Each reading is taken live, and a staged session takes exactly one for every consumer
+//! of that session to read; see [`HostProbe`].
 //!
 //! ## Fail-closed invariant
 //!
@@ -172,75 +173,135 @@ pub(crate) fn applied_tier(
     }
 }
 
-/// The three host facts the tier decision is made from, probed once per process.
+/// The host facts the tier decision is made from, taken together as one reading.
 ///
-/// Cached because two of the three probes have a cost worth paying once and not per session: the
-/// Landlock probe places the runtime process into a (fully permissive) Landlock domain, and the
-/// namespace probe forks a child.
-#[cfg(target_os = "linux")]
+/// A staged session takes exactly one of these and every consumer of that session reads it — the
+/// containment-floor refusal, the `ScopeReport` written to the trace, and the tier
+/// [`ShellEnforcement::resolve`] installs. Two readings of a host that changed between them would
+/// let the trace describe a session that never ran under what it claims.
 #[derive(Debug, Clone, Copy)]
-struct HostProbe {
+pub struct HostProbe {
     landlock_fully_enforced: Option<bool>,
     sealed: crate::sealed::SealedProbe,
 }
 
-#[cfg(target_os = "linux")]
-fn host_probe() -> HostProbe {
-    static PROBE: std::sync::OnceLock<HostProbe> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| HostProbe {
-        landlock_fully_enforced: linux_enforce::probe_landlock_full_access(),
-        sealed: crate::sealed::probe_sealed_support(),
-    })
+/// Probes taken since this process started. See [`HostProbe::probes_taken`].
+static PROBES_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl HostProbe {
+    /// Reads the host as it is right now: on Linux a real Landlock ruleset restriction attempt
+    /// (`RulesetStatus::FullyEnforced` → `Some(true)`, `PartiallyEnforced`/`NotEnforced` or any
+    /// construction error → `Some(false)`, no Landlock ABI → `None`) plus a real
+    /// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and `mount(2)`. Off Linux it probes nothing and
+    /// claims nothing.
+    ///
+    /// Taken once per staged session, not once per process. That is affordable because both
+    /// halves do their work in a forked child and leave the calling process exactly as they found
+    /// it — `linux_enforce::probe_landlock_full_access` forks so the runtime is never placed
+    /// into a Landlock domain by a capability check, and [`crate::sealed::probe_sealed_support`]
+    /// forks because `unshare(CLONE_NEWUSER)` is irreversible for the task that calls it. Neither
+    /// is idempotency-sensitive, so a reading costs no more than the syscalls it makes: two
+    /// `fork`/`waitpid` pairs and three small `/proc` reads.
+    ///
+    /// The window this leaves open is one session wide. Between `runtime::stage_session` and the
+    /// last subprocess that session spawns the host is not re-read; a change inside that window is
+    /// caught by the mechanism installation itself failing closed, not by a second probe. A
+    /// process that stages repeatedly — `mur eval`, which stages once per dataset case — judges
+    /// each session against the host as it was when that session was staged.
+    pub fn probe() -> HostProbe {
+        PROBES_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        let probe = HostProbe {
+            landlock_fully_enforced: linux_enforce::probe_landlock_full_access(),
+            sealed: crate::sealed::probe_sealed_support(),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe = HostProbe {
+            landlock_fully_enforced: None,
+            sealed: crate::sealed::SealedProbe::default(),
+        };
+        probe
+    }
+
+    /// A probe value assembled from known halves, without touching the host. The seam the
+    /// fail-closed tests use to assert what an all-negative reading resolves to on any OS.
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        landlock_fully_enforced: Option<bool>,
+        sealed: crate::sealed::SealedProbe,
+    ) -> HostProbe {
+        HostProbe {
+            landlock_fully_enforced,
+            sealed,
+        }
+    }
+
+    /// The tier this reading supports. `pub(crate)` because [`EnforcementTier`] is.
+    pub(crate) fn tier(&self) -> EnforcementTier {
+        tier_from_probe(
+            cfg!(target_os = "linux"),
+            self.landlock_fully_enforced,
+            self.sealed,
+        )
+    }
+
+    /// Which single mechanism keeps this reading below `sealed`, or `None` when nothing does.
+    pub fn sealed_blocker(&self) -> Option<crate::sealed::SealedBlocker> {
+        crate::sealed::sealed_blocker(
+            cfg!(target_os = "linux"),
+            self.landlock_fully_enforced == Some(true),
+            self.sealed,
+        )
+    }
+
+    /// Where this host's permission to create an unprivileged user namespace comes from, or
+    /// `None` off Linux, where the question has no answer rather than a negative one.
+    pub fn userns_grant(&self) -> Option<crate::sealed::UsernsGrant> {
+        if cfg!(target_os = "linux") {
+            Some(self.sealed.userns_grant)
+        } else {
+            None
+        }
+    }
+
+    /// How many probes this process has taken, counting from zero at startup and never
+    /// decreasing.
+    ///
+    /// The observability hook the freshness tests assert against — that staging twice advances it
+    /// by two, and that one `stage_session` advances it by one — and nothing else reads it. No
+    /// runtime decision depends on the count.
+    pub fn probes_taken() -> u64 {
+        PROBES_TAKEN.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
-/// Real host probe. On Linux, attempts to build a Landlock ruleset and call
-/// `.restrict_self()`, mapping `RulesetStatus::FullyEnforced` to `Some(true)` and anything
-/// else (`PartiallyEnforced`/`NotEnforced`, or any construction error) to `Some(false)`,
-/// probes the sealed mechanism, then delegates to `tier_from_probe`. Off Linux, never probes
-/// anything.
-#[cfg(target_os = "linux")]
-pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
-    let probe = host_probe();
-    tier_from_probe(true, probe.landlock_fully_enforced, probe.sealed)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
-    tier_from_probe(false, None, crate::sealed::probe_sealed_support())
-}
-
-/// Which single mechanism keeps this host below `sealed`, or `None` when nothing does.
+/// The tier this host can back, from a reading taken here.
 ///
-/// Reads the same cached probe [`detect_enforcement_tier`] does, so the refusal an operator sees
-/// and the tier the runtime installs can never disagree about the host.
-#[cfg(target_os = "linux")]
-pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
-    let probe = host_probe();
-    crate::sealed::sealed_blocker(
-        true,
-        probe.landlock_fully_enforced == Some(true),
-        probe.sealed,
-    )
+/// Answers a standalone host question — `mur doctor` and the escape-conformance harness ask it.
+/// A *session* must not: it reads its own [`HostProbe`] so its refusal, its trace and the
+/// mechanisms it installs describe one host at one moment.
+pub(crate) fn detect_enforcement_tier() -> EnforcementTier {
+    HostProbe::probe().tier()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Which single mechanism keeps this host below `sealed`, or `None` when nothing does, from a
+/// reading taken here.
+///
+/// Takes its own probe, as its neighbours do. What a session needs — that the refusal an operator
+/// sees and the tier the runtime installs cannot disagree about the host — is upheld by
+/// `runtime::stage_session` passing one [`HostProbe`] to both, not by this function.
 pub fn detect_sealed_blocker() -> Option<crate::sealed::SealedBlocker> {
-    crate::sealed::sealed_blocker(false, false, crate::sealed::probe_sealed_support())
+    HostProbe::probe().sealed_blocker()
 }
 
 /// Where this host's unprivileged-user-namespace permission comes from, or `None` off Linux, where
 /// the question has no answer rather than a negative one.
 ///
-/// Reads the same cached probe [`detect_sealed_blocker`] does, so the provenance an operator is
-/// shown and the tier the runtime installs describe one host at one moment.
-#[cfg(target_os = "linux")]
+/// Takes its own probe, as its neighbours do; a session reads the provenance off its own
+/// [`HostProbe`] instead, so what it is shown and the tier it installs describe one host at one
+/// moment.
 pub fn detect_userns_grant() -> Option<crate::sealed::UsernsGrant> {
-    Some(host_probe().sealed.userns_grant)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn detect_userns_grant() -> Option<crate::sealed::UsernsGrant> {
-    None
+    HostProbe::probe().userns_grant()
 }
 
 /// Resolves every host in `network_allow` (via `crate::network_policy::parse_network_allow_rules`,
@@ -1772,11 +1833,16 @@ impl ShellEnforcement {
     ///
     /// `declared` is the already-combined containment floor for the session. It is what decides
     /// whether a sealed-capable host actually installs a composed root — see [`applied_tier`].
+    ///
+    /// `probe` is the session's own [`HostProbe`], taken by `runtime::stage_session` and carried
+    /// on the `StagedSession`. Passed in rather than taken here so the mechanisms this installs
+    /// are the ones the session's trace already claims.
     pub(crate) fn resolve(
         policy: &CapabilityPolicy,
         declared: murmur_artifact::ContainmentClass,
+        probe: HostProbe,
     ) -> Result<Self, String> {
-        let tier = applied_tier(detect_enforcement_tier(), declared);
+        let tier = applied_tier(probe.tier(), declared);
         let network_allow_ips = resolve_network_allowlist_ips(&policy.network_allow)?;
         let network_allow_rules =
             crate::network_policy::parse_network_allow_rules(&policy.network_allow)
@@ -2871,8 +2937,8 @@ mod linux_enforce {
     /// Forking is required, not defensive. The rights the ruleset grants are beside the point:
     /// entering *any* Landlock domain — even one permitting everything — permanently forbids the
     /// mount family to the task and every descendant it will ever have, which is how Landlock
-    /// stops a sandbox being escaped through a nested namespace. `host_probe` runs this before the
-    /// sealed probe, and both run inside `ShellEnforcement::resolve` before any fork that would
+    /// stops a sandbox being escaped through a nested namespace. [`HostProbe::probe`] runs this
+    /// before the sealed probe, and a session's probe is taken before any fork that would
     /// build a composed root, so restricting in-process poisons `sealed` on every host and every
     /// invocation: the namespace is created and then `mount` is refused, with nothing in the error
     /// to suggest the runtime did it to itself.
@@ -3971,6 +4037,61 @@ mod tests {
         crate::sealed::SealedProbe::default()
     }
 
+    /// A probe that learned nothing: no Landlock answer and a sealed half that claims nothing.
+    /// The reading a host gives when neither half of the probe could run.
+    fn unprobed() -> HostProbe {
+        HostProbe::from_parts(None, crate::sealed::SealedProbe::default())
+    }
+
+    /// A probe that could not run must land on the weakest Linux tier, not on either kernel tier
+    /// it failed to demonstrate. This is the fail-closed direction, asserted at the one place the
+    /// tier is decided from a reading.
+    #[test]
+    fn an_unprobed_host_resolves_to_seccomp_only() {
+        let tier = unprobed().tier();
+        if cfg!(target_os = "linux") {
+            assert_eq!(tier, EnforcementTier::KernelSeccompOnly);
+        } else {
+            assert_eq!(tier, EnforcementTier::EnvironmentOnly);
+        }
+        assert_ne!(tier, EnforcementTier::KernelSealed);
+        assert_ne!(tier, EnforcementTier::KernelFull);
+    }
+
+    /// A reading that demonstrated nothing must still name what is missing: a refusal with no
+    /// blocker is a refusal an operator cannot act on.
+    #[test]
+    fn an_unprobed_host_names_a_blocker() {
+        assert!(unprobed().sealed_blocker().is_some());
+    }
+
+    /// The achieved class the trace records for an unprobed host stays strictly below `sealed`,
+    /// so nothing downstream can read a failed probe as a met floor.
+    #[test]
+    fn an_unprobed_host_achieves_less_than_sealed() {
+        let achieved = crate::containment::achieved_class_for_tier(unprobed().tier());
+        assert!(achieved < murmur_artifact::ContainmentClass::Sealed);
+    }
+
+    /// The whole point of the direction: a capsule declaring `sealed` against a reading that
+    /// demonstrated nothing is refused, with the shortfall naming the mechanism.
+    #[test]
+    fn an_unprobed_host_refuses_a_declared_sealed_floor() {
+        let probe = unprobed();
+        let achieved = crate::containment::achieved_class_for_tier(probe.tier());
+        let error = crate::containment::check_containment_floor(
+            murmur_artifact::ContainmentClass::Sealed,
+            achieved,
+            probe.sealed_blocker(),
+            false,
+        )
+        .expect_err("an unprobed host cannot back a declared sealed floor");
+        assert!(matches!(
+            error,
+            crate::errors::RuntimeError::ContainmentFloorUnmet { .. }
+        ));
+    }
+
     /// The tier decision reads only `UsernsGrant::permits_userns()`, so every grant that permits
     /// the namespace has to reach the same tier — otherwise reporting provenance would have
     /// changed an outcome, which is exactly what naming the grant set out not to do.
@@ -4299,16 +4420,24 @@ mod tests {
         let policy = CapabilityPolicy::default();
         let usr = PathBuf::from("/usr");
 
-        let scoped = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Scoped)
-            .expect("an empty policy resolves");
+        let scoped = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            HostProbe::probe(),
+        )
+        .expect("an empty policy resolves");
         assert!(
             !scoped.landlock_grants.iter().any(|grant| grant.path == usr),
             "a scoped capsule runs Landlock over the real host filesystem — /usr must stay \
              unenumerable there",
         );
 
-        let sealed = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed)
-            .expect("an empty policy resolves");
+        let sealed = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            HostProbe::probe(),
+        )
+        .expect("an empty policy resolves");
         let granted: Vec<&LandlockGrant> = sealed
             .landlock_grants
             .iter()
@@ -4408,16 +4537,24 @@ mod tests {
                 .any(|entry| Path::new(entry.path) == grant.path)
         };
 
-        let scoped = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Scoped)
-            .expect("an empty policy resolves");
+        let scoped = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Scoped,
+            HostProbe::probe(),
+        )
+        .expect("an empty policy resolves");
         assert!(
             !scoped.landlock_grants.iter().any(is_etc_grant),
             "a scoped capsule runs Landlock over the real host filesystem — /etc/shadow's \
              neighbours must not become readable there",
         );
 
-        let sealed = ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed)
-            .expect("an empty policy resolves");
+        let sealed = ShellEnforcement::resolve(
+            &policy,
+            murmur_artifact::ContainmentClass::Sealed,
+            HostProbe::probe(),
+        )
+        .expect("an empty policy resolves");
         let granted: Vec<&LandlockGrant> = sealed
             .landlock_grants
             .iter()
