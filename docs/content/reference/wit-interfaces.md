@@ -355,9 +355,31 @@ fail-closed rule that governs a policy hook's failures.
   passed via `-c`), truncated to 200 characters. It is a display string. `shell-event.argv` is the
   exact argument list the runtime passes to the executable and `shell-event.script` is the `-c`
   body (absent for every other form), both untruncated — a policy must decide on those two and on
-  `binary`, never on `command`. Recipes belonging to a build tool (`make <target>`,
-  `just <recipe>`, `npm run <script>`) are not resolved into their bodies: a hook gating
-  `just build` decides on the argv `["build"]` and the resolved path of `just`.
+  `binary`, never on `command`.
+- `shell-event.recipe` is the body of the recipe a build-tool call names, read by the runtime out
+  of the capsule's workdir. A hook holds no grant on that directory and reads nothing itself.
+
+    | Invocation | Body |
+    |---|---|
+    | `make <target>` | the target's recipe lines, from `GNUmakefile`, `makefile` or `Makefile` |
+    | `just <recipe>` | the recipe's indented body, from `justfile`, `.justfile`, `Justfile` or `JUSTFILE` |
+    | `npm run <script>` | the string value of `scripts.<script>` in `package.json` |
+
+    The body is the file's own text: variables, interpolations, conditionals and recipe arguments
+    are carried as written. It is absent when the call names no recipe, and when the runtime could
+    not resolve one:
+
+    - no recipe file in the workdir, or one that is unreadable, oversized or not UTF-8
+    - a target, recipe or script that is not defined, or one reached through a `make` pattern rule
+      or a `just` alias
+    - a form that could resolve to more than one body: two `make` rules for one target, a duplicate
+      `just` recipe, a `make` recipe written on the rule line as `target: ; cmd`, or an `npm` script
+      with a `pre`/`post` sibling
+    - an invocation carrying flags beyond the recipe file and working-directory selectors, or a
+      `make` variable override such as `make build VERSION=2`
+
+    Read an absent body as "the runtime has no body to show", which is a statement about the
+    resolution and not about the call.
 - `tool-event.input` is the exact tool input JSON the tool will receive, untruncated, and is what
   a policy decides on.
 - `shell-event.outcome` and `tool-event.outcome` carry what the call produced, and are absent at
@@ -547,7 +569,7 @@ Every `murmur:*` package declares an explicit `@x.y.z` version, so the contract 
 | `murmur:task-io` | `0.1.0` |
 | `murmur:conversation` | `0.1.0` |
 | `murmur:text` | `0.1.0` |
-| `murmur:hook` | `0.7.0` |
+| `murmur:hook` | `0.8.0` |
 | `murmur:runtime` | `0.3.0` |
 | `murmur:host` | `0.1.0` |
 | `murmur:runtime-guest` | `0.1.0` |

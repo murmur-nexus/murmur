@@ -36,6 +36,7 @@ pub(crate) mod outgoing;
 pub mod peer_handoff;
 pub mod plan;
 pub(crate) mod reachability;
+pub(crate) mod recipes;
 pub mod registration;
 pub mod resource_plane;
 pub mod resources;

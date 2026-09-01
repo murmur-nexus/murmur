@@ -925,6 +925,7 @@ pub(crate) async fn run_agent_loop(
                                             command: shell.command.clone(),
                                             argv: shell.argv.clone(),
                                             script: shell.script.clone(),
+                                            recipe: shell.recipe.clone(),
                                             exit_code: shell.exit_code,
                                             stdout: shell.stdout.clone(),
                                             stderr: shell.stderr.clone(),

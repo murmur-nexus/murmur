@@ -4023,17 +4023,24 @@ impl CapsuleStoreState {
         if native_bin.exists() && !self.tool_components.contains_key(name) {
             return as_tool();
         }
-        match resolve_shell_call(name, input, &self.capability_policy) {
+        match resolve_shell_call(
+            name,
+            input,
+            &self.accessible_workdir,
+            &self.capability_policy,
+        ) {
             Some(ResolvedShellCall {
                 binary,
                 command,
                 argv,
                 script,
+                recipe,
             }) => ResolvedCall::Shell {
                 binary,
                 command,
                 argv,
                 script,
+                recipe,
             },
             None => as_tool(),
         }
@@ -5195,6 +5202,10 @@ pub(crate) struct ResolvedShellCall {
     pub argv: Vec<String>,
     /// The `-c` body for the interpreter form, `None` for every other form.
     pub script: Option<String>,
+    /// The body of the recipe this call names, read out of `workdir` by
+    /// [`crate::recipes::resolve_recipe`], and `None` for every call that names none the
+    /// runtime can resolve.
+    pub recipe: Option<String>,
 }
 
 /// Resolve what a shell tool call will run, or `None` when `name` is not a declared shell
@@ -5203,12 +5214,16 @@ pub(crate) struct ResolvedShellCall {
 /// The decision point's view of a call. It performs no capability decision of its own: the
 /// `shell_allow` test here is the routing question "is this name a shell tool at all"; the
 /// enforcing check is at the top of `execute_shell`.
+///
+/// `workdir` is the directory the subprocess will run in, and is where a build-tool recipe is
+/// read from and confined to.
 pub(crate) fn resolve_shell_call(
     name: &str,
     input: &murmur::tool::run::ToolInput,
+    workdir: &Path,
     policy: &CapabilityPolicy,
 ) -> Option<ResolvedShellCall> {
-    resolve_shell_call_inner(name, input, policy).ok()
+    resolve_shell_call_inner(name, input, workdir, policy).ok()
 }
 
 /// [`resolve_shell_call`] keeping the diagnostic, for the dispatch path that reports it to the
@@ -5217,6 +5232,7 @@ pub(crate) fn resolve_shell_call(
 fn resolve_shell_call_inner(
     name: &str,
     input: &murmur::tool::run::ToolInput,
+    workdir: &Path,
     policy: &CapabilityPolicy,
 ) -> Result<ResolvedShellCall, String> {
     if !policy.shell_allow.iter().any(|allowed| allowed == name) {
@@ -5233,11 +5249,18 @@ fn resolve_shell_call_inner(
     } else {
         (split_shell_words(&command), None)
     };
+    // An interpreter form is never a recipe invocation: what it names is its own `-c` body, and
+    // reading a build tool out of that body would be guessing.
+    let recipe = match script {
+        Some(_) => None,
+        None => crate::recipes::resolve_recipe(workdir, name, &argv),
+    };
     Ok(ResolvedShellCall {
         binary: crate::sandbox::resolve_invoked_binary_path(name),
         command,
         argv,
         script,
+        recipe,
     })
 }
 
@@ -5253,7 +5276,7 @@ fn dispatch_shell_tool(
     enforcement: &sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
-    let resolved = match resolve_shell_call_inner(name, &input, policy) {
+    let resolved = match resolve_shell_call_inner(name, &input, workdir, policy) {
         Ok(resolved) => resolved,
         Err(error) => {
             return DispatchOutcome::tool(murmur::tool::run::ToolResult {
@@ -5270,6 +5293,7 @@ fn dispatch_shell_tool(
         command,
         argv,
         script,
+        recipe,
         ..
     } = resolved;
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -5296,6 +5320,7 @@ fn dispatch_shell_tool(
                 command: command.clone(),
                 argv: argv.clone(),
                 script: script.clone(),
+                recipe: recipe.clone(),
                 exit_code: result.exit_code,
                 stdout: result.stdout.clone(),
                 stderr: result.stderr.clone(),
@@ -7256,7 +7281,8 @@ inference:
             log_path: None,
         };
 
-        let resolved = resolve_shell_call("bash", &input, &policy).expect("bash resolves");
+        let resolved =
+            resolve_shell_call("bash", &input, tmp.path(), &policy).expect("bash resolves");
         let outcome = dispatch_shell_tool(
             "bash",
             input,
@@ -7282,6 +7308,7 @@ inference:
     /// A non-interpreter binary is word-split and carries no script.
     #[test]
     fn resolve_shell_call_splits_a_non_interpreter_and_reports_no_script() {
+        let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["curl".to_string()],
             ..CapabilityPolicy::default()
@@ -7292,6 +7319,7 @@ inference:
                 data: Some(r#"{"command":"-s http://example.com"}"#.to_string()),
                 log_path: None,
             },
+            tmp.path(),
             &policy,
         )
         .expect("curl resolves");
@@ -7305,6 +7333,7 @@ inference:
     /// than a shell call.
     #[test]
     fn resolve_shell_call_declines_an_undeclared_binary_and_unusable_input() {
+        let tmp = TempDir::new().unwrap();
         let policy = CapabilityPolicy {
             shell_allow: vec!["bash".to_string()],
             ..CapabilityPolicy::default()
@@ -7315,6 +7344,7 @@ inference:
                 data: Some(r#"{"command":"--version"}"#.to_string()),
                 log_path: None,
             },
+            tmp.path(),
             &policy,
         )
         .is_none());
@@ -7324,9 +7354,60 @@ inference:
                 data: Some(r#"{"nope":1}"#.to_string()),
                 log_path: None,
             },
+            tmp.path(),
             &policy,
         )
         .is_none());
+    }
+
+    /// One resolution feeds the policy decision and the spawn for a recipe invocation too: the
+    /// body the hook is shown arrives without moving the argv the executable receives.
+    #[test]
+    fn resolve_shell_call_and_dispatch_shell_tool_agree_on_a_recipe_invocation() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("justfile"),
+            "build:\n  echo RECIPE-BODY-MARKER\n",
+        )
+        .unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["just".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let input = murmur::tool::run::ToolInput {
+            data: Some(r#"{"command":"build"}"#.to_string()),
+            log_path: None,
+        };
+
+        let resolved =
+            resolve_shell_call("just", &input, tmp.path(), &policy).expect("just resolves");
+        let outcome = dispatch_shell_tool(
+            "just",
+            input,
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+
+        assert_eq!(
+            resolved.recipe.as_deref(),
+            Some("echo RECIPE-BODY-MARKER"),
+            "the recipe body is read out of the workdir"
+        );
+        assert_eq!(
+            resolved.argv,
+            vec!["build".to_string()],
+            "resolving a recipe does not move the argv"
+        );
+        // `just` need not exist on the host: what the resolution produced is the assertion, and
+        // a spawn that fails still carries the argv it was given.
+        if let Some(shell) = outcome.shell {
+            assert_eq!(resolved.argv, shell.argv);
+            assert_eq!(resolved.script, shell.script);
+            assert_eq!(resolved.recipe, shell.recipe);
+        }
     }
 
     /// The dispatch-layer half of the composed-root failure path: a sealed session whose root
@@ -8253,7 +8334,7 @@ inference:
         script
     }
 
-    /// A current-version (`@0.7.0`, 7-case `hook-output`) `on-task-end` hook double that
+    /// A current-version (`@0.8.0`, 7-case `hook-output`) `on-task-end` hook double that
     /// returns `reopen-task(reason)` on its first `reopen_limit` invocations (tracked by a
     /// mutable core global that persists across a blocking hook's reused store) and `none`
     /// thereafter. `reopen_limit` large ⇒ "always reopen".
@@ -8331,7 +8412,7 @@ inference:
     (export "on-task-end" (func $te))
 {stubs}
   )
-  (export "murmur:hook/lifecycle@0.7.0" (instance $lc))
+  (export "murmur:hook/lifecycle@0.8.0" (instance $lc))
 )"#
         );
         let bytes = wat::parse_str(&wat).expect("on-task-end reopen double WAT parses");

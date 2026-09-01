@@ -9,7 +9,7 @@ use std::{
 };
 
 /// Interface the host links hooks against.
-const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.7.0";
+const LIFECYCLE_IFACE: &str = "murmur:hook/lifecycle@0.8.0";
 
 /// Every lifecycle export a hook component must carry to instantiate.
 const HOOK_FNS: [&str; 8] = [
@@ -230,7 +230,7 @@ const REASON_POOL: u32 = 512;
 /// Where a policy hook assembles a reason out of the event it was handed.
 const SCRATCH: u32 = 4096;
 
-/// The seven-case `hook-output` of `murmur:hook/lifecycle@0.7.0`. `deny` is discriminant 6.
+/// The seven-case `hook-output` of `murmur:hook/lifecycle@0.8.0`. `deny` is discriminant 6.
 const HOOK_OUTPUT: &str = r#"  (type $hook-output (variant
     (case "none")
     (case "replace-context" (list $message))
@@ -280,6 +280,7 @@ fn event_shape(fn_name: &str) -> EventShape {
     (field "command" string)
     (field "argv" (list string))
     (field "script" (option string))
+    (field "recipe" (option string))
     (field "outcome" (option $shell-outcome))))"#,
             type_exports: "    (export \"shell-outcome\" (type $shell-outcome))\n    (export \"shell-event\" (type $event))",
         },
@@ -475,11 +476,11 @@ pub fn unreadable_output_hook_wasm(fn_name: &str) -> Vec<u8> {
 }
 
 /// An `on-shell` policy hook that denies with the identity it was handed:
-/// `<binary>|<script>|<argv joined by spaces>`.
+/// `<binary>|<script>|<recipe>|<argv joined by spaces>`.
 ///
 /// `shell-event` arrives indirectly, so the record is read out of guest memory at the
 /// canonical-ABI offsets: `binary` ptr/len 4/8, `argv` ptr/count 20/24, `script`
-/// discriminant/ptr/len 28/32/36.
+/// discriminant/ptr/len 28/32/36, `recipe` discriminant/ptr/len 40/44/48.
 pub fn shell_echo_deny_hook_wasm() -> Vec<u8> {
     let body = format!(
         r#"      (local $i i32)
@@ -492,6 +493,11 @@ pub fn shell_echo_deny_hook_wasm() -> Vec<u8> {
         (then (call $app
                 (i32.load (i32.add (local.get $event) (i32.const 32)))
                 (i32.load (i32.add (local.get $event) (i32.const 36))))))
+      (call $ch (i32.const 124))
+      (if (i32.eq (i32.load (i32.add (local.get $event) (i32.const 40))) (i32.const 1))
+        (then (call $app
+                (i32.load (i32.add (local.get $event) (i32.const 44)))
+                (i32.load (i32.add (local.get $event) (i32.const 48))))))
       (call $ch (i32.const 124))
       (block $done
         (loop $l

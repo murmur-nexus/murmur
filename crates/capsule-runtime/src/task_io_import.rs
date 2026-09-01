@@ -224,9 +224,9 @@ pub(crate) mod test_support {
     use super::TASK_IO_IFACE_VERSIONED;
     use wasmtime::component::Component;
 
-    /// One row per `murmur:hook/lifecycle@0.7.0` function: the WIT name, the WIT type of its
+    /// One row per `murmur:hook/lifecycle@0.8.0` function: the WIT name, the WIT type of its
     /// event parameter, and the core-function signature the canonical ABI flattens that type
-    /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 19, both past
+    /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 22, both past
     /// the 16-parameter limit, so each is passed indirectly as a single pointer.
     const LIFECYCLE_FNS: &[(&str, &str, &str)] = &[
         ("on-stage", "$stage-event", "i32 i32"),
@@ -412,6 +412,7 @@ pub(crate) mod test_support {
     (field "command" string)
     (field "argv" (list string))
     (field "script" (option string))
+    (field "recipe" (option string))
     (field "outcome" (option $shell-outcome))))
   (type $compaction-event (record
     (field "messages" (list $message))
@@ -449,7 +450,7 @@ pub(crate) mod test_support {
              (export \"rin\" (func $rin_l))\n      (export \"olen\" (func $olen_l))\n      \
              (export \"rout\" (func $rout_l))))))\n{LIFECYCLE_TYPES}\n{lifts}\n  \
              (instance $lc\n{TYPE_EXPORTS}{exports}  )\n  \
-             (export \"murmur:hook/lifecycle@0.7.0\" (instance $lc))\n)",
+             (export \"murmur:hook/lifecycle@0.8.0\" (instance $lc))\n)",
             preamble = preamble(),
         );
         let bytes = wat::parse_str(&wat).expect("task-io double WAT parses");
