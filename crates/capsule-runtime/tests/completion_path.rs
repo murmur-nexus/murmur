@@ -9,6 +9,13 @@
 //! One daemon, one registry and one `HOME` are shared by the whole suite, because `HOME` is
 //! process-wide and a child resolves its artifacts through it. Each case gets its own parent
 //! process and its own workdir.
+//!
+//! Every case needs a host that can isolate a capsule. The parent declares
+//! `capabilities.spawn.allow`, so its launch is refused with `E-CAP-005` on a host that cannot
+//! give a subprocess tree its own network namespace, and with `E-RUN-012` on one that cannot
+//! delegate a cgroup v2 scope — before anything a case here observes has happened. Each case
+//! stands down through [`capsule_runtime::skip_without_host_support`] rather than failing, which
+//! is what a containerised runner under the AppArmor unprivileged-userns restriction hits.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -465,6 +472,11 @@ fn wait_for_new_dir(parent: &Path, before: &[PathBuf]) -> Option<PathBuf> {
 /// runtime-owned value is applied last.
 #[test]
 fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
+    if capsule_runtime::skip_without_host_support(
+        "a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one",
+    ) {
+        return;
+    }
     let parent_dir = TempDir::new().unwrap();
     // The decoy the launching process itself holds. Nothing may reach a child from here.
     std::env::set_var(SPAWNER_ENV, "decoy-not-a-handle");
@@ -543,6 +555,11 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
 /// completion's text.
 #[test]
 fn a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task() {
+    if capsule_runtime::skip_without_host_support(
+        "a_finished_childs_completion_arrives_at_its_parent_as_a_completion_task",
+    ) {
+        return;
+    }
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
@@ -640,6 +657,11 @@ fn parent_sent(parent: &RunningParent, needle: &str) -> bool {
 /// the exit status and the child's own stderr, and the parent is told.
 #[test]
 fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
+    if capsule_runtime::skip_without_host_support(
+        "a_child_killed_without_reporting_is_reported_by_its_launcher",
+    ) {
+        return;
+    }
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
@@ -707,6 +729,11 @@ fn a_child_killed_without_reporting_is_reported_by_its_launcher() {
 /// deliver, and records that — the delivery failure is not the child's session failing.
 #[test]
 fn a_completion_with_no_parent_left_is_recorded_rather_than_dropped() {
+    if capsule_runtime::skip_without_host_support(
+        "a_completion_with_no_parent_left_is_recorded_rather_than_dropped",
+    ) {
+        return;
+    }
     let mut parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
     let spawner = parent.spawner(TrustClass::Trusted);
@@ -761,6 +788,11 @@ fn a_completion_with_no_parent_left_is_recorded_rather_than_dropped() {
 /// and the child records the refusal.
 #[test]
 fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
+    if capsule_runtime::skip_without_host_support(
+        "a_completion_addressed_to_another_session_is_refused_and_recorded",
+    ) {
+        return;
+    }
     let addressed = RunningParent::start();
     let elsewhere = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
@@ -820,6 +852,11 @@ fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
 /// a second time.
 #[test]
 fn a_completions_trust_is_the_delegating_tasks_trust() {
+    if capsule_runtime::skip_without_host_support(
+        "a_completions_trust_is_the_delegating_tasks_trust",
+    ) {
+        return;
+    }
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
@@ -867,6 +904,11 @@ fn a_completions_trust_is_the_delegating_tasks_trust() {
 /// party that would be told is the party that did it.
 #[test]
 fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
+    if capsule_runtime::skip_without_host_support(
+        "a_delegation_the_parent_ends_is_recorded_and_not_announced",
+    ) {
+        return;
+    }
     let parent = RunningParent::start();
     let parent_dir = TempDir::new().unwrap();
 
