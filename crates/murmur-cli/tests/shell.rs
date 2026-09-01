@@ -716,12 +716,13 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     );
 
     // ── First resume: the loss is reported ──
-    let resume_manifest = create_agent_project_with_lifecycle(
+    // No `lifecycle:` block at all, so the resume runs on the defaults — `task_acceptance:
+    // single`, one task and out. The report is not an incoming task, so it still runs.
+    let resume_manifest = create_agent_project(
         project.path(),
         &server.endpoint,
         DRIVER_ANTHROPIC_NAME,
         &["bash", "sleep"],
-        "lifecycle:\n  shell_grace_secs: 1\n  task_acceptance: queue\n",
     );
     let killed_session = session_name(&killed_dir);
     let status = spawn_mur_run(
@@ -853,7 +854,8 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
     let server = ScriptedServer::start(vec![
         end_turn("msg_1", "First run."),
         end_turn("msg_2", "Resumed over a torn trace."),
-        end_turn("msg_3", "Resumed over an unreadable trace."),
+        end_turn("msg_3", "Noted the record above the tear."),
+        end_turn("msg_4", "Resumed over an unreadable trace."),
     ]);
 
     let home = tempfile::tempdir().unwrap();
@@ -917,6 +919,16 @@ fn a_resume_over_an_unreadable_prior_trace_still_runs_its_task() {
         events_of_type(&torn_events, "shell_lost").len(),
         1,
         "the complete record above the tear is still accounted for"
+    );
+    // This manifest declares no `lifecycle:` block, so the resume runs on the defaults. The
+    // report still reaches the agent: a marker is only written for a loss that gets reported.
+    assert_eq!(
+        events_of_type(&trace_events(&resumed.workdir), "task_start")
+            .iter()
+            .filter(|event| event["source"] == "detached_lost")
+            .count(),
+        1,
+        "a default capsule reports the loss as well as marking it"
     );
 
     // Unreadable rather than unparseable: the read itself fails, and the launch still runs.
