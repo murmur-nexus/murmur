@@ -173,6 +173,10 @@ impl Roost {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path,
             spawn_allow: spawn_allow.iter().map(|name| name.to_string()).collect(),
+            max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+            // One parent session serves every case in a suite, so the children this daemon counts
+            // are the suite's rather than one delegation's.
+            max_concurrent: u32::MAX,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 

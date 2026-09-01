@@ -26,12 +26,18 @@ mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 | `--port` | `7700` | Port to bind on `127.0.0.1` |
 | `--registry-path` | `$HOME/.murmur/artifacts` | Local artifact registry the daemon resolves manifests from |
 | `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
+| `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
+| `--max-concurrent` | `4` | Children one session may hold live at once |
 
 `--spawn-allow` takes a single name per occurrence, not a comma-separated list. It gates the
 top-level path only — the registrations that present no approval. Started with no `--spawn-allow`
 at all, the daemon admits only capsules launched under an approval it granted.
 
-Any other flag is rejected and the daemon exits.
+`--max-depth` and `--max-concurrent` each take a whole number, and neither has a value meaning
+unlimited: `0` refuses every delegation.
+
+Any other flag is rejected and the daemon exits. There is no `--max-total` — see
+[No total cap](#no-total-cap).
 
 ---
 
@@ -100,6 +106,8 @@ The response carries no `capsule_url` and no `session_id`, because nothing was s
 | `400 Bad Request` | Body is not valid JSON, or a required field is missing |
 | `403 Forbidden` | The credential is absent or not valid, or names a session that is not running — see [Refusals](#refusals) |
 | `403 Forbidden` | `name` is not in the calling session's allow list |
+| `403 Forbidden` | The calling session has no delegation depth left — see [Delegation bounds](#delegation-bounds) |
+| `403 Forbidden` | The calling session already holds `--max-concurrent` live children |
 | `403 Forbidden` | The capsule's manifest declares more capability than the calling session holds — see [Spawn envelope](#spawn-envelope) |
 | `500 Internal Server Error` | The capsule could not be resolved from the registry |
 
@@ -214,14 +222,18 @@ Poll a registered session.
 **Success — `200 OK`**
 
 ```json
-{ "status": "running" }
+{
+  "status":          "running",
+  "depth_remaining": 2,
+  "live_children":   1
+}
 ```
 
-| `status` | Meaning |
-|---|---|
-| `running` | Registered and not yet retired |
-| `complete` | The session deregistered reporting `complete` |
-| `failed` | The session deregistered reporting `failed` |
+| Field | Type | Meaning |
+|---|---|---|
+| `status` | string | `running` — registered and not yet retired; `complete` or `failed` — the session deregistered reporting that outcome |
+| `depth_remaining` | number | Levels of delegation still available below this session, against `--max-depth` |
+| `live_children` | number | Children this session holds right now, counting one it has been approved to launch and has not launched yet |
 
 **Error — `404 Not Found`**
 
@@ -312,9 +324,9 @@ failed tool call, and the session continues.
 | Delivery | 30s | Retrying the task delivery while the child's listener comes up |
 | Answer | 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | Waiting for the child's task to reach a terminal state. On expiry the child is killed and reaped and the call returns `timed_out` |
 
-There is no depth cap, no concurrency cap and no total cap. A capsule that can delegate can
-delegate without limit, and a capsule whose `capabilities.spawn.allow` names itself can recurse
-until the host runs out of processes.
+How deep a chain of delegations may go and how many a capsule may have running at once are the
+daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon
+refuses comes back as a failed tool call carrying the refusal.
 
 **A delegated capsule must still be listening when its answer is read.** The answer is read after
 an A2A `tasks/get` reports the task complete, so a sub-capsule that exits the moment it finishes
@@ -547,6 +559,89 @@ The name-list refusals are their own, and name the list an operator has to edit:
     reaches the loopback port without a credential can use only the top-level `--spawn-allow` path.
     The credential is a bearer token over loopback: anything that can read another session's runtime
     memory can present that session's credential.
+
+---
+
+## Delegation bounds
+
+Two bounds on delegation, both the operator's and both decided from the daemon's own records rather
+than from anything a capsule says about itself.
+
+| Bound | Flag | Default | What it counts |
+|---|---|---|---|
+| Depth | `--max-depth` | `3` | Levels of delegation below a capsule that registered with no approval |
+| Concurrency | `--max-concurrent` | `4` | Children one session holds live at once |
+
+Both are checked at `POST /spawn`, after the name check, and a refused spawn leaves no record
+anywhere — no session, no workdir and no trace.
+
+### The depth budget
+
+Each session holds a number: how many further levels may hang below it. A session that registered
+with no approval holds `--max-depth`. Every other session holds the number sealed into the approval
+it registered with, which is one less than what its parent held. A session at `0` is refused every
+spawn it asks for.
+
+The budget rides the approval. `POST /spawn` computes the child's number, seals it into the MAC'd
+approval it mints, and reads it back out when that child presents the approval at `POST /register`.
+Between those two moments no party states it: the parent's runtime never sees the number, the
+`POST /register` body has no field it could arrive in, and an extra `depth_remaining` key in that
+body is read by nothing. An approval whose payload was edited fails its MAC and is refused with the
+[identity refusal](#refusals).
+
+This is what terminates a capsule whose `capabilities.spawn.allow` names itself. The
+[spawn envelope](#spawn-envelope) narrows a chain but never ends one — a capsule that names itself
+narrows to itself — so with `--max-depth 3` such a capsule runs at four levels and the fourth
+level's `POST /spawn` is refused:
+
+```json
+{
+  "error": "delegation depth bound reached: this daemon allows 3 levels of delegation below a top-level capsule (--max-depth 3), and this session has none left to spend — a capsule whose capabilities.spawn.allow names itself terminates here rather than recursing"
+}
+```
+
+### The concurrency cap
+
+A session may hold `--max-concurrent` children at once. The refusal names the bound and the count,
+so an operator reading it knows what to raise and what it is being raised past:
+
+```json
+{
+  "error": "delegation concurrency bound reached: this daemon allows a capsule 2 live children at a time (--max-concurrent 2), and this session already holds 2 — wait for one to finish, or raise --max-concurrent"
+}
+```
+
+A child occupies a slot from the moment its parent is approved to launch it, so `live_children`
+can exceed the number of sessions that have registered.
+
+| Event | Effect on the parent's count |
+|---|---|
+| `POST /spawn` is granted | The approval reserves a slot |
+| The child redeems the approval at `POST /register` | The reservation becomes a running child; the count is unchanged |
+| The child's `POST /deregister` | The slot is released |
+| The approval's 60-second expiry passes unredeemed | The slot is released, whether or not anybody ever presented it |
+| The parent's own `POST /deregister` | Every reservation it holds is released, because an approval it earned can no longer be redeemed by anybody |
+
+A session's current figures are readable at [`GET /status/{session_id}`](#get-statussession_id) as
+`depth_remaining` and `live_children`.
+
+### A bound that cannot be evaluated refuses
+
+Every figure a bound is decided from is read from the record of a *running* session. Where that
+record cannot be read the request is refused rather than granted on a default, and the refusal is
+the identity one. A `POST /spawn` whose credential names a session that has deregistered, and a
+`POST /register` whose approval was granted by a session that has since deregistered, are both
+refused on that ground.
+
+### No total cap { #no-total-cap }
+
+There is no cap on the total number of delegations, and no `--max-total` flag. An operator who
+tries to set one gets `unknown argument: --max-total` and the daemon exits.
+
+The job store is held in memory, so restarting the daemon discards every registration and every
+count a total would be kept in. `--max-depth` and `--max-concurrent` are unaffected: both are
+decided from the sessions the daemon is currently tracking, and a restart that discards those
+sessions also discards every credential and approval that could delegate under them.
 
 ---
 
