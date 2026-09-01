@@ -369,6 +369,17 @@ pub enum RuntimeError {
     },
 
     #[error(
+        "tool '{tool}' returned data_path '{path}', which does not resolve to a readable file \
+         beneath the session workdir ({code}): {detail}"
+    )]
+    ToolDataPathRefused {
+        tool: String,
+        path: String,
+        code: String,
+        detail: String,
+    },
+
+    #[error(
         "this capsule can spawn native subprocesses but no cgroup v2 scope could be created to \
          bound them ({reason}); on Linux the runtime refuses to launch rather than run a \
          subprocess tree with no aggregate memory/pids/cpu ceiling — see the systemd user \

@@ -8,9 +8,13 @@ use std::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use murmur_artifact::DEFAULT_EXPORT_MAX_BYTES;
+
 use crate::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
     delegation_plane::{DelegationPlane, DelegationRequest, DelegationStatus},
+    errors::RuntimeError,
+    resource_plane::{self, SymlinkPolicy},
     sandbox,
     shell::{execute_shell, split_shell_words},
     spawn_credential::SpawnCredential,
@@ -502,14 +506,17 @@ fn dispatch_tool_step(
             log_path: None,
         },
     ) {
-        Ok(result) if matches!(result.status, ToolStatus::Passed) => StepResult {
-            step_id: step.id.clone(),
-            status: StepStatus::Success,
-            output: result
-                .data
-                .or_else(|| read_optional_path(result.data_path.as_deref())),
-            error: None,
-        },
+        Ok(result) if matches!(result.status, ToolStatus::Passed) => {
+            match tool_step_output(name, &ctx.workdir, result.data, result.data_path.as_deref()) {
+                Ok(output) => StepResult {
+                    step_id: step.id.clone(),
+                    status: StepStatus::Success,
+                    output,
+                    error: None,
+                },
+                Err(error) => failed(&step.id, error),
+            }
+        }
         Ok(result) => failed(
             &step.id,
             result
@@ -719,8 +726,49 @@ fn parse_reference(reference: &str) -> Option<(&str, &str)> {
     reference.strip_prefix('$')?.rsplit_once('.')
 }
 
-fn read_optional_path(path: Option<&str>) -> Option<String> {
-    path.and_then(|path| fs::read_to_string(path).ok())
+/// The output of a tool step that passed: in-band `data` when the tool sent it, otherwise the
+/// file the tool named in `data_path`.
+///
+/// `data_path` is the escape hatch for a result too large to carry in band — the system prompt
+/// tells the model to read it when `truncated` is set — so a path the host cannot honour is
+/// resolved against the guest's own boundary rather than dropped from the interface. The
+/// resolution is [`resource_plane::read_file_beneath_root`] against `workdir`, the directory the
+/// tool's `.` means, and a refusal fails the step: a step whose declared output could not be read
+/// did not succeed.
+///
+/// The symlink policy is [`SymlinkPolicy::Refuse`] whatever containment class the session
+/// achieved. `resource_plane::symlink_policy` follows symlinks under `sealed` and `advisory`
+/// because a capsule reading its own export root has no outside to name; this read runs in the
+/// host process, which sits outside every class's boundary with ambient filesystem authority, so
+/// a symlink under the workdir pointing at `/etc/shadow` would be followed successfully at any
+/// class.
+fn tool_step_output(
+    tool: &str,
+    workdir: &Path,
+    data: Option<String>,
+    data_path: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(data) = data {
+        return Ok(Some(data));
+    }
+    let Some(relpath) = data_path else {
+        return Ok(None);
+    };
+    match resource_plane::read_file_beneath_root(
+        workdir,
+        relpath,
+        DEFAULT_EXPORT_MAX_BYTES,
+        SymlinkPolicy::Refuse,
+    ) {
+        Ok(response) => Ok(Some(String::from_utf8_lossy(&response.bytes).into_owned())),
+        Err(error) => Err(RuntimeError::ToolDataPathRefused {
+            tool: tool.to_string(),
+            path: relpath.to_string(),
+            code: error.code().to_string(),
+            detail: error.message(),
+        }
+        .to_string()),
+    }
 }
 
 #[cfg(test)]
