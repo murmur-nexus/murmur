@@ -725,3 +725,116 @@ fn a_value_after_bare_resume_is_read_as_an_address() {
     assert!(stderr.contains("nonesuch"), "{stderr}");
     drop(f.project);
 }
+
+/// A trace that ends mid-record is what a `SIGKILL`ed writer leaves: records are appended whole
+/// under `O_APPEND`, so the only line a kill can tear is the last one. The context id the resume
+/// needs sits in the first `task_start`, far behind that tail, and reading to the end of the file
+/// to answer a question settled at its start is what used to refuse the launch.
+#[test]
+fn a_torn_final_trace_line_still_resumes() {
+    let f = fixture(
+        vec![end_turn("first reply"), end_turn("second reply")],
+        "",
+        &[],
+    );
+
+    let first_dir = workdir_of(f.run("first task", &[]));
+    let trace = first_dir.join("trace.jsonl");
+    let mut content = fs::read_to_string(&trace).unwrap();
+    content.push_str(r#"{"event_type":"task_end","session_"#);
+    fs::write(&trace, &content).unwrap();
+    let torn_line = content.lines().count();
+
+    f.run("second task", &["--resume", "@1"]).success();
+
+    let requests = f.server.requests();
+    assert_eq!(requests.len(), 2, "one inference per run");
+    let second = request_text(&requests[1]);
+    assert!(
+        second.contains("first task") && second.contains("first reply"),
+        "run 1's conversation must be in front of the model: {second}"
+    );
+
+    // The reader's contract is untouched: a command whose subject *is* the whole file still
+    // refuses the same trace, naming the line it tore on.
+    let show = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", f.home.path())
+        .args(["trace", "show", trace.to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(show.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-TRC-001"), "{stderr}");
+    assert!(stderr.contains(trace.to_str().unwrap()), "{stderr}");
+    assert!(
+        stderr.contains(&format!(":{torn_line}:")),
+        "the refusal must name the torn line: {stderr}"
+    );
+    drop(f.project);
+}
+
+/// The narrowing is positional, not blanket tolerance. A line the resolver cannot read *before*
+/// it has an answer is not the shape a killed writer produces, and there is nothing yet to weigh
+/// skipping it against.
+#[test]
+fn a_malformed_line_before_the_answer_is_an_error() {
+    let f = fixture(vec![end_turn("unused")], "", &[]);
+    let session = "ses_00000000000000000000000000000003";
+    let dir = f.session_root().join(session);
+    fs::create_dir_all(&dir).unwrap();
+    let trace = dir.join("trace.jsonl");
+    fs::write(
+        &trace,
+        format!(
+            "{}\n{{\"event_type\":\"task_end\",\"session_\n{}\n",
+            session_start_line(session),
+            task_start_line(session, "ctx_after_the_tear")
+        ),
+    )
+    .unwrap();
+
+    let assert = f.run("second task", &["--resume", session]).failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-TRC-001"), "{stderr}");
+    assert!(stderr.contains(trace.to_str().unwrap()), "{stderr}");
+    assert!(
+        stderr.contains(":2:"),
+        "the refusal must name the malformed line: {stderr}"
+    );
+    assert!(f.server.requests().is_empty(), "nothing reached the driver");
+    drop(f.project);
+}
+
+/// A trace that exists and cannot be opened yields no context id to recover, so the launch is
+/// refused with the same IO diagnostic every other trace reader raises.
+#[test]
+fn an_unreadable_trace_is_an_io_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = fixture(vec![end_turn("unused")], "", &[]);
+    let session = "ses_00000000000000000000000000000004";
+    write_session(
+        &f.session_root(),
+        session,
+        &[
+            session_start_line(session),
+            task_start_line(session, "ctx_unreadable"),
+        ],
+    );
+    let trace = f.session_root().join(session).join("trace.jsonl");
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_to_string(&trace).is_ok() {
+        // uid 0, or an account holding CAP_DAC_OVERRIDE: the mode bits deny nobody and the
+        // state under test cannot be constructed here.
+        drop(f.project);
+        return;
+    }
+
+    let assert = f.run("second task", &["--resume", session]).failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("E-IO-003"), "{stderr}");
+    assert!(stderr.contains(trace.to_str().unwrap()), "{stderr}");
+    assert!(f.server.requests().is_empty(), "nothing reached the driver");
+    fs::set_permissions(&trace, fs::Permissions::from_mode(0o644)).unwrap();
+    drop(f.project);
+}
