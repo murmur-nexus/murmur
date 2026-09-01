@@ -384,6 +384,25 @@ struct CallDeniedEvent {
     reason: String,
 }
 
+/// The capsule manifest's own `capabilities.filesystem.read_only` rule refused a call before it
+/// ran. Rendered where it cannot be scrolled past, and counted: a run where the capsule attempted
+/// a protected write four times and was refused is a different result from one where it never
+/// tried.
+#[derive(Debug, Deserialize)]
+struct ProtectedPathDeniedEvent {
+    turn: u32,
+    /// `"shell"` or `"tool"`.
+    call: String,
+    /// The resolved executable path for a shell call, the tool name otherwise.
+    target: String,
+    /// The resolved workdir-relative path.
+    path: String,
+    /// The declared `read_only` entry that covers `path`.
+    rule: String,
+    /// What identified the call as a write.
+    signal: String,
+}
+
 /// A hook call that failed in a way the session survived. Rendered where it cannot be
 /// scrolled past, because nothing else in the session says the hook did not run.
 #[derive(Debug, Deserialize)]
@@ -427,6 +446,7 @@ enum TraceEvent {
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
     CallDenied(CallDeniedEvent),
+    ProtectedPathDenied(ProtectedPathDeniedEvent),
     HookDispatchError(HookDispatchErrorEvent),
     Retention(RetentionEvent),
     ResourceList(OutcomeEvent),
@@ -593,6 +613,9 @@ struct TraceMetrics {
     context_seeds: Vec<ContextSeedRecord>,
     /// Every `call_denied` record, in file order — one per call a policy hook refused.
     denials: Vec<DenialRecord>,
+    /// Every `protected_path_denied` record, in file order — one per call the manifest's own
+    /// `capabilities.filesystem.read_only` refused.
+    protected_path_denials: Vec<ProtectedPathDenialRecord>,
     /// Every `hook_dispatch_error` record, in file order.
     hook_failures: Vec<HookFailureRecord>,
     /// Every `retention` record, in file order — one per (store, reason) pair that removed
@@ -631,6 +654,16 @@ struct DenialRecord {
     hook_name: String,
     target: String,
     reason: String,
+}
+
+/// One `protected_path_denied` trace record, surfaced in `mur trace show`.
+struct ProtectedPathDenialRecord {
+    turn: u32,
+    call: String,
+    target: String,
+    path: String,
+    rule: String,
+    signal: String,
 }
 
 impl TraceMetrics {
@@ -921,6 +954,7 @@ fn compute_metrics(
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
+    let mut protected_path_denials: Vec<ProtectedPathDenialRecord> = Vec::new();
     let mut hook_failures: Vec<HookFailureRecord> = Vec::new();
     let mut retentions: Vec<RetentionRecord> = Vec::new();
     let mut resource_lists = OutcomeCounts::new();
@@ -1087,6 +1121,16 @@ fn compute_metrics(
                     reason: e.reason,
                 });
             }
+            TraceEvent::ProtectedPathDenied(e) => {
+                protected_path_denials.push(ProtectedPathDenialRecord {
+                    turn: e.turn,
+                    call: e.call,
+                    target: e.target,
+                    path: e.path,
+                    rule: e.rule,
+                    signal: e.signal,
+                });
+            }
             TraceEvent::HookDispatchError(e) => {
                 hook_failures.push(HookFailureRecord {
                     hook_name: e.hook_name,
@@ -1167,6 +1211,7 @@ fn compute_metrics(
             reopens,
             context_seeds,
             denials,
+            protected_path_denials,
             hook_failures,
             retentions,
             resource_lists,
@@ -1672,6 +1717,25 @@ fn print_show(m: &TraceMetrics) {
             println!(
                 "turn {}  {}  {}  by {}  “{}”",
                 d.turn, d.event, d.target, d.hook_name, reason
+            );
+        }
+    }
+
+    // Beside the hook denials and for the same reason: no `shell` or `tool_call` line exists for
+    // a refused call, so this is the only account of it. The count is the comparable number — a
+    // run that attempted a protected write and was refused is a different result from one that
+    // never tried.
+    if !m.protected_path_denials.is_empty() {
+        println!();
+        println!("── Protected paths ──────────────────────────────");
+        println!(
+            "protected-path refusals: {}",
+            m.protected_path_denials.len()
+        );
+        for d in &m.protected_path_denials {
+            println!(
+                "turn {}  {}  {}  path {}  rule {}  ({})",
+                d.turn, d.call, d.target, d.path, d.rule, d.signal
             );
         }
     }
@@ -2249,6 +2313,13 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.event,
             e.target,
             e.hook_name
+        ),
+        TraceEvent::ProtectedPathDenied(e) => format!(
+            "{}{}  {}  rule {}",
+            kind("protected_path_denied"),
+            e.call,
+            e.path,
+            e.rule
         ),
         _ => return None,
     })

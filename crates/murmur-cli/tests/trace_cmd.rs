@@ -149,6 +149,47 @@ const FIXTURE_DECLINED: &str = concat!(
     "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":50,\"exit_status\":\"ok\"}\n"
 );
 
+/// A session that attempted a protected write three times and was refused every time. The
+/// `protected_path_denied` lines carry no `shell` or `tool_call` beside them, because nothing ran.
+const FIXTURE_PROTECTED: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6000,",
+    "\"capsule_name\":\"protected-capsule\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[\"shell\"],\"tools_declared\":[\"bash\"]}\n",
+
+    "{\"event_type\":\"inference\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000002\",",
+    "\"parent_id\":\"evt_ffffffffffff4fff8fff000000000001\",",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6010,",
+    "\"turn\":1,\"input_tokens\":100,\"output_tokens\":10,\"decision\":\"tool_call\",\"tool_name\":\"bash\"}\n",
+
+    "{\"event_type\":\"protected_path_denied\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000003\",",
+    "\"parent_id\":\"evt_ffffffffffff4fff8fff000000000002\",",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6020,",
+    "\"turn\":1,\"call\":\"shell\",\"target\":\"/usr/bin/bash\",\"path\":\"tests/test_foo.py\",",
+    "\"rule\":\"tests\",\"signal\":\"shell redirection '>' into the path\",",
+    "\"reason\":\"'tests/test_foo.py' is under the read-only path 'tests'\"}\n",
+
+    "{\"event_type\":\"protected_path_denied\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000004\",",
+    "\"parent_id\":\"evt_ffffffffffff4fff8fff000000000002\",",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6030,",
+    "\"turn\":1,\"call\":\"shell\",\"target\":\"/usr/bin/bash\",\"path\":\"tests/conftest.py\",",
+    "\"rule\":\"tests\",\"signal\":\"write-target argument of 'tee'\",",
+    "\"reason\":\"'tests/conftest.py' is under the read-only path 'tests'\"}\n",
+
+    "{\"event_type\":\"protected_path_denied\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000005\",",
+    "\"parent_id\":\"evt_ffffffffffff4fff8fff000000000002\",",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6040,",
+    "\"turn\":1,\"call\":\"tool\",\"target\":\"edit-file\",\"path\":\"bench/fixtures/case.json\",",
+    "\"rule\":\"bench/fixtures\",\"signal\":\"tool input pairs 'path' with 'content'\",",
+    "\"reason\":\"'bench/fixtures/case.json' is under the read-only path 'bench/fixtures'\"}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_ffffffffffff4fff8fff000000000006\",",
+    "\"parent_id\":\"evt_ffffffffffff4fff8fff000000000001\",",
+    "\"session_id\":\"ses_ffffffffffff4fff8fff000000000004\",\"timestamp\":6050,",
+    "\"total_turns\":1,\"total_input_tokens\":100,\"total_output_tokens\":10,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":50,\"exit_status\":\"ok\"}\n"
+);
+
 fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, content).unwrap();
@@ -244,6 +285,64 @@ fn show_lists_declined_compactions_with_turn_and_reason() {
         .stdout(predicate::str::contains("turn 1"))
         .stdout(predicate::str::contains("no_hook_replacement"))
         .stdout(predicate::str::contains("5,000"));
+}
+
+/// A refused write is not a write that never happened: every `protected_path_denied` record is
+/// rendered under its own heading with its path and rule, and the count is reported beside them.
+#[test]
+fn show_lists_protected_path_refusals_with_path_rule_and_count() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "protected.jsonl", FIXTURE_PROTECTED);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Protected paths"))
+        .stdout(predicate::str::contains("protected-path refusals: 3"))
+        .stdout(predicate::str::contains("tests/test_foo.py"))
+        .stdout(predicate::str::contains("tests/conftest.py"))
+        .stdout(predicate::str::contains("bench/fixtures/case.json"))
+        .stdout(predicate::str::contains("rule tests"))
+        .stdout(predicate::str::contains("rule bench/fixtures"));
+}
+
+/// A trace with no refusal reports the section not at all, so an unchanged capsule's output is
+/// unchanged.
+#[test]
+fn show_omits_the_protected_path_section_when_there_are_none() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Protected paths").not())
+        .stdout(predicate::str::contains("protected-path refusals").not());
+}
+
+/// Each refusal gets its own line in the steps tree, naming the path and the rule.
+#[test]
+fn steps_renders_each_protected_path_refusal_on_its_own_line() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "protected.jsonl", FIXTURE_PROTECTED);
+
+    let out = mur()
+        .args(["trace", "steps", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains("protected_path_denied shell  tests/test_foo.py  rule tests"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .contains("protected_path_denied tool  bench/fixtures/case.json  rule bench/fixtures"),
+        "{stdout}"
+    );
 }
 
 #[test]

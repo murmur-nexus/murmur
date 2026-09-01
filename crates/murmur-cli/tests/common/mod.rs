@@ -221,7 +221,28 @@ pub fn stage_agent_session(
     project_dir: &Path,
     manifest_path: &Path,
 ) -> StagedSession {
-    stage_agent_session_inner(home, project_dir, manifest_path, None)
+    stage_agent_session_inner(home, project_dir, manifest_path, None, None)
+}
+
+/// `stage_agent_session` with an explicit accessible workdir, the shape `mur run --workdir` takes.
+///
+/// For the one property that needs the accessible workdir's path known *before* the session is
+/// scripted: with no override the runtime mints `<manifest_dir>/workdir/<random session id>`, so a
+/// test cannot name a file inside it up front.
+#[allow(dead_code)]
+pub fn stage_agent_session_with_workdir(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    workdir: &Path,
+) -> StagedSession {
+    stage_agent_session_inner(
+        home,
+        project_dir,
+        manifest_path,
+        None,
+        Some(workdir.to_path_buf()),
+    )
 }
 
 /// `stage_agent_session` for a launch that continues `from_session` under `context_id`, the pair
@@ -238,6 +259,7 @@ pub fn stage_agent_session_resuming(
         project_dir,
         manifest_path,
         Some((from_session.to_string(), context_id.to_string())),
+        None,
     )
 }
 
@@ -246,6 +268,7 @@ fn stage_agent_session_inner(
     project_dir: &Path,
     manifest_path: &Path,
     resume: Option<(String, String)>,
+    workdir: Option<PathBuf>,
 ) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
@@ -302,7 +325,7 @@ fn stage_agent_session_inner(
             // Carried through the same way `mur run` carries it, so a test manifest's `trace:`
             // block reaches the session's writer instead of being silently dropped.
             trace: runtime_manifest.trace,
-            workdir: None,
+            workdir,
             bind_addr: "127.0.0.1".to_string(),
             internal_port: None,
             declared_containment_floor: ContainmentClass::Advisory,

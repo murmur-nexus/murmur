@@ -49,6 +49,7 @@ pub const E_CAP_008: &str = "E-CAP-008"; // persistent capsule declares exports.
 pub const E_CAP_009: &str = "E-CAP-009"; // capabilities.state.store does not name a usable durable store
 pub const E_CAP_010: &str = "E-CAP-010"; // an artifact entry's config: block cannot be delivered as MURMUR_ARTIFACT_CONFIG
 pub const E_CAP_011: &str = "E-CAP-011"; // context.record_store or --context does not name one conversation record directory
+pub const E_CAP_012: &str = "E-CAP-012"; // capabilities.filesystem.read_only entry is not a usable workdir subpath
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -266,6 +267,10 @@ impl From<RuntimeError> for CliError {
             RuntimeError::InvalidFilesystemScope { scope, message } => CliError::new(
                 E_CAP_002,
                 format!("invalid filesystem scope '{scope}': {message}"),
+            ),
+            RuntimeError::InvalidReadOnlyPath { path, message } => CliError::new(
+                E_CAP_012,
+                format!("invalid read-only path '{path}': {message}"),
             ),
             // One code for every shape rule the config channel enforces, because they are one
             // operator problem — a declared block that cannot be delivered — and the message

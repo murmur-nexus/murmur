@@ -16,7 +16,7 @@ use murmur_artifact::{
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
     LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
     MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
+    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -66,6 +66,7 @@ use crate::{
     origin::{stamp_for_peer, TaskOrigin, TaskProvenance, TrustClass},
     otel::OtelEmitter,
     outgoing,
+    protected_paths::{ProtectedPathRefusal, ProtectedPaths},
     registration::SessionOutcome,
     resources, sandbox,
     sealed::UsernsGrant,
@@ -518,6 +519,13 @@ pub fn stage_session(
             || !request.capability_policy.spawn_allow.is_empty(),
         crate::network_namespace::detect_egress_namespace_blocker(),
     )?;
+    // Lowered here, in the same pre-registry-pull seam and for the same reason a state store name
+    // is: an entry that cannot be a workdir subtree refuses the launch before anything is pulled,
+    // created or instantiated, so no call is ever checked against a rule the runtime could not
+    // build. This is also the only place it is built — the dispatch check reads this value, never
+    // the declared strings.
+    let protected_paths =
+        ProtectedPaths::from_declared(&request.capability_policy.read_only_paths)?;
     // Capsule-ceiling-level, not per-artifact: `interpreter_runtime` lives on the capsule's own
     // top-level `capabilities.shell`, so warn here (before the per-artifact staging loop) rather
     // than in `stage_artifact_grant`.
@@ -526,6 +534,13 @@ pub fn stage_session(
     // once, before anything else happens. Ordered after the refusals above so a manifest that is
     // going to be rejected outright is not first warned about.
     warn_on_workdir_exec(workdir_exec);
+    // Ordered beside the other capsule-wide declarations whose cost the operator should read
+    // before the session starts, and after the refusals above so a manifest that will be rejected
+    // is not first warned about.
+    warn_on_advisory_read_only(
+        &request.capability_policy.read_only_paths,
+        &request.capability_policy.shell_allow,
+    );
     // A host posture rather than a manifest declaration, but stated in the same place and for the
     // same reason: this session is about to record an achieved class that a weakened host and the
     // shipped profile can both produce, and the operator should be told which one they are on
@@ -969,6 +984,7 @@ pub fn stage_session(
             .unwrap_or_default(),
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         host_probe,
+        protected_paths,
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
@@ -1262,6 +1278,7 @@ pub fn launch_session(
         let installed_artifacts = staged.installed_artifacts;
         let engine = staged.engine.clone();
         let capability_policy = staged.capability_policy.clone();
+        let protected_paths = staged.protected_paths.clone();
         let shell_enforcement_for_state = shell_enforcement.clone();
         let otel_endpoint = staged.otel_endpoint;
         let eval_config_json = staged.eval_config_json;
@@ -1465,6 +1482,7 @@ pub fn launch_session(
                         session_id: session_id.clone(),
                         pending_a2a_events: Vec::new(),
                         capability_policy,
+                        protected_paths,
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
@@ -2230,6 +2248,7 @@ pub fn launch_session(
         session_id: staged.session_id.clone(),
         pending_a2a_events: Vec::new(),
         capability_policy: staged.capability_policy,
+        protected_paths: staged.protected_paths,
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent: None,
         current_task_provenance: None,
@@ -2699,6 +2718,39 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
          there can run regardless of capabilities.shell.allow; this capsule reports containment \
          class 'advisory' on every host, including a Landlock-capable one ({link})"
     );
+}
+
+/// Warns (non-fatal, once per allowlisted interpreter) when `capabilities.filesystem.read_only`
+/// is declared alongside a binary that can construct a write the dispatch-time analyser cannot
+/// see.
+///
+/// The analyser reads a shell call's argv and its `-c` script body. An interpreter's own file I/O
+/// is in neither: `python3 -c "open(p,'w').write(x)"` is one opaque argument, and nothing in it
+/// names a redirection or a write verb. The declaration still holds for every call the analyser
+/// can read and for the whole tool path — this names the one route around the shell half rather
+/// than leaving an operator to discover it.
+///
+/// Deliberately not a refusal: the pairing is legitimate and common, and the answer to it is the
+/// kernel-backing layer, not a manifest rule. Same seam as [`warn_on_workdir_exec`] — fires at
+/// staging, before any session workdir exists, so it goes to stderr only.
+fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
+    if read_only.is_empty() {
+        return;
+    }
+    for binary in shell_allow
+        .iter()
+        .filter(|binary| crate::protected_paths::is_advisory_interpreter(binary))
+    {
+        let link = security_warning_link(W_SEC_017);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_017}]: capabilities.filesystem.read_only is \
+             declared and capabilities.shell.allow includes '{binary}', an interpreter that \
+             can construct a write the dispatch-time analyser cannot read — the declaration \
+             is advisory for that binary until the kernel-enforced layer lands. It still \
+             holds for every tool call and for every shell command whose write the analyser \
+             can identify ({link})"
+        );
+    }
 }
 
 /// Warns (non-fatal, once per session) when this host's unprivileged user namespaces are
@@ -3276,6 +3328,11 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) pending_a2a_events:
         Vec<(String, String, String, String, Option<String>, TrustClass)>,
     pub(crate) capability_policy: CapabilityPolicy,
+    /// The lowered `capabilities.filesystem.read_only` surface, built and validated once at
+    /// staging. Empty for every capsule that declared nothing, and
+    /// [`Self::has_protected_paths`] is the single boolean that keeps such a capsule from
+    /// resolving a call, walking a JSON input or resolving a path at all.
+    pub(crate) protected_paths: ProtectedPaths,
     /// Host-detected kernel enforcement tier + resolved network allowlist IPs for this
     /// session's shell subprocesses. Kept separate from `CapabilityPolicy` (which stays
     /// purely manifest-derived) since this is host-probed data, not manifest data.
@@ -4044,6 +4101,28 @@ impl CapsuleStoreState {
             },
             None => as_tool(),
         }
+    }
+
+    /// Whether this capsule declared any `capabilities.filesystem.read_only` entry.
+    ///
+    /// The one branch the dispatch path takes on: `false` means no call is resolved, no path is
+    /// resolved, no JSON input is walked and no analyser pass runs, so a capsule that declared
+    /// nothing pays nothing.
+    pub(crate) fn has_protected_paths(&self) -> bool {
+        !self.protected_paths.is_empty()
+    }
+
+    /// The manifest's own answer to "does this call write a declared read-only path?".
+    ///
+    /// Grants nothing and widens nothing: the only outcome it can produce is that a call does not
+    /// happen. Runs on this session's own workdir, which is the root every declared entry is
+    /// relative to.
+    pub(crate) fn check_protected_paths(
+        &self,
+        call: &ResolvedCall,
+    ) -> Option<ProtectedPathRefusal> {
+        self.protected_paths
+            .check_call(&self.accessible_workdir, call)
     }
 
     /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
@@ -6847,6 +6926,7 @@ inference:
             session_id: "ses_test".to_string(),
             pending_a2a_events: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
+            protected_paths: ProtectedPaths::default(),
             shell_enforcement: sandbox::ShellEnforcement::environment_only(),
             current_traceparent: None,
             current_task_provenance: None,
@@ -7843,6 +7923,7 @@ inference:
             filesystem: scope.map(|scope| murmur_artifact::FilesystemCapabilities {
                 scope: Some(scope.to_string()),
                 workdir_exec: false,
+                read_only: Vec::new(),
             }),
             shell: None,
             spawn: None,
@@ -8210,6 +8291,56 @@ inference:
         );
     }
 
+    // ── Protected paths on the store state ───────────────────────────────
+
+    /// The single boolean the dispatch path branches on. A capsule that declared nothing answers
+    /// `false`, which is what keeps it from resolving a call at all.
+    #[test]
+    fn has_protected_paths_is_false_without_a_declaration_and_true_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().to_path_buf();
+        let lock_path = workdir.join("murmur.lock");
+        let mut state = build_test_state(
+            Arc::new(FakeSkillRegistry::new(Vec::new())),
+            workdir,
+            lock_path,
+        );
+        assert!(!state.has_protected_paths());
+        assert!(state
+            .check_protected_paths(&ResolvedCall::Tool {
+                tool_name: "writer".to_string(),
+                input: r#"{"path":"tests/a","content":"x"}"#.to_string(),
+                input_bytes: 34,
+            })
+            .is_none());
+
+        state.protected_paths = ProtectedPaths::from_declared(&["tests".to_string()]).unwrap();
+        assert!(state.has_protected_paths());
+        let refusal = state
+            .check_protected_paths(&ResolvedCall::Tool {
+                tool_name: "writer".to_string(),
+                input: r#"{"path":"tests/a","content":"x"}"#.to_string(),
+                input_bytes: 34,
+            })
+            .expect("a declared subtree is checked");
+        assert_eq!(refusal.rule, "tests");
+        assert_eq!(refusal.path, "tests/a");
+    }
+
+    /// A `read_only` entry that cannot be a workdir subtree refuses the launch at lowering, so no
+    /// session ever runs against a rule the runtime could not build.
+    #[test]
+    fn a_malformed_read_only_entry_refuses_before_a_session_exists() {
+        for entry in ["/etc", "../outside", "tests/../../outside"] {
+            let err = ProtectedPaths::from_declared(&[entry.to_string()])
+                .expect_err("staging must refuse");
+            assert!(
+                matches!(&err, RuntimeError::InvalidReadOnlyPath { path, .. } if path == entry),
+                "{entry}: {err}"
+            );
+        }
+    }
+
     /// A malformed `config:` block fails staging by artifact name, before any component is
     /// instantiated — the same treatment a malformed capability grant beside it gets.
     #[test]
@@ -8251,6 +8382,7 @@ inference:
                 filesystem: Some(murmur_artifact::FilesystemCapabilities {
                     scope: Some("../escape".to_string()),
                     workdir_exec: false,
+                    read_only: Vec::new(),
                 }),
                 shell: None,
                 spawn: None,
@@ -8284,6 +8416,7 @@ inference:
             filesystem: Some(murmur_artifact::FilesystemCapabilities {
                 scope: None,
                 workdir_exec: false,
+                read_only: Vec::new(),
             }),
             shell: Some(murmur_artifact::ShellCapabilities {
                 allow: vec!["bash".to_string()],

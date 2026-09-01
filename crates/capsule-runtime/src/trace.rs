@@ -811,6 +811,34 @@ struct CallDeniedEvent {
     reason: String,
 }
 
+/// The manifest's own read-only rule refused a call before it ran. Distinct from
+/// [`CallDeniedEvent`] because it names a different authority and a different subject: no hook was
+/// asked, and what it carries is the path, the declared rule and the evidence that identified the
+/// call as a write.
+#[derive(Serialize)]
+struct ProtectedPathDeniedEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    /// Which dispatch path was refused: `"shell"` or `"tool"`.
+    call: String,
+    /// What was refused: the resolved executable path for a shell call, the tool name otherwise.
+    target: String,
+    /// The resolved workdir-relative path, never the string the model typed, so two spellings of
+    /// one file produce one comparable record.
+    path: String,
+    /// The `capabilities.filesystem.read_only` entry that covers `path`, as declared.
+    rule: String,
+    /// What identified the call as a write — a redirection operator, a write-verb argument
+    /// position, or the tool-input key pairing.
+    signal: String,
+    /// The same text the model was given, so the trace and the agent agree on why.
+    reason: String,
+}
+
 #[derive(Serialize)]
 struct HookDispatchErrorEvent {
     event_type: &'static str,
@@ -1719,6 +1747,37 @@ impl TraceWriter {
             event: event.to_string(),
             hook_name: hook_name.to_string(),
             target: target.to_string(),
+            reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that the manifest's `capabilities.filesystem.read_only` refused a call before it
+    /// ran. Like [`Self::write_call_denied`] it is the only account of a call the model asked for
+    /// and never got — nothing ran, so no `tool_call` or `shell` record accompanies it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_protected_path_denied(
+        &mut self,
+        turn: u32,
+        call: &str,
+        target: &str,
+        path: &str,
+        rule: &str,
+        signal: &str,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let event = ProtectedPathDeniedEvent {
+            event_type: "protected_path_denied",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            call: call.to_string(),
+            target: target.to_string(),
+            path: path.to_string(),
+            rule: rule.to_string(),
+            signal: signal.to_string(),
             reason: reason.to_string(),
         };
         self.write_event(&event).await

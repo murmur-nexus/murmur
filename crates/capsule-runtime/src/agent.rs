@@ -19,11 +19,13 @@ use crate::{
     detached::DetachedDispatchInfo,
     errors::RuntimeError,
     hooks::{
-        CallDecision, DispatchFault, HookEvent, HookRuntime, HookSeed, FAULT_ARM_SEED_REJECTED,
+        CallDecision, DispatchFault, HookEvent, HookRuntime, HookSeed, ResolvedCall,
+        FAULT_ARM_SEED_REJECTED,
     },
     murmur_md::MURMUR_MD_TRUST_NOTICE,
     origin::{TaskProvenance, TrustClass},
     otel::OtelEmitter,
+    protected_paths::ProtectedPathRefusal,
     runtime::CapsuleStoreState,
     streaming::{
         emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
@@ -778,12 +780,13 @@ pub(crate) async fn run_agent_loop(
 
                     // The decision point: after the manifest's capability check has already
                     // decided what this capsule may do, and immediately before the call is
-                    // dispatched. A policy hook can only subtract from here — its one possible
-                    // effect on the loop is that the call does not happen.
+                    // dispatched. Neither check here can grant anything — the one possible effect
+                    // either has on the loop is that the call does not happen.
                     //
-                    // Gated on a single boolean, so a capsule with no policy hook resolves
-                    // nothing and dispatches nothing extra.
-                    if hooks.gates_calls() {
+                    // Gated on a single boolean pair, so a capsule with neither a policy hook nor
+                    // a `read_only` declaration resolves nothing and dispatches nothing extra; and
+                    // the call is resolved exactly once for both.
+                    if hooks.gates_calls() || store_state.has_protected_paths() {
                         let resolved = store_state.resolve_call(
                             &tool_name,
                             &ToolInput {
@@ -791,6 +794,41 @@ pub(crate) async fn run_agent_loop(
                                 log_path: None,
                             },
                         );
+                        // The manifest is asked first, and its refusal is final: a hook can only
+                        // narrow further, so a call the manifest already refuses costs no hook
+                        // dispatch.
+                        if let Some(refusal) = store_state.check_protected_paths(&resolved) {
+                            let signal = refusal.signal.describe();
+                            let reason = protected_path_reason(&refusal);
+                            // Nothing ran, so nothing is recorded as having run: no `tool_call`
+                            // record and no `shell` record for this call.
+                            trace
+                                .write_protected_path_denied(
+                                    turn_u32,
+                                    protected_path_call_kind(&resolved),
+                                    resolved.target(),
+                                    &refusal.path,
+                                    &refusal.rule,
+                                    &signal,
+                                    &reason,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    RuntimeError::AgentLoopFailed(format!(
+                                        "trace write failed: {e}"
+                                    ))
+                                })?;
+                            tool_messages.push(with_new_id(json!({
+                                "role": "tool",
+                                "tool_call_id": tool_call_id,
+                                "is_error": true,
+                                "content": [{
+                                    "type": "text",
+                                    "text": protected_path_tool_result(&refusal),
+                                }],
+                            })));
+                            continue;
+                        }
                         if let CallDecision::Denied { hook_name, reason } =
                             hooks.decide(workdir, turn_u32, &resolved).await
                         {
@@ -1263,6 +1301,47 @@ async fn flush_hook_inference_records(
 ///
 /// The no-retry sentence is load-bearing: a model shown an opaque failure retries the same
 /// call, which is the behaviour a policy hook exists to stop.
+/// Which dispatch path a refusal names in the trace: `"shell"` or `"tool"`.
+fn protected_path_call_kind(call: &ResolvedCall) -> &'static str {
+    match call {
+        ResolvedCall::Shell { .. } => "shell",
+        ResolvedCall::Tool { .. } => "tool",
+    }
+}
+
+/// The one-line reason carried on the trace record, the same sentence the model's refusal opens
+/// with — so a trace reader and the agent are told the same thing.
+fn protected_path_reason(refusal: &ProtectedPathRefusal) -> String {
+    format!(
+        "'{}' is under the read-only path '{}' declared in \
+         capabilities.filesystem.read_only; identified as a write by {}",
+        refusal.path,
+        refusal.rule,
+        refusal.signal.describe()
+    )
+}
+
+/// What the model is told when the manifest refuses a call.
+///
+/// An unexplained denial makes an agent retry, which is the behaviour this exists to stop, so the
+/// text has to carry four things: the path, the rule that covers it, that nothing ran, and that no
+/// other route in this capsule writes it either — a different approach is needed, not a different
+/// spelling. It closes on what is still true, because "read-only" is the grant and an agent that
+/// stops reading the file has over-corrected.
+fn protected_path_tool_result(refusal: &ProtectedPathRefusal) -> String {
+    format!(
+        "Refused by the capsule manifest: '{path}' is under the read-only path '{rule}' \
+         declared in capabilities.filesystem.read_only. Identified as a write by \
+         {signal}.\n\n\
+         Nothing ran. '{path}' cannot be written by any tool or shell command in this \
+         capsule, so retrying in another form will be refused too — solve the task without \
+         writing it. It is still readable.",
+        path = refusal.path,
+        rule = refusal.rule,
+        signal = refusal.signal.describe(),
+    )
+}
+
 fn denial_tool_result(hook_name: &str, reason: &str) -> String {
     format!(
         "Refused by policy hook '{hook_name}': {reason}\n\n\

@@ -147,6 +147,16 @@ pub struct CapabilityPolicy {
     /// is the one *grant* in this struct that also lowers the session's achieved containment class
     /// (see `crate::containment::achieved_containment_class`) — nothing else here can.
     pub workdir_exec_allowed: bool,
+    /// From `capabilities.filesystem.read_only`: workdir subtrees the capsule may read but must
+    /// not write, in the same vocabulary [`Self::filesystem_scope`] uses. Empty by default, which
+    /// is the whole workdir writable.
+    ///
+    /// Carried here as the declared strings and lowered once at staging into
+    /// `crate::protected_paths::ProtectedPaths`, which is what the dispatch check consults — so a
+    /// malformed entry refuses the launch rather than one call at a time. Unlike every other field
+    /// here this one grants nothing: it can only subtract from what the workdir preopen already
+    /// allows.
+    pub read_only_paths: Vec<String>,
     pub shell_allow: Vec<String>,
     pub spawn_allow: Vec<String>,
     pub shell_strip_env: Vec<String>,
@@ -428,6 +438,10 @@ pub struct StagedSession {
     /// rather than taking a new one, so the mechanisms installed at launch are the ones
     /// [`Self::scope_report`] already claims.
     pub(crate) host_probe: crate::sandbox::HostProbe,
+    /// The declared read-only surface, lowered and validated by `stage_session` — a malformed
+    /// entry refuses the launch there rather than surfacing at the first call. Empty for every
+    /// capsule that declared no `capabilities.filesystem.read_only`.
+    pub(crate) protected_paths: crate::protected_paths::ProtectedPaths,
     /// The declared read-only file surface, with its root already checked against this session's
     /// accessible workdir by `stage_session` — a root that resolves outside it refuses the launch
     /// rather than being served. `None` means no resource plane.
@@ -512,6 +526,11 @@ pub fn capability_policy_from_runtime_manifest(
     let workdir_exec_allowed = caps
         .and_then(|c| c.filesystem.as_ref())
         .is_some_and(|filesystem| filesystem.workdir_exec);
+    // Absent block, absent key and an empty list are one declaration: nothing is protected.
+    let read_only_paths = caps
+        .and_then(|c| c.filesystem.as_ref())
+        .map(|filesystem| filesystem.read_only.clone())
+        .unwrap_or_default();
 
     let shell_allow = caps
         .and_then(|c| c.shell.as_ref())
@@ -557,6 +576,7 @@ pub fn capability_policy_from_runtime_manifest(
         unix_sockets_allowed,
         filesystem_scope,
         workdir_exec_allowed,
+        read_only_paths,
         shell_allow,
         spawn_allow,
         shell_strip_env,
@@ -581,6 +601,44 @@ mod tests {
         let manifest = murmur_artifact::RuntimeManifest::from_yaml_str(manifest_yaml)
             .expect("manifest fixture must parse");
         capability_policy_from_runtime_manifest(&manifest)
+    }
+
+    /// `read_only` reaches the policy in declaration order, trimmed, with empty entries already
+    /// dropped by the manifest parser — and a capsule that declares none gets an empty list, which
+    /// is what makes the dispatch check free for it.
+    #[test]
+    fn read_only_paths_are_carried_through_and_default_to_empty() {
+        let declared = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+capabilities:
+  filesystem:
+    read_only:
+      - tests
+      - "  bench/fixtures  "
+      - "   "
+"#,
+        );
+        assert_eq!(declared.read_only_paths, vec!["tests", "bench/fixtures"]);
+
+        let silent = policy_for(
+            "name: cap
+version: 0.1.0
+",
+        );
+        assert!(silent.read_only_paths.is_empty());
+
+        let no_key = policy_for(
+            r#"
+name: cap
+version: 0.1.0
+capabilities:
+  filesystem:
+    scope: work
+"#,
+        );
+        assert!(no_key.read_only_paths.is_empty());
     }
 
     /// A manifest that sets no deadline gives hook calls the hook-specific default while the

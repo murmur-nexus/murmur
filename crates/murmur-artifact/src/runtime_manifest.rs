@@ -1004,6 +1004,13 @@ pub struct FilesystemCapabilities {
     /// [`ContainmentClass::Scoped`] — see `capsule_runtime::containment` — and pairing it with
     /// `capabilities.containment: scoped` is refused at launch.
     pub workdir_exec: bool,
+    /// Workdir-relative subtrees the capsule may read but must not write, in the same vocabulary
+    /// [`Self::scope`] uses. Empty when the key is absent, which is the whole workdir writable —
+    /// the behaviour of every capsule that declares nothing here.
+    ///
+    /// Entries are trimmed and empty ones dropped at parse; path *shape* is judged by the
+    /// runtime (`capsule_runtime::protected_paths`), exactly as `scope`'s shape is.
+    pub read_only: Vec<String>,
 }
 
 /// The `capabilities.task_io` block on a `runtime: hook` artifact entry — the operator's
@@ -1689,6 +1696,10 @@ struct RawFilesystemCapabilities {
     /// "The key is absent" and "the key says `false`" are the same declaration.
     #[serde(default)]
     workdir_exec: bool,
+    /// Always a list after parsing, never an `Option`: an absent key and an empty list are the
+    /// same declaration — nothing is protected.
+    #[serde(default)]
+    read_only: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2463,6 +2474,17 @@ fn parse_capabilities(
             // refusal when `capabilities.containment: scoped` is also declared) belongs to the
             // runtime's containment layer, not to manifest parsing.
             workdir_exec: raw_filesystem.workdir_exec,
+            // Normalised on exactly the terms `scope` above is: trimmed, and an entry left empty
+            // by that trim is dropped rather than carried as a rule covering nothing. Shape is
+            // not judged here either — an absolute or escaping entry is the runtime's refusal.
+            read_only: raw_filesystem
+                .read_only
+                .into_iter()
+                .filter_map(|entry| {
+                    let trimmed = entry.trim();
+                    (!trimmed.is_empty()).then(|| trimmed.to_string())
+                })
+                .collect(),
         });
 
     let shell = raw_caps
@@ -4251,6 +4273,76 @@ capabilities:
     }
 
     /// The default every pre-existing manifest gets: a `filesystem:` block that has never heard of
+    /// `read_only` is normalised on exactly the terms `scope` is — trimmed, with an entry left
+    /// empty by that trim dropped rather than carried as a rule covering the whole workdir — and
+    /// path shape is deliberately not judged here.
+    #[test]
+    fn filesystem_read_only_is_trimmed_and_empty_entries_are_dropped() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  filesystem:
+    read_only:
+      - tests
+      - "  bench/fixtures  "
+      - ""
+      - "   "
+"#,
+        )
+        .unwrap();
+
+        let filesystem = manifest.capabilities.unwrap().filesystem.unwrap();
+        assert_eq!(filesystem.read_only, vec!["tests", "bench/fixtures"]);
+    }
+
+    /// An absent key and an empty list are one declaration: nothing is protected.
+    #[test]
+    fn filesystem_read_only_defaults_to_empty_when_the_key_is_absent() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  filesystem:
+    scope: workdir
+"#,
+        )
+        .unwrap();
+
+        assert!(manifest
+            .capabilities
+            .unwrap()
+            .filesystem
+            .unwrap()
+            .read_only
+            .is_empty());
+    }
+
+    /// Path shape is the runtime's refusal, not the parser's: an absolute or escaping entry parses
+    /// here exactly as an absolute `scope` does, and fails at launch with `E-CAP-012`.
+    #[test]
+    fn filesystem_read_only_does_not_judge_path_shape() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+capabilities:
+  filesystem:
+    read_only:
+      - /etc
+      - ../outside
+"#,
+        )
+        .expect("shape is judged by the runtime, not the parser");
+
+        assert_eq!(
+            manifest.capabilities.unwrap().filesystem.unwrap().read_only,
+            vec!["/etc", "../outside"]
+        );
+    }
+
     /// `workdir_exec` must not silently keep the workdir's `Execute` right, because that right is
     /// exactly what makes `capabilities.shell.allow` bypassable from inside the workdir.
     #[test]

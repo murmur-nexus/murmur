@@ -22,6 +22,7 @@ section that explains it.
 | `E-CAP-009` | `capabilities.state.store` does not name a usable durable store | [E-CAP-009](#e-cap-009) |
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
+| `E-CAP-012` | A `capabilities.filesystem.read_only` entry is not a usable workdir subpath | [E-CAP-012](#e-cap-012) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -89,6 +90,7 @@ section that explains it.
 | `W-SEC-014` | A capsule-wide `capabilities.state` block grants nothing — a durable store is granted per artifact | [W-SEC-014](#w-sec-014) |
 | `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
+| `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
 
 ---
 
@@ -481,6 +483,21 @@ Distinct from [`E-CAP-009`](#e-cap-009), which is the same shape rule applied to
 A `contextId` an A2A client sends is not an operator value and never refuses a launch: a task whose
 context id is not a usable segment simply goes unrecorded, reported once to stderr and to
 `logs/bootstrap.log`.
+
+### E-CAP-012 — invalid `filesystem.read_only` entry { #e-cap-012 }
+
+A `capabilities.filesystem.read_only` entry is not a usable subdirectory of the session workdir:
+
+```text
+error[E-CAP-012]: invalid read-only path '/etc': read-only path must be relative to the workdir
+error[E-CAP-012]: invalid read-only path '../outside': read-only path cannot escape the workdir via '..'
+```
+
+The same two rules [`E-CAP-002`](#e-cap-002) applies to `filesystem.scope`, applied to each entry
+of the read-only list. The check runs at staging, before any registry pull, workdir creation or
+component instantiation, so no session directory is created and no call is ever checked against a
+rule the runtime could not build. An empty or whitespace-only entry is dropped at manifest parse
+rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 
 ---
 
@@ -1209,3 +1226,33 @@ artifacts:
       conversation:
         read: true
 ```
+
+---
+
+### W-SEC-017 — `read_only` is advisory for an allowlisted interpreter { #w-sec-017 }
+
+**Fires when:** `capabilities.filesystem.read_only` is non-empty and `capabilities.shell.allow`
+names an interpreter — a shell (`bash`, `sh`, `zsh`, `fish`, `dash`, `ksh`) or a general-purpose
+one (`python`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun`, `php`, `awk`, `gawk`, `mawk`,
+`lua`, `tclsh`, `Rscript`). Once per such binary, at staging, on stderr.
+
+**Why it matters:** the dispatch-time check reads a shell call's argv and its `-c` script body, and
+flags what it can positively identify as a write — a redirection, or an argument in a write-target
+position of a binary it knows. An interpreter's own file I/O is in neither:
+`python3 -c "open(p,'w').write(x)"` is one opaque argument that names no redirection and no
+recognized verb. The interpreter can construct a write into a declared read-only subtree, and it
+will not be refused.
+
+```text
+[capsule-runtime] warning[W-SEC-017]: capabilities.filesystem.read_only is declared and capabilities.shell.allow includes 'python3', an interpreter that can construct a write the dispatch-time analyser cannot read — the declaration is advisory for that binary until the kernel-enforced layer lands. It still holds for every tool call and for every shell command whose write the analyser can identify (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-017)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The declaration
+still applies in full to every tool call and to every shell command whose write the analyser can
+identify, and every refusal is still recorded as
+[`protected_path_denied`](observability-schemas.md#protected-path-denied).
+
+**What to do:** treat the declaration as advisory for the named binary and decide whether that is
+acceptable for this capsule. Removing the interpreter from `capabilities.shell.allow` closes the
+gap; keeping it does not weaken any other part of the declaration. See
+[Read-only paths](manifest.md#read-only-paths).
