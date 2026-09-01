@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use mur_roost::bounds::{DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
 use mur_roost::{authority::SpawnAuthority, handle_connection, State};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -17,6 +18,8 @@ struct Args {
     port: u16,
     registry_path: PathBuf,
     spawn_allow: Vec<String>,
+    max_depth: u32,
+    max_concurrent: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -24,6 +27,8 @@ fn parse_args() -> Result<Args, String> {
     let mut port: u16 = 7700;
     let mut registry_path: Option<PathBuf> = None;
     let mut spawn_allow: Vec<String> = Vec::new();
+    let mut max_depth: u32 = DEFAULT_MAX_DEPTH;
+    let mut max_concurrent: u32 = DEFAULT_MAX_CONCURRENT;
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -46,6 +51,22 @@ fn parse_args() -> Result<Args, String> {
                 let val = raw.get(i).ok_or("--spawn-allow requires a value")?;
                 spawn_allow.push(val.clone());
             }
+            "--max-depth" => {
+                i += 1;
+                max_depth = raw
+                    .get(i)
+                    .ok_or("--max-depth requires a value")?
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid --max-depth: {e}"))?;
+            }
+            "--max-concurrent" => {
+                i += 1;
+                max_concurrent = raw
+                    .get(i)
+                    .ok_or("--max-concurrent requires a value")?
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid --max-concurrent: {e}"))?;
+            }
             other if other.starts_with("--spawn-allow=") => {
                 spawn_allow.push(other["--spawn-allow=".len()..].to_string());
             }
@@ -64,6 +85,8 @@ fn parse_args() -> Result<Args, String> {
         port,
         registry_path,
         spawn_allow,
+        max_depth,
+        max_concurrent,
     })
 }
 
@@ -96,6 +119,8 @@ fn main() {
         jobs: Arc::new(Mutex::new(HashMap::new())),
         registry_path: args.registry_path,
         spawn_allow: args.spawn_allow,
+        max_depth: args.max_depth,
+        max_concurrent: args.max_concurrent,
         authority,
     });
 

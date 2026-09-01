@@ -17,6 +17,7 @@
 //! ceiling.
 
 pub mod authority;
+pub mod bounds;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -32,6 +33,7 @@ use murmur_artifact::{current_platform, LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{now_ms, AuthorityError, SpawnAuthority, SPAWN_APPROVAL_TTL_SECS};
+use crate::bounds::{live_children, BoundRefusal};
 
 // ── Job store ─────────────────────────────────────────────────────────────────
 
@@ -53,6 +55,33 @@ pub struct JobRecord {
     /// credential is minted by this daemon and handed to that session's runtime alone, so a caller
     /// cannot be judged against the envelope of a session it does not hold.
     pub envelope: SpawnEnvelope,
+    /// How many further levels of delegation may hang below this session.
+    ///
+    /// `state.max_depth` for a session that registered with no approval; for every other session,
+    /// the number sealed into the approval it registered with, which is one less than what its
+    /// parent held. A session at `0` is refused every spawn it asks for, which is what terminates
+    /// a capsule whose `capabilities.spawn.allow` names itself.
+    pub depth_remaining: u32,
+    /// The session whose approval admitted this one, and therefore the session this one is counted
+    /// against for concurrency. `None` for a session that registered with no approval.
+    pub parent_session: Option<String>,
+    /// Approvals this session has been granted and nobody has redeemed yet. Each one holds a
+    /// concurrency slot until it is redeemed or its expiry passes — see [`bounds::live_children`].
+    pub pending: Vec<PendingApproval>,
+}
+
+/// An approval minted for a session, held by the daemon until the child it approves registers.
+///
+/// Holds no token bytes: the `jti` and the expiry are enough to match a redemption and to free
+/// the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// The `jti` of the approval, matched against [`authority::ApprovalPayload::jti`] on
+    /// redemption.
+    pub jti: String,
+    /// The approval's absolute expiry in unix milliseconds. Past it, the slot is free again
+    /// whether or not anybody ever presented the approval.
+    pub expires_at_ms: u64,
 }
 
 pub type JobStore = Arc<Mutex<HashMap<String, JobRecord>>>;
@@ -64,6 +93,12 @@ pub struct State {
     pub jobs: JobStore,
     pub registry_path: PathBuf,
     pub spawn_allow: Vec<String>,
+    /// Levels of delegation allowed below a session that registered with no approval, from
+    /// `--max-depth`. `0` refuses every delegation.
+    pub max_depth: u32,
+    /// Children one session may hold live at once, from `--max-concurrent`. `0` refuses every
+    /// delegation.
+    pub max_concurrent: u32,
     /// Mints and verifies every credential and approval this daemon issues. Generated once in
     /// `main` and dropped when the process exits, so a token from a previous daemon verifies
     /// against nothing.
@@ -119,6 +154,17 @@ struct RegisterResponse {
 #[derive(Debug, Deserialize)]
 struct DeregisterRequest {
     outcome: String,
+}
+
+/// What `GET /status/{session_id}` answers with.
+#[derive(Serialize)]
+struct StatusResponse {
+    status: &'static str,
+    /// Levels of delegation still available below this session.
+    depth_remaining: u32,
+    /// Children this session holds right now, counting one it has been approved to launch and has
+    /// not launched yet.
+    live_children: u32,
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -318,15 +364,16 @@ fn resolve_capsule(
     Ok((resolved, manifest))
 }
 
-/// The envelope of the session a credential names, or an identity refusal.
+/// The record of the session a credential names, or an identity refusal.
 ///
 /// The two questions this answers — is the credential one of ours, and is the session it names
 /// running — collapse into one outcome on purpose: a caller learns nothing about which sessions
-/// exist.
-fn session_envelope(state: &Arc<State>, session_id: &str) -> Result<SpawnEnvelope, String> {
+/// exist. Both delegation bounds are decided from the record this returns, so a session that
+/// cannot be found is refused rather than judged against a default.
+fn session_record(state: &Arc<State>, session_id: &str) -> Result<JobRecord, String> {
     let jobs = state.jobs.lock().unwrap();
     match jobs.get(session_id) {
-        Some(job) if job.status == JobStatus::Running => Ok(job.envelope.clone()),
+        Some(job) if job.status == JobStatus::Running => Ok(job.clone()),
         _ => Err(identity_refused()),
     }
 }
@@ -353,10 +400,13 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     let Ok(session_id) = state.authority.verify_credential(credential) else {
         return identity_refused();
     };
-    let parent_envelope = match session_envelope(state, &session_id) {
-        Ok(envelope) => envelope,
+    // Selected by the session id the credential names, never by one the body claims: the figures
+    // both bounds are decided from are this daemon's record of the asking session.
+    let parent = match session_record(state, &session_id) {
+        Ok(record) => record,
         Err(response) => return response,
     };
+    let parent_envelope = parent.envelope;
 
     // Authorization check.
     //
@@ -373,6 +423,31 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
         );
     }
 
+    // The operator's two bounds, ahead of the registry: a spawn refused for depth or concurrency
+    // resolves no artifact and reads no manifest.
+    if parent.depth_remaining == 0 {
+        return err(
+            403,
+            "Forbidden",
+            &BoundRefusal::DepthExhausted {
+                max_depth: state.max_depth,
+            }
+            .to_string(),
+        );
+    }
+    let live = live_children(&state.jobs.lock().unwrap(), &session_id, now_ms());
+    if live >= state.max_concurrent {
+        return err(
+            403,
+            "Forbidden",
+            &BoundRefusal::ConcurrencyReached {
+                max_concurrent: state.max_concurrent,
+                live,
+            }
+            .to_string(),
+        );
+    }
+
     let (resolved, manifest) = match resolve_capsule(state, &req.name, &req.version) {
         Ok(pair) => pair,
         Err(response) => return response,
@@ -386,14 +461,17 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     }
 
     let expires_at_ms = now_ms() + SPAWN_APPROVAL_TTL_SECS * 1_000;
-    let approval = match state.authority.mint_approval_token(
+    // One less than the asking session holds, sealed into the approval rather than sent beside it.
+    let child_depth = parent.depth_remaining - 1;
+    let (approval, payload) = match state.authority.mint_approval_payload(
         &session_id,
         &resolved.meta.name,
         &resolved.meta.version,
         &resolved.sha256,
+        child_depth,
         expires_at_ms,
     ) {
-        Ok(token) => token,
+        Ok(minted) => minted,
         Err(e) => {
             return err(
                 500,
@@ -402,6 +480,36 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
             )
         }
     };
+
+    // The slot is taken at approval, not at the child's registration — see
+    // [`bounds::live_children`].
+    //
+    // The count is taken again here, under the same lock hold that records the reservation. The
+    // check above is the one an ordinary refusal comes from, but it releases the lock before the
+    // registry is read, so two requests from one session can both pass it; only a count and a push
+    // that cannot be interleaved keep a parent from taking every slot at once.
+    {
+        let mut jobs = state.jobs.lock().unwrap();
+        let live = live_children(&jobs, &session_id, now_ms());
+        if live >= state.max_concurrent {
+            return err(
+                403,
+                "Forbidden",
+                &BoundRefusal::ConcurrencyReached {
+                    max_concurrent: state.max_concurrent,
+                    live,
+                }
+                .to_string(),
+            );
+        }
+        match jobs.get_mut(&session_id) {
+            Some(job) if job.status == JobStatus::Running => job.pending.push(PendingApproval {
+                jti: payload.jti,
+                expires_at_ms,
+            }),
+            _ => return identity_refused(),
+        }
+    }
 
     ok_json(&SpawnResponse {
         approval,
@@ -439,7 +547,10 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
         Err(response) => return response,
     };
 
-    match headers.get(SPAWN_APPROVAL_HEADER) {
+    // The registrant's delegation budget, and whose census it counts against. Both come from the
+    // approval it presented or, where there is none, from the operator's flag — never from the
+    // body, which has no field either could arrive in.
+    let (depth_remaining, parent_session, redeemed_jti) = match headers.get(SPAWN_APPROVAL_HEADER) {
         Some(approval) => {
             // The approval is marked spent the moment it verifies, above every check below: an
             // approval covers one launch, and presenting it for the wrong artifact or from a
@@ -465,7 +576,7 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
             // The parent that earned this approval must still be running: an approval outliving
             // the session it was granted to would let a child register under a ceiling nothing is
             // still accountable for.
-            if session_envelope(state, &approved.sid).is_err() {
+            if session_record(state, &approved.sid).is_err() {
                 return identity_refused();
             }
             if approved.name != resolved.meta.name || approved.version != resolved.meta.version {
@@ -488,9 +599,11 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
                     ),
                 );
             }
+            (approved.depth, Some(approved.sid), Some(approved.jti))
         }
         // No approval: there is no parent to have been approved by, so the operator who started
-        // the daemon is the only authority, and their list is the only gate.
+        // the daemon is the only authority, and their list is the only gate. The top of a chain
+        // starts from `--max-depth`.
         None => {
             if !state.spawn_allow.contains(&req.name) {
                 return err(
@@ -499,8 +612,9 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
                     &format!("capsule '{}' is not in --spawn-allow", req.name),
                 );
             }
+            (state.max_depth, None, None)
         }
-    }
+    };
 
     // The envelope is derived here, from the manifest this daemon resolved — never from anything
     // the registrant said about itself. A registrant that could state its grants would be a
@@ -523,13 +637,25 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
         }
     };
 
-    state.jobs.lock().unwrap().insert(
+    let mut jobs = state.jobs.lock().unwrap();
+    // Dropping the reservation and inserting the running record under one lock hold keeps the
+    // child counted once rather than twice.
+    if let (Some(parent), Some(jti)) = (parent_session.as_deref(), redeemed_jti) {
+        if let Some(job) = jobs.get_mut(parent) {
+            job.pending.retain(|pending| pending.jti != jti);
+        }
+    }
+    jobs.insert(
         req.session_id.clone(),
         JobRecord {
             status: JobStatus::Running,
             envelope,
+            depth_remaining,
+            parent_session,
+            pending: Vec::new(),
         },
     );
+    drop(jobs);
 
     ok_json(&RegisterResponse { credential })
 }
@@ -569,6 +695,10 @@ fn handle_deregister(headers: &RequestHeaders, body: &str, state: &Arc<State>) -
     match jobs.get_mut(&session_id) {
         Some(job) if job.status == JobStatus::Running => {
             job.status = status;
+            // An approval this session earned can no longer be redeemed by anybody — registering
+            // under it requires the granting session to be running — so the slots it was holding
+            // are released rather than left to expire.
+            job.pending.clear();
             ok(r#"{}"#)
         }
         _ => identity_refused(),
@@ -586,7 +716,11 @@ fn handle_status(session_id: &str, state: &Arc<State>) -> String {
                 JobStatus::Complete => "complete",
                 JobStatus::Failed => "failed",
             };
-            ok(&format!(r#"{{"status":"{status}"}}"#))
+            ok_json(&StatusResponse {
+                status,
+                depth_remaining: job.depth_remaining,
+                live_children: live_children(&jobs, session_id, now_ms()),
+            })
         }
         None => err(404, "Not Found", "session not found"),
     }

@@ -88,6 +88,8 @@ impl RecordingRoost {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             registry_path: registry_path.to_path_buf(),
             spawn_allow: spawn_allow.iter().map(|name| name.to_string()).collect(),
+            max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+            max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 

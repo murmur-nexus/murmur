@@ -149,7 +149,14 @@ fn a_refusal_does_not_say_whether_a_session_exists() {
         "0.1.0",
         Some(
             &foreign_authority
-                .mint_approval_token(CALLER_SESSION, "worker-a", "0.1.0", "d", now_ms() + 60_000)
+                .mint_approval_token(
+                    CALLER_SESSION,
+                    "worker-a",
+                    "0.1.0",
+                    "d",
+                    1,
+                    now_ms() + 60_000,
+                )
                 .unwrap(),
         ),
     );
@@ -164,6 +171,7 @@ fn a_refusal_does_not_say_whether_a_session_exists() {
                     "worker-a",
                     "0.1.0",
                     "d",
+                    1,
                     now_ms() + 60_000,
                 )
                 .unwrap(),
@@ -322,7 +330,14 @@ fn an_approval_past_its_expiry_is_refused() {
         daemon
             .state
             .authority
-            .mint_approval_token(CALLER_SESSION, "worker-a", "0.1.0", &digest, expires_at_ms)
+            .mint_approval_token(
+                CALLER_SESSION,
+                "worker-a",
+                "0.1.0",
+                &digest,
+                1,
+                expires_at_ms,
+            )
             .unwrap()
     };
 
