@@ -32,10 +32,11 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_start` | The session node. Its `event_id` is the task node |
 | `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
-| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
+| `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
+| `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch` | The session node |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
@@ -223,6 +224,44 @@ result as a task
 The command's result is lost. The session does not wait for it, and the same line is announced on
 the process's stderr.
 
+**`shell_lost`** — written once per demoted command a later `mur run --resume` found with no
+`shell_completed` and no `shell_abandoned`, and appended to the `trace.jsonl` of the session that
+started it rather than to the resuming session's own
+
+| Field | Type | Notes |
+|---|---|---|
+| `session_id` | string | The session that started the command, so the line matches the file it is written into |
+| `parent_id` | string | That session's `session_start` node. Absent when that record could not be read back |
+| `work_id` | string | The `shell_detached` line's `work_id` |
+| `binary` | string | As on `shell` |
+| `command` | string | As on `shell` |
+| `detached_at_ms` | u64 | The `shell_detached` line's own timestamp |
+| `reconciled_by_session` | string | The session that found the command unaccounted for and reported it |
+| `reconciled_task_id` | string | The `task_id` of the `completion`-origin task that reported it, whose `task_start` carries `source: "detached_lost"` |
+
+An unmatched `shell_detached` means the session was killed outright: the teardown sweep that
+writes `shell_abandoned` runs on every clean exit. This line carries no `exit_code`, no `status`,
+no `duration_ms`, no `output_path` and no `output_bytes`, because a command whose runtime was
+killed produced none of them — including no `logs/<work_id>.log`, which is written from inside the
+runtime after the command exits. Its presence is also what keeps a second resume of the same
+session from reporting the same work id again.
+
+**`shell_detach_unrecorded`** — written when a command was moved to the background and its own
+`shell_detached` line could not be written
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | |
+| `task_id` | string \| null | The task the command belongs to. `null` when no task is in scope |
+| `work_id` | string | The work id of the command that was moved to the background |
+| `binary` | string | As on `shell` |
+| `reason` | string | The write error, as the operating system reported it |
+
+The demotion stands: the command keeps running and the turn keeps its handle. This record is
+attempted into the file whose write just failed, so it is usually absent and the failure reaches
+stderr instead. Either way the command has no `shell_detached` line, so a later resume finds
+nothing to report about it.
+
 **`compaction`** — written when context compaction fires
 
 | Field | Type | Notes |
@@ -323,7 +362,7 @@ loop has exited, on every exit path
 |---|---|---|
 | `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
 | `context_id` | string | Context UUID for this task |
-| `source` | string | Which door the task came through: `"a2a"` for a task from a peer, `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished |
+| `source` | string | Which door the task came through: `"a2a"` for a task from a peer, `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished, `"detached_lost"` for the report a resume enqueues about demoted commands the session it resumes never accounted for |
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
@@ -332,7 +371,9 @@ loop has exited, on every exit path
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
 `task.md` tasks. A `"detached_shell"` task follows the `shell_completed` line that enqueued it and
-has no `a2a_task_received` line, having never crossed the peer door.
+has no `a2a_task_received` line, having never crossed the peer door. A `"detached_lost"` task
+names every lost work id in one message, and joins to the `shell_lost` lines in the resumed-from
+session's trace through `reconciled_task_id`.
 
 **`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
 for every task, on every exit path

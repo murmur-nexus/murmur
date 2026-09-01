@@ -221,6 +221,32 @@ pub fn stage_agent_session(
     project_dir: &Path,
     manifest_path: &Path,
 ) -> StagedSession {
+    stage_agent_session_inner(home, project_dir, manifest_path, None)
+}
+
+/// `stage_agent_session` for a launch that continues `from_session` under `context_id`, the pair
+/// `mur run --resume` resolves before staging.
+pub fn stage_agent_session_resuming(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    from_session: &str,
+    context_id: &str,
+) -> StagedSession {
+    stage_agent_session_inner(
+        home,
+        project_dir,
+        manifest_path,
+        Some((from_session.to_string(), context_id.to_string())),
+    )
+}
+
+fn stage_agent_session_inner(
+    home: &TempDir,
+    project_dir: &Path,
+    manifest_path: &Path,
+    resume: Option<(String, String)>,
+) -> StagedSession {
     let runtime_manifest = load_runtime_manifest(manifest_path).unwrap();
 
     redirect_home_away_from_the_developers();
@@ -258,8 +284,13 @@ pub fn stage_agent_session(
             inference: runtime_manifest.inference.clone(),
             system_prompt_overridden: false,
             context: runtime_manifest.context.clone(),
-            context_id: None,
-            resume: None,
+            context_id: resume.as_ref().map(|(_, context_id)| context_id.clone()),
+            resume: resume
+                .as_ref()
+                .map(|(from_session, _)| capsule_runtime::ResumeRequest {
+                    from_session: from_session.clone(),
+                    mode: capsule_runtime::ResumeMode::Full,
+                }),
             otel_endpoint: None,
             eval_config_json: None,
             case_id: None,

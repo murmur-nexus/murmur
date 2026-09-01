@@ -45,7 +45,9 @@ use crate::{
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
     delegation::SpawnerHandle,
-    detached::{demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry},
+    detached::{
+        demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry, DetachedReport,
+    },
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1175,6 +1177,9 @@ pub fn launch_session(
             .resume
             .as_ref()
             .map(|resume| resume.from_session.clone());
+        // The same value, read again below by the reconciliation step, which needs the directory
+        // name after `TraceWriter::open` has taken the one above.
+        let reconcile_from_session = trace_resumed_from.clone();
         let trace_context_id = supplied_context_id.clone();
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
@@ -1529,6 +1534,37 @@ pub fn launch_session(
                     // that one finishes.
                     let mut lanes = LaneQueue::new();
 
+                    // Demoted commands the resumed-from session never accounted for. Only a
+                    // resume does this, and it costs one read of a file `--resume` has already
+                    // read; a launch that resumes nothing does no work here at all.
+                    //
+                    // An unmatched `shell_detached` can only mean the teardown sweep below never
+                    // ran, because that sweep writes `shell_abandoned` for everything outstanding
+                    // on every clean exit. The one over-report is a graceful exit whose own
+                    // `write_shell_abandoned` failed, which reads here as unplanned death; for
+                    // accounting that is the right direction to be wrong in.
+                    if let (Some(from_session), Some(sessions_root)) =
+                        (reconcile_from_session.as_deref(), workdir.parent())
+                    {
+                        if let Some(report) =
+                            crate::detached_reconcile::reconcile_prior_session(
+                                sessions_root,
+                                from_session,
+                                &session_id,
+                                &task_context_id(supplied_context_id.as_deref()),
+                            )
+                            .await
+                        {
+                            enqueue_detached_report(
+                                DetachedReport::Lost(report),
+                                &task_registry,
+                                &mut lanes,
+                                &mut trace,
+                            )
+                            .await;
+                        }
+                    }
+
                     // ── LOOP BODY STARTS HERE ──────────────────────────────
                     // Each iteration processes one task. Single/none modes break after
                     // the first iteration; queue+sleep iterates until channel closes.
@@ -1699,8 +1735,8 @@ pub fn launch_session(
                                     // task was running is in its lane before anything is chosen
                                     // — behind everything a person or a peer is waiting for.
                                     while let Ok(completion) = completion_rx.try_recv() {
-                                        enqueue_detached_completion(
-                                            completion,
+                                        enqueue_detached_report(
+                                            DetachedReport::Completed(completion),
                                             &task_registry,
                                             &mut lanes,
                                             &mut trace,
@@ -1734,8 +1770,8 @@ pub fn launch_session(
                                                 }
                                             },
                                             Some(completion) = completion_rx.recv() => {
-                                                enqueue_detached_completion(
-                                                    completion,
+                                                enqueue_detached_report(
+                                                    DetachedReport::Completed(completion),
                                                     &task_registry,
                                                     &mut lanes,
                                                     &mut trace,
@@ -1770,8 +1806,8 @@ pub fn launch_session(
                                             // Filed and reconsidered on the next pass around the
                                             // drain, alongside anything else queued.
                                             Ok(Woke::Completion(completion)) => {
-                                                enqueue_detached_completion(
-                                                    completion,
+                                                enqueue_detached_report(
+                                                    DetachedReport::Completed(completion),
                                                     &task_registry,
                                                     &mut lanes,
                                                     &mut trace,
@@ -5312,50 +5348,71 @@ enum Woke {
     Completion(DetachedCompletion),
 }
 
-/// Turn a finished detached command into a queued `completion`-origin task and record the join
-/// between the two in the trace.
+/// Turn a report about detached work into a queued `completion`-origin task, and record whatever
+/// join the report needs in the trace.
 ///
-/// `can_accept` is deliberately not consulted. A completion is work the capsule already admitted
-/// when it admitted the task that started the command, so refusing it would drop a result the
-/// capsule asked for. The `enqueue` is not optional either: `start_task` asserts a positive
-/// pending count, so a task pushed onto the queue without one would trip that assertion. The
-/// consequence is deliberate — an outstanding completion counts against `queue_depth`, so a
-/// capsule with detached work in flight has less room for new inbound requests.
-async fn enqueue_detached_completion(
-    completion: DetachedCompletion,
+/// `can_accept` is not consulted, on either arm. A completion is work the capsule already
+/// admitted when it admitted the task that started the command, and a loss report is the only
+/// account anything will ever give of that work; refusing either would drop the result this path
+/// exists to deliver. The `enqueue` is not optional either: `start_task` asserts a positive
+/// pending count, so a task pushed onto the queue without one would trip that assertion. An
+/// outstanding report therefore counts against `queue_depth`, and a capsule with detached work in
+/// flight has less room for new inbound requests. A loss report costs exactly one pending item
+/// however many work ids it names, and the drain loop clears it on its first pass.
+async fn enqueue_detached_report(
+    report: DetachedReport,
     task_registry: &Arc<Mutex<TaskRegistry>>,
     lanes: &mut LaneQueue,
     trace: &mut TraceWriter,
 ) {
-    let task = IncomingTask {
-        task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
-        context_id: completion.context_id.clone(),
-        message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
-        message_text: completion.message_text(),
-        provenance: completion.provenance,
-        // Nothing propagated a trace context to a background command: the turn that started it
-        // is over, and inventing a parent span would attribute the completion to it.
-        traceparent: None,
-        source: crate::a2a::SOURCE_DETACHED_SHELL,
-        // A demoted shell command reports on a work id, not on a delegation: no sub-capsule was
-        // launched, so there is no delegation for the trace to join this task to.
-        delegation_id: None,
+    let task = match report {
+        DetachedReport::Completed(completion) => {
+            let task = IncomingTask {
+                task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+                context_id: completion.context_id.clone(),
+                message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+                message_text: completion.message_text(),
+                provenance: completion.provenance,
+                // Nothing propagated a trace context to a background command: the turn that
+                // started it is over, and inventing a parent span would attribute the completion
+                // to it.
+                traceparent: None,
+                source: crate::a2a::SOURCE_DETACHED_SHELL,
+                // A demoted shell command reports on a work id, not on a delegation: no
+                // sub-capsule was launched, so there is no delegation for the trace to join this
+                // task to.
+                delegation_id: None,
+            };
+            let _ = trace
+                .write_shell_completed(
+                    &completion.work_id,
+                    &completion.binary,
+                    &completion.command,
+                    completion.exit_code,
+                    completion.duration_ms,
+                    &completion.output_path,
+                    completion.output_bytes,
+                    completion.resource_limit.clone(),
+                    completion.status(),
+                    &task.task_id,
+                )
+                .await;
+            task
+        }
+        // Nothing is written to this session's trace beyond the `task_start` the loop writes when
+        // it starts the task: the `shell_lost` markers are already in the trace of the session
+        // that started the work, which is the file that has to hold them for the marker to clear.
+        DetachedReport::Lost(report) => IncomingTask {
+            task_id: report.task_id.clone(),
+            context_id: report.context_id.clone(),
+            message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+            message_text: report.message_text(),
+            provenance: report.provenance,
+            traceparent: None,
+            source: crate::a2a::SOURCE_DETACHED_LOST,
+            delegation_id: None,
+        },
     };
-
-    let _ = trace
-        .write_shell_completed(
-            &completion.work_id,
-            &completion.binary,
-            &completion.command,
-            completion.exit_code,
-            completion.duration_ms,
-            &completion.output_path,
-            completion.output_bytes,
-            completion.resource_limit.clone(),
-            completion.status(),
-            &task.task_id,
-        )
-        .await;
 
     task_registry
         .lock()

@@ -383,6 +383,11 @@ pub(crate) const SOURCE_A2A: &str = "a2a";
 /// The `source` of a task the runtime enqueued for itself when a demoted shell command finished.
 pub(crate) const SOURCE_DETACHED_SHELL: &str = "detached_shell";
 
+/// The `source` of a task a resumed launch enqueued for itself to report demoted commands the
+/// session it resumes never accounted for. Distinct from [`SOURCE_DETACHED_SHELL`] because the
+/// two say opposite things: one carries a result, the other says no result exists.
+pub(crate) const SOURCE_DETACHED_LOST: &str = "detached_lost";
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

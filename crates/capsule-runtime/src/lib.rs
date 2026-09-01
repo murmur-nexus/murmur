@@ -15,6 +15,7 @@ pub(crate) mod conversation;
 pub(crate) mod conversation_import;
 pub mod delegation;
 pub mod detached;
+pub(crate) mod detached_reconcile;
 pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;
