@@ -367,9 +367,19 @@ fail-closed rule that governs a policy hook's failures.
 
     The body is the file's own text: variables, interpolations, conditionals and recipe arguments
     are carried as written. It is absent when the call names no recipe, and when the runtime could
-    not resolve one — no recipe file, an unparseable one, a target that is not defined, or a shape
-    the parser does not model. Read an absent body as "the runtime has no body to show", which is
-    a statement about the resolution and not about the call.
+    not resolve one:
+
+    - no recipe file in the workdir, or one that is unreadable, oversized or not UTF-8
+    - a target, recipe or script that is not defined, or one reached through a `make` pattern rule
+      or a `just` alias
+    - a form that could resolve to more than one body: two `make` rules for one target, a duplicate
+      `just` recipe, a `make` recipe written on the rule line as `target: ; cmd`, or an `npm` script
+      with a `pre`/`post` sibling
+    - an invocation carrying flags beyond the recipe file and working-directory selectors, or a
+      `make` variable override such as `make build VERSION=2`
+
+    Read an absent body as "the runtime has no body to show", which is a statement about the
+    resolution and not about the call.
 - `tool-event.input` is the exact tool input JSON the tool will receive, untruncated, and is what
   a policy decides on.
 - `shell-event.outcome` and `tool-event.outcome` carry what the call produced, and are absent at

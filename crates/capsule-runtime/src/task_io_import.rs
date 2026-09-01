@@ -226,7 +226,7 @@ pub(crate) mod test_support {
 
     /// One row per `murmur:hook/lifecycle@0.8.0` function: the WIT name, the WIT type of its
     /// event parameter, and the core-function signature the canonical ABI flattens that type
-    /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 19, both past
+    /// to. `on-inference`'s record flattens to 17 values and `on-shell`'s to 22, both past
     /// the 16-parameter limit, so each is passed indirectly as a single pointer.
     const LIFECYCLE_FNS: &[(&str, &str, &str)] = &[
         ("on-stage", "$stage-event", "i32 i32"),
