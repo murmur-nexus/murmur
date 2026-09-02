@@ -401,7 +401,7 @@ mur doctor
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
-Ahead of the checklist it prints two blocks, neither of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)) and `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of. A tool or driver entry that declares no `capabilities.filesystem.scope` gets the whole accessible workdir; a hook entry that declares none gets no directory at all. See [The filesystem default](../concepts/access-control.md#filesystem-default).
+Ahead of the checklist it prints two blocks, neither of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)) and `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default) for which directory each role gets. An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>` there, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it; the exit code is still the checklist's alone.
 
 **Output — happy path:**
 

@@ -250,6 +250,24 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
         })
 }
 
+/// The entry's declared `capabilities.filesystem.scope`, validated as a relative, non-escaping
+/// path before it is returned.
+///
+/// The one place the declaration is read. Both grant derivations and [`preopen_reports`] go
+/// through it, so a scope that refuses a launch refuses the report that describes one.
+fn declared_filesystem_scope(
+    capabilities: &murmur_artifact::Capabilities,
+) -> Result<Option<String>, RuntimeError> {
+    let scope = capabilities
+        .filesystem
+        .as_ref()
+        .and_then(|filesystem| filesystem.scope.clone());
+    if let Some(scope) = scope.as_deref() {
+        validate_filesystem_scope(scope)?;
+    }
+    Ok(scope)
+}
+
 /// Resolve a validated filesystem `scope` to the directory a guest's preopen should target,
 /// creating it if it does not already exist.
 ///
@@ -338,13 +356,7 @@ impl HookCapabilityGrant {
             None => Vec::new(),
         };
 
-        let filesystem_scope = capabilities
-            .filesystem
-            .as_ref()
-            .and_then(|filesystem| filesystem.scope.clone());
-        if let Some(scope) = filesystem_scope.as_deref() {
-            validate_filesystem_scope(scope)?;
-        }
+        let filesystem_scope = declared_filesystem_scope(capabilities)?;
 
         Ok(Self {
             network_allow_rules,
@@ -496,13 +508,7 @@ impl ToolCapabilityGrant {
             }
         };
 
-        let filesystem_scope = capabilities
-            .filesystem
-            .as_ref()
-            .and_then(|filesystem| filesystem.scope.clone());
-        if let Some(scope) = filesystem_scope.as_deref() {
-            validate_filesystem_scope(scope)?;
-        }
+        let filesystem_scope = declared_filesystem_scope(capabilities)?;
 
         Ok(Self {
             network_allow_rules,
@@ -531,7 +537,7 @@ impl ToolCapabilityGrant {
 /// [`murmur_artifact::ArtifactRuntime::Skill`] produces no entry: a skill is markdown staged into
 /// the workdir, no component is instantiated for it, and it holds no descriptor to report.
 ///
-/// Every declared scope goes through [`validate_filesystem_scope`], so a scope a launch would
+/// Every declared scope is read through [`declared_filesystem_scope`], so a scope a launch would
 /// refuse is refused here too. Nothing is created — [`resolve_scoped_dir`] is the staging path's
 /// job — so this stays usable from a read-only diagnostic.
 pub fn preopen_reports<'a, I>(artifacts: I) -> Result<Vec<PreopenReport>, RuntimeError>
@@ -552,11 +558,9 @@ where
         }
 
         let scope = capabilities
-            .and_then(|capabilities| capabilities.filesystem.as_ref())
-            .and_then(|filesystem| filesystem.scope.clone());
-        if let Some(scope) = scope.as_deref() {
-            validate_filesystem_scope(scope)?;
-        }
+            .map(declared_filesystem_scope)
+            .transpose()?
+            .flatten();
 
         let surface = match (runtime, scope.is_some()) {
             // A declared scope resolves the same way for every role: `build_wasi_ctx` in both
