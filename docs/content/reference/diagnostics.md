@@ -23,6 +23,7 @@ section that explains it.
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
 | `E-CAP-012` | A `capabilities.filesystem.read_only` entry is not a usable workdir subpath | [E-CAP-012](#e-cap-012) |
+| `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -498,6 +499,24 @@ of the read-only list. The check runs at staging, before any registry pull, work
 component instantiation, so no session directory is created and no call is ever checked against a
 rule the runtime could not build. An empty or whitespace-only entry is dropped at manifest parse
 rather than refused. See [Read-only paths](manifest.md#read-only-paths).
+
+### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
+
+`share-file`, `fetch-peer-file` and `delegate-task` are answered by the runtime itself, so an
+artifact cannot be declared under any of them:
+
+```text
+error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task
+  hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see docs/content/reference/runtime-provided-tools.md
+```
+
+The check runs at staging, ahead of every artifact in the manifest, so no artifact is resolved,
+pulled or hash-verified and no session directory is created. `mur run --explain-scope` refuses the
+same manifest by the same code. The same refusal covers an in-session `manage.pull()` of one of
+these names, which the guest receives as an error string.
+
+Shell binary names are not reserved: they come from `capabilities.shell.allow`. See
+[Runtime-provided tools](runtime-provided-tools.md#reserved-names).
 
 ---
 

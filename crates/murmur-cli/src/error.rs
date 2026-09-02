@@ -50,6 +50,7 @@ pub const E_CAP_009: &str = "E-CAP-009"; // capabilities.state.store does not na
 pub const E_CAP_010: &str = "E-CAP-010"; // an artifact entry's config: block cannot be delivered as MURMUR_ARTIFACT_CONFIG
 pub const E_CAP_011: &str = "E-CAP-011"; // context.record_store or --context does not name one conversation record directory
 pub const E_CAP_012: &str = "E-CAP-012"; // capabilities.filesystem.read_only entry is not a usable workdir subpath
+pub const E_CAP_013: &str = "E-CAP-013"; // an artifact claims the name of a tool the runtime provides itself
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -271,6 +272,25 @@ impl From<RuntimeError> for CliError {
             RuntimeError::InvalidReadOnlyPath { path, message } => CliError::new(
                 E_CAP_012,
                 format!("invalid read-only path '{path}': {message}"),
+            ),
+            // Both halves of the reserved-name rule land on one code: an operator seeing either
+            // has the same manifest problem — a name that belongs to the runtime is being used for
+            // something else. The hint names the two remedies rather than the containment ladder,
+            // because no grant makes a colliding name reachable.
+            error @ RuntimeError::ReservedToolName { .. } => CliError::with_hint(
+                E_CAP_013,
+                error.to_string(),
+                "the runtime answers these names itself, so an artifact under one of them would \
+                 be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, \
+                 or drop the dependency if the runtime-provided tool is what you wanted — see \
+                 docs/content/reference/runtime-provided-tools.md",
+            ),
+            error @ RuntimeError::RuntimeProvidedToolNotReserved { .. } => CliError::with_hint(
+                E_CAP_013,
+                error.to_string(),
+                "this is a runtime defect rather than a manifest one: a runtime-provided tool was \
+                 written under a name no artifact is stopped from claiming — see \
+                 docs/content/reference/runtime-provided-tools.md",
             ),
             // One code for every shape rule the config channel enforces, because they are one
             // operator problem — a declared block that cannot be delivered — and the message
