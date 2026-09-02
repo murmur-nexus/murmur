@@ -228,6 +228,40 @@ pub enum RuntimeError {
         workdir: String,
     },
 
+    /// A capsule declares an artifact whose name collides with a tool the runtime provides
+    /// itself.
+    ///
+    /// The three names in [`crate::runtime::RESERVED_TOOL_NAMES`] are answered inside
+    /// `dispatch_agent_tool_unfenced` before any allowlist check is reached, and their synthetic
+    /// manifests are written after the staging loop. An artifact installed under one of them would
+    /// have its manifest overwritten and every call to it answered by the runtime, so the collision
+    /// is refused rather than resolved into a tool the capsule can never reach.
+    #[error(
+        "artifact '{name}' collides with a tool the runtime provides itself; the reserved names \
+         are {}",
+        crate::runtime::RESERVED_TOOL_NAMES.join(", ")
+    )]
+    ReservedToolName {
+        /// The declared artifact name that collides.
+        name: String,
+    },
+
+    /// A synthetic tool manifest was written under a name absent from
+    /// [`crate::runtime::RESERVED_TOOL_NAMES`].
+    ///
+    /// The inverse of [`Self::ReservedToolName`], and the reason a fifth runtime-provided tool
+    /// cannot be added without reserving its name: an unreserved name is claimable by an artifact,
+    /// which would then be installed and silently shadowed at dispatch.
+    #[error(
+        "'{name}' is written as a runtime-provided tool but is not one of {}; add it to \
+         RESERVED_TOOL_NAMES so no artifact can claim the name",
+        crate::runtime::RESERVED_TOOL_NAMES.join(", ")
+    )]
+    RuntimeProvidedToolNotReserved {
+        /// The name the synthetic write was attempted under.
+        name: String,
+    },
+
     /// A capsule declares `exports.peer_files` together with `lifecycle.after_task: sleep`, and
     /// either declared no `max_ttl` or declared one above the persistent ceiling.
     ///

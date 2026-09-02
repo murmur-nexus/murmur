@@ -451,6 +451,16 @@ pub fn stage_session(
     if let Some(context_id) = request.context_id.as_deref() {
         crate::conversation::validate_record_segment("--context", context_id)?;
     }
+    // An artifact may not claim a name the runtime answers itself. Checked here, ahead of the
+    // artifact loop, so the refusal names the collision rather than whatever the registry would
+    // have said about a name nothing can legally publish under: no resolve, no pull and no hash
+    // verification happens for a manifest that declares one.
+    check_no_reserved_tool_names(
+        request
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str()),
+    )?;
     // Resolved here for the same reason `state_stores` above is: a malformed `config:` block
     // refuses the launch before any registry pull, workdir creation or component instantiation,
     // and through the identical function `mur run --explain-scope` calls on the identical inputs.
@@ -4883,11 +4893,89 @@ impl WasiHttpView for ToolStoreState {
     }
 }
 
+/// The tool names the runtime answers itself, and which therefore no artifact may claim.
+///
+/// This is the single definition of the set. Each member is answered inside
+/// `dispatch_agent_tool_unfenced` before any allowlist check is reached, so an artifact installed
+/// under one of these names would be shadowed at dispatch no matter what the allowlist said — and
+/// its `tools/<name>/murmur.yaml` would in any case be overwritten by the synthetic write that
+/// follows the staging loop.
+///
+/// Shell binary names are deliberately absent: they are operator-chosen through
+/// `capabilities.shell.allow`, so there is no fixed set to reserve, and
+/// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 3] =
+    [SHARE_FILE_TOOL, FETCH_PEER_FILE_TOOL, DELEGATE_TASK_TOOL];
+
+/// Whether `name` is answered by the runtime itself rather than by an artifact.
+///
+/// Matched exactly rather than case-insensitively: artifact names are case-sensitive everywhere
+/// else in this codebase, so a name differing only in case is a different artifact.
+#[must_use]
+pub(crate) fn is_reserved_tool_name(name: &str) -> bool {
+    RESERVED_TOOL_NAMES.contains(&name)
+}
+
+/// Refuses the first declared artifact name that collides with a runtime-provided tool.
+///
+/// Called from `stage_session` ahead of the artifact loop, and from `mur run` ahead of its
+/// installed-artifact pre-flight, so the operator is told about the collision rather than about a
+/// missing artifact they were never going to be allowed to install under that name.
+pub fn check_no_reserved_tool_names<'a, I>(names: I) -> Result<(), RuntimeError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for name in names {
+        if is_reserved_tool_name(name) {
+            return Err(RuntimeError::ReservedToolName {
+                name: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Write a single artifact's `murmur.yaml` under `<workdir>/tools/<name>/`.
 ///
 /// Used both by `stage_session` (for every artifact declared in the manifest) and by
-/// `manage.pull()` (for the single artifact it just fetched at runtime).
+/// `manage.pull()` (for the single artifact it just fetched at runtime). It is the only function
+/// that writes an *artifact's* tool manifest, which is why the reserved-name guard sits here: the
+/// pull path has no staging check ahead of it, and a capsule that pulled `delegate-task` at
+/// runtime would otherwise overwrite the synthetic manifest and lose every call to the
+/// interception in `dispatch_agent_tool_unfenced`.
 fn write_tool_manifest(
+    workdir: &Path,
+    name: &str,
+    manifest_yaml: &str,
+) -> Result<(), RuntimeError> {
+    if is_reserved_tool_name(name) {
+        return Err(RuntimeError::ReservedToolName {
+            name: name.to_string(),
+        });
+    }
+    write_tool_manifest_unchecked(workdir, name, manifest_yaml)
+}
+
+/// Write one runtime-provided tool's synthetic `murmur.yaml`, carrying the inverse guard.
+///
+/// A name absent from [`RESERVED_TOOL_NAMES`] is refused, so a fifth runtime-provided tool routed
+/// through here without being added to the list fails loudly instead of shipping shadowable by an
+/// artifact of the same name.
+fn write_runtime_provided_tool_manifest(
+    workdir: &Path,
+    name: &str,
+    manifest_yaml: &str,
+) -> Result<(), RuntimeError> {
+    if !is_reserved_tool_name(name) {
+        return Err(RuntimeError::RuntimeProvidedToolNotReserved {
+            name: name.to_string(),
+        });
+    }
+    write_tool_manifest_unchecked(workdir, name, manifest_yaml)
+}
+
+/// The write both guarded entry points share, once their opposite name checks have passed.
+fn write_tool_manifest_unchecked(
     workdir: &Path,
     name: &str,
     manifest_yaml: &str,
@@ -5066,10 +5154,14 @@ fn write_peer_handoff_tool_manifests(
     can_fetch: bool,
 ) -> Result<(), RuntimeError> {
     if can_mint {
-        write_tool_manifest(workdir, SHARE_FILE_TOOL, SHARE_FILE_TOOL_MANIFEST)?;
+        write_runtime_provided_tool_manifest(workdir, SHARE_FILE_TOOL, SHARE_FILE_TOOL_MANIFEST)?;
     }
     if can_fetch {
-        write_tool_manifest(workdir, FETCH_PEER_FILE_TOOL, FETCH_PEER_FILE_TOOL_MANIFEST)?;
+        write_runtime_provided_tool_manifest(
+            workdir,
+            FETCH_PEER_FILE_TOOL,
+            FETCH_PEER_FILE_TOOL_MANIFEST,
+        )?;
     }
     Ok(())
 }
@@ -5125,7 +5217,7 @@ fn write_delegate_task_tool_manifest(
     if spawn_allow.is_empty() {
         return Ok(());
     }
-    write_tool_manifest(
+    write_runtime_provided_tool_manifest(
         workdir,
         DELEGATE_TASK_TOOL,
         &delegate_task_tool_manifest(spawn_allow),
@@ -5901,6 +5993,114 @@ mod tests {
             .join("delegate-task")
             .join(PACKED_MANIFEST_ENTRY)
             .exists());
+    }
+
+    // ── reserved tool names ──────────────────────────────────────────────────
+
+    /// The list is what every runtime-provided writer is routed through, so a fifth synthetic
+    /// tool added without extending it has to fail here rather than ship shadowed by an artifact
+    /// of the same name. The arity assertion is the part that catches that.
+    #[test]
+    fn the_reserved_set_covers_every_runtime_provided_tool() {
+        assert_eq!(
+            super::RESERVED_TOOL_NAMES.len(),
+            3,
+            "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
+             raised, before its writer can succeed"
+        );
+        for name in [
+            super::SHARE_FILE_TOOL,
+            super::FETCH_PEER_FILE_TOOL,
+            super::DELEGATE_TASK_TOOL,
+        ] {
+            assert!(
+                super::is_reserved_tool_name(name),
+                "'{name}' is answered by the runtime and must be reserved"
+            );
+        }
+        // Operator-chosen shell binary names are deliberately not members.
+        assert!(!super::is_reserved_tool_name("bash"));
+        // Case-sensitive, because artifact names are.
+        assert!(!super::is_reserved_tool_name("Delegate-Task"));
+    }
+
+    /// The funnel guard on the artifact side. `manage.pull()` writes through this function with no
+    /// staging check ahead of it, so a capsule that pulls `delegate-task` mid-session must be
+    /// refused here — and must leave the synthetic manifest untouched.
+    #[test]
+    fn an_artifact_manifest_write_refuses_a_reserved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        super::write_delegate_task_tool_manifest(dir.path(), &["worker".to_string()]).unwrap();
+        let synthetic = dir
+            .path()
+            .join("tools")
+            .join(super::DELEGATE_TASK_TOOL)
+            .join(PACKED_MANIFEST_ENTRY);
+        let before = std::fs::read_to_string(&synthetic).unwrap();
+
+        for name in super::RESERVED_TOOL_NAMES {
+            let error = super::write_tool_manifest(dir.path(), name, "name: impostor\n")
+                .expect_err("a reserved name must not be written as an artifact manifest");
+            assert!(
+                matches!(error, RuntimeError::ReservedToolName { .. }),
+                "got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(name),
+                "the refusal names the collision: {error}"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(&synthetic).unwrap(),
+            before,
+            "the synthetic manifest survives the refused write byte for byte"
+        );
+        assert!(
+            !dir.path()
+                .join("tools")
+                .join(super::SHARE_FILE_TOOL)
+                .exists(),
+            "a refused write creates no directory"
+        );
+    }
+
+    /// The inverse guard on the synthetic side.
+    #[test]
+    fn a_runtime_provided_write_refuses_an_unreserved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            super::write_runtime_provided_tool_manifest(dir.path(), "summon-task", "name: x\n")
+                .expect_err("an unreserved name must not be written as a runtime-provided tool");
+        assert!(
+            matches!(error, RuntimeError::RuntimeProvidedToolNotReserved { .. }),
+            "got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("RESERVED_TOOL_NAMES"),
+            "the refusal says where to add the name: {error}"
+        );
+        assert!(!dir.path().join("tools").exists(), "and writes no file");
+    }
+
+    /// The operator-facing half: every reserved name is refused as an artifact, and the message
+    /// carries the whole set so the operator sees what else is off-limits.
+    #[test]
+    fn a_declared_artifact_under_a_reserved_name_is_refused() {
+        for name in super::RESERVED_TOOL_NAMES {
+            let error = super::check_no_reserved_tool_names([name, "corpus"])
+                .expect_err("a reserved name must be refused as an artifact name");
+            let rendered = error.to_string();
+            assert!(rendered.contains(name), "{rendered}");
+            for reserved in super::RESERVED_TOOL_NAMES {
+                assert!(
+                    rendered.contains(reserved),
+                    "the refusal lists the whole reserved set: {rendered}"
+                );
+            }
+        }
+        super::check_no_reserved_tool_names(["corpus", "bash", "share_file"])
+            .expect("a capsule with no collision is untouched");
     }
 
     // ── task-start-event.context-window ──────────────────────────────────────

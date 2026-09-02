@@ -295,6 +295,18 @@ pub(crate) fn run_run(
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    // The same set, and the same checker, `stage_session` consults — called here only because the
+    // installed-artifact pre-flight below would otherwise report a colliding name as a missing
+    // artifact, sending the operator to `mur install` for something no registry may serve. Placed
+    // ahead of `--explain-scope` too, so the diagnostic refuses exactly what a real run refuses.
+    capsule_runtime::check_no_reserved_tool_names(
+        runtime_manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str()),
+    )
+    .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+
     // The containment floor is the strongest class any of the three sources asked for. This is
     // the only reason `mur run` reads a MurConfig at all — no other run behavior is configurable
     // from the workspace files.
