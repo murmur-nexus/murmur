@@ -327,6 +327,7 @@ Containment
 Effective grants
   filesystem scope: <none>
   workdir exec:     false
+  read_only: <none>
   network allow: <none>
   unix sockets:     false
   shell allow:
@@ -355,6 +356,7 @@ Containment
 Effective grants
   filesystem scope: <none>
   workdir exec:     true
+  read_only: <none>
   network allow: <none>
   unix sockets:     false
   shell allow:

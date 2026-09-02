@@ -7,6 +7,7 @@ use url::Url;
 use crate::{
     manifest_path::MANIFEST_FILENAME,
     trace_capture::{resolve_trace_capture, TraceCapture},
+    unknown_manifest_keys::{nearest_known_key, UnknownManifestKey},
 };
 
 // ── Lifecycle types ───────────────────────────────────────────────────────────
@@ -528,6 +529,16 @@ pub struct RuntimeManifest {
     /// and by `mur run` to warn on version mismatch.
     /// If absent, the running mur binary's version is used.
     pub mur_version: Option<String>,
+    /// Every key the manifest declared that this build does not recognize, captured by each
+    /// `Raw*` block's `#[serde(flatten)]` overflow map instead of dropped.
+    ///
+    /// Ordered by the walk rather than by the manifest's own line order: a containing block's own
+    /// keys precede the blocks nested inside it, and one block's keys are alphabetical.
+    ///
+    /// Empty for a manifest written entirely in keys this build knows. Never a reason to refuse a
+    /// manifest — it is reported as `W-SEC-019` by
+    /// [`crate::unknown_manifest_keys::warn_on_unknown_manifest_keys`] and nothing else reads it.
+    pub unknown_keys: Vec<UnknownManifestKey>,
 }
 
 impl RuntimeManifest {
@@ -1416,6 +1427,8 @@ struct RawRuntimeManifest {
     /// the unrecognized top-level keys this manifest silently ignores.
     #[serde(default, deserialize_with = "deserialize_present")]
     config: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1424,6 +1437,8 @@ struct RawExports {
     files: Option<RawFileExport>,
     #[serde(default)]
     peer_files: Option<RawPeerFilesExport>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1437,6 +1452,8 @@ struct RawPeerFilesExport {
     max_ttl: Option<serde_yaml::Value>,
     #[serde(default)]
     max_bytes: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1451,6 +1468,8 @@ struct RawFileExport {
     /// error naming a line number.
     #[serde(default)]
     max_bytes: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1469,11 +1488,15 @@ struct RawLifecycleConfig {
     max_task_reopens: Option<u32>,
     #[serde(default)]
     shell_grace_secs: Option<u64>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawNetworkConfig {
     internal_port: Option<u16>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1493,6 +1516,8 @@ struct RawContextConfig {
     /// as an invalid `context.retain` rather than as a serde message about a struct field.
     #[serde(default, deserialize_with = "present_yaml_value")]
     retain: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1501,6 +1526,8 @@ struct RawObservabilityConfig {
     otel_endpoint: Option<String>,
     #[serde(default)]
     eval: Option<RawEvalConfig>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1517,6 +1544,8 @@ struct RawTraceConfig {
     /// Untyped for the same reason as `context.retain` — see [`RawContextConfig::retain`].
     #[serde(default, deserialize_with = "present_yaml_value")]
     retain: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1525,6 +1554,8 @@ struct RawEvalConfig {
     dataset_id: Option<String>,
     #[serde(default)]
     scorers: Vec<RawScorerConfig>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1534,6 +1565,8 @@ struct RawScorerConfig {
     name: Option<String>,
     max: Option<u64>,
     expected: Option<Vec<String>>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1557,6 +1590,8 @@ struct RawArtifact {
     /// while an empty declaration is a written statement that carries nothing and is refused.
     #[serde(default, deserialize_with = "deserialize_present")]
     config: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 /// Deserialize a present key into `Some(value)` even when its value is YAML null, leaving `None`
@@ -1601,6 +1636,8 @@ struct RawCapabilities {
     /// "unknown variant" error attributed to the whole `capabilities:` block.
     #[serde(default)]
     containment: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1609,6 +1646,8 @@ struct RawTaskIoCapabilities {
     // is rejected outright rather than defaulted, because a capability is never inferred.
     #[serde(default)]
     read: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1617,18 +1656,24 @@ struct RawConversationCapabilities {
     // than defaulted.
     #[serde(default)]
     read: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawSpawnCapabilities {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawEnvCapabilities {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1641,12 +1686,16 @@ struct RawResourceLimits {
     instances: Option<usize>,
     #[serde(default)]
     deadline_seconds: Option<u64>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawStateCapabilities {
     #[serde(default)]
     store: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1671,6 +1720,8 @@ struct RawResourceCapabilities {
     cgroup_io_bytes_per_sec: Option<u64>,
     #[serde(default)]
     workdir_max_bytes: Option<u64>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1679,12 +1730,16 @@ struct RawNetworkCapabilities {
     allow: Vec<String>,
     #[serde(default)]
     unix_sockets: bool,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawPeerFetchCapabilities {
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1700,6 +1755,8 @@ struct RawFilesystemCapabilities {
     /// same declaration — nothing is protected.
     #[serde(default)]
     read_only: Vec<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1714,6 +1771,8 @@ struct RawShellCapabilities {
     interpreter_runtime: Vec<RawInterpreterRuntimeGrant>,
     #[serde(default)]
     staged_runtime: Vec<RawStagedRuntimeGrant>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1722,6 +1781,8 @@ struct RawInterpreterRuntimeGrant {
     binary: Option<String>,
     #[serde(default)]
     dirs: Vec<RawInterpreterRuntimeDir>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1733,6 +1794,8 @@ struct RawInterpreterRuntimeDir {
     // inferred.
     #[serde(default)]
     list_dir: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1746,6 +1809,8 @@ struct RawStagedRuntimeGrant {
     // "unpinned" — the one thing this field exists to make impossible.
     #[serde(default)]
     pin: Option<String>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1777,6 +1842,8 @@ struct RawInferenceConfig {
     max_task_reopens: Option<u32>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1786,6 +1853,8 @@ struct RawCompactionConfig {
     system_prompt: Option<String>,
     system_prompt_file: Option<String>,
     dump_summaries: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1793,6 +1862,477 @@ struct RawInferenceDriver {
     artifact: Option<String>,
     #[serde(default)]
     config: Option<serde_yaml::Value>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+/// The keys one `Raw*` block carried that no field of it claims.
+///
+/// A `BTreeMap` so the capture order is the manifest's key order sorted, which keeps the
+/// `W-SEC-019` lines for one manifest identical on every run. The values are discarded: a key this
+/// build does not recognize is reported by name and by containing block, and printing whatever an
+/// operator wrote under it would put manifest contents into a diagnostic that has no use for them.
+type UnknownKeys = std::collections::BTreeMap<String, serde::de::IgnoredAny>;
+
+/// A `Raw*` deserialization block that captures the keys this build does not recognize.
+///
+/// Implemented for every `Raw*` struct in this file, which is asserted structurally by
+/// `every_raw_struct_captures_unknown_keys` rather than left to review: a manifest key added
+/// without its block learning about it is exactly the defect `W-SEC-019` exists to report.
+trait RawBlock {
+    /// Every key serde accepts on this block, in declaration order and under the name serde
+    /// matches (so a `#[serde(rename)]` field appears under its renamed spelling). This is the
+    /// candidate set [`crate::unknown_manifest_keys::nearest_known_key`] suggests from.
+    const KNOWN_KEYS: &'static [&'static str];
+
+    fn unknown_keys(&self) -> &UnknownKeys;
+}
+
+impl RawBlock for RawRuntimeManifest {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "name",
+        "version",
+        "artifacts",
+        "capabilities",
+        "inference",
+        "context",
+        "observability",
+        "trace",
+        "network",
+        "lifecycle",
+        "exports",
+        "mur_version",
+        "config",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawExports {
+    const KNOWN_KEYS: &'static [&'static str] = &["files", "peer_files"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawPeerFilesExport {
+    const KNOWN_KEYS: &'static [&'static str] = &["root", "max_ttl", "max_bytes"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawFileExport {
+    const KNOWN_KEYS: &'static [&'static str] = &["root", "mode", "max_bytes"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawLifecycleConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "task_acceptance",
+        "after_task",
+        "queue_depth",
+        "input_timeout_secs",
+        "conversation",
+        "max_task_reopens",
+        "shell_grace_secs",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawNetworkConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["internal_port"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawContextConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "max_tokens",
+        "record",
+        "record_store",
+        "seed_budget",
+        "seed_overflow_margin",
+        "retain",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawObservabilityConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["otel_endpoint", "eval"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawTraceConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["capture", "include_tool_output", "retain"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawEvalConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["dataset_id", "scorers"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawScorerConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &["type", "name", "max", "expected"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawArtifact {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "name",
+        "version",
+        "runtime",
+        "source",
+        "local_source",
+        "prompt_payload",
+        "capabilities",
+        "on_overflow",
+        "config",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "network",
+        "peer_fetch",
+        "filesystem",
+        "shell",
+        "spawn",
+        "env",
+        "limits",
+        "resources",
+        "state",
+        "task_io",
+        "conversation",
+        "containment",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawTaskIoCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["read"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawConversationCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["read"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawSpawnCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["allow"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawEnvCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["allow"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawResourceLimits {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "memory_bytes",
+        "table_elements",
+        "instances",
+        "deadline_seconds",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawStateCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["store"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawResourceCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "max_processes",
+        "max_open_files",
+        "max_file_size_bytes",
+        "cpu_seconds",
+        "memory_bytes",
+        "cgroup_memory_bytes",
+        "cgroup_pids_max",
+        "cgroup_cpu_percent",
+        "cgroup_io_bytes_per_sec",
+        "workdir_max_bytes",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawNetworkCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["allow", "unix_sockets"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawPeerFetchCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["allow"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawFilesystemCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["scope", "workdir_exec", "read_only"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawShellCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "allow",
+        "strip_env",
+        "baseline_env",
+        "interpreter_runtime",
+        "staged_runtime",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawInterpreterRuntimeGrant {
+    const KNOWN_KEYS: &'static [&'static str] = &["binary", "dirs"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawInterpreterRuntimeDir {
+    const KNOWN_KEYS: &'static [&'static str] = &["path", "list_dir"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawStagedRuntimeGrant {
+    const KNOWN_KEYS: &'static [&'static str] = &["binary", "source_path", "pin"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawInferenceConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "transport",
+        "endpoint",
+        "model",
+        "api_key",
+        "command",
+        "system_prompt",
+        "system_prompt_file",
+        "system_prompt_artifact",
+        "driver",
+        "provider",
+        "compaction",
+        "max_turns",
+        "max_task_reopens",
+        "max_tokens",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawCompactionConfig {
+    const KNOWN_KEYS: &'static [&'static str] = &[
+        "threshold",
+        "model",
+        "system_prompt",
+        "system_prompt_file",
+        "dump_summaries",
+    ];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawInferenceDriver {
+    const KNOWN_KEYS: &'static [&'static str] = &["artifact", "config"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+/// Walks a parsed raw manifest and reports every key no block of it claimed, deepest path first
+/// within each block, in the order the blocks appear in the manifest's own type.
+///
+/// Called once, immediately after `serde_yaml` returns and before any field is moved out, so the
+/// result covers the whole document rather than the parts validation happens to reach. Reporting
+/// only; nothing here can refuse a manifest.
+fn collect_unknown_keys(raw: &RawRuntimeManifest) -> Vec<UnknownManifestKey> {
+    let mut out = Vec::new();
+    collect_block(raw, "", &mut out);
+
+    for (index, artifact) in raw.artifacts.iter().enumerate() {
+        let path = format!("artifacts[{index}]");
+        collect_block(artifact, &path, &mut out);
+        if let Some(capabilities) = &artifact.capabilities {
+            collect_capabilities(capabilities, &format!("{path}.capabilities"), &mut out);
+        }
+    }
+
+    if let Some(capabilities) = &raw.capabilities {
+        collect_capabilities(capabilities, "capabilities", &mut out);
+    }
+
+    if let Some(inference) = &raw.inference {
+        collect_block(inference, "inference", &mut out);
+        if let Some(driver) = &inference.driver {
+            collect_block(driver, "inference.driver", &mut out);
+        }
+        if let Some(provider) = &inference.provider {
+            collect_block(provider, "inference.provider", &mut out);
+        }
+        if let Some(compaction) = &inference.compaction {
+            collect_block(compaction, "inference.compaction", &mut out);
+        }
+    }
+
+    if let Some(context) = &raw.context {
+        collect_block(context, "context", &mut out);
+    }
+
+    if let Some(observability) = &raw.observability {
+        collect_block(observability, "observability", &mut out);
+        if let Some(eval) = &observability.eval {
+            collect_block(eval, "observability.eval", &mut out);
+            for (index, scorer) in eval.scorers.iter().enumerate() {
+                collect_block(
+                    scorer,
+                    &format!("observability.eval.scorers[{index}]"),
+                    &mut out,
+                );
+            }
+        }
+    }
+
+    if let Some(trace) = &raw.trace {
+        collect_block(trace, "trace", &mut out);
+    }
+
+    if let Some(network) = &raw.network {
+        collect_block(network, "network", &mut out);
+    }
+
+    if let Some(lifecycle) = &raw.lifecycle {
+        collect_block(lifecycle, "lifecycle", &mut out);
+    }
+
+    if let Some(exports) = &raw.exports {
+        collect_block(exports, "exports", &mut out);
+        if let Some(files) = &exports.files {
+            collect_block(files, "exports.files", &mut out);
+        }
+        if let Some(peer_files) = &exports.peer_files {
+            collect_block(peer_files, "exports.peer_files", &mut out);
+        }
+    }
+
+    out
+}
+
+/// The capability sub-blocks, walked from one function so the capsule-wide block and a
+/// per-artifact one report through identical code and differ only in the path they are handed —
+/// `capabilities.shell` against `artifacts[0].capabilities.shell`.
+fn collect_capabilities(raw: &RawCapabilities, path: &str, out: &mut Vec<UnknownManifestKey>) {
+    collect_block(raw, path, out);
+    if let Some(network) = &raw.network {
+        collect_block(network, &format!("{path}.network"), out);
+    }
+    if let Some(peer_fetch) = &raw.peer_fetch {
+        collect_block(peer_fetch, &format!("{path}.peer_fetch"), out);
+    }
+    if let Some(filesystem) = &raw.filesystem {
+        collect_block(filesystem, &format!("{path}.filesystem"), out);
+    }
+    if let Some(shell) = &raw.shell {
+        collect_block(shell, &format!("{path}.shell"), out);
+        for (index, grant) in shell.interpreter_runtime.iter().enumerate() {
+            let grant_path = format!("{path}.shell.interpreter_runtime[{index}]");
+            collect_block(grant, &grant_path, out);
+            for (dir_index, dir) in grant.dirs.iter().enumerate() {
+                collect_block(dir, &format!("{grant_path}.dirs[{dir_index}]"), out);
+            }
+        }
+        for (index, grant) in shell.staged_runtime.iter().enumerate() {
+            collect_block(grant, &format!("{path}.shell.staged_runtime[{index}]"), out);
+        }
+    }
+    if let Some(spawn) = &raw.spawn {
+        collect_block(spawn, &format!("{path}.spawn"), out);
+    }
+    if let Some(env) = &raw.env {
+        collect_block(env, &format!("{path}.env"), out);
+    }
+    if let Some(limits) = &raw.limits {
+        collect_block(limits, &format!("{path}.limits"), out);
+    }
+    if let Some(resources) = &raw.resources {
+        collect_block(resources, &format!("{path}.resources"), out);
+    }
+    if let Some(state) = &raw.state {
+        collect_block(state, &format!("{path}.state"), out);
+    }
+    if let Some(task_io) = &raw.task_io {
+        collect_block(task_io, &format!("{path}.task_io"), out);
+    }
+    if let Some(conversation) = &raw.conversation {
+        collect_block(conversation, &format!("{path}.conversation"), out);
+    }
+}
+
+/// One block's captured keys, each paired with the nearest key that block does recognize.
+///
+/// `path` is empty for the manifest root, which is what
+/// [`crate::unknown_manifest_keys::UnknownManifestKey`] renders as "at the top level".
+fn collect_block<T: RawBlock>(block: &T, path: &str, out: &mut Vec<UnknownManifestKey>) {
+    for key in block.unknown_keys().keys() {
+        out.push(UnknownManifestKey {
+            key: key.clone(),
+            block_path: path.to_string(),
+            nearest_known: nearest_known_key(key, T::KNOWN_KEYS),
+        });
+    }
 }
 
 #[must_use = "validated runtime manifest is required before run"]
@@ -1828,6 +2368,10 @@ impl RuntimeManifest {
                 ))
             }
         })?;
+
+        // Collected before any field is moved out of `raw`, so the walk sees the whole document
+        // rather than the part validation happens to reach before its first refusal.
+        let unknown_keys = collect_unknown_keys(&raw);
 
         let name = raw.name.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
             RuntimeManifestError::MissingField {
@@ -2150,6 +2694,7 @@ impl RuntimeManifest {
             lifecycle,
             exports,
             mur_version: raw.mur_version.filter(|s| !s.trim().is_empty()),
+            unknown_keys,
         })
     }
 }
@@ -8225,5 +8770,255 @@ capabilities:
             exports_manifest("exports:\n  files:\n    root: ./out\n    mode: read-only\n")
                 .expect("./out is a legal root");
         assert_eq!(manifest.exports.unwrap().files.unwrap().root, "./out");
+    }
+
+    // ── Unrecognized manifest keys (W-SEC-019) ────────────────────────────────
+
+    fn unknown_keys_of(yaml: &str) -> Vec<(String, String, Option<String>)> {
+        RuntimeManifest::from_yaml_str(yaml)
+            .expect("fixture must parse")
+            .unknown_keys
+            .into_iter()
+            .map(|key| (key.key, key.block_path, key.nearest_known))
+            .collect()
+    }
+
+    /// The typo the whole warning exists for: a hyphen where the key takes an underscore, named
+    /// with the block that held it and with the key it should have been.
+    #[test]
+    fn a_typo_in_a_capability_block_is_captured_with_its_path_and_suggestion() {
+        assert_eq!(
+            unknown_keys_of(
+                "name: cap\nversion: 0.1.0\ncapabilities:\n  filesystem:\n    read-only:\n      - tests\n"
+            ),
+            vec![(
+                "read-only".to_string(),
+                "capabilities.filesystem".to_string(),
+                Some("read_only".to_string())
+            )]
+        );
+    }
+
+    /// A manifest exercising every layer the walk descends through — capsule-wide capabilities,
+    /// a per-artifact block, shell, network and an artifact entry — reports nothing. A warning
+    /// that fires on correct input is noise, and noise is ignored.
+    #[test]
+    fn a_manifest_of_recognized_keys_reports_nothing() {
+        assert!(unknown_keys_of(
+            r#"
+name: cap
+version: 0.1.0
+mur_version: "0.2.0"
+artifacts:
+  - name: notes-tool
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      filesystem:
+        scope: notes
+      network:
+        allow:
+          - example.com:443
+capabilities:
+  filesystem:
+    read_only:
+      - tests
+      - bench/fixtures
+    workdir_exec: false
+  shell:
+    allow:
+      - git
+      - python3
+  network:
+    allow:
+      - example.com:443
+    unix_sockets: false
+"#
+        )
+        .is_empty());
+    }
+
+    /// A per-artifact capability block reports under its artifact's index, so an operator is not
+    /// sent to the capsule-wide block for a key they wrote on one entry.
+    #[test]
+    fn a_per_artifact_capability_block_carries_its_index_in_the_path() {
+        assert_eq!(
+            unknown_keys_of(
+                "name: cap\nversion: 0.1.0\nartifacts:\n  - name: t\n    version: 0.1.0\n    \
+                 runtime: tool\n    capabilities:\n      shell:\n        allow:\n          - git\n        \
+                 allwo:\n          - git\n"
+            ),
+            vec![(
+                "allwo".to_string(),
+                "artifacts[0].capabilities.shell".to_string(),
+                Some("allow".to_string())
+            )]
+        );
+    }
+
+    /// A top-level key with no near neighbour reports an empty path and no suggestion — the two
+    /// facts the emitter needs to word it as a possibly-newer key rather than a misspelling.
+    #[test]
+    fn an_unrelated_top_level_key_has_an_empty_path_and_no_suggestion() {
+        assert_eq!(
+            unknown_keys_of("name: cap\nversion: 0.1.0\nquantum_teleport: true\n"),
+            vec![("quantum_teleport".to_string(), String::new(), None)]
+        );
+    }
+
+    /// The overflow map captures the key without consuming the block: the rest of it still parses
+    /// and still applies. A capsule with an unrecognized key launches.
+    #[test]
+    fn capturing_a_key_does_not_disturb_the_rest_of_its_block() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.1.0\ncapabilities:\n  filesystem:\n    scope: notes\n    \
+             read-only:\n      - tests\n",
+        )
+        .expect("an unrecognized key never refuses a manifest");
+        assert_eq!(
+            manifest
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.filesystem.as_ref())
+                .and_then(|fs| fs.scope.as_deref()),
+            Some("notes")
+        );
+        assert_eq!(manifest.unknown_keys.len(), 1);
+    }
+
+    /// Every block on the way down is walked, not just the capability sub-blocks.
+    #[test]
+    fn nested_blocks_outside_capabilities_are_walked_too() {
+        let keys = unknown_keys_of(
+            "name: cap\nversion: 0.1.0\ncontext:\n  max_tokns: 100\nexports:\n  files:\n    \
+             root: out\n    mode: read-only\n    max_byts: 10\n",
+        );
+        assert_eq!(
+            keys,
+            vec![
+                (
+                    "max_tokns".to_string(),
+                    "context".to_string(),
+                    Some("max_tokens".to_string())
+                ),
+                (
+                    "max_byts".to_string(),
+                    "exports.files".to_string(),
+                    Some("max_bytes".to_string())
+                ),
+            ]
+        );
+    }
+
+    /// Source-derived, so a `Raw*` struct added later cannot skip the overflow map, and a field
+    /// added to one cannot skip its `KNOWN_KEYS`: the suggester would then never propose it.
+    ///
+    /// Reads this file's own text rather than a hand-written list for the same reason the
+    /// `CapabilityPolicy` coverage test in `capsule-runtime` does — a list maintained by hand
+    /// records what someone remembered, not what the code says.
+    #[test]
+    fn every_raw_struct_captures_unknown_keys_and_declares_its_own_field_names() {
+        let source = include_str!("runtime_manifest.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut checked = 0usize;
+        for (start, line) in lines.iter().enumerate() {
+            let Some(name) = line
+                .strip_prefix("struct Raw")
+                .and_then(|rest| rest.strip_suffix(" {"))
+            else {
+                continue;
+            };
+            let name = format!("Raw{name}");
+            let end = (start + 1..lines.len())
+                .find(|index| lines[*index] == "}")
+                .unwrap_or_else(|| panic!("{name} has no closing brace at column 0"));
+            let body = &lines[start + 1..end];
+
+            assert!(
+                body.contains(&"    #[serde(flatten)]")
+                    && body.contains(&"    unknown: UnknownKeys,"),
+                "{name} does not carry the `#[serde(flatten)] unknown: UnknownKeys` overflow map, \
+                 so a key it does not recognize would be dropped instead of reported"
+            );
+
+            let declared = serde_field_names(body);
+            let known = known_keys_of(source, &name);
+            assert_eq!(
+                declared, known,
+                "{name}'s KNOWN_KEYS does not match its serde field names; the W-SEC-019 \
+                 suggester would propose the wrong set for that block"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 30,
+            "expected every Raw* struct to be scanned, found only {checked}"
+        );
+    }
+
+    /// The names serde matches on for one struct body: field names in declaration order, with a
+    /// `#[serde(rename = "...")]` field under its renamed spelling, and the overflow map itself
+    /// excluded because it claims no name of its own.
+    fn serde_field_names(body: &[&str]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut rename: Option<String> = None;
+        for line in body {
+            let trimmed = line.trim();
+            if trimmed.starts_with("#[") {
+                if let Some(rest) = trimmed.split("rename = \"").nth(1) {
+                    if !trimmed.contains("rename_all") {
+                        rename = rest.split('"').next().map(str::to_string);
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let Some(field) = line
+                .strip_prefix("    ")
+                .and_then(|rest| rest.split(':').next())
+            else {
+                continue;
+            };
+            if field.is_empty()
+                || !field
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            {
+                continue;
+            }
+            if field == "unknown" {
+                rename = None;
+                continue;
+            }
+            names.push(rename.take().unwrap_or_else(|| field.to_string()));
+        }
+        names
+    }
+
+    /// The `KNOWN_KEYS` array `impl RawBlock for <name>` declares, read out of the source text so
+    /// the assertion compares two independent readings of the same file rather than one value
+    /// against itself.
+    fn known_keys_of(source: &str, name: &str) -> Vec<String> {
+        let header = format!("impl RawBlock for {name} {{");
+        let body = source
+            .split_once(&header)
+            .unwrap_or_else(|| panic!("{name} has no `impl RawBlock` block"))
+            .1;
+        let array = body
+            .split_once("KNOWN_KEYS: &'static [&'static str] = &[")
+            .unwrap_or_else(|| panic!("{name}'s RawBlock impl declares no KNOWN_KEYS"))
+            .1
+            .split_once("];")
+            .expect("KNOWN_KEYS array is unterminated")
+            .0;
+        array
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
     }
 }

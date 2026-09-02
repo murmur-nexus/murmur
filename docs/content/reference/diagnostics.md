@@ -95,6 +95,7 @@ section that explains it.
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
 | `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
+| `W-SEC-019` | A key in `murmur.yaml` this build does not recognize was parsed and ignored | [W-SEC-019](#w-sec-019) |
 
 ---
 
@@ -772,7 +773,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-018` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1370,3 +1371,53 @@ the key-name rules.
 string property whose value is a file the tool writes, `"format": "murmur-opaque"` on each object
 or array it only stores. The warning is the tool author's to answer, not the operator's: a capsule
 cannot annotate a tool it installs. See [Read-only paths](manifest.md#read-only-paths).
+
+### W-SEC-019 — an unrecognized key in `murmur.yaml` { #w-sec-019 }
+
+**Fires when:** `murmur.yaml` carries a key no field of the block it sits in claims. Once per such
+key, on stderr, from `mur run` and from `mur doctor` in identical words. One further line is added
+when `mur_version` pins a `major.minor.patch` version higher than the running binary's.
+
+**Why it matters:** the manifest parser sets `deny_unknown_fields` nowhere, so a key it does not
+recognize is accepted and applied to nothing. Without this warning a misspelled
+`capabilities.filesystem.read-only` and a correctly spelled `read_only` produce the same silent,
+successful launch — with opposite protections in force.
+
+The wording distinguishes the two causes. A key within edit distance of one the block does
+recognize is a spelling problem:
+
+```text
+[murmur-artifact] warning[W-SEC-019]: unrecognized key 'read-only' in capabilities.filesystem — did you mean 'read_only'? The manifest has a spelling problem here: the key was parsed and ignored, so whatever it declared is not in effect. Correct it in murmur.yaml (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+```
+
+A key with no near neighbour is one this build does not know, which a newer `mur` may:
+
+```text
+[murmur-artifact] warning[W-SEC-019]: unrecognized key 'quantum_teleport' at the top level — this build of mur does not recognize it and no key it does recognize there is close to it, so the key may come from a newer mur. It was parsed and ignored; nothing here says the manifest is misspelled (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+```
+
+A higher `mur_version` pin names the cause directly rather than leaving it to be inferred from
+unfamiliar key names:
+
+```text
+[murmur-artifact] warning[W-SEC-019]: this manifest pins mur 99.0.0, you are running 0.2.0; 2 keys in it are not recognized by this build (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-019)
+```
+
+| Part of the line | What it names |
+|---|---|
+| `'read-only'` | The key, spelled as the manifest spells it |
+| `in capabilities.filesystem` | The block that held it, dotted. A per-artifact block carries its index: `artifacts[0].capabilities.shell`. A top-level key reads `at the top level` |
+| `did you mean 'read_only'?` | The nearest key that block does recognize. Absent when none is near |
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The key is
+reported and dropped; every other key in its block still parses and still applies. Refusing would
+make a manifest written for a newer `mur` unloadable by an older one, which turns every optional-key
+addition into a breaking change across a fleet.
+
+**What to do:** correct the spelling when a suggestion is offered. When none is, check whether the
+key belongs to a newer `mur` than the one running — `mur --version` against the `mur_version` pin —
+and upgrade rather than edit the manifest. A version-gap line answers that question outright.
+
+The pin is separate from this warning and unchanged by it: `mur_version` is compared for equality
+by `mur run`, which warns on any difference in either direction, and only a pin parsing as a
+numeric triple *higher* than the running version adds the third line above.

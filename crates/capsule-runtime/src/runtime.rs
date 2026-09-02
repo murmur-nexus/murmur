@@ -2782,13 +2782,9 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 /// kernel-backing layer, not a manifest rule. Same seam as [`warn_on_workdir_exec`] — fires at
 /// staging, before any session workdir exists, so it goes to stderr only.
 fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
-    if read_only.is_empty() {
-        return;
-    }
-    for binary in shell_allow
-        .iter()
-        .filter(|binary| crate::protected_paths::is_advisory_interpreter(binary))
-    {
+    // The same resolver `--explain-scope` and `mur doctor` report from, so the set this warns
+    // about and the set they print `advisory against` cannot drift apart.
+    for binary in crate::containment::read_only_advisory_for(read_only, shell_allow) {
         let link = security_warning_link(W_SEC_017);
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_017}]: capabilities.filesystem.read_only is \

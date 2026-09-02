@@ -2,15 +2,16 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, inspect_installed_profile,
-    preopen_reports, warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
-    InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    preopen_reports, read_only_advisory_for, render_read_only, warn_on_interpreter_runtime_grants,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH,
+    SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_lockfile, resolve_manifest_path, sha256_hex,
-    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock,
-    NativeBinaryVerdict, PlatformMatch, W_REG_001,
+    warn_on_unknown_manifest_keys, ArtifactImplementation, ArtifactRuntime, LocalRegistry,
+    LockfileError, MurmurLock, NativeBinaryVerdict, PlatformMatch, W_REG_001,
 };
 
 use crate::commands::install::find_project_root;
@@ -245,6 +246,25 @@ fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
     println!();
 }
 
+/// Prints the workdir subtrees `capabilities.filesystem.read_only` protects, and whether that
+/// protection is enforced for every readable call or advisory against an allowlisted interpreter.
+///
+/// Rendered by `render_read_only`, the same function `ScopeReport::render` calls, so `mur doctor`
+/// and `mur run --explain-scope` cannot state one protection in two strengths. A report, never a
+/// verdict: declaring nothing is the common case and reaches no `fixes` entry, and an advisory
+/// declaration is a legitimate pairing that `W-SEC-017` already states in words.
+fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
+    println!("Read-only paths");
+    print!(
+        "{}",
+        render_read_only(
+            &policy.read_only_paths,
+            &read_only_advisory_for(&policy.read_only_paths, &policy.shell_allow),
+        )
+    );
+    println!();
+}
+
 /// Check every artifact the current project declares against the stores a session
 /// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
 /// is checked, with no change here.
@@ -256,6 +276,11 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     let manifest_path = resolve_manifest_path(&project_root);
     let runtime_manifest =
         load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+
+    // Keys this build does not recognize, in the same words and from the same emitter `mur run`
+    // uses — an operator reaching for `mur doctor` to find out why a declaration did nothing is
+    // exactly who this is for. Non-fatal, stderr only; nothing here reaches `fixes`.
+    warn_on_unknown_manifest_keys(&runtime_manifest, env!("CARGO_PKG_VERSION"));
 
     // `mur doctor` validates the manifest without launching a session, but the capsule-ceiling
     // `interpreter_runtime` grant is a posture warning an operator should see here too — surface
@@ -389,6 +414,10 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // artifact's presence in a store, and it is the question `capabilities.filesystem.scope` at
     // the capsule level does not answer.
     report_preopens(&runtime_manifest);
+
+    // The `read_only` declaration and whether it is enforced or advisory, through the renderer
+    // `--explain-scope` prints from, for the reason `report_preopens` shares `PreopenReport::render`.
+    report_read_only(&capability_policy);
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,

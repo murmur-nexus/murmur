@@ -372,6 +372,26 @@ pub struct ScopeReport {
     /// why it is reported next to the grants rather than buried: reading `achieved: advisory` on a
     /// Landlock-capable host makes sense only alongside it.
     pub workdir_exec: bool,
+    /// `capabilities.filesystem.read_only`, verbatim — the workdir subtrees the capsule may read
+    /// but must not write. Empty when the capsule declares none, which is the whole workdir
+    /// writable. Always serialized as an array (never skipped), on the same terms as
+    /// [`Self::state_stores`]: an absent key identifies a runtime that predates the field, not a
+    /// capsule that declared nothing.
+    ///
+    /// The one field here that subtracts rather than grants, which is why it is reported beside
+    /// [`Self::read_only_advisory_for`] rather than alone: a protection stated without its
+    /// qualification reads as a boundary the capsule does not have.
+    pub read_only_paths: Vec<String>,
+    /// The entries of [`Self::shell_allow`] that [`Self::read_only_paths`] is only advisory
+    /// against — the same set `W-SEC-017` fires for, resolved by the same
+    /// [`read_only_advisory_for`] both this report and `mur doctor` call.
+    ///
+    /// Empty means the declaration is enforced for every readable call. Non-empty names the
+    /// binaries whose own file I/O the dispatch-time write-intent analyser cannot read, so the
+    /// report cannot claim more than `W-SEC-017` already qualifies. Always serialized as an array
+    /// (never skipped), on the same terms as [`Self::read_only_paths`], and always empty when
+    /// that list is: nothing is advisory against a protection that was never declared.
+    pub read_only_advisory_for: Vec<String>,
     /// The filesystem surface every guest-bearing artifact in this capsule is preopened into, one
     /// entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, in manifest order.
     /// Empty when the capsule declares only skills. Always serialized as an array (never skipped),
@@ -488,6 +508,10 @@ impl ScopeReport {
             self.filesystem_scope.as_deref().unwrap_or("<none>")
         ));
         out.push_str(&format!("  workdir exec:     {}\n", self.workdir_exec));
+        out.push_str(&render_read_only(
+            &self.read_only_paths,
+            &self.read_only_advisory_for,
+        ));
         push_list(
             &mut out,
             "preopens",
@@ -557,6 +581,55 @@ impl ScopeReport {
         }
         out
     }
+}
+
+/// The allowlisted binaries a declared `capabilities.filesystem.read_only` is only advisory
+/// against: those whose own file I/O the dispatch-time write-intent analyser cannot read, in
+/// `shell_allow` order.
+///
+/// Exactly the set `W-SEC-017` fires one line for, resolved here so `--explain-scope`, `trace.jsonl`
+/// and `mur doctor` cannot disagree with the warning printed beside them. Empty when nothing is
+/// declared read-only: an interpreter is not advisory against a protection that does not exist.
+#[must_use]
+pub fn read_only_advisory_for(read_only_paths: &[String], shell_allow: &[String]) -> Vec<String> {
+    if read_only_paths.is_empty() {
+        return Vec::new();
+    }
+    shell_allow
+        .iter()
+        .filter(|binary| crate::protected_paths::is_advisory_interpreter(binary))
+        .cloned()
+        .collect()
+}
+
+/// The `read_only` block of the scope report: the declared paths, then one line saying whether the
+/// protection is enforced for every readable call or advisory against a named binary.
+///
+/// Shared by [`ScopeReport::render`] and by `mur doctor` so the two cannot word the same grant
+/// differently — the precedent [`PreopenReport::render`] sets. Ends with a newline; emits nothing
+/// beyond the `<none>` line when no path is declared, because there is no enforcement question to
+/// answer about a protection nobody asked for.
+#[must_use]
+pub fn render_read_only(read_only_paths: &[String], advisory_for: &[String]) -> String {
+    let mut out = String::new();
+    push_list(&mut out, "read_only", read_only_paths);
+    if read_only_paths.is_empty() {
+        return out;
+    }
+    if advisory_for.is_empty() {
+        out.push_str(
+            "  read_only enforcement: enforced for every tool call and every shell command the \
+             dispatch check can read\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "  read_only enforcement: advisory against {} — an interpreter's own file I/O is not \
+             something the dispatch check can read; enforced for every tool call and for every \
+             shell command it can read\n",
+            advisory_for.join(", ")
+        ));
+    }
+    out
 }
 
 fn push_list(out: &mut String, label: &str, values: &[String]) {
@@ -650,6 +723,11 @@ pub(crate) fn scope_report_for_tier(
         configured_artifacts,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
+        read_only_paths: policy.read_only_paths.clone(),
+        read_only_advisory_for: read_only_advisory_for(
+            &policy.read_only_paths,
+            &policy.shell_allow,
+        ),
         // Resolved by `network_policy::preopen_reports` before this call and copied through on the
         // same terms as the reports above: what one guest is preopened into gets no say in what
         // class this host is reported to back.
@@ -1885,5 +1963,248 @@ mod tests {
             declared.contains("max bytes:          10485760 (per file)"),
             "{declared}"
         );
+    }
+
+    // ── read_only reporting ───────────────────────────────────────────────────
+
+    fn report_for(read_only: &[&str], shell_allow: &[&str]) -> ScopeReport {
+        let policy = CapabilityPolicy {
+            read_only_paths: read_only.iter().map(|p| (*p).to_string()).collect(),
+            shell_allow: shell_allow.iter().map(|b| (*b).to_string()).collect(),
+            ..CapabilityPolicy::default()
+        };
+        scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// With no allowlisted interpreter the declaration holds everywhere the check can reach, and
+    /// the report says exactly that and nothing stronger.
+    #[test]
+    fn declared_read_only_with_no_interpreter_reports_as_enforced() {
+        let report = report_for(&["tests", "bench/fixtures"], &["git"]);
+        assert_eq!(
+            report.read_only_paths,
+            vec!["tests".to_string(), "bench/fixtures".to_string()]
+        );
+        assert!(report.read_only_advisory_for.is_empty());
+
+        let rendered = report.render();
+        assert!(rendered.contains("  read_only:\n    - tests\n    - bench/fixtures\n"));
+        assert!(rendered.contains(
+            "read_only enforcement: enforced for every tool call and every shell command the \
+             dispatch check can read"
+        ));
+        assert!(!rendered.contains("advisory against"));
+    }
+
+    /// An allowlisted interpreter is named, and the enforcement line is qualified — the report
+    /// must never claim more than `W-SEC-017` already withdraws.
+    #[test]
+    fn an_allowlisted_interpreter_is_named_as_advisory() {
+        let report = report_for(&["tests"], &["git", "python3"]);
+        assert_eq!(report.read_only_advisory_for, vec!["python3".to_string()]);
+
+        let rendered = report.render();
+        assert!(rendered.contains("read_only enforcement: advisory against python3"));
+        assert!(rendered
+            .contains("enforced for every tool call and for every shell command it can read"));
+    }
+
+    /// The report's advisory set is the set `W-SEC-017` fires for, because both call one
+    /// resolver. Asserted through the resolver rather than by re-listing interpreters, so adding
+    /// one to `protected_paths::ADVISORY_INTERPRETERS` cannot make the two disagree.
+    #[test]
+    fn the_reported_advisory_set_is_the_set_the_warning_fires_for() {
+        let shell_allow: Vec<String> = ["git", "python3", "node", "make", "bash"]
+            .iter()
+            .map(|b| (*b).to_string())
+            .collect();
+        let declared = vec!["tests".to_string()];
+        assert_eq!(
+            report_for(&["tests"], &["git", "python3", "node", "make", "bash"])
+                .read_only_advisory_for,
+            read_only_advisory_for(&declared, &shell_allow)
+        );
+        // Nothing is advisory against a protection that was never declared, whatever is allowed.
+        assert!(read_only_advisory_for(&[], &shell_allow).is_empty());
+    }
+
+    /// Both keys are always arrays, including for a capsule with no `capabilities.filesystem`
+    /// block at all: an absent key must identify a runtime that predates the field, never a
+    /// capsule that declared nothing.
+    #[test]
+    fn both_read_only_keys_are_always_serialized_arrays() {
+        let json = serde_json::to_value(report_for(&[], &["python3"])).unwrap();
+        assert_eq!(json["read_only_paths"], serde_json::json!([]));
+        assert_eq!(json["read_only_advisory_for"], serde_json::json!([]));
+
+        let json = serde_json::to_value(report_for(&["tests"], &["python3"])).unwrap();
+        assert_eq!(json["read_only_paths"], serde_json::json!(["tests"]));
+        assert_eq!(
+            json["read_only_advisory_for"],
+            serde_json::json!(["python3"])
+        );
+    }
+
+    /// An undeclared `read_only` renders one `<none>` line and asks no enforcement question,
+    /// because there is no protection to qualify.
+    #[test]
+    fn an_undeclared_read_only_renders_none_and_no_enforcement_line() {
+        let rendered = report_for(&[], &["python3"]).render();
+        assert!(rendered.contains("  read_only: <none>\n"));
+        assert!(!rendered.contains("read_only enforcement:"));
+    }
+
+    // ── Grant coverage ────────────────────────────────────────────────────────
+
+    /// Every `pub` field of [`CapabilityPolicy`] is either reported by [`ScopeReport`] or
+    /// exempted here with a written reason.
+    ///
+    /// The field list is derived from `types.rs`'s own source text rather than written out, so a
+    /// grant added later fails this test until someone decides which it is.
+    ///
+    /// The mapping is checked in both directions — every policy field is accounted for, *and*
+    /// every report key the mapping names is really present in a serialized report — so the
+    /// table cannot claim coverage it does not have.
+    #[test]
+    fn every_capability_policy_field_is_reported_or_exempted() {
+        /// Policy fields deliberately absent from the scope report, each with the reason.
+        const EXEMPT: &[(&str, &str)] = &[
+            (
+                "shell_strip_env",
+                "Names host variables removed from the shell child's environment on top of the \
+                 credential patterns the runtime always strips. It subtracts from what the \
+                 capsule sees and can open nothing, so reporting it beside the grants would pad \
+                 the list an operator audits for reach.",
+            ),
+            (
+                "shell_baseline_env",
+                "The fixed variables the shell child starts with (PATH, HOME, …). It shapes the \
+                 environment of a subprocess the capsule was already granted, and names no host \
+                 resource `shell allow` and `env allow` do not already account for.",
+            ),
+            (
+                "limits",
+                "Execution ceilings for a WASM guest — memory, table elements, instance count, \
+                 deadline. A bound on how much the capsule may consume, never a reach it gains.",
+            ),
+            (
+                "resources",
+                "The same, for native subprocesses: rlimits, the Linux cgroup v2 scope and the \
+                 workdir size ceiling. A ceiling, not a grant, on exactly `limits`' terms.",
+            ),
+            (
+                "declared_deadline_seconds",
+                "The undefaulted form of `limits.deadline_seconds`, retained only so hook calls \
+                 can apply a lower default. Reporting it would report one ceiling twice.",
+            ),
+            (
+                "state_declared",
+                "Records that a capsule-wide `capabilities.state` block was declared where \
+                 nothing reads it, which `W-SEC-014` says in words. The stores that actually \
+                 exist are reported per artifact in `state_stores`.",
+            ),
+            (
+                "conversation_declared",
+                "Records a capsule-wide `capabilities.conversation` block that reaches no \
+                 artifact, on `state_declared`'s terms; `W-SEC-016` is what an operator needs, \
+                 and the grant itself is per artifact.",
+            ),
+        ];
+
+        /// Policy field → the key it is reported under in a serialized [`ScopeReport`].
+        const REPORTED: &[(&str, &str)] = &[
+            ("network_allow", "network_allow"),
+            ("peer_fetch_allow", "peer_fetch_allow"),
+            ("unix_sockets_allowed", "unix_sockets"),
+            ("filesystem_scope", "filesystem_scope"),
+            ("workdir_exec_allowed", "workdir_exec"),
+            ("read_only_paths", "read_only_paths"),
+            ("shell_allow", "shell_allow"),
+            ("spawn_allow", "spawn_allow"),
+            ("shell_interpreter_runtime", "interpreter_runtime_grants"),
+            ("shell_staged_runtime", "staged_runtime_grants"),
+            ("env_allow", "env_allow"),
+            ("containment_floor", "declared_containment"),
+        ];
+
+        let declared = capability_policy_field_names(include_str!("types.rs"));
+        assert!(
+            declared.len() > 10,
+            "failed to read CapabilityPolicy's fields out of types.rs (found {declared:?})"
+        );
+
+        for field in &declared {
+            let reported = REPORTED.iter().any(|(policy, _)| policy == field);
+            let exempt = EXEMPT.iter().any(|(policy, _)| policy == field);
+            assert!(
+                reported || exempt,
+                "CapabilityPolicy::{field} is a grant no --explain-scope report mentions. Either \
+                 add it to ScopeReport and to this test's REPORTED table, or add it to EXEMPT \
+                 with a written reason for why an operator does not need to see it."
+            );
+            assert!(
+                !(reported && exempt),
+                "CapabilityPolicy::{field} is listed as both reported and exempt"
+            );
+        }
+
+        for (policy_field, _) in REPORTED.iter().chain(EXEMPT.iter()) {
+            assert!(
+                declared.iter().any(|field| field == policy_field),
+                "the table names CapabilityPolicy::{policy_field}, which types.rs no longer \
+                 declares — remove the stale row"
+            );
+        }
+
+        // The other direction: a report key the table claims must really be in the JSON, so no
+        // row can cover a field with a key that does not exist.
+        let json = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap();
+        let object = json.as_object().expect("a scope report is a JSON object");
+        for (policy_field, report_key) in REPORTED {
+            assert!(
+                object.contains_key(*report_key),
+                "the table maps CapabilityPolicy::{policy_field} to a report key \
+                 '{report_key}' that a serialized ScopeReport does not carry"
+            );
+        }
+    }
+
+    /// The `pub` field names of `CapabilityPolicy`, read out of `types.rs`'s own text.
+    fn capability_policy_field_names(source: &str) -> Vec<String> {
+        source
+            .split_once("pub struct CapabilityPolicy {")
+            .expect("types.rs declares CapabilityPolicy")
+            .1
+            .split_once("\n}")
+            .expect("CapabilityPolicy's declaration is closed at column 0")
+            .0
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("    pub ")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(name, _)| name.to_string())
+            })
+            .collect()
     }
 }

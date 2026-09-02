@@ -1176,6 +1176,10 @@ subtree a tool declared `murmur-opaque`, so a destination the same tool did not 
 seen there. The declaration is also not a defence against a malicious artifact: see
 [Access control](../concepts/access-control.md#read-only-paths).
 
+`mur run --explain-scope` and `mur doctor` both print the declared subtrees and whether the
+protection is enforced for every call the runtime can read as a write or advisory against a named
+interpreter, so it can be checked before a capsule is launched.
+
 ### State store name { #state-store-name }
 
 `capabilities.state.store` names one directory under `~/.murmur/state/`, so it is a single path

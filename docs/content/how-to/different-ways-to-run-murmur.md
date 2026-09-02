@@ -247,6 +247,7 @@ Containment
 Effective grants
   filesystem scope: <none>
   workdir exec:     false
+  read_only: <none>
   preopens:
     - murmur-tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
     - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
