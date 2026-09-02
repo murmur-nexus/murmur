@@ -553,7 +553,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
-| `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the `delegate-task` tool in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
+| `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
 treated as an error: the run proceeds with that host contributing no addresses to the launch-time
@@ -571,7 +571,8 @@ is omitted rather than reported.
 #### `capabilities.peer_fetch` { #field-peer-fetch }
 
 Names the peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against.
-Declaring it gives the agent one runtime-provided tool, `fetch-peer-file`.
+Declaring it gives the agent one
+[runtime-provided tool](runtime-provided-tools.md), `fetch-peer-file`.
 
 It sits beside `capabilities.network` rather than inside it because fetching a peer's bytes lands a
 file in this capsule's own workdir: that is an ingestion path, and therefore a prompt-injection
@@ -718,7 +719,7 @@ capability at all.
 #### `exports.peer_files` { #field-exports-peer-files }
 
 Names the one subtree a [peer-file handle](resource-plane.md#peer-plane) may address. Declaring it
-gives the agent one runtime-provided tool, `share-file`, and opens
+gives the agent one [runtime-provided tool](runtime-provided-tools.md), `share-file`, and opens
 `GET /resources/peer/<handle>` on the capsule's listener.
 
 | Field | Type | Required | Notes |
@@ -1132,11 +1133,47 @@ A refused call does not run: no `shell` record and no `tool_call` record is writ
 receives an error naming the path, the rule, that nothing ran, and that the path is still
 readable. See [`protected_path_denied`](observability-schemas.md#protected-path-denied).
 
+**What a tool declares about its own input.** A tool artifact says which of its inputs are
+filesystem destinations and which are payload it only stores, with JSON Schema's `format` keyword
+in its own `input_schema`:
+
+| `format` value | Declared on | Effect |
+|---|---|---|
+| `murmur-destination` | A string property | The value at that location is checked against every `read_only` entry, wherever in the input it sits |
+| `murmur-opaque` | An object or array property | The key-name rules above do not descend into that subtree |
+
+```yaml
+input_schema: |
+  {"type":"object","properties":{
+    "edits":{"type":"array","items":{"type":"object","properties":{
+      "path":{"type":"string","format":"murmur-destination"}}}},
+    "note":{"type":"object","format":"murmur-opaque"}}}
+```
+
+An annotation refines where the runtime looks, never whether it refuses: no `format` value permits
+a path, and every refusal is still decided by the operator's own `read_only` entries.
+
+| Case | Behaviour |
+|---|---|
+| A tool that annotates nothing | Judged by key name, exactly as the table above describes |
+| `murmur-opaque` on a string property | Ignored; the key-name rules keep running on the object that carries it |
+| `murmur-destination` inside a subtree marked `murmur-opaque` | Still checked |
+| `murmur-opaque` on the schema's top level | The key-name rules do not run on that tool's input at all; only its declared destinations are checked |
+| An annotation behind a `$ref` | Not resolved, so that tool keeps the key-name rules |
+
+A refusal a declared destination triggered names the location in the model's error and in the
+trace record: `edits[].path` for the schema above.
+
+A capsule that declares `read_only` and installs a tool whose schema names a path-shaped or
+destination-shaped property and annotates nothing fires
+[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and the property.
+
 **What it does not refuse.** Everything the dispatch check cannot positively identify — command
 substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file
 I/O. Declaring `read_only` alongside an interpreter in `capabilities.shell.allow` fires
-[`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. The declaration is also
-not a defence against a malicious artifact: see
+[`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. Nor does it descend into a
+subtree a tool declared `murmur-opaque`, so a destination the same tool did not declare is not
+seen there. The declaration is also not a defence against a malicious artifact: see
 [Access control](../concepts/access-control.md#read-only-paths).
 
 ### State store name { #state-store-name }

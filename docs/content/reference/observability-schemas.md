@@ -431,7 +431,7 @@ call before it runs
 | `target` | string | What was refused: the resolved executable path for a shell call, the tool name otherwise |
 | `path` | string | The resolved workdir-relative path. Always the resolved form, never the string the model typed, so two spellings of one file produce one comparable record |
 | `rule` | string | The `read_only` entry that covers `path`, exactly as the manifest declared it |
-| `signal` | string | What identified the call as a write: the redirection operator, the write-target argument position of a named binary, or the tool-input key pairing |
+| `signal` | string | What identified the call as a write: the redirection operator, the write-target argument position of a named binary, the tool-input key pairing, or the location the tool's own `input_schema` declared a destination (`edits[].path`) |
 | `reason` | string | The same sentence the model was given, so the trace and the agent agree on why |
 
 No `tool_call` or `shell` event accompanies it: the call did not run. A refusal is not a session

@@ -19,6 +19,8 @@
 //! | A binary outside [`SHELL_WRITE_VERBS`] | The table names what is recognized; an unrecognized binary's argument positions have no meaning here. |
 //! | A tool input carrying no [`TOOL_DESTINATION_KEYS`] key and no [`TOOL_PATH_KEYS`]/[`TOOL_CONTENT_KEYS`] pairing | A path alone is a read. |
 //! | A malicious artifact writing wherever its preopen allows | Dispatch sees innocuous input. Only a narrow `capabilities.filesystem.scope` on that artifact's entry stops it. |
+//! | A path inside a subtree a tool's own schema declared [`crate::tool_annotations::FORMAT_OPAQUE`] | The key-name heuristic does not descend there, so a destination the tool did not also declare is not seen. The tool author's declaration is taken at its word; the tool author is not this layer's adversary. |
+//! | A destination whose declaration the lowering could not read — behind a `$ref`, past [`crate::tool_annotations`]'s depth bound, in an unparsable schema, or in an artifact `manage.pull()` fetched after staging | The tool keeps the key-name heuristic, which is the conservative direction: it can only miss a declared destination, never permit one it looked at. |
 //!
 //! This layer is the only one that covers the tool path, which is where the threat lives, and the
 //! only portable one — Landlock does not exist on macOS or on older Linux kernels. A
@@ -29,6 +31,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::errors::RuntimeError;
 use crate::hooks::ResolvedCall;
+use crate::tool_annotations::{LocationStep, ToolAnnotationMap, ToolAnnotations};
 
 /// One lowered `capabilities.filesystem.read_only` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +87,10 @@ pub(crate) enum WriteSignal {
         path_key: String,
         content_key: String,
     },
+    /// A location the tool's own `input_schema` declared to be a filesystem destination with
+    /// [`crate::tool_annotations::FORMAT_DESTINATION`], named as
+    /// [`crate::tool_annotations::InputLocation::render`] writes it.
+    ToolDeclaredDestination { location: String },
 }
 
 impl WriteSignal {
@@ -103,6 +110,9 @@ impl WriteSignal {
                 path_key,
                 content_key,
             } => format!("tool input pairs '{path_key}' with '{content_key}'"),
+            Self::ToolDeclaredDestination { location } => {
+                format!("destination '{location}' declared by the tool's input schema")
+            }
         }
     }
 }
@@ -275,10 +285,15 @@ impl ProtectedPaths {
     /// The single write-intent pass over a resolved call. `None` means the analyser found nothing
     /// it can positively identify as a write into a declared subtree — which is not a claim that
     /// the call writes nothing.
+    ///
+    /// `annotations` is consulted for a tool call only, and only to decide *where* the analyser
+    /// looks: a shell call never reaches it, and no entry in it can make a path the analyser looks
+    /// at be permitted.
     pub(crate) fn check_call(
         &self,
         workdir: &Path,
         call: &ResolvedCall,
+        annotations: &ToolAnnotationMap,
     ) -> Option<ProtectedPathRefusal> {
         if self.is_empty() {
             return None;
@@ -290,7 +305,9 @@ impl ProtectedPaths {
                 script,
                 ..
             } => self.check_shell(workdir, binary, argv, script.as_deref()),
-            ResolvedCall::Tool { input, .. } => self.check_tool(workdir, input),
+            ResolvedCall::Tool {
+                tool_name, input, ..
+            } => self.check_tool(workdir, input, annotations.for_tool(tool_name)),
         }
     }
 
@@ -354,14 +371,65 @@ impl ProtectedPaths {
         None
     }
 
-    /// The tool arm: walk the input JSON and evaluate the pairing rule per object, so a nested
-    /// edit list is read the same way a flat input is.
-    fn check_tool(&self, workdir: &Path, input: &str) -> Option<ProtectedPathRefusal> {
+    /// The tool arm: the locations the tool declared as destinations first, then the key-name
+    /// heuristic over the input JSON, evaluating the pairing rule per object so a nested edit list
+    /// is read the same way a flat input is.
+    ///
+    /// A declared destination is asked first for the same reason a destination *key* is: it is a
+    /// write target on its own, and it is the more precise thing to name in the refusal.
+    fn check_tool(
+        &self,
+        workdir: &Path,
+        input: &str,
+        annotations: &ToolAnnotations,
+    ) -> Option<ProtectedPathRefusal> {
         let value: serde_json::Value = serde_json::from_str(input).ok()?;
-        self.walk_json(workdir, &value)
+        if let Some(refusal) = self.check_declared_destinations(workdir, &value, annotations) {
+            return Some(refusal);
+        }
+        self.walk_json(workdir, &value, &mut Vec::new(), annotations)
     }
 
-    fn walk_json(&self, workdir: &Path, value: &serde_json::Value) -> Option<ProtectedPathRefusal> {
+    /// Every location the schema declared a destination, checked wherever in the input it sits.
+    ///
+    /// Read from the schema rather than through the heuristic walk, so a destination inside a
+    /// subtree the same schema declared opaque is still checked.
+    fn check_declared_destinations(
+        &self,
+        workdir: &Path,
+        value: &serde_json::Value,
+        annotations: &ToolAnnotations,
+    ) -> Option<ProtectedPathRefusal> {
+        for location in annotations.destinations() {
+            for candidate in location.resolve(value) {
+                if let Some((rule, path)) = self.covering_rule(workdir, candidate) {
+                    return Some(ProtectedPathRefusal {
+                        rule: rule.declared().to_string(),
+                        path,
+                        signal: WriteSignal::ToolDeclaredDestination {
+                            location: location.render(),
+                        },
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// `at` is the location of `value` in the input, which is what an opaque declaration is
+    /// matched against. It is a scratch buffer: every push is popped before returning.
+    fn walk_json(
+        &self,
+        workdir: &Path,
+        value: &serde_json::Value,
+        at: &mut Vec<LocationStep>,
+        annotations: &ToolAnnotations,
+    ) -> Option<ProtectedPathRefusal> {
+        // Only a container can be opaque. On a string the declaration is ignored and the heuristic
+        // keeps running, so an annotation can never remove a check on a value.
+        if (value.is_object() || value.is_array()) && annotations.is_opaque(at) {
+            return None;
+        }
         match value {
             serde_json::Value::Object(map) => {
                 // A destination key is a write target on its own, so it is asked first: an input
@@ -401,12 +469,21 @@ impl ProtectedPaths {
                         }
                     }
                 }
-                map.values()
-                    .find_map(|entry| self.walk_json(workdir, entry))
+                map.iter().find_map(|(key, entry)| {
+                    at.push(LocationStep::Key(key.clone()));
+                    let refusal = self.walk_json(workdir, entry, at, annotations);
+                    at.pop();
+                    refusal
+                })
             }
-            serde_json::Value::Array(items) => items
-                .iter()
-                .find_map(|entry| self.walk_json(workdir, entry)),
+            serde_json::Value::Array(items) => {
+                at.push(LocationStep::Element);
+                let refusal = items
+                    .iter()
+                    .find_map(|entry| self.walk_json(workdir, entry, at, annotations));
+                at.pop();
+                refusal
+            }
             _ => None,
         }
     }
@@ -414,7 +491,7 @@ impl ProtectedPaths {
 
 /// Key matching is case-insensitive with `-` and `_` folded, so `newPath`, `new-path` and
 /// `new_path` are one key.
-fn matches_key(table: &[&str], key: &str) -> bool {
+pub(crate) fn matches_key(table: &[&str], key: &str) -> bool {
     let folded: String = key
         .chars()
         .filter(|c| *c != '-' && *c != '_')
@@ -771,6 +848,19 @@ fn read_word(chars: &[char], mut i: usize) -> (Option<String>, usize) {
 }
 
 #[cfg(test)]
+impl ProtectedPaths {
+    /// [`Self::check_call`] for a tool that declared no annotations, which is what every case
+    /// below that names no schema asserts on.
+    fn check_unannotated(
+        &self,
+        workdir: &Path,
+        call: &ResolvedCall,
+    ) -> Option<ProtectedPathRefusal> {
+        self.check_call(workdir, call, &ToolAnnotationMap::default())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -955,7 +1045,7 @@ mod tests {
         ];
         for (script, expected) in flagged {
             let refusal = protected
-                .check_call(workdir, &shell(script))
+                .check_unannotated(workdir, &shell(script))
                 .unwrap_or_else(|| panic!("must be flagged: {script}"));
             assert_eq!(refusal.path, expected, "{script}");
             assert_eq!(refusal.rule, "tests", "{script}");
@@ -978,7 +1068,9 @@ mod tests {
             "dd if=tests/a of=build/x",
         ] {
             assert!(
-                protected.check_call(workdir, &shell(script)).is_none(),
+                protected
+                    .check_unannotated(workdir, &shell(script))
+                    .is_none(),
                 "must not be flagged: {script}"
             );
         }
@@ -991,7 +1083,7 @@ mod tests {
         let workdir = Path::new("/nowhere/work");
         assert_eq!(
             protected
-                .check_call(workdir, &shell("echo broken > tests/test_foo.py"))
+                .check_unannotated(workdir, &shell("echo broken > tests/test_foo.py"))
                 .unwrap()
                 .signal,
             WriteSignal::ShellRedirection {
@@ -1000,7 +1092,7 @@ mod tests {
         );
         assert_eq!(
             protected
-                .check_call(workdir, &shell("tee tests/a"))
+                .check_unannotated(workdir, &shell("tee tests/a"))
                 .unwrap()
                 .signal,
             WriteSignal::ShellArgument {
@@ -1016,10 +1108,10 @@ mod tests {
         let protected = paths(&["tests"]);
         let workdir = Path::new("/nowhere/work");
         assert!(protected
-            .check_call(workdir, &shell("cat build/x && rm tests/a"))
+            .check_unannotated(workdir, &shell("cat build/x && rm tests/a"))
             .is_some());
         assert!(protected
-            .check_call(workdir, &shell("cat tests/a 2>&1"))
+            .check_unannotated(workdir, &shell("cat tests/a 2>&1"))
             .is_none());
     }
 
@@ -1036,10 +1128,10 @@ mod tests {
             recipe: None,
         };
         assert!(protected
-            .check_call(workdir, &argv_call("/usr/bin/rm", &["-rf", "tests"]))
+            .check_unannotated(workdir, &argv_call("/usr/bin/rm", &["-rf", "tests"]))
             .is_some());
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &argv_call("/usr/bin/curl", &["-o", ">", "tests/a"])
             )
@@ -1055,7 +1147,7 @@ mod tests {
         let workdir = Path::new("/nowhere/work");
 
         let refusal = protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({"path": "tests/test_foo.py", "content": "pass"})),
             )
@@ -1071,7 +1163,7 @@ mod tests {
         );
 
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({"path": "tests/test_foo.py"}))
             )
@@ -1086,7 +1178,7 @@ mod tests {
         let workdir = Path::new("/nowhere/work");
 
         let refusal = protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({
                     "source": "build/out.py",
@@ -1104,7 +1196,7 @@ mod tests {
 
         assert!(
             protected
-                .check_call(
+                .check_unannotated(
                     workdir,
                     &tool(serde_json::json!({
                         "source": "tests/test_foo.py",
@@ -1124,7 +1216,7 @@ mod tests {
         let workdir = Path::new("/nowhere/work");
 
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({
                     "edits": [
@@ -1136,7 +1228,7 @@ mod tests {
             .is_some());
         // The content key lives in a different object from the path, so nothing pairs.
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({
                     "content": "x",
@@ -1145,7 +1237,7 @@ mod tests {
             )
             .is_none());
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({"New-Path": "tests/test_foo.py"})),
             )
@@ -1158,7 +1250,7 @@ mod tests {
         let protected = paths(&["tests"]);
         let workdir = Path::new("/nowhere/work");
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &ResolvedCall::Tool {
                     tool_name: "writer".to_string(),
@@ -1168,7 +1260,7 @@ mod tests {
             )
             .is_none());
         assert!(protected
-            .check_call(workdir, &tool(serde_json::json!({"amount": 10})))
+            .check_unannotated(workdir, &tool(serde_json::json!({"amount": 10})))
             .is_none());
     }
 
@@ -1178,14 +1270,277 @@ mod tests {
         let protected = ProtectedPaths::default();
         let workdir = Path::new("/nowhere/work");
         assert!(protected
-            .check_call(workdir, &shell("echo x > tests/a"))
+            .check_unannotated(workdir, &shell("echo x > tests/a"))
             .is_none());
         assert!(protected
-            .check_call(
+            .check_unannotated(
                 workdir,
                 &tool(serde_json::json!({"path": "tests/a", "content": "x"}))
             )
             .is_none());
+    }
+
+    // ── What a tool's own schema declares ────────────────────────────────────
+
+    fn named_tool(name: &str, input: serde_json::Value) -> ResolvedCall {
+        let input = input.to_string();
+        ResolvedCall::Tool {
+            tool_name: name.to_string(),
+            input_bytes: input.len() as u64,
+            input,
+        }
+    }
+
+    /// A tool that declares an object opaque has that object's interior left alone: the
+    /// `{file, text}` pair inside a stored note is data, not filesystem intent.
+    #[test]
+    fn an_opaque_container_is_not_walked_by_the_heuristic() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "noter",
+            r#"{"type":"object","properties":{"note":{"type":"object","format":"murmur-opaque"}}}"#,
+        )]);
+
+        let call = named_tool(
+            "noter",
+            serde_json::json!({"note": {"file": "tests/test_foo.py", "text": "protected"}}),
+        );
+        assert!(protected.check_call(workdir, &call, &annotations).is_none());
+        assert!(
+            protected.check_unannotated(workdir, &call).is_some(),
+            "the same input without the declaration is refused, which is what the declaration is for"
+        );
+    }
+
+    /// `murmur-opaque` names a container. On a string property it is ignored, and the pairing
+    /// rule runs on the object that carries it.
+    #[test]
+    fn an_opaque_string_property_is_ignored() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "mislabeled",
+            r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-opaque"}}}"#,
+        )]);
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "mislabeled",
+                    serde_json::json!({"path": "tests/test_foo.py", "content": "x"}),
+                ),
+                &annotations,
+            )
+            .expect("a string declaration removes no check");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolPathWithContent {
+                path_key: "path".to_string(),
+                content_key: "content".to_string()
+            }
+        );
+    }
+
+    /// A declared destination is checked wherever it sits, including under an array step, and the
+    /// refusal names the location that triggered it.
+    #[test]
+    fn a_declared_destination_is_checked_and_names_its_location() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "batcher",
+            r#"{"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string","format":"murmur-destination"}}}}}}"#,
+        )]);
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "batcher",
+                    serde_json::json!({"edits": [{"path": "tests/test_foo.py"}]}),
+                ),
+                &annotations,
+            )
+            .expect("a declared destination under an array element is checked");
+        assert_eq!(refusal.path, "tests/test_foo.py");
+        assert_eq!(refusal.rule, "tests");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "edits[].path".to_string()
+            }
+        );
+    }
+
+    /// A declaration can only add a check: a destination under a name no table carries is refused
+    /// with the declaration and dispatched without it.
+    #[test]
+    fn a_declared_destination_adds_coverage_the_heuristic_does_not_have() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "renderer",
+            r#"{"type":"object","properties":{"sink":{"type":"string","format":"murmur-destination"}}}"#,
+        )]);
+
+        let call = named_tool("renderer", serde_json::json!({"sink": "tests/test_foo.py"}));
+        let refusal = protected
+            .check_call(workdir, &call, &annotations)
+            .expect("the declared sink is a destination");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "sink".to_string()
+            }
+        );
+        assert!(
+            protected.check_unannotated(workdir, &call).is_none(),
+            "a path with no content beside it is a read"
+        );
+    }
+
+    /// An opaque sibling shelters nothing: a destination declared in the same schema is still
+    /// checked, and a destination *inside* an opaque subtree is too.
+    #[test]
+    fn no_declaration_suppresses_a_check_on_a_declared_destination() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[
+            (
+                "sneaky",
+                r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-destination"},"body":{"type":"object","format":"murmur-opaque"}}}"#,
+            ),
+            (
+                "buried",
+                r#"{"type":"object","properties":{"body":{"type":"object","format":"murmur-opaque","properties":{"sink":{"type":"string","format":"murmur-destination"}}}}}"#,
+            ),
+        ]);
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "sneaky",
+                    serde_json::json!({
+                        "path": "tests/test_foo.py",
+                        "content": "x",
+                        "body": {"file": "tests/test_foo.py", "text": "note"}
+                    }),
+                ),
+                &annotations,
+            )
+            .expect("an opaque sibling does not shelter a declared destination");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "path".to_string()
+            }
+        );
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "buried",
+                    serde_json::json!({"body": {"sink": "tests/test_foo.py"}}),
+                ),
+                &annotations,
+            )
+            .expect("a destination inside an opaque subtree is still checked");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "body.sink".to_string()
+            }
+        );
+    }
+
+    /// `murmur-opaque` on the schema's top level names the input root, which is a container like
+    /// any other: the key-name heuristic stops there, and a declared destination is still checked.
+    #[test]
+    fn a_top_level_opaque_declaration_stops_only_the_heuristic() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "wholesale",
+            r#"{"type":"object","format":"murmur-opaque","properties":{"sink":{"type":"string","format":"murmur-destination"}}}"#,
+        )]);
+
+        assert!(
+            protected
+                .check_call(
+                    workdir,
+                    &named_tool(
+                        "wholesale",
+                        serde_json::json!({"path": "tests/test_foo.py", "content": "x"}),
+                    ),
+                    &annotations,
+                )
+                .is_none(),
+            "the heuristic does not descend into a container the tool declared opaque"
+        );
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "wholesale",
+                    serde_json::json!({"sink": "tests/test_foo.py"}),
+                ),
+                &annotations,
+            )
+            .expect("a declared destination is checked wherever the opaque boundary sits");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "sink".to_string()
+            }
+        );
+    }
+
+    /// Annotations are keyed by tool name: another tool's declaration is not this tool's.
+    #[test]
+    fn annotations_belong_to_the_tool_that_declared_them() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "noter",
+            r#"{"type":"object","properties":{"note":{"type":"object","format":"murmur-opaque"}}}"#,
+        )]);
+
+        assert!(
+            protected
+                .check_call(
+                    workdir,
+                    &named_tool(
+                        "other",
+                        serde_json::json!({"note": {"file": "tests/test_foo.py", "text": "x"}}),
+                    ),
+                    &annotations,
+                )
+                .is_some(),
+            "a tool absent from the map keeps the heuristic"
+        );
+    }
+
+    /// A shell call consults no annotation, whatever any tool declared.
+    #[test]
+    fn the_shell_arm_consults_no_annotation() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "bash",
+            r#"{"type":"object","format":"murmur-opaque"}"#,
+        )]);
+        assert!(protected
+            .check_call(
+                workdir,
+                &shell("echo broken > tests/test_foo.py"),
+                &annotations
+            )
+            .is_some());
     }
 
     /// The interpreter set the shell half cannot follow includes the shells and the general

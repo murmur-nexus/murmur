@@ -23,6 +23,7 @@ section that explains it.
 | `E-CAP-010` | An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG` | [E-CAP-010](#e-cap-010) |
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
 | `E-CAP-012` | A `capabilities.filesystem.read_only` entry is not a usable workdir subpath | [E-CAP-012](#e-cap-012) |
+| `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -92,6 +93,7 @@ section that explains it.
 | `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
+| `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
 
 ---
 
@@ -532,6 +534,24 @@ component instantiation, so no session directory is created and no call is ever 
 rule the runtime could not build. An empty or whitespace-only entry is dropped at manifest parse
 rather than refused. See [Read-only paths](manifest.md#read-only-paths).
 
+### E-CAP-013 — an artifact claims a runtime-provided tool name { #e-cap-013 }
+
+`share-file`, `fetch-peer-file` and `delegate-task` are answered by the runtime itself, so an
+artifact cannot be declared under any of them:
+
+```text
+error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime provides itself; the reserved names are share-file, fetch-peer-file, delegate-task
+  hint: the runtime answers these names itself, so an artifact under one of them would be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, or drop the dependency if the runtime-provided tool is what you wanted — see docs/content/reference/runtime-provided-tools.md
+```
+
+The check runs at staging, ahead of every artifact in the manifest, so no artifact is resolved,
+pulled or hash-verified and no session directory is created. `mur run --explain-scope` refuses the
+same manifest by the same code. An in-session `manage.pull()` of one of these names is refused the
+same way, and the running capsule receives that refusal as an error string.
+
+Shell binary names are not reserved: they come from `capabilities.shell.allow`. See
+[Runtime-provided tools](runtime-provided-tools.md#reserved-names).
+
 ---
 
 ## Conversation record errors
@@ -718,7 +738,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013`, `W-SEC-014`, `W-SEC-015` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-018` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1289,3 +1309,30 @@ identify, and every refusal is still recorded as
 acceptable for this capsule. Removing the interpreter from `capabilities.shell.allow` closes the
 gap; keeping it does not weaken any other part of the declaration. See
 [Read-only paths](manifest.md#read-only-paths).
+
+---
+
+### W-SEC-018 — a tool's input schema does not say where it writes { #w-sec-018 }
+
+**Fires when:** `capabilities.filesystem.read_only` is non-empty and an installed tool's
+`input_schema` names a path-shaped property (`path`, `file_path`, `filepath`, `filename`, `file`)
+or a destination-shaped one (`dest`, `dest_path`, `destination`, `destination_path`, `target_path`,
+`output_path`, `out_path`, `new_path`, `to`) and carries no `murmur-destination` or `murmur-opaque`
+annotation. Once per such tool, at staging, on stderr.
+
+**Why it matters:** with nothing declared, the dispatch-time check guesses which of a tool's inputs
+are filesystem destinations from those property names. The guess is wrong in both directions: a
+note the tool merely stores, carrying a `{file, text}` pair, is refused as a write, and a
+destination under a name no table carries is never checked.
+
+```text
+[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur format annotation — its calls are judged by key name. Annotate a destination property with "format": "murmur-destination", and any object the tool only stores with "format": "murmur-opaque" (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-018)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The tool keeps
+the key-name rules.
+
+**What to do:** annotate the tool's `input_schema` — `"format": "murmur-destination"` on each
+string property whose value is a file the tool writes, `"format": "murmur-opaque"` on each object
+or array it only stores. The warning is the tool author's to answer, not the operator's: a capsule
+cannot annotate a tool it installs. See [Read-only paths](manifest.md#read-only-paths).

@@ -106,16 +106,7 @@ pub(crate) fn build_tool_inventory(
         let parameters = if matches!(runtime, ArtifactRuntime::Skill) {
             DEFAULT_SCHEMA.clone()
         } else {
-            value
-                .get("input_schema")
-                .or_else(|| value.get("input"))
-                .and_then(|s| {
-                    if let serde_yaml::Value::String(json_str) = s {
-                        serde_json::from_str::<Value>(json_str).ok()
-                    } else {
-                        serde_json::to_value(s).ok()
-                    }
-                })
+            crate::tool_annotations::declared_input_schema(&value)
                 .unwrap_or_else(|| DEFAULT_SCHEMA.clone())
         };
 
