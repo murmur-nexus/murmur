@@ -134,7 +134,7 @@ fn install_refuses_a_release_that_publishes_no_asset_for_this_platform() {
     }
     drop(assertion);
 
-    // A refusal writes nothing: the download the loose match used to reach is never issued.
+    // A refusal writes nothing: no asset download is issued at all.
     let store = home.path().join(".murmur").join("artifacts").join(ARTIFACT);
     assert!(!store.exists(), "{} was written", store.display());
 }
