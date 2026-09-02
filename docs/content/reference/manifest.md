@@ -354,7 +354,9 @@ Rules:
 - **`filesystem.scope` is a real directory grant.** `<accessible workdir>/<scope>` is mounted as
   that artifact's current directory instead of the whole workdir, and is created if missing.
   `scope: "."` is the explicit "whole workdir" grant. An absolute scope, or one escaping via `..`,
-  fails at staging with [`E-CAP-002`](diagnostics.md#e-cap-002).
+  fails at staging with [`E-CAP-002`](diagnostics.md#e-cap-002). It is this scope, and not the
+  capsule's containment class, that bounds what a WASM artifact reaches —
+  [What bounds a WASM artifact](containment.md#artifact-boundary).
 - **Only the capsule operator can grant**, exactly as for hooks: the block is read from your
   manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`.
 - **Drivers narrow identically.** The artifact named by `inference.driver.artifact` dispatches
@@ -548,7 +550,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.resources.cgroup_cpu_percent` | integer | no | cgroup v2 `cpu.max` quota as a percentage of one core (200 = two cores' worth). Default: 200. Must be > 0. Linux only. |
 | `capabilities.resources.cgroup_io_bytes_per_sec` | integer | no | cgroup v2 `io.max` read+write throughput on the workdir's backing device, in bytes/sec. Default: 104857600 (100 MiB/s). Must be > 0. Linux only, best-effort — a workdir whose backing device cannot be resolved (overlayfs, tmpfs, device-mapper) logs a note and keeps the other three controllers. |
 | `capabilities.resources.workdir_max_bytes` | integer | no | Ceiling on total session-workdir size, in bytes, enforced by a periodic check. Default: 10737418240 (10 GiB). Must be > 0. Every platform. Under the `sealed` containment class this also bounds `/tmp`, which is backed by a directory inside the session workdir — see [the fixed capsule device set](containment.md#capsule-device-set). |
-| `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging. |
+| `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
 | `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the `delegate-task` tool in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
@@ -1079,7 +1081,8 @@ Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
 - must be relative, not absolute
 - cannot escape the workdir via `..`
 
-A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002).
+A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002). See
+[What bounds a WASM artifact](containment.md#artifact-boundary).
 
 ### Read-only paths { #read-only-paths }
 
