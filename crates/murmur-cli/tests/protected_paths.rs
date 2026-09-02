@@ -693,12 +693,22 @@ fn mur() -> Command {
 
 /// A script capsule declaring only capabilities — enough to reach staging, which is where both
 /// the `E-CAP-012` refusal and the `W-SEC-017` warning are decided.
+///
+/// An empty `shell_allow` omits the `shell:` block rather than writing an empty one, which is what
+/// keeps a case that has nothing to do with shell off the subprocess-capable-host gates: a capsule
+/// that can spawn refuses at `E-CAP-005`/`E-RUN-012` on a host without a network namespace or a
+/// delegated cgroup scope, and that refusal comes before anything this file asserts on.
 fn staging_project(read_only: &[&str], shell_allow: &[&str]) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
-    let shell_yaml: String = shell_allow
-        .iter()
-        .map(|binary| format!("      - {binary}\n"))
-        .collect();
+    let shell_yaml: String = if shell_allow.is_empty() {
+        String::new()
+    } else {
+        let allowed: String = shell_allow
+            .iter()
+            .map(|binary| format!("      - {binary}\n"))
+            .collect();
+        format!("  shell:\n    allow:\n{allowed}")
+    };
     let read_only_yaml: String = read_only
         .iter()
         .map(|entry| format!("      - \"{entry}\"\n"))
@@ -709,8 +719,6 @@ fn staging_project(read_only: &[&str], shell_allow: &[&str]) -> tempfile::TempDi
             "name: staging-capsule\n\
              version: 0.1.0\n\
              capabilities:\n\
-             \x20 shell:\n\
-             \x20   allow:\n\
              {shell_yaml}\
              \x20 filesystem:\n\
              \x20   read_only:\n\
@@ -728,6 +736,9 @@ fn staging_project(read_only: &[&str], shell_allow: &[&str]) -> tempfile::TempDi
 
 /// A `read_only` entry that cannot be a workdir subtree refuses the launch with `E-CAP-012`,
 /// naming the entry and the rule it broke, before a session directory exists.
+///
+/// Declares no shell allowlist: the refusal has nothing to do with shell, and a capsule that can
+/// spawn is gated on a network namespace and a delegated cgroup scope this case does not need.
 #[test]
 fn a_malformed_read_only_entry_refuses_the_launch() {
     for (entry, rule) in [
@@ -736,7 +747,7 @@ fn a_malformed_read_only_entry_refuses_the_launch() {
         ("tests/../../outside", "cannot escape the workdir via '..'"),
     ] {
         let home = tempfile::tempdir().unwrap();
-        let project = staging_project(&[entry], &["bash"]);
+        let project = staging_project(&[entry], &[]);
 
         mur()
             .env("HOME", home.path())
@@ -761,8 +772,17 @@ fn a_malformed_read_only_entry_refuses_the_launch() {
 
 /// Declaring `read_only` alongside an allowlisted interpreter warns, once per interpreter, that
 /// the declaration is advisory for that binary — and names the binary.
+///
+/// The shell allowlist is what the warning is about, so this one cannot drop it: staging refuses a
+/// spawn-capable capsule before it warns, and on a host without a network namespace or a delegated
+/// cgroup scope that refusal is all there is to see.
 #[test]
 fn staging_warns_that_read_only_is_advisory_for_an_interpreter() {
+    if common::skip_without_host_support(
+        "staging_warns_that_read_only_is_advisory_for_an_interpreter",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let project = staging_project(&["tests"], &["bash", "python3"]);
 
@@ -781,8 +801,16 @@ fn staging_warns_that_read_only_is_advisory_for_an_interpreter() {
 }
 
 /// A capsule that declares nothing read-only warns about nothing.
+///
+/// Keeps the shell allowlist, because "an allowlisted interpreter and no `read_only`" is the
+/// pairing under test — which puts it behind the same host gates as the warning case above. Guarded
+/// rather than left to pass on its own: an assertion that something is absent is satisfied by a
+/// staging refusal that printed nothing at all.
 #[test]
 fn no_declaration_means_no_warning() {
+    if common::skip_without_host_support("no_declaration_means_no_warning") {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     fs::write(
