@@ -321,7 +321,17 @@ impl DelegationPlane {
 
         // Handed back the moment the child is up and has reported its session id, so a child that
         // then hangs, crashes or is timed out is already attributable from the parent's side.
-        if let Some(launched) = &origin.launched {
+        //
+        // An unnamed delegation is not announced. A caller with no session id or no conversation
+        // to name injects no handle, so the launcher minted no id and there is nothing for the
+        // terminal `delegation` line — which writes `null` rather than an empty id — to join
+        // against. `delegation_start.delegation_id` is required to be a `dlg_` id; a launch that
+        // has none writes no line at all.
+        if let Some(launched) = origin
+            .launched
+            .as_ref()
+            .filter(|_| !delegation_id.is_empty())
+        {
             let _ = launched.send(DelegationLaunch {
                 delegation_id: delegation_id.clone(),
                 capsule: request.capsule.clone(),

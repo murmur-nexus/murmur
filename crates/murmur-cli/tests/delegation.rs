@@ -671,7 +671,10 @@ impl Parent {
         let staged = stage_session(
             Arc::new(LocalRegistry::new(&suite.registry)),
             StageRequest {
-                context_id,
+                // An empty context is a per-message fact, not a launch-scoped one: `--context`
+                // refuses one, while an A2A `contextId` of `""` is taken as the conversation. So
+                // an empty id here means "stamp it on every message" and "fix none at launch".
+                context_id: context_id.filter(|id| !id.is_empty()),
                 resume,
                 ..stage_request(&project, &runtime_manifest)
             },
@@ -1530,4 +1533,42 @@ fn lineage_survives_a_resume_of_the_parent() {
         json!(first_session_id),
         "the child still names the session that spawned it"
     );
+}
+
+/// A delegation the runtime cannot name writes no `delegation_start`, rather than one whose
+/// required `delegation_id` is the empty string.
+///
+/// An A2A client may send an empty `contextId`, which is taken as the conversation rather than
+/// replaced by a minted one. There is then no conversation to name in a spawner handle, so the
+/// launcher mints no `dlg_` id — and the terminal `delegation` line writes `null` for it. The
+/// launch line has no `null` to write, so it is not written at all: the two records can never
+/// disagree about which delegation they describe.
+#[test]
+fn a_delegation_with_no_id_writes_no_launch_line() {
+    if common::skip_without_host_support("a_delegation_with_no_id_writes_no_launch_line") {
+        return;
+    }
+    let parent = Parent::launch_in(
+        TempDir::new().unwrap().keep(),
+        PARENT,
+        SPAWN_YAML,
+        Some(String::new()),
+        None,
+    );
+    let text = parent.delegate("toolu_unnamed", WORKER, VERSION, "answer once");
+    let result: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
+
+    // The delegation itself still happened: the child ran and its answer came back.
+    assert_eq!(result["status"], "completed", "{text}");
+    assert!(unfence(result["output"].as_str().unwrap_or_default()).contains(WORKER_ANSWER));
+
+    // Neither record names a delegation, and neither invents an empty id.
+    assert!(
+        parent.events("delegation_start").is_empty(),
+        "an unnamed delegation opens no launch line"
+    );
+    let ended = parent.events("delegation");
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["delegation_id"], Value::Null, "{}", ended[0]);
 }

@@ -882,7 +882,7 @@ Output sections, in the order they are printed:
 
 | Section | Printed | Contents |
 |---|---|---|
-| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash |
+| Session | always | `session_id`, capsule name+version, model, exit status, duration, granted capability categories, declared tools, `containment: <declared> → <achieved>`, `workdir exec`, `userns`, and the system prompt's source and hash. For a capsule another capsule launched, a `Spawned by <session> (delegation <id>)` line follows `session` |
 | Hook failures | one or more `hook_dispatch_error` records | One `✗ <hook> <lifecycle event> <arm>` row per fault |
 | Retention | one or more [`retention`](observability-schemas.md#retention) records | One `<store>  <reason>  removed <n>` row per pair, followed by the names of what went |
 | Context | one or more `context_seed` records | Per seeding hook: outcome, tokens committed, tokens proposed, the budget, the rejection reason, and the ids of the messages seeded |
@@ -897,6 +897,7 @@ Output sections, in the order they are printed:
 | Reopens | one or more `task_reopened` records | Per reopen: its ordinal, the hook that asked, and the feedback it injected |
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
+| Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that is not `completed`, and the path to the child's own trace follows on any delegation that launched one |
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
 
