@@ -324,9 +324,9 @@ impl PreopenReport {
         let role = &self.role;
         let surface = self.surface.summary();
         match &self.scope {
-            Some(scope) => format!(
-                "{artifact} ({role}): {surface} — capabilities.filesystem.scope: {scope}"
-            ),
+            Some(scope) => {
+                format!("{artifact} ({role}): {surface} — capabilities.filesystem.scope: {scope}")
+            }
             None => format!(
                 "{artifact} ({role}): {surface} — no capabilities.filesystem.scope declared"
             ),

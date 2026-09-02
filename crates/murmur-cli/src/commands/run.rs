@@ -7,9 +7,9 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session, preopen_reports, stage_session, state_store_reports, AfterTask, ArtifactRequest,
-    LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
-    TaskAcceptance,
+    launch_session, preopen_reports, stage_session, state_store_reports, AfterTask,
+    ArtifactRequest, LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError,
+    StageRequest, TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,

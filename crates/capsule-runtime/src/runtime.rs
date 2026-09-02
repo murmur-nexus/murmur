@@ -463,13 +463,14 @@ pub fn stage_session(
     // the identical inputs, so all three describe one preopen set. An escaping scope refuses the
     // launch here, before any registry pull or workdir creation, on the same terms a malformed
     // store name does.
-    let preopens = crate::network_policy::preopen_reports(request.artifacts.iter().map(|artifact| {
-        (
-            artifact.name.as_str(),
-            &artifact.runtime,
-            artifact.capabilities.as_ref(),
-        )
-    }))?;
+    let preopens =
+        crate::network_policy::preopen_reports(request.artifacts.iter().map(|artifact| {
+            (
+                artifact.name.as_str(),
+                &artifact.runtime,
+                artifact.capabilities.as_ref(),
+            )
+        }))?;
     let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,

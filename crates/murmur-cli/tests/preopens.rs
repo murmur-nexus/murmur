@@ -112,7 +112,11 @@ fn install_wasm_artifact(fixture: &Path, project_dir: &Path, name: &str, runtime
 fn an_undeclared_tool_reads_as_the_whole_workdir() {
     let home = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();
-    project(dir.path(), "", &[artifact_entry("notes-tool", "tool", None)]);
+    project(
+        dir.path(),
+        "",
+        &[artifact_entry("notes-tool", "tool", None)],
+    );
 
     let stdout = explain_scope_stdout(&home, dir.path());
     assert!(
@@ -186,7 +190,11 @@ fn the_three_surfaces_render_as_three_different_lines() {
         })
         .collect();
 
-    assert_eq!(lines.len(), 3, "expected three preopen lines, got:\n{stdout}");
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected three preopen lines, got:\n{stdout}"
+    );
     assert!(
         lines[2].contains("nothing preopened — no capabilities.filesystem.scope declared"),
         "an ungranted hook must read as nothing preopened, got: {}",
