@@ -150,6 +150,19 @@ pub const W_SEC_016: &str = "W-SEC-016";
 /// `read_only`.
 pub const W_SEC_017: &str = "W-SEC-017";
 
+/// `capabilities.filesystem.read_only` is declared and an installed tool's `input_schema` names a
+/// path-shaped or destination-shaped property without saying which of its inputs are filesystem
+/// destinations, so its calls are judged by key name.
+///
+/// The dispatch-time write-intent analyser guesses from property names when a tool tells it
+/// nothing: an input pairing a path-shaped key with a content-shaped key is refused, wherever in
+/// the input that pair sits. The guess is wrong in both directions — a note a tool merely stores
+/// is refused as a write, and a destination under an unrecognized name is never checked. A tool
+/// silences this by annotating its schema: `"format": "murmur-destination"` on a destination
+/// string, `"format": "murmur-opaque"` on an object or array it only stores. Fires once per
+/// installed tool, at staging, only for a capsule that declared `read_only`.
+pub const W_SEC_018: &str = "W-SEC-018";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -169,7 +182,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017,
+            W_SEC_017, W_SEC_018,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

@@ -54,6 +54,7 @@ pub mod state_store;
 pub(crate) mod streaming;
 pub(crate) mod task_io_import;
 pub(crate) mod tokens_import;
+pub(crate) mod tool_annotations;
 pub(crate) mod trace;
 pub(crate) mod trace_blobs;
 pub mod types;
