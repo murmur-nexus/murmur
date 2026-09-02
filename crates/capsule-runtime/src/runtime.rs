@@ -4850,7 +4850,7 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub const RESERVED_TOOL_NAMES: [&str; 3] =
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 3] =
     [SHARE_FILE_TOOL, FETCH_PEER_FILE_TOOL, DELEGATE_TASK_TOOL];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
@@ -4858,7 +4858,7 @@ pub const RESERVED_TOOL_NAMES: [&str; 3] =
 /// Matched exactly rather than case-insensitively: artifact names are case-sensitive everywhere
 /// else in this codebase, so a name differing only in case is a different artifact.
 #[must_use]
-pub fn is_reserved_tool_name(name: &str) -> bool {
+pub(crate) fn is_reserved_tool_name(name: &str) -> bool {
     RESERVED_TOOL_NAMES.contains(&name)
 }
 

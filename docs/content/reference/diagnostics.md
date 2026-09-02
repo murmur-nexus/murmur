@@ -512,8 +512,8 @@ error[E-CAP-013]: artifact 'delegate-task' collides with a tool the runtime prov
 
 The check runs at staging, ahead of every artifact in the manifest, so no artifact is resolved,
 pulled or hash-verified and no session directory is created. `mur run --explain-scope` refuses the
-same manifest by the same code. The same refusal covers an in-session `manage.pull()` of one of
-these names, which the guest receives as an error string.
+same manifest by the same code. An in-session `manage.pull()` of one of these names is refused the
+same way, and the running capsule receives that refusal as an error string.
 
 Shell binary names are not reserved: they come from `capabilities.shell.allow`. See
 [Runtime-provided tools](runtime-provided-tools.md#reserved-names).
