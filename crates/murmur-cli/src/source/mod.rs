@@ -8,14 +8,28 @@ use crate::config::{MurConfig, SourceConfig, SourceType};
 
 use self::github::GitHubSource;
 
+/// What one source returned for one artifact.
+///
+/// [`Self::platform`] is the tag on the asset name that was actually selected, not the platform
+/// that was asked for: an install has to record which platform the bytes it holds are for, and a
+/// source that answered with an untagged asset did not say.
+#[derive(Debug, Clone)]
+pub struct SourceResolution {
+    pub bytes: Bytes,
+    /// The release tag the asset came from — not a platform.
+    pub resolved_version: String,
+    /// Platform tag split off the selected asset name, or `None` when the asset carries none.
+    pub platform: Option<String>,
+}
+
 pub trait ArtifactSource: Send + Sync {
     fn name(&self) -> &str;
-    fn resolve_bare(&self, name: &str) -> Result<(Bytes, String), SourceError>;
+    fn resolve_bare(&self, name: &str) -> Result<SourceResolution, SourceError>;
     fn resolve_bare_with_version(
         &self,
         name: &str,
         version: &str,
-    ) -> Result<(Bytes, String), SourceError> {
+    ) -> Result<SourceResolution, SourceError> {
         let _ = version;
         self.resolve_bare(name)
     }
@@ -29,10 +43,9 @@ pub trait ArtifactSource: Send + Sync {
         name: &str,
         version: &str,
         platform: &str,
-    ) -> Result<Vec<u8>, SourceError> {
+    ) -> Result<SourceResolution, SourceError> {
         let _ = platform;
         self.resolve_bare_with_version(name, version)
-            .map(|(bytes, _)| bytes.to_vec())
     }
 }
 
@@ -46,6 +59,9 @@ pub struct ResolvedSource {
     pub bytes: Bytes,
     pub source: String,
     pub resolved_version: Option<String>,
+    /// Platform tag of the asset name the source selected, or `None` when it carries none.
+    /// What an install records as the payload's platform, for a native payload.
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,11 +178,12 @@ impl SourceChain {
             };
 
             match result {
-                Ok((bytes, resolved_version)) => {
+                Ok(resolution) => {
                     return Ok(ResolvedSource {
-                        bytes,
+                        bytes: resolution.bytes,
                         source: source.name().to_string(),
-                        resolved_version: Some(resolved_version),
+                        resolved_version: Some(resolution.resolved_version),
+                        platform: resolution.platform,
                     });
                 }
                 Err(error) => attempts.push(SourceAttempt {
@@ -205,24 +222,33 @@ impl SourceChain {
                         bytes: r.bytes,
                         source: format!("github:{owner}/{repo}"),
                         resolved_version: Some(r.tag),
+                        platform: r.platform,
                     })
                     .collect()
             })
     }
 
     /// Resolve a specific version of an artifact for the given target platform, trying each
-    /// source in order. Returns the artifact bytes on the first success.
+    /// source in order. Returns the first success, carrying the platform tag of the asset that
+    /// was selected — which may be `None` when the source answered with an untagged asset.
     pub(crate) fn resolve_bare_for_platform(
         &self,
         name: &str,
         version: &str,
         platform: &str,
-    ) -> Result<Vec<u8>, SourceChainError> {
+    ) -> Result<ResolvedSource, SourceChainError> {
         let mut attempts = Vec::new();
 
         for source in &self.sources {
             match source.resolve_bare_with_version_for_platform(name, version, platform) {
-                Ok(bytes) => return Ok(bytes),
+                Ok(resolution) => {
+                    return Ok(ResolvedSource {
+                        bytes: resolution.bytes,
+                        source: source.name().to_string(),
+                        resolved_version: Some(resolution.resolved_version),
+                        platform: resolution.platform,
+                    })
+                }
                 Err(error) => attempts.push(SourceAttempt {
                     source: source.name().to_string(),
                     reason: error.reason(),
@@ -268,7 +294,7 @@ impl ArtifactSource for BrokenSource {
         &self.name
     }
 
-    fn resolve_bare(&self, _name: &str) -> Result<(Bytes, String), SourceError> {
+    fn resolve_bare(&self, _name: &str) -> Result<SourceResolution, SourceError> {
         Err(self.error.clone())
     }
 }
@@ -295,7 +321,7 @@ mod tests {
     struct MockSource {
         name: String,
         calls: Arc<AtomicUsize>,
-        result: Result<(Bytes, String), SourceError>,
+        result: Result<SourceResolution, SourceError>,
     }
 
     impl ArtifactSource for MockSource {
@@ -303,9 +329,17 @@ mod tests {
             &self.name
         }
 
-        fn resolve_bare(&self, _name: &str) -> Result<(Bytes, String), SourceError> {
+        fn resolve_bare(&self, _name: &str) -> Result<SourceResolution, SourceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
+        }
+    }
+
+    fn untagged(bytes: &'static [u8], version: &str) -> SourceResolution {
+        SourceResolution {
+            bytes: Bytes::from_static(bytes),
+            resolved_version: version.to_string(),
+            platform: None,
         }
     }
 
@@ -324,7 +358,7 @@ mod tests {
                 Box::new(MockSource {
                     name: "second".to_string(),
                     calls: Arc::clone(&second_calls),
-                    result: Ok((Bytes::from_static(b"artifact"), "0.1.0".to_string())),
+                    result: Ok(untagged(b"artifact", "0.1.0")),
                 }),
             ],
             Vec::new(),
@@ -350,7 +384,7 @@ mod tests {
             vec![Box::new(MockSource {
                 name: "chain-source".to_string(),
                 calls: Arc::clone(&calls),
-                result: Ok((Bytes::from_static(b"from-chain"), "1.0.0".to_string())),
+                result: Ok(untagged(b"from-chain", "1.0.0")),
             })],
             Vec::new(),
         );

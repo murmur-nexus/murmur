@@ -101,18 +101,27 @@ pub struct ArtifactRequest {
     pub config: Option<serde_yaml::Value>,
 }
 
+/// What `murmur.lock` pins one artifact at, already narrowed to this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockExpectation {
     pub name: String,
     pub resolved_version: String,
-    pub sha256_wasm: String,
+    /// The hash the resolved payload must have. Selected by the caller from the lock entry's
+    /// `sha256` for the platform staging runs on, so it is whichever of `any` or
+    /// `platforms.<platform>` applies to this host.
+    pub sha256: String,
 }
 
+/// What staging actually resolved, for the caller to write back into `murmur.lock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLockArtifact {
     pub name: String,
     pub resolved_version: String,
-    pub sha256_wasm: String,
+    /// Hash of the payload that was resolved on this host.
+    pub sha256: String,
+    /// Which platform the resolved payload is filed under, `None` for a platform-independent
+    /// one. Decides whether the lock entry pins `sha256.any` or `sha256.platforms.<platform>`.
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

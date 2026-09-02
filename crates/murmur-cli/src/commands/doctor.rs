@@ -10,7 +10,7 @@ use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, native_binary_verdict,
     parse_tool_implementation_from_yaml, read_lockfile, resolve_manifest_path, sha256_hex,
     ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock,
-    NativeBinaryVerdict,
+    NativeBinaryVerdict, PlatformMatch, W_REG_001,
 };
 
 use crate::commands::install::find_project_root;
@@ -92,14 +92,17 @@ enum LockVerdict {
     MissingEntry,
     /// The lock pins a different version than the manifest declares.
     VersionMismatch { pinned: String },
-    /// The bytes on disk hash to something other than the pinned `sha256.wasm` —
+    /// The bytes on disk hash to something other than the hash pinned for this platform —
     /// `mur run` fails with E-REG-002.
     HashMismatch { expected: String, actual: String },
+    /// The entry pins this artifact for other platforms but not for this host's —
+    /// `mur run` fails with E-RUN-003.
+    MissingPlatform { pinned: String },
 }
 
 /// Check one installed artifact against the lockfile the way `stage_session` does:
-/// entry must exist, its `resolved_version` must equal the manifest pin, and its
-/// `sha256.wasm` must equal the hash of the bytes that were actually resolved.
+/// entry must exist, its `resolved_version` must equal the manifest pin, and the hash it pins
+/// for `platform` must equal the hash of the bytes that were actually resolved.
 ///
 /// A version mismatch short-circuits the hash comparison — hashing bytes for a version
 /// already known to be wrong would report one drifted artifact as two failures.
@@ -108,6 +111,7 @@ fn check_lock_entry(
     name: &str,
     version: &str,
     artifact_bytes: &[u8],
+    platform: &str,
 ) -> LockVerdict {
     let Some(entry) = lock.artifact_for(name) else {
         return LockVerdict::MissingEntry;
@@ -119,10 +123,16 @@ fn check_lock_entry(
         };
     }
 
+    let Some(expected) = entry.sha256.for_platform(platform) else {
+        return LockVerdict::MissingPlatform {
+            pinned: entry.sha256.platform_tags().join(", "),
+        };
+    };
+
     let actual = sha256_hex(artifact_bytes);
-    if actual != entry.sha256.wasm {
+    if actual != expected {
         return LockVerdict::HashMismatch {
-            expected: entry.sha256.wasm.clone(),
+            expected: expected.to_string(),
             actual,
         };
     }
@@ -406,6 +416,11 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
 
     let mut total_pass: u32 = 0;
     let mut fixes: Vec<String> = Vec::new();
+    // Findings that are worth a printed Fix but are not failures. Kept apart from `fixes`
+    // because the exit code is driven by `fixes` alone: an artifact resolved off the untagged
+    // path still runs, and failing every pre-upgrade store's `mur doctor` in CI would be a
+    // worse outcome than the migration it announces.
+    let mut warnings: Vec<String> = Vec::new();
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {
@@ -431,7 +446,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             ArtifactPresence::Installed(resolved) => {
                 // No lockfile: presence is the whole check, as it has always been.
                 let verdict = match &lock {
-                    Some(lock) => check_lock_entry(lock, name, version, &resolved.bytes),
+                    Some(lock) => check_lock_entry(lock, name, version, &resolved.bytes, platform),
                     None => LockVerdict::Ok,
                 };
 
@@ -439,6 +454,15 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                     // A green line names only what was read: the host platform appears on it
                     // solely for a native binary this check identified and matched, never for an
                     // artifact whose payload doctor never opened.
+                    LockVerdict::Ok
+                        if resolved.platform_match == PlatformMatch::UntaggedFallback =>
+                    {
+                        println!(
+                            "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
+                        );
+                        warnings.push(format!("mur install {ref_str}"));
+                        total_pass += 1;
+                    }
                     LockVerdict::Ok => {
                         match check_artifact_platform(
                             name,
@@ -485,6 +509,12 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                             "{name}: remove the stale murmur.lock entry, then run mur install {ref_str}"
                         ));
                     }
+                    LockVerdict::MissingPlatform { pinned } => {
+                        println!(
+                            "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} murmur.lock has no sha256 for '{name}' on {platform}: it pins {pinned}"
+                        );
+                        fixes.push(format!("mur install {ref_str}"));
+                    }
                     LockVerdict::HashMismatch { expected, actual } => {
                         println!(
                             "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} artifact integrity check failed for {ref_str}"
@@ -508,19 +538,31 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
 
     println!();
 
-    if fixes.is_empty() {
+    if fixes.is_empty() && warnings.is_empty() {
         println!("All checks passed.");
         return Ok(());
     }
 
     let total_fail = fixes.len();
+    let total_warn = warnings.len();
     let ps = if total_pass == 1 { "" } else { "s" };
     let es = if total_fail == 1 { "" } else { "s" };
-    println!("{total_pass} check{ps} passed, {total_fail} error{es} found.");
+    let warn_tail = if total_warn == 0 {
+        String::new()
+    } else {
+        let ws = if total_warn == 1 { "" } else { "s" };
+        format!(", {total_warn} warning{ws}")
+    };
+    println!("{total_pass} check{ps} passed, {total_fail} error{es} found{warn_tail}.");
     println!();
 
-    for fix in &fixes {
+    for fix in fixes.iter().chain(warnings.iter()) {
         println!("Fix: {fix}");
+    }
+
+    // A warning is a report, not a failure: the artifact resolves and a session would run it.
+    if fixes.is_empty() {
+        return Ok(());
     }
 
     // Exit non-zero so `mur doctor` can be used in CI pre-flight checks.

@@ -14,10 +14,10 @@ use murmur_artifact::{
     parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
     write_lockfile_atomic, AfterTask, ArtifactImplementation, ArtifactRuntime, ContextConfig,
     ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
-    LockedArtifact, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
-    RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
-    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
-    W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
+    LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
+    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
+    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
+    W_SEC_016, W_SEC_017, W_SEC_018,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -650,7 +650,7 @@ pub fn stage_session(
 
                 (
                     expected.resolved_version.clone(),
-                    Some(expected.sha256_wasm.clone()),
+                    Some(expected.sha256.clone()),
                 )
             }
             None => (artifact.version.clone(), None),
@@ -673,6 +673,13 @@ pub fn stage_session(
             &resolved.sha256,
         )
         .map_err(|_| RuntimeError::artifact_integrity_failed(&artifact.name, &resolved_version))?;
+
+        // Which platform this payload gets pinned under in `murmur.lock`. A native binary is a
+        // different payload per platform, so its hash is only ever the hash for this host; a
+        // WASM component or a skill is the same bytes everywhere and is pinned once. Read from
+        // the payload's own recorded runtime, the same question `pull` asks.
+        let resolved_platform =
+            (resolved.meta.runtime == RuntimeType::Native).then(|| current_platform().to_string());
 
         if let Some(expected) = expected_hash {
             if resolved.sha256 != expected {
@@ -818,7 +825,8 @@ pub fn stage_session(
         resolved_lock_artifacts.push(ResolvedLockArtifact {
             name: artifact.name.clone(),
             resolved_version: resolved_version.clone(),
-            sha256_wasm: resolved.sha256,
+            sha256: resolved.sha256,
+            platform: resolved_platform,
         });
         installed_artifacts.push(InstalledArtifactSummary {
             name: artifact.name.clone(),
@@ -3706,13 +3714,20 @@ impl manage::Host for CapsuleStoreState {
             Err(err) => return Err(format!("failed to read murmur.lock: {err}")),
         };
 
+        // Which shape the pin takes follows the payload: a native binary is pinned under this
+        // host's platform, everything else under `any`. An entry that has no key for this
+        // platform yet is not a conflict — it is a platform nobody has installed on before.
+        let incoming_sha256 = if resolved.meta.runtime == RuntimeType::Native {
+            LockedSha256::for_one_platform(current_platform(), resolved.sha256.clone())
+        } else {
+            LockedSha256::any(resolved.sha256.clone())
+        };
+
         if let Some(existing) = lock.artifact_for(&name) {
-            if existing.resolved_version != version || existing.sha256.wasm != resolved.sha256 {
+            if let Some(conflict) = existing.conflict_with(&version, &incoming_sha256) {
                 return Err(format!(
-                    "murmur.lock conflict for '{name}': pinned {}@{} (sha256 {}), but the \
-                     registry now resolves {name}@{version} (sha256 {}) — refusing to override \
-                     a pinned artifact at runtime",
-                    existing.name, existing.resolved_version, existing.sha256.wasm, resolved.sha256
+                    "murmur.lock conflict for '{name}': {conflict} — refusing to override a \
+                     pinned artifact at runtime"
                 ));
             }
         }
@@ -3756,20 +3771,7 @@ impl manage::Host for CapsuleStoreState {
         };
 
         // 4. Files are on disk — now, and only now, update murmur.lock.
-        if let Some(entry) = lock.artifacts.iter_mut().find(|entry| entry.name == name) {
-            entry.resolved_version = version.clone();
-            entry.sha256 = LockedSha256 {
-                wasm: resolved.sha256.clone(),
-            };
-        } else {
-            lock.artifacts.push(LockedArtifact {
-                name: name.clone(),
-                resolved_version: version.clone(),
-                sha256: LockedSha256 {
-                    wasm: resolved.sha256.clone(),
-                },
-            });
-        }
+        lock.upsert(&name, &version, incoming_sha256);
         write_lockfile_atomic(&self.lock_path, &lock)
             .map_err(|err| format!("failed to write murmur.lock: {err}"))?;
 
@@ -5958,6 +5960,7 @@ fn resolve_lifecycle(
 
 #[cfg(test)]
 mod tests {
+    use murmur_artifact::LockedArtifact;
 
     // ── delegate-task's synthetic manifest ───────────────────────────────────
 
@@ -6672,6 +6675,7 @@ inference:
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: "definitely-wrong".to_string(),
+                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -6760,6 +6764,7 @@ inference:
                     },
                     bytes: b"not-a-real-zip".to_vec().into(),
                     sha256: murmur_artifact::sha256_hex(b"not-a-real-zip"),
+                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -6795,7 +6800,7 @@ inference:
             lock_expectations: Some(vec![crate::types::LockExpectation {
                 name: "echo-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
-                sha256_wasm: "different".to_string(),
+                sha256: "different".to_string(),
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -6874,7 +6879,7 @@ inference:
             lock_expectations: Some(vec![crate::types::LockExpectation {
                 name: "different-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
-                sha256_wasm: "abc".to_string(),
+                sha256: "abc".to_string(),
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -6952,7 +6957,7 @@ inference:
             lock_expectations: Some(vec![crate::types::LockExpectation {
                 name: "echo-tool".to_string(),
                 resolved_version: "0.0.1".to_string(),
-                sha256_wasm: "abc".to_string(),
+                sha256: "abc".to_string(),
             }]),
             capability_policy: CapabilityPolicy::default(),
             inference: None,
@@ -7344,6 +7349,7 @@ inference:
                 },
                 bytes: self.bytes.clone().into(),
                 sha256: self.sha256.clone(),
+                platform_match: murmur_artifact::PlatformMatch::NotApplicable,
             })
         }
 
@@ -7398,7 +7404,7 @@ inference:
             .artifact_for("my-skill")
             .expect("lock entry for my-skill");
         assert_eq!(entry.resolved_version, "1.0.0");
-        assert_eq!(entry.sha256.wasm, expected_sha256);
+        assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
     }
 
     /// A mid-session `manage.pull()` lands on disk but does not reach the wire: the agent loop
@@ -7486,6 +7492,7 @@ inference:
                     },
                     bytes: b"tampered-bytes".to_vec().into(),
                     sha256: "not-the-real-hash".to_string(),
+                    platform_match: murmur_artifact::PlatformMatch::NotApplicable,
                 })
             }
 
@@ -7546,9 +7553,7 @@ inference:
                 artifacts: vec![LockedArtifact {
                     name: "my-skill".to_string(),
                     resolved_version: "1.0.0".to_string(),
-                    sha256: LockedSha256 {
-                        wasm: "pinned-hash-from-earlier-pull".to_string(),
-                    },
+                    sha256: LockedSha256::any("pinned-hash-from-earlier-pull".to_string()),
                 }],
             },
         )
@@ -7574,7 +7579,10 @@ inference:
         let lock = read_lockfile(&lock_path).unwrap();
         let entry = lock.artifact_for("my-skill").unwrap();
         assert_eq!(entry.resolved_version, "1.0.0");
-        assert_eq!(entry.sha256.wasm, "pinned-hash-from-earlier-pull");
+        assert_eq!(
+            entry.sha256.any.as_deref().unwrap(),
+            "pinned-hash-from-earlier-pull"
+        );
     }
 
     /// Writes an executable shell script native-tool fixture that echoes the given env

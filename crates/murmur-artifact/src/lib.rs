@@ -11,6 +11,7 @@ pub mod manifest_path;
 pub mod payload_shape;
 pub mod platform;
 pub mod registry;
+pub mod registry_warnings;
 pub mod runtime_manifest;
 pub mod secrets;
 pub mod security_warnings;
@@ -41,13 +42,15 @@ pub use payload_shape::{
     CAPSULE_WASM_ENTRY, NATIVE_BIN_DIR, SKILL_MD_ENTRY, WASM_EXTENSION,
 };
 pub use platform::{
-    binary_platform, current_platform, native_binary_verdict, NativeBinaryVerdict, DARWIN_ANY_ARCH,
+    binary_platform, current_platform, native_binary_verdict, split_platform_suffix,
+    split_platform_tag, NativeBinaryVerdict, DARWIN_ANY_ARCH, SUPPORTED_PLATFORMS,
 };
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
-    LocalRegistry, Platform, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
-    RESERVED_VERSIONS,
+    LocalRegistry, Platform, PlatformMatch, PublishResult, Registry, RegistryError,
+    ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
 };
+pub use registry_warnings::{registry_warning_link, W_REG_001};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,

@@ -6,7 +6,7 @@ use std::{
 use murmur_artifact::{
     current_platform, is_reserved_version, load_manifest, load_manifest_from_artifact,
     load_manifest_yaml_from_artifact, parse_tool_implementation_from_yaml, resolve_manifest_path,
-    ArtifactImplementation, ArtifactMeta, RuntimeType,
+    split_platform_tag, ArtifactImplementation, ArtifactMeta, RuntimeType,
 };
 
 use crate::{
@@ -139,19 +139,12 @@ fn resolve_publish_artifact_path(artifact_path_arg: Option<&Path>) -> Result<Pat
 
 /// Parse a platform string in `os-arch` format (e.g. `darwin-aarch64`) into `(os, arch)`.
 pub(crate) fn parse_platform(input: &str) -> Result<(String, String), CliError> {
-    let Some((os, arch)) = input.split_once('-') else {
-        return Err(CliError::new(
-            E_IO_003,
-            format!("invalid platform '{input}' (expected os-arch, e.g. darwin-aarch64)"),
-        ));
-    };
-
-    if os.trim().is_empty() || arch.trim().is_empty() {
-        return Err(CliError::new(
-            E_IO_003,
-            format!("invalid platform '{input}' (expected os-arch, e.g. darwin-aarch64)"),
-        ));
-    }
-
-    Ok((os.to_string(), arch.to_string()))
+    split_platform_tag(input)
+        .map(|(os, arch)| (os.to_string(), arch.to_string()))
+        .ok_or_else(|| {
+            CliError::new(
+                E_IO_003,
+                format!("invalid platform '{input}' (expected os-arch, e.g. darwin-aarch64)"),
+            )
+        })
 }

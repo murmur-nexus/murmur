@@ -8,14 +8,14 @@ use std::{
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
     launch_session, preopen_reports, stage_session, state_store_reports, AfterTask,
-    ArtifactRequest, LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError,
-    StageRequest, TaskAcceptance,
+    ArtifactRequest, LifecycleOverride, LockExpectation, ResolvedLockArtifact, ResumeMode,
+    ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
-    read_lockfile, write_lockfile_atomic, ArtifactRuntime, ContainmentClass, InferenceConfig,
-    LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock, Registry,
-    ResolvedArtifact, LOCK_VERSION,
+    read_lockfile, registry_warning_link, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
+    InferenceConfig, LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
+    PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 
 use crate::{
@@ -31,6 +31,43 @@ use crate::{
 use super::{
     fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus,
 };
+
+/// Report a native payload the store served off its generic, untagged path: it runs here, but
+/// nothing recorded which platform it is for, so installing a second platform into that version
+/// directory would overwrite it. Printed once per artifact, at staging.
+fn warn_untagged_native(name: &str, version: &str) {
+    eprintln!(
+        "warning[{W_REG_001}]: {name}@{version} is a native artifact with no recorded platform \u{2014} \
+         it resolved from the generic store path, where every host resolves the same payload\n  \
+         Fix: mur install {name}@{version}\n  {}",
+        registry_warning_link(W_REG_001)
+    );
+}
+
+/// The `murmur.lock` pin for a payload staging resolved, mirroring `mur install`'s rule: a
+/// native binary is pinned under the platform it was resolved for, everything else under `any`.
+fn locked_sha256(entry: &ResolvedLockArtifact) -> LockedSha256 {
+    match &entry.platform {
+        Some(platform) => LockedSha256::for_one_platform(platform, entry.sha256.clone()),
+        None => LockedSha256::any(entry.sha256.clone()),
+    }
+}
+
+/// A lock that pins this artifact for other platforms but not for this one.
+///
+/// A missing entry for this host, not an integrity failure: the artifact on disk is fine and
+/// nothing has been tampered with — the lock was written somewhere else and has never been
+/// installed against here.
+fn missing_platform_hash(name: &str, host_platform: &str, entry: &LockedArtifact) -> CliError {
+    let pinned = entry.sha256.platform_tags().join(", ");
+    CliError::with_hint(
+        E_RUN_003,
+        format!(
+            "murmur.lock has no sha256 for '{name}' on platform {host_platform} \u{2014} it pins {pinned}"
+        ),
+        "run `mur install` on this host to add this platform's hash to murmur.lock",
+    )
+}
 
 /// In --json mode errors must not produce any stdout output — return the error as-is.
 /// In human mode, delegate to fail_run which prints the status line.
@@ -480,10 +517,22 @@ pub(crate) fn run_run(
                             config: artifact.config.clone(),
                             capabilities: artifact.capabilities.clone(),
                         });
+                        // The hash to verify against is this host's, never another
+                        // platform's: a lock written on one machine pins the payload that
+                        // machine resolved, and for a native tool that is different bytes.
+                        let host_platform = current_platform();
+                        let Some(sha256) = entry.sha256.for_platform(host_platform) else {
+                            return Err(fail(
+                                &session_id,
+                                &workdir,
+                                missing_platform_hash(&artifact.name, host_platform, entry),
+                                json,
+                            ));
+                        };
                         expectations.push(LockExpectation {
                             name: artifact.name.clone(),
                             resolved_version: entry.resolved_version.clone(),
-                            sha256_wasm: entry.sha256.wasm.clone(),
+                            sha256: sha256.to_string(),
                         });
                     }
                     (pinned_artifacts, Some(expectations), false)
@@ -630,9 +679,7 @@ pub(crate) fn run_run(
                 .map(|entry| LockedArtifact {
                     name: entry.name.clone(),
                     resolved_version: entry.resolved_version.clone(),
-                    sha256: LockedSha256 {
-                        wasm: entry.sha256_wasm.clone(),
-                    },
+                    sha256: locked_sha256(entry),
                 })
                 .collect(),
         };
@@ -770,6 +817,9 @@ pub(crate) fn artifact_presence(
     }
 }
 
+/// Resolve every declared artifact the way staging will, refusing the session when one is
+/// missing and reporting `W-REG-001` for each native payload that only resolved off the generic,
+/// untagged path. Both answers come from the same resolve, so the payloads are read once.
 fn check_artifacts_installed(
     project_registry: &LocalRegistry,
     global_registry: &LocalRegistry,
@@ -779,10 +829,16 @@ fn check_artifacts_installed(
     let mut missing = Vec::new();
 
     for artifact in artifacts {
-        if artifact_presence(project_registry, global_registry, artifact, platform)
-            == ArtifactPresence::Missing
-        {
-            missing.push(format!("{}@{}", artifact.name, artifact.version));
+        match artifact_presence(project_registry, global_registry, artifact, platform) {
+            ArtifactPresence::Missing => {
+                missing.push(format!("{}@{}", artifact.name, artifact.version));
+            }
+            ArtifactPresence::Installed(resolved)
+                if resolved.platform_match == PlatformMatch::UntaggedFallback =>
+            {
+                warn_untagged_native(&artifact.name, &artifact.version);
+            }
+            ArtifactPresence::Installed(_) | ArtifactPresence::LocalSource => {}
         }
     }
 

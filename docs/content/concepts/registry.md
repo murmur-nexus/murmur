@@ -27,9 +27,14 @@ they are read fresh from disk on every run.
 
 When a lockfile is present, three things are checked before a session is staged:
 
-1. The lock has an entry for the artifact.
+1. The lock has an entry for the artifact, carrying a hash for this host's platform.
 2. That entry's `resolved_version` matches the version `murmur.yaml` declares.
 3. Its recorded sha256 matches the sha256 of the bytes actually installed.
+
+A native tool is a different binary per platform, so an entry for one pins a hash per platform tag
+and a host verifies against its own — never against another platform's, which would report a
+correct artifact as tampered with. Everything else pins one hash every host verifies against. See
+[the lockfile reference](../reference/workdir.md#lockfile-murmurlock) for the file's shape.
 
 Any disagreement is a refusal, not a warning — the artifact is never used. `mur run` applies the
 check before staging, and `mur doctor` applies the same one without launching anything, so a

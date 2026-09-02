@@ -56,7 +56,7 @@ fn install_pinned_to_project(
 
 /// Overwrite `project_dir/murmur.lock` with a single hand-built entry. `mur install`
 /// writes a correct lock; tests call this afterwards to drift one field from it.
-fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256_wasm: &str) {
+fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &str) {
     let lock_path = project_dir.join("murmur.lock");
     let _ = fs::remove_file(&lock_path);
     write_lockfile_atomic(
@@ -66,9 +66,7 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256_was
             artifacts: vec![LockedArtifact {
                 name: name.to_string(),
                 resolved_version: resolved_version.to_string(),
-                sha256: LockedSha256 {
-                    wasm: sha256_wasm.to_string(),
-                },
+                sha256: LockedSha256::any(sha256.to_string()),
             }],
         },
     )

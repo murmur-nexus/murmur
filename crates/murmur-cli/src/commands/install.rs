@@ -6,10 +6,11 @@ use std::{
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{
-    load_manifest_from_artifact_bytes, load_runtime_manifest, read_lockfile, resolve_manifest_path,
-    sha256_hex, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactRef, LocalRegistry,
-    LockedArtifact, LockedSha256, LockfileError, MurmurLock, RegistryError, LOCK_VERSION,
-    MANIFEST_FILENAME,
+    current_platform, load_manifest_from_artifact_bytes, load_runtime_manifest, read_lockfile,
+    registry_warning_link, resolve_manifest_path, sha256_hex, split_platform_suffix,
+    split_platform_tag, verify_sha256, write_lockfile_atomic, ArtifactMeta, ArtifactRef,
+    LocalRegistry, LockedSha256, LockfileError, MurmurLock, Platform, RegistryError, RuntimeType,
+    LOCK_VERSION, MANIFEST_FILENAME, SUPPORTED_PLATFORMS, W_REG_001,
 };
 use rayon::prelude::*;
 
@@ -28,19 +29,15 @@ fn check_lock_conflict(
     lock_path: &Path,
     name: &str,
     version: &str,
-    sha256: &str,
+    sha256: &LockedSha256,
 ) -> Result<(), CliError> {
     match read_lockfile(lock_path) {
         Ok(lock) => {
             if let Some(entry) = lock.artifact_for(name) {
-                if entry.resolved_version != version || entry.sha256.wasm != sha256 {
+                if let Some(conflict) = entry.conflict_with(version, sha256) {
                     return Err(CliError::with_hint(
                         E_REG_005,
-                        format!(
-                            "murmur.lock conflict for '{name}': pinned {}@{} (sha256 {}), but \
-                             the registry now resolves {name}@{version} (sha256 {sha256})",
-                            entry.name, entry.resolved_version, entry.sha256.wasm
-                        ),
+                        format!("murmur.lock conflict for '{name}': {conflict}"),
                         "if this is an intentional upgrade, remove the stale entry from \
                          murmur.lock before installing again",
                     ));
@@ -53,13 +50,66 @@ fn check_lock_conflict(
     }
 }
 
+/// The `murmur.lock` pin for a payload the store has just recorded.
+///
+/// A native binary is different bytes per platform, so it is pinned under the platform it was
+/// installed for; a WASM component or a static skill is the same bytes everywhere and is pinned
+/// once under `any`. A native payload whose platform nothing recorded (see [`W_REG_001`]) is
+/// still pinned per-platform, under this host's — the bytes this host resolved are the bytes
+/// this hash verifies.
+fn lock_pin(meta: &ArtifactMeta, sha256: &str) -> LockedSha256 {
+    if meta.runtime != RuntimeType::Native {
+        return LockedSha256::any(sha256);
+    }
+    let platform = meta.platforms.first().map_or_else(
+        || current_platform().to_string(),
+        |(os, arch)| format!("{os}-{arch}"),
+    );
+    LockedSha256::for_one_platform(&platform, sha256)
+}
+
+/// The `platforms` list an [`ArtifactMeta`] records for a payload.
+///
+/// Only a native payload carries one: a WASM component or a static skill is filed at the generic
+/// path so every host resolves it, which is the invariant `stage_session`'s registry fallback
+/// depends on. `platform` is what the source reported for the payload it handed back — the tag
+/// on the asset name it selected, or an explicitly requested target platform — never the
+/// manifest's aspiration.
+fn recorded_platforms(
+    name: &str,
+    version: &str,
+    runtime: RuntimeType,
+    platform: Option<&str>,
+) -> Vec<Platform> {
+    if runtime != RuntimeType::Native {
+        return Vec::new();
+    }
+    match platform.and_then(split_platform_tag) {
+        Some((os, arch)) => vec![(os.to_string(), arch.to_string())],
+        None => {
+            warn_untagged_native(name, version);
+            Vec::new()
+        }
+    }
+}
+
+/// Report a native payload filed where every host will resolve it, because nothing in the
+/// install said which platform it is for.
+fn warn_untagged_native(name: &str, version: &str) {
+    eprintln!(
+        "warning[{W_REG_001}]: {name}@{version} is a native artifact with no recorded platform \u{2014} \
+         it was filed at the generic path, where every host resolves it\n  {}",
+        registry_warning_link(W_REG_001)
+    );
+}
+
 /// Upsert a single artifact's entry into `murmur.lock` at `lock_path`, creating the lockfile
 /// if it doesn't exist yet and preserving every other pre-existing entry.
 fn upsert_lock_entry(
     lock_path: &Path,
     name: &str,
     version: &str,
-    sha256: &str,
+    sha256: LockedSha256,
 ) -> Result<(), CliError> {
     let mut lock = match read_lockfile(lock_path) {
         Ok(lock) => lock,
@@ -70,20 +120,7 @@ fn upsert_lock_entry(
         Err(err) => return Err(super::lockfile_error_to_cli(err)),
     };
 
-    if let Some(entry) = lock.artifacts.iter_mut().find(|entry| entry.name == name) {
-        entry.resolved_version = version.to_string();
-        entry.sha256 = LockedSha256 {
-            wasm: sha256.to_string(),
-        };
-    } else {
-        lock.artifacts.push(LockedArtifact {
-            name: name.to_string(),
-            resolved_version: version.to_string(),
-            sha256: LockedSha256 {
-                wasm: sha256.to_string(),
-            },
-        });
-    }
+    lock.upsert(name, version, sha256);
 
     write_lockfile_atomic(lock_path, &lock).map_err(super::lockfile_error_to_cli)
 }
@@ -112,27 +149,34 @@ pub(crate) fn install_resolved(
         manifest.version.clone()
     };
     let sha256 = sha256_hex(&resolved.bytes);
+    let runtime = manifest.registry_runtime();
+    let meta = ArtifactMeta {
+        name: manifest.name.clone(),
+        version: installed_version.clone(),
+        runtime,
+        artifact_runtime: manifest.runtime.clone(),
+        // The platform of the asset the source chain actually selected, not of this host: a
+        // `--all-platforms` or deploy fetch installs a payload for a platform that is not the
+        // one running the install.
+        platforms: recorded_platforms(
+            &manifest.name,
+            &installed_version,
+            runtime,
+            resolved.platform.as_deref(),
+        ),
+        description: None,
+        tags: Vec::new(),
+        wit_contracts: None,
+    };
+    let pin = lock_pin(&meta, &sha256);
     local_registry
-        .store_installed_overwrite(
-            ArtifactMeta {
-                name: manifest.name.clone(),
-                version: installed_version.clone(),
-                runtime: manifest.registry_runtime(),
-                artifact_runtime: manifest.runtime.clone(),
-                platforms: Vec::new(),
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-            },
-            &resolved.bytes,
-            &sha256,
-        )
+        .store_installed_overwrite(meta, &resolved.bytes, &sha256)
         .map_err(CliError::from)?;
     // Source-chain resolutions must still pin the lockfile; without this a github-sourced
     // install stores the artifact but leaves murmur.lock without an entry, so `mur run`
     // later fails with E-RUN-003.
     if let Some(lock_path) = lock_path {
-        upsert_lock_entry(lock_path, &manifest.name, &installed_version, &sha256)?;
+        upsert_lock_entry(lock_path, &manifest.name, &installed_version, pin)?;
     }
     println!(
         "Installed {}@{} from {}",
@@ -155,6 +199,12 @@ pub(crate) fn source_chain_error_to_cli(target: &str, error: SourceChainError) -
     }
 }
 
+/// The platforms `mur install --all-platforms` downloads for.
+///
+/// Deliberately a subset of [`SUPPORTED_PLATFORMS`]: which platforms CI seeds a store with is a
+/// release-engineering decision, separate from which platform strings this build recognises in a
+/// store path, an asset name or a lockfile key. Collapsing the two lists would make adding a
+/// recognised platform silently add a download.
 const ALL_PLATFORMS: &[&str] = &["linux-x86_64", "darwin-aarch64"];
 
 // ─── spinner helpers (mirrors deploy.rs) ─────────────────────────────────────
@@ -298,18 +348,19 @@ fn install_single(
     // name@version — registry first, source chain fallback on NotFound
     let (name, version) = parse_versioned_ref(artifact_ref)?;
     let registry = resolve_registry(registry_override)?;
-    match registry.resolve(name, version) {
+    match registry.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
+            let pin = lock_pin(&resolved.meta, &resolved.sha256);
             if let Some(root) = project_root {
-                check_lock_conflict(&root.join("murmur.lock"), name, version, &resolved.sha256)?;
+                check_lock_conflict(&root.join("murmur.lock"), name, version, &pin)?;
             }
             store
                 .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             if let Some(root) = project_root {
-                upsert_lock_entry(&root.join("murmur.lock"), name, version, &resolved.sha256)?;
+                upsert_lock_entry(&root.join("murmur.lock"), name, version, pin)?;
             }
         }
         Err(RegistryError::NotFound { .. }) => {
@@ -553,7 +604,7 @@ fn install_manifest_deps(
     // how many other artifacts failed.
     for (_, outcome) in &successes {
         if let Some((name, version, sha256)) = &outcome.lock_upsert {
-            upsert_lock_entry(&lock_path, name, version, sha256)?;
+            upsert_lock_entry(&lock_path, name, version, sha256.clone())?;
         }
     }
 
@@ -635,7 +686,7 @@ fn install_summary_tail(count: usize, cached_n: usize, fetched_bytes: u64) -> St
 /// artifacts so every install path pins the lockfile.
 struct FetchOutcome {
     bytes_len: u64,
-    lock_upsert: Option<(String, String, String)>,
+    lock_upsert: Option<(String, String, LockedSha256)>,
 }
 
 /// Fetch one artifact from the registry (or source chain fallback) and write it
@@ -648,18 +699,19 @@ fn fetch_and_store(
     store: &LocalRegistry,
     lock_path: &Path,
 ) -> Result<FetchOutcome, CliError> {
-    match registry.resolve(name, version) {
+    match registry.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
-            check_lock_conflict(lock_path, name, version, &resolved.sha256)?;
+            let pin = lock_pin(&resolved.meta, &resolved.sha256);
+            check_lock_conflict(lock_path, name, version, &pin)?;
             let len = resolved.bytes.len() as u64;
             store
                 .store_installed_overwrite(resolved.meta, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             Ok(FetchOutcome {
                 bytes_len: len,
-                lock_upsert: Some((name.to_string(), version.to_string(), resolved.sha256)),
+                lock_upsert: Some((name.to_string(), version.to_string(), pin)),
             })
         }
         Err(RegistryError::NotFound { .. }) => match source_chain {
@@ -683,27 +735,31 @@ fn fetch_and_store(
                         ),
                     ));
                 }
+                let runtime = inner.registry_runtime();
+                let meta = ArtifactMeta {
+                    name: inner.name.clone(),
+                    version: version.to_string(),
+                    runtime,
+                    artifact_runtime: inner.runtime.clone(),
+                    platforms: recorded_platforms(
+                        name,
+                        version,
+                        runtime,
+                        resolved.platform.as_deref(),
+                    ),
+                    description: None,
+                    tags: Vec::new(),
+                    wit_contracts: None,
+                };
+                let pin = lock_pin(&meta, &sha256);
                 store
-                    .store_installed_overwrite(
-                        ArtifactMeta {
-                            name: inner.name.clone(),
-                            version: version.to_string(),
-                            runtime: inner.registry_runtime(),
-                            artifact_runtime: inner.runtime.clone(),
-                            platforms: Vec::new(),
-                            description: None,
-                            tags: Vec::new(),
-                            wit_contracts: None,
-                        },
-                        &resolved.bytes,
-                        &sha256,
-                    )
+                    .store_installed_overwrite(meta, &resolved.bytes, &sha256)
                     .map_err(CliError::from)?;
                 // Pin the source-chain resolution in murmur.lock too — otherwise the
                 // artifact stores but `mur run` fails with E-RUN-003 (missing lock entry).
                 Ok(FetchOutcome {
                     bytes_len: len,
-                    lock_upsert: Some((name.to_string(), version.to_string(), sha256)),
+                    lock_upsert: Some((name.to_string(), version.to_string(), pin)),
                 })
             }
             None => Err(CliError::with_hint(
@@ -723,22 +779,31 @@ fn install_from_local_file(path_str: &str, store: &LocalRegistry) -> Result<(), 
     let manifest = load_manifest_from_artifact_bytes(&bytes)
         .map_err(|e| CliError::new(E_IO_003, format!("{path_str} is not a valid .mur.zip: {e}")))?;
 
+    let runtime = manifest.registry_runtime();
+    let platform = if runtime == RuntimeType::Native {
+        Some(local_file_platform(path_str)?)
+    } else {
+        None
+    };
+
     let sha256 = sha256_hex(&bytes);
+    let meta = ArtifactMeta {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        runtime,
+        artifact_runtime: manifest.runtime.clone(),
+        platforms: recorded_platforms(
+            &manifest.name,
+            &manifest.version,
+            runtime,
+            platform.as_deref(),
+        ),
+        description: None,
+        tags: Vec::new(),
+        wit_contracts: None,
+    };
     store
-        .store_installed_overwrite(
-            ArtifactMeta {
-                name: manifest.name.clone(),
-                version: manifest.version.clone(),
-                runtime: manifest.registry_runtime(),
-                artifact_runtime: manifest.runtime.clone(),
-                platforms: Vec::new(),
-                description: None,
-                tags: Vec::new(),
-                wit_contracts: None,
-            },
-            &bytes,
-            &sha256,
-        )
+        .store_installed_overwrite(meta, &bytes, &sha256)
         .map_err(CliError::from)?;
 
     println!(
@@ -746,6 +811,40 @@ fn install_from_local_file(path_str: &str, store: &LocalRegistry) -> Result<(), 
         manifest.name, manifest.version, path_str
     );
     Ok(())
+}
+
+/// Which platform a native payload installed from a local file is for.
+///
+/// The file name is asked first — a `{name}-{version}-{platform}.mur.zip` built for another
+/// platform must file under that platform, not under this host's. Only a name carrying no
+/// recognised tag falls back to auto-detection, the same detection and the same printed line
+/// `mur publish` uses. A host outside [`SUPPORTED_PLATFORMS`] has nothing to detect, so the
+/// install is refused rather than filed under a platform nobody can resolve.
+fn local_file_platform(path_str: &str) -> Result<String, CliError> {
+    let file_name = Path::new(path_str)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path_str);
+
+    if let Some((_, platform)) = split_platform_suffix(file_name) {
+        return Ok(platform.to_string());
+    }
+
+    if current_platform() == "unknown" {
+        return Err(CliError::with_hint(
+            E_IO_003,
+            format!(
+                "cannot determine which platform the native artifact in {path_str} is for: its \
+                 file name carries no platform tag and this host is not one of {}",
+                SUPPORTED_PLATFORMS.join(", ")
+            ),
+            "install from a source that publishes platform-tagged assets, or rename the file to \
+             <name>-<version>-<platform>.mur.zip",
+        ));
+    }
+
+    println!("Platform: {} (auto-detected)", current_platform());
+    Ok(current_platform().to_string())
 }
 
 fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError> {
@@ -772,22 +871,34 @@ fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError>
 
     for platform in ALL_PLATFORMS {
         match chain.resolve_bare_for_platform(name, version, platform) {
-            Ok(bytes) => {
-                let sha256 = sha256_hex(&bytes);
-                let artifact_path =
-                    global_registry.artifact_path_for_platform(name, version, platform);
-                let artifact_dir = artifact_path.parent().ok_or_else(|| {
-                    CliError::new(E_IO_003, "unexpected artifact path (no parent)")
+            Ok(resolved) => {
+                let sha256 = sha256_hex(&resolved.bytes);
+                let manifest = load_manifest_from_artifact_bytes(&resolved.bytes).map_err(|e| {
+                    CliError::new(
+                        E_IO_003,
+                        format!("{name}@{version} ({platform}) is not a valid .mur.zip: {e}"),
+                    )
                 })?;
-                std::fs::create_dir_all(artifact_dir).map_err(|e| {
-                    CliError::new(E_IO_003, format!("failed to create artifact dir: {e}"))
-                })?;
-                std::fs::write(&artifact_path, &bytes).map_err(|e| {
-                    CliError::new(E_IO_003, format!("failed to write artifact: {e}"))
-                })?;
-                let sha256_path = artifact_dir.join(format!("{name}-{version}-{platform}.sha256"));
-                std::fs::write(&sha256_path, sha256.as_bytes())
-                    .map_err(|e| CliError::new(E_IO_003, format!("failed to write sha256: {e}")))?;
+                let runtime = manifest.registry_runtime();
+                // The loop's target platform, not the asset's own tag: this arm asked for one
+                // platform's payload, and a source that answered with an untagged asset
+                // answered for that request.
+                let meta = ArtifactMeta {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    runtime,
+                    artifact_runtime: manifest.runtime.clone(),
+                    platforms: recorded_platforms(name, version, runtime, Some(platform)),
+                    description: None,
+                    tags: Vec::new(),
+                    wit_contracts: None,
+                };
+                // Through the same write every other install path uses, so the store never
+                // holds a payload with no metadata beside it — the state that made a native
+                // artifact read back as `runtime: wasm`.
+                global_registry
+                    .store_installed_overwrite(meta, &resolved.bytes, &sha256)
+                    .map_err(CliError::from)?;
                 println!(
                     "Installed {name}@{version} ({platform}) → ~/.murmur/artifacts/{name}/{version}/{name}-{version}-{platform}.mur.zip"
                 );

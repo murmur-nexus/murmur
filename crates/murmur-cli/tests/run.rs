@@ -60,7 +60,7 @@ fn run_round_trip_writes_lock_and_uses_existing_lock_on_second_run() {
         .artifact_for(TOOL_NAME)
         .expect("lock entry for echo-tool");
     assert_eq!(entry.resolved_version, TOOL_VERSION);
-    assert!(!entry.sha256.wasm.is_empty());
+    assert!(!entry.sha256.any.as_deref().unwrap_or_default().is_empty());
 
     // Change the manifest version to a non-existent one. The second run should still
     // succeed by honoring the existing lock pin.

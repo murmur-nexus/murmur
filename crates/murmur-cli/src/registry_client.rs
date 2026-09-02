@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use murmur_artifact::{
-    ArtifactMeta, LocalRegistry, PublishResult, Registry, RegistryError, ResolvedArtifact,
-    RuntimeType,
+    load_manifest_from_artifact_bytes, split_platform_tag, ArtifactMeta, LocalRegistry, Manifest,
+    PlatformMatch, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
 };
 use serde::Deserialize;
 use ureq::http::StatusCode;
@@ -97,21 +97,41 @@ impl RemoteRegistry {
                         ))
                     })?;
 
-                // meta.runtime is not returned by the remote registry endpoint; read it
-                // from murmur.yaml inside the zip. RuntimeType::Wasm here is a placeholder.
+                // The endpoint returns no metadata, so the runtime is read from the
+                // murmur.yaml inside the bytes it did return. A payload that does not parse
+                // keeps the pre-derivation defaults rather than failing the download.
+                let manifest = load_manifest_from_artifact_bytes(&bytes).ok();
+                let runtime = manifest
+                    .as_ref()
+                    .map_or(RuntimeType::Wasm, Manifest::registry_runtime);
+                // The requested platform is the only platform information this exchange
+                // carries: serving different bytes for an explicit `?platform=` would be a
+                // server bug, and this is exactly what the local store will serve for that
+                // platform once these bytes are installed.
+                let platforms = match (runtime, platform.and_then(split_platform_tag)) {
+                    (RuntimeType::Native, Some((os, arch))) => {
+                        vec![(os.to_string(), arch.to_string())]
+                    }
+                    _ => Vec::new(),
+                };
                 Ok(ResolvedArtifact {
                     meta: ArtifactMeta {
                         name: name.to_string(),
                         version: version.to_string(),
-                        runtime: RuntimeType::Wasm,
-                        artifact_runtime: String::new(),
-                        platforms: Vec::new(),
+                        runtime,
+                        artifact_runtime: manifest
+                            .as_ref()
+                            .map_or_else(String::new, |manifest| manifest.runtime.clone()),
+                        platforms,
                         description: None,
                         tags: Vec::new(),
                         wit_contracts: None,
                     },
                     bytes,
                     sha256: expected_sha,
+                    // The endpoint serves one payload per request and never falls back to an
+                    // untagged one, so there is no fallback for this to report.
+                    platform_match: PlatformMatch::NotApplicable,
                 })
             }
             StatusCode::NOT_FOUND => Err(RegistryError::NotFound {

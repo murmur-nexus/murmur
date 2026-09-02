@@ -11,9 +11,9 @@ use capsule_runtime::{
 };
 use clap::Subcommand;
 use murmur_artifact::{
-    load_dotenv_non_override, load_runtime_manifest, read_lockfile, resolve_manifest_path,
-    write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact, LockedSha256,
-    LockfileError, MurmurLock, Registry, LOCK_VERSION,
+    current_platform, load_dotenv_non_override, load_runtime_manifest, read_lockfile,
+    resolve_manifest_path, write_lockfile_atomic, ArtifactRuntime, LocalRegistry, LockedArtifact,
+    LockedSha256, LockfileError, MurmurLock, Registry, LOCK_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -586,10 +586,24 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                         config: artifact.config.clone(),
                         capabilities: artifact.capabilities.clone(),
                     });
+                    // This host's hash, never another platform's — the same selection
+                    // `mur run` makes, so an eval enforces exactly what a session would.
+                    let host_platform = current_platform();
+                    let sha256 = entry.sha256.for_platform(host_platform).ok_or_else(|| {
+                        CliError::with_hint(
+                            E_IO_003,
+                            format!(
+                                "murmur.lock has no sha256 for '{}' on platform {host_platform} \u{2014} it pins {}",
+                                artifact.name,
+                                entry.sha256.platform_tags().join(", ")
+                            ),
+                            "run `mur install` on this host to add this platform's hash to murmur.lock",
+                        )
+                    })?;
                     expectations.push(LockExpectation {
                         name: artifact.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
-                        sha256_wasm: entry.sha256.wasm.clone(),
+                        sha256: sha256.to_string(),
                     });
                 } else {
                     pinned.push(artifact.clone());
@@ -689,8 +703,11 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                     .map(|entry| LockedArtifact {
                         name: entry.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
-                        sha256: LockedSha256 {
-                            wasm: entry.sha256_wasm.clone(),
+                        sha256: match &entry.platform {
+                            Some(platform) => {
+                                LockedSha256::for_one_platform(platform, entry.sha256.clone())
+                            }
+                            None => LockedSha256::any(entry.sha256.clone()),
                         },
                     })
                     .collect(),

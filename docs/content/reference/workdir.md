@@ -283,25 +283,54 @@ the turn and the two token counts, not the text.
 registry-resolved artifact to a version and a hash:
 
 ```yaml
-lock_version: 1
+lock_version: 2
 artifacts:
   - name: some-tool
     resolved_version: "1.2.3"
     sha256:
-      wasm: "<sha256>"
+      any: "<sha256>"
+  - name: some-native-tool
+    resolved_version: "0.4.2"
+    sha256:
+      platforms:
+        darwin-aarch64: "<sha256>"
+        linux-x86_64: "<sha256>"
 ```
 
-`lock_version` must be `1`. Every path below verifies against the pin before writing anything: a
-registry-resolved artifact whose version or hash disagrees with an existing entry is rejected, with
-nothing written to disk or to the lock.
+`lock_version` must be `2`. An entry carries exactly one of two hash shapes:
+
+| Key | Pins | Written for |
+|---|---|---|
+| `sha256.any` | One hash for one payload every host resolves | A WASM component or a static skill |
+| `sha256.platforms.<platform>` | One hash per platform tag | A native tool, whose payload is a different binary per platform |
+
+A platform tag is one of `darwin-aarch64`, `darwin-x86_64`, `linux-aarch64`, `linux-x86_64` — the
+same tags [`mur publish --platform`](cli.md#mur-publish) writes and the store files a payload
+under.
+
+A host verifies against the hash pinned for its own platform. A native artifact with no key for
+this host is not pinned here yet — run `mur install` on this host to add it, which leaves every
+other platform's key intact.
+
+Every path below verifies against the pin before writing anything: a registry-resolved artifact
+whose version or hash disagrees with an existing entry is rejected, with nothing written to disk or
+to the lock. A platform the entry has no key for is not a disagreement.
 
 | Path | When it writes |
 |---|---|
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
-| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms` |
+| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory) and for local-file installs |
 | `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI |
 
-A missing entry for a manifest artifact, or an unsupported `lock_version`, fails the run with
-`E-RUN-003`. An install whose registry hash disagrees with the pin fails with `E-REG-005`. See
-[Diagnostics](diagnostics.md).
+An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`
+block only when everything in it is stale: a different `resolved_version`, or a change between the
+`any` and `platforms` shapes.
+
+A `lock_version: 1` file is refused rather than migrated — it pinned one `sha256.wasm` per
+artifact, which cannot describe a native artifact's per-platform payloads. Delete `murmur.lock` and
+run `mur install` to regenerate it.
+
+A missing entry for a manifest artifact, an entry with no hash for this host's platform, or an
+unsupported `lock_version`, fails the run with `E-RUN-003`. An install whose registry hash
+disagrees with the pin fails with `E-REG-005`. See [Diagnostics](diagnostics.md).

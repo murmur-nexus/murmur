@@ -82,17 +82,22 @@ With neither `~/.murmur/config.yaml` nor `<cwd>/.murmur/config.yaml` present, `m
 | Project | `<project root>/.murmur/artifacts/` — the nearest directory at or above the working directory that holds a `murmur.yaml`. Installing without one fails with `E-IO-001` |
 | Global | `~/.murmur/artifacts/` |
 
-Under either root, an artifact occupies `<name>/<version>/`:
+Under either root, an artifact occupies `<name>/<version>/`. A native artifact is a different binary per platform, so its three files carry the platform tag its payload was built for; every other payload is one set of bytes each host resolves, and its files carry no tag:
 
 | File | Holds |
 |---|---|
-| `<name>-<version>.mur.zip` | The artifact |
+| `<name>-<version>.mur.zip` | The artifact — a WASM component or a static skill |
 | `<name>-<version>.sha256` | Its SHA-256 |
-| `<name>-<version>.meta.json` | Its name, version, runtime, description, tags and WIT contracts |
+| `<name>-<version>.meta.json` | Its name, version, runtime, platforms, description, tags and WIT contracts |
+| `<name>-<version>-<platform>.mur.zip` | A native artifact's payload for one platform |
+| `<name>-<version>-<platform>.sha256` | That payload's SHA-256 |
+| `<name>-<version>-<platform>.meta.json` | That payload's metadata, with `platforms` naming the one platform |
 
-The `wit_contracts` key of `<name>-<version>.meta.json` records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
+One version directory holds one payload, hash and metadata file per platform installed, so installing a native artifact for a second platform sits beside the first rather than replacing it. A resolve prefers the tagged payload for the host's platform and falls back to the untagged one, which is how a WASM artifact resolves everywhere; a *native* artifact resolved through that fallback is reported as [`W-REG-001`](diagnostics.md#w-reg-001).
 
-`mur install --all-platforms <name>@<version>` writes `<name>-<version>-<platform>.mur.zip` and `<name>-<version>-<platform>.sha256` into the global store instead, one pair per platform.
+The `wit_contracts` key of the metadata file records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
+
+`mur install --all-platforms <name>@<version>` installs into the global store, once per platform it downloads for, writing the same three files per platform as any other install.
 
 The global root is derived from `$HOME` (or `$USERPROFILE` on Windows). No environment variable overrides it; to relocate the store, set `HOME` before invoking `mur`.
 

@@ -319,7 +319,7 @@ mur install --all-platforms <name@version>
 | `mur install <name@version>` | Fetches a specific artifact into the project-local store |
 | `mur install github:<owner>/<repo>@<tag>` | Fetches directly from a GitHub release into the project-local store |
 | `mur install -g <ref>` | Fetches into the global store (`~/.murmur/artifacts/`) |
-| `mur install --all-platforms <name@version>` | Downloads all platform variants into the global store; useful for CI and cross-platform build seeding |
+| `mur install --all-platforms <name@version>` | Downloads all platform variants into the global store, filing each under its own platform tag; useful for CI and cross-platform build seeding |
 | `mur install --registry <url\|local> <ref>` | Resolves `name@version` against that registry for this invocation — a URL forces remote mode, `local` forces the local store. See [Registry selection rules](config.md#registry-selection-rules) |
 
 `mur install` (no args) is the standard pre-run step. It reads `murmur.yaml`, resolves every artifact listed in it, and if an artifact is not found in the local registry it falls back to the configured source chain automatically.
@@ -470,6 +470,7 @@ failure lines:
 - `✗ name@version   <platform>   — murmur.lock missing artifact entry for 'name'` — the lock exists but has no entry for this artifact
 - `✗ name@version   <platform>   — murmur.lock version mismatch for 'name': manifest requested X, lock pinned Y` — the lock pins a different version than `murmur.yaml` declares
 - `✗ name@version   <platform>   — artifact integrity check failed for name@version` (with `expected sha256 (murmur.lock):` / `actual sha256 (on disk):` detail lines) — the installed bytes don't hash to the lock's recorded sha256
+- `✗ name@version   <platform>   — murmur.lock has no sha256 for 'name' on <platform>: it pins <platforms>` — the lock was written on another platform and has never been installed against on this one
 
 **Output — lock hash mismatch:**
 
@@ -484,9 +485,27 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
 Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
 ```
 
+### Warnings
+
+A finding that is worth reporting but is not a failure prints on its own checklist line, marked
+`⚠`, and adds a `Fix:` line in the same block as the errors. The summary line counts warnings
+separately and the exit code ignores them, so a store that resolves everything it is asked for
+still exits `0`. [`W-REG-001`](diagnostics.md#w-reg-001) is the one warning the checklist reports.
+
+**Output — a native artifact with no recorded platform:**
+
+```text
+Checking /path/to/murmur.yaml for linux-x86_64...
+  ⚠  murmur-tool-git@1.0.0   linux-x86_64   — native artifact with no recorded platform (warning[W-REG-001])
+
+1 check passed, 0 errors found, 1 warning.
+
+Fix: mur install murmur-tool-git@1.0.0
+```
+
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform
+- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform. Warnings do not change this
 - `1` — one or more declared artifacts missing, disagree with `murmur.lock`, or hold a native binary this host cannot run (checklist printed to stdout first), or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
@@ -495,7 +514,7 @@ Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or d
 |---|---|
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
-| `E-RUN-003` | `murmur.lock` exists but failed to parse or validate |
+| `E-RUN-003` | `murmur.lock` exists but failed to parse or validate — including a `lock_version` other than 2, which is refused rather than migrated |
 | `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
 
 A setup failure (no project found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
