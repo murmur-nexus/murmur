@@ -29,17 +29,18 @@ four on every PR; the rest are release-time only.
 | Lint | `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Supply chain | `cargo deny check advisories bans licenses` |
 | WIT self-consistency | `./scripts/check-wit-versions.sh` |
+| WIT contracts moved since the last release | `./scripts/wit-versions-changed-since.sh vX.Y.Z` — pass the *previous* release tag; exits 1 naming every `murmur:*` package whose version moved |
 | Docs | `cd docs && mkdocs build --strict` |
 | Host-only isolation tests | `docs/content/reference/resource-limits-manual-verification.md` — CI reports these as `[SKIP-HOST]`; run them by hand on a real Linux host for any release touching containment |
 | Smoke | the maintainer-local smoke suite: real capsules against the built `mur` |
 
-**Did any WIT contract move since the last release?** `check-wit-versions.sh` is
-a within-commit check and cannot answer this. Diff the "Current versions" table
-in `crates/capsule-runtime/wit/VERSIONING.md` at `HEAD` against the same table
-at the previous tag. If any `murmur:*` package moved, the affected artifacts in
-`default-artifacts` must be rebuilt and republished — the host keeps **no
-fallback**, so a stale artifact fails at instantiation rather than degrading.
-See `wit/VERSIONING.md`.
+**If `wit-versions-changed-since.sh` fails, the release has work in another
+repo.** Every artifact in `default-artifacts` built against a package whose
+version moved must be rebuilt and republished *before* the tag is pushed. The
+host keeps **no fallback**: a stale artifact fails at instantiation rather than
+degrading. See `crates/capsule-runtime/wit/VERSIONING.md`. The script reports
+and fails only — it never touches `default-artifacts`, which is a deliberate
+act in that repo.
 
 **Release-note labels.** Every merged PR in the range needs one; the changelog
 generator reads them, and unlabelled PRs cannot be fixed after the fact without
