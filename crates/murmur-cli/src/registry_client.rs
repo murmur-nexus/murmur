@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use murmur_artifact::{
-    load_manifest_from_artifact_bytes, split_platform_tag, ArtifactMeta, LocalRegistry, Manifest,
+    declared_runtime_from_artifact_bytes, split_platform_tag, ArtifactMeta, LocalRegistry,
     PlatformMatch, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,
 };
 use serde::Deserialize;
@@ -97,13 +97,18 @@ impl RemoteRegistry {
                         ))
                     })?;
 
-                // The endpoint returns no metadata, so the runtime is read from the
-                // murmur.yaml inside the bytes it did return. A payload that does not parse
-                // falls back to `wasm` rather than failing the download.
-                let manifest = load_manifest_from_artifact_bytes(&bytes).ok();
-                let runtime = manifest
-                    .as_ref()
-                    .map_or(RuntimeType::Wasm, Manifest::registry_runtime);
+                // The endpoint returns no packaging type, so it is read from the murmur.yaml
+                // inside the bytes it did return: what the artifact says it is decides the
+                // recorded value, on this install path as on every other.
+                let declared = declared_runtime_from_artifact_bytes(&bytes).ok_or_else(|| {
+                    RegistryError::InvalidInput(format!(
+                        "artifact {name}@{version} downloaded from {} carries no readable \
+                         murmur.yaml: the download is corrupt, or the registry served something \
+                         that is not a .mur.zip",
+                        self.base_url
+                    ))
+                })?;
+                let runtime = declared.runtime;
                 // The requested platform is the only platform information this exchange
                 // carries: serving different bytes for an explicit `?platform=` would be a
                 // server bug, and this is exactly what the local store will serve for that
@@ -119,9 +124,7 @@ impl RemoteRegistry {
                         name: name.to_string(),
                         version: version.to_string(),
                         runtime,
-                        artifact_runtime: manifest
-                            .as_ref()
-                            .map_or_else(String::new, |manifest| manifest.runtime.clone()),
+                        artifact_runtime: declared.artifact_runtime,
                         platforms,
                         description: None,
                         tags: Vec::new(),
@@ -342,5 +345,156 @@ impl Registry for FallbackRegistry {
 
     fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
         self.primary.list_index()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::JoinHandle,
+    };
+
+    use murmur_artifact::{sha256_hex, Registry, RuntimeType};
+    use tempfile::tempdir;
+    use zip::{write::SimpleFileOptions, ZipWriter};
+
+    use super::RemoteRegistry;
+
+    /// A loopback HTTP server answering exactly one request with `body` and the headers an
+    /// artifact download carries. It binds port 0, so concurrent tests never contend for a
+    /// port, and its thread is detached on drop so an unanswered request cannot hang the run.
+    struct OneShotServer {
+        url: String,
+        join: Option<JoinHandle<()>>,
+    }
+
+    impl OneShotServer {
+        /// `sha256` is sent as `x-murmur-sha256`, the header the download path requires.
+        fn serving(body: Vec<u8>, sha256: String) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+
+            let join = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                // A GET carries no body, so the request head is the whole request.
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                     content-length: {}\r\nx-murmur-sha256: {sha256}\r\n\
+                     connection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+                stream.flush().unwrap();
+            });
+
+            Self {
+                url,
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for OneShotServer {
+        fn drop(&mut self) {
+            // Detached rather than joined: a test that never made its request would otherwise
+            // block the runner in accept().
+            let _ = self.join.take();
+        }
+    }
+
+    fn native_zip(name: &str, version: &str) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut cursor);
+            let opts = SimpleFileOptions::default();
+            zip.start_file("murmur.yaml", opts).unwrap();
+            write!(
+                zip,
+                "name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"
+            )
+            .unwrap();
+            zip.start_file(format!("bin/{name}"), opts).unwrap();
+            zip.write_all(b"binary").unwrap();
+            zip.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn recorded_meta(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).unwrap()).unwrap()
+            ["meta"]
+            .clone()
+    }
+
+    /// The same bytes record the same packaging type whichever install path stored them.
+    #[test]
+    fn a_remote_install_records_what_a_local_file_install_records() {
+        let bytes = native_zip("my-tool", "1.0.0");
+        let server = OneShotServer::serving(bytes.clone(), sha256_hex(&bytes));
+
+        let resolved = RemoteRegistry::new(&server.url, "test-key")
+            .resolve("my-tool", "1.0.0")
+            .unwrap();
+        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
+
+        let remote_dir = tempdir().unwrap();
+        let remote_store = murmur_artifact::LocalRegistry::new(remote_dir.path());
+        remote_store
+            .store_installed_overwrite(resolved.meta.clone(), &bytes, &resolved.sha256)
+            .unwrap();
+
+        // The local-file path reads the platform off the file name, so the file is named the
+        // way a published platform-tagged asset is.
+        let platform = murmur_artifact::SUPPORTED_PLATFORMS[0];
+        let source_dir = tempdir().unwrap();
+        let file = source_dir
+            .path()
+            .join(format!("my-tool-1.0.0-{platform}.mur.zip"));
+        std::fs::write(&file, &bytes).unwrap();
+
+        let local_dir = tempdir().unwrap();
+        let local_store = murmur_artifact::LocalRegistry::new(local_dir.path());
+        crate::commands::install::install_from_local_file(file.to_str().unwrap(), &local_store)
+            .unwrap();
+
+        let from_remote = recorded_meta(&remote_store.metadata_path_for("my-tool", "1.0.0", None));
+        let from_local =
+            recorded_meta(&local_store.metadata_path_for("my-tool", "1.0.0", Some(platform)));
+
+        assert_eq!(from_remote["runtime"], "native");
+        assert_eq!(from_local["runtime"], "native");
+        assert_eq!(from_remote["artifact_runtime"], "tool");
+        assert_eq!(
+            from_remote["artifact_runtime"],
+            from_local["artifact_runtime"]
+        );
+    }
+
+    /// A payload that is not a `.mur.zip` says nothing about itself, and is refused rather
+    /// than recorded as a guess.
+    #[test]
+    fn a_download_carrying_no_manifest_is_refused() {
+        let body = b"not-an-archive".to_vec();
+        let server = OneShotServer::serving(body.clone(), sha256_hex(&body));
+
+        let error = RemoteRegistry::new(&server.url, "test-key")
+            .resolve("my-tool", "1.0.0")
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("my-tool") && message.contains("1.0.0"),
+            "error must name the artifact: {message}"
+        );
+        assert!(
+            message.contains("murmur.yaml"),
+            "error must say what was missing: {message}"
+        );
     }
 }

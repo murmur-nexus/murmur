@@ -777,7 +777,11 @@ fn fetch_and_store(
     }
 }
 
-fn install_from_local_file(path_str: &str, store: &LocalRegistry) -> Result<(), CliError> {
+/// Install a `.mur.zip` sitting on this filesystem into `store`.
+pub(crate) fn install_from_local_file(
+    path_str: &str,
+    store: &LocalRegistry,
+) -> Result<(), CliError> {
     let bytes = std::fs::read(path_str)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to read {path_str}: {e}")))?;
 
