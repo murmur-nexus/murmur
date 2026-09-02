@@ -1,9 +1,10 @@
 # Containment
 
-A capsule's shell subprocesses are constrained by kernel mechanisms the host has to
-provide. This page covers the enforcement tier each host resolves to, the containment
-class a capsule can require of it, the fixed grants a contained capsule receives, and
-how each claim is checked.
+A containment class bounds what a capsule's shell subprocesses reach on the host, through kernel
+mechanisms the host has to provide. It does not bound what a WASM artifact does inside the workdir
+— [What bounds a WASM artifact](#artifact-boundary) names the grant that does. This page covers the
+enforcement tier each host resolves to, the containment class a capsule can require of it, the
+fixed grants a contained capsule receives, and how each claim is checked.
 
 ---
 
@@ -194,6 +195,44 @@ effective floor resolves to `advisory`, which every host satisfies.
 
 ---
 
+## What bounds a WASM artifact { #artifact-boundary }
+
+A containment class and a WASM artifact's own grants answer different questions:
+
+| Question | What answers it |
+|---|---|
+| Can this capsule reach my host? | [`capabilities.containment`](#field-containment) — the class the capsule's shell subprocesses run under |
+| Can this artifact reach outside its directory? | [`capabilities.filesystem.scope`](manifest.md#tool-capabilities) on that artifact's own entry |
+
+Under `sealed`, everything outside the composed root is absent to a shell subprocess. Inside the
+workdir, an artifact's reach is exactly what its own grants say, and the containment class leaves
+that unchanged: an artifact declaring no `capabilities.filesystem.scope` works out of the whole
+workdir under every class. Narrow one artifact by naming the subtree it needs on its entry:
+
+```yaml
+artifacts:
+  - name: report-writer
+    version: 0.1.0
+    runtime: tool
+    capabilities:
+      filesystem:
+        scope: reports
+      network:
+        allow: []
+```
+
+That entry is the whole of what `report-writer` reaches:
+
+- **`<accessible workdir>/reports` is the artifact's current directory**, created if missing, and
+  it reaches nothing above it. There is no wider filesystem behind the scope to fall back to.
+- **The grant is read from your own manifest entry**, never from the artifact's bundled
+  `murmur.yaml`, so an artifact cannot scope itself up.
+- **Outbound HTTP is allowlist-gated**, and an artifact's own declaration only ever subtracts from
+  the capsule ceiling — here to zero, so every request is refused. An artifact holds no raw
+  sockets, and has no way to run a command.
+
+---
+
 ## Containment and disclosure { #containment-and-disclosure }
 
 A containment class and an export answer different questions, and only one of them is about the
@@ -201,7 +240,7 @@ capsule:
 
 | | Bounds | Declared by | Effect on the achieved class |
 |---|---|---|---|
-| Containment (`capabilities.containment`) | What the capsule reaches outward — which paths, hosts and binaries it can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
+| Containment (`capabilities.containment`) | What the capsule's shell subprocesses reach outward — which host paths, hosts and binaries they can touch | Manifest, workspace config or `--containment`, strongest wins | It *is* the achieved class |
 | Disclosure (`exports.files`) | What an operator reaches inward — which files an external process may read out of the workdir | The manifest's top-level `exports:` block | None |
 
 Declaring `exports.files` gives the agent no capability whatsoever: the runtime serves the files

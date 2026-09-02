@@ -254,7 +254,7 @@ This example adds `DATABASE_URL` from the host and removes `CARGO_HOME` and `RUS
 
 ## Step 4 — narrow individual tools and drivers below the ceiling
 
-The strongest way to constrain a coding agent is to do less through `bash` and more through scoped tool artifacts. A per-artifact `filesystem.scope` on a WASM tool is a real WASI preopen — the wasm runtime enforces it on every platform, macOS included, where `bash`'s own confinement is only advisory. Moving a task out of `bash` and into a scoped tool turns an advisory boundary into an enforced one.
+The strongest way to constrain a coding agent is to do less through `bash` and more through scoped tool artifacts. A per-artifact `filesystem.scope` on a WASM tool is a real directory grant — the wasm runtime enforces it on every platform, macOS included, where `bash`'s own confinement is only advisory, and the capsule's containment class leaves it unchanged ([What bounds a WASM artifact](../reference/containment.md#artifact-boundary)). Moving a task out of `bash` and into a scoped tool turns an advisory boundary into an enforced one.
 
 Add the WASM tools this agent uses to the `artifacts:` list, add the one extra host they need to the ceiling, and scope each artifact to only its slice:
 
