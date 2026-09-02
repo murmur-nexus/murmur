@@ -11,6 +11,7 @@ use capsule_runtime::{
     ArtifactRequest, LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError,
     StageRequest, TaskAcceptance,
 };
+use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
     read_lockfile, registry_warning_link, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
@@ -321,6 +322,13 @@ pub(crate) fn run_run(
             );
         }
     }
+
+    // Keys the manifest declared that this build does not recognize, captured during parse rather
+    // than dropped. Emitted here — at the seam that already holds the parsed manifest — rather
+    // than from `stage_session`, so `--explain-scope` reports them without staging anything and so
+    // `StageRequest` gains no field. `mur doctor` calls the same emitter, so the two surfaces
+    // cannot word one ignored key differently. Never a refusal: the capsule launches regardless.
+    warn_on_unknown_manifest_keys(&runtime_manifest, env!("CARGO_PKG_VERSION"));
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 

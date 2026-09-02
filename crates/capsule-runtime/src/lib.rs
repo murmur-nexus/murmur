@@ -65,8 +65,9 @@ pub use artifact_config::{
 };
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, PreopenReport,
-    PreopenSurface, ScopeReport, StateStoreReport,
+    detect_sealed_blocker, detect_userns_grant, explain_scope, read_only_advisory_for,
+    render_read_only, ExportsFilesReport, PreopenReport, PreopenSurface, ScopeReport,
+    StateStoreReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,

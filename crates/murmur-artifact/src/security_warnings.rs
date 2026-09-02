@@ -163,6 +163,24 @@ pub const W_SEC_017: &str = "W-SEC-017";
 /// installed tool, at staging, only for a capsule that declared `read_only`.
 pub const W_SEC_018: &str = "W-SEC-018";
 
+/// A key in `murmur.yaml` that this build does not recognize, captured during parse instead of
+/// dropped.
+///
+/// Every `Raw*` deserialization struct carries a `#[serde(flatten)]` overflow map, so a key no
+/// field claims lands there rather than vanishing. Fires once per captured key, naming the key,
+/// the dotted path of the block that held it, and — when one is near enough by edit distance —
+/// the recognized key of that block it most resembles. A near match is worded as a spelling
+/// problem; no near match is worded as a key this build does not know, which a newer `mur` may.
+///
+/// One further line is emitted when `mur_version` pins a numeric triple higher than the running
+/// binary's, naming both versions and the count, so a stale binary is stated rather than inferred
+/// from unfamiliar key names.
+///
+/// Never a refusal: `#[serde(deny_unknown_fields)]` is deliberately set nowhere in the manifest
+/// parser, because refusing an unknown key makes a manifest written for a newer `mur` unloadable
+/// by an older one. Fires from `mur run` and from `mur doctor`, in the same words.
+pub const W_SEC_019: &str = "W-SEC-019";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -182,7 +200,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018,
+            W_SEC_017, W_SEC_018, W_SEC_019,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");
