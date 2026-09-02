@@ -116,3 +116,21 @@ Run both locally before submitting a PR. `--all-features` includes the beta CLI 
 still checked. An `#[allow(...)]` is acceptable when the lint's default judgment is wrong at that
 specific site, but it needs a comment saying why — a bare `#[allow(...)]` with no justification,
 or a crate-level `#![allow(...)]`, will not pass review.
+
+## Documentation
+
+The docs site is built with MkDocs from `docs/`:
+
+```bash
+cd docs && mkdocs build --strict
+```
+
+Pages never write a default artifact's version as a literal. Every version comes from the `v`
+table in `docs/mkdocs.yml`, written as `{{ "{{ v.murmur_tool_git }}" }}` and named after the
+artifact with underscores for hyphens, so one table governs every page.
+
+Set `MURMUR_DEFAULT_ARTIFACTS_DIR` to a `default-artifacts` checkout and the build checks that
+table, and every version the rendered pages print, against the artifacts that checkout publishes.
+A disagreement fails the build and names the key or page at fault. Adding a new `v` entry
+therefore requires the matching artifact to be published first. Without the variable set the check
+is skipped, which is how CI and the deploy job build the site.

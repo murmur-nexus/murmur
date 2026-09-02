@@ -329,7 +329,7 @@ artifacts:
 
   # widened by exactly one directory: a durable store outside every workdir
   - name: murmur-tool-corpus
-    version: 0.1.0
+    version: {{ v.murmur_tool_corpus }}
     runtime: tool
     capabilities:
       state:
@@ -382,7 +382,7 @@ environment:
 ```yaml
 artifacts:
   - name: murmur-tool-corpus
-    version: 0.1.0
+    version: {{ v.murmur_tool_corpus }}
     runtime: tool
     capabilities:
       state: {}
@@ -784,7 +784,7 @@ key names illustrate the question; each driver documents the keys it reads.
 ```yaml
 artifacts:
   - name: murmur-driver-anthropic
-    version: 1.0.0
+    version: {{ v.murmur_driver_anthropic }}
     runtime: driver
     config:
       prompt_cache: enabled
@@ -800,7 +800,7 @@ A tool or a hook has only this block, so every setting either role reads arrives
 ```yaml
 artifacts:
   - name: murmur-tool-corpus
-    version: 1.0.0
+    version: {{ v.murmur_tool_corpus }}
     runtime: tool
     capabilities:
       state: {}

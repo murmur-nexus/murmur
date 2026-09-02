@@ -255,7 +255,7 @@ version: "0.1.0"
 
 artifacts:
   - name: murmur-driver-anthropic
-    version: "1.0.0"
+    version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
   - name: fdprobe-native
     version: "0.1.0"

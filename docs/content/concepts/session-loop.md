@@ -128,7 +128,7 @@ written to `trace.jsonl` as a
 
 ```yaml
 name: murmur-hook-memory
-version: 1.0.0
+version: {{ v.murmur_hook_memory }}
 runtime: hook
 binding: on-task-start
 execution_mode: blocking

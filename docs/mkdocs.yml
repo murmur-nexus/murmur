@@ -90,6 +90,9 @@ hooks:
   - hooks/artifact_versions.py
 
 extra:
+  # Every murmur_* value mirrors default-artifacts/artifacts.toml and is checked
+  # against it by hooks/artifact_versions.py. Adding a key here requires the
+  # matching [[artifact]] to be published, or the docs build fails.
   v:
     model_anthropic: "claude-sonnet-5"
     model_openai: "o3-mini-high"

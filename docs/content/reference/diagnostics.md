@@ -1160,7 +1160,7 @@ structurally valid, exactly as an inert `shell` block on a hook entry is
 ```yaml
 artifacts:
   - name: murmur-tool-corpus
-    version: 0.1.0
+    version: {{ v.murmur_tool_corpus }}
     runtime: tool
     capabilities:
       state:

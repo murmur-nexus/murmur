@@ -40,6 +40,42 @@ _ARTIFACT_LITERAL = re.compile(
     r"(?P<name>murmur-(?:driver|hook|tool|skill)-[a-z0-9-]+)[@-](?P<version>[0-9]+\.[0-9]+\.[0-9]+)"
 )
 
+# The same assertion split across two YAML lines, as every manifest example
+# writes it. This is the form a reader copies into their own `murmur.yaml`, and
+# it carries no `@`, so `_ARTIFACT_LITERAL` cannot see it.
+_MANIFEST_NAME = re.compile(
+    r"^\s*-?\s*name:\s*[\"']?(?P<name>murmur-(?:driver|hook|tool|skill)-[a-z0-9-]+)[\"']?\s*$"
+)
+_MANIFEST_VERSION = re.compile(
+    r"^\s*version:\s*[\"']?(?P<version>[0-9]+\.[0-9]+\.[0-9]+)[\"']?\s*$"
+)
+
+
+def _manifest_pins(markdown: str):
+    """Yield (literal, name, version) for each `name:`/`version:` manifest pair.
+
+    Pages illustrate shapes with invented artifact names as often as they name
+    real ones, so an unrecognized name is left to the caller to skip rather than
+    reported — unlike the `@version` form, which appears in command lines meant
+    to be run verbatim.
+    """
+    lines = markdown.split("\n")
+    for i, line in enumerate(lines):
+        name_match = _MANIFEST_NAME.match(line)
+        if not name_match:
+            continue
+        # `version:` normally follows `name:` directly; allow a couple of
+        # intervening keys, but stop at the next entry or a blank line.
+        for candidate in lines[i + 1 : i + 4]:
+            if not candidate.strip() or _MANIFEST_NAME.match(candidate):
+                break
+            version_match = _MANIFEST_VERSION.match(candidate)
+            if version_match:
+                name = name_match.group("name")
+                version = version_match.group("version")
+                yield f"{name} version: {version}", name, version
+                break
+
 # Artifact name -> published version, or None when no checkout was named and the
 # comparison is therefore disabled for this build.
 _published: dict[str, str] | None = None
@@ -144,6 +180,15 @@ def on_page_markdown(markdown, page, config, files):
         elif version != actual:
             _findings.append(
                 f"{src_uri}: '{match.group(0)}' pins '{name}' at \"{version}\", but the "
+                f'published version is "{actual}" — write '
+                f"{{{{ v.{_macro_key(name)} }}}} instead of a literal"
+            )
+
+    for literal, name, version in _manifest_pins(markdown):
+        actual = _published.get(name)
+        if actual is not None and version != actual:
+            _findings.append(
+                f"{src_uri}: '{literal}' pins '{name}' at \"{version}\", but the "
                 f'published version is "{actual}" — write '
                 f"{{{{ v.{_macro_key(name)} }}}} instead of a literal"
             )
