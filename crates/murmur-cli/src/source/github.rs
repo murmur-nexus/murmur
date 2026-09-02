@@ -3,13 +3,13 @@ use std::env;
 
 use bytes::Bytes;
 use indicatif::ProgressBar;
-use murmur_artifact::current_platform;
+use murmur_artifact::{current_platform, split_platform_suffix, SUPPORTED_PLATFORMS};
 use serde::Deserialize;
 use ureq::Agent;
 
 use crate::registry_client::blocking_agent;
 
-use super::{ArtifactSource, SourceError};
+use super::{ArtifactSource, SourceError, SourceResolution};
 
 // ── Per-thread download progress ─────────────────────────────────────────────
 //
@@ -48,6 +48,8 @@ pub struct GitHubSource {
 pub struct GitHubDirectResolution {
     pub bytes: Bytes,
     pub tag: String,
+    /// Platform tag on the asset's own name, or `None` for an untagged asset.
+    pub platform: Option<String>,
 }
 
 impl GitHubSource {
@@ -129,6 +131,7 @@ impl GitHubSource {
                 Ok(GitHubDirectResolution {
                     bytes,
                     tag: tag.clone(),
+                    platform: asset_platform(&asset.name),
                 })
             })
             .collect()
@@ -138,28 +141,25 @@ impl GitHubSource {
         &self,
         artifact_name: &str,
         version_hint: Option<&str>,
-    ) -> Result<(Bytes, String), SourceError> {
+    ) -> Result<SourceResolution, SourceError> {
+        let platform = current_platform();
         if let Some(version) = version_hint {
             // Primary: look in the release whose tag matches the artifact version.
             // Use select_versioned_asset (exact name match) so that a workspace-level release
             // tag (e.g. v0.3.33) that contains an older artifact zip (e.g. name-0.3.31.mur.zip)
             // does not silently shadow the correct version from the latest release.
-            let primary = match self.fetch_release_by_version_hint(version) {
+            let (primary, primary_assets) = match self.fetch_release_by_version_hint(version) {
                 Ok(release) => {
-                    match select_versioned_asset(
-                        &release.assets,
-                        artifact_name,
-                        version,
-                        current_platform(),
-                    ) {
-                        Some(asset) => {
-                            let bytes = self.download_asset(&asset)?;
-                            return Ok((bytes, release.tag_name));
+                    match select_versioned_asset(&release.assets, artifact_name, version, platform)
+                    {
+                        Some(selected) => {
+                            return self.resolve_selected(selected, release.tag_name);
                         }
-                        None => Some(release.tag_name.clone()), // release found, artifact absent
+                        // Release found, artifact absent.
+                        None => (Some(release.tag_name.clone()), release.assets),
                     }
                 }
-                Err(SourceError::NotFound(_)) => None, // no release with this tag
+                Err(SourceError::NotFound(_)) => (None, Vec::new()), // no release with this tag
                 Err(e) => return Err(e),
             };
 
@@ -168,31 +168,52 @@ impl GitHubSource {
             // latest release for an asset whose name pins the requested version exactly:
             //   {name}-{version}.mur.zip  or  {name}-{version}-{platform}.mur.zip
             let latest = self.fetch_latest_release()?;
-            match select_versioned_asset(&latest.assets, artifact_name, version, current_platform())
-            {
-                Some(asset) => {
-                    let bytes = self.download_asset(&asset)?;
-                    Ok((bytes, latest.tag_name))
-                }
+            match select_versioned_asset(&latest.assets, artifact_name, version, platform) {
+                Some(selected) => self.resolve_selected(selected, latest.tag_name),
                 None => {
+                    let searched: Vec<&GitHubReleaseAsset> =
+                        primary_assets.iter().chain(latest.assets.iter()).collect();
                     Err(SourceError::NotFound(format!(
-                    "asset '{artifact_name}.mur.zip' not found in release '{}'{} or latest '{}'",
-                    primary.as_deref().unwrap_or(version),
-                    if primary.is_none() { " (no such release)" } else { "" },
-                    latest.tag_name,
-                )))
+                        "{} in release '{}'{} or latest '{}'",
+                        no_asset_message(artifact_name, Some(version), platform, &searched),
+                        primary.as_deref().unwrap_or(version),
+                        if primary.is_none() {
+                            " (no such release)"
+                        } else {
+                            ""
+                        },
+                        latest.tag_name,
+                    )))
                 }
             }
         } else {
             let release = self.fetch_latest_release()?;
-            let asset =
-                select_asset_for_artifact(&release.assets, artifact_name, current_platform())
-                    .ok_or_else(|| {
-                        SourceError::NotFound("asset not found in latest release".to_string())
-                    })?;
-            let bytes = self.download_asset(&asset)?;
-            Ok((bytes, release.tag_name))
+            let selected = select_asset_for_artifact(&release.assets, artifact_name, platform)
+                .ok_or_else(|| {
+                    let searched: Vec<&GitHubReleaseAsset> = release.assets.iter().collect();
+                    SourceError::NotFound(format!(
+                        "{} in latest release '{}'",
+                        no_asset_message(artifact_name, None, platform, &searched),
+                        release.tag_name,
+                    ))
+                })?;
+            self.resolve_selected(selected, release.tag_name)
         }
+    }
+
+    /// Download the bytes of an asset the selection above chose, carrying its platform tag
+    /// through: which asset was picked is the only record of which platform the bytes are for.
+    fn resolve_selected(
+        &self,
+        selected: SelectedAsset,
+        tag: String,
+    ) -> Result<SourceResolution, SourceError> {
+        let bytes = self.download_asset(&selected.asset)?;
+        Ok(SourceResolution {
+            bytes,
+            resolved_version: tag,
+            platform: selected.platform.map(str::to_string),
+        })
     }
 
     fn fetch_latest_release(&self) -> Result<GitHubRelease, SourceError> {
@@ -351,7 +372,7 @@ impl ArtifactSource for GitHubSource {
         &self.source_name
     }
 
-    fn resolve_bare(&self, name: &str) -> Result<(Bytes, String), SourceError> {
+    fn resolve_bare(&self, name: &str) -> Result<SourceResolution, SourceError> {
         self.resolve_bare_internal(name, None)
     }
 
@@ -359,7 +380,7 @@ impl ArtifactSource for GitHubSource {
         &self,
         name: &str,
         version: &str,
-    ) -> Result<(Bytes, String), SourceError> {
+    ) -> Result<SourceResolution, SourceError> {
         if version == "latest" {
             return self.resolve_bare_internal(name, None);
         }
@@ -371,43 +392,54 @@ impl ArtifactSource for GitHubSource {
         name: &str,
         version: &str,
         platform: &str,
-    ) -> Result<Vec<u8>, SourceError> {
+    ) -> Result<SourceResolution, SourceError> {
         if version == "latest" {
             let release = self.fetch_latest_release()?;
-            let asset =
+            let selected =
                 select_asset_for_artifact(&release.assets, name, platform).ok_or_else(|| {
+                    let searched: Vec<&GitHubReleaseAsset> = release.assets.iter().collect();
                     SourceError::NotFound(format!(
-                        "no asset for '{name}' (platform: {platform}) in latest release '{}'",
+                        "{} in latest release '{}'",
+                        no_asset_message(name, None, platform, &searched),
                         release.tag_name
                     ))
                 })?;
-            return self.download_asset(&asset).map(|b| b.to_vec());
+            return self.resolve_selected(selected, release.tag_name);
         }
 
         // Primary: release tagged with the artifact version.
-        let primary_tag = match self.fetch_release_by_version_hint(version) {
+        let (primary_tag, primary_assets) = match self.fetch_release_by_version_hint(version) {
             Ok(release) => {
-                if let Some(asset) =
+                if let Some(selected) =
                     select_versioned_asset(&release.assets, name, version, platform)
                 {
-                    return self.download_asset(&asset).map(|b| b.to_vec());
+                    return self.resolve_selected(selected, release.tag_name);
                 }
-                Some(release.tag_name) // release found, artifact absent
+                (Some(release.tag_name), release.assets) // release found, artifact absent
             }
-            Err(SourceError::NotFound(_)) => None,
+            Err(SourceError::NotFound(_)) => (None, Vec::new()),
             Err(e) => return Err(e),
         };
 
         // Fallback: latest release with version-pinned asset name.
         let latest = self.fetch_latest_release()?;
         match select_versioned_asset(&latest.assets, name, version, platform) {
-            Some(asset) => self.download_asset(&asset).map(|b| b.to_vec()),
-            None => Err(SourceError::NotFound(format!(
-                "no asset for '{name}' v{version} (platform: {platform}) in release '{}'{} or latest '{}'",
-                primary_tag.as_deref().unwrap_or(version),
-                if primary_tag.is_none() { " (no such release)" } else { "" },
-                latest.tag_name,
-            ))),
+            Some(selected) => self.resolve_selected(selected, latest.tag_name),
+            None => {
+                let searched: Vec<&GitHubReleaseAsset> =
+                    primary_assets.iter().chain(latest.assets.iter()).collect();
+                Err(SourceError::NotFound(format!(
+                    "{} in release '{}'{} or latest '{}'",
+                    no_asset_message(name, Some(version), platform, &searched),
+                    primary_tag.as_deref().unwrap_or(version),
+                    if primary_tag.is_none() {
+                        " (no such release)"
+                    } else {
+                        ""
+                    },
+                    latest.tag_name,
+                )))
+            }
         }
     }
 }
@@ -426,11 +458,27 @@ struct GitHubReleaseAsset {
     name: String,
 }
 
+/// An asset the selection chose, and the platform its name declared.
+///
+/// `platform` is `None` for an asset whose name carries no tag from `SUPPORTED_PLATFORMS` — a
+/// platform-independent payload. It is the selection's own answer, not the platform that was
+/// asked for, so an install records what it actually got.
+#[derive(Debug, Clone)]
+struct SelectedAsset {
+    asset: GitHubReleaseAsset,
+    platform: Option<&'static str>,
+}
+
+/// The platform tag on a release asset's name, or `None` when it carries none.
+fn asset_platform(asset_name: &str) -> Option<String> {
+    split_platform_suffix(asset_name).map(|(_, platform)| platform.to_string())
+}
+
 fn select_asset_for_artifact(
     assets: &[GitHubReleaseAsset],
     artifact_name: &str,
     platform: &str,
-) -> Option<GitHubReleaseAsset> {
+) -> Option<SelectedAsset> {
     // Prefer a platform-tagged variant so native tool artifacts resolve to the correct binary.
     // Pattern: <name>-<version>-<platform>.mur.zip  (e.g. murmur-tool-git-0.3.20-darwin-aarch64.mur.zip)
     let platform_suffix = format!("-{platform}.mur.zip");
@@ -438,25 +486,33 @@ fn select_asset_for_artifact(
         asset.name.starts_with(&format!("{artifact_name}-"))
             && asset.name.ends_with(&platform_suffix)
     }) {
-        return Some(asset.clone());
+        return Some(SelectedAsset {
+            asset: asset.clone(),
+            platform: SUPPORTED_PLATFORMS
+                .iter()
+                .copied()
+                .find(|supported| *supported == platform),
+        });
     }
 
-    // Fall back to an exact unplatformed name (WASM artifacts), then any versioned variant.
+    // Fall back to an exact unplatformed name (WASM artifacts), then any versioned variant that
+    // is itself unplatformed. Matching on name alone would hand back another platform's zip —
+    // a release carrying only darwin assets would resolve on a Linux host — so an asset whose
+    // name ends in a recognised platform tag is never returned for a different platform.
     let exact = format!("{artifact_name}.mur.zip");
-    if let Some(asset) = assets.iter().find(|asset| asset.name == exact) {
-        return Some(asset.clone());
-    }
-
-    // This last fallback matches on name alone, so for a native artifact it can hand back a zip
-    // built for another platform — a release carrying only darwin assets resolves on a Linux host.
-    // The staging platform check (`install_native_binaries`) is what stops those bytes ever being
-    // written into a session workdir and spawned.
+    let prefix = format!("{artifact_name}-");
     assets
         .iter()
         .find(|asset| {
-            asset.name.starts_with(&format!("{artifact_name}-")) && asset.name.ends_with(".mur.zip")
+            asset.name == exact
+                || (asset.name.starts_with(&prefix)
+                    && asset.name.ends_with(".mur.zip")
+                    && split_platform_suffix(&asset.name).is_none())
         })
-        .cloned()
+        .map(|asset| SelectedAsset {
+            asset: asset.clone(),
+            platform: None,
+        })
 }
 
 /// Find an asset that names a specific artifact version exactly.
@@ -471,13 +527,55 @@ fn select_versioned_asset(
     artifact_name: &str,
     version: &str,
     platform: &str,
-) -> Option<GitHubReleaseAsset> {
+) -> Option<SelectedAsset> {
     let platform_name = format!("{artifact_name}-{version}-{platform}.mur.zip");
-    if let Some(a) = assets.iter().find(|a| a.name == platform_name) {
-        return Some(a.clone());
+    if let Some(asset) = assets.iter().find(|a| a.name == platform_name) {
+        return Some(SelectedAsset {
+            asset: asset.clone(),
+            platform: SUPPORTED_PLATFORMS
+                .iter()
+                .copied()
+                .find(|supported| *supported == platform),
+        });
     }
     let generic_name = format!("{artifact_name}-{version}.mur.zip");
-    assets.iter().find(|a| a.name == generic_name).cloned()
+    assets
+        .iter()
+        .find(|a| a.name == generic_name)
+        .map(|asset| SelectedAsset {
+            asset: asset.clone(),
+            platform: None,
+        })
+}
+
+/// The message for a release that publishes nothing this host can use: what was looked for, and
+/// which platforms the release does publish for this artifact.
+fn no_asset_message(
+    artifact_name: &str,
+    version: Option<&str>,
+    platform: &str,
+    assets: &[&GitHubReleaseAsset],
+) -> String {
+    let looked_for = match version {
+        Some(version) => format!("{artifact_name}-{version}-{platform}.mur.zip"),
+        None => format!("{artifact_name}-<version>-{platform}.mur.zip"),
+    };
+
+    let mut published: Vec<String> = assets
+        .iter()
+        .filter(|asset| asset.name.starts_with(&format!("{artifact_name}-")))
+        .filter_map(|asset| asset_platform(&asset.name))
+        .collect();
+    published.sort_unstable();
+    published.dedup();
+
+    let publishes = if published.is_empty() {
+        "this release publishes no platform-tagged asset for it".to_string()
+    } else {
+        format!("this release publishes {}", published.join(", "))
+    };
+
+    format!("no asset for '{artifact_name}' on platform {platform} \u{2014} looked for '{looked_for}'; {publishes}")
 }
 
 fn github_api_base() -> String {
@@ -486,4 +584,101 @@ fn github_api_base() -> String {
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "https://api.github.com".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assets(names: &[&str]) -> Vec<GitHubReleaseAsset> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| GitHubReleaseAsset {
+                id: index as u64 + 1,
+                name: (*name).to_string(),
+            })
+            .collect()
+    }
+
+    /// An asset whose name carries a recognised platform tag is only ever returned for that
+    /// platform — matching on artifact name alone would hand a darwin zip to a Linux host.
+    #[test]
+    fn another_platforms_tagged_asset_is_never_selected() {
+        let release = assets(&["nativetool-0.1.0-darwin-aarch64.mur.zip"]);
+        assert!(select_asset_for_artifact(&release, "nativetool", "linux-x86_64").is_none());
+        assert!(select_asset_for_artifact(&release, "nativetool", "linux-aarch64").is_none());
+        assert!(select_asset_for_artifact(&release, "nativetool", "darwin-x86_64").is_none());
+    }
+
+    /// What that fallback exists for: a WASM artifact published under its plain versioned name
+    /// resolves on every host, and reports no platform.
+    #[test]
+    fn an_untagged_versioned_asset_resolves_for_any_platform() {
+        let release = assets(&["wasmtool-0.1.0.mur.zip"]);
+        for platform in SUPPORTED_PLATFORMS {
+            let selected = select_asset_for_artifact(&release, "wasmtool", platform)
+                .unwrap_or_else(|| panic!("no asset selected for {platform}"));
+            assert_eq!(selected.asset.name, "wasmtool-0.1.0.mur.zip");
+            assert_eq!(selected.platform, None);
+        }
+    }
+
+    #[test]
+    fn an_exact_unversioned_name_still_resolves() {
+        let release = assets(&["wasmtool.mur.zip"]);
+        let selected = select_asset_for_artifact(&release, "wasmtool", "linux-x86_64").unwrap();
+        assert_eq!(selected.asset.name, "wasmtool.mur.zip");
+        assert_eq!(selected.platform, None);
+    }
+
+    #[test]
+    fn this_platforms_tagged_asset_is_preferred_and_reports_its_platform() {
+        let release = assets(&[
+            "nativetool-0.1.0.mur.zip",
+            "nativetool-0.1.0-linux-x86_64.mur.zip",
+            "nativetool-0.1.0-darwin-aarch64.mur.zip",
+        ]);
+        let selected = select_asset_for_artifact(&release, "nativetool", "linux-x86_64").unwrap();
+        assert_eq!(selected.asset.name, "nativetool-0.1.0-linux-x86_64.mur.zip");
+        assert_eq!(selected.platform, Some("linux-x86_64"));
+    }
+
+    #[test]
+    fn the_versioned_selection_reports_which_of_its_two_names_matched() {
+        let tagged = assets(&["nativetool-0.1.0-linux-x86_64.mur.zip"]);
+        let selected = select_versioned_asset(&tagged, "nativetool", "0.1.0", "linux-x86_64")
+            .expect("tagged asset");
+        assert_eq!(selected.platform, Some("linux-x86_64"));
+
+        let generic = assets(&["wasmtool-0.1.0.mur.zip"]);
+        let selected =
+            select_versioned_asset(&generic, "wasmtool", "0.1.0", "linux-x86_64").expect("generic");
+        assert_eq!(selected.platform, None);
+
+        assert!(select_versioned_asset(&tagged, "nativetool", "0.1.0", "darwin-aarch64").is_none());
+    }
+
+    #[test]
+    fn the_miss_message_names_the_platform_and_what_the_release_does_publish() {
+        let release = assets(&[
+            "murmur-tool-git-0.4.2-darwin-aarch64.mur.zip",
+            "murmur-tool-git-0.4.2-linux-x86_64.mur.zip",
+            "some-other-tool-0.4.2-linux-aarch64.mur.zip",
+        ]);
+        let searched: Vec<&GitHubReleaseAsset> = release.iter().collect();
+        let message =
+            no_asset_message("murmur-tool-git", Some("0.4.2"), "linux-aarch64", &searched);
+        assert!(message.contains("linux-aarch64"), "{message}");
+        assert!(
+            message.contains("looked for 'murmur-tool-git-0.4.2-linux-aarch64.mur.zip'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("darwin-aarch64, linux-x86_64"),
+            "{message}"
+        );
+        // Another artifact's assets are not this artifact's published platforms.
+        assert!(!message.contains("some-other-tool"), "{message}");
+    }
 }

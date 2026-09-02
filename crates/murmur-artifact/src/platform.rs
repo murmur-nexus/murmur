@@ -19,6 +19,51 @@ pub fn current_platform() -> &'static str {
     }
 }
 
+/// Every platform tag [`current_platform`] can return, excluding `"unknown"`.
+///
+/// The one list of recognised platform strings: a store path, a release-asset name and a
+/// `murmur.lock` platform key are all tagged with a member of this set, and a tag outside it is
+/// not a platform tag. A second list open-coded elsewhere would recognise a different set than
+/// the one `current_platform` produces, which is how a `darwin-x86_64` payload gets filed where
+/// no `darwin-x86_64` host looks for it.
+pub const SUPPORTED_PLATFORMS: [&str; 4] = [
+    "darwin-aarch64",
+    "darwin-x86_64",
+    "linux-aarch64",
+    "linux-x86_64",
+];
+
+/// Split a platform tag into its `(os, arch)` halves.
+///
+/// Accepts any `os-arch` shape, not just [`SUPPORTED_PLATFORMS`], because
+/// [`crate::registry::ArtifactMeta::platforms`] records what a publisher declared rather than
+/// what this build recognises. `None` when either half is empty or there is no `-`.
+#[must_use]
+pub fn split_platform_tag(platform: &str) -> Option<(&str, &str)> {
+    let (os, arch) = platform.split_once('-')?;
+    if os.trim().is_empty() || arch.trim().is_empty() {
+        return None;
+    }
+    Some((os, arch))
+}
+
+/// Split a recognised platform tag off a `.mur.zip` file or release-asset name.
+///
+/// Returns the name with both the `-{platform}` tag and the `.mur.zip` extension removed, plus
+/// the tag itself: `"tool-0.1.0-linux-x86_64.mur.zip"` → `("tool-0.1.0", "linux-x86_64")`.
+/// `None` when the name does not end in `.mur.zip`, or ends in it with no tag from
+/// [`SUPPORTED_PLATFORMS`] — an untagged payload every host resolves.
+#[must_use]
+pub fn split_platform_suffix(file_name: &str) -> Option<(&str, &'static str)> {
+    let stem = file_name.strip_suffix(".mur.zip")?;
+    SUPPORTED_PLATFORMS.iter().find_map(|platform| {
+        stem.strip_suffix(platform)
+            .and_then(|head| head.strip_suffix('-'))
+            .filter(|head| !head.is_empty())
+            .map(|head| (head, *platform))
+    })
+}
+
 /// A fat Mach-O carries images for more than one architecture, so identifying one settles the
 /// operating system and nothing else. [`native_binary_verdict`] treats it as runnable on any
 /// `darwin-*` host.
@@ -168,6 +213,72 @@ mod tests {
         assert_eq!(map_platform("windows", "x86_64"), "unknown");
         assert_eq!(map_platform("freebsd", "aarch64"), "unknown");
         assert_eq!(map_platform("", ""), "unknown");
+    }
+
+    // ── SUPPORTED_PLATFORMS / tag splitting ───────────────────────────────────
+
+    use super::{split_platform_suffix, split_platform_tag, SUPPORTED_PLATFORMS};
+
+    /// The constant and the mapping are the same set. A platform `current_platform` can return
+    /// but the constant does not list would be filed at a path nothing recognises.
+    #[test]
+    fn supported_platforms_matches_what_current_platform_returns() {
+        let mapped = [
+            map_platform("macos", "aarch64"),
+            map_platform("macos", "x86_64"),
+            map_platform("linux", "aarch64"),
+            map_platform("linux", "x86_64"),
+        ];
+        let mut expected = mapped.to_vec();
+        expected.sort_unstable();
+        let mut actual = SUPPORTED_PLATFORMS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn platform_tag_splits_into_os_and_arch() {
+        assert_eq!(
+            split_platform_tag("linux-x86_64"),
+            Some(("linux", "x86_64"))
+        );
+        assert_eq!(
+            split_platform_tag("darwin-aarch64"),
+            Some(("darwin", "aarch64"))
+        );
+        assert_eq!(split_platform_tag("linux"), None);
+        assert_eq!(split_platform_tag("-x86_64"), None);
+        assert_eq!(split_platform_tag("linux-"), None);
+    }
+
+    #[test]
+    fn platform_suffix_splits_off_a_recognised_tag() {
+        assert_eq!(
+            split_platform_suffix("nativetool-0.1.0-linux-x86_64.mur.zip"),
+            Some(("nativetool-0.1.0", "linux-x86_64"))
+        );
+        assert_eq!(
+            split_platform_suffix("nativetool-0.1.0-darwin-aarch64.mur.zip"),
+            Some(("nativetool-0.1.0", "darwin-aarch64"))
+        );
+    }
+
+    #[test]
+    fn an_untagged_or_unrecognised_name_carries_no_platform() {
+        // A WASM artifact published under its plain versioned name.
+        assert_eq!(split_platform_suffix("wasmtool-0.1.0.mur.zip"), None);
+        // A tag outside the recognised set is not a tag.
+        assert_eq!(
+            split_platform_suffix("tool-0.1.0-windows-x86_64.mur.zip"),
+            None
+        );
+        // The tag must be preceded by a name.
+        assert_eq!(split_platform_suffix("linux-x86_64.mur.zip"), None);
+        // Not a .mur.zip at all.
+        assert_eq!(
+            split_platform_suffix("tool-0.1.0-linux-x86_64.sha256"),
+            None
+        );
     }
 
     // ── binary_platform / native_binary_verdict ───────────────────────────────

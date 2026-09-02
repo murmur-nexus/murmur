@@ -109,7 +109,7 @@ fn install_no_args_installs_manifest_declared_dependency() {
         .artifact_for("declared-dep")
         .expect("lock entry for declared-dep");
     assert_eq!(entry.resolved_version, "1.2.3");
-    assert_eq!(entry.sha256.wasm, expected_sha256);
+    assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
 }
 
 /// Write a project `murmur.yaml` declaring every `(name, version)` in `deps` as an artifact.
@@ -146,7 +146,7 @@ fn assert_installed_and_pinned(project: &Path, name: &str, version: &str, sha256
         .artifact_for(name)
         .unwrap_or_else(|| panic!("lock entry for {name}"));
     assert_eq!(entry.resolved_version, version);
-    assert_eq!(entry.sha256.wasm, sha256);
+    assert_eq!(entry.sha256.any.as_deref().unwrap(), sha256);
 }
 
 /// One unpublished artifact must not discard the other two: both successes are stored *and*
@@ -337,7 +337,7 @@ fn install_registers_lock_entry_for_registry_resolved_artifact() {
         .artifact_for("locked-tool")
         .expect("lock entry for locked-tool");
     assert_eq!(entry.resolved_version, "1.0.0");
-    assert_eq!(entry.sha256.wasm, expected_sha256);
+    assert_eq!(entry.sha256.any.as_deref().unwrap(), expected_sha256);
 
     let installed = project
         .path()
@@ -358,9 +358,7 @@ fn install_upserts_lock_preserving_existing_entries() {
         artifacts: vec![LockedArtifact {
             name: "already-pinned".to_string(),
             resolved_version: "0.4.0".to_string(),
-            sha256: LockedSha256 {
-                wasm: "preexisting-hash".to_string(),
-            },
+            sha256: LockedSha256::any("preexisting-hash".to_string()),
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &preexisting).unwrap();
@@ -376,11 +374,11 @@ fn install_upserts_lock_preserving_existing_entries() {
 
     let existing = lock.artifact_for("already-pinned").unwrap();
     assert_eq!(existing.resolved_version, "0.4.0");
-    assert_eq!(existing.sha256.wasm, "preexisting-hash");
+    assert_eq!(existing.sha256.any.as_deref().unwrap(), "preexisting-hash");
 
     let new_entry = lock.artifact_for("new-tool").unwrap();
     assert_eq!(new_entry.resolved_version, "2.0.0");
-    assert_eq!(new_entry.sha256.wasm, expected_sha256);
+    assert_eq!(new_entry.sha256.any.as_deref().unwrap(), expected_sha256);
 }
 
 #[test]
@@ -399,9 +397,7 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
         artifacts: vec![LockedArtifact {
             name: "conflict-tool".to_string(),
             resolved_version: "1.0.0".to_string(),
-            sha256: LockedSha256 {
-                wasm: "a-completely-different-hash-from-a-prior-pull".to_string(),
-            },
+            sha256: LockedSha256::any("a-completely-different-hash-from-a-prior-pull".to_string()),
         }],
     };
     murmur_artifact::write_lockfile_atomic(&lock_path, &pinned).unwrap();
@@ -419,7 +415,7 @@ fn install_rejects_lock_conflict_and_writes_nothing() {
     let lock = read_lockfile(&lock_path).unwrap();
     let entry = lock.artifact_for("conflict-tool").unwrap();
     assert_eq!(
-        entry.sha256.wasm,
+        entry.sha256.any.as_deref().unwrap(),
         "a-completely-different-hash-from-a-prior-pull"
     );
 }

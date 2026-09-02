@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::wit_contract::{wit_contracts_from_artifact_bytes, WitContracts};
+use crate::{
+    artifact::load_manifest_from_artifact_bytes,
+    manifest::Manifest,
+    platform::split_platform_tag,
+    wit_contract::{wit_contracts_from_artifact_bytes, WitContracts},
+};
 
 pub type Platform = (String, String);
 
@@ -84,11 +89,26 @@ pub struct PublishResult {
     pub sha256: String,
 }
 
+/// How the payload a resolve returned relates to the platform that was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformMatch {
+    /// No platform was requested, or the payload needs none (WASM, static).
+    NotApplicable,
+    /// A platform-tagged payload for the requested platform.
+    Tagged,
+    /// A native payload returned from the generic, untagged path because no tagged
+    /// payload exists — resolvable, but nothing recorded which platform it is for.
+    UntaggedFallback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedArtifact {
     pub meta: ArtifactMeta,
     pub bytes: Bytes,
     pub sha256: String,
+    /// Which store path these bytes came off, relative to the platform that was asked for.
+    /// [`PlatformMatch::UntaggedFallback`] is what `W-REG-001` reports.
+    pub platform_match: PlatformMatch,
 }
 
 pub trait Registry: Send + Sync {
@@ -161,9 +181,19 @@ impl LocalRegistry {
         self.root.join(name).join(version)
     }
 
-    fn metadata_path_for(&self, name: &str, version: &str) -> PathBuf {
-        self.artifact_dir(name, version)
-            .join(format!("{name}-{version}.meta.json"))
+    /// Path of the metadata sidecar describing one payload.
+    ///
+    /// `Some(platform)` names the sidecar beside the platform-tagged payload,
+    /// `None` the one beside the generic payload. One version directory holds one sidecar per
+    /// payload in it: a single untagged file would be overwritten by every platform installed
+    /// after the first, leaving the store claiming one platform's provenance for all of them.
+    #[must_use]
+    pub fn metadata_path_for(&self, name: &str, version: &str, platform: Option<&str>) -> PathBuf {
+        let file_name = match platform {
+            Some(platform) => format!("{name}-{version}-{platform}.meta.json"),
+            None => format!("{name}-{version}.meta.json"),
+        };
+        self.artifact_dir(name, version).join(file_name)
     }
 
     // Currently at most one platform per artifact. Vec<Platform> is kept for forward
@@ -208,7 +238,7 @@ impl LocalRegistry {
         } else {
             self.sha256_path_for(&meta.name, &meta.version)
         };
-        let metadata_path = self.metadata_path_for(&meta.name, &meta.version);
+        let metadata_path = self.metadata_path_for(&meta.name, &meta.version, platform.as_deref());
 
         if !overwrite && (artifact_path.exists() || hash_path.exists()) {
             return Err(RegistryError::Conflict {
@@ -275,27 +305,30 @@ impl LocalRegistry {
         version: &str,
         platform: Option<&str>,
     ) -> Result<ResolvedArtifact, RegistryError> {
-        let metadata_path = self.metadata_path_for(name, version);
-
         // When a platform is requested, prefer the platform-specific file first, then
         // fall back to the generic (platform-agnostic) file so WASM artifacts always resolve.
-        let (artifact_path, hash_path) = if let Some(p) = platform {
+        // `path_platform` is the tag of the payload actually chosen, and every sidecar below is
+        // read from beside that payload rather than from a single file per name+version.
+        let (artifact_path, hash_path, path_platform) = if let Some(p) = platform {
             let plat_artifact = self.artifact_path_for_platform(name, version, p);
             let plat_hash = self.sha256_path_for_platform(name, version, p);
             if plat_artifact.exists() && plat_hash.exists() {
-                (plat_artifact, plat_hash)
+                (plat_artifact, plat_hash, Some(p))
             } else {
                 (
                     self.artifact_path_for(name, version),
                     self.sha256_path_for(name, version),
+                    None,
                 )
             }
         } else {
             (
                 self.artifact_path_for(name, version),
                 self.sha256_path_for(name, version),
+                None,
             )
         };
+        let metadata_path = self.metadata_path_for(name, version, path_platform);
 
         if !artifact_path.exists() || !hash_path.exists() {
             return Err(RegistryError::NotFound {
@@ -331,13 +364,26 @@ impl LocalRegistry {
                 })?
                 .meta
         } else {
-            fallback_meta(name, version)
+            derived_meta(name, version, &bytes, path_platform)
+        };
+
+        // A native payload off the generic path resolves, and runs — but nothing on disk says
+        // which platform it was built for, so a second platform installed into this version
+        // directory would overwrite it. `W-REG-001` reports that; a WASM payload off the same
+        // path is simply how a platform-independent artifact is stored and is not reported.
+        let platform_match = match (platform, path_platform) {
+            (Some(_), Some(_)) => PlatformMatch::Tagged,
+            (Some(_), None) if meta.runtime == RuntimeType::Native => {
+                PlatformMatch::UntaggedFallback
+            }
+            _ => PlatformMatch::NotApplicable,
         };
 
         Ok(ResolvedArtifact {
             meta,
             sha256,
             bytes: Bytes::from(bytes),
+            platform_match,
         })
     }
 }
@@ -409,43 +455,87 @@ impl Registry for LocalRegistry {
                     continue;
                 };
 
-                let metadata_path = self.metadata_path_for(name_name, version_name);
+                // A version directory may contain the generic `name-ver.mur.zip` (WASM,
+                // static) or one `name-ver-<platform>.mur.zip` per platform (native), and one
+                // metadata sidecar beside each payload.
+                let mut payloads: Vec<PathBuf> = Vec::new();
+                let mut sidecars: Vec<PathBuf> = Vec::new();
+                let prefix = format!("{name_name}-{version_name}");
+                let mut names: Vec<String> = fs::read_dir(&version_path)
+                    .map_err(|source| RegistryError::Io {
+                        path: version_path.display().to_string(),
+                        source,
+                    })?
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort_unstable();
+                for file_name in names {
+                    let Some(tail) = file_name.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    if !tail.is_empty() && !tail.starts_with('-') && !tail.starts_with('.') {
+                        continue;
+                    }
+                    if file_name.ends_with(".mur.zip") {
+                        payloads.push(version_path.join(&file_name));
+                    } else if file_name.ends_with(".meta.json") {
+                        sidecars.push(version_path.join(&file_name));
+                    }
+                }
 
-                // Check for a platform-specific artifact OR the generic artifact.
-                // A version directory may contain either `name-ver.mur.zip` (WASM/generic)
-                // or `name-ver-<platform>.mur.zip` (native, platform-tagged).
                 let has_generic = self.artifact_path_for(name_name, version_name).exists()
                     && self.sha256_path_for(name_name, version_name).exists();
-                let has_any_platform = !has_generic && {
-                    let prefix = format!("{name_name}-{version_name}-");
-                    fs::read_dir(&version_path)
-                        .ok()
-                        .and_then(|entries| {
-                            entries
-                                .flatten()
-                                .any(|e| {
-                                    let fname = e.file_name();
-                                    let s = fname.to_string_lossy();
-                                    s.starts_with(&prefix) && s.ends_with(".mur.zip")
-                                })
-                                .then_some(())
-                        })
-                        .is_some()
-                };
-
-                if !has_generic && !has_any_platform {
+                if !has_generic && payloads.is_empty() {
                     continue;
                 }
 
-                let mut meta = if metadata_path.exists() {
-                    read_metadata(&metadata_path)
-                        .map_err(|source| RegistryError::Io {
-                            path: metadata_path.display().to_string(),
+                // One row per name+version, however many payloads back it: `mur list` reports
+                // an artifact, and `platforms` is the set of platforms that artifact is
+                // installed for. A row per sidecar would list the same artifact twice.
+                let mut sidecar_metas = Vec::with_capacity(sidecars.len());
+                for sidecar in &sidecars {
+                    sidecar_metas.push(
+                        read_metadata(sidecar)
+                            .map_err(|source| RegistryError::Io {
+                                path: sidecar.display().to_string(),
+                                source,
+                            })?
+                            .meta,
+                    );
+                }
+
+                let mut meta = match sidecar_metas.first() {
+                    Some(first) => {
+                        let mut meta = first.clone();
+                        meta.platforms = sidecar_metas
+                            .iter()
+                            .flat_map(|meta| meta.platforms.iter().cloned())
+                            .collect();
+                        meta.platforms.sort_unstable();
+                        meta.platforms.dedup();
+                        meta
+                    }
+                    // No sidecar anywhere in this directory: read the payload rather than
+                    // guessing, the same derivation `resolve_impl` makes. Only a directory
+                    // missing its sidecars pays for this read.
+                    None => {
+                        let payload = if has_generic {
+                            self.artifact_path_for(name_name, version_name)
+                        } else {
+                            payloads[0].clone()
+                        };
+                        let path_platform = payload
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .and_then(crate::platform::split_platform_suffix)
+                            .map(|(_, platform)| platform);
+                        let bytes = fs::read(&payload).map_err(|source| RegistryError::Io {
+                            path: payload.display().to_string(),
                             source,
-                        })?
-                        .meta
-                } else {
-                    fallback_meta(name_name, version_name)
+                        })?;
+                        derived_meta(name_name, version_name, &bytes, path_platform)
+                    }
                 };
 
                 meta.name = name_name.to_string();
@@ -643,13 +733,34 @@ fn restore_backup(backup: &Path, final_path: &Path, had_backup: bool) -> Result<
     })
 }
 
-fn fallback_meta(name: &str, version: &str) -> ArtifactMeta {
+/// Describe a payload that has no metadata sidecar, from the payload itself.
+///
+/// A store written before sidecars were per-platform, or seeded by a path that wrote only the
+/// zip and its hash, still has to answer what the artifact is. `runtime` and `artifact_runtime`
+/// come from the `murmur.yaml` packed inside the bytes and `platforms` from the tag of the path
+/// the bytes were found at, so the answer describes these bytes rather than a default. A payload
+/// that does not parse falls back to `wasm` with nothing else filled in, so an opaque payload
+/// still resolves.
+fn derived_meta(
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+    path_platform: Option<&str>,
+) -> ArtifactMeta {
+    let manifest = load_manifest_from_artifact_bytes(bytes).ok();
     ArtifactMeta {
         name: name.to_string(),
         version: version.to_string(),
-        runtime: RuntimeType::Wasm,
-        artifact_runtime: String::new(),
-        platforms: Vec::new(),
+        runtime: manifest
+            .as_ref()
+            .map_or(RuntimeType::Wasm, Manifest::registry_runtime),
+        artifact_runtime: manifest
+            .as_ref()
+            .map_or_else(String::new, |manifest| manifest.runtime.clone()),
+        platforms: path_platform
+            .and_then(split_platform_tag)
+            .map(|(os, arch)| vec![(os.to_string(), arch.to_string())])
+            .unwrap_or_default(),
         description: None,
         tags: Vec::new(),
         wit_contracts: None,
@@ -1122,7 +1233,7 @@ mod tests {
             let registry = LocalRegistry::new(dir.path());
             registry.publish(test_meta(name, "0.1.0"), &bytes).unwrap();
 
-            let raw = fs::read_to_string(registry.metadata_path_for(name, "0.1.0")).unwrap();
+            let raw = fs::read_to_string(registry.metadata_path_for(name, "0.1.0", None)).unwrap();
             assert!(
                 !raw.contains("wit_contracts"),
                 "{name}: metadata carries a wit_contracts key: {raw}"
@@ -1136,6 +1247,223 @@ mod tests {
         }
     }
 
+    // ── platform provenance ───────────────────────────────────────────────────
+
+    fn native_meta(name: &str, version: &str, platform: &str) -> ArtifactMeta {
+        let (os, arch) = crate::platform::split_platform_tag(platform).unwrap();
+        ArtifactMeta {
+            name: name.to_string(),
+            version: version.to_string(),
+            runtime: RuntimeType::Native,
+            artifact_runtime: "tool".to_string(),
+            platforms: vec![(os.to_string(), arch.to_string())],
+            description: None,
+            tags: Vec::new(),
+            wit_contracts: None,
+        }
+    }
+
+    /// A `.mur.zip` whose packed manifest declares a native tool, with `filler` bytes in the
+    /// binary so two platforms' payloads hash differently.
+    fn native_artifact_zip(name: &str, version: &str, filler: &[u8]) -> Vec<u8> {
+        let manifest =
+            format!("name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n");
+        zip_with(&[
+            ("murmur.yaml", manifest.as_bytes()),
+            (&format!("bin/{name}"), filler),
+        ])
+    }
+
+    #[test]
+    fn two_platforms_install_into_one_version_directory_without_clobbering() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let linux = native_artifact_zip("nativetool", "0.1.0", b"linux-binary");
+        let darwin = native_artifact_zip("nativetool", "0.1.0", b"darwin-binary");
+
+        for (platform, bytes) in [("linux-x86_64", &linux), ("darwin-aarch64", &darwin)] {
+            registry
+                .store_installed_overwrite(
+                    native_meta("nativetool", "0.1.0", platform),
+                    bytes,
+                    &sha256_hex(bytes),
+                )
+                .unwrap();
+        }
+
+        let version_dir = dir.path().join("nativetool/0.1.0");
+        let mut files: Vec<String> = fs::read_dir(&version_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                "nativetool-0.1.0-darwin-aarch64.meta.json",
+                "nativetool-0.1.0-darwin-aarch64.mur.zip",
+                "nativetool-0.1.0-darwin-aarch64.sha256",
+                "nativetool-0.1.0-linux-x86_64.meta.json",
+                "nativetool-0.1.0-linux-x86_64.mur.zip",
+                "nativetool-0.1.0-linux-x86_64.sha256",
+            ]
+        );
+
+        let resolved_linux = registry
+            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .unwrap();
+        let resolved_darwin = registry
+            .resolve_with_platform("nativetool", "0.1.0", Some("darwin-aarch64"))
+            .unwrap();
+
+        assert_eq!(resolved_linux.platform_match, PlatformMatch::Tagged);
+        assert_eq!(resolved_darwin.platform_match, PlatformMatch::Tagged);
+        assert_eq!(resolved_linux.bytes, Bytes::from(linux));
+        assert_eq!(resolved_darwin.bytes, Bytes::from(darwin));
+        assert_ne!(resolved_linux.sha256, resolved_darwin.sha256);
+        assert_eq!(
+            resolved_linux.meta.platforms,
+            vec![("linux".to_string(), "x86_64".to_string())]
+        );
+        assert_eq!(
+            resolved_darwin.meta.platforms,
+            vec![("darwin".to_string(), "aarch64".to_string())]
+        );
+        assert_eq!(resolved_linux.meta.runtime, RuntimeType::Native);
+    }
+
+    #[test]
+    fn a_platform_independent_payload_stays_at_the_generic_path() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = zip_with(&[
+            (
+                "murmur.yaml",
+                b"name: wasmtool\nversion: 0.1.0\nruntime: tool\n",
+            ),
+            ("tool.wasm", b"\0asm"),
+        ]);
+
+        registry
+            .store_installed_overwrite(test_meta("wasmtool", "0.1.0"), &bytes, &sha256_hex(&bytes))
+            .unwrap();
+
+        assert!(dir
+            .path()
+            .join("wasmtool/0.1.0/wasmtool-0.1.0.meta.json")
+            .exists());
+        // Requested for a platform this payload was never tagged with, and still resolved.
+        let resolved = registry
+            .resolve_with_platform("wasmtool", "0.1.0", Some("darwin-aarch64"))
+            .unwrap();
+        assert_eq!(resolved.platform_match, PlatformMatch::NotApplicable);
+        assert!(resolved.meta.platforms.is_empty());
+    }
+
+    #[test]
+    fn a_native_payload_off_the_generic_path_reports_the_untagged_fallback() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_artifact_zip("nativetool", "0.1.0", b"binary");
+        // An install written before platform tagging: generic paths, `platforms: []`.
+        let mut meta = native_meta("nativetool", "0.1.0", "linux-x86_64");
+        meta.platforms = Vec::new();
+        registry
+            .store_installed_overwrite(meta, &bytes, &sha256_hex(&bytes))
+            .unwrap();
+
+        let resolved = registry
+            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .unwrap();
+        assert_eq!(resolved.platform_match, PlatformMatch::UntaggedFallback);
+        assert_eq!(resolved.bytes, Bytes::from(bytes));
+    }
+
+    #[test]
+    fn missing_metadata_is_derived_from_the_payload() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_artifact_zip("nativetool", "0.1.0", b"binary");
+        let version_dir = dir.path().join("nativetool/0.1.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(
+            version_dir.join("nativetool-0.1.0-linux-x86_64.mur.zip"),
+            &bytes,
+        )
+        .unwrap();
+        fs::write(
+            version_dir.join("nativetool-0.1.0-linux-x86_64.sha256"),
+            sha256_hex(&bytes),
+        )
+        .unwrap();
+
+        let resolved = registry
+            .resolve_with_platform("nativetool", "0.1.0", Some("linux-x86_64"))
+            .unwrap();
+        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
+        assert_eq!(resolved.meta.artifact_runtime, "tool");
+        assert_eq!(
+            resolved.meta.platforms,
+            vec![("linux".to_string(), "x86_64".to_string())]
+        );
+        assert_eq!(resolved.platform_match, PlatformMatch::Tagged);
+
+        // The same derivation backs `mur list`, which has no sidecar to read either.
+        let index = registry.list_index().unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index[0].runtime, RuntimeType::Native);
+    }
+
+    #[test]
+    fn a_payload_that_does_not_parse_keeps_the_pre_derivation_defaults() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let version_dir = dir.path().join("opaque/0.1.0");
+        fs::create_dir_all(&version_dir).unwrap();
+        fs::write(version_dir.join("opaque-0.1.0.mur.zip"), b"not-a-zip").unwrap();
+        fs::write(
+            version_dir.join("opaque-0.1.0.sha256"),
+            sha256_hex(b"not-a-zip"),
+        )
+        .unwrap();
+
+        let resolved = registry.resolve("opaque", "0.1.0").unwrap();
+        assert_eq!(resolved.meta.runtime, RuntimeType::Wasm);
+        assert!(resolved.meta.artifact_runtime.is_empty());
+        assert!(resolved.meta.platforms.is_empty());
+    }
+
+    #[test]
+    fn list_index_returns_one_row_per_version_with_every_platform_installed() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        for (platform, filler) in [
+            ("linux-x86_64", b"linux".as_slice()),
+            ("darwin-aarch64", b"darwin".as_slice()),
+        ] {
+            let bytes = native_artifact_zip("nativetool", "0.1.0", filler);
+            registry
+                .store_installed_overwrite(
+                    native_meta("nativetool", "0.1.0", platform),
+                    &bytes,
+                    &sha256_hex(&bytes),
+                )
+                .unwrap();
+        }
+
+        let index = registry.list_index().unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            index[0].platforms,
+            vec![
+                ("darwin".to_string(), "aarch64".to_string()),
+                ("linux".to_string(), "x86_64".to_string()),
+            ]
+        );
+        assert_eq!(index[0].runtime, RuntimeType::Native);
+    }
+
     #[test]
     fn metadata_written_before_the_field_existed_still_loads() {
         let dir = tempdir().unwrap();
@@ -1144,7 +1472,7 @@ mod tests {
             .publish(test_meta("old", "0.1.0"), b"bytes")
             .unwrap();
 
-        let path = registry.metadata_path_for("old", "0.1.0");
+        let path = registry.metadata_path_for("old", "0.1.0", None);
         fs::write(
             &path,
             r#"{"meta":{"name":"old","version":"0.1.0","runtime":"wasm","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,

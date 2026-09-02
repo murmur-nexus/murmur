@@ -80,36 +80,47 @@ pub(crate) fn ensure_artifact_for_deploy(
 
     // Step B — fetch from source chain with explicit target platform
     match chain.resolve_bare_for_platform(name, version, target_platform) {
-        Ok(bytes) => {
+        Ok(resolved) => {
+            let bytes = resolved.bytes.to_vec();
             let sha256 = murmur_artifact::sha256_hex(&bytes);
 
-            let artifact_dir = platform_specific_path.parent().ok_or_else(|| {
-                crate::error::CliError::new(
-                    E_IO_003,
-                    format!(
-                        "unexpected artifact path (no parent): {}",
-                        platform_specific_path.display()
-                    ),
+            let manifest =
+                murmur_artifact::load_manifest_from_artifact_bytes(&bytes).map_err(|e| {
+                    crate::error::CliError::new(
+                        E_IO_003,
+                        format!(
+                            "{name}@{version} ({target_platform}) is not a valid .mur.zip: {e}"
+                        ),
+                    )
+                })?;
+            let runtime = manifest.registry_runtime();
+            // Cached through the registry rather than written by hand, so the cached payload
+            // carries the metadata every other resolve reads — including which platform it is
+            // for, which for a cross-platform deploy is not this host's.
+            local_registry
+                .store_installed_overwrite(
+                    murmur_artifact::ArtifactMeta {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        runtime,
+                        artifact_runtime: manifest.runtime.clone(),
+                        platforms: match (
+                            runtime,
+                            murmur_artifact::split_platform_tag(target_platform),
+                        ) {
+                            (RuntimeType::Native, Some((os, arch))) => {
+                                vec![(os.to_string(), arch.to_string())]
+                            }
+                            _ => Vec::new(),
+                        },
+                        description: None,
+                        tags: Vec::new(),
+                        wit_contracts: None,
+                    },
+                    &bytes,
+                    &sha256,
                 )
-            })?;
-            let sha256_path =
-                artifact_dir.join(format!("{name}-{version}-{target_platform}.sha256"));
-
-            std::fs::create_dir_all(artifact_dir).map_err(|e| {
-                crate::error::CliError::new(
-                    E_IO_003,
-                    format!("failed to create artifact cache dir: {e}"),
-                )
-            })?;
-            std::fs::write(&platform_specific_path, &bytes).map_err(|e| {
-                crate::error::CliError::new(E_IO_003, format!("failed to cache artifact: {e}"))
-            })?;
-            std::fs::write(&sha256_path, sha256.as_bytes()).map_err(|e| {
-                crate::error::CliError::new(
-                    E_IO_003,
-                    format!("failed to cache artifact sha256: {e}"),
-                )
-            })?;
+                .map_err(crate::error::CliError::from)?;
 
             Ok(StagedArtifact {
                 name: name.to_string(),
@@ -1904,8 +1915,7 @@ mod tests {
     #[test]
     fn parallel_resolution_returns_all_six_artifacts() {
         use crate::config::SourceConfig;
-        use crate::source::{ArtifactSource, SourceChain, SourceError};
-        use bytes::Bytes;
+        use crate::source::{ArtifactSource, SourceChain, SourceError, SourceResolution};
         use murmur_artifact::{sha256_hex, ArtifactMeta, LocalRegistry, RuntimeType};
         use std::io::Write;
         use zip::{
@@ -1932,7 +1942,7 @@ mod tests {
             fn name(&self) -> &str {
                 "never-called"
             }
-            fn resolve_bare(&self, _: &str) -> Result<(Bytes, String), SourceError> {
+            fn resolve_bare(&self, _: &str) -> Result<SourceResolution, SourceError> {
                 panic!("source chain must not be called when all artifacts are cached")
             }
         }
@@ -2190,7 +2200,7 @@ mod tests {
 
         use crate::{
             config::SourceConfig,
-            source::{ArtifactSource, SourceChain, SourceError},
+            source::{ArtifactSource, SourceChain, SourceError, SourceResolution},
         };
 
         use super::super::ensure_artifact_for_deploy;
@@ -2205,11 +2215,38 @@ mod tests {
                 zip.start_file("murmur.yaml", opts).unwrap();
                 writeln!(zip, "name: {name}").unwrap();
                 writeln!(zip, "version: {version}").unwrap();
+                writeln!(zip, "runtime: tool").unwrap();
                 zip.start_file("tool.wasm", opts).unwrap();
                 zip.write_all(b"fake-wasm").unwrap();
                 zip.finish().unwrap();
             }
             cursor.into_inner()
+        }
+
+        /// A `.mur.zip` declaring a native tool. `filler` goes in the binary, so two
+        /// platforms' payloads hash differently.
+        fn make_native_zip(name: &str, version: &str, filler: &[u8]) -> Vec<u8> {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut zip = ZipWriter::new(&mut cursor);
+                let opts: SimpleFileOptions =
+                    FileOptions::default().compression_method(CompressionMethod::Deflated);
+                zip.start_file("murmur.yaml", opts).unwrap();
+                writeln!(zip, "name: {name}").unwrap();
+                writeln!(zip, "version: {version}").unwrap();
+                writeln!(zip, "runtime: tool").unwrap();
+                writeln!(zip, "implementation: native").unwrap();
+                zip.start_file(format!("bin/{name}"), opts).unwrap();
+                zip.write_all(filler).unwrap();
+                zip.finish().unwrap();
+            }
+            cursor.into_inner()
+        }
+
+        /// A chain with no sources: every fetch misses without touching the network, so a test
+        /// can tell "resolved locally" from "fell through to the fetch step" unambiguously.
+        fn unreachable_chain() -> SourceChain {
+            SourceChain::from_sources_for_test(Vec::new(), Vec::<SourceConfig>::new())
         }
 
         fn store_wasm(registry: &LocalRegistry, name: &str, version: &str, bytes: &[u8]) {
@@ -2248,15 +2285,13 @@ mod tests {
                 .unwrap()
                 .join(format!("{name}-{version}-{platform}.sha256"));
             std::fs::write(&sha256_path, sha256.as_bytes()).unwrap();
-            let meta_path = artifact_path
-                .parent()
-                .unwrap()
-                .join(format!("{name}-{version}.meta.json"));
+            let (os, arch) = murmur_artifact::split_platform_tag(platform).unwrap();
+            let meta_path = registry.metadata_path_for(name, version, Some(platform));
             let meta = serde_json::json!({
                 "meta": {
                     "name": name, "version": version,
-                    "runtime": "native", "artifact_runtime": "native",
-                    "platforms": [], "description": null, "tags": []
+                    "runtime": "native", "artifact_runtime": "tool",
+                    "platforms": [[os, arch]], "description": null, "tags": []
                 }
             });
             std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
@@ -2301,21 +2336,27 @@ mod tests {
                 "mock"
             }
 
-            fn resolve_bare(&self, _name: &str) -> Result<(Bytes, String), SourceError> {
+            fn resolve_bare(&self, _name: &str) -> Result<SourceResolution, SourceError> {
                 self.called.store(true, Ordering::SeqCst);
-                self.result
-                    .clone()
-                    .map(|v| (Bytes::from(v), "0.0.0".to_string()))
+                self.result.clone().map(|bytes| SourceResolution {
+                    bytes: Bytes::from(bytes),
+                    resolved_version: "0.0.0".to_string(),
+                    platform: None,
+                })
             }
 
             fn resolve_bare_with_version_for_platform(
                 &self,
                 _name: &str,
                 _version: &str,
-                _platform: &str,
-            ) -> Result<Vec<u8>, SourceError> {
+                platform: &str,
+            ) -> Result<SourceResolution, SourceError> {
                 self.called.store(true, Ordering::SeqCst);
-                self.result.clone()
+                self.result.clone().map(|bytes| SourceResolution {
+                    bytes: Bytes::from(bytes),
+                    resolved_version: "0.0.0".to_string(),
+                    platform: Some(platform.to_string()),
+                })
             }
         }
 
@@ -2379,16 +2420,16 @@ mod tests {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
 
-            let darwin_bytes = b"darwin-binary";
+            let darwin_bytes = make_native_zip("my-tool", "1.0.0", b"darwin-binary");
             store_native_at_platform_path(
                 &registry,
                 "my-tool",
                 "1.0.0",
                 "darwin-aarch64",
-                darwin_bytes,
+                &darwin_bytes,
             );
 
-            let linux_bytes = b"linux-binary".to_vec();
+            let linux_bytes = make_native_zip("my-tool", "1.0.0", b"linux-binary");
             let (chain, called) = mock_chain(Ok(linux_bytes.clone()));
 
             let staged =
@@ -2410,8 +2451,8 @@ mod tests {
             let dir = tempdir().unwrap();
             let registry = LocalRegistry::new(dir.path());
 
-            let bytes = b"native-binary";
-            store_native_at_generic_path(&registry, "my-tool", "1.0.0", bytes);
+            let bytes = make_native_zip("my-tool", "1.0.0", b"native-binary");
+            store_native_at_generic_path(&registry, "my-tool", "1.0.0", &bytes);
 
             let (chain, called) = mock_chain(Err(SourceError::NotFound(
                 "should not be called".to_string(),
@@ -2421,7 +2462,7 @@ mod tests {
             let staged =
                 ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain).unwrap();
 
-            assert_eq!(&staged.bytes[..], bytes);
+            assert_eq!(staged.bytes, bytes);
             assert!(
                 !called.load(Ordering::SeqCst),
                 "chain must not be called for same-platform native"
@@ -2452,6 +2493,68 @@ mod tests {
             assert!(
                 err.message.contains("9.9.9"),
                 "error must include the version: {}",
+                err.message
+            );
+        }
+
+        /// A store holding one payload per platform stages the target's, not this host's.
+        #[test]
+        fn a_tagged_store_stages_the_target_platforms_payload() {
+            let dir = tempdir().unwrap();
+            let registry = LocalRegistry::new(dir.path());
+            let host = current_platform();
+            let target = murmur_artifact::SUPPORTED_PLATFORMS
+                .iter()
+                .copied()
+                .find(|platform| *platform != host)
+                .unwrap();
+
+            let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
+            let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
+            store_native_at_platform_path(&registry, "my-tool", "1.0.0", host, &host_bytes);
+            store_native_at_platform_path(&registry, "my-tool", "1.0.0", target, &target_bytes);
+
+            let staged = ensure_artifact_for_deploy(
+                "my-tool",
+                "1.0.0",
+                target,
+                &registry,
+                &unreachable_chain(),
+            )
+            .unwrap();
+
+            assert_eq!(staged.bytes, target_bytes);
+            assert_eq!(staged.sha256, sha256_hex(&target_bytes));
+            assert_ne!(staged.sha256, sha256_hex(&host_bytes));
+        }
+
+        /// A native payload at the generic path is for an unrecorded platform, so it must not
+        /// be staged for a foreign one. It falls through to the fetch step instead — here, one
+        /// that cannot reach anything.
+        #[test]
+        fn an_untagged_native_payload_is_not_staged_for_a_foreign_platform() {
+            let dir = tempdir().unwrap();
+            let registry = LocalRegistry::new(dir.path());
+            let target = murmur_artifact::SUPPORTED_PLATFORMS
+                .iter()
+                .copied()
+                .find(|platform| *platform != current_platform())
+                .unwrap();
+
+            let bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
+            store_native_at_generic_path(&registry, "my-tool", "1.0.0", &bytes);
+
+            let err = ensure_artifact_for_deploy(
+                "my-tool",
+                "1.0.0",
+                target,
+                &registry,
+                &unreachable_chain(),
+            )
+            .unwrap_err();
+            assert!(
+                err.message.contains("not found locally or in any source"),
+                "expected a fetch attempt, got: {}",
                 err.message
             );
         }

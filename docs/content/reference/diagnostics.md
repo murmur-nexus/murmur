@@ -49,7 +49,7 @@ section that explains it.
 | `E-REG-005` | A registry-resolved artifact's version or hash disagrees with the `murmur.lock` entry | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-001` | Capsule crashed, compile failure, missing component export, execution deadline exceeded (`capabilities.limits.deadline_seconds`), or resource limit exceeded (`capabilities.limits.memory_bytes`/`table_elements`) | [Execution limits](resource-limits.md#execution-limits) |
 | `E-RUN-002` | Missing WASI import (linker error) | — |
-| `E-RUN-003` | Lock version mismatch or missing lock entry | [Lockfile](workdir.md#lockfile-murmurlock) |
+| `E-RUN-003` | Unsupported `lock_version`, missing lock entry, or a lock entry with no hash for this host's platform | [Lockfile](workdir.md#lockfile-murmurlock) |
 | `E-RUN-004` | Capsule WASM not found at expected path | — |
 | `E-RUN-005` | Inference driver not configured in manifest | [Inference configuration](manifest.md#inference-config) |
 | `E-RUN-006` | Inference driver artifact not installed, or `inference.command` is not on `PATH` | [Inference configuration](manifest.md#inference-config) |
@@ -76,6 +76,7 @@ section that explains it.
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
+| `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -717,6 +718,39 @@ A wasm or native artifact declares an obvious build input in `requires_files:` �
 payload, not the sources it was built from, so this is almost always a stray declaration.
 
 Static artifacts (`runtime: skill`) are exempt: their files *are* their content.
+
+---
+
+## Registry warnings
+
+`mur run` and `mur doctor` print non-fatal warnings about what an artifact store holds. Each one
+carries a `W-REG-NNN` code and a link back to its section on this page. The artifact still resolves
+and the session still runs, and `mur doctor` still exits `0`.
+
+### W-REG-001 — installed native artifact with no recorded platform { #w-reg-001 }
+
+```text
+warning[W-REG-001]: murmur-tool-git@0.4.2 is a native artifact with no recorded platform — it resolved from the generic store path, where every host resolves the same payload
+  Fix: mur install murmur-tool-git@0.4.2
+  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-001)
+```
+
+A native tool is a different binary per platform, so the store files it at
+`<name>-<version>-<platform>.mur.zip` with a metadata sidecar of the same name. This artifact is at
+the untagged `<name>-<version>.mur.zip` instead, which is where an install that recorded no platform
+puts it. Two consequences:
+
+- Every host resolves that one payload, whichever platform it was built for.
+- Installing a second platform into the same version directory would overwrite it rather than sit
+  beside it.
+
+Reinstalling refiles the payload under this host's platform tag:
+`mur install <name>@<version>`. There is no separate migration command, and nothing rewrites a
+store in place — `mur install` overwrites what is there.
+
+`mur doctor` marks that artifact's checklist line, prints the same `Fix:` line, and counts it as a
+warning rather than an error, so a store holding an untagged native payload does not fail a CI
+pre-flight check.
 
 ---
 

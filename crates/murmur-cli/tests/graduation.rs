@@ -52,7 +52,7 @@ fn graduation_full_round_trip() {
         .artifact_for(TOOL_NAME)
         .expect("lock entry for jsonl-line-count");
     assert_eq!(entry.resolved_version, TOOL_VERSION);
-    assert!(!entry.sha256.wasm.is_empty());
+    assert!(!entry.sha256.any.as_deref().unwrap_or_default().is_empty());
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                     expectations.push(LockExpectation {
                         name: artifact.name.clone(),
                         resolved_version: entry.resolved_version.clone(),
-                        sha256_wasm: entry.sha256.wasm.clone(),
+                        sha256: entry.sha256.any.clone().unwrap(),
                     });
                 }
 
@@ -239,9 +239,7 @@ fn stage_and_launch(home: &TempDir, project_dir: &Path) -> PathBuf {
                 .map(|entry| LockedArtifact {
                     name: entry.name.clone(),
                     resolved_version: entry.resolved_version.clone(),
-                    sha256: LockedSha256 {
-                        wasm: entry.sha256_wasm.clone(),
-                    },
+                    sha256: LockedSha256::any(entry.sha256.clone()),
                 })
                 .collect(),
         };

@@ -26,7 +26,8 @@ pub(crate) mod watch;
 
 use std::path::Path;
 
-use murmur_artifact::{LockfileError, RuntimeManifestError, MANIFEST_FILENAME};
+use capsule_runtime::ResolvedLockArtifact;
+use murmur_artifact::{LockedSha256, LockfileError, RuntimeManifestError, MANIFEST_FILENAME};
 
 use crate::error::{CliError, E_IO_001, E_IO_003, E_MAN_001, E_MAN_002, E_MAN_003, E_RUN_003};
 
@@ -117,5 +118,14 @@ pub(crate) fn lockfile_error_to_cli(error: LockfileError) -> CliError {
             E_IO_003,
             format!("failed to write murmur.lock at {path}: {source}"),
         ),
+    }
+}
+
+/// The `murmur.lock` pin for a payload staging resolved, mirroring `mur install`'s rule: a
+/// native binary is pinned under the platform it was resolved for, everything else under `any`.
+pub(crate) fn locked_sha256(entry: &ResolvedLockArtifact) -> LockedSha256 {
+    match &entry.platform {
+        Some(platform) => LockedSha256::for_one_platform(platform, entry.sha256.clone()),
+        None => LockedSha256::any(entry.sha256.clone()),
     }
 }
