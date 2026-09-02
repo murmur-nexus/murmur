@@ -88,8 +88,7 @@ impl LockedSha256 {
 
     /// Whether `other` pins the same kind of payload — both platform-independent, or both
     /// per-platform. A shape change means every hash held here describes different bytes.
-    #[must_use]
-    pub fn same_shape_as(&self, other: &Self) -> bool {
+    fn same_shape_as(&self, other: &Self) -> bool {
         self.platforms.is_empty() == other.platforms.is_empty()
     }
 

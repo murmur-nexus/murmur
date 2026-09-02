@@ -76,6 +76,7 @@ section that explains it.
 | `W-BLD-001` | A declaration names an archive entry the packer already fills | [W-BLD-001](#w-bld-001) |
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
+| `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -94,7 +95,6 @@ section that explains it.
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
 | `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
-| `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 
 ---
 
@@ -737,8 +737,8 @@ warning[W-REG-001]: murmur-tool-git@0.4.2 is a native artifact with no recorded 
 
 A native tool is a different binary per platform, so the store files it at
 `<name>-<version>-<platform>.mur.zip` with a metadata sidecar of the same name. This artifact is at
-the untagged `<name>-<version>.mur.zip` instead, which is where an install written before the store
-recorded platforms put it. Two consequences:
+the untagged `<name>-<version>.mur.zip` instead, which is where an install that recorded no platform
+puts it. Two consequences:
 
 - Every host resolves that one payload, whichever platform it was built for.
 - Installing a second platform into the same version directory would overwrite it rather than sit
@@ -749,8 +749,8 @@ Reinstalling refiles the payload under this host's platform tag:
 store in place — `mur install` overwrites what is there.
 
 `mur doctor` marks that artifact's checklist line, prints the same `Fix:` line, and counts it as a
-warning rather than an error, so a store written before this change does not fail a CI pre-flight
-check.
+warning rather than an error, so a store holding an untagged native payload does not fail a CI
+pre-flight check.
 
 ---
 

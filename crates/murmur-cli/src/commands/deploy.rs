@@ -2528,9 +2528,9 @@ mod tests {
             assert_ne!(staged.sha256, sha256_hex(&host_bytes));
         }
 
-        /// The bug this replaces: a native payload at the generic path was staged for whatever
-        /// platform was asked for, because nothing recorded that it was native. It must fall
-        /// through to the fetch step instead — here, one that cannot reach anything.
+        /// A native payload at the generic path is for an unrecorded platform, so it must not
+        /// be staged for a foreign one. It falls through to the fetch step instead — here, one
+        /// that cannot reach anything.
         #[test]
         fn an_untagged_native_payload_is_not_staged_for_a_foreign_platform() {
             let dir = tempdir().unwrap();

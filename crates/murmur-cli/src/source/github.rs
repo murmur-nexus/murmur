@@ -601,9 +601,8 @@ mod tests {
             .collect()
     }
 
-    /// The loose "any versioned zip" fallback used to hand a darwin zip to a Linux host. An
-    /// asset whose name carries a recognised platform tag is now only ever returned for that
-    /// platform.
+    /// An asset whose name carries a recognised platform tag is only ever returned for that
+    /// platform — matching on artifact name alone would hand a darwin zip to a Linux host.
     #[test]
     fn another_platforms_tagged_asset_is_never_selected() {
         let release = assets(&["nativetool-0.1.0-darwin-aarch64.mur.zip"]);

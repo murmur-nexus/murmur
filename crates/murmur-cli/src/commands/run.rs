@@ -8,14 +8,14 @@ use std::{
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
     launch_session, preopen_reports, stage_session, state_store_reports, AfterTask,
-    ArtifactRequest, LifecycleOverride, LockExpectation, ResolvedLockArtifact, ResumeMode,
-    ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
+    ArtifactRequest, LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError,
+    StageRequest, TaskAcceptance,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_dotenv_non_override, load_runtime_manifest,
     read_lockfile, registry_warning_link, write_lockfile_atomic, ArtifactRuntime, ContainmentClass,
-    InferenceConfig, LocalRegistry, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
-    PlatformMatch, Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
+    InferenceConfig, LocalRegistry, LockedArtifact, LockfileError, MurmurLock, PlatformMatch,
+    Registry, ResolvedArtifact, LOCK_VERSION, W_REG_001,
 };
 
 use crate::{
@@ -29,7 +29,8 @@ use crate::{
 };
 
 use super::{
-    fail_run, lockfile_error_to_cli, print_run_output, runtime_manifest_error_to_cli, RunStatus,
+    fail_run, locked_sha256, lockfile_error_to_cli, print_run_output,
+    runtime_manifest_error_to_cli, RunStatus,
 };
 
 /// Report a native payload the store served off its generic, untagged path: it runs here, but
@@ -42,15 +43,6 @@ fn warn_untagged_native(name: &str, version: &str) {
          Fix: mur install {name}@{version}\n  {}",
         registry_warning_link(W_REG_001)
     );
-}
-
-/// The `murmur.lock` pin for a payload staging resolved, mirroring `mur install`'s rule: a
-/// native binary is pinned under the platform it was resolved for, everything else under `any`.
-fn locked_sha256(entry: &ResolvedLockArtifact) -> LockedSha256 {
-    match &entry.platform {
-        Some(platform) => LockedSha256::for_one_platform(platform, entry.sha256.clone()),
-        None => LockedSha256::any(entry.sha256.clone()),
-    }
 }
 
 /// A lock that pins this artifact for other platforms but not for this one.

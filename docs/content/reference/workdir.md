@@ -320,7 +320,7 @@ to the lock. A platform the entry has no key for is not a disagreement.
 |---|---|
 | `mur run` | Creates `murmur.lock` when none exists. Once present, only verifies against it — an existing entry is never refreshed |
 | `mur eval` | As `mur run`, once for the whole dataset run |
-| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory) and for local-file installs |
+| `mur install` | Upserts an entry for each artifact it installs successfully, preserving the rest. Skipped for `-g` (no project directory), for local-file installs, and for `--all-platforms`, which installs into the global store |
 | `manage.pull()` | The same verify-then-upsert, from a running capsule rather than the CLI |
 
 An upsert adds this platform's key beside the keys already there. It replaces the whole `sha256`

@@ -99,7 +99,7 @@ impl RemoteRegistry {
 
                 // The endpoint returns no metadata, so the runtime is read from the
                 // murmur.yaml inside the bytes it did return. A payload that does not parse
-                // keeps the pre-derivation defaults rather than failing the download.
+                // falls back to `wasm` rather than failing the download.
                 let manifest = load_manifest_from_artifact_bytes(&bytes).ok();
                 let runtime = manifest
                     .as_ref()

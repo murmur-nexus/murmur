@@ -348,11 +348,16 @@ fn install_single(
     // name@version — registry first, source chain fallback on NotFound
     let (name, version) = parse_versioned_ref(artifact_ref)?;
     let registry = resolve_registry(registry_override)?;
+    // The name the payload is filed under, which for a native artifact carries its platform tag.
+    let mut file_stem = format!("{name}-{version}");
     match registry.resolve_with_platform(name, version, Some(current_platform())) {
         Ok(resolved) => {
             verify_sha256(name, version, &resolved.bytes, &resolved.sha256)
                 .map_err(CliError::from)?;
             let pin = lock_pin(&resolved.meta, &resolved.sha256);
+            if let Some((os, arch)) = resolved.meta.platforms.first() {
+                file_stem = format!("{name}-{version}-{os}-{arch}");
+            }
             if let Some(root) = project_root {
                 check_lock_conflict(&root.join("murmur.lock"), name, version, &pin)?;
             }
@@ -397,7 +402,7 @@ fn install_single(
     }
 
     let display = store_display(store);
-    println!("Installed {name}@{version} → {display}/{name}/{version}/{name}-{version}.mur.zip");
+    println!("Installed {name}@{version} → {display}/{name}/{version}/{file_stem}.mur.zip");
     Ok(())
 }
 
@@ -894,8 +899,8 @@ fn run_install_all_platforms(artifact_ref: Option<&str>) -> Result<(), CliError>
                     wit_contracts: None,
                 };
                 // Through the same write every other install path uses, so the store never
-                // holds a payload with no metadata beside it — the state that made a native
-                // artifact read back as `runtime: wasm`.
+                // holds a payload with no metadata beside it — without a sidecar a native
+                // payload reads back as `runtime: wasm`.
                 global_registry
                     .store_installed_overwrite(meta, &resolved.bytes, &sha256)
                     .map_err(CliError::from)?;

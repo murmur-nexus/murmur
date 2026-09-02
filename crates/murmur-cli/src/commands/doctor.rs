@@ -451,26 +451,36 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                 };
 
                 match verdict {
-                    // A green line names only what was read: the host platform appears on it
-                    // solely for a native binary this check identified and matched, never for an
-                    // artifact whose payload doctor never opened.
-                    LockVerdict::Ok
-                        if resolved.platform_match == PlatformMatch::UntaggedFallback =>
-                    {
-                        println!(
-                            "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
-                        );
-                        warnings.push(format!("mur install {ref_str}"));
-                        total_pass += 1;
-                    }
                     LockVerdict::Ok => {
-                        match check_artifact_platform(
+                        let platform_verdict = check_artifact_platform(
                             name,
                             version,
                             &artifact.runtime,
                             &resolved.bytes,
                             platform,
-                        ) {
+                        );
+                        // A binary this host cannot run is an error whether or not the store
+                        // recorded a platform for it, and it is reported ahead of the missing
+                        // tag: reinstalling fixes both, but only one of them stops `mur run`.
+                        match platform_verdict {
+                            PlatformVerdict::Mismatch { binary_platform } => {
+                                println!(
+                                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
+                                );
+                                fixes.push(format!(
+                                    "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
+                                ));
+                            }
+                            _ if resolved.platform_match == PlatformMatch::UntaggedFallback => {
+                                println!(
+                                    "  \u{26A0}  {ref_str:<col_width$}   {platform}   \u{2014} native artifact with no recorded platform (warning[{W_REG_001}])"
+                                );
+                                warnings.push(format!("mur install {ref_str}"));
+                                total_pass += 1;
+                            }
+                            // A green line names only what was read: the host platform appears
+                            // on it solely for a native binary this check identified and
+                            // matched, never for an artifact whose payload doctor never opened.
                             PlatformVerdict::Independent => {
                                 println!(
                                     "  \u{2713}  {ref_str:<col_width$}   platform-independent"
@@ -484,14 +494,6 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                             PlatformVerdict::Unverified => {
                                 println!("  \u{2713}  {ref_str:<col_width$}   platform unverified");
                                 total_pass += 1;
-                            }
-                            PlatformVerdict::Mismatch { binary_platform } => {
-                                println!(
-                                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
-                                );
-                                fixes.push(format!(
-                                    "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
-                                ));
                             }
                         }
                     }

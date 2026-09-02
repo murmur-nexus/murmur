@@ -517,8 +517,8 @@ impl Registry for LocalRegistry {
                         meta
                     }
                     // No sidecar anywhere in this directory: read the payload rather than
-                    // guessing, the same derivation `resolve_impl` makes. Only a store written
-                    // before sidecars were per-payload pays for this read.
+                    // guessing, the same derivation `resolve_impl` makes. Only a directory
+                    // missing its sidecars pays for this read.
                     None => {
                         let payload = if has_generic {
                             self.artifact_path_for(name_name, version_name)
@@ -739,8 +739,8 @@ fn restore_backup(backup: &Path, final_path: &Path, had_backup: bool) -> Result<
 /// zip and its hash, still has to answer what the artifact is. `runtime` and `artifact_runtime`
 /// come from the `murmur.yaml` packed inside the bytes and `platforms` from the tag of the path
 /// the bytes were found at, so the answer describes these bytes rather than a default. A payload
-/// that does not parse falls back to `wasm` with nothing else filled in — the value this
-/// returned unconditionally before — so nothing that resolves today starts failing.
+/// that does not parse falls back to `wasm` with nothing else filled in, so an opaque payload
+/// still resolves.
 fn derived_meta(
     name: &str,
     version: &str,
