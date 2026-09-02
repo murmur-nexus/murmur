@@ -80,9 +80,11 @@ compared=0
 
 for name in $names; do
     # The trailing @ anchors the match, so murmur:tool cannot swallow
-    # murmur:tool-registry.
-    was_v=$(printf '%s\n' "$was" | sed -n "s/^${name}@//p")
-    now_v=$(printf '%s\n' "$now" | sed -n "s/^${name}@//p")
+    # murmur:tool-registry. A name can match more than once when subtrees have
+    # drifted apart, so join on commas rather than let a newline into the field
+    # and break the report — check-wit-versions.sh is what rejects that drift.
+    was_v=$(printf '%s\n' "$was" | sed -n "s/^${name}@//p" | paste -sd, -)
+    now_v=$(printf '%s\n' "$now" | sed -n "s/^${name}@//p" | paste -sd, -)
 
     if [ -z "$was_v" ]; then
         added="${added}$(printf '    %-*s  %s' "$width" "$name" "$now_v")
