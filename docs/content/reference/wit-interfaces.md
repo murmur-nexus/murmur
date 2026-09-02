@@ -620,5 +620,10 @@ naming the version the runtime expects and a rebuild hint (`mur install` for a d
 or a source rebuild otherwise). When a package is bumped, every artifact exporting it must be
 rebuilt and republished.
 
+An installed artifact carries the versioned interface names its own component declares in the
+`wit_contracts` key of its `<name>-<version>.meta.json`; see
+[Local artifact cache](installing-artifacts.md#local-artifact-cache).
+`mur list --contract <PREFIX>` lists the installed artifacts touching a package.
+
 Full policy in
 [`wit/VERSIONING.md`](https://github.com/murmur-nexus/murmur/blob/main/crates/capsule-runtime/wit/VERSIONING.md).

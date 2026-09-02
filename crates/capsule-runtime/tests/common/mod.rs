@@ -136,6 +136,7 @@ fn publish_bytes(registry_root: &Path, name: &str, version: &str, bytes: &[u8]) 
                 platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
+                wit_contracts: None,
             },
             bytes,
         )

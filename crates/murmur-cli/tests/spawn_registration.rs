@@ -132,6 +132,7 @@ impl CountingRoost {
                 platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
+                wit_contracts: None,
             },
             &cursor.into_inner(),
         )

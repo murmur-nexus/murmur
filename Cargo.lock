@@ -1706,6 +1706,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "url",
+ "wasmparser 0.251.0",
+ "wat",
  "zip",
 ]
 

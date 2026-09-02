@@ -279,6 +279,7 @@ fn publish_capsule(
             platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
+            wit_contracts: None,
         },
         &cursor.into_inner(),
     )
@@ -316,6 +317,7 @@ fn publish_driver(registry_root: &Path) {
             platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
+            wit_contracts: None,
         },
         &cursor.into_inner(),
     )

@@ -15,6 +15,7 @@ pub mod runtime_manifest;
 pub mod secrets;
 pub mod security_warnings;
 pub mod trace_capture;
+pub mod wit_contract;
 pub mod zip_guard;
 
 pub use artifact::{
@@ -70,6 +71,9 @@ pub use security_warnings::{
 };
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,
+};
+pub use wit_contract::{
+    extract_wit_contracts, wit_contracts_from_artifact_bytes, WitContractError, WitContracts,
 };
 pub use zip_guard::{
     max_artifact_decompressed_bytes, read_zip_entry_capped, read_zip_entry_to_string_capped,

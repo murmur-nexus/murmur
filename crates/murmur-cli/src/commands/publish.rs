@@ -101,6 +101,7 @@ pub(crate) fn run_publish(
         platforms,
         description: None,
         tags: Vec::new(),
+        wit_contracts: None,
     };
 
     let registry = resolve_registry(registry_override)?;

@@ -359,6 +359,9 @@ mur list -g
 
 # Show both stores with a SCOPE column (project / global)
 mur list --all
+
+# Show only artifacts declaring a WIT interface under murmur:hook
+mur list -g --contract murmur:hook
 ```
 
 | Flag | Shows |
@@ -366,6 +369,10 @@ mur list --all
 | _(none)_ | Project store (`.murmur/artifacts/` next to `murmur.yaml`) when inside a project directory |
 | `-g` | Global store (`~/.murmur/artifacts/`) |
 | `--all` | Both stores; output includes a `SCOPE` column (`project` or `global`) |
+| `--contract <PREFIX>` | Only artifacts whose recorded [WIT contracts](installing-artifacts.md#local-artifact-cache) include an interface name starting with `PREFIX`; output includes a `CONTRACTS` column naming the matches. Combines with `-g` and `--all` |
+
+`--contract` matches the imports and the exports alike: a package version bump renames the
+interface for an artifact that imports it as much as for one that exports it.
 
 Example output (`mur list`):
 
@@ -381,6 +388,14 @@ Example output (`mur list --all`):
 NAME                     VERSION  RUNTIME  PLATFORM        SCOPE
 murmur-driver-anthropic  1.0.0    driver   wasm            project
 murmur-tool-git          1.0.0    tool     darwin-aarch64  global
+```
+
+Example output (`mur list -g --contract murmur:tool`):
+
+```text
+NAME                     VERSION  RUNTIME  PLATFORMS       CONTRACTS
+murmur-driver-anthropic  1.0.0    driver   —               murmur:tool-registry/invoke@0.1.0
+murmur-tool-git          1.0.0    tool     darwin-aarch64  murmur:tool/run@0.1.0
 ```
 
 ---

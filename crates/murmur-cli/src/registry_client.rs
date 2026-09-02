@@ -108,6 +108,7 @@ impl RemoteRegistry {
                         platforms: Vec::new(),
                         description: None,
                         tags: Vec::new(),
+                        wit_contracts: None,
                     },
                     bytes,
                     sha256: expected_sha,
