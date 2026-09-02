@@ -4272,7 +4272,6 @@ capabilities:
         assert_eq!(network.allow, Vec::<String>::new());
     }
 
-    /// The default every pre-existing manifest gets: a `filesystem:` block that has never heard of
     /// `read_only` is normalised on exactly the terms `scope` is — trimmed, with an entry left
     /// empty by that trim dropped rather than carried as a rule covering the whole workdir — and
     /// path shape is deliberately not judged here.
@@ -4343,6 +4342,7 @@ capabilities:
         );
     }
 
+    /// The default every pre-existing manifest gets: a `filesystem:` block that has never heard of
     /// `workdir_exec` must not silently keep the workdir's `Execute` right, because that right is
     /// exactly what makes `capabilities.shell.allow` bypassable from inside the workdir.
     #[test]

@@ -1244,11 +1244,11 @@ recognized verb. The interpreter can construct a write into a declared read-only
 will not be refused.
 
 ```text
-[capsule-runtime] warning[W-SEC-017]: capabilities.filesystem.read_only is declared and capabilities.shell.allow includes 'python3', an interpreter that can construct a write the dispatch-time analyser cannot read — the declaration is advisory for that binary until the kernel-enforced layer lands. It still holds for every tool call and for every shell command whose write the analyser can identify (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-017)
+[capsule-runtime] warning[W-SEC-017]: capabilities.filesystem.read_only is declared and capabilities.shell.allow includes 'python3', an interpreter that can construct a write the dispatch check cannot read — the declaration is advisory for that binary. It still holds for every tool call and for every shell command whose write the dispatch check can identify (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-017)
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The declaration
-still applies in full to every tool call and to every shell command whose write the analyser can
+still applies in full to every tool call and to every shell command whose write the dispatch check can
 identify, and every refusal is still recorded as
 [`protected_path_denied`](observability-schemas.md#protected-path-denied).
 

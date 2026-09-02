@@ -182,40 +182,69 @@ fn default_port_for_scheme(scheme: &str) -> Option<u16> {
     }
 }
 
-pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError> {
-    let path = Path::new(scope);
+/// Which of the three shapes a workdir subtree cannot have a declared path broke.
+///
+/// Carried instead of a built error so one rule can serve declarations that report under
+/// different diagnostic codes; [`Self::message`] supplies the noun each of them names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkdirSubpathRejection {
+    Absolute,
+    Escapes,
+    Prefixed,
+}
 
+impl WorkdirSubpathRejection {
+    /// The operator-facing half of the message, with `noun` naming the declaration that was
+    /// rejected (`"scope"`, `"read-only path"`).
+    pub(crate) fn message(self, noun: &str) -> String {
+        match self {
+            Self::Absolute => format!("{noun} must be relative to the workdir"),
+            Self::Escapes => format!("{noun} cannot escape the workdir via '..'"),
+            Self::Prefixed => format!("{noun} must not contain absolute or prefixed components"),
+        }
+    }
+}
+
+/// Lower one manifest-declared workdir-relative path to its normalized form: `.` components
+/// dropped and `..` applied against what is already accumulated.
+///
+/// The single definition of what a workdir subtree may be, shared by
+/// `capabilities.filesystem.scope` and `capabilities.filesystem.read_only` so the two cannot drift
+/// into accepting different shapes. Purely lexical — no filesystem access — so it is safe on a
+/// path that does not exist yet.
+pub(crate) fn lower_workdir_subpath(raw: &str) -> Result<PathBuf, WorkdirSubpathRejection> {
+    let path = Path::new(raw);
     if path.is_absolute() {
-        return Err(RuntimeError::InvalidFilesystemScope {
-            scope: scope.to_string(),
-            message: "scope must be relative to the workdir".to_string(),
-        });
+        return Err(WorkdirSubpathRejection::Absolute);
     }
 
-    let mut depth = 0usize;
+    let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             PathComponent::CurDir => {}
-            PathComponent::Normal(_) => depth += 1,
+            PathComponent::Normal(part) => normalized.push(part),
+            // A `..` that would pop past the workdir root escapes it, whatever follows.
             PathComponent::ParentDir => {
-                if depth == 0 {
-                    return Err(RuntimeError::InvalidFilesystemScope {
-                        scope: scope.to_string(),
-                        message: "scope cannot escape the workdir via '..'".to_string(),
-                    });
+                if !normalized.pop() {
+                    return Err(WorkdirSubpathRejection::Escapes);
                 }
-                depth -= 1;
             }
             PathComponent::Prefix(_) | PathComponent::RootDir => {
-                return Err(RuntimeError::InvalidFilesystemScope {
-                    scope: scope.to_string(),
-                    message: "scope must not contain absolute or prefixed components".to_string(),
-                });
+                return Err(WorkdirSubpathRejection::Prefixed);
             }
         }
     }
 
-    Ok(())
+    Ok(normalized)
+}
+
+pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError> {
+    lower_workdir_subpath(scope)
+        .map(|_| ())
+        .map_err(|rejection| RuntimeError::InvalidFilesystemScope {
+            scope: scope.to_string(),
+            message: rejection.message("scope"),
+        })
 }
 
 /// Resolve a validated filesystem `scope` to the directory a guest's preopen should target,

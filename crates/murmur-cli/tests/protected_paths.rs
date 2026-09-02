@@ -609,8 +609,8 @@ fn a_path_outside_the_workdir_records_nothing() {
 /// refused, and nothing is recorded.
 ///
 /// Whether the interpreter's write then lands is a different mechanism's answer — on a
-/// Landlock-enforcing host it may not even reach its own stdlib — so what is asserted here is the
-/// half this slice owns. The observed write is pinned by
+/// Landlock-enforcing host it may not even reach its own stdlib — so what is asserted here is
+/// only that the manifest check stayed out of the way. A write that does land is pinned by
 /// [`a_write_the_analyser_cannot_read_is_not_refused_and_lands`] below, and staging says so with
 /// `W-SEC-017` (see [`staging_warns_that_read_only_is_advisory_for_an_interpreter`]).
 #[test]

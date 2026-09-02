@@ -1297,10 +1297,6 @@ async fn flush_hook_inference_records(
     }
 }
 
-/// What the agent is handed in place of a call a policy hook refused.
-///
-/// The no-retry sentence is load-bearing: a model shown an opaque failure retries the same
-/// call, which is the behaviour a policy hook exists to stop.
 /// Which dispatch path a refusal names in the trace: `"shell"` or `"tool"`.
 fn protected_path_call_kind(call: &ResolvedCall) -> &'static str {
     match call {
@@ -1342,6 +1338,10 @@ fn protected_path_tool_result(refusal: &ProtectedPathRefusal) -> String {
     )
 }
 
+/// What the agent is handed in place of a call a policy hook refused.
+///
+/// The no-retry sentence is load-bearing: a model shown an opaque failure retries the same
+/// call, which is the behaviour a policy hook exists to stop.
 fn denial_tool_result(hook_name: &str, reason: &str) -> String {
     format!(
         "Refused by policy hook '{hook_name}': {reason}\n\n\

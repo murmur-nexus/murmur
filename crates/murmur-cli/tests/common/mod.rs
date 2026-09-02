@@ -229,7 +229,6 @@ pub fn stage_agent_session(
 /// For the one property that needs the accessible workdir's path known *before* the session is
 /// scripted: with no override the runtime mints `<manifest_dir>/workdir/<random session id>`, so a
 /// test cannot name a file inside it up front.
-#[allow(dead_code)]
 pub fn stage_agent_session_with_workdir(
     home: &TempDir,
     project_dir: &Path,

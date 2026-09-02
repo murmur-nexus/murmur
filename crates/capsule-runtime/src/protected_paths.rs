@@ -21,8 +21,8 @@
 //! | A malicious artifact writing wherever its preopen allows | Dispatch sees innocuous input. Only a narrow `capabilities.filesystem.scope` on that artifact's entry stops it. |
 //!
 //! This layer is the only one that covers the tool path, which is where the threat lives, and the
-//! only portable one — Landlock does not exist on macOS or on older Linux kernels. Kernel backing
-//! is a companion card, which consumes [`ProtectedPaths::absolute_roots`]; nothing here calls it
+//! only portable one — Landlock does not exist on macOS or on older Linux kernels. A
+//! kernel-enforced layer would consume [`ProtectedPaths::absolute_roots`]; nothing here calls it
 //! from `sandbox.rs` or from any Landlock path.
 
 use std::path::{Component, Path, PathBuf};
@@ -243,10 +243,13 @@ impl ProtectedPaths {
     /// The absolute subtree roots, shortest covering root per declaration, in declaration order
     /// and without duplicates.
     ///
-    /// The enumeration input for the kernel-backing companion card, which has to turn "deny these
-    /// subtrees" into "allow everything else" because Landlock has only allow rules. Not called
-    /// from `sandbox.rs` or from any Landlock path in this slice, which is why nothing outside
-    /// this module's own tests calls it yet.
+    /// The enumeration input for a kernel-enforced layer, which has to turn "deny these subtrees"
+    /// into "allow everything else" because Landlock has only allow rules.
+    ///
+    /// Nothing outside this module's tests calls it: the dispatch check works from
+    /// [`Self::covering_rule`], and wiring these roots into `sandbox.rs` without also withdrawing
+    /// the blanket workdir write grant would enumerate a deny set as an allow set and widen what
+    /// the capsule may write.
     #[allow(dead_code)]
     pub(crate) fn absolute_roots(&self, workdir: &Path) -> Vec<PathBuf> {
         let mut roots: Vec<PathBuf> = Vec::new();
@@ -426,39 +429,19 @@ fn matches_key(table: &[&str], key: &str) -> bool {
     })
 }
 
-/// Lower one declared entry to its workdir-relative form, refusing the two shapes a subtree of
-/// the workdir cannot have.
+/// Lower one declared entry to its workdir-relative form, refusing the shapes a subtree of the
+/// workdir cannot have.
+///
+/// The shape rule itself is [`crate::network_policy::lower_workdir_subpath`], which
+/// `capabilities.filesystem.scope` is held to as well — one definition, so the two declarations
+/// cannot drift into accepting different paths. Only the diagnostic differs.
 fn lower_declared_entry(entry: &str) -> Result<PathBuf, RuntimeError> {
-    let path = Path::new(entry);
-    if path.is_absolute() {
-        return Err(RuntimeError::InvalidReadOnlyPath {
+    crate::network_policy::lower_workdir_subpath(entry).map_err(|rejection| {
+        RuntimeError::InvalidReadOnlyPath {
             path: entry.to_string(),
-            message: "read-only path must be relative to the workdir".to_string(),
-        });
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => normalized.push(part),
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(RuntimeError::InvalidReadOnlyPath {
-                        path: entry.to_string(),
-                        message: "read-only path cannot escape the workdir via '..'".to_string(),
-                    });
-                }
-            }
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(RuntimeError::InvalidReadOnlyPath {
-                    path: entry.to_string(),
-                    message: "read-only path must not contain absolute or prefixed components"
-                        .to_string(),
-                });
-            }
+            message: rejection.message("read-only path"),
         }
-    }
-    Ok(normalized)
+    })
 }
 
 /// Resolve one candidate — the string a model typed — to its workdir-relative form, or `None`
@@ -781,6 +764,8 @@ fn read_word(chars: &[char], mut i: usize) -> (Option<String>, usize) {
     if saw_any {
         (Some(word), i)
     } else {
+        // No word here means the cursor sits on a metacharacter the caller does not otherwise
+        // consume. Advance past it anyway: returning the cursor unmoved would spin `scan_script`.
         (None, i + usize::from(i < chars.len()))
     }
 }
@@ -903,13 +888,23 @@ mod tests {
                 .expect("a symlink into a protected subtree does not evade the rule");
             assert_eq!(rule.declared(), "tests");
             assert_eq!(path, "tests/test_foo.py");
+
+            // The two forms combined: an absolute path whose own components are a symlink into
+            // the subtree. Resolution happens before matching for an absolute candidate too, or
+            // spelling the same file through a link would evade the rule that covers it.
+            let via_link = workdir.join("link/test_foo.py");
+            let (rule, path) = protected
+                .covering_rule(workdir, via_link.to_str().unwrap())
+                .expect("an absolute path through a symlink resolves to the rule");
+            assert_eq!(rule.declared(), "tests");
+            assert_eq!(path, "tests/test_foo.py");
         }
     }
 
     // ── absolute_roots ───────────────────────────────────────────────────────
 
-    /// What the kernel-backing companion card inherits: declaration order, no duplicates, and a
-    /// nested declaration collapsed to the shortest covering root.
+    /// Declaration order, no duplicates, and a nested declaration collapsed to the shortest
+    /// covering root.
     #[test]
     fn absolute_roots_are_declaration_ordered_deduplicated_and_collapsed() {
         let workdir = Path::new("/work");

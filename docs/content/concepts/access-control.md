@@ -111,7 +111,7 @@ an interpreter in `capabilities.shell.allow` fires
 [`W-SEC-017`](../reference/diagnostics.md#w-sec-017) at staging, naming the binary.
 
 The declaration still holds in full for every tool call — which is where the steered-tool threat
-lives — and for every shell command whose write the analyser can identify. The full list of what
+lives — and for every shell command whose write the dispatch check can identify. The full list of what
 is and is not identified is in [Read-only paths](../reference/manifest.md#read-only-paths).
 
 ## Untrusted publisher text

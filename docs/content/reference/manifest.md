@@ -1129,7 +1129,7 @@ A refused call does not run: no `shell` record and no `tool_call` record is writ
 receives an error naming the path, the rule, that nothing ran, and that the path is still
 readable. See [`protected_path_denied`](observability-schemas.md#protected-path-denied).
 
-**What it does not refuse.** Everything the analyser cannot positively identify — command
+**What it does not refuse.** Everything the dispatch check cannot positively identify — command
 substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file
 I/O. Declaring `read_only` alongside an interpreter in `capabilities.shell.allow` fires
 [`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. The declaration is also

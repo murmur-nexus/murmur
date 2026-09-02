@@ -2745,10 +2745,9 @@ fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_017}]: capabilities.filesystem.read_only is \
              declared and capabilities.shell.allow includes '{binary}', an interpreter that \
-             can construct a write the dispatch-time analyser cannot read — the declaration \
-             is advisory for that binary until the kernel-enforced layer lands. It still \
-             holds for every tool call and for every shell command whose write the analyser \
-             can identify ({link})"
+             can construct a write the dispatch check cannot read — the declaration is \
+             advisory for that binary. It still holds for every tool call and for every \
+             shell command whose write the dispatch check can identify ({link})"
         );
     }
 }
