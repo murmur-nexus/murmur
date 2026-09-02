@@ -7,10 +7,10 @@
 //! those three strings and nothing else. It never sees the daemon's address, the credential, the
 //! approval or the child's directory.
 //!
-//! **The wait ends when the child finishes.** A delegation made through this plane injects no
-//! [`crate::delegation::Spawner`], so the child reports to nobody and the answer arrives on the
-//! connection the parent already holds, rather than as a `completion`-origin task in
-//! [`crate::delegation`]'s lane.
+//! **The wait ends when the child finishes.** A delegation made through this plane injects a
+//! spawner with no [`crate::delegation::CompletionAddress`], so the child knows which session
+//! spawned it and reports to nobody: the answer arrives on the connection the parent already
+//! holds, rather than as a `completion`-origin task in [`crate::delegation`]'s lane.
 //!
 //! Waiting costs two things. The whole plane is blocking, so its caller runs it on a blocking
 //! thread and the delegating capsule's own A2A listener keeps answering while the child runs. And
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::child_launch::{launch_child_capsule, ChildLaunchRequest};
+use crate::delegation::Spawner;
 use crate::http_client::http_json;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
 
@@ -112,8 +113,9 @@ impl DelegationStatus {
 #[derive(Debug, Clone)]
 pub struct DelegationResult {
     /// The id this delegation is named by, in the `dlg_` id space
-    /// ([`crate::delegation::new_delegation_id`]). Empty on a [`DelegationStatus::Refused`]
-    /// result, which named no delegation because none was made.
+    /// ([`crate::delegation::new_delegation_id`]). Minted by the launcher, one per launched
+    /// child, and empty whenever no child was launched — a refusal, or a process that never
+    /// started. A delegation that was never made names no delegation.
     pub delegation_id: String,
     /// The child's own session id, so its trace is findable. Empty when no child ran.
     pub session_id: String,
@@ -133,14 +135,18 @@ pub struct DelegationResult {
 
 impl DelegationResult {
     /// A result that names no child, for a delegation that was never made.
-    fn refused(request: &DelegationRequest, reason: String) -> Self {
+    ///
+    /// Two ways to reach it, and they name the same nothing: the daemon refused, or the approved
+    /// child's process never started. A delegation id is minted by the launcher, so neither has
+    /// one to report.
+    fn unmade(request: &DelegationRequest, status: DelegationStatus, reason: String) -> Self {
         let truncated = reason.len() > MAX_OUTPUT_BYTES;
         Self {
             delegation_id: String::new(),
             session_id: String::new(),
             capsule: request.capsule.clone(),
             version: request.version.clone(),
-            status: DelegationStatus::Refused,
+            status,
             output: if truncated {
                 bound_output(reason)
             } else {
@@ -150,6 +156,39 @@ impl DelegationResult {
             truncated,
         }
     }
+
+    /// A delegation the daemon refused, by the spawn envelope or by one of its own bounds.
+    fn refused(request: &DelegationRequest, reason: String) -> Self {
+        Self::unmade(request, DelegationStatus::Refused, reason)
+    }
+}
+
+/// What the parent knows the moment one child is up, handed back while the delegation is still
+/// running so the parent's trace names the child before it can hang, crash or be timed out.
+#[derive(Debug, Clone)]
+pub struct DelegationLaunch {
+    /// The `dlg_` id the launcher minted for this launch.
+    pub delegation_id: String,
+    pub capsule: String,
+    pub version: String,
+    /// The session id the child's runtime minted for itself and reported on its launch line.
+    pub child_session_id: String,
+    /// The child's directory, relative to the parent's accessible workdir — the path a reader of
+    /// the parent's trace joins to find the child's own `trace.jsonl`.
+    pub child_workdir: String,
+}
+
+/// The parent's side of one delegation, beyond the three strings its agent supplied.
+///
+/// Per call rather than per plane: a launch that mints one context id per task has no
+/// launch-scoped conversation to name, so the id is only knowable once a task is running.
+#[derive(Debug, Clone, Default)]
+pub struct DelegationOrigin {
+    /// The conversation the delegation was made from. Empty when the caller has none, which
+    /// injects no handle at all rather than one naming a conversation that does not exist.
+    pub context_id: String,
+    /// Where the launch notice goes, or `None` for a caller that records no `delegation_start`.
+    pub launched: Option<tokio::sync::mpsc::UnboundedSender<DelegationLaunch>>,
 }
 
 /// One session's authority to delegate, and everything a delegation needs beyond the three
@@ -170,23 +209,29 @@ pub struct DelegationPlane {
     /// This plane's bound on the wait for an answer. Read once at construction so every
     /// delegation in a session is bounded the same way.
     result_timeout: Duration,
+    /// The delegating session's own id, written into every child's injected handle and from there
+    /// into that child's `session_start.spawned_by`. Empty for a caller that does not know it,
+    /// which injects no handle.
+    session_id: String,
 }
 
 impl DelegationPlane {
     /// The plane for a registered session.
     ///
-    /// `roost_url` and `credential` come from the session's own registration, never from
-    /// anything the agent said.
+    /// `roost_url`, `credential` and `session_id` come from the session's own registration, never
+    /// from anything the agent said.
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
         accessible_workdir: PathBuf,
+        session_id: String,
     ) -> Self {
         Self {
             roost_url: roost_url.trim_end_matches('/').to_string(),
             credential,
             accessible_workdir,
             result_timeout: configured_result_timeout(),
+            session_id,
         }
     }
 
@@ -200,7 +245,11 @@ impl DelegationPlane {
     /// Blocking from end to end, and never `Err`: every way a delegation can fail is one of the
     /// four [`DelegationStatus`] words, because the caller has to record all four in the trace
     /// the same way and a refusal is as much a fact about the run as an answer is.
-    pub fn delegate(&self, request: &DelegationRequest) -> DelegationResult {
+    pub fn delegate(
+        &self,
+        request: &DelegationRequest,
+        origin: &DelegationOrigin,
+    ) -> DelegationResult {
         // Step 1: ask whether this session may spawn that capsule. One request, and the only
         // one: the daemon judges the session the credential names, runs the referee, and answers
         // with an approval naming the exact artifact it resolved. It launches nothing.
@@ -236,11 +285,60 @@ impl DelegationPlane {
         // version and nothing else about its manifest; a delegated child therefore sees no host
         // variables beyond the three every child gets. Deriving it would take the child's
         // manifest, which only the daemon has resolved.
-        let delegation_id = crate::delegation::new_delegation_id();
-        // Every result this call can produce, built from one place so the delegation id, the
-        // capsule and the version cannot disagree between two of them — and so [`MAX_OUTPUT_BYTES`]
-        // bounds every branch. A child's *failure* message is as much its own text as its answer
-        // is, so it is cut on the same terms.
+        //
+        // The spawner is lineage and nothing else. The answer arrives on the connection this
+        // plane opened, so there is nothing for a completion to tell it: no address means no
+        // watcher and no post, while the child still learns which session spawned it.
+        let spawner =
+            (!self.session_id.is_empty() && !origin.context_id.is_empty()).then(|| Spawner {
+                session_id: self.session_id.clone(),
+                context_id: origin.context_id.clone(),
+                report_to: None,
+            });
+        let child = match launch_child_capsule(ChildLaunchRequest {
+            parent_accessible_workdir: self.accessible_workdir.clone(),
+            capsule_name: request.capsule.clone(),
+            capsule_version: request.version.clone(),
+            grant,
+            child_env_allow: Vec::new(),
+            roost_url: self.roost_url.clone(),
+            spawner,
+        }) {
+            Ok(child) => child,
+            // A child whose process never started named no delegation, the same as one the daemon
+            // refused: the id is minted by the launcher, and this launch reached no launcher.
+            Err(error) => {
+                return DelegationResult::unmade(
+                    request,
+                    DelegationStatus::Failed,
+                    error.to_string(),
+                )
+            }
+        };
+        // Adopted, never minted here: one launch, one id, and the same string the child was
+        // injected with and wrote into its own `session_start`.
+        let delegation_id = child.delegation_id.clone().unwrap_or_default();
+
+        // Handed back the moment the child is up and has reported its session id, so a child that
+        // then hangs, crashes or is timed out is already attributable from the parent's side.
+        if let Some(launched) = &origin.launched {
+            let _ = launched.send(DelegationLaunch {
+                delegation_id: delegation_id.clone(),
+                capsule: request.capsule.clone(),
+                version: request.version.clone(),
+                child_session_id: child.session_id.clone(),
+                child_workdir: child
+                    .workdir
+                    .strip_prefix(&self.accessible_workdir)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| child.workdir.to_string_lossy().replace('\\', "/")),
+            });
+        }
+
+        // Every result this call can produce past the launch, built from one place so the
+        // delegation id, the capsule and the version cannot disagree between two of them — and so
+        // [`MAX_OUTPUT_BYTES`] bounds every branch. A child's *failure* message is as much its own
+        // text as its answer is, so it is cut on the same terms.
         let outcome = |status, session_id: &str, output: String| {
             let truncated = output.len() > MAX_OUTPUT_BYTES;
             DelegationResult {
@@ -257,21 +355,6 @@ impl DelegationPlane {
                 result_path: None,
                 truncated,
             }
-        };
-
-        let child = match launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_workdir: self.accessible_workdir.clone(),
-            capsule_name: request.capsule.clone(),
-            capsule_version: request.version.clone(),
-            grant,
-            child_env_allow: Vec::new(),
-            roost_url: self.roost_url.clone(),
-            // The answer arrives on the connection this plane opened, so there is nothing for a
-            // completion to tell it. No spawner means no injected handle and no watcher.
-            spawner: None,
-        }) {
-            Ok(child) => child,
-            Err(error) => return outcome(DelegationStatus::Failed, "", error.to_string()),
         };
 
         if child.capsule_url.is_empty() {
@@ -578,6 +661,7 @@ mod tests {
             "http://127.0.0.1:7700/".to_string(),
             SpawnCredential::new("msc1.test".to_string()),
             PathBuf::from("/tmp"),
+            "ses_parent".to_string(),
         );
         assert_eq!(plane.roost_url, "http://127.0.0.1:7700");
     }

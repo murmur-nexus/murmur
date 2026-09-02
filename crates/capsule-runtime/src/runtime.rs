@@ -1042,6 +1042,10 @@ pub fn stage_session(
         // session id, and staging is what mints one.
         spawn_credential: None,
         spawn_grant: request.spawn_grant,
+        // The one read of `MURMUR_SPAWNER` inside a session. `mur run` validates it earlier and
+        // discards the value, so a handle that cannot be read refuses the launch before a session
+        // directory exists; this is where the value itself enters the session.
+        spawner: SpawnerHandle::from_env()?,
     })
 }
 
@@ -1247,6 +1251,16 @@ pub fn launch_session(
         // name after `TraceWriter::open` has taken the one above.
         let reconcile_from_session = trace_resumed_from.clone();
         let trace_context_id = supplied_context_id.clone();
+        // Lineage for `session_start`, from the handle the spawning capsule's launcher injected.
+        // Both `None` for a capsule nobody delegated, and both omitted from the record then.
+        let trace_spawned_by = staged
+            .spawner
+            .as_ref()
+            .map(|handle| handle.session_id.clone());
+        let trace_spawn_delegation_id = staged
+            .spawner
+            .as_ref()
+            .map(|handle| handle.delegation_id.clone());
         let queue_capacity = match effective_lifecycle.task_acceptance {
             TaskAcceptance::Queue => effective_lifecycle.queue_depth,
             _ => 1,
@@ -1312,6 +1326,7 @@ pub fn launch_session(
                 roost_url.to_string(),
                 credential,
                 accessible_workdir.clone(),
+                session_id.clone(),
             ))
         });
 
@@ -1380,6 +1395,8 @@ pub fn launch_session(
                 system_prompt_overridden,
                 trace_resumed_from,
                 trace_context_id,
+                trace_spawned_by,
+                trace_spawn_delegation_id,
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
@@ -2383,6 +2400,8 @@ pub fn launch_session(
                 false,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             {
@@ -2524,10 +2543,10 @@ struct DelegationReport {
 }
 
 impl DelegationReport {
-    /// Read this process's spawner handle, or refuse the launch when it cannot be read.
+    /// This session's obligation, taken from the handle staging already read.
     fn open(staged: &StagedSession) -> Result<Self, RuntimeError> {
         Ok(Self {
-            handle: SpawnerHandle::from_env()?,
+            handle: staged.spawner.clone(),
             capsule_name: staged.capsule_name.clone(),
             capsule_version: staged.capsule_version.clone(),
             session_id: staged.session_id.clone(),
@@ -2568,8 +2587,15 @@ impl Drop for DelegationReport {
     /// Writes `completion.json` into this capsule's own directory and posts the notification to
     /// the address its parent injected. A delivery that fails is recorded in that file and on
     /// stderr; it never fails this session, whose work was already done.
+    ///
+    /// A handle that names no address writes nothing and posts nothing: the parent that made that
+    /// delegation waits on the connection it already holds, so the child knows its parent and
+    /// reports to nobody.
     fn drop(&mut self) {
         let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let Some(address) = handle.report_to.clone() else {
             return;
         };
         let outcome = crate::delegation::DelegationOutcome {
@@ -2593,7 +2619,7 @@ impl Drop for DelegationReport {
             delivered: false,
             delivery_error: None,
         };
-        crate::delegation::report_completion(&handle, outcome, &self.accessible_workdir);
+        crate::delegation::report_completion(&handle, &address, outcome, &self.accessible_workdir);
     }
 }
 
@@ -4435,6 +4461,21 @@ impl CapsuleStoreState {
         }
     }
 
+    /// Records one launched child in this session's trace, before its delegation has ended.
+    async fn write_delegation_start(&self, notice: &crate::delegation_plane::DelegationLaunch) {
+        if let Some(trace) = &self.peer_trace {
+            trace
+                .write_delegation_start(
+                    &notice.delegation_id,
+                    &notice.capsule,
+                    &notice.version,
+                    &notice.child_session_id,
+                    &notice.child_workdir,
+                )
+                .await;
+        }
+    }
+
     /// `delegate-task`: hand one task to one sub-capsule and return its answer.
     ///
     /// The agent names a capsule, a version and a task. Everything else — the daemon's address,
@@ -4469,9 +4510,33 @@ impl CapsuleStoreState {
         // weaker one and let a capsule self-authorise its own spawn rights.
         let plane = Arc::clone(plane);
         let started = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || plane.delegate(&request))
-            .await
-            .map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
+        // The launch notice leaves the blocking call on a channel whose `send` is synchronous, so
+        // the parent's `delegation_start` reaches disk while the delegation is still running
+        // rather than after it returns — which is the whole point of the record, for a child that
+        // hangs, crashes or is timed out.
+        let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let origin = crate::delegation_plane::DelegationOrigin {
+            context_id: self.current_context_id.clone().unwrap_or_default(),
+            launched: Some(launch_tx),
+        };
+        let mut delegating = tokio::task::spawn_blocking(move || plane.delegate(&request, &origin));
+        let mut notices_open = true;
+        let joined = loop {
+            tokio::select! {
+                notice = launch_rx.recv(), if notices_open => match notice {
+                    Some(notice) => self.write_delegation_start(&notice).await,
+                    // The sender lives in the blocking closure, so this is that closure ending.
+                    None => notices_open = false,
+                },
+                joined = &mut delegating => break joined,
+            }
+        };
+        // A launch that finished between the two arms being polled leaves its notice behind, and
+        // it still has to be written before the terminal line below it.
+        while let Ok(notice) = launch_rx.try_recv() {
+            self.write_delegation_start(&notice).await;
+        }
+        let result = joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
 
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let refused = result.status == crate::delegation_plane::DelegationStatus::Refused;
@@ -8013,6 +8078,8 @@ inference:
                 false,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -8907,6 +8974,8 @@ inference:
             false,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -9118,6 +9187,8 @@ inference:
             murmur_artifact::TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
             None,
             None,
         )

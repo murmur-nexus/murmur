@@ -54,6 +54,9 @@ const WORKER: &str = "worker";
 const GREEDY_WORKER: &str = "greedy-worker";
 /// The sub-capsule whose inference endpoint never answers, so its task never leaves `working`.
 const MUTE_WORKER: &str = "mute-worker";
+/// The sub-capsule the recording proxy refuses on the daemon's behalf, with the daemon's own
+/// depth-bound sentence. Never launched, so nothing about it beyond the name matters.
+const DEEP_WORKER: &str = "deep-worker";
 
 const WORKER_ANSWER: &str = "WORKER-ANSWER-4K2P-DELEGATED";
 
@@ -80,6 +83,13 @@ struct RecordingRoost {
     credentials: Arc<Mutex<HashSet<String>>>,
     approvals: Arc<Mutex<HashSet<String>>>,
     spawn_requests: Arc<AtomicUsize>,
+    /// Capsule name → the sentence a `POST /spawn` naming it is refused with, answered by the
+    /// proxy instead of being relayed.
+    ///
+    /// Keyed by capsule name rather than armed as a one-shot because one daemon is shared by
+    /// every case in this file and they run concurrently: a refusal armed for one case must not
+    /// be able to land on another's spawn.
+    refusals: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RecordingRoost {
@@ -108,19 +118,22 @@ impl RecordingRoost {
         let credentials = Arc::new(Mutex::new(HashSet::new()));
         let approvals = Arc::new(Mutex::new(HashSet::new()));
         let spawn_requests = Arc::new(AtomicUsize::new(0));
+        let refusals = Arc::new(Mutex::new(HashMap::new()));
 
-        let (seen_credentials, seen_approvals, counted) = (
+        let (seen_credentials, seen_approvals, counted, canned) = (
             Arc::clone(&credentials),
             Arc::clone(&approvals),
             Arc::clone(&spawn_requests),
+            Arc::clone(&refusals),
         );
         thread::spawn(move || {
             for stream in proxy.incoming().flatten() {
                 let upstream = daemon_addr.clone();
-                let (seen_credentials, seen_approvals, counted) = (
+                let (seen_credentials, seen_approvals, counted, canned) = (
                     Arc::clone(&seen_credentials),
                     Arc::clone(&seen_approvals),
                     Arc::clone(&counted),
+                    Arc::clone(&canned),
                 );
                 thread::spawn(move || {
                     relay(
@@ -129,6 +142,7 @@ impl RecordingRoost {
                         &seen_credentials,
                         &seen_approvals,
                         &counted,
+                        &canned,
                     );
                 });
             }
@@ -140,7 +154,17 @@ impl RecordingRoost {
             credentials,
             approvals,
             spawn_requests,
+            refusals,
         }
+    }
+
+    /// Answer every `POST /spawn` naming `capsule` with `sentence`, in the shape the daemon
+    /// refuses in, instead of relaying it upstream.
+    fn refuse_spawns_of(&self, capsule: &str, sentence: &str) {
+        self.refusals
+            .lock()
+            .unwrap()
+            .insert(capsule.to_string(), sentence.to_string());
     }
 
     fn tokens(&self) -> Vec<String> {
@@ -165,6 +189,7 @@ fn relay(
     credentials: &Mutex<HashSet<String>>,
     approvals: &Mutex<HashSet<String>>,
     spawn_requests: &AtomicUsize,
+    refusals: &Mutex<HashMap<String, String>>,
 ) {
     let Some(request) = read_framed_request(&mut client) else {
         return;
@@ -172,6 +197,19 @@ fn relay(
     let head = String::from_utf8_lossy(&request).to_string();
     if head.starts_with("POST /spawn ") {
         spawn_requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(name) = extract_json_string(&head, "name") {
+            if let Some(sentence) = refusals.lock().unwrap().get(&name).cloned() {
+                let body = json!({ "error": sentence }).to_string();
+                let raw = format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = client.write_all(raw.as_bytes());
+                let _ = client.flush();
+                return;
+            }
+        }
     }
     for line in head.lines() {
         if let Some((name, value)) = line.split_once(':') {
@@ -509,7 +547,7 @@ fn suite() -> &'static Suite {
             &format!(
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [127.0.0.1]\n  \
-                 spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}]\n"
+                 spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}, {DEEP_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -541,6 +579,16 @@ fn suite() -> &'static Suite {
             VERSION,
             &agent_capsule_manifest(&never_replying()),
             None,
+        );
+        // The sub-capsule a bound refuses. Published so the parent's own manifest can name it;
+        // the proxy answers its spawn before the daemon resolves anything.
+        roost.publish(
+            DEEP_WORKER,
+            VERSION,
+            "artifacts: []\n",
+            Some(&common::fixture_path(
+                "run/components/capsule-env-echo.wasm",
+            )),
         );
 
         Suite {
@@ -581,15 +629,30 @@ struct Parent {
     session_dir: PathBuf,
     url: String,
     server: QueuedServer,
+    /// The conversation every task this parent is given runs under, when the case fixed one.
+    /// An A2A message that names no `contextId` gets a freshly minted one per task, which is no
+    /// conversation for a later `--resume` to continue.
+    context_id: Option<String>,
     handle: Option<thread::JoinHandle<capsule_runtime::LaunchResult>>,
 }
 
 impl Parent {
     /// Launch one parent capsule in this process, with its own scripted model.
     fn launch(name: &str, spawn_yaml: &str) -> Self {
+        Self::launch_in(TempDir::new().unwrap().keep(), name, spawn_yaml, None, None)
+    }
+
+    /// The same launch in a named project directory, optionally under a fixed context id and
+    /// continuing an earlier session of the same capsule.
+    fn launch_in(
+        project: PathBuf,
+        name: &str,
+        spawn_yaml: &str,
+        context_id: Option<String>,
+        resume: Option<capsule_runtime::ResumeRequest>,
+    ) -> Self {
         let suite = suite();
         let server = QueuedServer::start();
-        let project = TempDir::new().unwrap().keep();
 
         let manifest_body = format!(
             "name: {name}\nversion: {VERSION}\n\
@@ -604,9 +667,14 @@ impl Parent {
         std::fs::write(&manifest_path, manifest_body).unwrap();
         let runtime_manifest = load_runtime_manifest(&manifest_path).unwrap();
 
+        let fixed_context = context_id.clone();
         let staged = stage_session(
             Arc::new(LocalRegistry::new(&suite.registry)),
-            stage_request(&project, &runtime_manifest),
+            StageRequest {
+                context_id,
+                resume,
+                ..stage_request(&project, &runtime_manifest)
+            },
         )
         .expect("staging should succeed");
         let session_dir = staged.workdir.clone();
@@ -627,12 +695,28 @@ impl Parent {
             session_dir,
             url,
             server,
+            context_id: fixed_context,
             handle: Some(handle),
         }
     }
 
+    /// This launch's own session id — the name of the directory staging composed for it.
+    fn session_id(&self) -> String {
+        self.session_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn trace(&self) -> String {
         std::fs::read_to_string(self.session_dir.join("trace.jsonl")).unwrap_or_default()
+    }
+
+    /// Every line of the parent's trace, in file order, so a case can assert that one record
+    /// reached disk before another rather than that one timestamp is lower.
+    fn trace_events(&self) -> Vec<Value> {
+        parse_events(&self.trace())
     }
 
     fn events(&self, event_type: &str) -> Vec<Value> {
@@ -647,6 +731,13 @@ impl Parent {
             .collect()
     }
 
+    /// The one child directory the parent composed, once it has composed exactly one.
+    fn only_child_dir(&self) -> PathBuf {
+        let dirs = self.child_dirs();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs.into_iter().next().unwrap()
+    }
+
     /// The directories the parent composed for its children, if any.
     fn child_dirs(&self) -> Vec<PathBuf> {
         let children = self.project.join(".murmur").join("children");
@@ -657,10 +748,14 @@ impl Parent {
     }
 
     fn submit(&self, message_id: &str, text: &str) -> String {
+        let mut message = json!({"messageId": message_id, "role": "user",
+                                 "parts": [{"text": text}]});
+        if let Some(context_id) = &self.context_id {
+            message["contextId"] = json!(context_id);
+        }
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "message/send",
-            "params": {"message": {"messageId": message_id, "role": "user",
-                                   "parts": [{"text": text}]}}
+            "params": {"message": message}
         })
         .to_string();
         let response = post_json(&self.url, &body);
@@ -858,6 +953,50 @@ fn unfence(text: &str) -> String {
         .to_string()
 }
 
+/// Every JSON line of one trace file, in file order.
+fn parse_events(trace: &str) -> Vec<Value> {
+    trace
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("trace line is not JSON ({error}): {line}"))
+        })
+        .collect()
+}
+
+/// The child's own `trace.jsonl`, found from the parent's side exactly as an operator would:
+/// the child directory the parent composed, then the session directory beneath it.
+fn child_events(child_dir: &Path, child_session_id: &str) -> Vec<Value> {
+    let path = child_dir
+        .join(".murmur")
+        .join(child_session_id)
+        .join("trace.jsonl");
+    parse_events(
+        &std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("the child kept no trace at {} ({error})", path.display())
+        }),
+    )
+}
+
+/// The one event of `event_type` in `events`.
+fn only_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
+    let matching: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event_type"] == event_type)
+        .collect();
+    assert_eq!(matching.len(), 1, "{event_type}: {matching:?}");
+    matching[0]
+}
+
+/// The file position of the one line whose `event_type` is `event_type`.
+fn position_of(events: &[Value], event_type: &str) -> usize {
+    events
+        .iter()
+        .position(|event| event["event_type"] == event_type)
+        .unwrap_or_else(|| panic!("no {event_type} line: {events:?}"))
+}
+
 /// Every file under `root`, following directories.
 fn files_under(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -889,7 +1028,7 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
-const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, greedy-worker, mute-worker]\n";
+const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, greedy-worker, mute-worker, deep-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
 
@@ -927,7 +1066,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     );
     assert_eq!(
         schema["properties"]["capsule"]["enum"],
-        json!([WORKER, GREEDY_WORKER, MUTE_WORKER]),
+        json!([WORKER, GREEDY_WORKER, MUTE_WORKER, DEEP_WORKER]),
         "the enum is this capsule's own spawn.allow"
     );
 
@@ -954,20 +1093,13 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     );
 
     // A directory of the child's own, beneath the parent's accessible workdir, with its own trace.
-    let child_dirs = parent.child_dirs();
-    assert_eq!(child_dirs.len(), 1, "{child_dirs:?}");
-    let child_dir = &child_dirs[0];
+    let child_dir = parent.only_child_dir();
     assert!(
         child_dir
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(&format!("{WORKER}-"))),
         "{child_dir:?}"
-    );
-    assert!(
-        find_in_files(child_dir, "\"event_type\":\"session_start\"").is_some(),
-        "the child kept a trace of its own under {}",
-        child_dir.display()
     );
 
     // One `delegation` event, naming the same delegation the model was told about.
@@ -980,6 +1112,83 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     assert_eq!(event["version"], VERSION, "{event}");
     assert_eq!(event["child_session_id"], result["session_id"], "{event}");
     assert_eq!(event["reason"], Value::Null, "{event}");
+
+    // The parent names the child at launch, not at completion.
+    let started = parent.events("delegation_start");
+    assert_eq!(started.len(), 1, "{started:?}");
+    let started = &started[0];
+    let started_id = started["delegation_id"].as_str().unwrap_or_default();
+    assert!(
+        started_id.starts_with("dlg_")
+            && started_id["dlg_".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{started}"
+    );
+    assert_eq!(started["capsule"], WORKER, "{started}");
+    assert_eq!(started["version"], VERSION, "{started}");
+    let child_session_id = started["child_session_id"].as_str().unwrap_or_default();
+    assert!(!child_session_id.is_empty(), "{started}");
+    assert_eq!(started_id, delegation_id, "{started}");
+    assert_eq!(
+        started["child_session_id"], result["session_id"],
+        "{started}"
+    );
+
+    // And the child names the parent, in its own `session_start`, under the child directory the
+    // parent composed.
+    let child_trace = child_events(&child_dir, child_session_id);
+    let child_start = only_event(&child_trace, "session_start");
+    assert_eq!(child_start["spawned_by"], json!(parent.session_id()));
+    assert_eq!(child_start["delegation_id"], json!(delegation_id));
+
+    // The relationship is recorded once, and by that name. `parent_id` is the event-tree edge and
+    // names an `event_id`, never a session.
+    let mut objects: Vec<(PathBuf, Value)> = child_trace
+        .iter()
+        .map(|event| {
+            (
+                child_dir
+                    .join(".murmur")
+                    .join(child_session_id)
+                    .join("trace.jsonl"),
+                event.clone(),
+            )
+        })
+        .collect();
+    for path in files_under(&child_dir).into_iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "completion.json")
+    }) {
+        let raw = std::fs::read_to_string(&path).unwrap();
+        objects.push((path, serde_json::from_str(&raw).unwrap()));
+    }
+    for (path, object) in objects {
+        let named: Vec<&str> = object
+            .as_object()
+            .map(|fields| {
+                fields
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|key| {
+                        matches!(
+                            *key,
+                            "spawned_by"
+                                | "parent_session"
+                                | "parent_session_id"
+                                | "spawner_session"
+                                | "formation_id"
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            named.is_empty() || named == ["spawned_by"],
+            "{}: {named:?}",
+            path.display()
+        );
+    }
 
     // The sweep. Both workdirs, both traces, and every request the parent's model ever saw.
     let tokens = suite.roost.tokens();
@@ -1100,10 +1309,54 @@ fn a_referee_refusal_names_the_axis_and_the_entry() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["outcome"], "refused", "{}", events[0]);
     assert_eq!(events[0]["delegation_id"], Value::Null, "{}", events[0]);
+    assert_eq!(events[0]["child_session_id"], Value::Null, "{}", events[0]);
+    assert_eq!(events[0]["reason"], json!(text), "{}", events[0]);
     assert!(events[0]["reason"]
         .as_str()
         .unwrap_or_default()
         .contains("capabilities.shell.allow"));
+    assert!(events[0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("bash"));
+
+    // Nothing launched, so nothing opened a delegation.
+    assert!(
+        parent.events("delegation_start").is_empty(),
+        "a refused delegation launched no child"
+    );
+}
+
+/// A bound the daemon refuses on reaches the parent's trace as the daemon's own sentence, unedited.
+///
+/// The proxy answers this one spawn itself, with the refusal type `mur-roost` formats its own
+/// bounds from, so the wording under test is the daemon's rather than a hand-copied string. That
+/// the daemon emits it for a real depth exhaustion is `mur-roost`'s own suite; what this proves is
+/// the joining fact — whatever it refuses with arrives at the parent unaltered.
+#[test]
+fn a_bound_refusal_reaches_the_parents_trace_unaltered() {
+    if common::skip_without_host_support("a_bound_refusal_reaches_the_parents_trace_unaltered") {
+        return;
+    }
+    let sentence = mur_roost::bounds::BoundRefusal::DepthExhausted {
+        max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+    }
+    .to_string();
+    suite().roost.refuse_spawns_of(DEEP_WORKER, &sentence);
+
+    let parent = Parent::launch(PARENT, SPAWN_YAML);
+    let text = parent.delegate("toolu_bound", DEEP_WORKER, VERSION, "go one deeper");
+
+    assert_eq!(text, sentence, "the model was given the daemon's sentence");
+    assert!(text.contains("--max-depth"), "{text}");
+
+    let events = parent.events("delegation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], "refused", "{}", events[0]);
+    assert_eq!(events[0]["delegation_id"], Value::Null, "{}", events[0]);
+    assert_eq!(events[0]["reason"], json!(sentence), "{}", events[0]);
+    assert!(parent.events("delegation_start").is_empty());
+    assert!(parent.child_dirs().is_empty(), "no child directory exists");
 }
 
 /// A child that never answers fails the call. It does not hang the parent, and it does not
@@ -1139,6 +1392,27 @@ fn a_silent_child_fails_the_call_rather_than_hanging_the_parent() {
     let events = parent.events("delegation");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["outcome"], "timed_out", "{}", events[0]);
+
+    // The child that never finished is still attributable, because the parent named it at launch
+    // — and named it first, in the file, rather than only once the delegation had ended.
+    let trace = parent.trace_events();
+    let started = only_event(&trace, "delegation_start");
+    assert!(
+        started["child_session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("ses_"),
+        "{started}"
+    );
+    assert_eq!(started["capsule"], MUTE_WORKER, "{started}");
+    assert_eq!(
+        events[0]["delegation_id"], started["delegation_id"],
+        "{started}"
+    );
+    assert!(
+        position_of(&trace, "delegation_start") < position_of(&trace, "delegation"),
+        "the launch is on disk before the ending is"
+    );
 
     // The parent is still its own capsule afterwards: it answers the next turn.
     parent.server.push(end_turn_response("still here"));
@@ -1190,4 +1464,70 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
     assert_eq!(parent.task_state(&task_id), "working");
 
     parent.await_task(&task_id, Duration::from_secs(300));
+}
+
+/// Lineage survives a resume of the parent, with no field added and nothing rewritten.
+///
+/// The child's `spawned_by` names the session that spawned it and is never revisited; the resumed
+/// session's `resumed_from` names that same session, so the child is a child of the resumed parent
+/// by one hop through facts that were already recorded.
+#[test]
+fn lineage_survives_a_resume_of_the_parent() {
+    if common::skip_without_host_support("lineage_survives_a_resume_of_the_parent") {
+        return;
+    }
+    // One project directory and one context for both launches: `--resume` continues a
+    // conversation, and the record it continues has to be the one the first launch wrote.
+    let project = TempDir::new().unwrap().keep();
+    let context_id = format!("ctx-lineage-{}", std::process::id());
+
+    let first = Parent::launch_in(
+        project.clone(),
+        PARENT,
+        SPAWN_YAML,
+        Some(context_id.clone()),
+        None,
+    );
+    let text = first.delegate("toolu_resumed", WORKER, VERSION, "answer once");
+    let result: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
+    let child_session_id = result["session_id"].as_str().unwrap().to_string();
+    let first_session_id = first.session_id();
+    let child_dir = first.only_child_dir();
+    drop(first);
+
+    let second = Parent::launch_in(
+        project.clone(),
+        PARENT,
+        SPAWN_YAML,
+        Some(context_id.clone()),
+        Some(capsule_runtime::ResumeRequest {
+            from_session: first_session_id.clone(),
+            mode: capsule_runtime::ResumeMode::Full,
+        }),
+    );
+    // The session frame is written by the task loop rather than by the bind, so the resumed
+    // session has to run a turn before its `session_start` is on disk.
+    second.server.push(end_turn_response("resumed"));
+    let task_id = second.submit("msg-resumed", "carry on");
+    second.await_task(&task_id, Duration::from_secs(300));
+
+    let resumed_start = only_event(&second.trace_events(), "session_start").clone();
+    assert_eq!(resumed_start["resumed_from"], json!(first_session_id));
+    assert_eq!(
+        resumed_start.get("spawned_by"),
+        None,
+        "an operator's resume is not a delegation: {resumed_start}"
+    );
+
+    let child_start = only_event(
+        &child_events(&child_dir, &child_session_id),
+        "session_start",
+    )
+    .clone();
+    assert_eq!(
+        child_start["spawned_by"],
+        json!(first_session_id),
+        "the child still names the session that spawned it"
+    );
 }

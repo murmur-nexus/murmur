@@ -141,6 +141,12 @@ struct SessionStartEvent {
     /// blob name in its own right under `trace.capture: content`.
     #[serde(default)]
     system_prompt_sha256: Option<String>,
+    /// The session that spawned this one, and the delegation that created it. Both absent from
+    /// the record for a capsule nobody delegated.
+    #[serde(default)]
+    spawned_by: Option<String>,
+    #[serde(default)]
+    delegation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,6 +432,31 @@ struct A2aSendEvent {
     peer_url: String,
 }
 
+/// One `delegation_start` record: a child that was launched, whatever became of it.
+#[derive(Debug, Deserialize)]
+struct DelegationStartEvent {
+    delegation_id: String,
+    capsule: String,
+    version: String,
+    child_session_id: String,
+    child_workdir: String,
+}
+
+/// One `delegation` record: how a delegation ended. A refusal carries no ids, because it made no
+/// delegation.
+#[derive(Debug, Deserialize)]
+struct DelegationEvent {
+    capsule: String,
+    version: String,
+    #[serde(default)]
+    delegation_id: Option<String>,
+    #[serde(default)]
+    child_session_id: Option<String>,
+    outcome: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -458,6 +489,8 @@ enum TraceEvent {
     /// on the record beyond its own existence is rendered.
     A2aTaskReceived,
     A2aSend(A2aSendEvent),
+    DelegationStart(DelegationStartEvent),
+    Delegation(DelegationEvent),
     #[serde(other)]
     Unknown,
 }
@@ -629,6 +662,32 @@ struct TraceMetrics {
     a2a_tasks_received: u32,
     /// The peer URL of every `a2a_send`, in file order.
     a2a_sends: Vec<String>,
+    /// The session that spawned this one, and the delegation that created it. Both `None` for a
+    /// capsule nobody delegated.
+    spawned_by: Option<String>,
+    spawned_by_delegation: Option<String>,
+    /// Every delegation this session made, in the order it started them.
+    delegations: Vec<DelegationRecord>,
+}
+
+/// One delegation this session made, as the two lines that record it join up.
+///
+/// Joined on the `dlg_` id, and never across files: a `delegation_start` with no terminal line is
+/// a delegation this trace never saw end, and a terminal line with no start is one the daemon
+/// refused. Both are rendered as what they are.
+struct DelegationRecord {
+    /// `None` only for a refusal, which named no delegation.
+    delegation_id: Option<String>,
+    capsule: String,
+    version: String,
+    child_session_id: Option<String>,
+    /// Where the child's own trace is, relative to this capsule's accessible workdir. `None` for
+    /// a delegation with no `delegation_start`.
+    child_workdir: Option<String>,
+    /// `None` while a delegation is still in flight — the shape a parent that died mid-delegation
+    /// leaves behind.
+    outcome: Option<String>,
+    reason: Option<String>,
 }
 
 /// One `retention` trace record, surfaced in `mur trace show`.
@@ -964,6 +1023,7 @@ fn compute_metrics(
     let mut peer_fetches = OutcomeCounts::new();
     let mut a2a_tasks_received = 0u32;
     let mut a2a_sends: Vec<String> = Vec::new();
+    let mut delegations: Vec<DelegationRecord> = Vec::new();
 
     for event in events {
         match event {
@@ -1154,6 +1214,39 @@ fn compute_metrics(
             TraceEvent::PeerFileFetch(e) => *peer_fetches.entry(e.outcome).or_insert(0) += 1,
             TraceEvent::A2aTaskReceived => a2a_tasks_received += 1,
             TraceEvent::A2aSend(e) => a2a_sends.push(e.peer_url),
+            TraceEvent::DelegationStart(e) => delegations.push(DelegationRecord {
+                delegation_id: Some(e.delegation_id),
+                capsule: e.capsule,
+                version: e.version,
+                child_session_id: Some(e.child_session_id),
+                child_workdir: Some(e.child_workdir),
+                outcome: None,
+                reason: None,
+            }),
+            TraceEvent::Delegation(e) => {
+                // The terminal line closes the row its `delegation_start` opened. A refusal names
+                // no id and closes nothing, so it becomes a row of its own.
+                let opened = e.delegation_id.as_ref().and_then(|id| {
+                    delegations.iter_mut().find(|record| {
+                        record.outcome.is_none() && record.delegation_id.as_deref() == Some(id)
+                    })
+                });
+                match opened {
+                    Some(record) => {
+                        record.outcome = Some(e.outcome);
+                        record.reason = e.reason;
+                    }
+                    None => delegations.push(DelegationRecord {
+                        delegation_id: e.delegation_id,
+                        capsule: e.capsule,
+                        version: e.version,
+                        child_session_id: e.child_session_id,
+                        child_workdir: None,
+                        outcome: Some(e.outcome),
+                        reason: e.reason,
+                    }),
+                }
+            }
             TraceEvent::Unknown => {}
         }
     }
@@ -1221,6 +1314,9 @@ fn compute_metrics(
             peer_fetches,
             a2a_tasks_received,
             a2a_sends,
+            spawned_by: ss.spawned_by,
+            spawned_by_delegation: ss.delegation_id,
+            delegations,
         },
         task_metrics,
     ))
@@ -1428,6 +1524,14 @@ fn fmt_session_short(id: &str) -> String {
 fn print_show(m: &TraceMetrics) {
     println!("── Session ──────────────────────────────────────");
     println!("session:    {}", m.session_id);
+    // Only for a capsule another capsule launched. One level up from here is where "why did this
+    // run?" is answered, and this is the only line in the file that names it.
+    if let Some(parent) = &m.spawned_by {
+        match &m.spawned_by_delegation {
+            Some(id) => println!("Spawned by {parent} (delegation {id})"),
+            None => println!("Spawned by {parent}"),
+        }
+    }
     println!("capsule:    {} v{}", m.capsule_name, m.capsule_version);
     println!("model:      {}", m.model);
     println!("status:     {}", m.exit_status);
@@ -1762,6 +1866,31 @@ fn print_show(m: &TraceMetrics) {
         }
         if !m.peer_fetches.is_empty() {
             println!("fetched:    {}", fmt_outcomes(&m.peer_fetches));
+        }
+    }
+
+    if !m.delegations.is_empty() {
+        println!();
+        println!("── Delegations ──────────────────────────────────");
+        for d in &m.delegations {
+            println!(
+                "{}  {}@{}  {}  {}",
+                d.delegation_id.as_deref().unwrap_or("(none)"),
+                d.capsule,
+                d.version,
+                d.child_session_id.as_deref().unwrap_or("(no child)"),
+                d.outcome.as_deref().unwrap_or("in flight"),
+            );
+            // Carried on every outcome that is not `completed`, which is exactly where the
+            // runtime writes one: a delegation that did nothing shows why rather than nothing.
+            if let Some(reason) = &d.reason {
+                println!("  {reason}");
+            }
+            // The one join a reader would otherwise have to compose by hand, and the only thing
+            // in this file that points outside it. Relative to this capsule's accessible workdir.
+            if let (Some(workdir), Some(child)) = (&d.child_workdir, &d.child_session_id) {
+                println!("  child trace: {workdir}/.murmur/{child}/trace.jsonl");
+            }
         }
     }
 

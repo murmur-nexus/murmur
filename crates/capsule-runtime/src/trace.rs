@@ -55,6 +55,11 @@ pub(crate) struct TraceWriter {
     /// The launch-scoped context id: the `--context` value, or the id `--resume` resolved to.
     /// `None` when each task of this launch mints its own.
     context_id: Option<String>,
+    /// The session that spawned this one, and the delegation that created it, read out of the
+    /// handle the spawning capsule's launcher injected. Both `None` for a capsule nobody
+    /// delegated, and both omitted from `session_start` when absent rather than written as null.
+    spawned_by: Option<String>,
+    spawn_delegation_id: Option<String>,
     session_start_time: Instant,
     /// The session node of the event tree: the `event_id` `session_start` carries, and the
     /// `parent_id` every launch-scoped event names. Minted in [`TraceWriter::open`] rather than
@@ -254,6 +259,15 @@ struct SessionStartEvent {
     ///
     /// Always written, on the same terms as `resumed_from`.
     context_id: Option<String>,
+    /// The `ses_` id of the session that spawned this one, for a capsule launched by another
+    /// capsule's `delegate-task`. Omitted from the record entirely for every other launch: the
+    /// field is absent, not null, on the same terms as `task_start.delegation_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spawned_by: Option<String>,
+    /// The `dlg_` id of the delegation that created this session, character-identical to the id
+    /// in the spawning session's own `delegation_start`. Present exactly when `spawned_by` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delegation_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -958,6 +972,31 @@ struct PeerFileFetchEvent {
     reason: Option<String>,
 }
 
+/// One `delegate-task` call, written the moment its child is up.
+///
+/// Separate from the `delegation` line below because the two answer different questions and land
+/// at different times: this one reaches disk while the delegation is still in flight, so a child
+/// that hangs, crashes or is timed out is attributable from the parent's side whatever happens
+/// next. A delegation the daemon refused writes none of these — nothing was launched.
+#[derive(Serialize)]
+struct DelegationStartEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The `dlg_` id the launcher minted, character-identical to the one on this delegation's
+    /// terminal `delegation` line and in the child's own `session_start`.
+    delegation_id: String,
+    capsule: String,
+    version: String,
+    /// The session id the child's runtime minted for itself.
+    child_session_id: String,
+    /// The child's directory, relative to this capsule's accessible workdir — join the two to
+    /// reach the child's own `trace.jsonl`.
+    child_workdir: String,
+}
+
 /// One `delegate-task` call, written when the delegation ends.
 ///
 /// One line per call whatever happened, including a call the daemon refused: a delegation that was
@@ -1003,6 +1042,8 @@ impl TraceWriter {
         system_prompt_overridden: bool,
         resumed_from: Option<String>,
         context_id: Option<String>,
+        spawned_by: Option<String>,
+        spawn_delegation_id: Option<String>,
     ) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -1044,6 +1085,8 @@ impl TraceWriter {
             system_prompt_sha256,
             resumed_from,
             context_id,
+            spawned_by,
+            spawn_delegation_id,
             session_start_time: Instant::now(),
             session_event_id: new_event_id(),
             session_started: false,
@@ -1126,6 +1169,8 @@ impl TraceWriter {
             system_prompt_sha256: self.system_prompt_sha256.clone(),
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
+            spawned_by: self.spawned_by.clone(),
+            delegation_id: self.spawn_delegation_id.clone(),
         };
         self.write_event(&event).await?;
         self.session_started = true;
@@ -2057,6 +2102,33 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
+    /// Records one launched child, while its delegation is still running.
+    ///
+    /// Every field is known by the time the child has reported its session id, so none is
+    /// optional: a delegation with nothing to say here was never launched and writes no line.
+    pub(crate) async fn write_delegation_start(
+        &self,
+        delegation_id: &str,
+        capsule: &str,
+        version: &str,
+        child_session_id: &str,
+        child_workdir: &str,
+    ) {
+        let event = DelegationStartEvent {
+            event_type: "delegation_start",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            delegation_id: delegation_id.to_string(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            child_session_id: child_session_id.to_string(),
+            child_workdir: child_workdir.to_string(),
+        };
+        self.append(&event).await;
+    }
+
     /// Records one delegation. `delegation_id` and `child_session_id` are `None` when no child was
     /// launched — a refused delegation names no id, and an audit record must not imply one exists.
     #[allow(clippy::too_many_arguments)]
@@ -2340,6 +2412,8 @@ mod tests {
             system_prompt_overridden,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap()
@@ -2520,6 +2594,8 @@ mod tests {
             false,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -2547,6 +2623,8 @@ mod tests {
             TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
             None,
             None,
         )
@@ -2593,6 +2671,8 @@ mod tests {
                 TraceCapture::Meta,
                 None,
                 false,
+                None,
+                None,
                 None,
                 None,
             )
@@ -2700,6 +2780,8 @@ mod tests {
             TraceCapture::Meta,
             None,
             false,
+            None,
+            None,
             None,
             None,
         )

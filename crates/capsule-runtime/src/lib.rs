@@ -94,13 +94,13 @@ pub use child_launch::{
 // The delegation types and constants stay module-qualified beyond these: `Spawner` and
 // `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the
 // module — the outcome, the file, the two headers — is read by name from `delegation::`.
-pub use delegation::{Spawner, SpawnerHandle};
+pub use delegation::{CompletionAddress, Spawner, SpawnerHandle};
 // The delegating side's own types. `DelegationPlane` is built by `launch_session` and reached
 // only through the `delegate-task` dispatch branch, so what leaves this crate is the vocabulary a
 // reader of a trace or a tool result needs, plus the bound and its override.
 pub use delegation_plane::{
-    DelegationPlane, DelegationRequest, DelegationResult, DELEGATION_RESULT_TIMEOUT,
-    DELEGATION_TIMEOUT_ENV,
+    DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest, DelegationResult,
+    DELEGATION_RESULT_TIMEOUT, DELEGATION_TIMEOUT_ENV,
 };
 // `reachability` is a private module, but both of its entry points are consumed from
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the

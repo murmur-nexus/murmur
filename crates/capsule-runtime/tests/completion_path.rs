@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use capsule_runtime::delegation::{DelegationStatus, Reporter, SpawnerHandle, SPAWNER_ENV};
 use capsule_runtime::{
-    launch_child_capsule, ChildLaunchRequest, LaunchedChild, SpawnApproval, Spawner, TrustClass,
+    launch_child_capsule, ChildLaunchRequest, CompletionAddress, LaunchedChild, SpawnApproval,
+    Spawner, TrustClass,
 };
 use common::{component, mur_binary, Roost, ScriptedServer};
 use serde_json::Value;
@@ -278,10 +279,12 @@ impl RunningParent {
     /// Where the parent wants completions of its delegations sent.
     fn spawner(&self, trust: TrustClass) -> Spawner {
         Spawner {
-            url: self.url.clone(),
             session_id: self.session_id.clone(),
             context_id: format!("ctx_{}", uuid_hex()),
-            trust,
+            report_to: Some(CompletionAddress {
+                url: self.url.clone(),
+                trust,
+            }),
         }
     }
 
@@ -478,8 +481,12 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
         return;
     }
     let parent_dir = TempDir::new().unwrap();
-    // The decoy the launching process itself holds. Nothing may reach a child from here.
-    std::env::set_var(SPAWNER_ENV, "decoy-not-a-handle");
+    // The decoy the launching process itself holds. Nothing may reach a child from here. It is a
+    // readable handle rather than nonsense because `SPAWNER_ENV` is process-wide, and an
+    // unreadable one would refuse a launch running beside this case.
+    const DECOY_HANDLE: &str =
+        r#"{"session_id":"ses_decoy","context_id":"ctx_decoy","delegation_id":"dlg_decoy"}"#;
+    std::env::set_var(SPAWNER_ENV, DECOY_HANDLE);
 
     let parent = RunningParent::start();
     let spawner = parent.spawner(TrustClass::Trusted);
@@ -510,10 +517,15 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
     let values = injected(&delegated);
     assert_eq!(values.len(), 1, "{:?}", delegated.env);
     let handle = SpawnerHandle::parse(values[0]).expect("the injected value parses as a handle");
-    assert_eq!(handle.url, spawner.url);
+    let address = handle.report_to.as_ref().expect("the parent wants telling");
+    let expected = spawner
+        .report_to
+        .as_ref()
+        .expect("the parent wants telling");
+    assert_eq!(address.url, expected.url);
     assert_eq!(handle.session_id, parent.session_id);
     assert_eq!(handle.context_id, spawner.context_id);
-    assert_eq!(handle.trust, TrustClass::Trusted);
+    assert_eq!(address.trust, TrustClass::Trusted);
     assert_eq!(
         Some(handle.delegation_id.clone()),
         delegated.delegation_id,
@@ -534,7 +546,7 @@ fn a_child_knows_its_spawner_from_an_injected_value_and_not_an_inherited_one() {
 
     let allowlisted = injected(&allowlisting);
     assert_eq!(allowlisted.len(), 1, "{:?}", allowlisting.env);
-    assert_ne!(allowlisted[0], "decoy-not-a-handle");
+    assert_ne!(allowlisted[0], DECOY_HANDLE);
     assert_eq!(
         SpawnerHandle::parse(allowlisted[0])
             .expect("the injected value parses")
@@ -803,10 +815,12 @@ fn a_completion_addressed_to_another_session_is_refused_and_recorded() {
         .count();
 
     let misaddressed = Spawner {
-        url: addressed.url.clone(),
         session_id: elsewhere.session_id.clone(),
         context_id: format!("ctx_{}", uuid_hex()),
-        trust: TrustClass::Trusted,
+        report_to: Some(CompletionAddress {
+            url: addressed.url.clone(),
+            trust: TrustClass::Trusted,
+        }),
     };
     let child = launch(
         parent_dir.path(),
