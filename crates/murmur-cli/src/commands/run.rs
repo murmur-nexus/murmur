@@ -7,7 +7,7 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session, stage_session, state_store_reports, AfterTask, ArtifactRequest,
+    launch_session, preopen_reports, stage_session, state_store_reports, AfterTask, ArtifactRequest,
     LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest,
     TaskAcceptance,
 };
@@ -338,12 +338,24 @@ pub(crate) fn run_run(
                 .map(|artifact| (artifact.name.as_str(), artifact.config.as_ref())),
         )
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        // Same inputs and the same resolver again, so the preopen this reports is the preopen a
+        // launch opens, and an escaping `capabilities.filesystem.scope` refuses here exactly as it
+        // refuses a real run. Resolving creates no directory — that is the staging path's job.
+        let preopens = preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
+            (
+                artifact.name.as_str(),
+                &artifact.runtime,
+                artifact.capabilities.as_ref(),
+            )
+        }))
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
             runtime_manifest.exports.as_ref(),
             state_stores,
             configured_artifacts,
+            preopens,
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {

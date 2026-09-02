@@ -3049,6 +3049,7 @@ forgery: {prompt}"
                 None,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ),
             murmur_artifact::TraceCapture::Content,
             None,

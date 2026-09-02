@@ -459,6 +459,17 @@ pub fn stage_session(
             .iter()
             .map(|artifact| (artifact.name.as_str(), artifact.config.as_ref())),
     )?;
+    // Resolved through the identical function `mur run --explain-scope` and `mur doctor` call on
+    // the identical inputs, so all three describe one preopen set. An escaping scope refuses the
+    // launch here, before any registry pull or workdir creation, on the same terms a malformed
+    // store name does.
+    let preopens = crate::network_policy::preopen_reports(request.artifacts.iter().map(|artifact| {
+        (
+            artifact.name.as_str(),
+            &artifact.runtime,
+            artifact.capabilities.as_ref(),
+        )
+    }))?;
     let scope_report = crate::containment::scope_report_for_tier(
         &request.capability_policy,
         request.declared_containment_floor,
@@ -468,6 +479,7 @@ pub fn stage_session(
         request.exports.as_ref(),
         state_stores,
         configured_artifacts,
+        preopens,
     );
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
@@ -3059,9 +3071,10 @@ fn map_registry_error(name: &str, version: &str, error: RegistryError) -> Runtim
 /// by allowlisting its name.
 ///
 /// `filesystem_scope` is a per-artifact narrowing of what gets preopened as `"."`: `None`
-/// preopens `workdir` itself, which is what every caller without a per-artifact grant passes
-/// and is the pre-existing behavior. `Some(scope)` preopens `workdir/scope` instead, created
-/// if missing — already validated as relative and non-escaping by
+/// preopens `workdir` itself, which is what every caller without a per-artifact grant passes —
+/// the wide default, and the threat it is and is not chosen against, are recorded on
+/// [`crate::network_policy::ToolCapabilityGrant`]. `Some(scope)` preopens `workdir/scope`
+/// instead, created if missing — already validated as relative and non-escaping by
 /// [`ToolCapabilityGrant::derive`] at staging time.
 ///
 /// `state_dir` is the artifact's durable state store, already created at `0700` by the staging
@@ -7710,6 +7723,7 @@ inference:
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 ),
                 murmur_artifact::TraceCapture::Meta,
                 None,
@@ -8603,6 +8617,7 @@ inference:
                 None,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             ),
             murmur_artifact::TraceCapture::Meta,
             None,
@@ -8813,6 +8828,7 @@ inference:
                 None,
                 None,
                 None,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             ),

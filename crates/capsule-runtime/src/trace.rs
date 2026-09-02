@@ -2243,6 +2243,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -2578,6 +2579,7 @@ mod tests {
                 None,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
@@ -2629,6 +2631,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
@@ -2677,6 +2680,12 @@ mod tests {
             }],
             // Populated for the same reason as `state_stores` above.
             vec!["config-echo".to_string()],
+            vec![crate::containment::PreopenReport {
+                artifact: "notes-tool".to_string(),
+                role: "tool".to_string(),
+                scope: None,
+                surface: crate::containment::PreopenSurface::WholeWorkdir,
+            }],
         );
 
         let dir = tempfile::tempdir().unwrap();
@@ -2724,6 +2733,18 @@ mod tests {
         assert_eq!(
             events[0]["effective_grants"]["configured_artifacts"],
             serde_json::json!(["config-echo"])
+        );
+        // The per-artifact preopen set reaches the trace with no trace-side plumbing: the report
+        // is cloned whole, so `filesystem_scope` above (which narrows no guest) and the surface a
+        // guest is actually opened into are both on the record.
+        assert_eq!(
+            events[0]["effective_grants"]["preopens"],
+            serde_json::json!([{
+                "artifact": "notes-tool",
+                "role": "tool",
+                "scope": null,
+                "surface": "whole-workdir",
+            }])
         );
         assert_eq!(events[0]["containment_declared"], "scoped");
         assert_eq!(events[0]["containment_achieved"], "scoped");

@@ -401,9 +401,15 @@ mur doctor
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
+Ahead of the checklist it prints two blocks, neither of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)) and `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of. A tool or driver entry that declares no `capabilities.filesystem.scope` gets the whole accessible workdir; a hook entry that declares none gets no directory at all. See [The filesystem default](../concepts/access-control.md#filesystem-default).
+
 **Output — happy path:**
 
 ```text
+Filesystem preopens
+  - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
+  - murmur-tool-git (tool): one subtree of the accessible workdir — capabilities.filesystem.scope: repo
+
 Checking /path/to/murmur.yaml for darwin-aarch64...
   ✓  murmur-driver-anthropic@1.0.0    darwin-aarch64
   ✓  murmur-tool-git@1.0.0            darwin-aarch64

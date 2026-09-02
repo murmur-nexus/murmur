@@ -254,6 +254,86 @@ pub struct StateStoreReport {
     pub host_path: String,
 }
 
+/// The filesystem surface one artifact's guest is preopened into, as a stable wire name.
+///
+/// The three values are the whole space: a WASI guest either holds a directory descriptor for the
+/// accessible workdir, holds one for a subtree of it, or holds none at all. Which one an entry
+/// resolves to is decided by its role and its `capabilities.filesystem.scope` in
+/// [`crate::network_policy::preopen_reports`]; the baselines the two roles start from are
+/// [`crate::network_policy::ToolCapabilityGrant`] and
+/// [`crate::network_policy::HookCapabilityGrant`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PreopenSurface {
+    /// The entire accessible workdir, preopened as `"."` with `DirPerms::all()` and
+    /// `FilePerms::all()`. The wide default a `runtime: tool` or `runtime: driver` entry with no
+    /// `capabilities.filesystem.scope` resolves to — see
+    /// [`crate::network_policy::ToolCapabilityGrant`] for the threat that default is chosen
+    /// against and the threat it is not.
+    WholeWorkdir,
+    /// `<accessible workdir>/<scope>` and nothing above it, preopened as `"."` with the same
+    /// rights. What a declared `capabilities.filesystem.scope` resolves to, whatever the role.
+    ScopedSubtree,
+    /// No preopened directory of any kind, so the guest holds no `wasi:filesystem` descriptor. The
+    /// default-deny baseline a `runtime: hook` entry with no `capabilities.filesystem.scope`
+    /// resolves to — see [`crate::network_policy::HookCapabilityGrant`].
+    Nothing,
+}
+
+impl PreopenSurface {
+    /// The phrase [`PreopenReport::render`] names this surface with. Distinct per variant rather
+    /// than a formatted path, because the point of the line is that an operator can tell the three
+    /// apart without knowing the resolved workdir.
+    fn summary(self) -> &'static str {
+        match self {
+            PreopenSurface::WholeWorkdir => "the whole accessible workdir",
+            PreopenSurface::ScopedSubtree => "one subtree of the accessible workdir",
+            PreopenSurface::Nothing => "nothing preopened",
+        }
+    }
+}
+
+/// One artifact's resolved WASI preopen as it appears in a [`ScopeReport`] — and therefore in
+/// `mur run --explain-scope`, in `mur doctor`, and in `trace.jsonl`'s
+/// `session_start.effective_grants`.
+///
+/// Per-artifact, like [`StateStoreReport`] beside it, and reported for the same reason: the
+/// capsule-wide [`ScopeReport::filesystem_scope`] is joined into no guest preopen root, so an
+/// operator reading that field alone learns nothing about what any tool, driver or hook can
+/// actually see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreopenReport {
+    /// The artifact whose entry in the capsule operator's own manifest this describes.
+    pub artifact: String,
+    /// [`murmur_artifact::ArtifactRuntime::as_str`] verbatim, so the report and the manifest name
+    /// a role with one vocabulary.
+    pub role: String,
+    /// The entry's declared `capabilities.filesystem.scope`, verbatim. `None` = undeclared, which
+    /// is what [`Self::surface`] has already resolved against the role's own baseline.
+    pub scope: Option<String>,
+    /// What the guest is preopened into once the role's baseline and [`Self::scope`] are both
+    /// applied.
+    pub surface: PreopenSurface,
+}
+
+impl PreopenReport {
+    /// The single line this preopen renders as, shared by [`ScopeReport::render`] and by
+    /// `mur doctor` so the two cannot word the same grant differently.
+    pub fn render(&self) -> String {
+        let artifact = &self.artifact;
+        let role = &self.role;
+        let surface = self.surface.summary();
+        match &self.scope {
+            Some(scope) => format!(
+                "{artifact} ({role}): {surface} — capabilities.filesystem.scope: {scope}"
+            ),
+            None => format!(
+                "{artifact} ({role}): {surface} — no capabilities.filesystem.scope declared"
+            ),
+        }
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
@@ -292,6 +372,19 @@ pub struct ScopeReport {
     /// why it is reported next to the grants rather than buried: reading `achieved: advisory` on a
     /// Landlock-capable host makes sense only alongside it.
     pub workdir_exec: bool,
+    /// The filesystem surface every guest-bearing artifact in this capsule is preopened into, one
+    /// entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, in manifest order.
+    /// Empty when the capsule declares only skills. Always serialized as an array (never skipped),
+    /// on the same terms as [`Self::state_stores`]: an absent key identifies a runtime that
+    /// predates the field, not a capsule with no guest artifacts.
+    ///
+    /// This is the field that answers "what can this tool read and write?".
+    /// [`Self::filesystem_scope`] above does not: it is the capsule-wide declaration, and it is
+    /// joined into no preopen root.
+    ///
+    /// Copied through untouched, exactly as the reports beside it are — resolving a preopen
+    /// changes no class, no floor and no tier.
+    pub preopens: Vec<PreopenReport>,
     /// `capabilities.network.allow`, verbatim — declared destinations, not resolved IPs.
     pub network_allow: Vec<String>,
     /// `capabilities.network.unix_sockets`.
@@ -395,6 +488,15 @@ impl ScopeReport {
             self.filesystem_scope.as_deref().unwrap_or("<none>")
         ));
         out.push_str(&format!("  workdir exec:     {}\n", self.workdir_exec));
+        push_list(
+            &mut out,
+            "preopens",
+            &self
+                .preopens
+                .iter()
+                .map(PreopenReport::render)
+                .collect::<Vec<_>>(),
+        );
         push_list(&mut out, "network allow", &self.network_allow);
         out.push_str(&format!("  unix sockets:     {}\n", self.unix_sockets));
         push_list(&mut out, "shell allow", &self.shell_allow);
@@ -472,17 +574,19 @@ fn push_list(out: &mut String, label: &str, values: &[String]) {
 /// combined floor. Takes one [`crate::sandbox::HostProbe`], so the tier, the blocker and the
 /// grant it reports all describe one host at one moment.
 ///
-/// `state_stores` and `configured_artifacts` are resolved by the caller (from the manifest's
-/// artifact entries, via [`crate::state_store::state_store_reports`] and
-/// [`crate::artifact_config::configured_artifact_names`]) rather than derived here, because both
-/// are per-artifact and `policy` is capsule-wide. Neither resolution creates anything, so this
-/// stays a read-only diagnostic.
+/// `state_stores`, `configured_artifacts` and `preopens` are resolved by the caller (from the
+/// manifest's artifact entries, via [`crate::state_store::state_store_reports`],
+/// [`crate::artifact_config::configured_artifact_names`] and
+/// [`crate::network_policy::preopen_reports`]) rather than derived here, because all three are
+/// per-artifact and `policy` is capsule-wide. No resolution creates anything, so this stays a
+/// read-only diagnostic.
 pub fn explain_scope(
     policy: &CapabilityPolicy,
     declared: ContainmentClass,
     exports: Option<&Exports>,
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
+    preopens: Vec<PreopenReport>,
 ) -> ScopeReport {
     let probe = crate::sandbox::HostProbe::probe();
     scope_report_for_tier(
@@ -494,6 +598,7 @@ pub fn explain_scope(
         exports,
         state_stores,
         configured_artifacts,
+        preopens,
     )
 }
 
@@ -509,6 +614,7 @@ pub(crate) fn scope_report_for_tier(
     exports: Option<&Exports>,
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
+    preopens: Vec<PreopenReport>,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -544,6 +650,10 @@ pub(crate) fn scope_report_for_tier(
         configured_artifacts,
         filesystem_scope: policy.filesystem_scope.clone(),
         workdir_exec: policy.workdir_exec_allowed,
+        // Resolved by `network_policy::preopen_reports` before this call and copied through on the
+        // same terms as the reports above: what one guest is preopened into gets no say in what
+        // class this host is reported to back.
+        preopens,
         network_allow: policy.network_allow.clone(),
         unix_sockets: policy.unix_sockets_allowed,
         shell_allow: policy.shell_allow.clone(),
@@ -965,6 +1075,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -1005,6 +1116,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
 
         assert!(report.workdir_exec);
@@ -1040,6 +1152,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -1068,6 +1181,7 @@ mod tests {
                 Some(SealedBlocker::NamespaceCreationDenied),
                 None,
                 None,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             );
@@ -1099,6 +1213,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -1118,6 +1233,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -1132,6 +1248,7 @@ mod tests {
             Some(SealedBlocker::NotLinux),
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1154,6 +1271,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
@@ -1172,6 +1290,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         );
@@ -1198,6 +1317,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
 
         for grant in UsernsGrant::ALL {
@@ -1208,6 +1328,7 @@ mod tests {
                 None,
                 Some(*grant),
                 None,
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             );
@@ -1239,6 +1360,7 @@ mod tests {
             Some(SealedBlocker::AppArmorProfileMissing),
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -1276,6 +1398,7 @@ mod tests {
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &policy,
@@ -1287,6 +1410,7 @@ mod tests {
                         files: Some(export.clone()),
                         peer_files: None,
                     }),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 );
@@ -1347,6 +1471,7 @@ mod tests {
                     None,
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 );
                 let with = scope_report_for_tier(
                     &with_policy,
@@ -1358,6 +1483,7 @@ mod tests {
                         files: None,
                         peer_files: Some(peer_files.clone()),
                     }),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 );
@@ -1407,6 +1533,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
@@ -1429,6 +1556,7 @@ mod tests {
                     max_bytes: 10 * 1024 * 1024,
                 }),
             }),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ))
@@ -1454,6 +1582,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .render();
         assert!(undeclared.contains("Peer handoff"));
@@ -1477,6 +1606,7 @@ mod tests {
                     max_bytes: 4096,
                 }),
             }),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -1508,6 +1638,7 @@ mod tests {
             None,
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         );
         let with = scope_report_for_tier(
             &policy,
@@ -1517,6 +1648,7 @@ mod tests {
             None,
             None,
             stores.clone(),
+            Vec::new(),
             Vec::new(),
         );
 
@@ -1555,6 +1687,113 @@ mod tests {
         );
     }
 
+    /// The preopen set is reported and moves nothing else, on the same terms the state-store
+    /// report beside it is held to. It is also the field that answers what `filesystem_scope`
+    /// does not: a capsule-wide scope is joined into no guest preopen root, so both can be
+    /// present and disagree without either being wrong.
+    #[test]
+    fn preopens_are_reported_and_move_no_other_field() {
+        let policy = sample_policy();
+        let preopens = vec![
+            PreopenReport {
+                artifact: "notes-tool".to_string(),
+                role: "tool".to_string(),
+                scope: None,
+                surface: PreopenSurface::WholeWorkdir,
+            },
+            PreopenReport {
+                artifact: "cache-tool".to_string(),
+                role: "tool".to_string(),
+                scope: Some("cache".to_string()),
+                surface: PreopenSurface::ScopedSubtree,
+            },
+            PreopenReport {
+                artifact: "telemetry-hook".to_string(),
+                role: "hook".to_string(),
+                scope: None,
+                surface: PreopenSurface::Nothing,
+            },
+        ];
+
+        let without = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let with = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            preopens.clone(),
+        );
+
+        assert_eq!(with.preopens, preopens);
+        assert!(without.preopens.is_empty());
+        // The only field that moved is its own.
+        assert_eq!(
+            ScopeReport {
+                preopens: Vec::new(),
+                ..with.clone()
+            },
+            without
+        );
+
+        // Three visibly different lines under `Effective grants`; `<none>` when empty.
+        let rendered = with.render();
+        assert!(rendered.contains(
+            "- notes-tool (tool): the whole accessible workdir — no capabilities.filesystem.scope \
+             declared"
+        ));
+        assert!(rendered.contains(
+            "- cache-tool (tool): one subtree of the accessible workdir — \
+             capabilities.filesystem.scope: cache"
+        ));
+        assert!(rendered.contains(
+            "- telemetry-hook (hook): nothing preopened — no capabilities.filesystem.scope declared"
+        ));
+        assert!(without.render().contains("preopens: <none>"));
+
+        // Always an array in JSON, never skipped, with an undeclared scope as `null`.
+        assert_eq!(
+            serde_json::to_value(&without).unwrap()["preopens"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            serde_json::to_value(&with).unwrap()["preopens"],
+            serde_json::json!([
+                {
+                    "artifact": "notes-tool",
+                    "role": "tool",
+                    "scope": null,
+                    "surface": "whole-workdir",
+                },
+                {
+                    "artifact": "cache-tool",
+                    "role": "tool",
+                    "scope": "cache",
+                    "surface": "scoped-subtree",
+                },
+                {
+                    "artifact": "telemetry-hook",
+                    "role": "hook",
+                    "scope": null,
+                    "surface": "nothing",
+                },
+            ])
+        );
+    }
+
     /// `exports_files` is written whether or not it was declared, on the same terms as
     /// `workdir_exec`: an absent key identifies an older runtime, a `null` a capsule that
     /// exported nothing.
@@ -1567,6 +1806,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ))
@@ -1589,6 +1829,7 @@ mod tests {
             }),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         ))
         .unwrap();
         assert_eq!(
@@ -1606,6 +1847,7 @@ mod tests {
             None,
             None,
             None,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )
@@ -1629,6 +1871,7 @@ mod tests {
                 }),
                 peer_files: None,
             }),
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         )

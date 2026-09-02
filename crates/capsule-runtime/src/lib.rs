@@ -64,13 +64,17 @@ pub use artifact_config::{
 };
 pub use containment::{
     check_containment_floor, containment_shortfall_reason, detect_achieved_containment,
-    detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, ScopeReport,
-    StateStoreReport,
+    detect_sealed_blocker, detect_userns_grant, explain_scope, ExportsFilesReport, PreopenReport,
+    PreopenSurface, ScopeReport, StateStoreReport,
 };
 pub use network_namespace::{
     check_egress_namespace, detect_egress_namespace_blocker, skip_without_egress_namespace,
     EgressNamespaceBlocker,
 };
+// `network_policy` is a private module; `preopen_reports` is re-exported because `mur run
+// --explain-scope` and `mur doctor` both resolve the preopen set the same way `stage_session`
+// does, and one resolver shared by all three is what keeps the report a description of the launch.
+pub use network_policy::preopen_reports;
 // `sandbox` is a private module; `HostProbe` is re-exported because the freshness of a session's
 // host reading is asserted from integration tests outside this crate.
 pub use sandbox::HostProbe;
