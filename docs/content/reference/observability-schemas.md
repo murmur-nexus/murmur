@@ -33,7 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `call_denied` | The turn node, falling back to the task node and then the session node |
+| `call_denied`, `protected_path_denied` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
@@ -419,6 +419,27 @@ refuses a shell command or tool call before it runs
 No `tool_call` or `shell` event accompanies it: the call did not run, so there is nothing to
 record about a run. A refusal is not a session failure and the turn continues. An unsupported arm
 returned at the decision point produces a `hook_dispatch_error` alongside this line.
+
+**`protected_path_denied`**{ #protected-path-denied } — written when the capsule manifest's
+[`capabilities.filesystem.read_only`](manifest.md#read-only-paths) refuses a shell command or tool
+call before it runs
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn the refused call was requested in |
+| `call` | string | `"shell"` \| `"tool"` — which dispatch path was refused |
+| `target` | string | What was refused: the resolved executable path for a shell call, the tool name otherwise |
+| `path` | string | The resolved workdir-relative path. Always the resolved form, never the string the model typed, so two spellings of one file produce one comparable record |
+| `rule` | string | The `read_only` entry that covers `path`, exactly as the manifest declared it |
+| `signal` | string | What identified the call as a write: the redirection operator, the write-target argument position of a named binary, or the tool-input key pairing |
+| `reason` | string | The same sentence the model was given, so the trace and the agent agree on why |
+
+No `tool_call` or `shell` event accompanies it: the call did not run. A refusal is not a session
+failure and the turn continues. The manifest is asked before any [policy
+hook](../concepts/hooks.md#policy-hooks), so a call refused here produces no `call_denied` line
+beside it. `mur trace show` reports the count as `protected-path refusals`.
+
+Distinct from `call_denied` above, which is a *hook's* refusal and names the hook.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 

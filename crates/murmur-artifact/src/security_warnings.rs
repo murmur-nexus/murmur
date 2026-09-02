@@ -138,6 +138,18 @@ pub const W_SEC_015: &str = "W-SEC-015";
 /// Fires at staging, before any session workdir exists.
 pub const W_SEC_016: &str = "W-SEC-016";
 
+/// `capabilities.filesystem.read_only` is declared alongside an allowlisted interpreter, so the
+/// declaration is advisory for that binary.
+///
+/// The dispatch-time write-intent analyser reads a shell call's argv and `-c` script text. An
+/// interpreter's own file I/O is not in either: `python3 -c "open(p,'w').write(x)"` is one opaque
+/// argument, and nothing in it names a redirection or a write verb the analyser recognizes. The
+/// declaration still holds for every call the analyser *can* read, and it still holds against the
+/// tool path — this names the one route around the shell half rather than leaving it implied.
+/// Fires once per allowlisted interpreter, at staging, only for a capsule that declared
+/// `read_only`.
+pub const W_SEC_017: &str = "W-SEC-017";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -157,6 +169,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
+            W_SEC_017,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

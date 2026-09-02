@@ -65,6 +65,55 @@ exactly one directory, `<workdir>/<scope>`, as its current directory, and with
 its grant the same way, whatever its binding or execution mode. See
 [Hook capabilities](../reference/manifest.md#hook-capabilities) for the full rules.
 
+## Read-only paths { #read-only-paths }
+
+A capsule declares the parts of its workdir it reads but does not write:
+
+```yaml
+capabilities:
+  filesystem:
+    read_only:
+      - tests
+      - bench/fixtures
+```
+
+The runtime refuses, before dispatch, any tool call or shell command it can identify as writing
+one, records it as
+[`protected_path_denied`](../reference/observability-schemas.md#protected-path-denied), and tells
+the model the path, the rule, that nothing ran and that the path is still readable. The check runs
+before a [policy hook](hooks.md#policy-hooks) is asked: the manifest is the authority, and a hook
+can only narrow further.
+
+What this stops is an honest tool being steered into a dishonest write — the agent cannot make the
+code pass the test, so it edits the test. That failure is invisible in a green run, and on a
+benchmark it is the difference between a result and a fiction.
+
+### Two threats, two mechanisms
+
+`read_only` answers one of them. The other has a different answer, and neither substitutes for the
+other:
+
+| Threat | What it looks like | What stops it |
+|---|---|---|
+| A steered honest tool | The model sends a write into a protected subtree through a tool or shell command that behaves exactly as documented | `capabilities.filesystem.read_only` — the dispatch check reads the resolved call and refuses it |
+| A malicious artifact | The artifact receives innocuous input, passes every dispatch check, and writes wherever its preopen allows | `capabilities.filesystem.scope` on that artifact's entry in the operator's own manifest — a narrow preopen the artifact cannot widen (see [Per-tool narrowing](#per-tool-narrowing)) |
+
+The dispatch check sees what a call *says*. It cannot see what a component *does* once it holds a
+directory handle, and a narrow preopen is the only thing that governs that.
+
+### The interpreter gap
+
+The dispatch check reads a shell call's argv and its `-c` script body, and flags what it can
+positively identify as a write. An interpreter defeats that half:
+`python3 -c "open('tests/x','w').write('y')"` is one opaque argument naming no redirection and no
+recognized write verb, so it is not flagged and the write lands. Declaring `read_only` alongside
+an interpreter in `capabilities.shell.allow` fires
+[`W-SEC-017`](../reference/diagnostics.md#w-sec-017) at staging, naming the binary.
+
+The declaration still holds in full for every tool call — which is where the steered-tool threat
+lives — and for every shell command whose write the dispatch check can identify. The full list of what
+is and is not identified is in [Read-only paths](../reference/manifest.md#read-only-paths).
+
 ## Untrusted publisher text
 
 Tool and skill descriptions rendered into [`MURMUR.md`](session-loop.md#murmurmd) are

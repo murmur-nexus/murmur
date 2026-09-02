@@ -127,6 +127,15 @@ pub enum RuntimeError {
     #[error("invalid filesystem capability scope '{scope}': {message}")]
     InvalidFilesystemScope { scope: String, message: String },
 
+    /// A `capabilities.filesystem.read_only` entry is not a usable workdir subpath: it is
+    /// absolute, or it escapes the workdir via `..`. The exact parallel of
+    /// [`Self::InvalidFilesystemScope`], raised from
+    /// [`crate::protected_paths::ProtectedPaths::from_declared`] at staging — before any registry
+    /// pull, workdir creation or component instantiation — so no call is ever checked against a
+    /// rule the runtime could not build.
+    #[error("invalid read-only path '{path}': {message}")]
+    InvalidReadOnlyPath { path: String, message: String },
+
     /// An artifact entry's `config:` block cannot be delivered as `MURMUR_ARTIFACT_CONFIG`: it is
     /// not a string-keyed mapping, does not serialize to JSON, or exceeds
     /// [`crate::artifact_config::MAX_ARTIFACT_CONFIG_BYTES`]. Raised at staging (and from `mur run

@@ -4332,6 +4332,7 @@ mod tests {
             filesystem: scope.map(|scope| FilesystemCapabilities {
                 scope: Some(scope.to_string()),
                 workdir_exec: false,
+                read_only: Vec::new(),
             }),
             shell: None,
             spawn: None,

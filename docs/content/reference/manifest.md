@@ -521,6 +521,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.network.unix_sockets` | bool | no | Default: `false`. When false, the capsule's shell subprocess tree cannot create an `AF_UNIX` socket at all: `socket(AF_UNIX, ...)` fails with `EACCES`. Set `true` only if a shell tool genuinely needs a local daemon socket — the grant is capsule-wide, not a per-socket-path allowlist, so it re-exposes **every** unix socket the process can reach, `/var/run/docker.sock` (host root) included. No effect on non-Linux hosts, which have no kernel enforcement — see [`W-SEC-001`](diagnostics.md#w-sec-001). |
 | `capabilities.peer_fetch.allow` | list<string> | see notes | Peers this capsule may redeem a [peer-file handle](resource-plane.md#peer-plane) against — see [`capabilities.peer_fetch`](#field-peer-fetch). Required and non-empty when the `peer_fetch:` block is present. Absent block means no fetching is possible and the `fetch-peer-file` tool does not exist. |
 | `capabilities.filesystem.scope` | string | no | Relative scope under the workdir; see [Filesystem scope](#filesystem-scope). Omitted, the capsule sees the whole workdir. |
+| `capabilities.filesystem.read_only` | list<string> | no | Workdir-relative subtrees the capsule may read but must not write, in the same vocabulary as `scope`. The runtime refuses, before dispatch, any tool call or shell command it can identify as writing one, records it as `protected_path_denied` and tells the model why. Omitted or `[]`, the whole workdir is writable. See [Read-only paths](#read-only-paths). |
 | `capabilities.filesystem.workdir_exec` | bool | no | Default: `false`. When false, nothing the capsule writes into the session workdir can be executed — under any name, including one that appears in `capabilities.shell.allow`. Set `true` only for compile-and-run workflows (the capsule builds a binary in its workdir and then runs it); doing so makes `shell.allow` unenforceable for anything inside the workdir, caps the capsule's achieved containment class at `advisory` on **every** host, and fires [`W-SEC-011`](diagnostics.md#w-sec-011) at staging. See [Executable workdirs](containment.md#field-workdir-exec). |
 | `capabilities.shell.allow` | list<string> | no | Shell binaries the agent may invoke (e.g. `bash`); see [Shell allow](#shell-allow). |
 | `capabilities.shell.strip_env` | list<string> | no | Glob patterns for env vars to strip from the subprocess environment (e.g. `AWS_*`). |
@@ -1082,6 +1083,61 @@ Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
 
 A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002). See
 [What bounds a WASM artifact](containment.md#artifact-boundary).
+
+### Read-only paths { #read-only-paths }
+
+`capabilities.filesystem.read_only` lists workdir-relative subtrees the capsule reads but does not
+write:
+
+```yaml
+capabilities:
+  filesystem:
+    read_only:
+      - tests
+      - bench/fixtures
+```
+
+Each entry follows the same two rules `scope` does — relative, and no `..` that escapes the
+workdir — and an entry that breaks either fails with [`E-CAP-012`](diagnostics.md#e-cap-012) at
+staging, before any registry pull, workdir creation or component instantiation. An empty or
+whitespace-only entry is dropped at parse.
+
+An entry names a subtree of the workdir root, matched a path component at a time:
+
+| Entry | Covers | Does not cover |
+|---|---|---|
+| `tests` | `tests`, `tests/a`, `tests/a/b`, `./tests/a`, `<workdir>/tests/a` | `tests2`, `testsuite/a`, `atests`, `build/tests` |
+
+A candidate path is resolved against the workdir before it is matched: an absolute path, a
+relative one and a symlink into the subtree all produce the same rule and the same recorded path.
+A path that resolves outside the workdir is not covered by any entry — what reaches it is decided
+by the preopen and, on a kernel-enforcing host, by Landlock.
+
+**What the runtime refuses.** The check runs on the resolved call, before dispatch and before any
+[policy hook](../concepts/hooks.md#policy-hooks) is asked. It refuses what it can positively
+identify as a write:
+
+| Call | Identified as a write when |
+|---|---|
+| Shell (`-c` script body) | A redirection — `>`, `>>`, `>\|`, `&>`, `&>>`, `N>`, `N>>` — names a covered path |
+| Shell | A covered path is in a write-target position of `tee`, `rm`, `rmdir`, `unlink`, `shred`, `truncate`, `mkdir`, `touch`, `chmod`, `chown`, `patch` (any non-flag argument), `mv`, `cp`, `install`, `ln` (the last one), `sed` (with `-i`/`--in-place`), or `dd` (the `of=` value) |
+| Tool | A covered path is the string value of `dest`, `dest_path`, `destination`, `destination_path`, `target_path`, `output_path`, `out_path`, `new_path` or `to` |
+| Tool | A covered path is the string value of `path`, `file_path`, `filepath`, `filename` or `file`, **and** the same JSON object also carries `content`, `contents`, `text`, `data`, `body`, `new_str`, `new_string`, `replacement`, `patch` or `diff` |
+
+Tool-input keys are matched case-insensitively with `-` and `_` folded, and the pairing rule is
+evaluated per JSON object, so a nested edit list is read the same way a flat input is. A path with
+no content key beside it is a read.
+
+A refused call does not run: no `shell` record and no `tool_call` record is written, and the model
+receives an error naming the path, the rule, that nothing ran, and that the path is still
+readable. See [`protected_path_denied`](observability-schemas.md#protected-path-denied).
+
+**What it does not refuse.** Everything the dispatch check cannot positively identify — command
+substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file
+I/O. Declaring `read_only` alongside an interpreter in `capabilities.shell.allow` fires
+[`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. The declaration is also
+not a defence against a malicious artifact: see
+[Access control](../concepts/access-control.md#read-only-paths).
 
 ### State store name { #state-store-name }
 
