@@ -10,13 +10,14 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
-    read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
-    ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
-    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
-    LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
-    MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
+    current_platform, native_binary_verdict, parse_hook_config_from_yaml,
+    parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
+    write_lockfile_atomic, AfterTask, ArtifactImplementation, ArtifactRuntime, ContextConfig,
+    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
+    LockedArtifact, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
+    RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
+    W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
 };
 use serde_yaml::Value;
 use wasmtime::{
