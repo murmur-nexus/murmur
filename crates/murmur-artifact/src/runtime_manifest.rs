@@ -529,8 +529,11 @@ pub struct RuntimeManifest {
     /// and by `mur run` to warn on version mismatch.
     /// If absent, the running mur binary's version is used.
     pub mur_version: Option<String>,
-    /// Every key the manifest declared that this build does not recognize, in document order,
-    /// captured by each `Raw*` block's `#[serde(flatten)]` overflow map instead of dropped.
+    /// Every key the manifest declared that this build does not recognize, captured by each
+    /// `Raw*` block's `#[serde(flatten)]` overflow map instead of dropped.
+    ///
+    /// Ordered by the walk rather than by the manifest's own line order: a containing block's own
+    /// keys precede the blocks nested inside it, and one block's keys are alphabetical.
     ///
     /// Empty for a manifest written entirely in keys this build knows. Never a reason to refuse a
     /// manifest — it is reported as `W-SEC-019` by

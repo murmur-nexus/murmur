@@ -2070,9 +2070,7 @@ mod tests {
     /// exempted here with a written reason.
     ///
     /// The field list is derived from `types.rs`'s own source text rather than written out, so a
-    /// grant added later fails this test until someone decides which it is. That is the whole
-    /// point: adding `read_only` to the report by hand fixed today and would not have fixed
-    /// tomorrow.
+    /// grant added later fails this test until someone decides which it is.
     ///
     /// The mapping is checked in both directions — every policy field is accounted for, *and*
     /// every report key the mapping names is really present in a serialized report — so the

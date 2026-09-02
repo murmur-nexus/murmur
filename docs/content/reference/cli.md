@@ -423,7 +423,7 @@ Every green line means the artifact resolved from the project store (`.murmur/ar
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
-Ahead of the checklist it prints two blocks, neither of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)) and `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default) for which directory each role gets. An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>` there, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it; the exit code is still the checklist's alone.
+Ahead of the checklist it prints three blocks, none of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)); `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default) for which directory each role gets. An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>` there, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it; the exit code is still the checklist's alone. Last, `Read-only paths` lists the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter — the same block, in the same words, that [`mur run --explain-scope`](#mur-run) prints.
 
 **Output — happy path:**
 
@@ -431,6 +431,12 @@ Ahead of the checklist it prints two blocks, neither of which affects the exit c
 Filesystem preopens
   - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
   - murmur-tool-git (tool): one subtree of the accessible workdir — capabilities.filesystem.scope: repo
+
+Read-only paths
+  read_only:
+    - tests
+    - bench/fixtures
+  read_only enforcement: enforced for every tool call and every shell command the dispatch check can read
 
 Checking /path/to/murmur.yaml for darwin-aarch64...
   ✓  murmur-driver-anthropic@1.0.0    platform-independent

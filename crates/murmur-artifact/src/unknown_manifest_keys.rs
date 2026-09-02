@@ -106,10 +106,9 @@ pub fn nearest_known_key(declared: &str, known: &[&str]) -> Option<String> {
 
 /// A `major.minor.patch` version as a comparable triple, or `None` for anything else.
 ///
-/// Deliberately not a semver parse: the workspace carries no semver crate and this slice adds no
-/// dependency. A pin carrying a pre-release or build suffix, or any component that is not a plain
-/// number, simply yields no version-gap line — silence is the correct answer to a pin this cannot
-/// read, not an error.
+/// Deliberately not a semver parse: the workspace carries no semver crate. A pin carrying a
+/// pre-release or build suffix, or any component that is not a plain number, simply yields no
+/// version-gap line — silence is the correct answer to a pin this cannot read, not an error.
 fn numeric_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.trim().split('.');
     let major = parts.next()?.parse().ok()?;
