@@ -1080,9 +1080,7 @@ Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
 - must be relative, not absolute
 - cannot escape the workdir via `..`
 
-A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002). A scope on an
-artifact entry is what bounds that artifact's filesystem reach; a containment class bounds the
-capsule's shell subprocesses instead. See
+A scope that breaks either rule fails with [`E-CAP-002`](diagnostics.md#e-cap-002). See
 [What bounds a WASM artifact](containment.md#artifact-boundary).
 
 ### State store name { #state-store-name }

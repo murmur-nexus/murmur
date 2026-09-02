@@ -18,7 +18,7 @@ The relevant manifest options are:
 | [capabilities.shell.baseline_env](../reference/manifest.md#field-capabilities) | Additional host env vars to expose beyond the default baseline |
 | [artifacts[].capabilities](../reference/manifest.md#tool-capabilities) | Optional per-artifact grant that narrows one tool or driver below the ceiling |
 | [artifacts[].capabilities.network.allow](../reference/manifest.md#tool-capabilities) | Hosts one artifact may reach, intersected with the ceiling |
-| [artifacts[].capabilities.filesystem.scope](../reference/manifest.md#tool-capabilities) | Workdir subtree one artifact preopens instead of the whole workdir |
+| [artifacts[].capabilities.filesystem.scope](../reference/manifest.md#tool-capabilities) | Workdir subtree one artifact reaches instead of the whole workdir |
 
 ---
 
@@ -254,7 +254,7 @@ This example adds `DATABASE_URL` from the host and removes `CARGO_HOME` and `RUS
 
 ## Step 4 — narrow individual tools and drivers below the ceiling
 
-The strongest way to constrain a coding agent is to do less through `bash` and more through scoped tool artifacts. A per-artifact `filesystem.scope` on a WASM tool is a real directory grant — the wasm runtime enforces it on every platform, macOS included, where `bash`'s own confinement is only advisory, and the capsule's containment class leaves it unchanged ([What bounds a WASM artifact](../reference/containment.md#artifact-boundary)). Moving a task out of `bash` and into a scoped tool turns an advisory boundary into an enforced one.
+The strongest way to constrain a coding agent is to do less through `bash` and more through scoped tool artifacts. A per-artifact `filesystem.scope` on a WASM tool is a real directory grant, enforced on every platform, macOS included, where `bash`'s own confinement is only advisory. The capsule's containment class leaves that grant unchanged — see [What bounds a WASM artifact](../reference/containment.md#artifact-boundary). Moving a task out of `bash` and into a scoped tool turns an advisory boundary into an enforced one.
 
 Add the WASM tools this agent uses to the `artifacts:` list, add the one extra host they need to the ceiling, and scope each artifact to only its slice:
 
@@ -299,7 +299,7 @@ The effective grant is the intersection of what an artifact declares and the cei
 
 - **The driver** reaches only `api.anthropic.com`, dropping `github.com` from the ceiling. A driver narrows through the same path as any WASM tool, so this also applies to a driver call a hook's `run-inference` makes.
 - **The git tool** reaches only `github.com`, dropping the inference endpoint it never calls.
-- **The editor tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which preopens only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
+- **The editor tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
 
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.
 
@@ -384,7 +384,7 @@ mur trace show
 | `artifacts[].capabilities` present | Narrows that one tool or driver; effective grant = declaration ∩ ceiling |
 | `artifacts[].capabilities` absent | Artifact inherits the full ceiling |
 | `network.allow: []` on an artifact | Denies that one artifact all outbound HTTP; siblings keep theirs |
-| `filesystem.scope` on a WASM artifact | A real WASI preopen, enforced on every platform including macOS |
+| `filesystem.scope` on a WASM artifact | A real directory grant, enforced on every platform including macOS |
 | Bare host under a scheme-bound ceiling | Dropped with `W-SEC-007`; write the entry as specifically as the ceiling |
 | `shell`/`spawn`/`env`/`limits` in a per-artifact block | Parsed but inert; prints `W-SEC-008` |
 | `api_key: ${ENV_VAR}` | Keeps secrets out of the manifest; a literal triggers `W-SEC-004` |
