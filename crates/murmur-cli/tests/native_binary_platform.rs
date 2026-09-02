@@ -2,9 +2,8 @@
 //! `mur doctor`, on one shared reading of the same bytes.
 //!
 //! The two surfaces are asserted to agree by extracting the platform string each one prints
-//! rather than by comparing both against a literal: the point of the slice is that there is one
-//! classifier with two callers, and a test that hardcodes the answer twice would still pass if
-//! they drifted apart.
+//! rather than by comparing both against a literal: there is one classifier with two callers, and
+//! a test that hardcodes the answer twice would still pass if they drifted apart.
 //!
 //! Every foreign binary here is a synthetic header built in the test body from the offsets the
 //! classifier reads, and the foreign platform is derived from `current_platform()`, so the suite
@@ -370,8 +369,8 @@ fn staging_and_doctor_name_the_same_platform_for_the_same_bytes() {
 /// Scenario: an unrecognised payload format still stages, and doctor says so rather than claiming
 /// a platform it never identified.
 ///
-/// The refusal is built on positive identification. A shell script at `bin/<name>` is a shape that
-/// works today, and it has to keep working.
+/// The refusal is built on positive identification: a shell script at `bin/<name>` is a runnable
+/// payload the classifier cannot identify, and it must never be refused.
 #[test]
 fn an_unrecognised_payload_stages_and_doctor_reports_it_unverified() {
     let home = tempdir().unwrap();
@@ -386,7 +385,7 @@ fn an_unrecognised_payload_stages_and_doctor_reports_it_unverified() {
         home.path().join(".murmur").join("artifacts"),
     ));
     let staged = stage_session(registry, stage_request(project.path(), &manifest))
-        .expect("an unidentifiable payload must stage exactly as before");
+        .expect("an unidentifiable payload must stage");
     assert!(
         staged
             .workdir

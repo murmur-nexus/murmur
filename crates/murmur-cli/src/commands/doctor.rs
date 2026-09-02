@@ -39,9 +39,9 @@ enum PlatformVerdict {
 /// before it writes a native binary into a session workdir.
 ///
 /// An artifact is native when the capsule manifest declares it a tool *and* its own packed
-/// `murmur.yaml` says `implementation: native`. Neither `artifacts-index.json` nor
-/// `ArtifactMeta.runtime` can stand in: the index tags every non-skill artifact with both
-/// platforms, and `ArtifactMeta.runtime` is `Wasm` for anything installed through the normal path.
+/// `murmur.yaml` says `implementation: native`. `ArtifactMeta.runtime` cannot stand in: the value
+/// recorded on disk depends on which install path wrote it — resolving from a remote registry
+/// stores `Wasm` for a native tool — so the same artifact can carry either answer.
 ///
 /// Any failure to open the archive or read `bin/<name>` is `Unverified`, never `Mismatch`. The
 /// lock and hash checks above already report a corrupt or truncated artifact, and reporting the
@@ -436,9 +436,9 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                 };
 
                 match verdict {
-                    // A green line has to say what it actually verified. Before this check
-                    // every passing artifact printed the host platform, including artifacts
-                    // whose payload doctor had never opened — an attestation it could not make.
+                    // A green line names only what was read: the host platform appears on it
+                    // solely for a native binary this check identified and matched, never for an
+                    // artifact whose payload doctor never opened.
                     LockVerdict::Ok => {
                         match check_artifact_platform(
                             name,

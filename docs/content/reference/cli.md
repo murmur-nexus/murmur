@@ -410,14 +410,16 @@ mur doctor
 
 `mur doctor` takes no flags or arguments. It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
 
-- `✓ name@version   <platform>` — a native tool whose `bin/<name>` binary was read and identified as this host's platform
-- `✓ name@version   platform-independent` — nothing about this artifact's payload is platform-specific: a skill, a WASM tool, a driver, a hook
-- `✓ name@version   platform unverified` — a native tool whose `bin/<name>` payload is in a format the platform check does not recognise, such as a shell script
-- `✓ name@version   local source` — declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry or a lockfile
-- `✗ name@version   <platform>   — missing` — resolved from neither store
-- `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` — the artifact holds a host executable this machine cannot exec; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021)
+| Line | Meaning |
+|---|---|
+| `✓ name@version   <platform>` | A native tool whose `bin/<name>` binary was read and identified as this host's platform |
+| `✓ name@version   platform-independent` | The payload runs the same on every platform: a skill, a WASM tool, a driver, a hook |
+| `✓ name@version   platform unverified` | A native tool whose `bin/<name>` payload is in a format the platform check does not recognise, such as a shell script |
+| `✓ name@version   local source` | Declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry or a lockfile |
+| `✗ name@version   <platform>   — missing` | Resolved from neither store |
+| `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` | The artifact holds a host executable this machine cannot run; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021) |
 
-Every green line resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
+Every green line means the artifact resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 

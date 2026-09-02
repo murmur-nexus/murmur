@@ -274,16 +274,16 @@ delegated, which reports to nobody and runs exactly as it would have.
 
 ### E-RUN-021 — the native binary is built for another platform { #e-run-021 }
 
-A native tool artifact carries a host executable at `bin/<name>`. Staging reads that binary's
-header and compares the platform it was built for against this host's, before any of the session's
-native binaries is written to the workdir:
+A native tool artifact carries a host executable at `bin/<name>`. Staging compares the platform
+that binary was built for against this host's, before any of the session's native binaries is
+written to the workdir:
 
 ```text
 error[E-RUN-021]: native tool 'murmur-tool-git' cannot run on this host: its binary is built for darwin-aarch64, this host is linux-x86_64
   hint: the installed artifact holds a binary for another platform — reinstall it on this host with `mur install <name>@<version>`, or publish a build for this host's platform
 ```
 
-The check is a fixed-offset read of the image header, and it recognises these formats:
+The check reads the binary's header and recognises these formats:
 
 | Format | Identified from | Platforms |
 |---|---|---|
@@ -295,11 +295,11 @@ Architecture is compared as strictly as operating system: an `x86_64` ELF on an 
 host is refused on the same terms as a Mach-O on Linux.
 
 Refusal requires a positive identification of both sides. A payload in a format the check does not
-recognise — a shell script, a WASM module, a 32-bit image — stages and runs exactly as it does
-today, and so does any payload on a host outside the four platform targets.
+recognise — a shell script, a WASM module, a 32-bit image — stages and runs, and so does any
+payload on a host outside the four platform targets.
 
-A staging batch holding one unrunnable binary installs none of them, so a refused session leaves no
-`tools/<name>/<name>` in its workdir.
+When a capsule declares several native tools, one unrunnable binary refuses all of them: a refused
+session leaves no tool binaries in its workdir.
 
 [`mur doctor`](cli.md#mur-doctor) reads the same header of the same installed bytes and fails that
 artifact's line, so the mismatch is reportable without launching a session.
