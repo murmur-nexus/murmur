@@ -850,7 +850,7 @@ fn read_word(chars: &[char], mut i: usize) -> (Option<String>, usize) {
 #[cfg(test)]
 impl ProtectedPaths {
     /// [`Self::check_call`] for a tool that declared no annotations, which is what every case
-    /// written before annotations existed asserts on.
+    /// below that names no schema asserts on.
     fn check_unannotated(
         &self,
         workdir: &Path,
@@ -1453,6 +1453,49 @@ mod tests {
             refusal.signal,
             WriteSignal::ToolDeclaredDestination {
                 location: "body.sink".to_string()
+            }
+        );
+    }
+
+    /// `murmur-opaque` on the schema's top level names the input root, which is a container like
+    /// any other: the key-name heuristic stops there, and a declared destination is still checked.
+    #[test]
+    fn a_top_level_opaque_declaration_stops_only_the_heuristic() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "wholesale",
+            r#"{"type":"object","format":"murmur-opaque","properties":{"sink":{"type":"string","format":"murmur-destination"}}}"#,
+        )]);
+
+        assert!(
+            protected
+                .check_call(
+                    workdir,
+                    &named_tool(
+                        "wholesale",
+                        serde_json::json!({"path": "tests/test_foo.py", "content": "x"}),
+                    ),
+                    &annotations,
+                )
+                .is_none(),
+            "the heuristic does not descend into a container the tool declared opaque"
+        );
+
+        let refusal = protected
+            .check_call(
+                workdir,
+                &named_tool(
+                    "wholesale",
+                    serde_json::json!({"sink": "tests/test_foo.py"}),
+                ),
+                &annotations,
+            )
+            .expect("a declared destination is checked wherever the opaque boundary sits");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "sink".to_string()
             }
         );
     }

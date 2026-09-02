@@ -120,8 +120,7 @@ impl Session {
 /// tools it carries.
 ///
 /// Each tool is a name and the `input_schema` its artifact manifest carries — `None` for a tool
-/// that publishes no schema, which is the shape every case written before schema annotations
-/// existed uses.
+/// that publishes no schema, which is what leaves it on the key-name rules.
 struct Capsule<'a> {
     read_only: &'a [&'a str],
     shell_allow: &'a [&'a str],
@@ -558,8 +557,8 @@ fn an_opaque_payload_carrying_a_path_and_text_is_recorded_not_refused() {
     );
 }
 
-/// A tool that declares nothing is judged exactly as before: a nested path/content pair is
-/// refused before dispatch.
+/// A tool that declares nothing is judged by key name: a nested path/content pair is refused
+/// before dispatch.
 #[test]
 fn a_nested_path_and_content_pair_is_still_refused_without_a_schema() {
     if common::skip_without_host_support(

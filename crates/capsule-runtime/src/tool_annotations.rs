@@ -22,10 +22,10 @@
 //! refusal itself stays with `ProtectedPaths::covering_rule`, which reads only the operator's
 //! declared `read_only` entries.
 //!
-//! The honest cost: inside a subtree a tool declared opaque, the key-name heuristic does not run,
-//! so a tool whose *real* destination sits in there is not caught by that heuristic. That is the
-//! tool author's declaration taken at its word, and the tool author is not the adversary this
-//! layer addresses — see the "what it cannot see" table in [`crate::protected_paths`].
+//! Inside a subtree a tool declared opaque the key-name heuristic does not run, so a destination
+//! that tool did not also declare is not seen there. The declaration is taken at its word: the
+//! tool author is not this layer's adversary — see the "what it cannot see" table in
+//! [`crate::protected_paths`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -250,8 +250,7 @@ fn push_unique(locations: &mut Vec<InputLocation>, location: &InputLocation) {
 ///
 /// Holds an entry only for a tool that annotated something. A tool absent from it — one with no
 /// schema, an unparsable schema, an unreadable manifest, or one pulled at runtime by
-/// `manage.pull()` after staging — is judged by the key-name heuristic exactly as it was before
-/// annotations existed.
+/// `manage.pull()` after staging — is judged by the key-name heuristic alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolAnnotationMap {
     tools: BTreeMap<String, ToolAnnotations>,
@@ -311,20 +310,27 @@ impl ToolAnnotationMap {
     }
 }
 
-/// The `input_schema` of one staged tool manifest, as JSON text.
+/// The `input_schema` one tool manifest declares, under either spelling and in either shape.
 ///
-/// Independent of `agent::inventory`'s reader on purpose: what the model is offered and what the
-/// analyser is told are two different questions about the same file, and coupling them would make
-/// a change to either one answer the other.
-pub(crate) fn schema_from_manifest_yaml(manifest_yaml: &str) -> Option<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(manifest_yaml).ok()?;
-    let schema = value.get("input_schema").or_else(|| value.get("input"))?;
+/// The single reader for that field: the analyser must judge the same schema
+/// [`crate::agent::inventory`] offers the model, so a manifest whose schema one of them reads and
+/// the other does not is a hole rather than a difference of opinion.
+pub(crate) fn declared_input_schema(manifest: &serde_yaml::Value) -> Option<Value> {
+    let schema = manifest
+        .get("input_schema")
+        .or_else(|| manifest.get("input"))?;
     match schema {
         // The common shape: a YAML string holding JSON.
-        serde_yaml::Value::String(text) => Some(text.clone()),
+        serde_yaml::Value::String(text) => serde_json::from_str(text).ok(),
         // A YAML mapping written out directly still describes the same schema.
-        other => serde_json::to_string(other).ok(),
+        other => serde_json::to_value(other).ok(),
     }
+}
+
+/// The `input_schema` of one staged tool manifest, as JSON text.
+pub(crate) fn schema_from_manifest_yaml(manifest_yaml: &str) -> Option<String> {
+    let manifest: serde_yaml::Value = serde_yaml::from_str(manifest_yaml).ok()?;
+    Some(declared_input_schema(&manifest)?.to_string())
 }
 
 fn read_staged_schema(manifest_path: &Path) -> Option<String> {

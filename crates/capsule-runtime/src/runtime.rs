@@ -2789,8 +2789,7 @@ fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
 /// filesystem destinations from [`crate::protected_paths::TOOL_PATH_KEYS`] and
 /// [`crate::protected_paths::TOOL_DESTINATION_KEYS`] — and a guess is wrong in both directions: a
 /// stored payload carrying a `{file, text}` pair is refused as a write, and a destination under an
-/// unrecognized name is not checked. The tool can say which it is; this says so before a refusal
-/// is what says it.
+/// unrecognized name is not checked. The tool's own schema can say which it is.
 ///
 /// Only the capsule's own installed artifacts are considered. The synthetic manifests the runtime
 /// writes (the shell binaries, the peer-handoff tools, `delegate-task`) are not an operator's to

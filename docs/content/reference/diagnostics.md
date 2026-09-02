@@ -1278,7 +1278,7 @@ destination under a name no table carries is never checked.
 ```
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The tool keeps
-the key-name rules, which is exactly how it behaved before annotations existed.
+the key-name rules.
 
 **What to do:** annotate the tool's `input_schema` — `"format": "murmur-destination"` on each
 string property whose value is a file the tool writes, `"format": "murmur-opaque"` on each object

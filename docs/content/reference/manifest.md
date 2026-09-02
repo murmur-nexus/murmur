@@ -1157,6 +1157,7 @@ a path, and every refusal is still decided by the operator's own `read_only` ent
 | A tool that annotates nothing | Judged by key name, exactly as the table above describes |
 | `murmur-opaque` on a string property | Ignored; the key-name rules keep running on the object that carries it |
 | `murmur-destination` inside a subtree marked `murmur-opaque` | Still checked |
+| `murmur-opaque` on the schema's top level | The key-name rules do not run on that tool's input at all; only its declared destinations are checked |
 | An annotation behind a `$ref` | Not resolved, so that tool keeps the key-name rules |
 
 A refusal a declared destination triggered names the location in the model's error and in the
