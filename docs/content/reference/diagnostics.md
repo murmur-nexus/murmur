@@ -91,6 +91,7 @@ section that explains it.
 | `W-SEC-015` | A `config:` block on a native tool delivers nothing — config reaches WASM tools, drivers and hooks | [W-SEC-015](#w-sec-015) |
 | `W-SEC-016` | A capsule-wide `capabilities.conversation` block grants nothing — the grant is per hook | [W-SEC-016](#w-sec-016) |
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
+| `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
 
 ---
 
@@ -685,7 +686,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011`, `W-SEC-012`, `W-SEC-013`, `W-SEC-014`, `W-SEC-015` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-018` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1256,3 +1257,30 @@ identify, and every refusal is still recorded as
 acceptable for this capsule. Removing the interpreter from `capabilities.shell.allow` closes the
 gap; keeping it does not weaken any other part of the declaration. See
 [Read-only paths](manifest.md#read-only-paths).
+
+---
+
+### W-SEC-018 — a tool's input schema does not say where it writes { #w-sec-018 }
+
+**Fires when:** `capabilities.filesystem.read_only` is non-empty and an installed tool's
+`input_schema` names a path-shaped property (`path`, `file_path`, `filepath`, `filename`, `file`)
+or a destination-shaped one (`dest`, `dest_path`, `destination`, `destination_path`, `target_path`,
+`output_path`, `out_path`, `new_path`, `to`) and carries no `murmur-destination` or `murmur-opaque`
+annotation. Once per such tool, at staging, on stderr.
+
+**Why it matters:** with nothing declared, the dispatch-time check guesses which of a tool's inputs
+are filesystem destinations from those property names. The guess is wrong in both directions: a
+note the tool merely stores, carrying a `{file, text}` pair, is refused as a write, and a
+destination under a name no table carries is never checked.
+
+```text
+[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur format annotation — its calls are judged by key name. Annotate a destination property with "format": "murmur-destination", and any object the tool only stores with "format": "murmur-opaque" (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-018)
+```
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The tool keeps
+the key-name rules, which is exactly how it behaved before annotations existed.
+
+**What to do:** annotate the tool's `input_schema` — `"format": "murmur-destination"` on each
+string property whose value is a file the tool writes, `"format": "murmur-opaque"` on each object
+or array it only stores. The warning is the tool author's to answer, not the operator's: a capsule
+cannot annotate a tool it installs. See [Read-only paths](manifest.md#read-only-paths).

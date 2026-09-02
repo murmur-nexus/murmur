@@ -118,10 +118,14 @@ impl Session {
 
 /// One capsule to stage: what it declares read-only, which binaries it allows, and which native
 /// tools it carries.
+///
+/// Each tool is a name and the `input_schema` its artifact manifest carries — `None` for a tool
+/// that publishes no schema, which is the shape every case written before schema annotations
+/// existed uses.
 struct Capsule<'a> {
     read_only: &'a [&'a str],
     shell_allow: &'a [&'a str],
-    tools: &'a [&'a str],
+    tools: &'a [(&'a str, Option<&'a str>)],
 }
 
 fn capsule<'a>(read_only: &'a [&'a str], shell_allow: &'a [&'a str]) -> Capsule<'a> {
@@ -136,7 +140,7 @@ fn create_manifest(project_dir: &Path, endpoint: &str, capsule: &Capsule<'_>) ->
     let tool_yaml: String = capsule
         .tools
         .iter()
-        .map(|name| format!("  - name: {name}\n    version: 0.1.0\n    runtime: tool\n"))
+        .map(|(name, _)| format!("  - name: {name}\n    version: 0.1.0\n    runtime: tool\n"))
         .collect();
     let shell_yaml: String = capsule
         .shell_allow
@@ -198,14 +202,14 @@ fn run_session(responses: Vec<String>, capsule: &Capsule<'_>, seed: impl FnOnce(
     );
     common::publish_local(&home, &driver_artifact).success();
 
-    for name in capsule.tools {
+    for (name, schema) in capsule.tools {
         let artifact = common::create_native_artifact(
             artifact_dir.path(),
             name,
             "0.1.0",
             &writer_tool_script(),
             Some("Fixture writer tool"),
-            None,
+            *schema,
         );
         common::publish_local(&home, &artifact).success();
     }
@@ -400,7 +404,7 @@ fn a_tool_call_pairing_a_protected_path_with_content_is_refused() {
         &Capsule {
             read_only: &["tests"],
             shell_allow: &["bash"],
-            tools: &["writer"],
+            tools: &[("writer", None)],
         },
         |_| {},
     );
@@ -444,7 +448,7 @@ fn a_tool_call_naming_a_protected_path_with_no_content_is_dispatched() {
         &Capsule {
             read_only: &["tests"],
             shell_allow: &["bash"],
-            tools: &["writer"],
+            tools: &[("writer", None)],
         },
         |_| {},
     );
@@ -479,7 +483,7 @@ fn a_destination_key_is_a_write_on_its_own() {
         &Capsule {
             read_only: &["tests"],
             shell_allow: &["bash"],
-            tools: &["writer"],
+            tools: &[("writer", None)],
         },
         |_| {},
     );
@@ -492,6 +496,252 @@ fn a_destination_key_is_a_write_on_its_own() {
     assert!(
         signal.contains("destination"),
         "the signal names the destination key: {signal}"
+    );
+}
+
+// ── What a tool's own input schema declares ──────────────────────────────────
+
+/// A tool that declares an object opaque has the pair inside it read as data: the note is
+/// recorded, not refused.
+const NOTER_SCHEMA: &str =
+    r#"{"type":"object","properties":{"note":{"type":"object","format":"murmur-opaque"}}}"#;
+
+/// A batch editor that says which of its inputs is the destination, under an array step.
+const BATCHER_SCHEMA: &str = r#"{"type":"object","properties":{"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string","format":"murmur-destination"}}}}}}"#;
+
+/// A destination under a name no key table carries.
+const RENDERER_SCHEMA: &str =
+    r#"{"type":"object","properties":{"sink":{"type":"string","format":"murmur-destination"}}}"#;
+
+/// An opaque payload beside a declared destination.
+const SNEAKY_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-destination"},"body":{"type":"object","format":"murmur-opaque"}}}"#;
+
+/// `murmur-opaque` on a string, which is ignored.
+const MISLABELED_SCHEMA: &str =
+    r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-opaque"}}}"#;
+
+/// A `{file, text}` pair inside a subtree the tool declared opaque is stored data, and the call
+/// is dispatched.
+#[test]
+fn an_opaque_payload_carrying_a_path_and_text_is_recorded_not_refused() {
+    if common::skip_without_host_support(
+        "an_opaque_payload_carrying_a_path_and_text_is_recorded_not_refused",
+    ) {
+        return;
+    }
+    let session = run_session(
+        one_tool_call(
+            "noter",
+            json!({"note": {"file": PROTECTED_FILE, "text": "the test is protected"}}),
+        ),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("noter", Some(NOTER_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(session.marker_exists(), "the tool ran");
+    assert!(
+        session.events("protected_path_denied").is_empty(),
+        "a declared payload is data, not filesystem intent:\n{}",
+        session.trace_raw
+    );
+    assert!(
+        session
+            .events("tool_call")
+            .iter()
+            .any(|e| e["tool_name"] == "noter"),
+        "the dispatch is recorded:\n{}",
+        session.trace_raw
+    );
+}
+
+/// A tool that declares nothing is judged exactly as before: a nested path/content pair is
+/// refused before dispatch.
+#[test]
+fn a_nested_path_and_content_pair_is_still_refused_without_a_schema() {
+    if common::skip_without_host_support(
+        "a_nested_path_and_content_pair_is_still_refused_without_a_schema",
+    ) {
+        return;
+    }
+    let session = run_session(
+        one_tool_call(
+            "batcher",
+            json!({"edits": [{"path": PROTECTED_FILE, "content": "pass"}]}),
+        ),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("batcher", None)],
+        },
+        |_| {},
+    );
+
+    assert!(!session.marker_exists(), "the tool must never be invoked");
+    assert!(
+        !session
+            .events("tool_call")
+            .iter()
+            .any(|e| e["tool_name"] == "batcher"),
+        "a refused tool call is not recorded as a tool call:\n{}",
+        session.trace_raw
+    );
+    assert_eq!(session.protected_file_contents(), PROTECTED_CONTENTS);
+
+    let refusal = session.refusal();
+    assert_eq!(refusal["path"], PROTECTED_FILE);
+    assert_eq!(refusal["rule"], "tests");
+    let signal = refusal["signal"].as_str().unwrap();
+    assert!(
+        signal.contains("path") && signal.contains("content"),
+        "the signal names the pairing: {signal}"
+    );
+}
+
+/// A declared destination is checked under an array step, and both the trace and `mur trace show`
+/// name the location that triggered the refusal.
+#[test]
+fn a_declared_destination_under_an_array_names_its_location() {
+    if common::skip_without_host_support("a_declared_destination_under_an_array_names_its_location")
+    {
+        return;
+    }
+    let session = run_session(
+        one_tool_call(
+            "batcher-declared",
+            json!({"edits": [{"path": PROTECTED_FILE, "content": "pass"}]}),
+        ),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("batcher-declared", Some(BATCHER_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(!session.marker_exists(), "the tool must never be invoked");
+    let refusal = session.refusal();
+    assert_eq!(refusal["path"], PROTECTED_FILE);
+    assert_eq!(refusal["rule"], "tests");
+    let signal = refusal["signal"].as_str().unwrap();
+    assert!(
+        signal.contains("edits[].path"),
+        "the signal names the declared location: {signal}"
+    );
+    assert!(
+        session
+            .tool_result_text("toolu_tool")
+            .contains("edits[].path"),
+        "the model is told which location triggered it"
+    );
+
+    mur()
+        .args(["trace", "show", session.trace_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("protected-path refusals: 1"))
+        .stdout(predicate::str::contains(PROTECTED_FILE))
+        .stdout(predicate::str::contains("edits[].path"));
+}
+
+/// A declared destination adds coverage the key tables do not have: the same input is refused for
+/// the tool that declared it and dispatched for the tool that did not.
+#[test]
+fn a_declared_destination_adds_coverage_the_key_names_do_not_have() {
+    if common::skip_without_host_support(
+        "a_declared_destination_adds_coverage_the_key_names_do_not_have",
+    ) {
+        return;
+    }
+    let declared = run_session(
+        one_tool_call("renderer", json!({"sink": PROTECTED_FILE})),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("renderer", Some(RENDERER_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(!declared.marker_exists(), "the tool must never be invoked");
+    let signal = declared.refusal()["signal"].as_str().unwrap().to_string();
+    assert!(signal.contains("sink"), "the signal names it: {signal}");
+
+    let undeclared = run_session(
+        one_tool_call("renderer", json!({"sink": PROTECTED_FILE})),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("renderer", None)],
+        },
+        |_| {},
+    );
+
+    assert!(
+        undeclared.events("protected_path_denied").is_empty(),
+        "a path with no content beside it is a read:\n{}",
+        undeclared.trace_raw
+    );
+    assert!(undeclared.marker_exists(), "the tool ran");
+}
+
+/// No annotation, at any location, suppresses a refusal: an opaque sibling does not shelter a
+/// declared destination, and `murmur-opaque` on a string is ignored.
+#[test]
+fn no_annotation_suppresses_a_refusal() {
+    if common::skip_without_host_support("no_annotation_suppresses_a_refusal") {
+        return;
+    }
+    let sneaky = run_session(
+        one_tool_call(
+            "sneaky",
+            json!({
+                "path": PROTECTED_FILE,
+                "content": "x",
+                "body": {"file": PROTECTED_FILE, "text": "note"}
+            }),
+        ),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("sneaky", Some(SNEAKY_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(!sneaky.marker_exists(), "the tool must never be invoked");
+    assert_eq!(sneaky.protected_file_contents(), PROTECTED_CONTENTS);
+    let signal = sneaky.refusal()["signal"].as_str().unwrap().to_string();
+    assert!(
+        signal.contains("path"),
+        "the declared destination is named: {signal}"
+    );
+
+    let mislabeled = run_session(
+        one_tool_call(
+            "mislabeled",
+            json!({"path": PROTECTED_FILE, "content": "x"}),
+        ),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("mislabeled", Some(MISLABELED_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(
+        !mislabeled.marker_exists(),
+        "the tool must never be invoked"
+    );
+    assert_eq!(mislabeled.protected_file_contents(), PROTECTED_CONTENTS);
+    let signal = mislabeled.refusal()["signal"].as_str().unwrap().to_string();
+    assert!(
+        signal.contains("path") && signal.contains("content"),
+        "murmur-opaque on a string is ignored and the heuristic runs: {signal}"
     );
 }
 
@@ -543,7 +793,7 @@ fn an_absolute_path_resolves_to_the_same_rule() {
         &Capsule {
             read_only: &["tests"],
             shell_allow: &["bash"],
-            tools: &["writer"],
+            tools: &[("writer", None)],
         },
     );
     let staged = common::stage_agent_session_with_workdir(
@@ -593,7 +843,7 @@ fn a_path_outside_the_workdir_records_nothing() {
         &Capsule {
             read_only: &["tests"],
             shell_allow: &["bash"],
-            tools: &["writer"],
+            tools: &[("writer", None)],
         },
         |_| {},
     );
@@ -834,6 +1084,141 @@ fn no_declaration_means_no_warning() {
         ])
         .assert()
         .stderr(predicate::str::contains("W-SEC-017").not());
+}
+
+/// A script capsule that installs one native tool, so staging has a tool schema to judge.
+///
+/// The tool is published into `home` first: `mur run` resolves the artifact out of the local
+/// store the same way a real capsule does.
+fn staging_project_with_tool(
+    home: &tempfile::TempDir,
+    artifact_dir: &Path,
+    read_only: &[&str],
+    tool: &str,
+    schema: Option<&str>,
+) -> tempfile::TempDir {
+    let artifact = common::create_native_artifact(
+        artifact_dir,
+        tool,
+        "0.1.0",
+        &writer_tool_script(),
+        Some("Fixture writer tool"),
+        schema,
+    );
+    common::publish_local(home, &artifact).success();
+
+    let project = tempfile::tempdir().unwrap();
+    let read_only_yaml: String = read_only
+        .iter()
+        .map(|entry| format!("      - \"{entry}\"\n"))
+        .collect();
+    let capabilities = if read_only.is_empty() {
+        String::new()
+    } else {
+        format!("capabilities:\n  filesystem:\n    read_only:\n{read_only_yaml}")
+    };
+    fs::write(
+        project.path().join("murmur.yaml"),
+        format!(
+            "name: staging-capsule\n\
+             version: 0.1.0\n\
+             artifacts:\n\
+             \x20 - name: {tool}\n\
+             \x20   version: 0.1.0\n\
+             \x20   runtime: tool\n\
+             {capabilities}"
+        ),
+    )
+    .unwrap();
+    fs::copy(
+        common::fixture_path("run/components/capsule-allowlisted.wasm"),
+        project.path().join("capsule.wasm"),
+    )
+    .unwrap();
+    project
+}
+
+/// A path-shaped tool schema with no annotation is judged by key name, and staging says so —
+/// naming the tool and the property. The same schema with the annotation says nothing.
+#[test]
+fn staging_warns_that_an_unannotated_tool_schema_is_judged_by_key_name() {
+    if common::skip_without_host_support(
+        "staging_warns_that_an_unannotated_tool_schema_is_judged_by_key_name",
+    ) {
+        return;
+    }
+    let unannotated = r#"{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}"#;
+    let annotated = r#"{"type":"object","properties":{"file_path":{"type":"string","format":"murmur-destination"},"content":{"type":"string"}}}"#;
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = staging_project_with_tool(
+        &home,
+        artifact_dir.path(),
+        &["tests"],
+        "guessed-tool",
+        Some(unannotated),
+    );
+    mur()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            project.path().join("murmur.yaml").to_str().unwrap(),
+        ])
+        .assert()
+        .stderr(predicate::str::contains("warning[W-SEC-018]"))
+        .stderr(predicate::str::contains("'guessed-tool'"))
+        .stderr(predicate::str::contains("'file_path'"));
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = staging_project_with_tool(
+        &home,
+        artifact_dir.path(),
+        &["tests"],
+        "declared-tool",
+        Some(annotated),
+    );
+    mur()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            project.path().join("murmur.yaml").to_str().unwrap(),
+        ])
+        .assert()
+        .stderr(predicate::str::contains("W-SEC-018").not());
+}
+
+/// A capsule that declares nothing read-only reads no tool schema, so it warns about nothing.
+#[test]
+fn a_capsule_without_read_only_gets_no_schema_warning() {
+    if common::skip_without_host_support("a_capsule_without_read_only_gets_no_schema_warning") {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = staging_project_with_tool(
+        &home,
+        artifact_dir.path(),
+        &[],
+        "guessed-tool",
+        Some(r#"{"type":"object","properties":{"file_path":{"type":"string"}}}"#),
+    );
+
+    mur()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            project.path().join("murmur.yaml").to_str().unwrap(),
+        ])
+        .assert()
+        .stderr(predicate::str::contains("W-SEC-018").not());
 }
 
 /// The refusal is readable in `mur trace show`: its own line under its own heading, naming the

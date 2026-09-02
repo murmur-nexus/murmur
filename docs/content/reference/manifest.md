@@ -1132,11 +1132,46 @@ A refused call does not run: no `shell` record and no `tool_call` record is writ
 receives an error naming the path, the rule, that nothing ran, and that the path is still
 readable. See [`protected_path_denied`](observability-schemas.md#protected-path-denied).
 
+**What a tool declares about its own input.** A tool artifact says which of its inputs are
+filesystem destinations and which are payload it only stores, with JSON Schema's `format` keyword
+in its own `input_schema`:
+
+| `format` value | Declared on | Effect |
+|---|---|---|
+| `murmur-destination` | A string property | The value at that location is checked against every `read_only` entry, wherever in the input it sits |
+| `murmur-opaque` | An object or array property | The key-name rules above do not descend into that subtree |
+
+```yaml
+input_schema: |
+  {"type":"object","properties":{
+    "edits":{"type":"array","items":{"type":"object","properties":{
+      "path":{"type":"string","format":"murmur-destination"}}}},
+    "note":{"type":"object","format":"murmur-opaque"}}}
+```
+
+An annotation refines where the runtime looks, never whether it refuses: no `format` value permits
+a path, and every refusal is still decided by the operator's own `read_only` entries.
+
+| Case | Behaviour |
+|---|---|
+| A tool that annotates nothing | Judged by key name, exactly as the table above describes |
+| `murmur-opaque` on a string property | Ignored; the key-name rules keep running on the object that carries it |
+| `murmur-destination` inside a subtree marked `murmur-opaque` | Still checked |
+| An annotation behind a `$ref` | Not resolved, so that tool keeps the key-name rules |
+
+A refusal a declared destination triggered names the location in the model's error and in the
+trace record: `edits[].path` for the schema above.
+
+A capsule that declares `read_only` and installs a tool whose schema names a path-shaped or
+destination-shaped property and annotates nothing fires
+[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and the property.
+
 **What it does not refuse.** Everything the dispatch check cannot positively identify — command
 substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file
 I/O. Declaring `read_only` alongside an interpreter in `capabilities.shell.allow` fires
-[`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. The declaration is also
-not a defence against a malicious artifact: see
+[`W-SEC-017`](diagnostics.md#w-sec-017) at staging, naming that binary. Nor does it descend into a
+subtree a tool declared `murmur-opaque`, so a destination the same tool did not declare is not
+seen there. The declaration is also not a defence against a malicious artifact: see
 [Access control](../concepts/access-control.md#read-only-paths).
 
 ### State store name { #state-store-name }

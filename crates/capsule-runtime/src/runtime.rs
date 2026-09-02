@@ -16,7 +16,7 @@ use murmur_artifact::{
     InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
     LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
     MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
+    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -80,6 +80,7 @@ use crate::{
         emit_chunk_sse, emit_sse, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
         StreamStatus, TaskStatusUpdateEvent,
     },
+    tool_annotations::ToolAnnotationMap,
     trace::TraceWriter,
     types::{
         ArtifactRequest, CapabilityPolicy, DispatchOutcome, InstalledArtifactSummary, LaunchResult,
@@ -883,8 +884,8 @@ pub fn stage_session(
         source,
     })?;
 
-    for (name, manifest_yaml) in installed_manifests {
-        write_tool_manifest(&workdir, &name, &manifest_yaml)?;
+    for (name, manifest_yaml) in &installed_manifests {
+        write_tool_manifest(&workdir, name, manifest_yaml)?;
     }
 
     install_native_binaries(&workdir, native_binaries)?;
@@ -907,6 +908,17 @@ pub fn stage_session(
     // the `capsule` property's `enum` is this capsule's own `capabilities.spawn.allow`, so the
     // model is offered the names the operator granted and cannot name anything else.
     write_delegate_task_tool_manifest(&workdir, &request.capability_policy.spawn_allow)?;
+
+    // Read once, here, from the manifests just staged: the schema is fixed before the session
+    // starts, so an annotation is the tool author's statement and never a call-time choice. A
+    // capsule that declared nothing read-only reads no schema at all — the analyser it would feed
+    // never runs.
+    let tool_annotations = if protected_paths.is_empty() {
+        ToolAnnotationMap::default()
+    } else {
+        warn_on_unannotated_tool_schemas(&installed_manifests);
+        ToolAnnotationMap::from_workdir(&workdir)
+    };
 
     // Dispatch on-stage hooks synchronously now that manifests are in place.
     let stage_env = HookEnvVars::default();
@@ -998,6 +1010,7 @@ pub fn stage_session(
         trace_retain: request.trace.as_ref().and_then(|t| t.retain),
         host_probe,
         protected_paths,
+        tool_annotations,
         bind_addr: request.bind_addr,
         internal_port: request.internal_port,
         declared_containment_floor: request.declared_containment_floor,
@@ -1292,6 +1305,7 @@ pub fn launch_session(
         let engine = staged.engine.clone();
         let capability_policy = staged.capability_policy.clone();
         let protected_paths = staged.protected_paths.clone();
+        let tool_annotations = staged.tool_annotations.clone();
         let shell_enforcement_for_state = shell_enforcement.clone();
         let otel_endpoint = staged.otel_endpoint;
         let eval_config_json = staged.eval_config_json;
@@ -1496,6 +1510,7 @@ pub fn launch_session(
                         pending_a2a_events: Vec::new(),
                         capability_policy,
                         protected_paths,
+                        tool_annotations,
                         shell_enforcement: shell_enforcement_for_state,
                         current_traceparent: None,
                         current_task_provenance: None,
@@ -2262,6 +2277,7 @@ pub fn launch_session(
         pending_a2a_events: Vec::new(),
         capability_policy: staged.capability_policy,
         protected_paths: staged.protected_paths,
+        tool_annotations: staged.tool_annotations,
         shell_enforcement: shell_enforcement.clone(),
         current_traceparent: None,
         current_task_provenance: None,
@@ -2761,6 +2777,41 @@ fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
              can construct a write the dispatch check cannot read — the declaration is \
              advisory for that binary. It still holds for every tool call and for every \
              shell command whose write the dispatch check can identify ({link})"
+        );
+    }
+}
+
+/// Warns (non-fatal, once per installed tool) when a capsule that declares
+/// `capabilities.filesystem.read_only` installs a tool whose `input_schema` names a path-shaped or
+/// destination-shaped property and annotates nothing.
+///
+/// Such a tool's calls are judged by key name — the analyser guesses which of its inputs are
+/// filesystem destinations from [`crate::protected_paths::TOOL_PATH_KEYS`] and
+/// [`crate::protected_paths::TOOL_DESTINATION_KEYS`] — and a guess is wrong in both directions: a
+/// stored payload carrying a `{file, text}` pair is refused as a write, and a destination under an
+/// unrecognized name is not checked. The tool can say which it is; this says so before a refusal
+/// is what says it.
+///
+/// Only the capsule's own installed artifacts are considered. The synthetic manifests the runtime
+/// writes (the shell binaries, the peer-handoff tools, `delegate-task`) are not an operator's to
+/// annotate.
+fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
+    for (tool, manifest_yaml) in installed_manifests {
+        let Some(schema) = crate::tool_annotations::schema_from_manifest_yaml(manifest_yaml) else {
+            continue;
+        };
+        let Some(property) = crate::tool_annotations::unannotated_path_property(&schema) else {
+            continue;
+        };
+        let link = security_warning_link(W_SEC_018);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_018}]: capabilities.filesystem.read_only is \
+             declared and the tool '{tool}' declares the property '{property}' with no murmur \
+             format annotation — its calls are judged by key name. Annotate a destination \
+             property with \"format\": \"{destination}\", and any object the tool only stores \
+             with \"format\": \"{opaque}\" ({link})",
+            destination = crate::tool_annotations::FORMAT_DESTINATION,
+            opaque = crate::tool_annotations::FORMAT_OPAQUE,
         );
     }
 }
@@ -3346,6 +3397,10 @@ pub(crate) struct CapsuleStoreState {
     /// [`Self::has_protected_paths`] is the single boolean that keeps such a capsule from
     /// resolving a call, walking a JSON input or resolving a path at all.
     pub(crate) protected_paths: ProtectedPaths,
+    /// What each staged tool's own `input_schema` declared about where its inputs go. Read only
+    /// by [`Self::check_protected_paths`], and only to decide *where* the analyser looks — never
+    /// whether it refuses. Empty whenever [`Self::has_protected_paths`] is false.
+    pub(crate) tool_annotations: ToolAnnotationMap,
     /// Host-detected kernel enforcement tier + resolved network allowlist IPs for this
     /// session's shell subprocesses. Kept separate from `CapabilityPolicy` (which stays
     /// purely manifest-derived) since this is host-probed data, not manifest data.
@@ -4135,7 +4190,7 @@ impl CapsuleStoreState {
         call: &ResolvedCall,
     ) -> Option<ProtectedPathRefusal> {
         self.protected_paths
-            .check_call(&self.accessible_workdir, call)
+            .check_call(&self.accessible_workdir, call, &self.tool_annotations)
     }
 
     /// Dispatch a tool call from the agent loop: native binary, shell, or WASM, and fence
@@ -6942,6 +6997,7 @@ inference:
             pending_a2a_events: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             protected_paths: ProtectedPaths::default(),
+            tool_annotations: ToolAnnotationMap::default(),
             shell_enforcement: sandbox::ShellEnforcement::environment_only(),
             current_traceparent: None,
             current_task_provenance: None,
