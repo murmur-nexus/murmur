@@ -447,6 +447,10 @@ fn select_asset_for_artifact(
         return Some(asset.clone());
     }
 
+    // This last fallback matches on name alone, so for a native artifact it can hand back a zip
+    // built for another platform — a release carrying only darwin assets resolves on a Linux host.
+    // The staging platform check (`install_native_binaries`) is what stops those bytes ever being
+    // written into a session workdir and spawned.
     assets
         .iter()
         .find(|asset| {

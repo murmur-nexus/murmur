@@ -40,7 +40,9 @@ pub use payload_shape::{
     select_root_wasm_from_entries, select_root_wasm_in_archive, PayloadShapeError,
     CAPSULE_WASM_ENTRY, NATIVE_BIN_DIR, SKILL_MD_ENTRY, WASM_EXTENSION,
 };
-pub use platform::current_platform;
+pub use platform::{
+    binary_platform, current_platform, native_binary_verdict, NativeBinaryVerdict, DARWIN_ANY_ARCH,
+};
 pub use registry::{
     is_reserved_version, sha256_hex, sha256_hex_of_reader, verify_sha256, ArtifactMeta,
     LocalRegistry, Platform, PublishResult, Registry, RegistryError, ResolvedArtifact, RuntimeType,

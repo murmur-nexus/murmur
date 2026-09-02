@@ -410,9 +410,14 @@ mur doctor
 
 `mur doctor` takes no flags or arguments. It walks up from the current directory to find `murmur.yaml` (same walk `mur install` uses), loads it, and prints one checklist line per declared artifact:
 
-- `✓ name@version   <platform>` — resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`) for the current platform, and agrees with `murmur.lock` if one is present (see below)
+- `✓ name@version   <platform>` — a native tool whose `bin/<name>` binary was read and identified as this host's platform
+- `✓ name@version   platform-independent` — nothing about this artifact's payload is platform-specific: a skill, a WASM tool, a driver, a hook
+- `✓ name@version   platform unverified` — a native tool whose `bin/<name>` payload is in a format the platform check does not recognise, such as a shell script
 - `✓ name@version   local source` — declared with a `source:` path; resolved from the filesystem at stage time, never checked against a registry or a lockfile
 - `✗ name@version   <platform>   — missing` — resolved from neither store
+- `✗ name@version   <platform>   — native binary is built for <binary-platform>, this host is <platform>` — the artifact holds a host executable this machine cannot exec; `mur run` refuses it at staging with [`E-RUN-021`](diagnostics.md#e-run-021)
+
+Every green line resolved from the project store (`.murmur/artifacts/`) or the global store (`~/.murmur/artifacts/`), and agrees with `murmur.lock` if one is present (see below). The host platform appears on a green line only for an artifact whose binary was identified and matched.
 
 There is no hardcoded artifact list: the checklist is derived entirely from `murmur.yaml`'s `artifacts:` block. Editing a version pin or adding/removing an artifact changes what `mur doctor` checks, with no code change.
 
@@ -426,7 +431,7 @@ Filesystem preopens
   - murmur-tool-git (tool): one subtree of the accessible workdir — capabilities.filesystem.scope: repo
 
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur-driver-anthropic@1.0.0    darwin-aarch64
+  ✓  murmur-driver-anthropic@1.0.0    platform-independent
   ✓  murmur-tool-git@1.0.0            darwin-aarch64
 
 All checks passed.
@@ -441,6 +446,17 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
 0 checks passed, 1 error found.
 
 Fix: mur install murmur-tool-git@1.0.0
+```
+
+**Output — a native binary built for another platform:**
+
+```text
+Checking /path/to/murmur.yaml for linux-x86_64...
+  ✗  murmur-tool-git@1.0.0   linux-x86_64   — native binary is built for darwin-aarch64, this host is linux-x86_64
+
+0 checks passed, 1 error found.
+
+Fix: murmur-tool-git: native binary is built for darwin-aarch64 — reinstall murmur-tool-git@1.0.0 on this host
 ```
 
 ### Lock integrity
@@ -468,8 +484,8 @@ Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or d
 
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), and agrees with `murmur.lock` if one is present
-- `1` — one or more declared artifacts missing, or disagree with `murmur.lock` (checklist printed to stdout first), or a setup failure (no checklist printed; error goes to stderr)
+- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, or hold a native binary this host cannot run (checklist printed to stdout first), or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 
@@ -478,6 +494,7 @@ Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or d
 | `E-IO-001` | No `murmur.yaml` found in the current directory or any parent |
 | `E-MAN-001` / `E-MAN-002` / `E-MAN-003` | Manifest failed to load — missing field, YAML syntax error, or invalid field, respectively |
 | `E-RUN-003` | `murmur.lock` exists but failed to parse or validate |
+| `E-RUN-021` | A declared native tool's binary is built for another platform — reported on the checklist line; `mur run` refuses the same artifact at staging |
 
 A setup failure (no project found, the manifest fails to load, or the lockfile fails to parse) is reported on stderr before any checklist is printed — `mur doctor` never reports "all checks passed" against zero artifacts because the manifest or lockfile couldn't be read.
 

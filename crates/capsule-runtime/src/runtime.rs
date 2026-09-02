@@ -10,13 +10,14 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,
-    read_lockfile, security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask,
-    ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
-    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedArtifact, LockedSha256,
-    LockfileError, MurmurLock, Registry, RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION,
-    MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008,
-    W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
+    current_platform, native_binary_verdict, parse_hook_config_from_yaml,
+    parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
+    write_lockfile_atomic, AfterTask, ArtifactImplementation, ArtifactRuntime, ContextConfig,
+    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
+    LockedArtifact, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
+    RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
+    W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -4856,10 +4857,28 @@ fn write_tool_manifest(
     })
 }
 
+/// Write each native tool's binary to `<workdir>/tools/<name>/<name>`, executable.
+///
+/// Every image is classified against this host before the first one is written. A batch holding
+/// one unrunnable binary installs none of them: a refusal that had already written two of three
+/// tools would leave a workdir that is neither the state before staging nor the state after it.
 fn install_native_binaries(
     workdir: &Path,
     native_binaries: Vec<(String, Vec<u8>)>,
 ) -> Result<(), RuntimeError> {
+    let host_platform = current_platform();
+    for (name, bytes) in &native_binaries {
+        if let NativeBinaryVerdict::Mismatch { binary_platform } =
+            native_binary_verdict(bytes, host_platform)
+        {
+            return Err(RuntimeError::NativeBinaryPlatformMismatch {
+                name: name.clone(),
+                binary_platform: binary_platform.to_string(),
+                host_platform: host_platform.to_string(),
+            });
+        }
+    }
+
     for (name, bytes) in native_binaries {
         let binary_path = workdir.join("tools").join(&name).join(&name);
         let Some(parent) = binary_path.parent() else {

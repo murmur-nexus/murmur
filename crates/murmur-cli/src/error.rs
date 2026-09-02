@@ -36,6 +36,7 @@ pub const E_RUN_017: &str = "E-RUN-017"; // the resolved context has no conversa
 pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook bound to on-compaction
 pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
 pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle
+pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built for another platform
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -450,6 +451,16 @@ impl From<RuntimeError> for CliError {
                 "start the daemon the capsule registers with — `mur-roost --port 7700 \
                  --registry-path <store>` — and set MURMUR_ROOST_URL to its base URL, or drop \
                  capabilities.spawn.allow from the manifest if this capsule spawns nothing",
+            ),
+            // Delegates to the Display text for the same reason the two arms above do: the
+            // staging refusal names the artifact and both platforms, and the CLI restating that
+            // is one more place for the wording to drift from capsule-runtime's errors.rs.
+            error @ RuntimeError::NativeBinaryPlatformMismatch { .. } => CliError::with_hint(
+                E_RUN_021,
+                error.to_string(),
+                "the installed artifact holds a binary for another platform \u{2014} reinstall it \
+                 on this host with `mur install <name>@<version>`, or publish a build for this \
+                 host's platform",
             ),
             error @ RuntimeError::SpawnerHandleUnreadable { .. } => CliError::with_hint(
                 E_RUN_020,

@@ -7,8 +7,10 @@ use capsule_runtime::{
     InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, load_runtime_manifest, read_lockfile,
-    resolve_manifest_path, sha256_hex, LocalRegistry, LockfileError, MurmurLock,
+    current_platform, effective_containment_floor, load_runtime_manifest, native_binary_verdict,
+    parse_tool_implementation_from_yaml, read_lockfile, resolve_manifest_path, sha256_hex,
+    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock,
+    NativeBinaryVerdict,
 };
 
 use crate::commands::install::find_project_root;
@@ -16,6 +18,69 @@ use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
 use crate::error::{CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006};
+
+/// Whether an installed artifact's payload can run on the host doctor is checking for.
+///
+/// Separate from [`LockVerdict`] because it asks a different question of the same bytes: the lock
+/// checks that the artifact on disk is the one that was pinned, this checks that the machine can
+/// execute it. Only a native tool has an answer beyond `Independent`.
+enum PlatformVerdict {
+    /// Nothing about this artifact's payload is platform-specific.
+    Independent,
+    /// A native binary identified as this host's platform.
+    Matches,
+    /// A native binary whose format this check does not recognise.
+    Unverified,
+    /// A native binary built for another platform.
+    Mismatch { binary_platform: String },
+}
+
+/// Classify one installed artifact's payload against `platform`, the way `stage_session` does
+/// before it writes a native binary into a session workdir.
+///
+/// An artifact is native when the capsule manifest declares it a tool *and* its own packed
+/// `murmur.yaml` says `implementation: native`. Neither `artifacts-index.json` nor
+/// `ArtifactMeta.runtime` can stand in: the index tags every non-skill artifact with both
+/// platforms, and `ArtifactMeta.runtime` is `Wasm` for anything installed through the normal path.
+///
+/// Any failure to open the archive or read `bin/<name>` is `Unverified`, never `Mismatch`. The
+/// lock and hash checks above already report a corrupt or truncated artifact, and reporting the
+/// same read failure a second time as a platform failure would send the operator after the wrong
+/// thing.
+fn check_artifact_platform(
+    name: &str,
+    version: &str,
+    runtime: &ArtifactRuntime,
+    artifact_bytes: &[u8],
+    platform: &str,
+) -> PlatformVerdict {
+    if !matches!(runtime, ArtifactRuntime::Tool) {
+        return PlatformVerdict::Independent;
+    }
+
+    let Ok(manifest_yaml) =
+        capsule_runtime::artifact::extract_manifest_yaml(name, version, artifact_bytes)
+    else {
+        return PlatformVerdict::Unverified;
+    };
+    if parse_tool_implementation_from_yaml(&manifest_yaml) != ArtifactImplementation::Native {
+        return PlatformVerdict::Independent;
+    }
+
+    let Ok(binary) =
+        capsule_runtime::artifact::extract_native_binary(name, version, artifact_bytes)
+    else {
+        return PlatformVerdict::Unverified;
+    };
+
+    match native_binary_verdict(&binary, platform) {
+        NativeBinaryVerdict::Runnable => PlatformVerdict::Matches,
+        NativeBinaryVerdict::Indeterminate => PlatformVerdict::Unverified,
+        NativeBinaryVerdict::Mismatch { binary_platform } => PlatformVerdict::Mismatch {
+            binary_platform: binary_platform.to_string(),
+        },
+    }
+}
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
@@ -371,9 +436,40 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
                 };
 
                 match verdict {
+                    // A green line has to say what it actually verified. Before this check
+                    // every passing artifact printed the host platform, including artifacts
+                    // whose payload doctor had never opened — an attestation it could not make.
                     LockVerdict::Ok => {
-                        println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
-                        total_pass += 1;
+                        match check_artifact_platform(
+                            name,
+                            version,
+                            &artifact.runtime,
+                            &resolved.bytes,
+                            platform,
+                        ) {
+                            PlatformVerdict::Independent => {
+                                println!(
+                                    "  \u{2713}  {ref_str:<col_width$}   platform-independent"
+                                );
+                                total_pass += 1;
+                            }
+                            PlatformVerdict::Matches => {
+                                println!("  \u{2713}  {ref_str:<col_width$}   {platform}");
+                                total_pass += 1;
+                            }
+                            PlatformVerdict::Unverified => {
+                                println!("  \u{2713}  {ref_str:<col_width$}   platform unverified");
+                                total_pass += 1;
+                            }
+                            PlatformVerdict::Mismatch { binary_platform } => {
+                                println!(
+                                    "  \u{2717}  {ref_str:<col_width$}   {platform}   \u{2014} native binary is built for {binary_platform}, this host is {platform}"
+                                );
+                                fixes.push(format!(
+                                    "{name}: native binary is built for {binary_platform} \u{2014} reinstall {ref_str} on this host"
+                                ));
+                            }
+                        }
                     }
                     LockVerdict::MissingEntry => {
                         println!(
