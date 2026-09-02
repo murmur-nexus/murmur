@@ -25,22 +25,23 @@
 #      (package, version) pairs the tree declares — no stale row, no missing row.
 #
 # Exits non-zero with a diff on any mismatch. Run it from the repo root.
+#
+# Within-commit only: it cannot tell you whether a version *moved* since the
+# last release, because it never looks at history. That is the release-time
+# question, and scripts/wit-versions-changed-since.sh answers it. Both read the
+# declarations through lib/wit-packages.sh.
 
 set -eu
 
-WIT_DIR="crates/capsule-runtime/wit"
+# WIT_DIR and the extraction itself; see lib/wit-packages.sh for the contract.
+. "$(dirname "$0")/lib/wit-packages.sh"
+
 POLICY="$WIT_DIR/VERSIONING.md"
 
-if [ ! -d "$WIT_DIR" ]; then
-    echo "error: $WIT_DIR not found — run this from the repository root" >&2
-    exit 2
-fi
+wit_require_repo_root
 
-# Every `package murmur:x@y.z;` declaration in the tree, deduplicated.
-declared=$(grep -rhoE '^package murmur:[a-z-]+@[0-9]+\.[0-9]+\.[0-9]+' "$WIT_DIR" \
-    --include='*.wit' | sed 's/^package //' | sort -u)
-
-if [ -z "$declared" ]; then
+# Every declaration in the tree, deduplicated, via the shared extraction.
+if ! declared=$(wit_packages --worktree); then
     echo "error: no murmur:* package declarations found under $WIT_DIR" >&2
     exit 2
 fi
@@ -51,7 +52,7 @@ if [ -n "$dupes" ]; then
     echo "error: a package is declared at more than one version:" >&2
     for pkg in $dupes; do
         printf '%s\n' "$declared" | grep "^${pkg}@" | sed 's/^/  /' >&2
-        grep -rlE "^package ${pkg}@" "$WIT_DIR" --include='*.wit' | sed 's/^/    declared in: /' >&2
+        wit_files_declaring "$pkg" | sed 's/^/    declared in: /' >&2
     done
     echo >&2
     echo "Every subtree under $WIT_DIR is parsed independently, so this will not" >&2
