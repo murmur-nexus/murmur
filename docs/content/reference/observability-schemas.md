@@ -37,7 +37,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
-| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation` | The session node |
+| `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
 a file that has no session frame — writes `parent_id: null` on every line, rather than naming a
@@ -60,6 +60,8 @@ before the first task begins
 | `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
+| `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
+| `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
 | `effective_grants` | object | The complete grant set this session ran under — the same object [`mur run --explain-scope --json`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it) prints for the same manifest on the same host: `declared_containment`, `achieved_containment`, `floor_met`, `shortfall_reason` (present only when `floor_met` is `false`), `enforcement_tier`, `userns_grant`, `filesystem_scope`, `workdir_exec`, `read_only_paths` (the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects; `[]` when the manifest declares none), `read_only_advisory_for` (the entries of `shell_allow` that protection is only advisory against; `[]` when it is enforced for every call the runtime can read as a write), `network_allow`, `unix_sockets`, `shell_allow`, `spawn_allow`, `env_allow`, `interpreter_runtime_grants`, `staged_runtime_grants`, `preopens` (one entry per `runtime: tool`, `runtime: driver` and `runtime: hook` entry — `artifact`, `role`, the declared `scope` or `null`, and a `surface` of `whole-workdir`, `scoped-subtree` or `nothing`; `[]` when the capsule declares only skills), `state_stores` (`[]` when no artifact declares [`capabilities.state`](manifest.md#field-capabilities)), `configured_artifacts` (`[]` when no artifact declares [`config:`](manifest.md#artifact-config)), `exports_files` (`null` when the manifest declares no [`exports.files`](manifest.md#field-exports)), `peer_files` (`null` when the manifest declares no [`exports.peer_files`](manifest.md#field-exports-peer-files)) and `peer_fetch_allow` (`[]` when the manifest declares no [`capabilities.peer_fetch`](manifest.md#field-peer-fetch)). Where `capabilities` above names categories, this names the actual destinations, binaries, capsule names and paths |
@@ -541,13 +543,29 @@ refused
 by the listener, concurrently with any running task. All three are written at the moment of the
 event.
 
+**`delegation_start`** — written by the `delegate-task` tool once per launched child, as soon as
+that child's process is up and has reported its session id
+
+| Field | Type | Notes |
+|---|---|---|
+| `delegation_id` | string | `dlg_…`, the id the delegation is named by. Always present: a delegation with no id was never launched and writes no line here |
+| `capsule` | string | The sub-capsule the agent named |
+| `version` | string | The version the agent named |
+| `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
+| `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir. Join the two, then `.murmur/<child_session_id>/trace.jsonl`, to reach the child's own trace |
+
+Written while the delegation is still running, not when it ends, so a child that hangs, crashes or
+is timed out is attributable from the parent's side whatever happens next. A delegation the daemon
+refused writes none of these — nothing was launched — and is recorded only by the `delegation` line
+below.
+
 **`delegation`** — written by the `delegate-task` tool when a delegation ends, whatever ended it
 
 | Field | Type | Notes |
 |---|---|---|
 | `capsule` | string | The sub-capsule the agent named |
 | `version` | string | The version the agent named |
-| `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` on `"refused"` — a delegation the daemon refused was never made |
+| `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one whose approved child's process never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
 | `duration_ms` | u64 | From the first request to the daemon until the delegation ended |
 | `outcome` | string | `"completed"`, `"failed"`, `"timed_out"` or `"refused"` |
@@ -556,6 +574,28 @@ event.
 One line per call. It carries neither the task text nor the child's answer — both are the agent's
 own conversation, which the `tool_call` line for the same call already records under the session's
 `trace.capture` setting.
+
+### Reading a formation { #delegation-lineage }
+
+The relationship between a parent and a child is recorded once, from both ends, and joined by the
+`dlg_` id:
+
+| From | Read | To reach |
+|---|---|---|
+| A parent's trace | `delegation_start.child_workdir` and `child_session_id` | `<accessible workdir>/<child_workdir>/.murmur/<child_session_id>/trace.jsonl` |
+| A child's trace | `session_start.spawned_by` | The `ses_` id of the session that spawned it |
+
+[`mur trace show`](cli.md#mur-trace-show) renders both ends within the one file it is given: a child's
+header names the session that spawned it and the delegation that created it, and a parent grows a
+Delegations section listing each delegation, the child session it launched, how it ended and why.
+No command walks a formation across files.
+
+**A resumed child's lineage is one hop back.** `spawned_by` is written at spawn and never
+rewritten, so resuming a *parent* keeps the child reachable: the resumed session's `resumed_from`
+names the session the child's `spawned_by` names. Resuming a *child* is the other direction and the
+window is open — that resume is an operator launch with no `MURMUR_SPAWNER` in its environment, so
+the new session writes no `spawned_by` at all, and its `resumed_from` names the child session that
+was spawned. The lineage is in the session it continues, one `resumed_from` hop back.
 
 **The handle itself never appears in a trace, on either side.** Where a token would otherwise reach
 one — most obviously as the recorded `handle` argument of a `fetch-peer-file` `tool_call` — it is

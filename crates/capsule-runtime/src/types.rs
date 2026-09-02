@@ -483,6 +483,14 @@ pub struct StagedSession {
     /// Copied from [`StageRequest::spawn_grant`]. Read by `launch_session`, which presents it at
     /// `POST /register` and never again — an approval covers one launch.
     pub(crate) spawn_grant: Option<SpawnApproval>,
+    /// The handle the spawning capsule's launcher injected, read once per process at staging.
+    ///
+    /// `None` for every capsule nobody delegated. Its `session_id` and `delegation_id` become
+    /// `session_start.spawned_by` and `session_start.delegation_id`; its `report_to` — present
+    /// only for a parent that wants a completion — is what `launch_session`'s reporting guard
+    /// posts to. Read here rather than at each of those two points so one process reads
+    /// `MURMUR_SPAWNER` once and both readers see the same value.
+    pub(crate) spawner: Option<crate::delegation::SpawnerHandle>,
 }
 
 impl StagedSession {

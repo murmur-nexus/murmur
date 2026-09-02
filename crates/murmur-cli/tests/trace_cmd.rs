@@ -190,6 +190,66 @@ const FIXTURE_PROTECTED: &str = concat!(
     "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":50,\"exit_status\":\"ok\"}\n"
 );
 
+/// A parent that made three delegations: one that answered, one the daemon refused, and one whose
+/// child it never saw end. The child's own trace is `FIXTURE_CHILD` below, and nothing in either
+/// file names the other's path — `mur trace show` renders each within the file it was given.
+const FIXTURE_PARENT: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_11111111111141118111000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7000,",
+    "\"capsule_name\":\"delegator\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[\"delegate-task\"]}\n",
+
+    "{\"event_type\":\"delegation_start\",\"event_id\":\"evt_11111111111141118111000000000002\",",
+    "\"parent_id\":\"evt_11111111111141118111000000000001\",",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7010,",
+    "\"delegation_id\":\"dlg_aaaa0001\",\"capsule\":\"worker\",\"version\":\"0.1.0\",",
+    "\"child_session_id\":\"ses_22222222222242228222000000000009\",",
+    "\"child_workdir\":\".murmur/children/worker-0123456789abcdef\"}\n",
+
+    "{\"event_type\":\"delegation\",\"event_id\":\"evt_11111111111141118111000000000003\",",
+    "\"parent_id\":\"evt_11111111111141118111000000000001\",",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7020,",
+    "\"capsule\":\"worker\",\"version\":\"0.1.0\",\"delegation_id\":\"dlg_aaaa0001\",",
+    "\"child_session_id\":\"ses_22222222222242228222000000000009\",\"duration_ms\":900,",
+    "\"outcome\":\"completed\",\"reason\":null}\n",
+
+    "{\"event_type\":\"delegation\",\"event_id\":\"evt_11111111111141118111000000000004\",",
+    "\"parent_id\":\"evt_11111111111141118111000000000001\",",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7030,",
+    "\"capsule\":\"greedy-worker\",\"version\":\"0.1.0\",\"delegation_id\":null,",
+    "\"child_session_id\":null,\"duration_ms\":40,\"outcome\":\"refused\",",
+    "\"reason\":\"capabilities.shell.allow: the child declares 'bash', which its parent does not hold\"}\n",
+
+    "{\"event_type\":\"delegation_start\",\"event_id\":\"evt_11111111111141118111000000000005\",",
+    "\"parent_id\":\"evt_11111111111141118111000000000001\",",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7040,",
+    "\"delegation_id\":\"dlg_aaaa0002\",\"capsule\":\"mute-worker\",\"version\":\"0.1.0\",",
+    "\"child_session_id\":\"ses_33333333333343338333000000000009\",",
+    "\"child_workdir\":\".murmur/children/mute-worker-fedcba9876543210\"}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_11111111111141118111000000000006\",",
+    "\"parent_id\":\"evt_11111111111141118111000000000001\",",
+    "\"session_id\":\"ses_11111111111141118111000000000009\",\"timestamp\":7050,",
+    "\"total_turns\":2,\"total_input_tokens\":100,\"total_output_tokens\":20,",
+    "\"total_tool_calls\":3,\"total_shell_calls\":0,\"duration_ms\":1000,\"exit_status\":\"ok\"}\n"
+);
+
+/// The child `FIXTURE_PARENT`'s first delegation launched, which names its parent and the
+/// delegation that created it and nothing else about the relationship.
+const FIXTURE_CHILD: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_22222222222242228222000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_22222222222242228222000000000009\",\"timestamp\":7011,",
+    "\"capsule_name\":\"worker\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[],",
+    "\"spawned_by\":\"ses_11111111111141118111000000000009\",\"delegation_id\":\"dlg_aaaa0001\"}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_22222222222242228222000000000002\",",
+    "\"parent_id\":\"evt_22222222222242228222000000000001\",",
+    "\"session_id\":\"ses_22222222222242228222000000000009\",\"timestamp\":7019,",
+    "\"total_turns\":1,\"total_input_tokens\":10,\"total_output_tokens\":5,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":800,\"exit_status\":\"ok\"}\n"
+);
+
 fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, content).unwrap();
@@ -3575,4 +3635,62 @@ fn diff_omitted_args_print_the_same_bytes_as_at2_at1() {
         text.contains("500ms") && text.contains("1.7s"),
         "Run A is the older session: {text}"
     );
+}
+
+/// A parent's Delegations section lists every delegation it made, however each one ended: the
+/// `dlg_` id, the capsule, the child session, the outcome, and the reason on everything that is
+/// not `completed`.
+#[test]
+fn show_lists_every_delegation_a_parent_made() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "parent.jsonl", FIXTURE_PARENT);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Delegations"))
+        .stdout(predicate::str::contains(
+            "dlg_aaaa0001  worker@0.1.0  ses_22222222222242228222000000000009  completed",
+        ))
+        // A refusal made no delegation, so it names none — and says why it made none.
+        .stdout(predicate::str::contains(
+            "(none)  greedy-worker@0.1.0  (no child)  refused",
+        ))
+        .stdout(predicate::str::contains("capabilities.shell.allow"))
+        // A child the parent never saw end is still named, which is the point of recording the
+        // launch rather than only the ending.
+        .stdout(predicate::str::contains(
+            "dlg_aaaa0002  mute-worker@0.1.0  ses_33333333333343338333000000000009  in flight",
+        ));
+}
+
+/// A capsule that delegated to nobody grows no section, so its output is what it always was.
+#[test]
+fn show_omits_the_delegations_section_when_there_are_none() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "trace-a.jsonl", FIXTURE_A);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Delegations").not())
+        .stdout(predicate::str::contains("Spawned by").not());
+}
+
+/// A delegated child's header names the session that spawned it and the delegation that created
+/// it, out of its own file — `mur trace show` reads no other.
+#[test]
+fn show_names_the_session_that_spawned_a_child() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "child.jsonl", FIXTURE_CHILD);
+
+    mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Spawned by ses_11111111111141118111000000000009 (delegation dlg_aaaa0001)",
+        ));
 }

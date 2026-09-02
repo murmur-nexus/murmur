@@ -27,7 +27,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::delegation::{
-    self, DelegationOutcome, DelegationStatus, Reporter, Spawner, SpawnerHandle, SPAWNER_ENV,
+    self, CompletionAddress, DelegationOutcome, DelegationStatus, Reporter, Spawner, SpawnerHandle,
+    SPAWNER_ENV,
 };
 use crate::errors::RuntimeError;
 use crate::mac_token;
@@ -86,11 +87,14 @@ pub struct ChildLaunchRequest {
     pub child_env_allow: Vec<String>,
     /// Base URL of the daemon the child registers with.
     pub roost_url: String,
-    /// Where this child reports its outcome, or `None` for a launch nobody wants told.
+    /// The session this child belongs to, or `None` for a launch that is not a delegation.
     ///
-    /// `Some` is what turns the launch into a delegation: the launcher mints a delegation id,
-    /// injects a [`SpawnerHandle`] as [`SPAWNER_ENV`], and starts the watcher that reports for a
-    /// child that could not report for itself. `None` injects nothing and starts nothing.
+    /// `Some` is what turns the launch into a delegation: the launcher mints a delegation id and
+    /// injects a [`SpawnerHandle`] as [`SPAWNER_ENV`], which is where the child reads the lineage
+    /// it records in its own `session_start`. The watcher that reports for a child which could
+    /// not report for itself starts only when that spawner also names a
+    /// [`CompletionAddress`] — a parent waiting on its own connection wants no completion.
+    /// `None` injects nothing and starts nothing.
     pub spawner: Option<Spawner>,
 }
 
@@ -382,15 +386,19 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
         format!("http://{url}")
     };
 
-    // Started only for a launch somebody wants told about: a launch with no spawner starts no
-    // watcher.
+    // Started only for a launch somebody wants told about. A lineage-only handle names no
+    // address, so a child whose parent waits on the connection it already holds is launched with
+    // no watcher behind it and posts nothing anywhere.
     if let Some(handle) = handle {
-        watch_for_completion(
-            &launched,
-            handle,
-            &request.capsule_name,
-            &request.capsule_version,
-        );
+        if let Some(address) = handle.report_to.clone() {
+            watch_for_completion(
+                &launched,
+                handle,
+                address,
+                &request.capsule_name,
+                &request.capsule_version,
+            );
+        }
     }
     Ok(launched)
 }
@@ -412,6 +420,7 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 fn watch_for_completion(
     launched: &LaunchedChild,
     handle: SpawnerHandle,
+    address: CompletionAddress,
     capsule_name: &str,
     capsule_version: &str,
 ) {
@@ -436,7 +445,7 @@ fn watch_for_completion(
             if recorded.delivered {
                 return;
             }
-            let retried = delegation::report_completion(&handle, recorded, &workdir);
+            let retried = delegation::report_completion(&handle, &address, recorded, &workdir);
             if !retried.delivered {
                 // One retry, then the file and the line above it are the record.
                 eprintln!(
@@ -492,6 +501,7 @@ fn watch_for_completion(
                 };
                 delegation::report_completion(
                     &handle,
+                    &address,
                     outcome(DelegationStatus::Crashed, detail),
                     &workdir,
                 );
@@ -697,12 +707,30 @@ mod tests {
         }
     }
 
+    /// A handle naming some *other* delegation, for the two cases that prove a child cannot be
+    /// handed this process's own.
+    ///
+    /// Readable rather than nonsense, because `SPAWNER_ENV` is process-wide and every other test
+    /// in this binary shares it: an unreadable value here refuses an unrelated `stage_session`
+    /// running beside it.
+    fn decoy() -> String {
+        SpawnerHandle {
+            session_id: "ses_decoy".to_string(),
+            context_id: "ctx_decoy".to_string(),
+            delegation_id: "dlg_decoy".to_string(),
+            report_to: None,
+        }
+        .to_env_value()
+    }
+
     fn spawner() -> Spawner {
         Spawner {
-            url: "http://127.0.0.1:7000".to_string(),
             session_id: "ses_parent".to_string(),
             context_id: "ctx_parent".to_string(),
-            trust: crate::origin::TrustClass::Trusted,
+            report_to: Some(CompletionAddress {
+                url: "http://127.0.0.1:7000".to_string(),
+                trust: crate::origin::TrustClass::Trusted,
+            }),
         }
     }
 
@@ -738,7 +766,7 @@ mod tests {
     /// environment holds and whatever the child declared.
     #[test]
     fn the_spawner_handle_is_injected_last_and_cannot_be_displaced() {
-        std::env::set_var(SPAWNER_ENV, "decoy");
+        std::env::set_var(SPAWNER_ENV, decoy());
         let handle = SpawnerHandle::for_delegation(&spawner(), "dlg_0001".to_string());
 
         let env = child_environment(&request(&[SPAWNER_ENV], Some(spawner())), Some(&handle));
@@ -758,15 +786,17 @@ mod tests {
             Some(SPAWNER_ENV),
             "the handle is applied in the runtime-owned tail: {env:?}"
         );
+        std::env::remove_var(SPAWNER_ENV);
     }
 
     /// A launch with no spawner injects nothing, even from a decoy the launching process holds.
     #[test]
     fn a_launch_without_a_spawner_injects_no_handle() {
-        std::env::set_var(SPAWNER_ENV, "decoy");
+        std::env::set_var(SPAWNER_ENV, decoy());
 
         let env = child_environment(&request(&[SPAWNER_ENV], None), None);
 
         assert!(!env.iter().any(|(key, _)| key == SPAWNER_ENV), "{env:?}");
+        std::env::remove_var(SPAWNER_ENV);
     }
 }

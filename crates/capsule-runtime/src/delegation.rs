@@ -1,9 +1,16 @@
-//! How a delegated child tells the parent that launched it that it finished.
+//! Which capsule delegated to this one, and how a delegated child says that it finished.
 //!
 //! A child launched by [`crate::child_launch`] knows its spawner from one injected environment
 //! variable, [`SPAWNER_ENV`], and from nothing it inherited: the parent's launcher composes a
 //! [`SpawnerHandle`] and applies it in the runtime-owned tail of the child's environment. A
-//! capsule launched any other way has no handle and contacts nothing.
+//! capsule launched any other way has no handle, records no lineage and contacts nothing.
+//!
+//! **Knowing your parent and reporting to it are separate.** Every handle names the session that
+//! spawned this one and the delegation that created it, which is what the child writes into its
+//! own `session_start`. Only a handle carrying a [`CompletionAddress`] also has somewhere to post
+//! an outcome: a parent that waits on the connection it already holds — every delegation made
+//! through [`crate::delegation_plane`] — supplies none, so its child is attributable without
+//! anything being sent anywhere.
 //!
 //! **The completion names the delegation; it never carries the child's output.** Every field of
 //! [`DelegationOutcome`] is composed by a runtime — ids, a status word, a path, a duration — and
@@ -70,65 +77,80 @@ pub fn new_delegation_id() -> String {
     format!("{DELEGATION_ID_PREFIX}{}", uuid::Uuid::now_v7().simple())
 }
 
-/// Where the parent wants to hear about a delegation, supplied by the parent at launch.
+/// Where a completion is posted and the trust it inherits.
 ///
-/// Carries no delegation id: the id is minted by the launcher, one per launch, so a caller
-/// holding one `Spawner` cannot make two delegations report under one id.
-#[derive(Debug, Clone)]
-pub struct Spawner {
+/// Absent for a delegation whose parent waits on the connection it already holds and therefore
+/// wants no completion. Reporting needs an address; knowing your parent does not, which is why
+/// this is the optional half of a [`Spawner`] and the lineage is the unconditional half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionAddress {
     /// The parent's own A2A endpoint, `http://host:port`.
     pub url: String,
-    /// The parent's session id. A completion addressed to any other session is refused at the
-    /// door rather than delivered to whoever answers the address now.
-    pub session_id: String,
-    /// The conversation the delegation was made from. The completion task runs under this id, so
-    /// the outcome joins the thread that asked for it.
-    pub context_id: String,
     /// The trust class of the parent task that made the delegation. Inherited by the completion
     /// through [`stamp_for_completion`] and decided nowhere else.
     pub trust: TrustClass,
 }
 
+/// The parent a delegated child belongs to, supplied by the parent at launch.
+///
+/// Carries no delegation id: the id is minted by the launcher, one per launch, so a caller
+/// holding one `Spawner` cannot make two delegations report under one id.
+#[derive(Debug, Clone)]
+pub struct Spawner {
+    /// The parent's session id. A completion addressed to any other session is refused at the
+    /// door rather than delivered to whoever answers the address now, and it is the value the
+    /// child writes to its own `session_start.spawned_by`.
+    pub session_id: String,
+    /// The conversation the delegation was made from. The completion task runs under this id, so
+    /// the outcome joins the thread that asked for it.
+    pub context_id: String,
+    /// Where this delegation's completion goes, or `None` for a parent that wants none.
+    pub report_to: Option<CompletionAddress>,
+}
+
 /// The value injected into the child: a [`Spawner`] plus the delegation id the launcher minted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnerHandle {
-    pub url: String,
     pub session_id: String,
     pub context_id: String,
-    pub trust: TrustClass,
     pub delegation_id: String,
+    pub report_to: Option<CompletionAddress>,
 }
 
 impl SpawnerHandle {
     /// The handle for one launch of `spawner`'s child.
     pub fn for_delegation(spawner: &Spawner, delegation_id: String) -> Self {
         Self {
-            url: spawner.url.clone(),
             session_id: spawner.session_id.clone(),
             context_id: spawner.context_id.clone(),
-            trust: spawner.trust,
             delegation_id,
+            report_to: spawner.report_to.clone(),
         }
     }
 
     /// The compact JSON written into [`SPAWNER_ENV`].
+    ///
+    /// `url` and `trust` appear together or not at all: a lineage-only handle carries the three
+    /// keys that name the relationship and nothing that could be read as an address.
     pub fn to_env_value(&self) -> String {
-        serde_json::json!({
-            "url": self.url,
+        let mut value = serde_json::json!({
             "session_id": self.session_id,
             "context_id": self.context_id,
-            "trust": self.trust.as_str(),
             "delegation_id": self.delegation_id,
-        })
-        .to_string()
+        });
+        if let Some(address) = &self.report_to {
+            value["url"] = Value::String(address.url.clone());
+            value["trust"] = Value::String(address.trust.as_str().to_string());
+        }
+        value.to_string()
     }
 
     /// This process's own handle, read from [`SPAWNER_ENV`].
     ///
     /// `Ok(None)` for a capsule nobody delegated — the variable absent, or blank. A variable that
     /// is set to something else is an error and not an absence: a child that cannot read its
-    /// spawner cannot report to it, and running it anyway would produce work whose outcome
-    /// reaches nobody.
+    /// spawner cannot record which session spawned it or report to it, and running it anyway
+    /// would produce work whose provenance and outcome reach nobody.
     pub fn from_env() -> Result<Option<Self>, RuntimeError> {
         let Some(raw) = std::env::var_os(SPAWNER_ENV) else {
             return Ok(None);
@@ -153,18 +175,39 @@ impl SpawnerHandle {
                 .map(str::to_string)
                 .ok_or_else(|| unreadable(format!("it carries no '{name}'")))
         };
-        let trust_value = field("trust")?;
-        // The one place in this module that names a trust class: every other use passes the
-        // parsed value through `stamp_for_completion`, so the completion's class is derived
-        // once, from the delegating task, and never decided here.
-        let trust = TrustClass::parse(&trust_value)
-            .ok_or_else(|| unreadable(format!("'{trust_value}' is not a trust class")))?;
+        // Half an address is not a lineage-only handle with a stray key: it is a handle whose
+        // author meant a completion to arrive somewhere and did not say where, or under what
+        // trust, and delivering one on a guess is the thing this refuses to do.
+        let report_to =
+            match (parsed.get("url").is_some(), parsed.get("trust").is_some()) {
+                (false, false) => None,
+                (true, true) => {
+                    let trust_value = field("trust")?;
+                    // The one place in this module that names a trust class: every other use passes
+                    // the parsed value through `stamp_for_completion`, so the completion's class is
+                    // derived once, from the delegating task, and never decided here.
+                    let trust = TrustClass::parse(&trust_value).ok_or_else(|| {
+                        unreadable(format!("'{trust_value}' is not a trust class"))
+                    })?;
+                    Some(CompletionAddress {
+                        url: field("url")?,
+                        trust,
+                    })
+                }
+                (true, false) => return Err(unreadable(
+                    "it carries a 'url' with no 'trust'; a completion address is both or neither"
+                        .to_string(),
+                )),
+                (false, true) => return Err(unreadable(
+                    "it carries a 'trust' with no 'url'; a completion address is both or neither"
+                        .to_string(),
+                )),
+            };
         Ok(Self {
-            url: field("url")?,
             session_id: field("session_id")?,
             context_id: field("context_id")?,
-            trust,
             delegation_id: field("delegation_id")?,
+            report_to,
         })
     }
 }
@@ -335,9 +378,10 @@ pub fn write_completion(workdir: &Path, outcome: &DelegationOutcome) -> Result<(
 /// launcher's is a watcher thread.
 pub fn deliver_completion(
     handle: &SpawnerHandle,
+    address: &CompletionAddress,
     outcome: &DelegationOutcome,
 ) -> Result<(), String> {
-    let stamped = stamp_for_completion(Some(handle.trust));
+    let stamped = stamp_for_completion(Some(address.trust));
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": format!("req_{}", uuid::Uuid::now_v7().simple()),
@@ -355,7 +399,7 @@ pub fn deliver_completion(
 
     let response = http_json(
         "POST",
-        &handle.url,
+        &address.url,
         Some(&body),
         &[
             (PEER_ORIGIN_HEADER, stamped.origin().as_str()),
@@ -388,8 +432,13 @@ pub fn deliver_completion(
 ///
 /// The file is written before the post and rewritten after it, so a reporter that dies mid-post
 /// still leaves the outcome on disk. The returned outcome is the one that was written last.
+///
+/// `address` is separate from `handle` because a handle need not carry one: a caller reaches this
+/// only by having matched on [`SpawnerHandle::report_to`], so a lineage-only delegation cannot
+/// take this path by accident.
 pub fn report_completion(
     handle: &SpawnerHandle,
+    address: &CompletionAddress,
     outcome: DelegationOutcome,
     workdir: &Path,
 ) -> DelegationOutcome {
@@ -403,7 +452,7 @@ pub fn report_completion(
         );
     }
 
-    match deliver_completion(handle, &outcome) {
+    match deliver_completion(handle, address, &outcome) {
         Ok(()) => outcome.delivered = true,
         Err(reason) => {
             // The record, and the operator's only other sign that a result went nowhere. Not a
@@ -412,7 +461,7 @@ pub fn report_completion(
             eprintln!(
                 "[capsule-runtime] delegation {}: the completion could not be delivered to {}: {reason}; recorded in {}",
                 outcome.delegation_id,
-                handle.url,
+                address.url,
                 completion_path(workdir).display(),
             );
             outcome.delivery_error = Some(reason);
@@ -450,11 +499,17 @@ mod tests {
 
     fn handle() -> SpawnerHandle {
         SpawnerHandle {
-            url: "http://127.0.0.1:7777".to_string(),
             session_id: "ses_parent".to_string(),
             context_id: "ctx_parent".to_string(),
-            trust: TrustClass::Untrusted,
             delegation_id: "dlg_0001".to_string(),
+            report_to: Some(address()),
+        }
+    }
+
+    fn address() -> CompletionAddress {
+        CompletionAddress {
+            url: "http://127.0.0.1:7777".to_string(),
+            trust: TrustClass::Untrusted,
         }
     }
 
@@ -479,10 +534,29 @@ mod tests {
     fn a_handle_round_trips_through_its_env_value() {
         for trust in [TrustClass::Trusted, TrustClass::Untrusted] {
             let mut original = handle();
-            original.trust = trust;
+            original.report_to = Some(CompletionAddress {
+                url: address().url,
+                trust,
+            });
             let parsed = SpawnerHandle::parse(&original.to_env_value()).expect("a written handle");
             assert_eq!(parsed, original);
         }
+    }
+
+    /// A child that is told who spawned it and nothing about where to report carries the lineage
+    /// and no address at all — not an empty one.
+    #[test]
+    fn a_lineage_only_handle_carries_no_address() {
+        let mut original = handle();
+        original.report_to = None;
+        let written = original.to_env_value();
+        assert!(!written.contains("url"), "{written}");
+        assert!(!written.contains("trust"), "{written}");
+
+        let parsed = SpawnerHandle::parse(&written).expect("a written handle");
+        assert_eq!(parsed, original);
+        assert_eq!(parsed.session_id, "ses_parent");
+        assert_eq!(parsed.delegation_id, "dlg_0001");
     }
 
     #[test]
@@ -496,6 +570,11 @@ mod tests {
             .to_string(),
             serde_json::json!({"url": "http://x", "session_id": "s", "context_id": "c",
                                "trust": "maybe", "delegation_id": "dlg_1"})
+            .to_string(),
+            // Half a completion address: the author meant an outcome to arrive somewhere and did
+            // not say where, or under what trust.
+            serde_json::json!({"session_id": "s", "context_id": "c", "delegation_id": "dlg_1",
+                               "trust": "trusted"})
             .to_string(),
         ];
         for value in refused {
@@ -602,10 +681,12 @@ mod tests {
     fn an_undeliverable_completion_is_recorded_with_its_reason() {
         let dir = tempfile::tempdir().unwrap();
         // Port 1 is reserved and nothing listens there.
-        let mut nowhere = handle();
-        nowhere.url = "http://127.0.0.1:1".to_string();
+        let nowhere = CompletionAddress {
+            url: "http://127.0.0.1:1".to_string(),
+            trust: TrustClass::Untrusted,
+        };
 
-        let reported = report_completion(&nowhere, outcome(), dir.path());
+        let reported = report_completion(&handle(), &nowhere, outcome(), dir.path());
         assert!(!reported.delivered);
         let reason = reported.delivery_error.expect("the refusal is recorded");
         assert!(reason.contains("failed to connect"), "{reason}");
