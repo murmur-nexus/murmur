@@ -35,12 +35,6 @@ pub struct WitContracts {
 }
 
 impl WitContracts {
-    /// Are both directions empty?
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.exports.is_empty() && self.imports.is_empty()
-    }
-
     /// Every recorded interface name across both directions, exports first.
     pub fn all(&self) -> impl Iterator<Item = &str> {
         self.exports
@@ -193,14 +187,20 @@ mod tests {
           (func $run (result u32) (canon lift (core func $i "run")))
           (component $inner
             (core module $n (func (export "nested")))
+            (core instance $ni (instantiate $n))
+            (func $nested (canon lift (core func $ni "nested")))
+            (instance $niface (export "nested" (func $nested)))
+            (export "murmur:nested/inner@9.9.9" (instance $niface))
           )
           (instance $iface (export "handle" (func $run)))
           (export "murmur:hook/lifecycle@0.5.0" (instance $iface))
         )
     "#;
 
+    /// The nested component in the fixture exports an interface of its own, which belongs to
+    /// the composition rather than to what the host resolves on the artifact.
     #[test]
-    fn records_exported_interface_names() {
+    fn records_the_outermost_components_exports_only() {
         let contracts = extract_wit_contracts(&component(EXPORTING_COMPONENT))
             .unwrap()
             .unwrap();
@@ -240,7 +240,8 @@ mod tests {
             )
         "#;
         let contracts = extract_wit_contracts(&component(wat)).unwrap().unwrap();
-        assert!(contracts.is_empty());
+        assert!(contracts.exports.is_empty());
+        assert!(contracts.imports.is_empty());
     }
 
     #[test]
