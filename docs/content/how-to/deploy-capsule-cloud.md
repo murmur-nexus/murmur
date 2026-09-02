@@ -89,17 +89,17 @@ Initial state (everything pending):
 
 ```text
   · ↓ 3 artifacts  2↓  1 cached
-      · ↓ murmur-driver-anthropic@0.4.1
-      · ↓ murmur-hook-compact@0.3.1
-      · ↓ murmur-tool-editor@0.4.4
+      · ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+      · ↓ murmur-hook-compact@{{ v.murmur_hook_compact }}
+      · ↓ murmur-tool-editor@{{ v.murmur_tool_editor }}
   · mur vX.Y.Z
   · SSH
   · ↑ mur binary
   · ↑ files
   · ↑ 3 artifacts
-      · ↑ murmur-driver-anthropic@0.4.1
-      · ↑ murmur-hook-compact@0.3.1
-      · ↑ murmur-tool-editor@0.4.4
+      · ↑ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+      · ↑ murmur-hook-compact@{{ v.murmur_hook_compact }}
+      · ↑ murmur-tool-editor@{{ v.murmur_tool_editor }}
   · start capsule
 ```
 
@@ -107,9 +107,9 @@ During downloads (parallel, bytes / total bar per artifact being fetched):
 
 ```text
   ⠸ ↓ 3 artifacts
-      ✓ ↓ murmur-driver-anthropic@0.4.1  cached
-      ⠸ ↓ murmur-hook-compact@0.3.1  2/2 MB  [████████████]
-      ⠸ ↓ murmur-tool-editor@0.4.4   7/14 MB [██████░░░░░░]
+      ✓ ↓ murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}  cached
+      ⠸ ↓ murmur-hook-compact@{{ v.murmur_hook_compact }}  2/2 MB  [████████████]
+      ⠸ ↓ murmur-tool-editor@{{ v.murmur_tool_editor }}   7/14 MB [██████░░░░░░]
   · mur vX.Y.Z
   ...
 ```

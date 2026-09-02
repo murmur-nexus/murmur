@@ -23,14 +23,15 @@ The relevant manifest options are:
 ## Step 1 — install the generator artifacts
 
 `mur new` uses two artifacts to run its internal generator capsule. Both must be present in
-`~/.murmur/artifacts/` before the first run.
+`~/.murmur/artifacts/` before the first run. A bare artifact name resolves to the latest published
+release — see [Reference forms](../reference/installing-artifacts.md#reference-forms).
 
 Install the inference driver for your provider:
 
 === "Anthropic"
 
     ```bash
-    mur install murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}
+    mur install murmur-driver-anthropic
     ```
 
     --8<-- "includes/mur-pull-info.md"
@@ -38,7 +39,7 @@ Install the inference driver for your provider:
 === "OpenAI"
 
     ```bash
-    mur install murmur-driver-openai@{{ v.murmur_driver_openai }}
+    mur install murmur-driver-openai
     ```
 
     --8<-- "includes/mur-pull-info.md"
@@ -46,7 +47,7 @@ Install the inference driver for your provider:
 === "DeepSeek"
 
     ```bash
-    mur install murmur-driver-deepseek@{{ v.murmur_driver_deepseek }}
+    mur install murmur-driver-deepseek
     ```
 
     --8<-- "includes/mur-pull-info.md"
@@ -54,7 +55,7 @@ Install the inference driver for your provider:
 Install `murmur-tool-registry-search`:
 
 ```bash
-mur install murmur-tool-registry-search@{{ v.murmur_tool_registry_search }}
+mur install murmur-tool-registry-search
 ```
 
 --8<-- "includes/mur-pull-info.md"

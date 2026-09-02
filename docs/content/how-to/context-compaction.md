@@ -128,10 +128,12 @@ mur install
 
 --8<-- "includes/mur-pull-info.md"
 
-To install the compaction artifact directly without going through the manifest:
+The bare name installs the compaction artifact directly, without going through the manifest, and
+resolves to the latest published release — see
+[Reference forms](../reference/installing-artifacts.md#reference-forms):
 
 ```bash
-mur install murmur-hook-compact@{{ v.murmur_hook_compact }}
+mur install murmur-hook-compact
 ```
 
 Compaction is not built into the Murmur runtime — it is externalized as an artifact by design. Everything in Murmur is composable, including something as fundamental as how context is condensed. `murmur-hook-compact` is the default implementation: it summarizes the message history using the configured model and replaces it with a compact representation. But compaction strategy is not one-size-fits-all. A coding agent might benefit from keeping the full tool call history and compacting only prose; a research agent might maintain a structured memory store rather than a rolling summary. You can build any of these as a hook artifact, package it once, and swap it in by changing a single line in the manifest. The runtime does not care which artifact provides compaction — only that one is declared with `runtime: hook` and responds to the compaction lifecycle event.

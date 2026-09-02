@@ -84,6 +84,10 @@ hooks:
   # Adds the markdown-twin <link rel="alternate"> and the WebMCP bundle to
   # every page head.
   - hooks/agent_head.py
+  # Fails the build when a version the site prints disagrees with what
+  # default-artifacts publishes. Active only when MURMUR_DEFAULT_ARTIFACTS_DIR
+  # names a checkout.
+  - hooks/artifact_versions.py
 
 extra:
   v:
@@ -96,20 +100,20 @@ extra:
     max_tokens_anthropic: 1000000
     max_tokens_openai: 200000
     max_tokens_deepseek: 1000000
-    murmur_driver_anthropic: "1.0.0"
-    murmur_driver_openai: "1.0.0"
-    murmur_driver_deepseek: "1.0.0"
-    murmur_hook_compact: "1.0.0"
-    murmur_hook_eval: "1.0.0"
-    murmur_hook_grafana: "1.0.0"
-    murmur_hook_debug: "1.0.0"
-    murmur_hook_memory: "1.0.0"
-    murmur_tool_git: "1.0.0"
-    murmur_tool_editor: "1.0.0"
-    murmur_tool_request_input: "1.0.0"
-    murmur_tool_registry_search: "1.0.0"
-    murmur_tool_corpus: "1.0.0"
-    murmur_skill_create_manifest: "1.0.0"
+    murmur_driver_anthropic: "0.4.0"
+    murmur_driver_openai: "0.2.0"
+    murmur_driver_deepseek: "0.2.0"
+    murmur_hook_compact: "0.7.0"
+    murmur_hook_eval: "0.7.0"
+    murmur_hook_grafana: "0.7.0"
+    murmur_hook_debug: "0.6.0"
+    murmur_hook_memory: "0.7.0"
+    murmur_tool_git: "0.1.0"
+    murmur_tool_editor: "0.2.0"
+    murmur_tool_request_input: "0.1.0"
+    murmur_tool_registry_search: "0.1.0"
+    murmur_tool_corpus: "0.2.0"
+    murmur_skill_create_manifest: "0.1.0"
 
 markdown_extensions:
   - admonition

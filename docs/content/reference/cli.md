@@ -334,7 +334,7 @@ mur run
 Example — install a specific artifact:
 
 ```bash
-mur install murmur-tool-git@1.0.0
+mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 Behavior:
@@ -405,8 +405,8 @@ There is no hardcoded artifact list: the checklist is derived entirely from `mur
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✓  murmur-driver-anthropic@1.0.0    darwin-aarch64
-  ✓  murmur-tool-git@1.0.0            darwin-aarch64
+  ✓  murmur-driver-anthropic@{{ v.murmur_driver_anthropic }}    darwin-aarch64
+  ✓  murmur-tool-git@{{ v.murmur_tool_git }}            darwin-aarch64
 
 All checks passed.
 ```
@@ -415,11 +415,11 @@ All checks passed.
 
 ```text
 Checking /path/to/murmur.yaml for darwin-aarch64...
-  ✗  murmur-tool-git@1.0.0   darwin-aarch64   — missing
+  ✗  murmur-tool-git@{{ v.murmur_tool_git }}   darwin-aarch64   — missing
 
 0 checks passed, 1 error found.
 
-Fix: mur install murmur-tool-git@1.0.0
+Fix: mur install murmur-tool-git@{{ v.murmur_tool_git }}
 ```
 
 ### Lock integrity
