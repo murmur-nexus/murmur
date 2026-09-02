@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::wit_contract::{wit_contracts_from_artifact_bytes, WitContracts};
+
 pub type Platform = (String, String);
 
 pub const RESERVED_VERSIONS: [&str; 3] = ["latest", "stable", "edge"];
@@ -69,6 +71,11 @@ pub struct ArtifactMeta {
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The versioned WIT interfaces the packed component declares, derived from the artifact
+    /// bytes by [`LocalRegistry`] on every write. Absent when the artifact carries no readable
+    /// component — a native binary, a skill, a core module, or a payload that does not parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wit_contracts: Option<WitContracts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +216,12 @@ impl LocalRegistry {
                 version: meta.version.clone(),
             });
         }
+
+        // The contracts describe these exact bytes, so they are read from them rather than
+        // taken from the caller: a hand-authored value cannot survive a store and so cannot
+        // drift from the artifact it describes.
+        let mut meta = meta.clone();
+        meta.wit_contracts = wit_contracts_from_artifact_bytes(bytes);
 
         let seed = unique_seed();
         let artifact_tmp = temp_path(&artifact_path, "zip", seed);
@@ -639,6 +652,7 @@ fn fallback_meta(name: &str, version: &str) -> ArtifactMeta {
         platforms: Vec::new(),
         description: None,
         tags: Vec::new(),
+        wit_contracts: None,
     }
 }
 
@@ -801,6 +815,7 @@ mod tests {
             platforms: Vec::new(),
             description: Some("demo".to_string()),
             tags: vec!["test".to_string()],
+            wit_contracts: None,
         }
     }
 
@@ -979,6 +994,7 @@ mod tests {
             platforms: Vec::new(),
             description: None,
             tags: Vec::new(),
+            wit_contracts: None,
         };
         registry.publish(meta, b"skill-zip-bytes").unwrap();
 
@@ -986,5 +1002,157 @@ mod tests {
         assert_eq!(index.len(), 1);
         assert_eq!(index[0].runtime, RuntimeType::Static);
         assert_eq!(index[0].runtime.as_str(), "static");
+    }
+
+    // ── wit_contracts ─────────────────────────────────────────────────────────
+
+    fn zip_with(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+        use zip::{write::SimpleFileOptions, ZipWriter};
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            for (name, bytes) in files {
+                zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    fn tool_component() -> Vec<u8> {
+        wat::parse_str(
+            r#"
+            (component
+              (import "murmur:tool-registry/invoke@0.1.0" (instance))
+              (core module $m (func (export "run")))
+              (core instance $i (instantiate $m))
+              (func $run (canon lift (core func $i "run")))
+              (instance $iface (export "run" (func $run)))
+              (export "murmur:tool/run@0.1.0" (instance $iface))
+            )
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publish_records_the_contracts_the_component_declares() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = zip_with(&[("tool.wasm", &tool_component())]);
+
+        registry.publish(test_meta("ct", "0.1.0"), &bytes).unwrap();
+
+        let contracts = registry
+            .resolve("ct", "0.1.0")
+            .unwrap()
+            .meta
+            .wit_contracts
+            .unwrap();
+        assert_eq!(contracts.exports, vec!["murmur:tool/run@0.1.0"]);
+        assert_eq!(contracts.imports, vec!["murmur:tool-registry/invoke@0.1.0"]);
+    }
+
+    #[test]
+    fn publish_replaces_a_caller_supplied_value_with_the_extracted_one() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let mut meta = test_meta("ct", "0.1.0");
+        meta.wit_contracts = Some(WitContracts {
+            exports: vec!["murmur:hook/lifecycle@9.9.9".to_string()],
+            imports: vec!["murmur:nothing/at-all@9.9.9".to_string()],
+        });
+
+        registry
+            .publish(meta, &zip_with(&[("tool.wasm", &tool_component())]))
+            .unwrap();
+
+        let contracts = registry
+            .resolve("ct", "0.1.0")
+            .unwrap()
+            .meta
+            .wit_contracts
+            .unwrap();
+        assert_eq!(contracts.exports, vec!["murmur:tool/run@0.1.0"]);
+        assert_eq!(contracts.imports, vec!["murmur:tool-registry/invoke@0.1.0"]);
+    }
+
+    #[test]
+    fn a_fabricated_value_does_not_survive_a_payload_with_no_component() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let mut meta = test_meta("skill", "0.1.0");
+        meta.wit_contracts = Some(WitContracts {
+            exports: vec!["murmur:hook/lifecycle@9.9.9".to_string()],
+            imports: Vec::new(),
+        });
+
+        registry
+            .publish(meta, &zip_with(&[("skill.md", b"# guidance")]))
+            .unwrap();
+
+        assert!(registry
+            .resolve("skill", "0.1.0")
+            .unwrap()
+            .meta
+            .wit_contracts
+            .is_none());
+    }
+
+    #[test]
+    fn payloads_with_nothing_to_extract_omit_the_key_entirely() {
+        let module = wat::parse_str(r#"(module (func (export "f")))"#).unwrap();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("skill", zip_with(&[("skill.md", b"# guidance")])),
+            ("native", zip_with(&[("bin/native", b"\x7fELF")])),
+            ("stub", zip_with(&[("tool.wasm", b"\0asm")])),
+            ("module", zip_with(&[("tool.wasm", &module)])),
+            (
+                "ambiguous",
+                zip_with(&[("a.wasm", b"\0asm"), ("b.wasm", b"\0asm")]),
+            ),
+            ("not-a-zip", b"fake-artifact-bytes".to_vec()),
+        ];
+
+        for (name, bytes) in cases {
+            let dir = tempdir().unwrap();
+            let registry = LocalRegistry::new(dir.path());
+            registry.publish(test_meta(name, "0.1.0"), &bytes).unwrap();
+
+            let raw = fs::read_to_string(registry.metadata_path_for(name, "0.1.0")).unwrap();
+            assert!(
+                !raw.contains("wit_contracts"),
+                "{name}: metadata carries a wit_contracts key: {raw}"
+            );
+            assert!(registry
+                .resolve(name, "0.1.0")
+                .unwrap()
+                .meta
+                .wit_contracts
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_written_before_the_field_existed_still_loads() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        registry
+            .publish(test_meta("old", "0.1.0"), b"bytes")
+            .unwrap();
+
+        let path = registry.metadata_path_for("old", "0.1.0");
+        fs::write(
+            &path,
+            r#"{"meta":{"name":"old","version":"0.1.0","runtime":"wasm","artifact_runtime":"tool","platforms":[],"description":null,"tags":[]}}"#,
+        )
+        .unwrap();
+
+        let index = registry.list_index().unwrap();
+        assert_eq!(index.len(), 1);
+        assert!(index[0].wit_contracts.is_none());
     }
 }

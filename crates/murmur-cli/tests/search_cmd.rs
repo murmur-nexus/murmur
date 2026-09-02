@@ -40,6 +40,7 @@ fn publish_local(home: &TempDir, name: &str) {
         platforms: vec![("darwin".to_string(), "aarch64".to_string())],
         description: None,
         tags: vec![],
+        wit_contracts: None,
     };
     reg.publish(meta, b"fake").unwrap();
 }

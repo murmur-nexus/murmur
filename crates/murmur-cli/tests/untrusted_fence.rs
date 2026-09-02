@@ -99,6 +99,7 @@ fn publish_native_tool(home: &TempDir, artifact_dir: &Path, binary: &Path) {
                 platforms: Vec::new(),
                 description: None,
                 tags: Vec::new(),
+                wit_contracts: None,
             },
             &fs::read(&artifact_path).unwrap(),
         )

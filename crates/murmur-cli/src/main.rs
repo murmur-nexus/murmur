@@ -75,6 +75,10 @@ enum Commands {
         /// Show artifacts from both the project store and the global store, with a SCOPE column
         #[arg(long, conflicts_with = "global")]
         all: bool,
+        /// Show only artifacts declaring a WIT interface whose name starts with this prefix,
+        /// with a CONTRACTS column naming the matches (e.g. `murmur:hook`)
+        #[arg(long, value_name = "PREFIX")]
+        contract: Option<String>,
     },
     #[cfg(feature = "beta-mur-new")]
     /// Generate a murmur.yaml from a plain-language task description
@@ -430,7 +434,11 @@ fn main() {
             }
             run_new(&task, registry.as_deref())
         }
-        Commands::List { global, all } => run_list(global, all),
+        Commands::List {
+            global,
+            all,
+            contract,
+        } => run_list(global, all, contract.as_deref()),
         Commands::Search {
             query,
             registry,

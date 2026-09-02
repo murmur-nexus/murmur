@@ -88,7 +88,9 @@ Under either root, an artifact occupies `<name>/<version>/`:
 |---|---|
 | `<name>-<version>.mur.zip` | The artifact |
 | `<name>-<version>.sha256` | Its SHA-256 |
-| `<name>-<version>.meta.json` | Its name, version, runtime, description and tags |
+| `<name>-<version>.meta.json` | Its name, version, runtime, description, tags and WIT contracts |
+
+The `wit_contracts` key of `<name>-<version>.meta.json` records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
 
 `mur install --all-platforms <name>@<version>` writes `<name>-<version>-<platform>.mur.zip` and `<name>-<version>-<platform>.sha256` into the global store instead, one pair per platform.
 

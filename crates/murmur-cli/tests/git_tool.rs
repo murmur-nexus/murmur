@@ -123,6 +123,7 @@ fn publish_fixture_tool(home: &TempDir, artifact_path: &Path) {
         platforms: Vec::new(),
         description: None,
         tags: Vec::new(),
+        wit_contracts: None,
     };
     registry.publish(meta, &bytes).unwrap();
 }

@@ -42,6 +42,7 @@ fn artifact_meta(
             .collect(),
         description: None,
         tags: vec![],
+        wit_contracts: None,
     }
 }
 
