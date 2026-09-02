@@ -136,8 +136,9 @@ pub use retention::{
     RemovedRecord, TruncationMarker, TruncationOutcome,
 };
 pub use runtime::{
-    launch_session, stage_session, warn_on_interpreter_runtime_grants,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec,
+    check_no_reserved_tool_names, launch_session, stage_session,
+    warn_on_interpreter_runtime_grants, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec,
 };
 pub use spawn_credential::{
     SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
