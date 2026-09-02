@@ -67,6 +67,7 @@ section that explains it.
 | `E-RUN-018` | `--resume-mode compact` with no hook bound to `on-compaction` | [E-RUN-018](#e-run-018) |
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
 | `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle | [E-RUN-020](#e-run-020) |
+| `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -272,6 +273,38 @@ capsule's address and session.
 
 An unset or blank `MURMUR_SPAWNER` is not this error: it is the ordinary case of a capsule nobody
 delegated, which reports to nobody and runs exactly as it would have.
+
+### E-RUN-021 — the native binary is built for another platform { #e-run-021 }
+
+A native tool artifact carries a host executable at `bin/<name>`. Staging compares the platform
+that binary was built for against this host's, before any of the session's native binaries is
+written to the workdir:
+
+```text
+error[E-RUN-021]: native tool 'murmur-tool-git' cannot run on this host: its binary is built for darwin-aarch64, this host is linux-x86_64
+  hint: the installed artifact holds a binary for another platform — reinstall it on this host with `mur install <name>@<version>`, or publish a build for this host's platform
+```
+
+The check reads the binary's header and recognises these formats:
+
+| Format | Identified from | Platforms |
+|---|---|---|
+| ELF64 | `e_machine` | `linux-x86_64`, `linux-aarch64` |
+| Mach-O 64-bit | `cputype` | `darwin-x86_64`, `darwin-aarch64` |
+| Fat Mach-O | `0xCAFEBABE` magic | any `darwin-*` host |
+
+Architecture is compared as strictly as operating system: an `x86_64` ELF on an `aarch64` Linux
+host is refused on the same terms as a Mach-O on Linux.
+
+Refusal requires a positive identification of both sides. A payload in a format the check does not
+recognise — a shell script, a WASM module, a 32-bit image — stages and runs, and so does any
+payload on a host outside the four platform targets.
+
+When a capsule declares several native tools, one unrunnable binary refuses all of them: a refused
+session leaves no tool binaries in its workdir.
+
+[`mur doctor`](cli.md#mur-doctor) reads the same header of the same installed bytes and fails that
+artifact's line, so the mismatch is reportable without launching a session.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

@@ -481,6 +481,26 @@ pub enum RuntimeError {
     )]
     SpawnerHandleUnreadable { reason: String },
 
+    /// A native tool's `bin/<name>` payload was built for another operating system or CPU
+    /// architecture than this host.
+    ///
+    /// Raised before any byte of any native binary in the same staging batch reaches the session
+    /// workdir: an image this host cannot exec would otherwise be written, made executable, and
+    /// then die on a raw `Exec format error` mid-run, at a point where nothing left says which
+    /// artifact was wrong.
+    ///
+    /// Both platforms are `current_platform()`-shaped strings, or the bare `darwin` a fat Mach-O
+    /// identifies as.
+    #[error(
+        "native tool '{name}' cannot run on this host: its binary is built for \
+         {binary_platform}, this host is {host_platform}"
+    )]
+    NativeBinaryPlatformMismatch {
+        name: String,
+        binary_platform: String,
+        host_platform: String,
+    },
+
     #[error("runtime failure: {0}")]
     Runtime(String),
 }
