@@ -247,6 +247,10 @@ Containment
 Effective grants
   filesystem scope: <none>
   workdir exec:     false
+  preopens:
+    - murmur-tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
+    - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
+    - murmur-hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
   network allow:
     - https://api.anthropic.com
   unix sockets:     false
@@ -258,6 +262,8 @@ Effective grants
 ```
 
 The report shows *declared* network destinations, not resolved IP addresses — it deliberately skips DNS to stay fast and read-only.
+
+`preopens:` lists one line per tool, driver and hook: which directory that artifact works out of once its own `capabilities.filesystem.scope` is applied. A tool or driver that declares no scope gets the whole accessible workdir; a hook that declares none gets no directory at all. See [The filesystem default](../concepts/access-control.md#filesystem-default) for why the two roles start from opposite baselines and when to narrow one.
 
 `userns grant:` names where this host's permission to create an unprivileged user namespace comes
 from, and is `n/a` off Linux. See

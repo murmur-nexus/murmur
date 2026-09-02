@@ -36,6 +36,41 @@ read only from the capsule operator's entry, never from the tool's own bundled m
 artifact named by `inference.driver.artifact` narrows the same way. See [Tool and driver
 capabilities](../reference/manifest.md#tool-capabilities) for the full rules.
 
+### The filesystem default { #filesystem-default }
+
+What an artifact can read and write when its entry declares no `capabilities.filesystem.scope`
+depends on its role:
+
+| Entry | No `filesystem.scope` declared | `filesystem.scope: cache` |
+|---|---|---|
+| `runtime: tool` | The whole accessible session workdir, read-write | `<workdir>/cache` and nothing above it |
+| `runtime: driver` | The whole accessible session workdir, read-write | `<workdir>/cache` and nothing above it |
+| `runtime: hook` | No directory of any kind | `<workdir>/cache` and nothing above it |
+
+The wide default for tools and drivers is chosen against prompt injection steering an honest
+artifact — the model reads attacker-controlled text and calls a tool with attacker-chosen
+arguments. The mechanisms against that are the [containment
+class](../reference/containment.md), `capabilities.network.allow`, the [untrusted
+fence](#threat-model), and a per-artifact `filesystem.scope` on the entries where a narrower
+working directory is known.
+
+It is not chosen against a hostile artifact. Malicious artifact code sits outside the threat model
+above: there is no artifact trust model and no signing, so nothing establishes that an artifact's
+code is what its publisher intended. Hash-pinning through `murmur.lock` establishes that an
+artifact has not changed since it was locked, and nothing about whether it was safe when it was
+locked. An artifact you have not read is one you are trusting with the workdir it runs in.
+
+The capsule-wide `capabilities.filesystem.scope` does not narrow any of this. The per-artifact
+`filesystem.scope` on the entry is what decides an artifact's directory, and it is the only thing
+that does.
+
+To read what a capsule resolves to before launching it, use the `preopens:` list in [`mur run
+--explain-scope`](../how-to/different-ways-to-run-murmur.md#step-5-inspect-the-capsules-reach-before-launching-it)
+or in [`mur doctor`](../reference/cli.md#mur-doctor). Every artifact appears with its role, its
+declared scope, and one of three surfaces: `whole-workdir`, `scoped-subtree` or `nothing`. The same
+list is recorded on each session as `effective_grants.preopens` in
+[`trace.jsonl`](../reference/observability-schemas.md#session-trace-tracejsonl).
+
 ## Hook capabilities { #hook-capabilities }
 
 A hook runs default-deny, and only the capsule operator can widen it. A hook artifact's own

@@ -12,7 +12,7 @@ The relevant manifest options are:
 | Option | Controls |
 |---|---|
 | [capabilities.network.allow](../reference/manifest.md#field-capabilities) | The capsule-wide network ceiling every artifact clamps to |
-| [capabilities.filesystem.scope](../reference/manifest.md#field-capabilities) | The capsule-wide filesystem scope every artifact clamps to |
+| [capabilities.filesystem.scope](../reference/manifest.md#field-capabilities) | The capsule-wide filesystem scope declaration |
 | [capabilities.shell.allow](../reference/manifest.md#field-capabilities) | Which binaries the agent may invoke as shell tools |
 | [capabilities.shell.strip_env](../reference/manifest.md#field-capabilities) | Glob patterns for host env vars to remove from the subprocess environment |
 | [capabilities.shell.baseline_env](../reference/manifest.md#field-capabilities) | Additional host env vars to expose beyond the default baseline |
@@ -144,7 +144,9 @@ capabilities:
       - bash
 ```
 
-`filesystem.scope` is a path relative to the session workdir — here `<workdir>/repo`, created on demand. This is the boundary every artifact in the capsule inherits and the subtree the coding agent checks the repository out into.
+`filesystem.scope` is a path relative to the session workdir — here `<workdir>/repo`, created on demand, and the subtree the coding agent checks the repository out into.
+
+WASM tools, drivers and hooks do not inherit it. Each of those works out of the directory its own entry's `capabilities.filesystem.scope` names — Step 4 declares them — and a tool or driver entry that names none works out of the whole accessible workdir. Read what each one resolves to with `mur run --explain-scope`, and see [The filesystem default](../concepts/access-control.md#filesystem-default).
 
 !!! warning "`bash` still reaches the whole machine on this platform"
     The ceiling's `filesystem.scope` and `network.allow` are only a real boundary for a `bash` subprocess when a kernel sandbox enforces them, and whether one does is a property of the host — see [Subprocess enforcement tiers](../reference/containment.md#subprocess-enforcement-tiers) for which hosts enforce what. Where nothing enforces them, treat these settings as advisory for `bash`: it can read and write files outside `repo` and open connections to hosts outside `network.allow` regardless of what the manifest declares ([`W-SEC-001`](../reference/diagnostics.md#w-sec-001), [`W-SEC-003`](../reference/diagnostics.md#w-sec-003)). Pairing `bash` with any external-fetch capability is the [maximum-risk combination](../concepts/access-control.md#threat-model) the threat model describes — Step 4 shows how to move work into artifacts whose scope *is* enforced on every platform.

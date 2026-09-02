@@ -2,7 +2,7 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, inspect_installed_profile,
-    warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
+    preopen_reports, warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
     warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
     InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
@@ -15,7 +15,7 @@ use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
-use crate::error::{CliError, E_CAP_004, E_CAP_005, E_CAP_006};
+use crate::error::{CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006};
 
 /// The verdict for one installed artifact when `murmur.lock` is present. Mirrors the
 /// three ways `mur run` rejects a locked artifact (`stage_session`'s lock enforcement),
@@ -125,6 +125,49 @@ fn report_userns_grant() {
 
     // Stderr, in the same words `mur run` uses at staging, so the two cannot state it differently.
     warn_on_userns_restriction_disabled_host_wide(grant);
+}
+
+/// Prints the filesystem surface every guest-bearing artifact in `runtime_manifest` will be
+/// preopened into, one line per artifact, resolved through the same `preopen_reports` that
+/// `mur run --explain-scope` and `stage_session` use.
+///
+/// A report, never a verdict: a whole-workdir preopen is the default for a `runtime: tool` or
+/// `runtime: driver` entry that declares no `capabilities.filesystem.scope`, so counting it as a
+/// failure would fail essentially every capsule that exists, and it trades away no enforcement
+/// property the way `workdir_exec` does. Nothing here reaches `run_doctor`'s `fixes` vector, which
+/// is what drives its exit status.
+///
+/// A scope `mur run` would refuse is reported as a warning rather than a failure, on the
+/// `E-CAP-004` precedent above: doctor launches nothing, so it has nothing to refuse, and aborting
+/// the checklist over one manifest line would hide every artifact problem behind it.
+fn report_preopens(runtime_manifest: &murmur_artifact::RuntimeManifest) {
+    println!("Filesystem preopens");
+    match preopen_reports(runtime_manifest.artifacts.iter().map(|artifact| {
+        (
+            artifact.name.as_str(),
+            &artifact.runtime,
+            artifact.capabilities.as_ref(),
+        )
+    })) {
+        Ok(preopens) if preopens.is_empty() => {
+            println!("  <none> (this capsule declares no tool, driver or hook artifact)");
+        }
+        Ok(preopens) => {
+            for preopen in &preopens {
+                println!("  - {}", preopen.render());
+            }
+        }
+        Err(error) => {
+            println!("  <unresolved>");
+            eprintln!(
+                "[mur doctor] warning[{E_CAP_002}]: {error}\n  \
+                 `mur run` will refuse this capsule until that entry's \
+                 capabilities.filesystem.scope names a path inside the workdir."
+            );
+        }
+    }
+
+    println!();
 }
 
 /// Check every artifact the current project declares against the stores a session
@@ -265,6 +308,12 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // sealed` needs to know whether that came from the profile murmur ships or from the host's
     // unprivileged-userns hardening being switched off for every binary on the machine.
     report_userns_grant();
+
+    // What each guest will actually be preopened into, printed before the artifact checklist for
+    // the same reason the block above is: it is a property of the manifest, not of any one
+    // artifact's presence in a store, and it is the question `capabilities.filesystem.scope` at
+    // the capsule level does not answer.
+    report_preopens(&runtime_manifest);
 
     // A lockfile is optional. When one is present it is what `mur run` enforces, so
     // doctor checks against it too; when it is absent doctor reports presence only,

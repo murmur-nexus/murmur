@@ -1,6 +1,9 @@
 use std::path::{Component as PathComponent, Path, PathBuf};
 
-use crate::errors::RuntimeError;
+use crate::{
+    containment::{PreopenReport, PreopenSurface},
+    errors::RuntimeError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkAllowRule {
@@ -247,6 +250,24 @@ pub(crate) fn validate_filesystem_scope(scope: &str) -> Result<(), RuntimeError>
         })
 }
 
+/// The entry's declared `capabilities.filesystem.scope`, validated as a relative, non-escaping
+/// path before it is returned.
+///
+/// The one place the declaration is read. Both grant derivations and [`preopen_reports`] go
+/// through it, so a scope that refuses a launch refuses the report that describes one.
+fn declared_filesystem_scope(
+    capabilities: &murmur_artifact::Capabilities,
+) -> Result<Option<String>, RuntimeError> {
+    let scope = capabilities
+        .filesystem
+        .as_ref()
+        .and_then(|filesystem| filesystem.scope.clone());
+    if let Some(scope) = scope.as_deref() {
+        validate_filesystem_scope(scope)?;
+    }
+    Ok(scope)
+}
+
 /// Resolve a validated filesystem `scope` to the directory a guest's preopen should target,
 /// creating it if it does not already exist.
 ///
@@ -335,13 +356,7 @@ impl HookCapabilityGrant {
             None => Vec::new(),
         };
 
-        let filesystem_scope = capabilities
-            .filesystem
-            .as_ref()
-            .and_then(|filesystem| filesystem.scope.clone());
-        if let Some(scope) = filesystem_scope.as_deref() {
-            validate_filesystem_scope(scope)?;
-        }
+        let filesystem_scope = declared_filesystem_scope(capabilities)?;
 
         Ok(Self {
             network_allow_rules,
@@ -388,6 +403,30 @@ fn derive_state_store(
 /// it *from the capsule ceiling* (absent block = the capsule-wide policy, unchanged). Both fields
 /// are therefore `Option`-of-narrowing rather than plain values, and [`Default`] — what an entry
 /// with no `capabilities:` block yields — means "inherit everything".
+///
+/// # The wide filesystem default
+///
+/// [`Default`]'s `filesystem_scope: None` preopens the entire accessible workdir, read-write, for
+/// every tool and driver whose entry declares no `capabilities.filesystem.scope`. That default is
+/// chosen against **prompt injection steering an honest artifact**: the artifact's code does what
+/// its publisher wrote, and the hazard is a model that has read attacker-controlled text calling
+/// it with attacker-chosen arguments. Against that, the containment class, the network allow-list,
+/// the untrusted fence and `exports` are the mechanisms, and a per-artifact `scope` is the
+/// operator's tool for the entries where a narrower working surface is known.
+///
+/// It is **not** chosen against a hostile artifact. Malicious artifact code is outside murmur's
+/// documented threat model: no artifact trust model and no signing exist, so nothing here
+/// establishes that an artifact's code is what its publisher intended. Hash-pinning through
+/// `murmur.lock` establishes that an artifact has not changed since it was locked, and never that
+/// it was safe when it was locked.
+///
+/// The alternative — deny by default, narrow by declaration — is rejected because nothing in the
+/// system tells an operator what scope to write. A grant is read only from the operator's own
+/// manifest and never from the artifact's bundled one (the anti-self-escalation property every
+/// `derive` here rests on), so there is no declaration of need to migrate from. Under a narrow
+/// default the discoverable path to a working capsule is trial and error, and its terminal state
+/// is `scope: .` on every entry: this default restated, plus a migration that broke every existing
+/// capsule.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolCapabilityGrant {
     /// Effective allow-rules for this artifact, already clamped to the ceiling. `None` =
@@ -396,8 +435,8 @@ pub(crate) struct ToolCapabilityGrant {
     /// explicit `allow: []` and an allow-list wholly outside the ceiling lower to.
     pub(crate) network_allow_rules: Option<Vec<NetworkAllowRule>>,
     /// Relative path under `accessible_workdir` to preopen as `"."` instead of the whole
-    /// workdir. `None` = no `capabilities.filesystem.scope`, so the artifact keeps seeing
-    /// the entire `accessible_workdir`, as every tool does today.
+    /// workdir. `None` = no `capabilities.filesystem.scope`, so the artifact sees the entire
+    /// `accessible_workdir` — the wide default this type documents above.
     pub(crate) filesystem_scope: Option<String>,
     /// Declared `network.allow` entries dropped because no ceiling rule covers them. Held
     /// (rather than warned about in `derive`) so lowering stays pure and unit-testable; the
@@ -469,13 +508,7 @@ impl ToolCapabilityGrant {
             }
         };
 
-        let filesystem_scope = capabilities
-            .filesystem
-            .as_ref()
-            .and_then(|filesystem| filesystem.scope.clone());
-        if let Some(scope) = filesystem_scope.as_deref() {
-            validate_filesystem_scope(scope)?;
-        }
+        let filesystem_scope = declared_filesystem_scope(capabilities)?;
 
         Ok(Self {
             network_allow_rules,
@@ -486,6 +519,66 @@ impl ToolCapabilityGrant {
             config_json: None,
         })
     }
+}
+
+/// The filesystem surface each of the given artifacts will be preopened into, resolved but not
+/// opened, one entry per artifact that has a guest.
+///
+/// Lives here, beside the two grant types whose [`Default`]s it reports: [`ToolCapabilityGrant`]
+/// supplies the whole-workdir baseline a tool or driver falls back to, and
+/// [`HookCapabilityGrant`] the deny baseline a hook falls back to. Resolving the same question in
+/// a second place is how a report starts disagreeing with a launch.
+///
+/// Takes `(artifact name, role, that artifact's operator-declared capabilities)` triples rather
+/// than a concrete artifact type so the two callers that must agree can both satisfy it:
+/// `stage_session` holds [`crate::types::ArtifactRequest`]s, and `mur run --explain-scope` and
+/// `mur doctor` hold [`murmur_artifact::RuntimeArtifact`]s and have staged nothing.
+///
+/// [`murmur_artifact::ArtifactRuntime::Skill`] produces no entry: a skill is markdown staged into
+/// the workdir, no component is instantiated for it, and it holds no descriptor to report.
+///
+/// Every declared scope is read through [`declared_filesystem_scope`], so a scope a launch would
+/// refuse is refused here too. Nothing is created — [`resolve_scoped_dir`] is the staging path's
+/// job — so this stays usable from a read-only diagnostic.
+pub fn preopen_reports<'a, I>(artifacts: I) -> Result<Vec<PreopenReport>, RuntimeError>
+where
+    I: IntoIterator<
+        Item = (
+            &'a str,
+            &'a murmur_artifact::ArtifactRuntime,
+            Option<&'a murmur_artifact::Capabilities>,
+        ),
+    >,
+{
+    let mut reports = Vec::new();
+
+    for (name, runtime, capabilities) in artifacts {
+        if matches!(runtime, murmur_artifact::ArtifactRuntime::Skill) {
+            continue;
+        }
+
+        let scope = capabilities
+            .map(declared_filesystem_scope)
+            .transpose()?
+            .flatten();
+
+        let surface = match (runtime, scope.is_some()) {
+            // A declared scope resolves the same way for every role: `build_wasi_ctx` in both
+            // `runtime.rs` and `hooks.rs` preopens `<workdir>/<scope>` as `"."`.
+            (_, true) => PreopenSurface::ScopedSubtree,
+            (murmur_artifact::ArtifactRuntime::Hook, false) => PreopenSurface::Nothing,
+            (_, false) => PreopenSurface::WholeWorkdir,
+        };
+
+        reports.push(PreopenReport {
+            artifact: name.to_string(),
+            role: runtime.as_str().to_string(),
+            scope,
+            surface,
+        });
+    }
+
+    Ok(reports)
 }
 
 /// The rules `NetworkPolicyHooks` enforces for one tool/driver dispatch: the artifact's own
@@ -1001,5 +1094,135 @@ mod tests {
 
         assert!(rules.iter().any(|rule| rule.matches(&https_default)));
         assert!(rules.iter().any(|rule| rule.matches(&custom_port)));
+    }
+
+    /// The two opposite baselines, read off one manifest: a `runtime: tool` and a
+    /// `runtime: driver` entry that declare nothing keep the whole accessible workdir, and a
+    /// `runtime: hook` entry that declares nothing holds no descriptor at all.
+    #[test]
+    fn undeclared_entries_report_the_baseline_their_role_starts_from() {
+        let tool = murmur_artifact::ArtifactRuntime::Tool;
+        let driver = murmur_artifact::ArtifactRuntime::Driver;
+        let hook = murmur_artifact::ArtifactRuntime::Hook;
+
+        let reports = preopen_reports(vec![
+            ("notes-tool", &tool, None),
+            ("anthropic-driver", &driver, None),
+            ("telemetry-hook", &hook, None),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            reports,
+            vec![
+                PreopenReport {
+                    artifact: "notes-tool".to_string(),
+                    role: "tool".to_string(),
+                    scope: None,
+                    surface: PreopenSurface::WholeWorkdir,
+                },
+                PreopenReport {
+                    artifact: "anthropic-driver".to_string(),
+                    role: "driver".to_string(),
+                    scope: None,
+                    surface: PreopenSurface::WholeWorkdir,
+                },
+                PreopenReport {
+                    artifact: "telemetry-hook".to_string(),
+                    role: "hook".to_string(),
+                    scope: None,
+                    surface: PreopenSurface::Nothing,
+                },
+            ]
+        );
+    }
+
+    /// A declared scope resolves the same way whatever the role, and is carried verbatim so an
+    /// operator reads back the line they wrote.
+    #[test]
+    fn a_declared_scope_narrows_every_role_to_a_subtree() {
+        let tool = murmur_artifact::ArtifactRuntime::Tool;
+        let hook = murmur_artifact::ArtifactRuntime::Hook;
+        let tool_caps = capabilities_block(None, Some("cache"));
+        let hook_caps = capabilities_block(None, Some("hook-state"));
+
+        let reports = preopen_reports(vec![
+            ("notes-tool", &tool, Some(&tool_caps)),
+            ("telemetry-hook", &hook, Some(&hook_caps)),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            reports,
+            vec![
+                PreopenReport {
+                    artifact: "notes-tool".to_string(),
+                    role: "tool".to_string(),
+                    scope: Some("cache".to_string()),
+                    surface: PreopenSurface::ScopedSubtree,
+                },
+                PreopenReport {
+                    artifact: "telemetry-hook".to_string(),
+                    role: "hook".to_string(),
+                    scope: Some("hook-state".to_string()),
+                    surface: PreopenSurface::ScopedSubtree,
+                },
+            ]
+        );
+    }
+
+    /// A skill is markdown staged into the workdir with no component behind it, so it produces no
+    /// entry at all — not a `Nothing` entry, which would claim a guest was denied a descriptor.
+    #[test]
+    fn a_skill_produces_no_entry() {
+        let skill = murmur_artifact::ArtifactRuntime::Skill;
+        let tool = murmur_artifact::ArtifactRuntime::Tool;
+
+        let reports = preopen_reports(vec![
+            ("notes-skill", &skill, None),
+            ("notes-tool", &tool, None),
+        ])
+        .unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].artifact, "notes-tool");
+    }
+
+    /// The report runs the declared scope through the same validator the grant derivation does,
+    /// so a scope that would refuse a launch refuses the report.
+    #[test]
+    fn an_escaping_scope_is_refused() {
+        let tool = murmur_artifact::ArtifactRuntime::Tool;
+        let caps = capabilities_block(None, Some("../escape"));
+
+        let err = preopen_reports(vec![("notes-tool", &tool, Some(&caps))]).unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                RuntimeError::InvalidFilesystemScope { ref scope, .. } if scope == "../escape"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            ToolCapabilityGrant::derive(Some(&caps), &[], "test-capsule").is_err(),
+            "the grant derivation must refuse what the report refuses"
+        );
+    }
+
+    /// The three surfaces carry stable kebab-case wire names, and the enum has exactly three
+    /// variants: a guest holds the workdir, one subtree of it, or no descriptor.
+    #[test]
+    fn preopen_surfaces_serialize_to_stable_wire_names() {
+        for (surface, wire) in [
+            (PreopenSurface::WholeWorkdir, "whole-workdir"),
+            (PreopenSurface::ScopedSubtree, "scoped-subtree"),
+            (PreopenSurface::Nothing, "nothing"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(surface).unwrap(),
+                serde_json::Value::String(wire.to_string())
+            );
+        }
     }
 }
