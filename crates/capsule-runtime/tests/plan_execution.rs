@@ -50,6 +50,7 @@ fn ctx<'a>(
         capsule_versions: HashMap::from([("worker".to_string(), "0.1.0".to_string())]),
         current_session_id: Some(TEST_SESSION.to_string()),
         spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
+        trace: None,
         invoke_tool,
     }
 }
@@ -793,10 +794,17 @@ fn test_the_spawn_credential_reaches_no_file_and_no_step_result() {
             }),
         );
 
-        let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
+        // Traced, so `trace.jsonl` is one of the files the search below reads: a capsule step's
+        // records name the step and its verdict, never the token that authorized it.
+        let trace = appender(dir.path());
+        let mut context = ctx(dir.path().to_path_buf(), &invoke);
+        context.trace = Some(&trace);
+        let report = plan::execute(&plan, &context);
         std::env::remove_var("MURMUR_ROOST_URL");
 
         assert_eq!(report.completed, !refuse_spawn, "{report:?}");
+        let lines = trace_lines(dir.path());
+        assert_eq!(only(&lines, "plan_step")["kind"], "capsule", "{lines:#?}");
         for result in &report.results {
             for text in [result.output.as_deref(), result.error.as_deref()]
                 .into_iter()
@@ -1340,4 +1348,501 @@ fn test_tool_data_path_missing_file_fails_step() {
         step.error.as_deref().unwrap().contains("not_found"),
         "{step:?}"
     );
+}
+
+// ── Per-step trace records ───────────────────────────────────────────────────
+
+/// The session node the appender in these tests hangs a run's `plan_start` off.
+const TEST_SESSION_EVENT: &str = "evt_00000000000000000000000000session";
+
+/// [`ctx`] with a trace appender attached and every subprocess grant dropped.
+///
+/// Dropping `shell_allow` and `spawn_allow` is what lets these tests run on a host that cannot
+/// delegate a cgroup v2 scope: with neither grant, `plan::execute` needs no delegated scope.
+fn traced_ctx<'a>(
+    workdir: PathBuf,
+    invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+    appender: &'a capsule_runtime::PlanTraceAppender,
+) -> SchedulerContext<'a> {
+    let mut context = ctx(workdir, invoke_tool);
+    context.capability_policy = CapabilityPolicy::default();
+    context.trace = Some(appender);
+    context
+}
+
+fn appender(workdir: &Path) -> capsule_runtime::PlanTraceAppender {
+    capsule_runtime::PlanTraceAppender::open(
+        workdir,
+        TEST_SESSION.to_string(),
+        TEST_SESSION_EVENT.to_string(),
+    )
+    .unwrap()
+}
+
+/// Every line of `<workdir>/trace.jsonl`, each parsed as its own JSON object.
+fn trace_lines(workdir: &Path) -> Vec<Value> {
+    let raw = fs::read_to_string(workdir.join("trace.jsonl")).unwrap();
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap_or_else(|e| panic!("{line}: {e}")))
+        .collect()
+}
+
+fn of_type<'a>(lines: &'a [Value], event_type: &str) -> Vec<&'a Value> {
+    lines
+        .iter()
+        .filter(|line| line["event_type"] == event_type)
+        .collect()
+}
+
+fn only<'a>(lines: &'a [Value], event_type: &str) -> &'a Value {
+    let found = of_type(lines, event_type);
+    assert_eq!(found.len(), 1, "{event_type}: {lines:#?}");
+    found[0]
+}
+
+/// Every line opens with the five identity fields, in the order every other event type writes
+/// them. Read off the raw text because parsing a line into a [`Value`] sorts its keys.
+fn assert_identity_order(workdir: &Path) {
+    for line in fs::read_to_string(workdir.join("trace.jsonl"))
+        .unwrap()
+        .lines()
+    {
+        assert!(line.starts_with("{\"event_type\":"), "{line}");
+        let mut at = 0;
+        for key in [
+            "event_type",
+            "event_id",
+            "parent_id",
+            "session_id",
+            "timestamp",
+        ] {
+            let needle = format!("\"{key}\":");
+            let found = line[at..]
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{key} is missing or out of order: {line}"));
+            at += found + needle.len();
+        }
+    }
+}
+
+/// Every line a plan run writes names this session and hangs off the node it should.
+fn assert_identity(line: &Value, session_event: &str) {
+    assert_eq!(line["session_id"], TEST_SESSION, "{line}");
+    assert!(
+        line["event_id"].as_str().unwrap().starts_with("evt_"),
+        "{line}"
+    );
+    assert_eq!(line["parent_id"], session_event, "{line}");
+}
+
+#[test]
+fn test_trace_records_a_two_step_plan_run() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id":"p",
+            "steps":[
+                {"id":"a","tool":"echo","input":{"x":1}},
+                {"id":"b","tool":"echo","depends_on":["a"]}
+            ]
+        }),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert!(report.completed, "{report:?}");
+
+    assert_identity_order(dir.path());
+    let lines = trace_lines(dir.path());
+    let start = only(&lines, "plan_start");
+    assert_identity(start, TEST_SESSION_EVENT);
+    assert_eq!(start["plan_id"], "p");
+    assert_eq!(start["step_count"], 2);
+    assert_eq!(
+        start["steps"],
+        json!([
+            {"step_id":"a","kind":"tool","depends_on":[],"has_condition":false},
+            {"step_id":"b","kind":"tool","depends_on":["a"],"has_condition":false}
+        ])
+    );
+
+    // Every later line of the run hangs off the plan node.
+    let plan_node = start["event_id"].as_str().unwrap();
+    for line in lines
+        .iter()
+        .filter(|line| line["event_type"] != "plan_start")
+    {
+        assert_identity(line, plan_node);
+    }
+
+    let starts = of_type(&lines, "plan_step_start");
+    assert_eq!(starts.len(), 2, "{lines:#?}");
+    assert_eq!(starts[0]["step_id"], "a");
+    assert_eq!(starts[1]["step_id"], "b");
+    assert_eq!(starts[1]["depends_on"], json!(["a"]));
+
+    let steps = of_type(&lines, "plan_step");
+    assert_eq!(steps.len(), 2, "{lines:#?}");
+    for step in &steps {
+        assert_eq!(step["plan_id"], "p");
+        assert_eq!(step["kind"], "tool");
+        assert_eq!(step["status"], "success");
+        assert_eq!(step["attempts"], 1);
+        assert!(step.get("error").is_none(), "{step}");
+    }
+    assert_eq!(steps[0]["input"], json!({"x":1}));
+    // `b` declares no input, so the key is absent rather than written as null.
+    assert!(steps[1].get("input").is_none(), "{}", steps[1]);
+
+    // The first step settles before the second is dispatched: the dependency edge is legible
+    // from the file order alone.
+    let order: Vec<String> = lines
+        .iter()
+        .map(|line| format!("{}:{}", line["event_type"], line["step_id"]))
+        .collect();
+    let settled_a = order
+        .iter()
+        .position(|e| e == "\"plan_step\":\"a\"")
+        .unwrap();
+    let started_b = order
+        .iter()
+        .position(|e| e == "\"plan_step_start\":\"b\"")
+        .unwrap();
+    assert!(settled_a < started_b, "{order:?}");
+
+    let end = only(&lines, "plan_end");
+    assert_eq!(end["plan_id"], "p");
+    assert_eq!(end["outcome"], "completed");
+    assert_eq!(end["steps_total"], 2);
+    assert_eq!(end["steps_succeeded"], 2);
+    assert_eq!(end["steps_failed"], 0);
+    assert_eq!(end["steps_skipped"], 0);
+    assert!(end.get("failed_step").is_none(), "{end}");
+    assert!(end.get("reason").is_none(), "{end}");
+}
+
+#[test]
+fn test_trace_counts_every_attempt_of_a_retried_failure() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Failed,
+            None,
+            Some("tool said no".to_string()),
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"fail","retries":2}]}),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert!(!report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    let step = only(&lines, "plan_step");
+    assert_eq!(step["status"], "failed");
+    assert_eq!(step["attempts"], 3);
+    assert_eq!(step["error"], "tool said no");
+
+    let end = only(&lines, "plan_end");
+    assert_eq!(end["outcome"], "failed");
+    assert_eq!(end["failed_step"], "a");
+    assert_eq!(end["steps_failed"], 1);
+    assert!(
+        !lines.iter().any(|line| line["status"] == "success"),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn test_trace_records_a_condition_false_skip_as_never_dispatched() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id":"p",
+            "steps":[
+                {"id":"a","tool":"echo"},
+                {"id":"b","tool":"echo","depends_on":["a"],"if":"$a.status == 'failed'"}
+            ]
+        }),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert_eq!(find(&report, "b").status, StepStatus::Skipped, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    assert_eq!(
+        only(&lines, "plan_start")["steps"][1]["has_condition"],
+        json!(true)
+    );
+
+    // Dispatched: `a` only. A step that never ran must not read as one that ran.
+    let starts = of_type(&lines, "plan_step_start");
+    assert_eq!(starts.len(), 1, "{lines:#?}");
+    assert_eq!(starts[0]["step_id"], "a");
+
+    let skipped = of_type(&lines, "plan_step")
+        .into_iter()
+        .find(|line| line["step_id"] == "b")
+        .unwrap();
+    assert_eq!(skipped["status"], "skipped");
+    assert_eq!(skipped["attempts"], 0);
+    assert_eq!(skipped["duration_ms"], 0);
+    assert!(skipped.get("error").is_none(), "{skipped}");
+
+    let end = only(&lines, "plan_end");
+    assert_eq!(end["outcome"], "completed");
+    assert_eq!(end["steps_skipped"], 1);
+    assert_eq!(end["steps_succeeded"], 1);
+}
+
+/// The trace and the returned report never disagree: `on_error: "skip"` demotes a failed step to
+/// skipped in the report, and the line the scheduler writes reads the same.
+#[test]
+fn test_trace_reads_an_on_error_skip_demotion_as_skipped() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Failed,
+            None,
+            Some("tool said no".to_string()),
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"fail","on_error":"skip"}]}),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert_eq!(find(&report, "a").status, StepStatus::Skipped, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    let step = only(&lines, "plan_step");
+    assert_eq!(step["status"], "skipped");
+    assert_eq!(step["attempts"], 1);
+    // The demotion keeps the step's own error text, exactly as the report does.
+    assert_eq!(step["error"], "tool said no");
+    assert_eq!(only(&lines, "plan_end")["steps_skipped"], 1);
+}
+
+#[test]
+fn test_a_rejected_plan_writes_its_shape_and_no_step_lines() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"not-installed"}]}),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert!(!report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    assert_eq!(only(&lines, "plan_start")["step_count"], 1);
+    assert!(of_type(&lines, "plan_step_start").is_empty(), "{lines:#?}");
+    assert!(of_type(&lines, "plan_step").is_empty(), "{lines:#?}");
+
+    let end = only(&lines, "plan_end");
+    assert_eq!(end["outcome"], "failed");
+    assert_eq!(end["failed_step"], "a");
+    assert_eq!(end["steps_total"], 1);
+    assert_eq!(end["steps_succeeded"], 0);
+    assert!(
+        end["reason"].as_str().unwrap().contains("is not installed"),
+        "{end}"
+    );
+}
+
+#[test]
+fn test_a_malformed_plan_file_describes_no_dag() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plan.json");
+    fs::write(&path, "{ not json").unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &path,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert!(!report.completed, "{report:?}");
+
+    assert_identity_order(dir.path());
+    let lines = trace_lines(dir.path());
+    assert!(of_type(&lines, "plan_start").is_empty(), "{lines:#?}");
+    let end = only(&lines, "plan_end");
+    // No plan node to hang off: the summary parents to the session instead.
+    assert_identity(end, TEST_SESSION_EVENT);
+    assert_eq!(end["plan_id"], "");
+    assert_eq!(end["outcome"], "failed");
+    assert_eq!(end["failed_step"], "plan");
+    assert_eq!(end["steps_total"], 0);
+    assert!(
+        end["reason"]
+            .as_str()
+            .unwrap()
+            .contains("failed to parse plan JSON"),
+        "{end}"
+    );
+}
+
+/// A tool step carries what the tool declared about itself, so a plan run and an agent turn are
+/// scored on the same resource history by `mur trace`.
+#[test]
+fn test_a_tool_step_carries_the_metadata_the_tool_declared() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(ToolResult {
+            status: ToolStatus::Passed,
+            summary: None,
+            data: Some("out".to_string()),
+            data_path: None,
+            truncated: false,
+            metadata: vec![
+                ("state_effect".to_string(), "read".to_string()),
+                ("resource_id".to_string(), "src/lib.rs".to_string()),
+            ],
+        })
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id":"p",
+            "steps":[
+                {"id":"a","tool":"echo","input":{"path":"src/lib.rs"}},
+                {"id":"b","shell":"true"}
+            ]
+        }),
+    );
+
+    let trace = appender(dir.path());
+    let mut context = traced_ctx(dir.path().to_path_buf(), &invoke, &trace);
+    // `b` is refused by validation, which is enough to prove the shape a non-tool step gets in
+    // `plan_start` without granting this test a subprocess and the cgroup scope that needs.
+    context.capability_policy.shell_allow = Vec::new();
+    let report = plan::execute(&plan, &context);
+    assert!(!report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    assert_eq!(only(&lines, "plan_start")["steps"][1]["kind"], "shell");
+    assert!(of_type(&lines, "plan_step").is_empty(), "{lines:#?}");
+
+    // And again with the plan the validator accepts, to read the tool step's own line.
+    let dir = tempdir().unwrap();
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo","input":{"path":"src/lib.rs"}}]}),
+    );
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+    assert!(report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    let step = only(&lines, "plan_step");
+    assert_eq!(step["state_effect"], "read");
+    assert_eq!(step["resource_id"], "src/lib.rs");
+    assert_eq!(step["input"], json!({"path":"src/lib.rs"}));
+}
+
+/// A tool that declares nothing writes neither key, rather than writing them empty.
+#[test]
+fn test_an_undeclared_tool_step_omits_the_metadata_keys() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let trace = appender(dir.path());
+    plan::execute(
+        &plan,
+        &traced_ctx(dir.path().to_path_buf(), &invoke, &trace),
+    );
+
+    let step = only(&trace_lines(dir.path()), "plan_step").clone();
+    assert!(step.get("state_effect").is_none(), "{step}");
+    assert!(step.get("resource_id").is_none(), "{step}");
+}
+
+/// The opt-in: a context carrying no appender opens no file and writes no line.
+#[test]
+fn test_no_appender_writes_no_trace_file() {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"a","tool":"echo"}]}),
+    );
+
+    let mut context = ctx(dir.path().to_path_buf(), &invoke);
+    context.capability_policy = CapabilityPolicy::default();
+    let report = plan::execute(&plan, &context);
+
+    assert!(report.completed, "{report:?}");
+    assert!(!dir.path().join("trace.jsonl").exists());
 }

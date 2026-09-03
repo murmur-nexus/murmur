@@ -2366,7 +2366,7 @@ pub(crate) const STATE_EFFECT_KEY: &str = "state_effect";
 /// empty-string value or an absent key both yield `None` ("undeclared"). The host does not
 /// interpret the value here — it is passed through to the trace verbatim, and consumers apply
 /// the conservative default for anything they don't recognize.
-fn extract_state_effect(metadata: &[(String, String)]) -> Option<String> {
+pub(crate) fn extract_state_effect(metadata: &[(String, String)]) -> Option<String> {
     metadata
         .iter()
         .find(|(k, _)| k == STATE_EFFECT_KEY)
@@ -2385,7 +2385,7 @@ pub(crate) const RESOURCE_ID_KEY: &str = "resource_id";
 /// empty-string value or an absent key both yield `None` ("undeclared"). The value is opaque:
 /// the host does not parse, normalize, or validate it here — it is passed through to the
 /// trace verbatim, and consumers compare it byte-for-byte.
-fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
+pub(crate) fn extract_resource_id(metadata: &[(String, String)]) -> Option<String> {
     metadata
         .iter()
         .find(|(k, _)| k == RESOURCE_ID_KEY)
