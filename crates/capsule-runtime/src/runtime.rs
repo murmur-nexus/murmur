@@ -47,7 +47,8 @@ use crate::{
     containment::{achieved_containment_class, check_containment_floor},
     delegation::SpawnerHandle,
     detached::{
-        demotion_tool_result, DetachPolicy, DetachedCompletion, DetachedRegistry, DetachedReport,
+        demotion_tool_result, DelegationDeadlineReport, DetachPolicy, DetachedRegistry,
+        DetachedReport,
     },
     errors::RuntimeError,
     hooks::{
@@ -1327,6 +1328,7 @@ pub fn launch_session(
                 credential,
                 accessible_workdir.clone(),
                 session_id.clone(),
+                std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
             ))
         });
 
@@ -1868,9 +1870,9 @@ pub fn launch_session(
                                         // tasks first, so a completion delivered while the previous
                                         // task was running is in its lane before anything is chosen
                                         // — behind everything a person or a peer is waiting for.
-                                        while let Ok(completion) = completion_rx.try_recv() {
+                                        while let Ok(report) = completion_rx.try_recv() {
                                             enqueue_detached_report(
-                                                DetachedReport::Completed(completion),
+                                                report,
                                                 &task_registry,
                                                 &mut lanes,
                                                 &mut trace,
@@ -1903,9 +1905,9 @@ pub fn launch_session(
                                                         break 'task_loop;
                                                     }
                                                 },
-                                                Some(completion) = completion_rx.recv() => {
+                                                Some(report) = completion_rx.recv() => {
                                                     enqueue_detached_report(
-                                                        DetachedReport::Completed(completion),
+                                                        report,
                                                         &task_registry,
                                                         &mut lanes,
                                                         &mut trace,
@@ -1929,8 +1931,8 @@ pub fn launch_session(
                                                 async {
                                                     tokio::select! {
                                                         arrived = task_rx.recv() => Woke::Task(arrived),
-                                                        Some(completion) = completion_rx.recv() => {
-                                                            Woke::Completion(completion)
+                                                        Some(report) = completion_rx.recv() => {
+                                                            Woke::Report(report)
                                                         }
                                                     }
                                                 },
@@ -1939,9 +1941,9 @@ pub fn launch_session(
                                             {
                                                 // Filed and reconsidered on the next pass around the
                                                 // drain, alongside anything else queued.
-                                                Ok(Woke::Completion(completion)) => {
+                                                Ok(Woke::Report(report)) => {
                                                     enqueue_detached_report(
-                                                        DetachedReport::Completed(completion),
+                                                        report,
                                                         &task_registry,
                                                         &mut lanes,
                                                         &mut trace,
@@ -2180,26 +2182,43 @@ pub fn launch_session(
                             .await;
                         recorded.push(work.work_id);
                     }
-                    // A command that finished after the task loop stopped reading. Its result
-                    // exists, but no task will ever carry it, so it is lost on the same terms as
-                    // one still running and is recorded the same way.
-                    while let Ok(completion) = completion_rx.try_recv() {
-                        if recorded.contains(&completion.work_id) {
-                            continue;
+                    // Work that reported after the task loop stopped reading. The result exists,
+                    // but no task will ever carry it, so it is lost on the same terms as work still
+                    // running and is recorded the same way.
+                    while let Ok(report) = completion_rx.try_recv() {
+                        match report {
+                            DetachedReport::Completed(completion) => {
+                                if recorded.contains(&completion.work_id) {
+                                    continue;
+                                }
+                                eprintln!(
+                                    "[capsule-runtime] detached shell command {} ({}) finished after the session stopped accepting work; its result is lost",
+                                    completion.work_id, completion.binary
+                                );
+                                let _ = trace
+                                    .write_shell_abandoned(
+                                        &completion.work_id,
+                                        &completion.binary,
+                                        &completion.command,
+                                        completion.duration_ms,
+                                    )
+                                    .await;
+                                recorded.push(completion.work_id);
+                            }
+                            // Both delegation reports are already recorded where they can still be
+                            // read: the deadline on the `delegation` line this session wrote, and a
+                            // late outcome in the child's own `completion.json`. Nothing further is
+                            // written here, because there is no agent left to tell.
+                            DetachedReport::DelegationDeadline(report) => eprintln!(
+                                "[capsule-runtime] delegation {} reached its deadline after the session stopped accepting work; the capsule was left running",
+                                report.delegation_id
+                            ),
+                            DetachedReport::DelegationLate(report) => eprintln!(
+                                "[capsule-runtime] delegation {} ended after the session stopped accepting work; its outcome is in the child's completion.json",
+                                report.delegation_id
+                            ),
+                            DetachedReport::Lost(_) => {}
                         }
-                        eprintln!(
-                            "[capsule-runtime] detached shell command {} ({}) finished after the session stopped accepting work; its result is lost",
-                            completion.work_id, completion.binary
-                        );
-                        let _ = trace
-                            .write_shell_abandoned(
-                                &completion.work_id,
-                                &completion.binary,
-                                &completion.command,
-                                completion.duration_ms,
-                            )
-                            .await;
-                        recorded.push(completion.work_id);
                     }
 
                     let _ = trace
@@ -4476,6 +4495,61 @@ impl CapsuleStoreState {
         }
     }
 
+    /// Tell this capsule's own agent that a delegation reached its deadline, and start watching
+    /// the child it released.
+    ///
+    /// Two things happen here and their order is the whole rule: the deadline task is handed over
+    /// first, then the watcher is started. A child that ended in the same instant the deadline
+    /// fired can therefore only be reported second, which is what makes the late report always the
+    /// second word on a delegation rather than sometimes the first.
+    ///
+    /// Both tasks inherit the delegating task's trust through
+    /// [`TaskProvenance::derive`] with [`TaskOrigin::Completion`], the same derivation a demoted
+    /// shell command's completion uses, so untrust survives the round trip.
+    fn report_delegation_deadline(&self, notice: crate::delegation_plane::DelegationDeadline) {
+        // No registry means no task loop to deliver into — the script-capsule path. Dropping the
+        // notice drops the released child with it, and nothing reaps the process; that is why the
+        // plane only releases for a caller that took the channel, and this branch is unreachable
+        // from a session that has one.
+        let Some(detached) = self.detached.as_ref() else {
+            return;
+        };
+        let provenance = TaskProvenance::derive(
+            TaskOrigin::Completion,
+            self.current_task_provenance.map(|task| task.trust()),
+        );
+        let context_id = self.current_context_id.clone().unwrap_or_default();
+
+        detached.report(DetachedReport::DelegationDeadline(
+            DelegationDeadlineReport {
+                delegation_id: notice.delegation_id.clone(),
+                capsule_name: notice.capsule.clone(),
+                capsule_version: notice.version.clone(),
+                child_session_id: notice.child_session_id.clone(),
+                child_workdir: notice.child_workdir.clone(),
+                child_pid: notice.child_pid,
+                deadline_secs: notice.deadline_secs,
+                context_id: context_id.clone(),
+                provenance,
+            },
+        ));
+
+        crate::child_launch::watch_released_child(
+            notice.released,
+            crate::child_launch::LateReportPlan {
+                capsule_name: notice.capsule,
+                capsule_version: notice.version,
+                deadline_secs: notice.deadline_secs,
+                deadline_at: std::time::Instant::now(),
+                context_id,
+                provenance,
+                result_root: self.accessible_workdir.clone(),
+                child_task_id: notice.child_task_id,
+                reports: detached.sender(),
+            },
+        );
+    }
+
     /// `delegate-task`: hand one task to one sub-capsule and return its answer.
     ///
     /// The agent names a capsule, a version and a task. Everything else — the daemon's address,
@@ -4515,9 +4589,15 @@ impl CapsuleStoreState {
         // rather than after it returns — which is the whole point of the record, for a child that
         // hangs, crashes or is timed out.
         let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Where the child goes if the deadline fires. Supplying it is what turns the deadline from
+        // a kill into a release: the plane hands the process over instead of dropping it, and this
+        // dispatch is the one place that knows the conversation, the trust and the report channel a
+        // released child's outcome has to reach.
+        let (released_tx, mut released_rx) = tokio::sync::mpsc::unbounded_channel();
         let origin = crate::delegation_plane::DelegationOrigin {
             context_id: self.current_context_id.clone().unwrap_or_default(),
             launched: Some(launch_tx),
+            released: Some(released_tx),
         };
         let mut delegating = tokio::task::spawn_blocking(move || plane.delegate(&request, &origin));
         let mut notices_open = true;
@@ -4539,6 +4619,12 @@ impl CapsuleStoreState {
         let result = joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
 
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        // The deadline's own task, and the watcher for an outcome that may still arrive. Both
+        // before the terminal `delegation` line is written, so the record of the deadline and the
+        // report of it cannot be separated by a failure in between.
+        while let Ok(notice) = released_rx.try_recv() {
+            self.report_delegation_deadline(notice);
+        }
         let refused = result.status == crate::delegation_plane::DelegationStatus::Refused;
         if let Some(trace) = &self.peer_trace {
             trace
@@ -5919,15 +6005,20 @@ where
     dispatch()
 }
 
-/// What ended the task loop's bounded wait: a task arriving (or its channel closing) or a
-/// detached command reporting back.
+/// What ended the task loop's bounded wait: a task arriving (or its channel closing) or a report
+/// on work this runtime started — a detached command, or a delegation that outran its deadline.
 enum Woke {
     Task(Option<IncomingTask>),
-    Completion(DetachedCompletion),
+    Report(DetachedReport),
 }
 
-/// Turn a report about detached work into a queued `completion`-origin task, and record whatever
-/// join the report needs in the trace.
+/// Turn a report about work this runtime started into a queued `completion`-origin task, and
+/// record whatever join the report needs in the trace.
+///
+/// Four kinds of report, one path: a demoted shell command finishing, a prior session's demoted
+/// commands going unaccounted, a delegation reaching its deadline, and a released child ending
+/// after that deadline was reported. All four are [`TaskOrigin::Completion`] and land in the `bg`
+/// lane by [`TaskLane::for_origin`]'s rule; none of them declares a lane.
 ///
 /// `can_accept` is not consulted, on either arm. A completion is work the capsule already
 /// admitted when it admitted the task that started the command, and a loss report is the only
@@ -5990,6 +6081,46 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             delegation_id: None,
         },
+        // The deadline itself is already on the `delegation` line this session wrote, with
+        // `outcome: "timed_out"`, so nothing further goes in the trace here: the `task_start` the
+        // loop writes carries the same `dlg_` id and is the join.
+        DetachedReport::DelegationDeadline(report) => IncomingTask {
+            task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+            context_id: report.context_id.clone(),
+            message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+            message_text: report.message_text(),
+            provenance: report.provenance,
+            traceparent: None,
+            source: crate::a2a::SOURCE_DELEGATION_DEADLINE,
+            delegation_id: Some(report.delegation_id.clone()).filter(|id| !id.is_empty()),
+        },
+        DetachedReport::DelegationLate(report) => {
+            let delegation_id = Some(report.delegation_id.clone()).filter(|id| !id.is_empty());
+            let task = IncomingTask {
+                task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
+                context_id: report.context_id.clone(),
+                message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
+                message_text: report.message_text(),
+                provenance: report.provenance,
+                traceparent: None,
+                source: crate::a2a::SOURCE_DELEGATION_LATE,
+                delegation_id: delegation_id.clone(),
+            };
+            let _ = trace
+                .write_delegation_late(
+                    delegation_id,
+                    &report.capsule_name,
+                    &report.capsule_version,
+                    &report.child_session_id,
+                    report.status.as_str(),
+                    report.duration_ms,
+                    report.after_deadline_ms,
+                    report.result_path.clone(),
+                    &task.task_id,
+                )
+                .await;
+            task
+        }
     };
 
     task_registry

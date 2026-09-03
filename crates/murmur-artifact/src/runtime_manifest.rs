@@ -61,6 +61,17 @@ pub struct LifecycleConfig {
     /// reports back later as a `completion`-origin task. `0` demotes at the first poll after the
     /// spawn, so effectively every command detaches.
     pub shell_grace_secs: u64,
+    /// How long a delegation waits for a sub-capsule's answer before the parent stops waiting.
+    /// Defaults to 600 seconds. Absent is a ceiling rather than an absence: a capsule that never
+    /// declares this one is still bounded, because an unbounded delegation strands the parent on
+    /// a child that has wedged. `0` gives up at the first poll after the task is delivered, the
+    /// same reading `shell_grace_secs: 0` has.
+    ///
+    /// Reaching the deadline stops the wait; it does not stop the child. The parent releases the
+    /// child's process, receives a `completion`-origin task naming the deadline, and receives a
+    /// second one if the released child later ends. `MURMUR_DELEGATION_TIMEOUT_SECS` overrides
+    /// this value when it names a positive number of seconds.
+    pub delegation_deadline_secs: u64,
 }
 
 impl Default for LifecycleConfig {
@@ -73,6 +84,7 @@ impl Default for LifecycleConfig {
             conversation_mode: ConversationMode::Stateless,
             max_task_reopens: 1,
             shell_grace_secs: 10,
+            delegation_deadline_secs: 600,
         }
     }
 }
@@ -1488,6 +1500,8 @@ struct RawLifecycleConfig {
     max_task_reopens: Option<u32>,
     #[serde(default)]
     shell_grace_secs: Option<u64>,
+    #[serde(default)]
+    delegation_deadline_secs: Option<u64>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -1991,6 +2005,7 @@ impl RawBlock for RawLifecycleConfig {
         "conversation",
         "max_task_reopens",
         "shell_grace_secs",
+        "delegation_deadline_secs",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -2712,6 +2727,9 @@ impl RuntimeManifest {
                 conversation_mode: raw_lc.conversation.unwrap_or(defaults.conversation_mode),
                 max_task_reopens: raw_lc.max_task_reopens.unwrap_or(defaults.max_task_reopens),
                 shell_grace_secs: raw_lc.shell_grace_secs.unwrap_or(defaults.shell_grace_secs),
+                delegation_deadline_secs: raw_lc
+                    .delegation_deadline_secs
+                    .unwrap_or(defaults.delegation_deadline_secs),
             }
         });
 
@@ -7466,6 +7484,72 @@ context:
         let without_block =
             RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
         assert_eq!(without_block.effective_lifecycle().shell_grace_secs, 10);
+    }
+
+    /// The bound a capsule delegates under is declared, and a capsule that declares nothing is
+    /// still bounded: absent means a ceiling, never "wait forever".
+    #[test]
+    fn lifecycle_delegation_deadline_secs_defaults_to_600() {
+        let without_block =
+            RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n").unwrap();
+        assert_eq!(
+            without_block.effective_lifecycle().delegation_deadline_secs,
+            600
+        );
+
+        let without_key = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  queue_depth: 3\n",
+        )
+        .unwrap();
+        let lifecycle = without_key.lifecycle.unwrap();
+        assert_eq!(lifecycle.delegation_deadline_secs, 600);
+        assert_eq!(lifecycle.queue_depth, 3);
+    }
+
+    #[test]
+    fn lifecycle_delegation_deadline_secs_takes_the_declared_value() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
+             delegation_deadline_secs: 30\n",
+        )
+        .unwrap();
+        let lifecycle = manifest.lifecycle.unwrap();
+        assert_eq!(lifecycle.delegation_deadline_secs, 30);
+        // Every other lifecycle field is untouched by declaring this one.
+        assert_eq!(
+            lifecycle.shell_grace_secs,
+            LifecycleConfig::default().shell_grace_secs
+        );
+        assert_eq!(
+            lifecycle.max_task_reopens,
+            LifecycleConfig::default().max_task_reopens
+        );
+    }
+
+    /// Declaring the key produces no unknown-key report, and a misspelling of it still does.
+    #[test]
+    fn lifecycle_delegation_deadline_secs_is_a_known_key() {
+        assert!(RawLifecycleConfig::KNOWN_KEYS.contains(&"delegation_deadline_secs"));
+        let manifest = RuntimeManifest::from_yaml_str(
+            "name: cap\nversion: 0.0.1\nartifacts: []\nlifecycle:\n  \
+             delegation_deadline_secs: 30\n  delegation_deadline: 30\n",
+        )
+        .unwrap();
+        let reported: Vec<(String, String)> = manifest
+            .unknown_keys
+            .iter()
+            .map(|key| (key.key.clone(), key.block_path.clone()))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![("delegation_deadline".to_string(), "lifecycle".to_string())],
+            "the declared key is known and only the misspelt neighbour is reported"
+        );
+        assert_eq!(
+            manifest.lifecycle.unwrap().delegation_deadline_secs,
+            30,
+            "the misspelt neighbour does not disturb the declared value"
+        );
     }
 
     /// `0` is a valid explicit value, not an absent one: it demotes at the first poll after the

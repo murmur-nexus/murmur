@@ -1025,6 +1025,36 @@ struct DelegationEvent {
     reason: Option<String>,
 }
 
+/// One released child ending after its deadline had already been reported, written by the task
+/// loop as it turns the late outcome into a task. Keyed on the same `dlg_` id the delegation's
+/// other two lines carry; no new id space exists for it.
+#[derive(Serialize)]
+struct DelegationLateEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    /// The `dlg_` id the launcher minted. `null` for a delegation the launcher could not name.
+    delegation_id: Option<String>,
+    capsule: String,
+    version: String,
+    /// The child's own session id, so its trace is findable.
+    child_session_id: String,
+    /// `ok`, `error`, `crashed` or `terminated` — how the released child ended, in
+    /// `delegation::DelegationStatus`'s words rather than the four the `delegation` line uses.
+    status: String,
+    /// How long the child ran, from launch to ending.
+    duration_ms: u64,
+    /// How long after the deadline fired the child ended.
+    after_deadline_ms: u64,
+    /// The child's result file, relative to this capsule's accessible workdir. `null` when the
+    /// child wrote none.
+    result_path: Option<String>,
+    /// The `task_id` of the `completion`-origin task that carried this outcome to the agent.
+    completion_task_id: String,
+}
+
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
 
 impl TraceWriter {
@@ -1459,6 +1489,41 @@ impl TraceWriter {
             output_bytes,
             resource_limit,
             status: status.to_string(),
+            completion_task_id: completion_task_id.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// A released child ending after its deadline was already reported, written by the task loop
+    /// as it turns the late outcome into a task. `completion_task_id` is that task's id, so the
+    /// two records join.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_delegation_late(
+        &mut self,
+        delegation_id: Option<String>,
+        capsule: &str,
+        version: &str,
+        child_session_id: &str,
+        status: &str,
+        duration_ms: u64,
+        after_deadline_ms: u64,
+        result_path: Option<String>,
+        completion_task_id: &str,
+    ) -> std::io::Result<()> {
+        let event = DelegationLateEvent {
+            event_type: "delegation_late",
+            event_id: new_event_id(),
+            parent_id: self.session_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            delegation_id,
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            child_session_id: child_session_id.to_string(),
+            status: status.to_string(),
+            duration_ms,
+            after_deadline_ms,
+            result_path,
             completion_task_id: completion_task_id.to_string(),
         };
         self.write_event(&event).await

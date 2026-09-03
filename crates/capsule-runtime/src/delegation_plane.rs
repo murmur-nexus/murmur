@@ -28,23 +28,27 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::child_launch::{launch_child_capsule, ChildLaunchRequest};
+use crate::child_launch::{
+    launch_child_capsule, workdir_relative_to, ChildLaunchRequest, ReleasedChild,
+};
 use crate::delegation::Spawner;
 use crate::http_client::http_json;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
 
-/// How long a delegation waits for its child's answer before ending the delegation.
+/// The deadline a session delegates under when nothing declares one.
 ///
-/// Bounds the poll for a terminal task state and nothing else — reaching the child is already
-/// bounded by [`crate::child_launch`]'s own launch timeout and by [`SEND_DEADLINE`] below. Ten
-/// minutes is long enough for a sub-capsule that thinks, and short enough that a silent one
-/// surfaces as a failed tool call within a turn rather than never.
+/// The same number `murmur_artifact::LifecycleConfig::default().delegation_deadline_secs` carries,
+/// and the value a caller with no manifest to read passes in. Bounds the poll for a terminal task
+/// state and nothing else — reaching the child is already bounded by [`crate::child_launch`]'s own
+/// launch timeout and by [`SEND_DEADLINE`] below. Ten minutes is long enough for a sub-capsule that
+/// thinks, and short enough that a wedged one is reported within a turn rather than never.
 pub const DELEGATION_RESULT_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Environment variable overriding [`DELEGATION_RESULT_TIMEOUT`], in whole seconds.
+/// Environment variable overriding both the declared `lifecycle.delegation_deadline_secs` and
+/// [`DELEGATION_RESULT_TIMEOUT`], in whole seconds.
 ///
-/// For an operator whose sub-capsules legitimately run longer than the default, and for a value
-/// below it. A value that is not a positive integer is ignored and the default stands.
+/// For an operator whose sub-capsules legitimately run longer than the capsule declared, and for a
+/// value below it. A value that is not a positive integer is ignored and the declared bound stands.
 pub const DELEGATION_TIMEOUT_ENV: &str = "MURMUR_DELEGATION_TIMEOUT_SECS";
 
 /// How long the task delivery is retried while the child's listener comes up.
@@ -86,8 +90,8 @@ pub enum DelegationStatus {
     /// A child ran and did not answer: its task ended `failed` or `rejected`, or it could not be
     /// reached or launched after the daemon had approved it.
     Failed,
-    /// No terminal state within [`DelegationPlane::result_timeout`]. The child was killed and
-    /// reaped.
+    /// No terminal state within [`DelegationPlane::result_timeout`]. The parent stopped waiting;
+    /// the child was released rather than stopped, and is reported on separately if it ever ends.
     TimedOut,
     /// The daemon refused, so no child was launched and no child directory exists.
     Refused,
@@ -178,6 +182,32 @@ pub struct DelegationLaunch {
     pub child_workdir: String,
 }
 
+/// One delegation whose deadline expired, handed back with the child it stopped waiting for.
+///
+/// Sent instead of the child being killed: the receiver takes over what happens next — telling the
+/// parent's agent that the deadline passed, and watching the released process for an outcome that
+/// may still arrive.
+#[derive(Debug)]
+pub struct DelegationDeadline {
+    /// The `dlg_` id the launcher minted.
+    pub delegation_id: String,
+    pub capsule: String,
+    pub version: String,
+    /// The session id the child's runtime minted for itself.
+    pub child_session_id: String,
+    /// The child's directory, relative to the parent's accessible workdir.
+    pub child_workdir: String,
+    /// The A2A task id the parent delivered, so the child's per-task result file is findable.
+    pub child_task_id: String,
+    /// The released process's id, so an operator can find it without the parent's help.
+    pub child_pid: u32,
+    /// The bound that expired, in whole seconds.
+    pub deadline_secs: u64,
+    /// The child itself, no longer owned by the plane. Dropping this without watching it forgets
+    /// a running process.
+    pub released: ReleasedChild,
+}
+
 /// The parent's side of one delegation, beyond the three strings its agent supplied.
 ///
 /// Per call rather than per plane: a launch that mints one context id per task has no
@@ -189,6 +219,13 @@ pub struct DelegationOrigin {
     pub context_id: String,
     /// Where the launch notice goes, or `None` for a caller that records no `delegation_start`.
     pub launched: Option<tokio::sync::mpsc::UnboundedSender<DelegationLaunch>>,
+    /// Where a released child goes when the deadline fires, or `None` for a caller with no task
+    /// loop to report into.
+    ///
+    /// `None` means the deadline drops the child and its `Drop` kills it, which is the answer for
+    /// a caller that could not act on a release: a process nothing will ever wait on is worse than
+    /// one that was stopped. Every caller with a task loop supplies a sender.
+    pub released: Option<tokio::sync::mpsc::UnboundedSender<DelegationDeadline>>,
 }
 
 /// One session's authority to delegate, and everything a delegation needs beyond the three
@@ -206,8 +243,10 @@ pub struct DelegationPlane {
     /// The parent's accessible workdir. Child directories are composed beneath it, which is what
     /// keeps a child inside the single preopen the parent's WASI layer already has.
     accessible_workdir: PathBuf,
-    /// This plane's bound on the wait for an answer. Read once at construction so every
-    /// delegation in a session is bounded the same way.
+    /// This plane's bound on the wait for an answer: the declared
+    /// `lifecycle.delegation_deadline_secs`, or [`DELEGATION_TIMEOUT_ENV`] where it names a
+    /// positive number of seconds. Read once at construction so every delegation in a session is
+    /// bounded the same way.
     result_timeout: Duration,
     /// The delegating session's own id, written into every child's injected handle and from there
     /// into that child's `session_start.spawned_by`. Empty for a caller that does not know it,
@@ -219,18 +258,21 @@ impl DelegationPlane {
     /// The plane for a registered session.
     ///
     /// `roost_url`, `credential` and `session_id` come from the session's own registration, never
-    /// from anything the agent said.
+    /// from anything the agent said. `declared_deadline` is the capsule's own
+    /// `lifecycle.delegation_deadline_secs`; [`DELEGATION_TIMEOUT_ENV`] overrides it where it
+    /// names a positive number of seconds.
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
         accessible_workdir: PathBuf,
         session_id: String,
+        declared_deadline: Duration,
     ) -> Self {
         Self {
             roost_url: roost_url.trim_end_matches('/').to_string(),
             credential,
             accessible_workdir,
-            result_timeout: configured_result_timeout(),
+            result_timeout: configured_result_timeout(declared_deadline),
             session_id,
         }
     }
@@ -238,6 +280,12 @@ impl DelegationPlane {
     /// This plane's bound on the wait for a child's answer.
     pub fn result_timeout(&self) -> Duration {
         self.result_timeout
+    }
+
+    /// A child's directory named from the parent's accessible workdir, which is the only root the
+    /// parent's own tools address.
+    fn workdir_relative(&self, workdir: &Path) -> String {
+        workdir_relative_to(workdir, &self.accessible_workdir)
     }
 
     /// Ask the daemon, launch the approved child, deliver the task, and wait for the answer.
@@ -279,7 +327,8 @@ impl DelegationPlane {
 
         // Step 2: launch it here, in this runtime, as a process of its own. `child` owns that
         // process: dropping it — including on every early return below — terminates and reaps the
-        // child rather than leaving it holding a port.
+        // child rather than leaving it holding a port. The one exception is the deadline in step 4,
+        // which releases the child first.
         //
         // `child_env_allow` is empty because the delegating side knows the capsule's name and
         // version and nothing else about its manifest; a delegated child therefore sees no host
@@ -295,7 +344,7 @@ impl DelegationPlane {
                 context_id: origin.context_id.clone(),
                 report_to: None,
             });
-        let child = match launch_child_capsule(ChildLaunchRequest {
+        let mut child = match launch_child_capsule(ChildLaunchRequest {
             parent_accessible_workdir: self.accessible_workdir.clone(),
             capsule_name: request.capsule.clone(),
             capsule_version: request.version.clone(),
@@ -337,11 +386,7 @@ impl DelegationPlane {
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
                 child_session_id: child.session_id.clone(),
-                child_workdir: child
-                    .workdir
-                    .strip_prefix(&self.accessible_workdir)
-                    .map(|path| path.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| child.workdir.to_string_lossy().replace('\\', "/")),
+                child_workdir: self.workdir_relative(&child.workdir),
             });
         }
 
@@ -428,8 +473,8 @@ impl DelegationPlane {
             );
         };
 
-        // Step 4: wait for a terminal state, bounded. On expiry `child` is dropped on the way out
-        // of this function, which kills and reaps it.
+        // Step 4: wait for a terminal state, bounded. On expiry the parent stops waiting; what
+        // happens to the child is decided below.
         let poll_body = json!({
             "jsonrpc": "2.0",
             "id": delegation_id,
@@ -440,12 +485,47 @@ impl DelegationPlane {
         let poll_deadline = Instant::now() + self.result_timeout;
         loop {
             if Instant::now() >= poll_deadline {
+                // The deadline stops the wait, not the child. Releasing hands the process to the
+                // caller's watcher, which is the only thing that will ever reap it — so with no
+                // `released` sender the child is dropped and killed on the way out instead.
+                let child_session_id = child.session_id.clone();
+                let handed_over = match origin.released.as_ref() {
+                    None => false,
+                    Some(releases) => {
+                        let released = child.release();
+                        match releases.send(DelegationDeadline {
+                            delegation_id: delegation_id.clone(),
+                            capsule: request.capsule.clone(),
+                            version: request.version.clone(),
+                            child_session_id: child_session_id.clone(),
+                            child_workdir: self.workdir_relative(&child.workdir),
+                            child_task_id: task_id.to_string(),
+                            child_pid: released.pid(),
+                            deadline_secs: self.result_timeout.as_secs(),
+                            released,
+                        }) {
+                            Ok(()) => true,
+                            // The receiver is gone, so nothing will ever watch or reap this
+                            // process: the release is undone by ending it here, and the tool
+                            // result below says so.
+                            Err(tokio::sync::mpsc::error::SendError(notice)) => {
+                                notice.released.end();
+                                false
+                            }
+                        }
+                    }
+                };
+                let fate = if handed_over {
+                    "the parent stopped waiting and the capsule was left running; if it ever \
+                     finishes, its outcome arrives as a separate task"
+                } else {
+                    "the delegation was ended and the child was stopped"
+                };
                 return outcome(
                     DelegationStatus::TimedOut,
-                    &child.session_id,
+                    &child_session_id,
                     format!(
-                        "capsule '{}' did not answer within {}s; the delegation was ended and the \
-                         child was stopped",
+                        "capsule '{}' did not answer within {}s; {fate}",
                         request.capsule,
                         self.result_timeout.as_secs()
                     ),
@@ -518,26 +598,16 @@ impl DelegationPlane {
 
 /// Where a finished child left its answer, and what it says.
 ///
-/// Four candidates, most specific first. A capsule that stays up for more than one task overwrites
-/// the unsuffixed file, so the per-task one is preferred; and the agent loop writes into the
-/// session directory beneath the child's workdir while a script capsule writes into that workdir
-/// directly, which is the same two-place rule `runtime::DelegationReport::result_path` follows.
+/// The candidate list is [`crate::delegation::child_result_candidates`], so the file this plane
+/// reads and the file the released-child watcher names are found by one rule.
 fn read_child_result(
     child_workdir: &Path,
     session_id: &str,
     task_id: &str,
 ) -> Option<(PathBuf, String)> {
-    let session_out = child_workdir.join(".murmur").join(session_id).join("out");
-    let workdir_out = child_workdir.join("out");
-    let per_task = format!("result_{task_id}.txt");
-    [
-        session_out.join(&per_task),
-        session_out.join("result.txt"),
-        workdir_out.join(&per_task),
-        workdir_out.join("result.txt"),
-    ]
-    .into_iter()
-    .find_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+    crate::delegation::child_result_candidates(child_workdir, session_id, task_id)
+        .into_iter()
+        .find_map(|path| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
 }
 
 /// `output` cut to [`MAX_OUTPUT_BYTES`] at a character boundary, with the cut marked.
@@ -549,20 +619,28 @@ fn bound_output(output: String) -> String {
     format!("{} […]", &output[..end])
 }
 
-/// The bound this process delegates under: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
-/// number of seconds, and [`DELEGATION_RESULT_TIMEOUT`] otherwise.
-fn configured_result_timeout() -> Duration {
-    result_timeout_from(std::env::var(DELEGATION_TIMEOUT_ENV).ok().as_deref())
+/// The bound this session delegates under: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
+/// number of seconds, and `declared` — the capsule's own `lifecycle.delegation_deadline_secs` —
+/// otherwise.
+fn configured_result_timeout(declared: Duration) -> Duration {
+    result_timeout_from(
+        std::env::var(DELEGATION_TIMEOUT_ENV).ok().as_deref(),
+        declared,
+    )
 }
 
 /// [`configured_result_timeout`]'s rule, without the environment read, so it is testable without
 /// mutating process-wide state that every other test in this binary shares.
-fn result_timeout_from(value: Option<&str>) -> Duration {
+///
+/// `declared` is taken as written, including zero: a capsule that declares `0` means the first
+/// poll gives up. The override is only honoured for a positive integer, because an operator who
+/// exported nonsense meant to change nothing rather than to remove the bound.
+fn result_timeout_from(value: Option<&str>, declared: Duration) -> Duration {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs)
-        .unwrap_or(DELEGATION_RESULT_TIMEOUT)
+        .unwrap_or(declared)
 }
 
 /// The daemon's own refusal, lifted out of the transport error it arrived wrapped in.
@@ -626,14 +704,32 @@ mod tests {
     /// positive number of seconds does not name one.
     #[test]
     fn the_result_timeout_reads_its_override() {
-        assert_eq!(result_timeout_from(Some(" 20 ")), Duration::from_secs(20));
+        let declared = Duration::from_secs(30);
+        assert_eq!(
+            result_timeout_from(Some(" 20 "), declared),
+            Duration::from_secs(20)
+        );
         for ignored in [None, Some(""), Some("0"), Some("-5"), Some("later")] {
             assert_eq!(
-                result_timeout_from(ignored),
-                DELEGATION_RESULT_TIMEOUT,
-                "{ignored:?} is not a positive number of seconds"
+                result_timeout_from(ignored, declared),
+                declared,
+                "{ignored:?} is not a positive number of seconds, so the declared bound stands"
             );
         }
+    }
+
+    /// The declared bound is the whole of the fallback, and a capsule that declares `0` means it.
+    #[test]
+    fn a_declared_deadline_of_zero_is_a_bound_and_not_an_absence() {
+        assert_eq!(
+            result_timeout_from(None, Duration::ZERO),
+            Duration::ZERO,
+            "0 gives up at the first poll rather than falling back to the default"
+        );
+        assert_eq!(
+            result_timeout_from(None, DELEGATION_RESULT_TIMEOUT),
+            DELEGATION_RESULT_TIMEOUT
+        );
     }
 
     /// The ceiling holds on every status, not only on an answer: a child's failure message and a
@@ -672,6 +768,7 @@ mod tests {
             SpawnCredential::new("msc1.test".to_string()),
             PathBuf::from("/tmp"),
             "ses_parent".to_string(),
+            DELEGATION_RESULT_TIMEOUT,
         );
         assert_eq!(plane.roost_url, "http://127.0.0.1:7700");
     }

@@ -617,11 +617,14 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     // and the bounded wait — belongs to `DelegationPlane`, and a capsule step is input and output
     // marshalling around it. The agent-facing `delegate-task` tool calls the same code, so there
     // is one delegation mechanism in this crate rather than two that drift.
+    // A plan step reads no manifest of its own here, so it delegates under the default bound
+    // rather than under a declared one.
     let plane = DelegationPlane::new(
         roost_url,
         credential.clone(),
         ctx.workdir.clone(),
         ctx.current_session_id.clone().unwrap_or_default(),
+        crate::delegation_plane::DELEGATION_RESULT_TIMEOUT,
     );
     // A plan step holds no conversation id and no trace appender, so its child is launched
     // without a handle and the step writes no delegation records — the same as before lineage

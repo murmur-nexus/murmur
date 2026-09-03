@@ -89,7 +89,8 @@ pub use sealed::{
 // rather than duplicating the delegation probe once per crate that has to skip on it.
 pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
 pub use child_launch::{
-    child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
+    child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, ReleasedChild,
+    MUR_BINARY_ENV,
 };
 // The delegation types and constants stay module-qualified beyond these: `Spawner` and
 // `SpawnerHandle` are what a caller of `launch_child_capsule` composes, and the rest of the
@@ -99,8 +100,8 @@ pub use delegation::{CompletionAddress, Spawner, SpawnerHandle};
 // only through the `delegate-task` dispatch branch, so what leaves this crate is the vocabulary a
 // reader of a trace or a tool result needs, plus the bound and its override.
 pub use delegation_plane::{
-    DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest, DelegationResult,
-    DELEGATION_RESULT_TIMEOUT, DELEGATION_TIMEOUT_ENV,
+    DelegationDeadline, DelegationLaunch, DelegationOrigin, DelegationPlane, DelegationRequest,
+    DelegationResult, DELEGATION_RESULT_TIMEOUT, DELEGATION_TIMEOUT_ENV,
 };
 // `reachability` is a private module, but both of its entry points are consumed from
 // `murmur-cli`'s `mur doctor` as well as from `stage_session`, so they are re-exported here — the

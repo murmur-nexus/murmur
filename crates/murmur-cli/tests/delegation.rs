@@ -54,11 +54,22 @@ const WORKER: &str = "worker";
 const GREEDY_WORKER: &str = "greedy-worker";
 /// The sub-capsule whose inference endpoint never answers, so its task never leaves `working`.
 const MUTE_WORKER: &str = "mute-worker";
+/// The sub-capsule whose inference endpoint answers only after the deadline has passed, and which
+/// then exits — so its parent is told twice about one delegation.
+const LATE_WORKER: &str = "late-worker";
 /// The sub-capsule the recording proxy refuses on the daemon's behalf, with the daemon's own
 /// depth-bound sentence. Never launched, so nothing about it beyond the name matters.
 const DEEP_WORKER: &str = "deep-worker";
 
 const WORKER_ANSWER: &str = "WORKER-ANSWER-4K2P-DELEGATED";
+/// The late sub-capsule's answer. Spelled nowhere else, so finding it in a task the parent's agent
+/// was handed would mean the child's output travelled with the report rather than staying in its
+/// file.
+const LATE_ANSWER: &str = "LATE-ANSWER-7Q9X-AFTER-DEADLINE";
+
+/// How long past [`TIMEOUT_SECS`] the late sub-capsule's endpoint holds its answer. Long enough
+/// that the parent's deadline is certainly reported first, short enough for a test.
+const LATE_ANSWER_DELAY_SECS: u64 = TIMEOUT_SECS + 12;
 
 /// The bound every delegation in this file runs under, short enough that the silent-child case
 /// finishes in a test and long enough that a launched child gets its turn.
@@ -386,6 +397,35 @@ fn always_replying(text: &str) -> String {
     endpoint
 }
 
+/// An inference endpoint that answers, eventually — for a sub-capsule that finishes only after its
+/// parent has stopped waiting for it.
+///
+/// One thread per connection, because a capsule that is held here for half a minute must not hold
+/// up the next capsule's first turn.
+fn slowly_replying(delay: Duration, text: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let body = end_turn_response(text);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let body = body.clone();
+            thread::spawn(move || {
+                let mut stream = stream;
+                let _ = read_framed_request(&mut stream);
+                thread::sleep(delay);
+                let raw = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(raw.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    endpoint
+}
+
 /// An inference endpoint that accepts a connection and never answers on it, for a sub-capsule that
 /// goes silent mid-task.
 fn never_replying() -> String {
@@ -547,7 +587,8 @@ fn suite() -> &'static Suite {
             &format!(
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [127.0.0.1]\n  \
-                 spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}, {DEEP_WORKER}]\n"
+                 spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}, {LATE_WORKER}, \
+                 {DEEP_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -578,6 +619,18 @@ fn suite() -> &'static Suite {
             MUTE_WORKER,
             VERSION,
             &agent_capsule_manifest(&never_replying()),
+            None,
+        );
+        // The sub-capsule that answers after its parent has given up. `after_task: exit` is the
+        // point of it: a released child that never ends is never reported on, so this one finishes
+        // its task and goes, which is what the released-child watcher is waiting to see.
+        roost.publish(
+            LATE_WORKER,
+            VERSION,
+            &agent_capsule_manifest_with(
+                &slowly_replying(Duration::from_secs(LATE_ANSWER_DELAY_SECS), LATE_ANSWER),
+                "task_acceptance: single\n  after_task: exit",
+            ),
             None,
         );
         // The sub-capsule a bound refuses. Published so the parent's own manifest can name it;
@@ -612,10 +665,16 @@ fn mur_binary() -> PathBuf {
 /// `after_task: sleep` is not decoration: a delegation reads its answer with an A2A `tasks/get`,
 /// so the capsule that produced it has to still be listening when the read happens.
 fn agent_capsule_manifest(endpoint: &str) -> String {
+    agent_capsule_manifest_with(endpoint, "task_acceptance: queue\n  after_task: sleep")
+}
+
+/// The same, under a stated `lifecycle:` body — for the one sub-capsule that has to exit rather
+/// than stay up.
+fn agent_capsule_manifest_with(endpoint: &str, lifecycle: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
          capabilities:\n  network:\n    allow: [{authority}]\n\
-         lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
+         lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
          api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
         authority = endpoint.trim_start_matches("http://"),
@@ -982,6 +1041,107 @@ fn child_events(child_dir: &Path, child_session_id: &str) -> Vec<Value> {
     )
 }
 
+/// Every `task_start` line whose task was one this runtime enqueued for itself.
+fn completion_starts(parent: &Parent) -> Vec<Value> {
+    parent
+        .events("task_start")
+        .into_iter()
+        .filter(|event| event["origin"] == "completion")
+        .collect()
+}
+
+/// Wait until the parent has started at least `count` `completion`-origin tasks.
+fn await_completion_starts(parent: &Parent, count: usize, within: Duration) -> Vec<Value> {
+    let deadline = Instant::now() + within;
+    loop {
+        let started = completion_starts(parent);
+        if started.len() >= count {
+            return started;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} completion-origin tasks; the parent started {}",
+            started.len()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The first user message the parent's model was shown that contains `needle` — the text the
+/// agent was actually handed, read from the wire rather than rebuilt.
+fn await_model_message(parent: &Parent, needle: &str, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        for request in parent.server.requests() {
+            for message in request
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if message.get("role").and_then(Value::as_str) != Some("user") {
+                    continue;
+                }
+                for text in message_texts(message.get("content")) {
+                    if text.contains(needle) {
+                        return text;
+                    }
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the model was never shown a message containing {needle:?}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The line the parent's deadline report opens with, and the needle every case that waits for one
+/// looks for.
+const DEADLINE_OPENING: &str = "Delegated capsule did not answer before the delegation deadline.";
+
+/// End the capsule a deadline released, which is what nothing in the runtime will ever do.
+///
+/// A released capsule that never finishes its task never ends, so a suite that leaves one behind
+/// leaks a process for the life of the machine. The pid is read from the deadline report, because
+/// naming it is what makes an operator able to do this too.
+fn reap_released_child(parent: &Parent) {
+    let handed = await_model_message(parent, DEADLINE_OPENING, Duration::from_secs(240));
+    let pid = handed
+        .lines()
+        .find_map(|line| line.strip_prefix("pid: "))
+        .unwrap_or_else(|| panic!("the deadline report names the released process: {handed}"));
+    assert!(
+        std::process::Command::new("kill")
+            .arg(pid)
+            .status()
+            .is_ok_and(|status| status.success()),
+        "the released capsule is still running under pid {pid}"
+    );
+}
+
+/// The first line of a task's own text, with the untrusted-content fence the runtime wraps every
+/// completion in taken off.
+fn opening_line(text: &str) -> &str {
+    text.lines()
+        .find(|line| !line.starts_with("<untrusted-content"))
+        .unwrap_or_default()
+}
+
+/// Every text an Anthropic message `content` carries, whichever of its two shapes it is in.
+fn message_texts(content: Option<&Value>) -> Vec<String> {
+    match content {
+        Some(Value::String(text)) => vec![text.clone()],
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The one event of `event_type` in `events`.
 fn only_event<'a>(events: &'a [Value], event_type: &str) -> &'a Value {
     let matching: Vec<&Value> = events
@@ -1031,7 +1191,8 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
-const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, greedy-worker, mute-worker, deep-worker]\n";
+const SPAWN_YAML: &str =
+    "  spawn:\n    allow: [worker, greedy-worker, mute-worker, late-worker, deep-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
 
@@ -1069,7 +1230,7 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     );
     assert_eq!(
         schema["properties"]["capsule"]["enum"],
-        json!([WORKER, GREEDY_WORKER, MUTE_WORKER, DEEP_WORKER]),
+        json!([WORKER, GREEDY_WORKER, MUTE_WORKER, LATE_WORKER, DEEP_WORKER]),
         "the enum is this capsule's own spawn.allow"
     );
 
@@ -1144,6 +1305,16 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     let child_start = only_event(&child_trace, "session_start");
     assert_eq!(child_start["spawned_by"], json!(parent.session_id()));
     assert_eq!(child_start["delegation_id"], json!(delegation_id));
+
+    // A child that answered in time is reported once, as the tool result. Nothing about the
+    // delegation deadline runs: no `completion`-origin task is enqueued and no late outcome is
+    // recorded, so the parent is told exactly once.
+    assert!(
+        completion_starts(&parent).is_empty(),
+        "a delegation that answered enqueues no completion-origin task: {:?}",
+        completion_starts(&parent)
+    );
+    assert!(parent.events("delegation_late").is_empty());
 
     // The relationship is recorded once, and by that name. `parent_id` is the event-tree edge and
     // names an `event_id`, never a session.
@@ -1362,8 +1533,11 @@ fn a_bound_refusal_reaches_the_parents_trace_unaltered() {
     assert!(parent.child_dirs().is_empty(), "no child directory exists");
 }
 
-/// A child that never answers fails the call. It does not hang the parent, and it does not
-/// survive the delegation that gave up on it.
+/// A child that never answers ends the wait, not the child.
+///
+/// The call comes back `timed_out` rather than hanging, the capsule is left running, and the
+/// parent's agent is told so in a task of its own — because "it never answered" and "it failed"
+/// call for different next moves, and only one of them is a retry.
 #[test]
 fn a_silent_child_fails_the_call_rather_than_hanging_the_parent() {
     if common::skip_without_host_support(
@@ -1416,12 +1590,187 @@ fn a_silent_child_fails_the_call_rather_than_hanging_the_parent() {
         position_of(&trace, "delegation_start") < position_of(&trace, "delegation"),
         "the launch is on disk before the ending is"
     );
+    let delegation_id = started["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let child_session_id = started["child_session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let child_workdir = started["child_workdir"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // One further task, in the background lane, naming the deadline.
+    parent.server.push(end_turn_response("noted the deadline"));
+    let started_tasks = await_completion_starts(&parent, 1, Duration::from_secs(180));
+    assert_eq!(started_tasks.len(), 1, "{started_tasks:?}");
+    let deadline_start = &started_tasks[0];
+    assert_eq!(deadline_start["origin"], "completion", "{deadline_start}");
+    assert_eq!(deadline_start["lane"], "bg", "{deadline_start}");
+    assert_eq!(
+        deadline_start["source"], "delegation_deadline",
+        "{deadline_start}"
+    );
+    assert_eq!(
+        deadline_start["delegation_id"],
+        json!(delegation_id),
+        "the deadline task joins the delegation the launch line opened: {deadline_start}"
+    );
+
+    // And the text the agent was handed says what happened, in words that are not a failure.
+    let handed = await_model_message(&parent, DEADLINE_OPENING, Duration::from_secs(180));
+    assert!(
+        handed.contains(&format!("deadline_secs: {TIMEOUT_SECS}")),
+        "{handed}"
+    );
+    assert!(
+        handed.contains(&format!("delegation_id: {delegation_id}")),
+        "{handed}"
+    );
+    assert!(
+        handed.contains(&format!("capsule: {MUTE_WORKER}@{VERSION}")),
+        "{handed}"
+    );
+    assert!(
+        handed.contains(&format!("session_id: {child_session_id}")),
+        "{handed}"
+    );
+    assert!(handed.contains(&child_workdir), "{handed}");
+    assert!(handed.contains("was not stopped"), "{handed}");
+    assert!(handed.contains("still be running"), "{handed}");
+    assert!(handed.contains("did not answer"), "{handed}");
 
     // The parent is still its own capsule afterwards: it answers the next turn.
     parent.server.push(end_turn_response("still here"));
     let task_id = parent.submit("msg-after-timeout", "are you there");
     parent.await_task(&task_id, Duration::from_secs(120));
     assert_eq!(parent.task_state(&task_id), "completed");
+
+    reap_released_child(&parent);
+}
+
+/// A child that answers after the deadline is reported a second time, and marked as second.
+///
+/// Two `completion`-origin tasks for one delegation and never a third: the deadline, then the
+/// outcome that arrived once nobody was waiting for it. Both carry the same `dlg_` id, and the
+/// second names the result file rather than carrying what is in it.
+#[test]
+fn a_late_answer_is_reported_once_more_and_told_apart_from_the_first() {
+    if common::skip_without_host_support(
+        "a_late_answer_is_reported_once_more_and_told_apart_from_the_first",
+    ) {
+        return;
+    }
+    let parent = Parent::launch(PARENT, SPAWN_YAML);
+
+    let text = parent.delegate("toolu_late", LATE_WORKER, VERSION, "take your time");
+    let result: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
+    assert_eq!(result["status"], "timed_out", "{result}");
+    let delegation_id = result["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(delegation_id.starts_with("dlg_"), "{result}");
+    let child_session_id = result["session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // First the deadline, then the outcome. Each completion-origin task runs a turn of its own, so
+    // each needs its own scripted answer.
+    parent.server.push(end_turn_response("noted the deadline"));
+    let deadline_text = await_model_message(&parent, DEADLINE_OPENING, Duration::from_secs(180));
+    parent
+        .server
+        .push(end_turn_response("noted the late outcome"));
+    let late_text = await_model_message(
+        &parent,
+        "Delegated capsule finished after its deadline was already reported.",
+        Duration::from_secs(300),
+    );
+
+    // The two tasks, in that order, both joined to the one delegation.
+    let started = await_completion_starts(&parent, 2, Duration::from_secs(60));
+    assert_eq!(started.len(), 2, "{started:?}");
+    let sources: Vec<&str> = started
+        .iter()
+        .map(|event| event["source"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(sources, vec!["delegation_deadline", "delegation_late"]);
+    for event in &started {
+        assert_eq!(event["origin"], "completion", "{event}");
+        assert_eq!(event["lane"], "bg", "{event}");
+        assert_eq!(event["delegation_id"], json!(delegation_id), "{event}");
+    }
+    assert_ne!(
+        opening_line(&deadline_text),
+        opening_line(&late_text),
+        "the second telling opens differently from the first"
+    );
+
+    // What the late text says, and what it deliberately does not carry.
+    assert!(
+        late_text.contains(&format!("delegation_id: {delegation_id}")),
+        "{late_text}"
+    );
+    assert!(
+        late_text.contains(&format!("capsule: {LATE_WORKER}@{VERSION}")),
+        "{late_text}"
+    );
+    assert!(
+        late_text.contains(&format!("session_id: {child_session_id}")),
+        "{late_text}"
+    );
+    assert!(late_text.contains("status: ok"), "{late_text}");
+    assert!(late_text.contains("duration_ms: "), "{late_text}");
+    assert!(late_text.contains("after_deadline_ms: "), "{late_text}");
+    assert!(
+        late_text.contains(&format!("result: .murmur/children/{LATE_WORKER}-")),
+        "the late report names the result file: {late_text}"
+    );
+    assert!(
+        !late_text.contains(LATE_ANSWER),
+        "the child's answer stays in its file: {late_text}"
+    );
+
+    // The child's own directory holds the launcher's record of the outcome, delivered.
+    let child_dir = parent.only_child_dir();
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(child_dir.join("completion.json"))
+            .expect("the released child's outcome is recorded in its own directory"),
+    )
+    .unwrap();
+    assert_eq!(completion["reported_by"], "launcher", "{completion}");
+    assert_eq!(completion["delivered"], json!(true), "{completion}");
+    assert_eq!(completion["status"], "ok", "{completion}");
+    assert_eq!(
+        completion["delegation_id"],
+        json!(delegation_id),
+        "{completion}"
+    );
+
+    // One `delegation_late` line, joined to the task that carried it.
+    let late_events = parent.events("delegation_late");
+    assert_eq!(late_events.len(), 1, "{late_events:?}");
+    assert_eq!(late_events[0]["delegation_id"], json!(delegation_id));
+    assert_eq!(late_events[0]["status"], "ok", "{}", late_events[0]);
+    assert_eq!(
+        late_events[0]["completion_task_id"], started[1]["task_id"],
+        "the record and the task it produced name each other"
+    );
+
+    // And no third. The deadline branch runs once and the watcher sends once, so there is nothing
+    // left that could report a third time.
+    thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        completion_starts(&parent).len(),
+        2,
+        "no third report exists"
+    );
 }
 
 /// The parent stays reachable while a child runs: the wait is on a blocking thread, not on the
@@ -1467,6 +1816,8 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
     assert_eq!(parent.task_state(&task_id), "working");
 
     parent.await_task(&task_id, Duration::from_secs(300));
+    // This delegation ended at its deadline, so its child was released rather than stopped.
+    reap_released_child(&parent);
 }
 
 /// Lineage survives a resume of the parent, with no field added and nothing rewritten.
