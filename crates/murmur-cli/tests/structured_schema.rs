@@ -1,14 +1,11 @@
 //! What `mur run` actually delivers to a capsule, and what it leaves behind.
 //!
-//! These tests once asserted a structured task envelope — an `input.json` written into the
-//! workdir, an `out/result.json` written back, and an `Objective:`/`Instructions:` rendering in
-//! between. None of that machinery exists: `--task` writes `task.md`, `read_task` reads it (then
-//! falls back to `input.txt`), the text reaches the model verbatim, and `write_result` writes
-//! `out/result.txt` and nothing else. The `CodeTaskRequest`/`CodeTaskResult`/`MurmurMessage`
-//! types that envelope was built on have since been deleted, having had no reader anywhere. The
-//! assertions below cover the path that is really there; see
-//! `.nexus/roadmap/dag-capsule-step-workdir-and-input-routing-gap.md` for the open question of
-//! whether structured task routing should exist at all.
+//! A task reaches a capsule as text and comes back as text: `--task` writes `task.md`,
+//! `read_task` reads it (then falls back to `input.txt`), the text reaches the model verbatim,
+//! and `write_result` writes `out/result.txt` and nothing else. There is no structured task
+//! envelope, and there is not going to be one — an envelope has no reader on this side, so it
+//! would arrive as prose for the model to decode. A delegating parent obeys the same contract:
+//! `plan::capsule_task_text` refuses a capsule step whose input is anything but task text.
 
 #[path = "common/mod.rs"]
 mod common;
