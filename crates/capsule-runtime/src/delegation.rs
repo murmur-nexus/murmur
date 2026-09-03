@@ -334,7 +334,7 @@ impl DelegationOutcome {
 }
 
 /// `detail` cut to [`MAX_DETAIL_BYTES`] at a character boundary, with the cut marked.
-fn bound_detail(detail: String) -> String {
+pub(crate) fn bound_detail(detail: String) -> String {
     if detail.len() <= MAX_DETAIL_BYTES {
         return detail;
     }
@@ -343,6 +343,36 @@ fn bound_detail(detail: String) -> String {
         end -= 1;
     }
     format!("{} […]", &detail[..end])
+}
+
+/// Where a finished child may have left its answer, most specific first.
+///
+/// A capsule that stays up for more than one task overwrites the unsuffixed file, so the per-task
+/// one is preferred; and the agent loop writes into the session directory beneath the child's
+/// workdir while a script capsule writes into that workdir directly. One rule, read by the
+/// delegating plane when it takes the answer and by the released-child watcher when it names the
+/// file it did not read.
+pub fn child_result_candidates(
+    child_workdir: &Path,
+    session_id: &str,
+    task_id: &str,
+) -> [PathBuf; 4] {
+    let session_out = child_workdir.join(".murmur").join(session_id).join("out");
+    let workdir_out = child_workdir.join("out");
+    let per_task = format!("result_{task_id}.txt");
+    [
+        session_out.join(&per_task),
+        session_out.join("result.txt"),
+        workdir_out.join(&per_task),
+        workdir_out.join("result.txt"),
+    ]
+}
+
+/// The first of [`child_result_candidates`] that exists, or `None` when the child wrote no result.
+pub fn child_result_path(child_workdir: &Path, session_id: &str, task_id: &str) -> Option<PathBuf> {
+    child_result_candidates(child_workdir, session_id, task_id)
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 /// Where a child's own record of its ending goes: `<child workdir>/completion.json`.

@@ -781,6 +781,37 @@ fn dropping_a_launched_child_terminates_and_reaps_it() {
     );
 }
 
+/// `release` is the one way out of that: the parent stops owning the child's lifetime, and
+/// dropping the handle afterwards signals nothing. The process keeps running, and this suite ends
+/// it itself, because after a release nothing in the runtime will.
+#[test]
+fn a_released_child_survives_the_handle_that_launched_it() {
+    let parent = Parent::new();
+    let pid = {
+        let mut child = parent.launch("child-agent", &[]);
+        let pid = child.pid();
+        assert!(process_is_alive(pid));
+
+        let released = child.release();
+        assert_eq!(released.pid(), pid, "the release names the same process");
+        assert_eq!(released.session_id, child.session_id);
+        pid
+    };
+
+    // Long enough that a `Drop` which killed would have been observed.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        process_is_alive(pid),
+        "a released child is not signalled when its launch handle is dropped"
+    );
+
+    // Nothing owns this process now, so the test ends it rather than leaving it holding a daemon
+    // slot for the life of the binary.
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+}
+
 #[cfg(target_os = "linux")]
 fn process_is_alive(pid: u32) -> bool {
     // A reaped child has no `/proc` entry at all; a zombie would still have one, which is exactly

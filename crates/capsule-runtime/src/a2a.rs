@@ -370,10 +370,10 @@ pub(crate) struct IncomingTask {
     /// that arrived over the peer door, `"detached_shell"` for a completion the runtime produced
     /// locally. The `a2a_task_received` record is written only for the former.
     pub source: &'static str,
-    /// The delegation this task reports the completion of, for a task the door classified
-    /// `completion` and carrying [`crate::delegation::DELEGATION_ID_HEADER`]. `None` for every
-    /// other task, including a locally produced detached-shell completion, which reports on a
-    /// work id rather than a delegation.
+    /// The delegation this task reports on: one the door classified `completion` and carrying
+    /// [`crate::delegation::DELEGATION_ID_HEADER`], or one this runtime's own deadline or
+    /// released-child watcher reported. `None` for every other task, including a locally produced
+    /// detached-shell completion, which reports on a work id rather than a delegation.
     pub delegation_id: Option<String>,
 }
 
@@ -387,6 +387,15 @@ pub(crate) const SOURCE_DETACHED_SHELL: &str = "detached_shell";
 /// session it resumes never accounted for. Distinct from [`SOURCE_DETACHED_SHELL`] because the
 /// two say opposite things: one carries a result, the other says no result exists.
 pub(crate) const SOURCE_DETACHED_LOST: &str = "detached_lost";
+
+/// The `source` of a task the runtime enqueued for itself when a delegation reached its
+/// `lifecycle.delegation_deadline_secs` and the parent stopped waiting.
+pub(crate) const SOURCE_DELEGATION_DEADLINE: &str = "delegation_deadline";
+
+/// The `source` of a task reporting a released child that ended after its deadline had already
+/// been reported. Distinct from [`SOURCE_DELEGATION_DEADLINE`] because the two say opposite
+/// things: one says nothing is known yet, the other carries the outcome.
+pub(crate) const SOURCE_DELEGATION_LATE: &str = "delegation_late";
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 

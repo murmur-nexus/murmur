@@ -169,19 +169,33 @@ pub(crate) fn demotion_tool_result(work_id: &str) -> ToolResult {
 /// (which completes it), so the session-end sweep has one place to ask what is still running.
 pub(crate) struct DetachedRegistry {
     outstanding: Mutex<BTreeMap<String, DetachedWork>>,
-    completions: UnboundedSender<DetachedCompletion>,
+    /// Every report the task loop turns into a `completion`-origin task, not only a demoted
+    /// command's. A delegation that outran its deadline arrives here too, so one channel feeds one
+    /// enqueue path and the admission rule cannot differ between them.
+    reports: UnboundedSender<DetachedReport>,
 }
 
 impl DetachedRegistry {
-    pub(crate) fn new() -> (Arc<Self>, UnboundedReceiver<DetachedCompletion>) {
-        let (completions, receiver) = unbounded_channel();
+    pub(crate) fn new() -> (Arc<Self>, UnboundedReceiver<DetachedReport>) {
+        let (reports, receiver) = unbounded_channel();
         (
             Arc::new(Self {
                 outstanding: Mutex::new(BTreeMap::new()),
-                completions,
+                reports,
             }),
             receiver,
         )
+    }
+
+    /// A sender onto the same channel, for a reporter that outlives the call that made it — the
+    /// released-child watcher, which runs on a thread of its own and reports once, later.
+    pub(crate) fn sender(&self) -> UnboundedSender<DetachedReport> {
+        self.reports.clone()
+    }
+
+    /// Hand the task loop one report. A send that fails means the loop is gone.
+    pub(crate) fn report(&self, report: DetachedReport) {
+        let _ = self.reports.send(report);
     }
 
     /// Record a demoted command. Called before the dispatch returns its handle, so the
@@ -203,7 +217,7 @@ impl DetachedRegistry {
             .lock()
             .expect("detached registry mutex")
             .remove(&completion.work_id);
-        let _ = self.completions.send(completion);
+        self.report(DetachedReport::Completed(completion));
     }
 
     /// Every command demoted and not yet completed, oldest work id first.
@@ -321,14 +335,154 @@ impl LostReport {
     }
 }
 
+// -- A delegation that outran its deadline ------------------------------------
+
+/// A delegation whose child did not answer inside `lifecycle.delegation_deadline_secs`.
+///
+/// The parent stopped waiting; the child was released rather than stopped. Carries no exit status
+/// and names no result file, because at this instant neither exists: the whole point of the record
+/// is that nothing is yet known about how the work went.
+#[derive(Debug, Clone)]
+pub(crate) struct DelegationDeadlineReport {
+    /// The `dlg_` id the launcher minted, the same one this delegation's `delegation_start` and
+    /// `delegation` lines carry. Empty for a delegation the launcher could not name.
+    pub delegation_id: String,
+    pub capsule_name: String,
+    pub capsule_version: String,
+    /// The child's own session, so its trace is findable.
+    pub child_session_id: String,
+    /// The child's directory, relative to the parent's accessible workdir.
+    pub child_workdir: String,
+    /// The released child's process id, so an operator can find it without the parent's help.
+    pub child_pid: u32,
+    /// The bound that expired, in whole seconds.
+    pub deadline_secs: u64,
+    /// The conversation the delegation was made from, so the task joins that thread.
+    pub context_id: String,
+    /// Stamped [`TaskOrigin::Completion`] with the delegating task's trust inherited.
+    pub provenance: TaskProvenance,
+}
+
+impl DelegationDeadlineReport {
+    /// The `IncomingTask.message_text` the agent reads.
+    ///
+    /// Shares no opening line with [`DelegationLateReport::message_text`] or with
+    /// [`crate::delegation::DelegationOutcome::message_text`]. An agent that cannot tell "it
+    /// failed" from "it never answered" retries, and the second run of a task whose first run is
+    /// still going is exactly what this record exists to prevent.
+    pub(crate) fn message_text(&self) -> String {
+        format!(
+            "Delegated capsule did not answer before the delegation deadline.\n\
+             delegation_id: {}\n\
+             capsule: {}@{}\n\
+             session_id: {}\n\
+             deadline_secs: {}\n\
+             pid: {}\n\
+             workdir: {} (in this capsule's workdir)\n\
+             \n\
+             This is not a failure and not an answer: the capsule was still working when the \
+             deadline passed. It was not stopped and may still be running. Nothing is known about \
+             whether the work succeeded, so do not treat it as failed, and do not delegate the \
+             same task again — a second run would run alongside the first. If the capsule does \
+             finish, a further task will arrive saying so.",
+            self.delegation_id,
+            self.capsule_name,
+            self.capsule_version,
+            self.child_session_id,
+            self.deadline_secs,
+            self.child_pid,
+            self.child_workdir,
+        )
+    }
+}
+
+/// A released child that ended after its deadline had already been reported.
+///
+/// The second of the two things the parent is told about one delegation, and marked as second in
+/// its own first line. Names the result file and never its text, on the same terms
+/// [`crate::delegation::DelegationOutcome`] does.
+#[derive(Debug, Clone)]
+pub(crate) struct DelegationLateReport {
+    /// The same `dlg_` id the deadline report carried. Empty for a delegation the launcher could
+    /// not name.
+    pub delegation_id: String,
+    pub capsule_name: String,
+    pub capsule_version: String,
+    pub child_session_id: String,
+    /// The child's directory, relative to the parent's accessible workdir.
+    pub child_workdir: String,
+    /// How the released child ended, in the vocabulary a child's ending is described in.
+    pub status: crate::delegation::DelegationStatus,
+    /// How long the child ran, from launch to ending.
+    pub duration_ms: u64,
+    /// How long after the deadline fired the child ended.
+    pub after_deadline_ms: u64,
+    /// The bound that had already expired, in whole seconds.
+    pub deadline_secs: u64,
+    /// Where the child's answer is, relative to the parent's accessible workdir. `None` when the
+    /// child wrote no result file.
+    pub result_path: Option<String>,
+    /// The exit status, and the child's bounded stderr tail when it ended badly. Capped at
+    /// [`crate::delegation::MAX_DETAIL_BYTES`].
+    pub detail: Option<String>,
+    pub context_id: String,
+    /// Stamped [`TaskOrigin::Completion`] with the delegating task's trust inherited.
+    pub provenance: TaskProvenance,
+}
+
+impl DelegationLateReport {
+    /// The `IncomingTask.message_text` the agent reads. Opens by saying this outcome is the
+    /// second word on one delegation, so it is never read as a first report of a new one.
+    pub(crate) fn message_text(&self) -> String {
+        let mut text = format!(
+            "Delegated capsule finished after its deadline was already reported.\n\
+             delegation_id: {}\n\
+             capsule: {}@{}\n\
+             session_id: {}\n\
+             status: {}\n\
+             duration_ms: {}\n\
+             deadline_secs: {}\n\
+             after_deadline_ms: {}\n\
+             workdir: {} (in this capsule's workdir)\n",
+            self.delegation_id,
+            self.capsule_name,
+            self.capsule_version,
+            self.child_session_id,
+            self.status.as_str(),
+            self.duration_ms,
+            self.deadline_secs,
+            self.after_deadline_ms,
+            self.child_workdir,
+        );
+        match &self.result_path {
+            Some(path) => text.push_str(&format!("result: {path} (in this capsule's workdir)")),
+            None => text.push_str("result: none (the capsule wrote no result file)"),
+        }
+        if let Some(detail) = &self.detail {
+            text.push_str(&format!("\ndetail: {detail}"));
+        }
+        text.push_str(
+            "\n\nThis delegation was already reported once, when its deadline passed; this is \
+             the same delegation ending, not a second one. The capsule's own output is in that \
+             file and is not reproduced here.",
+        );
+        text
+    }
+}
+
 /// What the task loop turns into a `completion`-origin task.
 ///
-/// One enum rather than two enqueue paths: an authority reporting on work it started is the same
-/// shape whether the work finished under this runtime or was left unaccounted by one that died.
+/// One enum rather than four enqueue paths: an authority reporting on work it started is the same
+/// shape whether the work finished under this runtime, was left unaccounted by one that died, or
+/// outran the deadline its parent was waiting under.
 #[derive(Debug, Clone)]
 pub(crate) enum DetachedReport {
     Completed(DetachedCompletion),
     Lost(LostReport),
+    /// A delegation the parent stopped waiting for. Written the instant the deadline fires.
+    DelegationDeadline(DelegationDeadlineReport),
+    /// The released child of that delegation, ending later.
+    DelegationLate(DelegationLateReport),
 }
 
 #[cfg(test)]
@@ -363,7 +517,7 @@ mod tests {
     ) -> (
         ShellOutcome,
         Arc<DetachedRegistry>,
-        UnboundedReceiver<DetachedCompletion>,
+        UnboundedReceiver<DetachedReport>,
     ) {
         let (registry, receiver) = DetachedRegistry::new();
         let outcome = run_shell(
@@ -386,13 +540,16 @@ mod tests {
     }
 
     /// Block until the completion lands, so the test fails with a timeout rather than hanging.
-    fn await_completion(
-        receiver: &mut UnboundedReceiver<DetachedCompletion>,
-    ) -> DetachedCompletion {
+    ///
+    /// The channel carries every report the task loop enqueues, so a shell command's completion is
+    /// taken off it by variant: anything else on this receiver means a delegation report reached a
+    /// test that started no delegation.
+    fn await_completion(receiver: &mut UnboundedReceiver<DetachedReport>) -> DetachedCompletion {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match receiver.try_recv() {
-                Ok(completion) => return completion,
+                Ok(DetachedReport::Completed(completion)) => return completion,
+                Ok(other) => panic!("a shell command's completion was expected; got {other:?}"),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
@@ -403,6 +560,126 @@ mod tests {
                 Err(error) => panic!("the completion channel closed early: {error}"),
             }
         }
+    }
+
+    fn completion_provenance() -> TaskProvenance {
+        TaskProvenance::derive(TaskOrigin::Completion, Some(TrustClass::Untrusted))
+    }
+
+    fn deadline_report() -> DelegationDeadlineReport {
+        DelegationDeadlineReport {
+            delegation_id: "dlg_0001".to_string(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            child_session_id: "ses_child".to_string(),
+            child_workdir: ".murmur/children/worker-abc".to_string(),
+            child_pid: 4242,
+            deadline_secs: 20,
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+        }
+    }
+
+    fn late_report() -> DelegationLateReport {
+        DelegationLateReport {
+            delegation_id: "dlg_0001".to_string(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            child_session_id: "ses_child".to_string(),
+            child_workdir: ".murmur/children/worker-abc".to_string(),
+            status: crate::delegation::DelegationStatus::Ok,
+            duration_ms: 31_000,
+            after_deadline_ms: 11_000,
+            deadline_secs: 20,
+            result_path: Some(".murmur/children/worker-abc/out/result.txt".to_string()),
+            detail: None,
+            context_id: "ctx_1".to_string(),
+            provenance: completion_provenance(),
+        }
+    }
+
+    /// Every completion an agent can be handed opens with a line no other one opens with.
+    ///
+    /// This is the whole point of telling a parent twice about one delegation: a model that cannot
+    /// tell "it failed" from "it never answered" retries, and a retry runs the work a second time
+    /// alongside a first run that may still be going.
+    #[test]
+    fn no_two_completions_share_an_opening_line() {
+        let outcome = crate::delegation::DelegationOutcome {
+            delegation_id: "dlg_0001".to_string(),
+            capsule_name: "worker".to_string(),
+            capsule_version: "0.1.0".to_string(),
+            session_id: "ses_child".to_string(),
+            status: crate::delegation::DelegationStatus::Ok,
+            result_path: None,
+            workdir: "/tmp/child".to_string(),
+            duration_ms: 1,
+            detail: None,
+            reported_by: crate::delegation::Reporter::Launcher,
+            delivered: true,
+            delivery_error: None,
+        };
+        let texts = [
+            ("delegation outcome", outcome.message_text()),
+            ("delegation deadline", deadline_report().message_text()),
+            ("late delegation outcome", late_report().message_text()),
+        ];
+        for (index, (name, text)) in texts.iter().enumerate() {
+            let opening = text.lines().next().unwrap_or_default();
+            assert!(!opening.is_empty(), "{name} opens with nothing");
+            for (other_name, other) in texts.iter().skip(index + 1) {
+                assert_ne!(
+                    opening,
+                    other.lines().next().unwrap_or_default(),
+                    "{name} and {other_name} open with the same line"
+                );
+            }
+        }
+    }
+
+    /// The deadline says the capsule did not answer. It asserts no exit status, names no result
+    /// file and never calls the delegation failed — none of the three is known yet.
+    #[test]
+    fn the_deadline_report_names_the_deadline_and_claims_no_outcome() {
+        let text = deadline_report().message_text();
+        assert!(text.contains("deadline_secs: 20"), "{text}");
+        assert!(text.contains("delegation_id: dlg_0001"), "{text}");
+        assert!(text.contains("capsule: worker@0.1.0"), "{text}");
+        assert!(text.contains("session_id: ses_child"), "{text}");
+        assert!(text.contains(".murmur/children/worker-abc"), "{text}");
+        assert!(text.contains("pid: 4242"), "{text}");
+        assert!(text.contains("not stopped"), "{text}");
+        assert!(text.contains("still be running"), "{text}");
+        assert!(text.contains("did not answer"), "{text}");
+        for absent in ["exit_code", "result:", "status:"] {
+            assert!(
+                !text.contains(absent),
+                "the deadline knows no {absent}: {text}"
+            );
+        }
+    }
+
+    /// The late report says it is the second word on a delegation, and names the result file
+    /// rather than carrying it.
+    #[test]
+    fn the_late_report_marks_itself_as_second_and_names_only_a_path() {
+        let mut report = late_report();
+        report.detail = Some("x".repeat(8));
+        let text = report.message_text();
+        assert!(
+            text.contains("after its deadline was already reported"),
+            "{text}"
+        );
+        assert!(text.contains("delegation_id: dlg_0001"), "{text}");
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("duration_ms: 31000"), "{text}");
+        assert!(text.contains("after_deadline_ms: 11000"), "{text}");
+        assert!(
+            text.contains("result: .murmur/children/worker-abc/out/result.txt"),
+            "{text}"
+        );
+        assert!(text.contains("not reproduced here"), "{text}");
+        assert!(text.contains("not a second one"), "{text}");
     }
 
     /// The whole argument of demotion: the call returns long before the command does, and the

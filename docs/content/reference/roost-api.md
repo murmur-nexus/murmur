@@ -301,14 +301,15 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 
 ### What the call returns
 
-The call returns when the child finishes, not when it starts. A successful result is a JSON object:
+The call returns when the child finishes or when the deadline passes, not when it starts. A
+successful result is a JSON object:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` |
 | `session_id` | string | `ses_…`, the child's own session |
 | `capsule`, `version` | string | The artifact that ran |
-| `status` | string | `completed`, `failed` or `timed_out` |
+| `status` | string | `completed`, `failed` or `timed_out`. `timed_out` means the capsule stopped waiting, not that the sub-capsule was stopped |
 | `output` | string | The child's answer, read from the result file its own runtime wrote. Cut at 64 KiB, with the cut marked and the tool result flagged `truncated` |
 | `result_path` | string | Where the answer is on disk, relative to the delegating capsule's accessible workdir. Absent when the child wrote no result file |
 
@@ -322,7 +323,18 @@ failed tool call, and the session continues.
 |---|---|---|
 | Launch | 180s | From starting the child process to its first `--json` line |
 | Delivery | 30s | Retrying the task delivery while the child's listener comes up |
-| Answer | 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | Waiting for the child's task to reach a terminal state. On expiry the child is killed and reaped and the call returns `timed_out` |
+| Answer | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | Waiting for the child's task to reach a terminal state. On expiry the call returns `timed_out` and the child is released |
+
+The answer bound is the delegating capsule's own runtime's clock. No request is made to the daemon
+to decide or enforce it, so no daemon has to be reachable for it to fire.
+
+**Reaching it stops the wait, not the child.** The child's process is released: it keeps running,
+and the delegating capsule's runtime watches it only to learn what it eventually did. The capsule
+is then told twice about that one delegation — once at the deadline, and once more if the released
+child later ends — as two `completion`-origin tasks in the background lane, each opening with a
+line the other does not. See
+[`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) for what
+each carries and what a released child costs.
 
 How deep a chain of delegations may go and how many a capsule may have running at once are the
 daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon

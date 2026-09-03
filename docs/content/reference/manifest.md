@@ -696,6 +696,7 @@ verbatim and unredacted — bodies can be large, and a blob holds the wire paylo
 | `lifecycle.conversation` | `stateless \| threaded` | no | Default: `stateless`. Whether tasks sharing a `contextId` accumulate history — see [`lifecycle.conversation`](#lifecycle-conversation). |
 | `lifecycle.max_task_reopens` | integer | no | Default: `1`. Maximum times an `on-task-end` hook (`commit_policy: reopen-task`) may reopen a single task. `0` is a valid explicit value and disables reopening. Reopening never grants turns past `inference.max_turns`; see [Task reopening](../concepts/session-loop.md#task-reopening-commit_policy-reopen-task). |
 | `lifecycle.shell_grace_secs` | integer | no | Default: `10`. Seconds a shell command runs in the foreground before it is demoted to the background — see [`lifecycle.shell_grace_secs`](#lifecycle-shell-grace-secs). |
+| `lifecycle.delegation_deadline_secs` | integer | no | Default: `600`. Seconds a `delegate-task` call waits for a sub-capsule's answer before the capsule stops waiting — see [`lifecycle.delegation_deadline_secs`](#lifecycle-delegation-deadline-secs). |
 
 #### `exports` { #field-exports }
 
@@ -1283,6 +1284,7 @@ lifecycle:
   conversation: stateless
   max_task_reopens: 1
   shell_grace_secs: 10
+  delegation_deadline_secs: 600
 ```
 
 ### `lifecycle.task_acceptance` { #lifecycle-task-acceptance }
@@ -1374,6 +1376,65 @@ seconds of the file can go with the machine.
 A demotion whose own record cannot be written does not fail the command or the session. The
 command runs, the turn keeps its handle, and the failure is announced on stderr — with the
 consequence that a later resume has nothing to find and that command's loss is never reported.
+
+### `lifecycle.delegation_deadline_secs` { #lifecycle-delegation-deadline-secs }
+
+How long a [`delegate-task`](runtime-provided-tools.md) call waits for the sub-capsule's answer.
+The capsule's own runtime holds the clock; no daemon has to be reachable for the deadline to fire.
+
+| Value | Behaviour |
+|---|---|
+| `600` (default) | A sub-capsule answering within 10 minutes returns its answer to the turn. One that has not answered by then stops being waited for. |
+| `N` (positive integer) | The same, with an `N`-second window. |
+| `0` | The first poll after the task is delivered gives up. |
+
+Absent is a ceiling, not an absence: a capsule that never declares this one still delegates under
+600 seconds, because an unbounded delegation strands the delegating capsule on a sub-capsule that
+has wedged. The `MURMUR_DELEGATION_TIMEOUT_SECS` environment variable overrides the declared value
+when it names a positive integer; the declared value applies otherwise, and `600` when neither is
+given.
+
+**Reaching the deadline stops the wait, not the sub-capsule.** The call returns `status:
+"timed_out"`, and the sub-capsule's process is released: it keeps running, and the delegating
+capsule's runtime watches it only to learn what it eventually did. The `delegate-task` result is
+the last thing that turn hears about it.
+
+The delegating capsule is told twice, and told apart:
+
+| Task | Arrives | Carries |
+|---|---|---|
+| The deadline | The instant the deadline fires | The deadline in seconds, the `dlg_` id, the sub-capsule, its session id, its directory and its process id. No exit status and no result file: neither exists yet |
+| The late outcome | If the released sub-capsule later ends | The `dlg_` id, the status, the duration, how long after the deadline it ended and the path to the result. Never the result itself |
+
+Both are tasks with [origin](../concepts/access-control.md#task-origin-and-trust-class)
+`completion` in the `bg` lane, and both open with a line the other does not, so "it never answered"
+is never read as "it failed". Their records are the
+[`delegation`](observability-schemas.md#session-trace-tracejsonl) line with `outcome: "timed_out"`
+and the [`delegation_late`](observability-schemas.md#session-trace-tracejsonl) line, joined to each
+other by the same `dlg_` id.
+
+Both reach only a capsule that outlives the task which made the delegation. Under the default
+`after_task: exit` the session ends when the task does, and neither arrives. A capsule that means
+to receive them declares `task_acceptance: queue` and `after_task: sleep`:
+
+```yaml
+lifecycle:
+  task_acceptance: queue
+  after_task: sleep
+  delegation_deadline_secs: 120
+```
+
+#### What a released sub-capsule costs
+
+A released sub-capsule outlives the delegation and can outlive the delegating capsule. If the
+parent process exits first, the released process is reparented to init and keeps running with
+nothing reading its outcome; it holds a [`--max-concurrent`](roost-api.md#delegation-bounds) slot at
+`mur-roost` until it deregisters, exactly as a sub-capsule killed without deregistering does. Its
+result stays in its own directory under `.murmur/children/`, so a later reader still finds it.
+
+An outcome that arrives when the delegating capsule's task loop has already ended is recorded
+rather than dropped: the sub-capsule's own `completion.json` is written with `delivered: false` and
+the reason, and a line goes to stderr.
 
 ### `lifecycle.conversation` { #lifecycle-conversation }
 
