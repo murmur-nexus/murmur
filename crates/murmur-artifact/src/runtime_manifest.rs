@@ -1877,8 +1877,9 @@ type UnknownKeys = std::collections::BTreeMap<String, serde::de::IgnoredAny>;
 /// A `Raw*` deserialization block that captures the keys this build does not recognize.
 ///
 /// Implemented for every `Raw*` struct in this file, which is asserted structurally by
-/// `every_raw_struct_captures_unknown_keys` rather than left to review: a manifest key added
-/// without its block learning about it is exactly the defect `W-SEC-019` exists to report.
+/// `every_raw_struct_captures_unknown_keys_and_declares_its_own_field_names` rather than left to
+/// review: a manifest key added without its block learning about it is exactly the defect
+/// `W-SEC-019` exists to report.
 trait RawBlock {
     /// Every key serde accepts on this block, in declaration order and under the name serde
     /// matches (so a `#[serde(rename)]` field appears under its renamed spelling). This is the
@@ -1886,6 +1887,17 @@ trait RawBlock {
     const KNOWN_KEYS: &'static [&'static str];
 
     fn unknown_keys(&self) -> &UnknownKeys;
+
+    /// Descends into the blocks this one owns, in declaration order, so the reported paths read
+    /// down the manifest the way the document does.
+    ///
+    /// Defaulted to a no-op, which is correct for a block that owns no other block. A block that
+    /// does own one must override this: `every_raw_struct_descends_into_the_blocks_it_owns` reads
+    /// this file's own text and fails, naming the struct and the field, if it does not — an
+    /// unwalked block reports none of its keys, silently.
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let _ = (path, out);
+    }
 }
 
 impl RawBlock for RawRuntimeManifest {
@@ -1907,12 +1919,52 @@ impl RawBlock for RawRuntimeManifest {
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let artifacts = child_path(path, "artifacts");
+        for (index, artifact) in self.artifacts.iter().enumerate() {
+            collect_block(artifact, &format!("{artifacts}[{index}]"), out);
+        }
+        if let Some(capabilities) = &self.capabilities {
+            collect_block(capabilities, &child_path(path, "capabilities"), out);
+        }
+        if let Some(inference) = &self.inference {
+            collect_block(inference, &child_path(path, "inference"), out);
+        }
+        if let Some(context) = &self.context {
+            collect_block(context, &child_path(path, "context"), out);
+        }
+        if let Some(observability) = &self.observability {
+            collect_block(observability, &child_path(path, "observability"), out);
+        }
+        if let Some(trace) = &self.trace {
+            collect_block(trace, &child_path(path, "trace"), out);
+        }
+        if let Some(network) = &self.network {
+            collect_block(network, &child_path(path, "network"), out);
+        }
+        if let Some(lifecycle) = &self.lifecycle {
+            collect_block(lifecycle, &child_path(path, "lifecycle"), out);
+        }
+        if let Some(exports) = &self.exports {
+            collect_block(exports, &child_path(path, "exports"), out);
+        }
+    }
 }
 
 impl RawBlock for RawExports {
     const KNOWN_KEYS: &'static [&'static str] = &["files", "peer_files"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(files) = &self.files {
+            collect_block(files, &child_path(path, "files"), out);
+        }
+        if let Some(peer_files) = &self.peer_files {
+            collect_block(peer_files, &child_path(path, "peer_files"), out);
+        }
     }
 }
 
@@ -1971,6 +2023,12 @@ impl RawBlock for RawObservabilityConfig {
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(eval) = &self.eval {
+            collect_block(eval, &child_path(path, "eval"), out);
+        }
+    }
 }
 
 impl RawBlock for RawTraceConfig {
@@ -1984,6 +2042,13 @@ impl RawBlock for RawEvalConfig {
     const KNOWN_KEYS: &'static [&'static str] = &["dataset_id", "scorers"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let scorers = child_path(path, "scorers");
+        for (index, scorer) in self.scorers.iter().enumerate() {
+            collect_block(scorer, &format!("{scorers}[{index}]"), out);
+        }
     }
 }
 
@@ -2009,6 +2074,12 @@ impl RawBlock for RawArtifact {
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(capabilities) = &self.capabilities {
+            collect_block(capabilities, &child_path(path, "capabilities"), out);
+        }
+    }
 }
 
 impl RawBlock for RawCapabilities {
@@ -2028,6 +2099,45 @@ impl RawBlock for RawCapabilities {
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
+    }
+
+    /// Reached from both [`RawRuntimeManifest`] and [`RawArtifact`], so the capsule-wide block and
+    /// a per-artifact one report through identical code and differ only in the `path` they are
+    /// handed — `capabilities.shell` against `artifacts[0].capabilities.shell`.
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(network) = &self.network {
+            collect_block(network, &child_path(path, "network"), out);
+        }
+        if let Some(peer_fetch) = &self.peer_fetch {
+            collect_block(peer_fetch, &child_path(path, "peer_fetch"), out);
+        }
+        if let Some(filesystem) = &self.filesystem {
+            collect_block(filesystem, &child_path(path, "filesystem"), out);
+        }
+        if let Some(shell) = &self.shell {
+            collect_block(shell, &child_path(path, "shell"), out);
+        }
+        if let Some(spawn) = &self.spawn {
+            collect_block(spawn, &child_path(path, "spawn"), out);
+        }
+        if let Some(env) = &self.env {
+            collect_block(env, &child_path(path, "env"), out);
+        }
+        if let Some(limits) = &self.limits {
+            collect_block(limits, &child_path(path, "limits"), out);
+        }
+        if let Some(resources) = &self.resources {
+            collect_block(resources, &child_path(path, "resources"), out);
+        }
+        if let Some(state) = &self.state {
+            collect_block(state, &child_path(path, "state"), out);
+        }
+        if let Some(task_io) = &self.task_io {
+            collect_block(task_io, &child_path(path, "task_io"), out);
+        }
+        if let Some(conversation) = &self.conversation {
+            collect_block(conversation, &child_path(path, "conversation"), out);
+        }
     }
 }
 
@@ -2128,12 +2238,30 @@ impl RawBlock for RawShellCapabilities {
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let interpreter_runtime = child_path(path, "interpreter_runtime");
+        for (index, grant) in self.interpreter_runtime.iter().enumerate() {
+            collect_block(grant, &format!("{interpreter_runtime}[{index}]"), out);
+        }
+        let staged_runtime = child_path(path, "staged_runtime");
+        for (index, grant) in self.staged_runtime.iter().enumerate() {
+            collect_block(grant, &format!("{staged_runtime}[{index}]"), out);
+        }
+    }
 }
 
 impl RawBlock for RawInterpreterRuntimeGrant {
     const KNOWN_KEYS: &'static [&'static str] = &["binary", "dirs"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
+    }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        let dirs = child_path(path, "dirs");
+        for (index, dir) in self.dirs.iter().enumerate() {
+            collect_block(dir, &format!("{dirs}[{index}]"), out);
+        }
     }
 }
 
@@ -2171,6 +2299,18 @@ impl RawBlock for RawInferenceConfig {
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
+
+    fn walk_children(&self, path: &str, out: &mut Vec<UnknownManifestKey>) {
+        if let Some(driver) = &self.driver {
+            collect_block(driver, &child_path(path, "driver"), out);
+        }
+        if let Some(provider) = &self.provider {
+            collect_block(provider, &child_path(path, "provider"), out);
+        }
+        if let Some(compaction) = &self.compaction {
+            collect_block(compaction, &child_path(path, "compaction"), out);
+        }
+    }
 }
 
 impl RawBlock for RawCompactionConfig {
@@ -2193,8 +2333,8 @@ impl RawBlock for RawInferenceDriver {
     }
 }
 
-/// Walks a parsed raw manifest and reports every key no block of it claimed, deepest path first
-/// within each block, in the order the blocks appear in the manifest's own type.
+/// Walks a parsed raw manifest and reports every key no block of it claimed, each block's own
+/// keys before the blocks it owns, in the order the blocks appear in the manifest's own type.
 ///
 /// Called once, immediately after `serde_yaml` returns and before any field is moved out, so the
 /// result covers the whole document rather than the parts validation happens to reach. Reporting
@@ -2202,126 +2342,11 @@ impl RawBlock for RawInferenceDriver {
 fn collect_unknown_keys(raw: &RawRuntimeManifest) -> Vec<UnknownManifestKey> {
     let mut out = Vec::new();
     collect_block(raw, "", &mut out);
-
-    for (index, artifact) in raw.artifacts.iter().enumerate() {
-        let path = format!("artifacts[{index}]");
-        collect_block(artifact, &path, &mut out);
-        if let Some(capabilities) = &artifact.capabilities {
-            collect_capabilities(capabilities, &format!("{path}.capabilities"), &mut out);
-        }
-    }
-
-    if let Some(capabilities) = &raw.capabilities {
-        collect_capabilities(capabilities, "capabilities", &mut out);
-    }
-
-    if let Some(inference) = &raw.inference {
-        collect_block(inference, "inference", &mut out);
-        if let Some(driver) = &inference.driver {
-            collect_block(driver, "inference.driver", &mut out);
-        }
-        if let Some(provider) = &inference.provider {
-            collect_block(provider, "inference.provider", &mut out);
-        }
-        if let Some(compaction) = &inference.compaction {
-            collect_block(compaction, "inference.compaction", &mut out);
-        }
-    }
-
-    if let Some(context) = &raw.context {
-        collect_block(context, "context", &mut out);
-    }
-
-    if let Some(observability) = &raw.observability {
-        collect_block(observability, "observability", &mut out);
-        if let Some(eval) = &observability.eval {
-            collect_block(eval, "observability.eval", &mut out);
-            for (index, scorer) in eval.scorers.iter().enumerate() {
-                collect_block(
-                    scorer,
-                    &format!("observability.eval.scorers[{index}]"),
-                    &mut out,
-                );
-            }
-        }
-    }
-
-    if let Some(trace) = &raw.trace {
-        collect_block(trace, "trace", &mut out);
-    }
-
-    if let Some(network) = &raw.network {
-        collect_block(network, "network", &mut out);
-    }
-
-    if let Some(lifecycle) = &raw.lifecycle {
-        collect_block(lifecycle, "lifecycle", &mut out);
-    }
-
-    if let Some(exports) = &raw.exports {
-        collect_block(exports, "exports", &mut out);
-        if let Some(files) = &exports.files {
-            collect_block(files, "exports.files", &mut out);
-        }
-        if let Some(peer_files) = &exports.peer_files {
-            collect_block(peer_files, "exports.peer_files", &mut out);
-        }
-    }
-
     out
 }
 
-/// The capability sub-blocks, walked from one function so the capsule-wide block and a
-/// per-artifact one report through identical code and differ only in the path they are handed —
-/// `capabilities.shell` against `artifacts[0].capabilities.shell`.
-fn collect_capabilities(raw: &RawCapabilities, path: &str, out: &mut Vec<UnknownManifestKey>) {
-    collect_block(raw, path, out);
-    if let Some(network) = &raw.network {
-        collect_block(network, &format!("{path}.network"), out);
-    }
-    if let Some(peer_fetch) = &raw.peer_fetch {
-        collect_block(peer_fetch, &format!("{path}.peer_fetch"), out);
-    }
-    if let Some(filesystem) = &raw.filesystem {
-        collect_block(filesystem, &format!("{path}.filesystem"), out);
-    }
-    if let Some(shell) = &raw.shell {
-        collect_block(shell, &format!("{path}.shell"), out);
-        for (index, grant) in shell.interpreter_runtime.iter().enumerate() {
-            let grant_path = format!("{path}.shell.interpreter_runtime[{index}]");
-            collect_block(grant, &grant_path, out);
-            for (dir_index, dir) in grant.dirs.iter().enumerate() {
-                collect_block(dir, &format!("{grant_path}.dirs[{dir_index}]"), out);
-            }
-        }
-        for (index, grant) in shell.staged_runtime.iter().enumerate() {
-            collect_block(grant, &format!("{path}.shell.staged_runtime[{index}]"), out);
-        }
-    }
-    if let Some(spawn) = &raw.spawn {
-        collect_block(spawn, &format!("{path}.spawn"), out);
-    }
-    if let Some(env) = &raw.env {
-        collect_block(env, &format!("{path}.env"), out);
-    }
-    if let Some(limits) = &raw.limits {
-        collect_block(limits, &format!("{path}.limits"), out);
-    }
-    if let Some(resources) = &raw.resources {
-        collect_block(resources, &format!("{path}.resources"), out);
-    }
-    if let Some(state) = &raw.state {
-        collect_block(state, &format!("{path}.state"), out);
-    }
-    if let Some(task_io) = &raw.task_io {
-        collect_block(task_io, &format!("{path}.task_io"), out);
-    }
-    if let Some(conversation) = &raw.conversation {
-        collect_block(conversation, &format!("{path}.conversation"), out);
-    }
-}
-
-/// One block's captured keys, each paired with the nearest key that block does recognize.
+/// One block's captured keys, each paired with the nearest key that block does recognize, then
+/// the same for every block it owns.
 ///
 /// `path` is empty for the manifest root, which is what
 /// [`crate::unknown_manifest_keys::UnknownManifestKey`] renders as "at the top level".
@@ -2333,6 +2358,17 @@ fn collect_block<T: RawBlock>(block: &T, path: &str, out: &mut Vec<UnknownManife
             nearest_known: nearest_known_key(key, T::KNOWN_KEYS),
         });
     }
+    block.walk_children(path, out);
+}
+
+/// The dotted path of `field` inside the block at `parent`, built in one place so no
+/// [`RawBlock::walk_children`] has to reproduce the rule that the manifest root has no prefix.
+/// An indexed child appends its own `[index]` to the result.
+fn child_path(parent: &str, field: &str) -> String {
+    if parent.is_empty() {
+        return field.to_string();
+    }
+    format!("{parent}.{field}")
 }
 
 #[must_use = "validated runtime manifest is required before run"]
@@ -8955,6 +8991,257 @@ capabilities:
             checked >= 30,
             "expected every Raw* struct to be scanned, found only {checked}"
         );
+    }
+
+    /// Source-derived for the same reason its sibling above is: a `Raw*`-typed field added to a
+    /// block and left unwalked reports none of the keys inside that block, and reports nothing
+    /// about having done so. The scan is keyed on the *parent's field*, not on the child's type,
+    /// because `inference.driver` and `inference.provider` are the same type — a check keyed on
+    /// the type would call `provider` covered because `driver` is walked.
+    #[test]
+    fn every_raw_struct_descends_into_the_blocks_it_owns() {
+        let source = include_str!("runtime_manifest.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut structs = 0usize;
+        let mut children = 0usize;
+        for (start, line) in lines.iter().enumerate() {
+            let Some(name) = line
+                .strip_prefix("struct Raw")
+                .and_then(|rest| rest.strip_suffix(" {"))
+            else {
+                continue;
+            };
+            let name = format!("Raw{name}");
+            let end = (start + 1..lines.len())
+                .find(|index| lines[*index] == "}")
+                .unwrap_or_else(|| panic!("{name} has no closing brace at column 0"));
+            let owned = block_typed_fields(&lines[start + 1..end]);
+            structs += 1;
+
+            if owned.is_empty() {
+                continue;
+            }
+            let block = raw_block_impl_of(source, &name);
+            assert!(
+                block.contains("fn walk_children"),
+                "{name} owns the nested block{} {}, but its `impl RawBlock` declares no \
+                 `walk_children`, so every key written inside {} would go unreported",
+                if owned.len() == 1 { "" } else { "s" },
+                owned.join(", "),
+                if owned.len() == 1 { "it" } else { "them" }
+            );
+            for field in &owned {
+                assert!(
+                    block.contains(&format!("self.{field}")),
+                    "{name}'s `walk_children` never touches `self.{field}`, so every key written \
+                     inside that block would go unreported — descend into it with \
+                     `collect_block(.., &child_path(path, \"{field}\"), out)`"
+                );
+                children += 1;
+            }
+        }
+        assert!(
+            structs >= 30,
+            "expected every Raw* struct to be scanned, found only {structs}"
+        );
+        assert!(
+            children >= 31,
+            "expected every nested block field to be scanned, found only {children}"
+        );
+    }
+
+    /// The fields of one struct body whose declared type names another `Raw*` type, in
+    /// declaration order. Comment and attribute lines are skipped, so a doc comment that mentions
+    /// a `Raw*` type by name is not read as a field.
+    fn block_typed_fields(body: &[&str]) -> Vec<String> {
+        let mut fields = Vec::new();
+        for line in body {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+                continue;
+            }
+            let Some((field, declared)) = line
+                .strip_prefix("    ")
+                .and_then(|rest| rest.split_once(':'))
+            else {
+                continue;
+            };
+            if field.is_empty()
+                || !field
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+            {
+                continue;
+            }
+            if declared.contains("Raw") {
+                fields.push(field.to_string());
+            }
+        }
+        fields
+    }
+
+    /// The text of `impl RawBlock for <name>`, cut at the next line that is exactly `}` at column
+    /// 0 so one impl's body cannot be read as the next one's.
+    fn raw_block_impl_of(source: &str, name: &str) -> String {
+        let header = format!("impl RawBlock for {name} {{");
+        let body = source
+            .split_once(&header)
+            .unwrap_or_else(|| panic!("{name} has no `impl RawBlock` block"))
+            .1;
+        body.split_once("\n}\n")
+            .unwrap_or_else(|| panic!("{name}'s RawBlock impl has no closing brace at column 0"))
+            .0
+            .to_string()
+    }
+
+    /// The walk's own result, taken straight off a deserialized `RawRuntimeManifest`.
+    ///
+    /// Deliberately not routed through [`RuntimeManifest::from_yaml_str`]: that validates, and a
+    /// fixture that names every block at once would have to satisfy every semantic rule as well
+    /// to reach the walk. What is under test here is which blocks are descended into, which the
+    /// validator has no part in.
+    fn raw_unknown_keys(yaml: &str) -> Vec<(String, String)> {
+        let raw: RawRuntimeManifest = serde_yaml::from_str(yaml).expect("fixture must parse");
+        collect_unknown_keys(&raw)
+            .into_iter()
+            .map(|key| (key.key, key.block_path))
+            .collect()
+    }
+
+    /// Every block the manifest type owns, each carrying one key no field of it claims, reported
+    /// once and at its own dotted path. The blocks a later slice adds are held to this by
+    /// `every_raw_struct_descends_into_the_blocks_it_owns`; this is what "descended into" means.
+    #[test]
+    fn every_block_reports_its_own_unknown_key_at_its_own_path() {
+        let keys = raw_unknown_keys(
+            r#"
+name: every-block
+version: 0.1.0
+probe_root: 1
+artifacts:
+  - name: t
+    version: 0.1.0
+    runtime: tool
+    probe_artifact: 1
+    capabilities:
+      probe_artifact_capabilities: 1
+      shell:
+        probe_artifact_shell: 1
+capabilities:
+  probe_capabilities: 1
+  network:
+    probe_network: 1
+  peer_fetch:
+    probe_peer_fetch: 1
+  filesystem:
+    probe_filesystem: 1
+  shell:
+    probe_shell: 1
+    interpreter_runtime:
+      - binary: python3
+        probe_interpreter_runtime: 1
+        dirs:
+          - path: /usr/lib/python3
+            probe_interpreter_runtime_dir: 1
+    staged_runtime:
+      - binary: rg
+        probe_staged_runtime: 1
+  spawn:
+    probe_spawn: 1
+  env:
+    probe_env: 1
+  limits:
+    probe_limits: 1
+  resources:
+    probe_resources: 1
+  state:
+    probe_state: 1
+  task_io:
+    probe_task_io: 1
+  conversation:
+    probe_conversation: 1
+inference:
+  probe_inference: 1
+  driver:
+    probe_driver: 1
+  provider:
+    probe_provider: 1
+  compaction:
+    probe_compaction: 1
+context:
+  probe_context: 1
+observability:
+  probe_observability: 1
+  eval:
+    probe_eval: 1
+    scorers:
+      - type: exact_match
+        probe_scorer: 1
+trace:
+  probe_trace: 1
+network:
+  probe_network_config: 1
+lifecycle:
+  probe_lifecycle: 1
+exports:
+  probe_exports: 1
+  files:
+    probe_files: 1
+  peer_files:
+    probe_peer_files: 1
+"#,
+        );
+
+        let expected: Vec<(String, String)> = [
+            ("probe_root", ""),
+            ("probe_artifact", "artifacts[0]"),
+            ("probe_artifact_capabilities", "artifacts[0].capabilities"),
+            ("probe_artifact_shell", "artifacts[0].capabilities.shell"),
+            ("probe_capabilities", "capabilities"),
+            ("probe_network", "capabilities.network"),
+            ("probe_peer_fetch", "capabilities.peer_fetch"),
+            ("probe_filesystem", "capabilities.filesystem"),
+            ("probe_shell", "capabilities.shell"),
+            (
+                "probe_interpreter_runtime",
+                "capabilities.shell.interpreter_runtime[0]",
+            ),
+            (
+                "probe_interpreter_runtime_dir",
+                "capabilities.shell.interpreter_runtime[0].dirs[0]",
+            ),
+            (
+                "probe_staged_runtime",
+                "capabilities.shell.staged_runtime[0]",
+            ),
+            ("probe_spawn", "capabilities.spawn"),
+            ("probe_env", "capabilities.env"),
+            ("probe_limits", "capabilities.limits"),
+            ("probe_resources", "capabilities.resources"),
+            ("probe_state", "capabilities.state"),
+            ("probe_task_io", "capabilities.task_io"),
+            ("probe_conversation", "capabilities.conversation"),
+            ("probe_inference", "inference"),
+            ("probe_driver", "inference.driver"),
+            ("probe_provider", "inference.provider"),
+            ("probe_compaction", "inference.compaction"),
+            ("probe_context", "context"),
+            ("probe_observability", "observability"),
+            ("probe_eval", "observability.eval"),
+            ("probe_scorer", "observability.eval.scorers[0]"),
+            ("probe_trace", "trace"),
+            ("probe_network_config", "network"),
+            ("probe_lifecycle", "lifecycle"),
+            ("probe_exports", "exports"),
+            ("probe_files", "exports.files"),
+            ("probe_peer_files", "exports.peer_files"),
+        ]
+        .into_iter()
+        .map(|(key, path)| (key.to_string(), path.to_string()))
+        .collect();
+
+        assert_eq!(keys, expected);
     }
 
     /// The names serde matches on for one struct body: field names in declaration order, with a
