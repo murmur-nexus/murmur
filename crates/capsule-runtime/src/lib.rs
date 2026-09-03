@@ -78,8 +78,10 @@ pub use network_namespace::{
 // does, and one resolver shared by all three is what keeps the report a description of the launch.
 pub use network_policy::preopen_reports;
 // `sandbox` is a private module; `HostProbe` is re-exported because the freshness of a session's
-// host reading is asserted from integration tests outside this crate.
-pub use sandbox::HostProbe;
+// host reading is asserted from integration tests outside this crate. `find_on_path` is re-exported
+// so a caller outside this crate resolves a binary name the way the shell allowlist and the
+// invoked-binary report already resolve one, rather than open-coding the `PATH` walk again.
+pub use sandbox::{find_on_path, HostProbe};
 pub use sealed::{
     classify_installed_profile, inspect_installed_profile, InstalledProfileState, SealedBlocker,
     UsernsGrant, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,

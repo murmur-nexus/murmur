@@ -1,9 +1,7 @@
-use std::path::{Path, PathBuf};
-
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
-    detect_egress_namespace_blocker, detect_userns_grant, inspect_installed_profile,
+    detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     preopen_reports, read_only_advisory_for, render_read_only, warn_on_interpreter_runtime_grants,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
     warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH,
@@ -270,28 +268,6 @@ fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
 /// The daemon binary a delegating capsule needs, under the name the installer puts on `PATH` and
 /// the name `docs/content/reference/roost-api.md` starts.
 const ROOST_BINARY: &str = "mur-roost";
-
-/// The first executable named `binary` on this process's `PATH`, resolved the way `execvp`
-/// resolves it: first match wins, and a directory entry that is not an executable file is not one.
-fn find_on_path(binary: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join(binary))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
 
 /// Whether the daemon a capsule declaring `capabilities.spawn.allow` registers with can be
 /// obtained and reached from here.
