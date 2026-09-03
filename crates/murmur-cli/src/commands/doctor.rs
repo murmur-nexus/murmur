@@ -1,6 +1,8 @@
+use std::path::{Path, PathBuf};
+
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
-    check_interpreted_entrypoints_reachable, check_staged_runtime_floor,
+    check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, inspect_installed_profile,
     preopen_reports, read_only_advisory_for, render_read_only, warn_on_interpreter_runtime_grants,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
@@ -18,7 +20,7 @@ use crate::commands::install::find_project_root;
 use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
-use crate::error::{CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006};
+use crate::error::{CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_RUN_019};
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
 ///
@@ -265,6 +267,80 @@ fn report_read_only(policy: &capsule_runtime::CapabilityPolicy) {
     println!();
 }
 
+/// The daemon binary a delegating capsule needs, under the name the installer puts on `PATH` and
+/// the name `docs/content/reference/roost-api.md` starts.
+const ROOST_BINARY: &str = "mur-roost";
+
+/// The first executable named `binary` on this process's `PATH`, resolved the way `execvp`
+/// resolves it: first match wins, and a directory entry that is not an executable file is not one.
+fn find_on_path(binary: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
+/// Whether the daemon a capsule declaring `capabilities.spawn.allow` registers with can be
+/// obtained and reached from here.
+///
+/// Three states an operator has to tell apart: `mur-roost` is not installed, it is installed but
+/// `MURMUR_ROOST_URL` does not name a daemon, and it names one that does not answer. A daemon that
+/// answers prints nothing.
+///
+/// A report, never a verdict: it reaches no `fixes` entry and cannot change doctor's exit status,
+/// following the `E-CAP-005` precedent. The registration itself is what refuses a launch, with
+/// `E-RUN-019`; this is that refusal predicted before the run.
+fn report_roost_daemon() {
+    let Some(binary) = find_on_path(ROOST_BINARY) else {
+        eprintln!(
+            "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
+             and {ROOST_BINARY} was not found on PATH.\n  \
+             `mur run` refuses a capsule that cannot register with the daemon that referees its \
+             spawns. {ROOST_BINARY} ships with `mur`, at the same version and in the same \
+             directory: install both with `curl -fsSL https://install.murmur.rs | sh`."
+        );
+        return;
+    };
+
+    let roost_url = std::env::var("MURMUR_ROOST_URL").unwrap_or_default();
+    let roost_url = roost_url.trim();
+    if roost_url.is_empty() {
+        eprintln!(
+            "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
+             and {ROOST_BINARY} is installed at {binary}, but MURMUR_ROOST_URL — the variable \
+             naming the daemon to register with — is not set.\n  \
+             Start the daemon with `{ROOST_BINARY} --port 7700 --registry-path <store>` and \
+             export MURMUR_ROOST_URL=http://127.0.0.1:7700.",
+            binary = binary.display()
+        );
+        return;
+    }
+
+    if let Err(reason) = check_roost_health(roost_url) {
+        eprintln!(
+            "[mur doctor] warning[{E_RUN_019}]: this capsule declares capabilities.spawn.allow, \
+             and {ROOST_BINARY} is installed at {binary}, but no daemon answered at \
+             {roost_url}: {reason}\n  \
+             Start it with `{ROOST_BINARY} --port 7700 --registry-path <store>`, or point \
+             MURMUR_ROOST_URL at a daemon that is already running.",
+            binary = binary.display()
+        );
+    }
+}
+
 /// Check every artifact the current project declares against the stores a session
 /// resolves from. The checklist is the manifest — editing `murmur.yaml` changes what
 /// is checked, with no change here.
@@ -400,6 +476,13 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
              `mur run` will refuse this capsule on this host until that is resolved. Nothing in \
              murmur.yaml can change it — the refusal is about this machine, not the manifest."
         );
+    }
+
+    // The daemon that capsule registers with at launch, gated on `spawn_allows` alone: a capsule
+    // declaring only `capabilities.shell.allow` spawns native subprocesses of its own and
+    // addresses no daemon, so `can_spawn_subprocess` above is the wrong question here.
+    if spawn_allows {
+        report_roost_daemon();
     }
 
     // Where this host's permission to create an unprivileged user namespace comes from, and how

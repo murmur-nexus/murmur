@@ -4,8 +4,8 @@
 #
 #   curl -fsSL https://install.murmur.rs | sh
 #
-# Detects the platform, resolves the latest release, verifies the download against
-# the release's checksums.txt, and installs `mur` onto PATH.
+# Detects the platform, resolves the latest release, verifies every download against
+# the release's checksums.txt, and installs `mur` and `mur-roost` onto PATH.
 #
 # Environment overrides:
 #   MUR_VERSION      version to install, with or without the leading "v" (default: latest)
@@ -188,6 +188,15 @@ on_path() {
 
 # ---------------------------------------------------------------- checksum
 
+# asset_in_checksums <asset_name> <checksums_file>
+#
+# Whether the release published this asset at all, asked before downloading it. An asset
+# missing from checksums.txt is one this release does not carry — a different state from an
+# asset that is carried and fails to verify.
+asset_in_checksums() {
+    awk -v name="$1" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' "$2"
+}
+
 # verify_checksum <file> <asset_name> <checksums_file> [soft]
 #
 # Dies on any failure by default — the main `mur` binary must never be installed
@@ -288,8 +297,7 @@ ${manual}"
     elif [ -n "${TMPDIR_INSTALL:-}" ]; then
         asset_name="${APPARMOR_PROFILE_NAME}.apparmor"
         if download "${base_url}/${asset_name}" "${TMPDIR_INSTALL}/${asset_name}" 2>/dev/null; then
-            if awk -v name="$asset_name" '$2 == name || $2 == "*" name { found = 1 } END { exit !found }' \
-                "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"; then
+            if asset_in_checksums "$asset_name" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"; then
                 if verify_checksum "${TMPDIR_INSTALL}/${asset_name}" "$asset_name" \
                     "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}" soft; then
                     profile_src="${TMPDIR_INSTALL}/${asset_name}"
@@ -367,8 +375,10 @@ main() {
     detect_install_dir
 
     asset="mur-${VERSION}-${PLATFORM}"
+    roost_asset="mur-roost-${VERSION}-${PLATFORM}"
     base_url="https://github.com/${REPO}/releases/download/v${VERSION}"
     target="${INSTALL_DIR}/mur"
+    roost_target="${INSTALL_DIR}/mur-roost"
 
     info "installing mur ${VERSION} (${PLATFORM}) to ${INSTALL_DIR}"
 
@@ -385,6 +395,25 @@ The release may not include a binary for ${PLATFORM}. See https://github.com/${R
     verify_checksum "${TMPDIR_INSTALL}/mur" "$asset" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"
     info "checksum verified"
 
+    # mur-roost is the daemon a capsule declaring capabilities.spawn.allow registers with at
+    # launch. It comes from the same release, at the same version, and both binaries are
+    # downloaded and verified before either is moved into place — a release that lists the asset
+    # and cannot deliver it installs nothing.
+    #
+    # A release that does not list it in checksums.txt does not carry it: warn and install `mur`
+    # alone, so installing an older release stays possible.
+    install_roost=""
+    if asset_in_checksums "$roost_asset" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"; then
+        download "${base_url}/${roost_asset}" "${TMPDIR_INSTALL}/mur-roost" ||
+            die "could not download ${roost_asset} from ${base_url}, and this release lists it in ${CHECKSUMS_FILE}. Nothing was installed."
+        verify_checksum "${TMPDIR_INSTALL}/mur-roost" "$roost_asset" "${TMPDIR_INSTALL}/${CHECKSUMS_FILE}"
+        install_roost=1
+        info "checksum verified for ${roost_asset}"
+    else
+        warn "release v${VERSION} carries no ${roost_asset}, so mur-roost was not installed.
+mur is installed and works normally, but a capsule declaring capabilities.spawn.allow has no daemon to register with: \`mur run\` refuses it with error[E-RUN-019]. Install a release that ships mur-roost to get the daemon."
+    fi
+
     # Report what is being replaced before overwriting it.
     if [ -e "$target" ]; then
         previous="$("$target" --version 2>/dev/null | head -1)" || previous=""
@@ -396,18 +425,35 @@ The release may not include a binary for ${PLATFORM}. See https://github.com/${R
     fi
 
     chmod 755 "${TMPDIR_INSTALL}/mur"
+    [ -z "$install_roost" ] || chmod 755 "${TMPDIR_INSTALL}/mur-roost"
 
     # Stage inside the install directory so the final step is a same-filesystem
     # rename: atomic, and it replaces a running binary without a "text file busy"
     # failure. Both paths are inside INSTALL_DIR, so nothing outside it is touched.
     staged="${INSTALL_DIR}/.mur.install.$$"
-    cp "${TMPDIR_INSTALL}/mur" "$staged" || die "could not write to ${INSTALL_DIR}"
-    if ! mv -f "$staged" "$target"; then
+    roost_staged="${INSTALL_DIR}/.mur-roost.install.$$"
+    if ! cp "${TMPDIR_INSTALL}/mur" "$staged"; then
         rm -f "$staged"
+        die "could not write to ${INSTALL_DIR}"
+    fi
+    if [ -n "$install_roost" ] && ! cp "${TMPDIR_INSTALL}/mur-roost" "$roost_staged"; then
+        rm -f "$staged" "$roost_staged"
+        die "could not write to ${INSTALL_DIR}"
+    fi
+    if ! mv -f "$staged" "$target"; then
+        rm -f "$staged" "$roost_staged"
         die "could not install to ${target}"
     fi
 
     info "installed mur ${VERSION} to ${target}"
+
+    if [ -n "$install_roost" ]; then
+        if ! mv -f "$roost_staged" "$roost_target"; then
+            rm -f "$roost_staged"
+            die "could not install to ${roost_target}"
+        fi
+        info "installed mur-roost ${VERSION} to ${roost_target}"
+    fi
 
     install_apparmor_profile
 

@@ -10,13 +10,17 @@
 //! `x-murmur-spawn-credential` cannot travel back out through a failure.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::Value;
 use url::Url;
 
-/// One request, one response, one connection.
+/// Deadline every request gets unless the caller states a shorter one: long enough for a daemon
+/// that is staging a child, short enough that a session cannot block on it forever.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One request, one response, one connection, under [`DEFAULT_TIMEOUT`].
 ///
 /// `extra_headers` are appended verbatim after the framing headers. `body` is sent as
 /// `application/json` on `POST`, and ignored otherwise.
@@ -25,6 +29,21 @@ pub(crate) fn http_json(
     url: &str,
     body: Option<&str>,
     extra_headers: &[(&str, &str)],
+) -> Result<Value, String> {
+    http_json_with_timeout(method, url, body, extra_headers, DEFAULT_TIMEOUT)
+}
+
+/// [`http_json`] with the connect, write and read deadline named by the caller.
+///
+/// `timeout` bounds each of the three separately, not the call as a whole: an interactive caller
+/// asking an address nothing answers waits for the connect refusal or the deadline, whichever
+/// comes first.
+pub(crate) fn http_json_with_timeout(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    timeout: Duration,
 ) -> Result<Value, String> {
     let url = Url::parse(url).map_err(|error| format!("invalid URL '{url}': {error}"))?;
     if url.scheme() != "http" {
@@ -35,10 +54,12 @@ pub(crate) fn http_json(
         .ok_or_else(|| format!("URL '{url}' has no host"))?;
     let port = url.port_or_known_default().unwrap_or(80);
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr)
-        .map_err(|error| format!("failed to connect to {addr}: {error}"))?;
+    let mut stream = connect_within(&addr, timeout)?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
         .map_err(|error| error.to_string())?;
 
     let path = match url.query() {
@@ -73,4 +94,25 @@ pub(crate) fn http_json(
         return Err(format!("HTTP request failed: {headers}; body: {body}"));
     }
     serde_json::from_str(body).map_err(|error| format!("failed to parse HTTP JSON: {error}"))
+}
+
+/// The first address `addr` resolves to that accepts a connection within `timeout`.
+///
+/// `TcpStream::connect` has no deadline of its own, so a host that neither accepts nor refuses
+/// would hold the caller for as long as the OS retries.
+fn connect_within(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
+    let resolved = addr
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve {addr}: {error}"))?;
+    let mut last_error = None;
+    for socket_addr in resolved {
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(match last_error {
+        Some(error) => format!("failed to connect to {addr}: {error}"),
+        None => format!("failed to connect to {addr}: it resolved to no address"),
+    })
 }

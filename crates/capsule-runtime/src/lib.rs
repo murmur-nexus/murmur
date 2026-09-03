@@ -123,7 +123,7 @@ pub use reachability::{
     check_interpreted_entrypoints_reachable, warn_on_unreachable_toolchain_helpers,
     ToolchainHelperWarning,
 };
-pub use registration::{deregister_session, register_session, SessionOutcome};
+pub use registration::{check_roost_health, deregister_session, register_session, SessionOutcome};
 pub use resource_plane::{
     check_export_root, check_peer_files_root, handle_resource_request, reason_phrase,
     symlink_policy, DeclaredExport, ListEntry, ListResponse, ReadResponse, ResourceError,
