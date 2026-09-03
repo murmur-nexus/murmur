@@ -28,7 +28,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::child_launch::{launch_child_capsule, ChildLaunchRequest, ReleasedChild};
+use crate::child_launch::{
+    launch_child_capsule, workdir_relative_to, ChildLaunchRequest, ReleasedChild,
+};
 use crate::delegation::Spawner;
 use crate::http_client::http_json;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
@@ -220,9 +222,9 @@ pub struct DelegationOrigin {
     /// Where a released child goes when the deadline fires, or `None` for a caller with no task
     /// loop to report into.
     ///
-    /// `None` is what keeps the old behaviour for a caller that could not act on a release: the
-    /// deadline drops the child and its `Drop` kills it, because a process nothing will ever wait
-    /// on is worse than one that was stopped. Every caller with a task loop supplies a sender.
+    /// `None` means the deadline drops the child and its `Drop` kills it, which is the answer for
+    /// a caller that could not act on a release: a process nothing will ever wait on is worse than
+    /// one that was stopped. Every caller with a task loop supplies a sender.
     pub released: Option<tokio::sync::mpsc::UnboundedSender<DelegationDeadline>>,
 }
 
@@ -281,13 +283,9 @@ impl DelegationPlane {
     }
 
     /// A child's directory named from the parent's accessible workdir, which is the only root the
-    /// parent's own tools address. Falls back to the absolute path for a directory outside it.
+    /// parent's own tools address.
     fn workdir_relative(&self, workdir: &Path) -> String {
-        workdir
-            .strip_prefix(&self.accessible_workdir)
-            .unwrap_or(workdir)
-            .to_string_lossy()
-            .replace('\\', "/")
+        workdir_relative_to(workdir, &self.accessible_workdir)
     }
 
     /// Ask the daemon, launch the approved child, deliver the task, and wait for the answer.
@@ -488,14 +486,14 @@ impl DelegationPlane {
         loop {
             if Instant::now() >= poll_deadline {
                 // The deadline stops the wait, not the child. Releasing hands the process to the
-                // caller's watcher, which is the only thing that will ever reap it — so a caller
-                // that took no `released` sender gets the old behaviour instead, and `child` is
-                // dropped and killed on the way out.
+                // caller's watcher, which is the only thing that will ever reap it — so with no
+                // `released` sender the child is dropped and killed on the way out instead.
                 let child_session_id = child.session_id.clone();
-                let handed_over = origin.released.as_ref().is_some_and(|releases| {
-                    let released = child.release();
-                    releases
-                        .send(DelegationDeadline {
+                let handed_over = match origin.released.as_ref() {
+                    None => false,
+                    Some(releases) => {
+                        let released = child.release();
+                        match releases.send(DelegationDeadline {
                             delegation_id: delegation_id.clone(),
                             capsule: request.capsule.clone(),
                             version: request.version.clone(),
@@ -505,9 +503,18 @@ impl DelegationPlane {
                             child_pid: released.pid(),
                             deadline_secs: self.result_timeout.as_secs(),
                             released,
-                        })
-                        .is_ok()
-                });
+                        }) {
+                            Ok(()) => true,
+                            // The receiver is gone, so nothing will ever watch or reap this
+                            // process: the release is undone by ending it here, and the tool
+                            // result below says so.
+                            Err(tokio::sync::mpsc::error::SendError(notice)) => {
+                                notice.released.end();
+                                false
+                            }
+                        }
+                    }
+                };
                 let fate = if handed_over {
                     "the parent stopped waiting and the capsule was left running; if it ever \
                      finishes, its outcome arrives as a separate task"

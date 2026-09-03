@@ -1729,7 +1729,7 @@ fn a_late_answer_is_reported_once_more_and_told_apart_from_the_first() {
     assert!(late_text.contains("duration_ms: "), "{late_text}");
     assert!(late_text.contains("after_deadline_ms: "), "{late_text}");
     assert!(
-        late_text.contains(&format!(".murmur/children/{LATE_WORKER}-")),
+        late_text.contains(&format!("result: .murmur/children/{LATE_WORKER}-")),
         "the late report names the result file: {late_text}"
     );
     assert!(

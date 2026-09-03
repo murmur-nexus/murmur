@@ -321,6 +321,17 @@ impl ReleasedChild {
             .unwrap_or(0)
     }
 
+    /// End a released child no watcher took, and reap it.
+    ///
+    /// The hand-over to [`watch_released_child`] is the only thing that ever reaps a released
+    /// process, so a release whose receiver was already gone leaves one nothing will wait on.
+    /// Stopping it is the lesser harm, and is what the caller's tool result then reports.
+    pub(crate) fn end(self) {
+        let mut process = lock(&self.process);
+        process.deliberate = true;
+        let _ = process.end();
+    }
+
     /// A released child around a process this crate started itself, for the watcher's own tests.
     #[cfg(test)]
     pub(crate) fn adopt(child: Child, workdir: PathBuf, delegation_id: String) -> Self {
@@ -506,7 +517,10 @@ pub(crate) fn watch_released_child(
 }
 
 /// `workdir` named from `root`, falling back to the absolute path when it sits outside it.
-fn workdir_relative_to(workdir: &Path, root: &Path) -> String {
+///
+/// One rule, used by the delegating plane when it names a child's directory in a launch or a
+/// deadline notice and by the released-child watcher when it names the same directory later.
+pub(crate) fn workdir_relative_to(workdir: &Path, root: &Path) -> String {
     workdir
         .strip_prefix(root)
         .unwrap_or(workdir)
@@ -1106,6 +1120,33 @@ mod tests {
         assert!(recorded.delivered, "{recorded:?}");
         assert_eq!(recorded.reported_by, Reporter::Launcher);
         assert!(recorded.delivery_error.is_none(), "{recorded:?}");
+    }
+
+    /// A release nobody took is ended here rather than left running: `end` is what the plane
+    /// falls back to when the hand-over fails, so the tool result's "the child was stopped" is
+    /// true.
+    #[test]
+    fn a_released_child_no_watcher_took_is_ended_and_reaped() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("sh is on the test host");
+        let pid = child.id();
+        let workdir = tempfile::tempdir().unwrap();
+
+        ReleasedChild::adopt(
+            child,
+            workdir.path().to_path_buf(),
+            "dlg_undone".to_string(),
+        )
+        .end();
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "an ended release is reaped, leaving no zombie"
+        );
+        let _ = pid;
     }
 
     /// A late outcome with nowhere to go is recorded rather than dropped, and the released child is
