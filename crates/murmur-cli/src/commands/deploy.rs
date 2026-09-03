@@ -2558,5 +2558,76 @@ mod tests {
                 err.message
             );
         }
+
+        /// A native payload at the generic path under a sidecar that disagrees with it:
+        /// `wasm` and no role, what an install recording a guess rather than the artifact's
+        /// own manifest leaves behind.
+        fn store_native_recorded_as_wasm(
+            registry: &LocalRegistry,
+            name: &str,
+            version: &str,
+            bytes: &[u8],
+        ) {
+            let artifact_path = registry.artifact_path_for(name, version);
+            std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+            std::fs::write(&artifact_path, bytes).unwrap();
+            let sha256 = sha256_hex(bytes);
+            std::fs::write(
+                artifact_path
+                    .parent()
+                    .unwrap()
+                    .join(format!("{name}-{version}.sha256")),
+                sha256.as_bytes(),
+            )
+            .unwrap();
+            let meta = serde_json::json!({
+                "meta": {
+                    "name": name, "version": version,
+                    "runtime": "wasm", "artifact_runtime": "",
+                    "platforms": [], "description": null, "tags": []
+                }
+            });
+            std::fs::write(
+                registry.metadata_path_for(name, version, None),
+                serde_json::to_string_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+        }
+
+        /// The payload decides, not the sidecar: a native artifact whose recorded packaging
+        /// type says `wasm` still fetches the target platform's binary rather than staging this
+        /// host's.
+        #[test]
+        fn a_native_payload_recorded_as_wasm_still_pulls_the_target_platforms_binary() {
+            let dir = tempdir().unwrap();
+            let registry = LocalRegistry::new(dir.path());
+            let target = murmur_artifact::SUPPORTED_PLATFORMS
+                .iter()
+                .copied()
+                .find(|platform| *platform != current_platform())
+                .unwrap();
+
+            let host_bytes = make_native_zip("my-tool", "1.0.0", b"this-host");
+            store_native_recorded_as_wasm(&registry, "my-tool", "1.0.0", &host_bytes);
+
+            let target_bytes = make_native_zip("my-tool", "1.0.0", b"the-target");
+            let (chain, called) = mock_chain(Ok(target_bytes.clone()));
+
+            let staged =
+                ensure_artifact_for_deploy("my-tool", "1.0.0", target, &registry, &chain).unwrap();
+
+            assert_eq!(staged.bytes, target_bytes);
+            assert_ne!(staged.bytes, host_bytes);
+            assert!(
+                called.load(Ordering::SeqCst),
+                "chain must be called to fetch the target platform's binary"
+            );
+            assert!(
+                registry
+                    .artifact_path_for_platform("my-tool", "1.0.0", target)
+                    .exists(),
+                "the fetched payload must be cached under the target platform"
+            );
+        }
     }
 }

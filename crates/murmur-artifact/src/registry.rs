@@ -12,8 +12,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    artifact::load_manifest_from_artifact_bytes,
-    manifest::Manifest,
+    artifact::declared_runtime_from_artifact_bytes,
     platform::split_platform_tag,
     wit_contract::{wit_contracts_from_artifact_bytes, WitContracts},
 };
@@ -356,7 +355,7 @@ impl LocalRegistry {
             )));
         }
 
-        let meta = if metadata_path.exists() {
+        let mut meta = if metadata_path.exists() {
             read_metadata(&metadata_path)
                 .map_err(|source| RegistryError::Io {
                     path: metadata_path.display().to_string(),
@@ -366,6 +365,15 @@ impl LocalRegistry {
         } else {
             derived_meta(name, version, &bytes, path_platform)
         };
+
+        // What an artifact is, is what its own packed murmur.yaml says: a payload readable here
+        // overrules the sidecar rather than the other way round, so a value recorded wrongly by
+        // an earlier install cannot outlive the next resolve. The recorded value stands only for
+        // bytes carrying no readable manifest, which say nothing to prefer over it.
+        if let Some(declared) = declared_runtime_from_artifact_bytes(&bytes) {
+            meta.runtime = declared.runtime;
+            meta.artifact_runtime = declared.artifact_runtime;
+        }
 
         // A native payload off the generic path resolves, and runs — but nothing on disk says
         // which platform it was built for, so a second platform installed into this version
@@ -747,16 +755,15 @@ fn derived_meta(
     bytes: &[u8],
     path_platform: Option<&str>,
 ) -> ArtifactMeta {
-    let manifest = load_manifest_from_artifact_bytes(bytes).ok();
+    let (runtime, artifact_runtime) = declared_runtime_from_artifact_bytes(bytes).map_or_else(
+        || (RuntimeType::Wasm, String::new()),
+        |declared| (declared.runtime, declared.artifact_runtime),
+    );
     ArtifactMeta {
         name: name.to_string(),
         version: version.to_string(),
-        runtime: manifest
-            .as_ref()
-            .map_or(RuntimeType::Wasm, Manifest::registry_runtime),
-        artifact_runtime: manifest
-            .as_ref()
-            .map_or_else(String::new, |manifest| manifest.runtime.clone()),
+        runtime,
+        artifact_runtime,
         platforms: path_platform
             .and_then(split_platform_tag)
             .map(|(os, arch)| vec![(os.to_string(), arch.to_string())])
@@ -1482,5 +1489,82 @@ mod tests {
         let index = registry.list_index().unwrap();
         assert_eq!(index.len(), 1);
         assert!(index[0].wit_contracts.is_none());
+    }
+
+    // ── recorded runtime versus declared runtime ──────────────────────────────
+
+    /// A `.mur.zip` whose manifest declares a native tool.
+    fn native_zip(name: &str, version: &str) -> Vec<u8> {
+        zip_with(&[
+            (
+                "murmur.yaml",
+                format!(
+                    "name: {name}\nversion: {version}\nruntime: tool\nimplementation: native\n"
+                )
+                .as_bytes(),
+            ),
+            (&format!("bin/{name}"), b"binary"),
+        ])
+    }
+
+    /// Write one payload, its sha256 sidecar and a `.meta.json` recording exactly
+    /// `recorded_runtime` and `recorded_artifact_runtime`, whether or not the payload agrees.
+    fn write_store_by_hand(
+        registry: &LocalRegistry,
+        name: &str,
+        version: &str,
+        bytes: &[u8],
+        recorded_runtime: &str,
+        recorded_artifact_runtime: &str,
+    ) {
+        let dir = registry.artifact_path_for(name, version);
+        let dir = dir.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::write(registry.artifact_path_for(name, version), bytes).unwrap();
+        fs::write(registry.sha256_path_for(name, version), sha256_hex(bytes)).unwrap();
+        let meta = format!(
+            r#"{{"meta":{{"name":"{name}","version":"{version}","runtime":"{recorded_runtime}","artifact_runtime":"{recorded_artifact_runtime}","platforms":[],"description":null,"tags":[]}}}}"#
+        );
+        fs::write(registry.metadata_path_for(name, version, None), meta).unwrap();
+    }
+
+    #[test]
+    fn a_native_payload_recorded_as_wasm_resolves_as_native() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        let bytes = native_zip("my-tool", "1.0.0");
+        write_store_by_hand(&registry, "my-tool", "1.0.0", &bytes, "wasm", "");
+
+        let metadata_path = registry.metadata_path_for("my-tool", "1.0.0", None);
+        let on_disk_before = fs::read_to_string(&metadata_path).unwrap();
+
+        let resolved = registry.resolve("my-tool", "1.0.0").unwrap();
+
+        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
+        assert_eq!(resolved.meta.artifact_runtime, "tool");
+        assert_eq!(
+            fs::read_to_string(&metadata_path).unwrap(),
+            on_disk_before,
+            "resolving must not rewrite the sidecar"
+        );
+    }
+
+    #[test]
+    fn a_recorded_runtime_stands_for_bytes_carrying_no_manifest() {
+        let dir = tempdir().unwrap();
+        let registry = LocalRegistry::new(dir.path());
+        write_store_by_hand(
+            &registry,
+            "opaque",
+            "1.0.0",
+            b"not-an-archive",
+            "native",
+            "tool",
+        );
+
+        let resolved = registry.resolve("opaque", "1.0.0").unwrap();
+
+        assert_eq!(resolved.meta.runtime, RuntimeType::Native);
+        assert_eq!(resolved.meta.artifact_runtime, "tool");
     }
 }

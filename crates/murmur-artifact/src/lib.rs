@@ -21,8 +21,9 @@ pub mod wit_contract;
 pub mod zip_guard;
 
 pub use artifact::{
-    load_manifest_from_artifact, load_manifest_from_artifact_bytes,
-    load_manifest_yaml_from_artifact, load_manifest_yaml_from_artifact_bytes, ArtifactError,
+    declared_runtime_from_artifact_bytes, load_manifest_from_artifact,
+    load_manifest_from_artifact_bytes, load_manifest_yaml_from_artifact,
+    load_manifest_yaml_from_artifact_bytes, ArtifactError, DeclaredRuntime,
 };
 pub use artifact_ref::{ArtifactRef, ArtifactRefError};
 pub use build::{build_artifact, BuildError, MAX_ARTIFACT_NAME_LEN, PACKED_MANIFEST_ENTRY};

@@ -6,6 +6,7 @@ use zip::ZipArchive;
 use crate::{
     build::PACKED_MANIFEST_ENTRY,
     manifest::{Manifest, ManifestError},
+    registry::RuntimeType,
     zip_guard::{self, ZipGuardError},
 };
 
@@ -94,6 +95,29 @@ pub fn load_manifest_from_artifact_bytes(bytes: &[u8]) -> Result<Manifest, Artif
     };
 
     Ok(Manifest::from_yaml_str(&manifest_content)?)
+}
+
+/// The packaging type and role an artifact's own packed `murmur.yaml` declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredRuntime {
+    /// Packaging type — the value belonging in `ArtifactMeta::runtime`.
+    pub runtime: RuntimeType,
+    /// Role from `runtime:` — the value belonging in `ArtifactMeta::artifact_runtime`.
+    pub artifact_runtime: String,
+}
+
+/// What `bytes` declare about themselves, for the fields of `ArtifactMeta` an artifact
+/// determines rather than its installer.
+///
+/// `None` when `bytes` carry no readable `murmur.yaml`: not a zip, no manifest entry, or a
+/// manifest that does not parse.
+#[must_use]
+pub fn declared_runtime_from_artifact_bytes(bytes: &[u8]) -> Option<DeclaredRuntime> {
+    let manifest = load_manifest_from_artifact_bytes(bytes).ok()?;
+    Some(DeclaredRuntime {
+        runtime: manifest.registry_runtime(),
+        artifact_runtime: manifest.runtime,
+    })
 }
 
 #[cfg(test)]

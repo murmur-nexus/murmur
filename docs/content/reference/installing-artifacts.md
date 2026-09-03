@@ -97,6 +97,8 @@ Under either root, an artifact occupies `<name>/<version>/`. A native artifact i
 
 One version directory holds one payload, hash and metadata file per platform installed, so installing a native artifact for a second platform sits beside the first rather than replacing it. A resolve prefers the tagged payload for the host's platform and falls back to the untagged one, which is how a WASM artifact resolves everywhere; a *native* artifact resolved through that fallback is reported as [`W-REG-001`](diagnostics.md#w-reg-001).
 
+The `runtime` and `artifact_runtime` keys of the metadata file record what the packed `murmur.yaml` declares: the packaging type (`native`, `wasm` or `static`) and the role (`tool`, `skill`, `driver` or `hook`). Every command that resolves an artifact takes both from the artifact bytes, so a metadata file recording something else does not change what is resolved, run or deployed. `mur list` reads the metadata file rather than the artifact, so an artifact whose file records the wrong role is listed with a blank `RUNTIME` column until it is reinstalled.
+
 The `wit_contracts` key of the metadata file records the versioned WIT interface names the packed component declares, under `exports` and `imports`. The store derives both lists from the artifact bytes on every write, so they always describe the artifact they sit beside. The key is absent for an artifact carrying no readable component — a native binary, a skill, or a payload that is not a WebAssembly component. `mur list --contract <PREFIX>` reads it; see [`mur list`](cli.md#mur-list).
 
 `mur install --all-platforms <name>@<version>` installs into the global store, once per platform it downloads for, writing the same three files per platform as any other install.
