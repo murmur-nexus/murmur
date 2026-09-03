@@ -32,6 +32,7 @@ use crate::child_launch::{
     launch_child_capsule, workdir_relative_to, ChildLaunchRequest, ReleasedChild,
 };
 use crate::delegation::Spawner;
+use crate::errors::RuntimeError;
 use crate::http_client::http_json;
 use crate::spawn_credential::{SpawnApproval, SpawnCredential, SPAWN_CREDENTIAL_HEADER};
 
@@ -252,6 +253,14 @@ pub struct DelegationPlane {
     /// into that child's `session_start.spawned_by`. Empty for a caller that does not know it,
     /// which injects no handle.
     session_id: String,
+    /// Where a child's own manifest is read from, so the parent knows which host variables that
+    /// child declares. The same store the child's runtime will resolve the artifact out of, so
+    /// the manifest read here is the manifest the child will load.
+    registry: std::sync::Arc<dyn murmur_artifact::Registry>,
+    /// The delegating capsule's own `capabilities.env.allow`. Every child's declaration is
+    /// clamped to this list, so a delegation can never widen the set of host variables the
+    /// parent's own manifest declares.
+    parent_env_allow: Vec<String>,
 }
 
 impl DelegationPlane {
@@ -260,13 +269,17 @@ impl DelegationPlane {
     /// `roost_url`, `credential` and `session_id` come from the session's own registration, never
     /// from anything the agent said. `declared_deadline` is the capsule's own
     /// `lifecycle.delegation_deadline_secs`; [`DELEGATION_TIMEOUT_ENV`] overrides it where it
-    /// names a positive number of seconds.
+    /// names a positive number of seconds. `registry` is the store a child's manifest is read
+    /// from and `parent_env_allow` the delegating capsule's own `capabilities.env.allow`, which
+    /// together decide the host variables a child is handed.
     pub fn new(
         roost_url: String,
         credential: SpawnCredential,
         accessible_workdir: PathBuf,
         session_id: String,
         declared_deadline: Duration,
+        registry: std::sync::Arc<dyn murmur_artifact::Registry>,
+        parent_env_allow: Vec<String>,
     ) -> Self {
         Self {
             roost_url: roost_url.trim_end_matches('/').to_string(),
@@ -274,12 +287,40 @@ impl DelegationPlane {
             accessible_workdir,
             result_timeout: configured_result_timeout(declared_deadline),
             session_id,
+            registry,
+            parent_env_allow,
         }
     }
 
     /// This plane's bound on the wait for a child's answer.
     pub fn result_timeout(&self) -> Duration {
         self.result_timeout
+    }
+
+    /// The host variables this launch copies into the child: what the child's own manifest
+    /// declares under `capabilities.env.allow`, clamped to what the parent's declares.
+    ///
+    /// The manifest is read narrowly, out of the packed artifact, because a full parse resolves
+    /// the child's `${VAR}` references against this process's environment and would refuse a
+    /// manifest naming a variable the parent has not been given. An artifact that cannot be
+    /// resolved, or whose declaration cannot be read, is an error naming the capsule and version
+    /// rather than an empty list: a child launched without what it declares fails later and less
+    /// legibly.
+    fn child_env_allow(&self, capsule: &str, version: &str) -> Result<Vec<String>, RuntimeError> {
+        let resolved = self
+            .registry
+            .resolve_with_platform(capsule, version, Some(murmur_artifact::current_platform()))
+            .map_err(|error| {
+                RuntimeError::Runtime(format!(
+                    "cannot read what '{capsule}@{version}' declares under \
+                     capabilities.env.allow: {error}"
+                ))
+            })?;
+        let manifest_yaml =
+            crate::artifact::extract_manifest_yaml(capsule, version, &resolved.bytes)?;
+        let declared =
+            crate::artifact::extract_declared_env_allow(capsule, version, &manifest_yaml)?;
+        Ok(env_allow_intersection(&declared, &self.parent_env_allow))
     }
 
     /// A child's directory named from the parent's accessible workdir, which is the only root the
@@ -330,10 +371,11 @@ impl DelegationPlane {
         // child rather than leaving it holding a port. The one exception is the deadline in step 4,
         // which releases the child first.
         //
-        // `child_env_allow` is empty because the delegating side knows the capsule's name and
-        // version and nothing else about its manifest; a delegated child therefore sees no host
-        // variables beyond the three every child gets. Deriving it would take the child's
-        // manifest, which only the daemon has resolved.
+        // `child_env_allow` is what both manifests declare and nothing else, read here rather
+        // than taken from the daemon's answer: the referee answers whether a spawn may happen, and
+        // the clamp has to hold whatever it answered. A read that fails starts no child — one
+        // launched without the variables its manifest names dies at its own manifest load, inside
+        // a process nobody is reading.
         //
         // The spawner is lineage and nothing else. The answer arrives on the connection this
         // plane opened, so there is nothing for a completion to tell it: no address means no
@@ -344,12 +386,22 @@ impl DelegationPlane {
                 context_id: origin.context_id.clone(),
                 report_to: None,
             });
+        let child_env_allow = match self.child_env_allow(&request.capsule, &request.version) {
+            Ok(names) => names,
+            Err(error) => {
+                return DelegationResult::unmade(
+                    request,
+                    DelegationStatus::Failed,
+                    error.to_string(),
+                )
+            }
+        };
         let mut child = match launch_child_capsule(ChildLaunchRequest {
             parent_accessible_workdir: self.accessible_workdir.clone(),
             capsule_name: request.capsule.clone(),
             capsule_version: request.version.clone(),
             grant,
-            child_env_allow: Vec::new(),
+            child_env_allow,
             roost_url: self.roost_url.clone(),
             spawner,
         }) {
@@ -619,6 +671,22 @@ fn bound_output(output: String) -> String {
     format!("{} […]", &output[..end])
 }
 
+/// The host variables a child is handed: the names it declares that its parent declares too.
+///
+/// Order follows the child's declaration and no name appears twice, so what the launcher copies
+/// reads as the child's own list. The clamp is the parent's second, independent statement of the
+/// `capabilities.env.allow` envelope axis `mur-roost` already referees — a child can never hold a
+/// variable the capsule that spawned it does not itself declare, whatever a daemon answered.
+fn env_allow_intersection(child: &[String], parent: &[String]) -> Vec<String> {
+    let mut allowed: Vec<String> = Vec::new();
+    for name in child {
+        if parent.contains(name) && !allowed.contains(name) {
+            allowed.push(name.clone());
+        }
+    }
+    allowed
+}
+
 /// The bound this session delegates under: [`DELEGATION_TIMEOUT_ENV`] when it names a positive
 /// number of seconds, and `declared` — the capsule's own `lifecycle.delegation_deadline_secs` —
 /// otherwise.
@@ -760,6 +828,40 @@ mod tests {
         assert!(bounded.len() <= MAX_OUTPUT_BYTES + " […]".len());
     }
 
+    /// A child is handed the names both manifests declare, in the order the child declared them.
+    #[test]
+    fn a_child_is_handed_only_what_both_manifests_declare() {
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|name| name.to_string()).collect() };
+
+        assert_eq!(
+            env_allow_intersection(&names(&["A", "B", "C"]), &names(&["B", "C", "D"])),
+            names(&["B", "C"])
+        );
+        assert_eq!(
+            env_allow_intersection(&names(&["A"]), &names(&[])),
+            Vec::<String>::new(),
+            "a parent that declares nothing hands nothing on"
+        );
+        assert_eq!(
+            env_allow_intersection(&names(&[]), &names(&["A"])),
+            Vec::<String>::new(),
+            "a child that declares nothing asks for nothing"
+        );
+    }
+
+    /// The order is the child's, and a name it declared twice is copied once.
+    #[test]
+    fn the_intersection_keeps_the_childs_order_and_names_nothing_twice() {
+        let names =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|name| name.to_string()).collect() };
+
+        assert_eq!(
+            env_allow_intersection(&names(&["C", "A", "C"]), &names(&["A", "B", "C"])),
+            names(&["C", "A"])
+        );
+    }
+
     /// The trailing slash is taken off once, so no request is built against `//spawn`.
     #[test]
     fn a_trailing_slash_on_the_daemon_url_is_trimmed_once() {
@@ -769,6 +871,8 @@ mod tests {
             PathBuf::from("/tmp"),
             "ses_parent".to_string(),
             DELEGATION_RESULT_TIMEOUT,
+            std::sync::Arc::new(murmur_artifact::LocalRegistry::new("/tmp")),
+            Vec::new(),
         );
         assert_eq!(plane.roost_url, "http://127.0.0.1:7700");
     }

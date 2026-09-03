@@ -174,6 +174,57 @@ fn extract_manifest_yaml_capped(
         })
 }
 
+/// The `capabilities.env.allow` a packed manifest declares, read on its own.
+///
+/// Narrow on purpose. `murmur_artifact::RuntimeManifest::from_yaml_str` validates the whole
+/// manifest, and that resolves every `${VAR}` in `inference.api_key` against the reading
+/// process's environment — so a parent asking what its child declares would have to already hold
+/// the child's variables before it could read which ones they are. Reading the one key answers
+/// that without the circle.
+///
+/// A manifest with no `capabilities:` block, or none under `env:`, declares nothing and yields an
+/// empty list. Malformed YAML, or an `env.allow` that is not a list of strings, is an error
+/// naming the artifact and version.
+pub fn extract_declared_env_allow(
+    artifact_name: &str,
+    artifact_version: &str,
+    manifest_yaml: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    let declared: DeclaredEnvAllow =
+        serde_yaml::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            message: format!(
+                "cannot read capabilities.env.allow from {PACKED_MANIFEST_ENTRY}: {err}"
+            ),
+        })?;
+    Ok(declared
+        .capabilities
+        .and_then(|capabilities| capabilities.env)
+        .map(|env| env.allow)
+        .unwrap_or_default())
+}
+
+/// The one key [`extract_declared_env_allow`] reads. Every other manifest key deserializes into
+/// nothing here, so a child declaring anything at all is still readable.
+#[derive(serde::Deserialize)]
+struct DeclaredEnvAllow {
+    #[serde(default)]
+    capabilities: Option<DeclaredCapabilities>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeclaredCapabilities {
+    #[serde(default)]
+    env: Option<DeclaredEnv>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeclaredEnv {
+    #[serde(default)]
+    allow: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -218,6 +269,70 @@ mod tests {
         let manifest = extract_manifest_yaml("demo", "0.1.0", &archive).unwrap();
         assert!(manifest.contains("name: demo"));
         assert!(manifest.contains("version: 0.1.0"));
+    }
+
+    #[test]
+    fn reads_the_declared_env_allow_out_of_a_manifest() {
+        let manifest = "name: worker\nversion: 0.1.0\ncapabilities:\n  network:\n    \
+                        allow: [127.0.0.1]\n  env:\n    allow: [OPENAI_API_KEY, HTTPS_PROXY]\n";
+
+        assert_eq!(
+            extract_declared_env_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["OPENAI_API_KEY".to_string(), "HTTPS_PROXY".to_string()]
+        );
+    }
+
+    /// The read answers what the child declares without validating the rest of the manifest: a
+    /// `${VAR}` the reading process does not hold would fail a full parse, and the whole point is
+    /// to learn which variables the child needs before holding any of them.
+    #[test]
+    fn an_unresolvable_inference_key_does_not_stop_the_read() {
+        let manifest = "name: worker\nversion: 0.1.0\ninference:\n  transport: http\n  \
+                        api_key: ${MURMUR_A_VARIABLE_NOBODY_EXPORTED}\ncapabilities:\n  env:\n    \
+                        allow: [MURMUR_A_VARIABLE_NOBODY_EXPORTED]\n";
+
+        assert_eq!(
+            extract_declared_env_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["MURMUR_A_VARIABLE_NOBODY_EXPORTED".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_manifest_declaring_no_env_allow_declares_nothing() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  shell:\n    allow: [bash]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: []\n",
+        ] {
+            assert_eq!(
+                extract_declared_env_allow("worker", "0.1.0", manifest).unwrap(),
+                Vec::<String>::new(),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_env_allow_is_an_error_naming_the_artifact() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: OPENAI_API_KEY\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [[OPENAI_API_KEY]]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n\tenv: broken\n",
+        ] {
+            let err = extract_declared_env_allow("worker", "0.1.0", manifest).unwrap_err();
+            match err {
+                RuntimeError::ArtifactArchive {
+                    name,
+                    version,
+                    message,
+                } => {
+                    assert_eq!(name, "worker");
+                    assert_eq!(version, "0.1.0");
+                    assert!(message.contains("capabilities.env.allow"), "{message}");
+                }
+                other => panic!("expected ArtifactArchive error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

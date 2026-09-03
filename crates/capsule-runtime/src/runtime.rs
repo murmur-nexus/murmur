@@ -1329,6 +1329,8 @@ pub fn launch_session(
                 accessible_workdir.clone(),
                 session_id.clone(),
                 std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
+                Arc::clone(&staged.registry),
+                staged.capability_policy.env_allow.clone(),
             ))
         });
 
