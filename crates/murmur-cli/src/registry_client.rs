@@ -353,10 +353,9 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::TcpListener,
-        thread::JoinHandle,
     };
 
-    use murmur_artifact::{sha256_hex, Registry, RuntimeType};
+    use murmur_artifact::{sha256_hex, Registry, RegistryError, RuntimeType};
     use tempfile::tempdir;
     use zip::{write::SimpleFileOptions, ZipWriter};
 
@@ -364,10 +363,10 @@ mod tests {
 
     /// A loopback HTTP server answering exactly one request with `body` and the headers an
     /// artifact download carries. It binds port 0, so concurrent tests never contend for a
-    /// port, and its thread is detached on drop so an unanswered request cannot hang the run.
+    /// port, and its thread is left detached so a test that never made its request cannot
+    /// block the runner in `accept()`.
     struct OneShotServer {
         url: String,
-        join: Option<JoinHandle<()>>,
     }
 
     impl OneShotServer {
@@ -376,7 +375,7 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
 
-            let join = std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 // A GET carries no body, so the request head is the whole request.
                 let mut request = [0u8; 4096];
@@ -393,18 +392,7 @@ mod tests {
                 stream.flush().unwrap();
             });
 
-            Self {
-                url,
-                join: Some(join),
-            }
-        }
-    }
-
-    impl Drop for OneShotServer {
-        fn drop(&mut self) {
-            // Detached rather than joined: a test that never made its request would otherwise
-            // block the runner in accept().
-            let _ = self.join.take();
+            Self { url }
         }
     }
 
@@ -487,6 +475,10 @@ mod tests {
             .resolve("my-tool", "1.0.0")
             .unwrap_err();
 
+        assert!(
+            matches!(error, RegistryError::InvalidInput(_)),
+            "unreadable bytes are rejected input, not a transport failure: {error:?}"
+        );
         let message = error.to_string();
         assert!(
             message.contains("my-tool") && message.contains("1.0.0"),

@@ -755,16 +755,15 @@ fn derived_meta(
     bytes: &[u8],
     path_platform: Option<&str>,
 ) -> ArtifactMeta {
-    let declared = declared_runtime_from_artifact_bytes(bytes);
+    let (runtime, artifact_runtime) = declared_runtime_from_artifact_bytes(bytes).map_or_else(
+        || (RuntimeType::Wasm, String::new()),
+        |declared| (declared.runtime, declared.artifact_runtime),
+    );
     ArtifactMeta {
         name: name.to_string(),
         version: version.to_string(),
-        runtime: declared
-            .as_ref()
-            .map_or(RuntimeType::Wasm, |declared| declared.runtime),
-        artifact_runtime: declared
-            .as_ref()
-            .map_or_else(String::new, |declared| declared.artifact_runtime.clone()),
+        runtime,
+        artifact_runtime,
         platforms: path_platform
             .and_then(split_platform_tag)
             .map(|(os, arch)| vec![(os.to_string(), arch.to_string())])
