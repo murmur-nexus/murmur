@@ -337,21 +337,48 @@ it are composed by the capsule's own runtime, so **a delegating capsule needs no
 
 ### What the call returns
 
-The call returns when the child finishes or when the deadline passes, not when it starts. A
-successful result is a JSON object:
+**The call returns when the child starts, not when it finishes.** A result is a JSON object:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` |
+| `delegation_id` | string | `dlg_…`, the id this delegation is named by in `trace.jsonl` and on the outcome that arrives later |
 | `session_id` | string | `ses_…`, the child's own session |
-| `capsule`, `version` | string | The artifact that ran |
-| `status` | string | `completed`, `failed` or `timed_out`. `timed_out` means the capsule stopped waiting, not that the sub-capsule was stopped |
-| `output` | string | The child's answer, read from the result file its own runtime wrote. Cut at 64 KiB, with the cut marked and the tool result flagged `truncated` |
-| `result_path` | string | Where the answer is on disk, relative to the delegating capsule's accessible workdir. Absent when the child wrote no result file |
+| `capsule`, `version` | string | The artifact that was launched |
+| `status` | string | `started`, `failed` or `refused` |
+| `child_workdir` | string | The child's directory, relative to the delegating capsule's accessible workdir — where its own `trace.jsonl` is, and where its result will be. Present only on `started` |
+| `output` | string | Why there is no delegation, on `failed`. Absent on `started`, which has produced nothing yet |
+
+`started` means the sub-capsule is running **and holding its task**, not merely that a process
+exists. Everything short of that fails the call in the same turn: a daemon refusal, a child that
+could not be launched, one that bound no address, and one that did not accept its task within the
+delivery bound. A child that fails at any of those points is stopped and reaped rather than left
+running.
 
 A refusal comes back instead as a plain sentence naming the manifest key and the entry that failed,
 with no JSON around it. The delegating capsule's own run carries on: a refused delegation is a
 failed tool call, and the session continues.
+
+### How the outcome arrives
+
+What the sub-capsule did reaches the delegating capsule afterwards, as its own task with
+[origin](../concepts/access-control.md#task-origin-and-trust-class) `completion` in the `bg` lane,
+carrying the same `dlg_` id the call returned. That is the whole of what a turn issuing several
+delegations has to do differently: issue them, end the turn, and handle each outcome as it lands.
+See [The completion path](#the-completion-path) for what one carries.
+
+**A delegating capsule has to be able to receive one.** Under the default `lifecycle` block the
+session ends with the task that made the delegation, and every outcome is posted to a session that
+is already gone. A capsule that delegates declares:
+
+| Key | Value | Why |
+|---|---|---|
+| [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) | `queue` | An outcome is an inbound task; a capsule accepting one task at a time never takes it |
+| [`lifecycle.queue_depth`](manifest.md#field-lifecycle) | at least the number of delegations one turn issues | Each outcome in flight occupies a slot |
+| [`lifecycle.after_task`](manifest.md#lifecycle-after-task) | `sleep` | The session has to outlive the task that delegated |
+
+A capsule that declares `capabilities.spawn.allow` and leaves that block unable to receive a
+completion is warned at launch with [`W-SEC-020`](diagnostics.md#w-sec-020). The launch is not
+refused: a capsule that delegates and deliberately does not wait is legitimate.
 
 ### Bounds
 
@@ -359,27 +386,23 @@ failed tool call, and the session continues.
 |---|---|---|
 | Launch | 180s | From starting the child process to its first `--json` line |
 | Delivery | 30s | Retrying the task delivery while the child's listener comes up |
-| Answer | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | Waiting for the child's task to reach a terminal state. On expiry the call returns `timed_out` and the child is released |
+| Child watch | [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), default 600s, or `MURMUR_DELEGATION_TIMEOUT_SECS` | How long the started child runs. Counted from the moment it reported itself ready, so the launch bound above is not spent out of it. On expiry the child is ended and a `terminated` completion is posted to the delegating capsule, naming the bound in seconds |
 
-The answer bound is the delegating capsule's own runtime's clock. No request is made to the daemon
-to decide or enforce it, so no daemon has to be reachable for it to fire.
-
-**Reaching it stops the wait, not the child.** The child's process is released: it keeps running,
-and the delegating capsule's runtime watches it only to learn what it eventually did. The capsule
-is then told twice about that one delegation — once at the deadline, and once more if the released
-child later ends — as two `completion`-origin tasks in the background lane, each opening with a
-line the other does not. See
-[`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) for what
-each carries and what a released child costs.
+The child-watch bound is the delegating capsule's own runtime's clock. No request is made to the
+daemon to decide or enforce it, so no daemon has to be reachable for it to fire.
 
 How deep a chain of delegations may go and how many a capsule may have running at once are the
 daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon
 refuses comes back as a failed tool call carrying the refusal.
 
-**A delegated capsule must still be listening when its answer is read.** The answer is read after
-an A2A `tasks/get` reports the task complete, so a sub-capsule that exits the moment it finishes
-can leave the delegation with nothing to read. Declare `lifecycle.after_task: sleep` on a capsule
-meant to be delegated to.
+**A delegated capsule reports when its session ends.** A sub-capsule that sleeps between tasks
+never ends its session, so nothing about it reaches its parent until the child-watch bound stops it.
+Declare `lifecycle.after_task: exit` on a capsule meant to be delegated to with `delegate-task`.
+
+A plan's `capsule` step is the exception, and it runs the other way: that step waits on the
+connection it opened and reads the answer with an A2A `tasks/get`, so a capsule meant to be used as
+a plan step must still be listening when the read happens and declares
+`lifecycle.after_task: sleep` instead.
 
 ---
 
@@ -701,7 +724,7 @@ sessions also discards every credential and approval that could delegate under t
 | `MURMUR_SESSION_ID` | The runtime, in every capsule | The capsule's own session ID, which its traces carry and which `mur run` prints |
 | `MURMUR_SPAWNER` | The parent capsule's runtime, on a delegated child only | Where the child reports its outcome, and under which delegation id — see [The completion path](#the-completion-path). A value that is not a spawner handle refuses the launch with [`E-RUN-020`](diagnostics.md#e-run-020) |
 | `MURMUR_MUR_BINARY` | The environment of the process that runs the capsule | The `mur` binary a parent starts its children from. Defaults to the running executable, which in production is `mur` itself |
-| `MURMUR_DELEGATION_TIMEOUT_SECS` | The environment of the process that runs the capsule | Whole seconds a `delegate-task` call waits for the sub-capsule's answer. Default 600. A value that is not a positive integer is ignored |
+| `MURMUR_DELEGATION_TIMEOUT_SECS` | The environment of the process that runs the capsule | The single delegation bound, in whole seconds: how long a started sub-capsule is watched, and how long a plan `capsule` step waits for its answer. Sets [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) for the whole process. Default 600. A value that is not a positive integer is ignored |
 
 The spawn credential and the spawn approval have no environment variable. Every request to this
 daemon is made by the capsule's runtime, which holds them; `MURMUR_SESSION_ID` authorises nothing

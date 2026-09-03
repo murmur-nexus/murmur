@@ -388,15 +388,6 @@ pub(crate) const SOURCE_DETACHED_SHELL: &str = "detached_shell";
 /// two say opposite things: one carries a result, the other says no result exists.
 pub(crate) const SOURCE_DETACHED_LOST: &str = "detached_lost";
 
-/// The `source` of a task the runtime enqueued for itself when a delegation reached its
-/// `lifecycle.delegation_deadline_secs` and the parent stopped waiting.
-pub(crate) const SOURCE_DELEGATION_DEADLINE: &str = "delegation_deadline";
-
-/// The `source` of a task reporting a released child that ended after its deadline had already
-/// been reported. Distinct from [`SOURCE_DELEGATION_DEADLINE`] because the two say opposite
-/// things: one says nothing is known yet, the other carries the outcome.
-pub(crate) const SOURCE_DELEGATION_LATE: &str = "delegation_late";
-
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

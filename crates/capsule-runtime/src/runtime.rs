@@ -17,7 +17,7 @@ use murmur_artifact::{
     LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
     RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -46,10 +46,7 @@ use crate::{
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
     delegation::SpawnerHandle,
-    detached::{
-        demotion_tool_result, DelegationDeadlineReport, DetachPolicy, DetachedRegistry,
-        DetachedReport,
-    },
+    detached::{demotion_tool_result, DetachPolicy, DetachedRegistry, DetachedReport},
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1225,6 +1222,11 @@ pub fn launch_session(
             requires_process_bounding,
             shell_enforcement.cgroup_scope.is_some(),
         );
+        warn_for_unreachable_delegation_outcomes(
+            &workdir,
+            !staged.capability_policy.spawn_allow.is_empty(),
+            &staged.lifecycle,
+        );
 
         let agent_card = identity::build_agent_card(
             &capsule_identity,
@@ -1323,15 +1325,20 @@ pub fn launch_session(
         // session holds one exactly when the daemon minted it — the `delegate-task` manifest was
         // written from the same declaration, so the tool and the plane appear together.
         let delegation_plane = roost_session.endpoint().map(|(roost_url, credential)| {
-            std::sync::Arc::new(crate::delegation_plane::DelegationPlane::new(
-                roost_url.to_string(),
-                credential,
-                accessible_workdir.clone(),
-                session_id.clone(),
-                std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
-                Arc::clone(&staged.registry),
-                staged.capability_policy.env_allow.clone(),
-            ))
+            std::sync::Arc::new(
+                crate::delegation_plane::DelegationPlane::new(
+                    roost_url.to_string(),
+                    credential,
+                    accessible_workdir.clone(),
+                    session_id.clone(),
+                    std::time::Duration::from_secs(effective_lifecycle.delegation_deadline_secs),
+                    Arc::clone(&staged.registry),
+                    staged.capability_policy.env_allow.clone(),
+                )
+                // This capsule's own A2A door, bound just above: where a started delegation's
+                // completion is posted, and what makes `DelegationPlane::start` available at all.
+                .reporting_to(format!("http://{capsule_url}")),
+            )
         });
 
         // Capture staged fields that move into the async block
@@ -1555,6 +1562,7 @@ pub fn launch_session(
                         current_traceparent: None,
                         current_task_provenance: None,
                         current_context_id: None,
+                        delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
                         detached: Some(Arc::clone(&detached)),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
@@ -2035,6 +2043,11 @@ pub fn launch_session(
                                 incoming.message_text.len() as u64,
                             )
                             .await;
+                        // A task naming a delegation is that delegation's outcome arriving, which
+                        // is where a `delegate-task` call that returned on start finally ends.
+                        if let Some(delegation_id) = &incoming.delegation_id {
+                            state.close_started_delegation(delegation_id).await;
+                        }
                         let seed = hooks
                             .dispatch_task_start(
                                 incoming.task_id.clone(),
@@ -2207,18 +2220,6 @@ pub fn launch_session(
                                     .await;
                                 recorded.push(completion.work_id);
                             }
-                            // Both delegation reports are already recorded where they can still be
-                            // read: the deadline on the `delegation` line this session wrote, and a
-                            // late outcome in the child's own `completion.json`. Nothing further is
-                            // written here, because there is no agent left to tell.
-                            DetachedReport::DelegationDeadline(report) => eprintln!(
-                                "[capsule-runtime] delegation {} reached its deadline after the session stopped accepting work; the capsule was left running",
-                                report.delegation_id
-                            ),
-                            DetachedReport::DelegationLate(report) => eprintln!(
-                                "[capsule-runtime] delegation {} ended after the session stopped accepting work; its outcome is in the child's completion.json",
-                                report.delegation_id
-                            ),
                             DetachedReport::Lost(_) => {}
                         }
                     }
@@ -2339,6 +2340,7 @@ pub fn launch_session(
         current_traceparent: None,
         current_task_provenance: None,
         current_context_id: None,
+        delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
         // The script-capsule path runs no task loop, so a demoted command's completion would
         // have nowhere to be delivered: every command it dispatches runs to completion in the
         // foreground.
@@ -2752,6 +2754,47 @@ pub(crate) fn warn_if_bash_network_bypass(workdir: &Path, policy: &CapabilityPol
             &format!(
                 "[capability-policy] warning[{W_SEC_003}]: {BASH_NETWORK_BYPASS_WARNING} ({link})"
             ),
+        );
+    }
+}
+
+const NO_COMPLETION_LANE_WARNING: &str = "this capsule declares capabilities.spawn.allow, but \
+its lifecycle block cannot receive a delegation's outcome: delegate-task returns as soon as the \
+sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. \
+Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a \
+lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this \
+capsule delegates for will be posted to a session that has already exited.";
+
+/// Pure decision for the delegation-lifecycle warning, split out of
+/// [`warn_for_unreachable_delegation_outcomes`] the same way `sandbox::aggregate_bounding_warning`
+/// is split out of its emitter, so a test can assert it without capturing stderr.
+///
+/// Fires exactly where an outcome has nowhere to land: a capsule that can delegate and either
+/// exits after its task or accepts no second one. Never a refusal — a capsule that delegates and
+/// deliberately does not wait for the answer is legitimate, and this is what makes that a choice
+/// rather than an accident.
+pub(crate) fn unreachable_delegation_outcomes_warning(
+    can_delegate: bool,
+    lifecycle: &LifecycleConfig,
+) -> Option<(&'static str, &'static str)> {
+    let can_receive = lifecycle.task_acceptance == TaskAcceptance::Queue
+        && lifecycle.after_task == AfterTask::Sleep;
+    (can_delegate && !can_receive).then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
+}
+
+/// Fires at every launch, not just once.
+pub(crate) fn warn_for_unreachable_delegation_outcomes(
+    workdir: &Path,
+    can_delegate: bool,
+    lifecycle: &LifecycleConfig,
+) {
+    if let Some((code, message)) = unreachable_delegation_outcomes_warning(can_delegate, lifecycle)
+    {
+        let link = security_warning_link(code);
+        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        agent::append_bootstrap_log(
+            workdir,
+            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
         );
     }
 }
@@ -3408,6 +3451,21 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     }
 }
 
+/// One delegation this session started and is still waiting on the outcome of.
+///
+/// Kept because the terminal `delegation` trace line names the capsule and the version, and a
+/// completion arriving later carries neither: it names the delegation, and the runtime remembers
+/// what that delegation was for.
+pub(crate) struct StartedDelegation {
+    /// The child's directory, absolute — where its `completion.json` is read from.
+    pub(crate) workdir: PathBuf,
+    pub(crate) capsule: String,
+    pub(crate) version: String,
+    /// When the launch was recorded, so an unreadable completion still closes the row with a
+    /// duration rather than a zero.
+    pub(crate) started: std::time::Instant,
+}
+
 pub(crate) struct CapsuleStoreState {
     /// Resource limiter for this store, registered via `Store::limiter`. Also the record of
     /// any growth request it denied, which `classify_guest_failure` reads to tell a
@@ -3479,6 +3537,14 @@ pub(crate) struct CapsuleStoreState {
     /// at every task-activation site. A demoted command's completion is enqueued under this id,
     /// so the result joins the conversation the command was started from.
     pub(crate) current_context_id: Option<String>,
+    /// Every delegation this session started and has not yet closed, by `dlg_` id.
+    ///
+    /// Filled from the launch notice, read when that delegation's completion arrives as a task:
+    /// the terminal `delegation` trace line is written then, out of the child's own
+    /// `completion.json`, because a delegation that returns on start has not ended when the tool
+    /// call returns. Session-scoped, and behind a lock because the dispatch that fills it and the
+    /// task loop that reads it both hold this state shared.
+    pub(crate) delegation_workdirs: Arc<Mutex<HashMap<String, StartedDelegation>>>,
     // ── Detached shell ───────────────────────────────────────────────────────────
     /// Where a demoted command registers itself and delivers its completion. `None` is what
     /// keeps a call site foreground-only: the script-capsule path and every test construction
@@ -4482,8 +4548,22 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Records one launched child in this session's trace, before its delegation has ended.
+    /// Records one launched child in this session's trace, before its delegation has ended, and
+    /// remembers where that child's directory is.
+    ///
+    /// The directory is what [`Self::close_started_delegation`] later reads the child's own
+    /// `completion.json` out of, so the pair is filled here rather than recomposed from the
+    /// delegation id, which names no path.
     async fn write_delegation_start(&self, notice: &crate::delegation_plane::DelegationLaunch) {
+        self.delegation_workdirs.lock().unwrap().insert(
+            notice.delegation_id.clone(),
+            StartedDelegation {
+                workdir: self.accessible_workdir.join(&notice.child_workdir),
+                capsule: notice.capsule.clone(),
+                version: notice.version.clone(),
+                started: std::time::Instant::now(),
+            },
+        );
         if let Some(trace) = &self.peer_trace {
             trace
                 .write_delegation_start(
@@ -4497,62 +4577,71 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Tell this capsule's own agent that a delegation reached its deadline, and start watching
-    /// the child it released.
+    /// Close the `delegation_start` this completion belongs to, as the task carrying it begins.
     ///
-    /// Two things happen here and their order is the whole rule: the deadline task is handed over
-    /// first, then the watcher is started. A child that ended in the same instant the deadline
-    /// fired can therefore only be reported second, which is what makes the late report always the
-    /// second word on a delegation rather than sometimes the first.
+    /// A delegation that returns on start has not ended when its tool call returns, so this is
+    /// where its terminal `delegation` line is written — one line per delegation still, joined to
+    /// the start by the `dlg_` id both carry, and to the completion task by the same id on its
+    /// `task_start`.
     ///
-    /// Both tasks inherit the delegating task's trust through
-    /// [`TaskProvenance::derive`] with [`TaskOrigin::Completion`], the same derivation a demoted
-    /// shell command's completion uses, so untrust survives the round trip.
-    fn report_delegation_deadline(&self, notice: crate::delegation_plane::DelegationDeadline) {
-        // No registry means no task loop to deliver into — the script-capsule path. Dropping the
-        // notice drops the released child with it, and nothing reaps the process; that is why the
-        // plane only releases for a caller that took the channel, and this branch is unreachable
-        // from a session that has one.
-        let Some(detached) = self.detached.as_ref() else {
+    /// `outcome` and `reason` come out of the child's own `completion.json`, never out of the
+    /// completion's message text: both reporters write that file before they post, so the
+    /// structured record is on disk by the time this task exists. A file that cannot be read still
+    /// closes the row — a delegation left permanently in flight in the trace is a worse record
+    /// than one whose outcome is stated as unknown.
+    async fn close_started_delegation(&self, delegation_id: &str) {
+        let Some(started) = self
+            .delegation_workdirs
+            .lock()
+            .unwrap()
+            .remove(delegation_id)
+        else {
+            // A completion for a delegation this session did not start: another session's, or one
+            // whose start was never recorded. `mur trace show` renders the terminal line on its
+            // own row, which is the honest reading of it.
             return;
         };
-        let provenance = TaskProvenance::derive(
-            TaskOrigin::Completion,
-            self.current_task_provenance.map(|task| task.trust()),
-        );
-        let context_id = self.current_context_id.clone().unwrap_or_default();
-
-        detached.report(DetachedReport::DelegationDeadline(
-            DelegationDeadlineReport {
-                delegation_id: notice.delegation_id.clone(),
-                capsule_name: notice.capsule.clone(),
-                capsule_version: notice.version.clone(),
-                child_session_id: notice.child_session_id.clone(),
-                child_workdir: notice.child_workdir.clone(),
-                child_pid: notice.child_pid,
-                deadline_secs: notice.deadline_secs,
-                context_id: context_id.clone(),
-                provenance,
-            },
-        ));
-
-        crate::child_launch::watch_released_child(
-            notice.released,
-            crate::child_launch::LateReportPlan {
-                capsule_name: notice.capsule,
-                capsule_version: notice.version,
-                deadline_secs: notice.deadline_secs,
-                deadline_at: std::time::Instant::now(),
-                context_id,
-                provenance,
-                result_root: self.accessible_workdir.clone(),
-                child_task_id: notice.child_task_id,
-                reports: detached.sender(),
-            },
-        );
+        let Some(trace) = &self.peer_trace else {
+            return;
+        };
+        let recorded = crate::delegation::read_completion(&started.workdir);
+        let (outcome, reason, child_session_id, duration_ms) = match recorded {
+            Some(outcome) => (
+                outcome.status.as_str().to_string(),
+                outcome.detail.clone(),
+                Some(outcome.session_id.clone()).filter(|id| !id.is_empty()),
+                outcome.duration_ms,
+            ),
+            None => (
+                "unknown".to_string(),
+                Some(format!(
+                    "a completion arrived for this delegation, but no readable {} was left in {}",
+                    crate::delegation::COMPLETION_FILE,
+                    started.workdir.display()
+                )),
+                None,
+                started
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        };
+        trace
+            .write_delegation(
+                &started.capsule,
+                &started.version,
+                Some(delegation_id.to_string()),
+                child_session_id,
+                duration_ms,
+                &outcome,
+                reason,
+            )
+            .await;
     }
 
-    /// `delegate-task`: hand one task to one sub-capsule and return its answer.
+    /// `delegate-task`: hand one task to one sub-capsule and return as soon as it holds it.
     ///
     /// The agent names a capsule, a version and a task. Everything else — the daemon's address,
     /// this session's credential, the approval, the child's directory, the child's process and the
@@ -4560,8 +4649,16 @@ impl CapsuleStoreState {
     /// never enters the model's context. That is why a delegating capsule needs no
     /// `capabilities.network.allow` entry for the daemon: it never addresses it.
     ///
-    /// Run on a blocking thread, exactly as the shell branch is: the plane waits for the child's
-    /// whole run, and the parent's own A2A listener shares this `LocalSet`.
+    /// **The call returns when the child starts, not when it finishes.** What the child did
+    /// arrives afterwards as a `completion`-origin task in the background lane, carrying this
+    /// delegation's `dlg_` id — so one turn can issue several delegations and carry on while all
+    /// of them run. The `data` this returns therefore names a delegation in flight and carries no
+    /// answer: `output` and `result_path` are absent, and `child_workdir` is where the child's
+    /// own trace and, later, its result will be.
+    ///
+    /// Still run on a blocking thread, exactly as the shell branch is, because the plane's three
+    /// steps — the daemon, the launch and the delivery — are blocking calls; it is now the length
+    /// of a launch rather than the length of a child's run.
     async fn dispatch_delegate_task(
         &self,
         input: murmur::tool::run::ToolInput,
@@ -4587,21 +4684,19 @@ impl CapsuleStoreState {
         let plane = Arc::clone(plane);
         let started = std::time::Instant::now();
         // The launch notice leaves the blocking call on a channel whose `send` is synchronous, so
-        // the parent's `delegation_start` reaches disk while the delegation is still running
-        // rather than after it returns — which is the whole point of the record, for a child that
-        // hangs, crashes or is timed out.
+        // the parent's `delegation_start` reaches disk while the launch is still finishing rather
+        // than after it returns — which is the whole point of the record, for a child that is
+        // about to be handed a task and may then hang or crash.
         let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Where the child goes if the deadline fires. Supplying it is what turns the deadline from
-        // a kill into a release: the plane hands the process over instead of dropping it, and this
-        // dispatch is the one place that knows the conversation, the trust and the report channel a
-        // released child's outcome has to reach.
-        let (released_tx, mut released_rx) = tokio::sync::mpsc::unbounded_channel();
         let origin = crate::delegation_plane::DelegationOrigin {
             context_id: self.current_context_id.clone().unwrap_or_default(),
             launched: Some(launch_tx),
-            released: Some(released_tx),
+            // The completion this delegation posts inherits the delegating task's class, the same
+            // derivation a demoted shell command's completion uses. `None` — the script-capsule
+            // path — is read as untrusted by the plane.
+            trust: self.current_task_provenance.map(|task| task.trust()),
         };
-        let mut delegating = tokio::task::spawn_blocking(move || plane.delegate(&request, &origin));
+        let mut starting = tokio::task::spawn_blocking(move || plane.start(&request, &origin));
         let mut notices_open = true;
         let joined = loop {
             tokio::select! {
@@ -4610,70 +4705,79 @@ impl CapsuleStoreState {
                     // The sender lives in the blocking closure, so this is that closure ending.
                     None => notices_open = false,
                 },
-                joined = &mut delegating => break joined,
+                joined = &mut starting => break joined,
             }
         };
         // A launch that finished between the two arms being polled leaves its notice behind, and
-        // it still has to be written before the terminal line below it.
+        // it still has to be recorded.
         while let Ok(notice) = launch_rx.try_recv() {
             self.write_delegation_start(&notice).await;
         }
         let result = joined.map_err(|error| format!("'{DELEGATE_TASK_TOOL}' panicked: {error}"))?;
 
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        // The deadline's own task, and the watcher for an outcome that may still arrive. Both
-        // before the terminal `delegation` line is written, so the record of the deadline and the
-        // report of it cannot be separated by a failure in between.
-        while let Ok(notice) = released_rx.try_recv() {
-            self.report_delegation_deadline(notice);
-        }
-        let refused = result.status == crate::delegation_plane::DelegationStatus::Refused;
-        if let Some(trace) = &self.peer_trace {
-            trace
-                .write_delegation(
-                    &result.capsule,
-                    &result.version,
-                    Some(result.delegation_id.clone()).filter(|id| !id.is_empty()),
-                    Some(result.session_id.clone()).filter(|id| !id.is_empty()),
-                    duration_ms,
-                    result.status.as_str(),
-                    match result.status {
-                        crate::delegation_plane::DelegationStatus::Completed => None,
-                        _ => Some(result.output.clone()),
-                    },
-                )
-                .await;
+        let status = result.status;
+        // A delegation that started has not ended, so its terminal `delegation` line is not
+        // written here: it is written when the completion arrives, by
+        // [`Self::close_started_delegation`]. Only a delegation that will never produce a
+        // completion — the daemon refused it, or the child never took its task — is closed now.
+        if status != crate::delegation_plane::DelegationStatus::Started {
+            // A launch that got far enough to be announced but not far enough to be started is
+            // closed here, so the row it opened is not also waiting for a completion that will
+            // never come.
+            self.delegation_workdirs
+                .lock()
+                .unwrap()
+                .remove(&result.delegation_id);
+            if let Some(trace) = &self.peer_trace {
+                trace
+                    .write_delegation(
+                        &result.capsule,
+                        &result.version,
+                        Some(result.delegation_id.clone()).filter(|id| !id.is_empty()),
+                        Some(result.session_id.clone()).filter(|id| !id.is_empty()),
+                        duration_ms,
+                        status.as_str(),
+                        Some(result.output.clone()),
+                    )
+                    .await;
+            }
         }
 
         // A refusal is the referee's own sentence and nothing else. The operator reading it has to
         // see which manifest key and which entry to edit, not the HTTP transcript that carried it,
         // and not this runtime's opinion wrapped around it.
-        if refused {
+        if status == crate::delegation_plane::DelegationStatus::Refused {
             return Err(result.output);
         }
 
-        let completed = result.status == crate::delegation_plane::DelegationStatus::Completed;
         let summary = format!(
             "Delegated to {}@{}: {}",
             result.capsule,
             result.version,
-            result.status.as_str()
+            status.as_str()
         );
         let mut data = serde_json::json!({
             "delegation_id": result.delegation_id,
             "session_id": result.session_id,
             "capsule": result.capsule,
             "version": result.version,
-            "status": result.status.as_str(),
-            "output": result.output,
+            "status": status.as_str(),
         });
-        // Present only when the child left a result file, so the parent can read the untruncated
-        // answer through an ordinary tool call. Omitted rather than null when there is none.
-        if let Some(path) = &result.result_path {
-            data["result_path"] = serde_json::Value::String(path.clone());
+        match &result.child_workdir {
+            // Present only on a started delegation, and the only path there is to the child's own
+            // trace: joined to this capsule's workdir, it is a directory the parent's ordinary
+            // file tools can already address.
+            Some(workdir) => {
+                data["child_workdir"] = serde_json::Value::String(workdir.clone());
+            }
+            // A failed start produced no child worth naming, so what the agent gets is why.
+            None => {
+                data["output"] = serde_json::Value::String(result.output.clone());
+            }
         }
         Ok(murmur::tool::run::ToolResult {
-            status: if completed {
+            status: if status == crate::delegation_plane::DelegationStatus::Started {
                 murmur::tool::run::Status::Passed
             } else {
                 murmur::tool::run::Status::Failed
@@ -6008,7 +6112,7 @@ where
 }
 
 /// What ended the task loop's bounded wait: a task arriving (or its channel closing) or a report
-/// on work this runtime started — a detached command, or a delegation that outran its deadline.
+/// on work this runtime started.
 enum Woke {
     Task(Option<IncomingTask>),
     Report(DetachedReport),
@@ -6017,10 +6121,11 @@ enum Woke {
 /// Turn a report about work this runtime started into a queued `completion`-origin task, and
 /// record whatever join the report needs in the trace.
 ///
-/// Four kinds of report, one path: a demoted shell command finishing, a prior session's demoted
-/// commands going unaccounted, a delegation reaching its deadline, and a released child ending
-/// after that deadline was reported. All four are [`TaskOrigin::Completion`] and land in the `bg`
-/// lane by [`TaskLane::for_origin`]'s rule; none of them declares a lane.
+/// Two kinds of report, one path: a demoted shell command finishing, and a prior session's
+/// demoted commands going unaccounted. Both are [`TaskOrigin::Completion`] and land in the `bg`
+/// lane by [`TaskLane::for_origin`]'s rule; neither declares a lane. A delegation's outcome is
+/// not one of these — it arrives at the door as an ordinary inbound completion, posted by the
+/// child or by the watcher behind it.
 ///
 /// `can_accept` is not consulted, on either arm. A completion is work the capsule already
 /// admitted when it admitted the task that started the command, and a loss report is the only
@@ -6083,46 +6188,6 @@ async fn enqueue_detached_report(
             source: crate::a2a::SOURCE_DETACHED_LOST,
             delegation_id: None,
         },
-        // The deadline itself is already on the `delegation` line this session wrote, with
-        // `outcome: "timed_out"`, so nothing further goes in the trace here: the `task_start` the
-        // loop writes carries the same `dlg_` id and is the join.
-        DetachedReport::DelegationDeadline(report) => IncomingTask {
-            task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
-            context_id: report.context_id.clone(),
-            message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
-            message_text: report.message_text(),
-            provenance: report.provenance,
-            traceparent: None,
-            source: crate::a2a::SOURCE_DELEGATION_DEADLINE,
-            delegation_id: Some(report.delegation_id.clone()).filter(|id| !id.is_empty()),
-        },
-        DetachedReport::DelegationLate(report) => {
-            let delegation_id = Some(report.delegation_id.clone()).filter(|id| !id.is_empty());
-            let task = IncomingTask {
-                task_id: format!("tsk_{}", uuid::Uuid::now_v7().simple()),
-                context_id: report.context_id.clone(),
-                message_id: format!("msg_{}", uuid::Uuid::now_v7().simple()),
-                message_text: report.message_text(),
-                provenance: report.provenance,
-                traceparent: None,
-                source: crate::a2a::SOURCE_DELEGATION_LATE,
-                delegation_id: delegation_id.clone(),
-            };
-            let _ = trace
-                .write_delegation_late(
-                    delegation_id,
-                    &report.capsule_name,
-                    &report.capsule_version,
-                    &report.child_session_id,
-                    report.status.as_str(),
-                    report.duration_ms,
-                    report.after_deadline_ms,
-                    report.result_path.clone(),
-                    &task.task_id,
-                )
-                .await;
-            task
-        }
     };
 
     task_registry
@@ -6445,6 +6510,56 @@ inference:
 
     fn bootstrap_log_contents(workdir: &Path) -> String {
         fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
+    }
+
+    fn lifecycle(task_acceptance: TaskAcceptance, after_task: AfterTask) -> LifecycleConfig {
+        LifecycleConfig {
+            task_acceptance,
+            after_task,
+            ..LifecycleConfig::default()
+        }
+    }
+
+    /// A capsule that can delegate and leaves `lifecycle` at its defaults is warned, because
+    /// `after_task: exit` ends the session before any outcome can arrive.
+    #[test]
+    fn warn_for_unreachable_delegation_outcomes_writes_the_code_and_link_to_bootstrap_log() {
+        let temp = TempDir::new().unwrap();
+        warn_for_unreachable_delegation_outcomes(temp.path(), true, &LifecycleConfig::default());
+        let log = bootstrap_log_contents(temp.path());
+
+        assert!(log.contains(W_SEC_020), "log was: {log}");
+        assert!(
+            log.contains(&security_warning_link(W_SEC_020)),
+            "log was: {log}"
+        );
+        assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
+        assert!(log.contains("lifecycle.after_task"), "log was: {log}");
+    }
+
+    /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
+    /// `capabilities.spawn.allow` is never warned whatever it declares.
+    #[test]
+    fn only_a_delegating_capsule_that_cannot_be_told_is_warned() {
+        assert!(unreachable_delegation_outcomes_warning(
+            true,
+            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep)
+        )
+        .is_none());
+        for lifecycle in [
+            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Single, AfterTask::Sleep),
+            lifecycle(TaskAcceptance::None, AfterTask::Sleep),
+        ] {
+            assert!(
+                unreachable_delegation_outcomes_warning(true, &lifecycle).is_some(),
+                "{lifecycle:?} cannot receive a completion"
+            );
+            assert!(
+                unreachable_delegation_outcomes_warning(false, &lifecycle).is_none(),
+                "a capsule that cannot delegate is not warned about delegating"
+            );
+        }
     }
 
     /// An `InferenceConfig` with every system-prompt field empty, for the prompt-resolution
@@ -7419,6 +7534,7 @@ inference:
             current_traceparent: None,
             current_task_provenance: None,
             current_context_id: None,
+            delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
             detached: None,
             shell_grace_secs: 0,
             a2a_task_registry: None,
