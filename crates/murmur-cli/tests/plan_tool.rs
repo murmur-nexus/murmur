@@ -55,6 +55,18 @@ fn write_project(
     plan_grant: bool,
     shell_allow: &[&str],
 ) -> PathBuf {
+    write_project_with(project, endpoint, plan_grant, shell_allow, &[])
+}
+
+/// [`write_project`] for a case that also declares `capabilities.filesystem.read_only`, which is
+/// one of the two things the session's decision point refuses a call for.
+fn write_project_with(
+    project: &Path,
+    endpoint: &str,
+    plan_grant: bool,
+    shell_allow: &[&str],
+    read_only: &[&str],
+) -> PathBuf {
     let skill_dir = project.join("skills").join(SKILL);
     fs::create_dir_all(&skill_dir).unwrap();
     fs::write(skill_dir.join("skill.md"), SKILL_BODY).unwrap();
@@ -74,11 +86,22 @@ fn write_project(
         format!("  shell:\n    allow:\n{entries}")
     };
 
+    let filesystem_block = if read_only.is_empty() {
+        String::new()
+    } else {
+        let entries = read_only
+            .iter()
+            .map(|path| format!("      - {path}\n"))
+            .collect::<String>();
+        format!("  filesystem:\n    read_only:\n{entries}")
+    };
+
     let manifest = format!(
         "name: plan-capsule\nversion: 0.1.0\nartifacts:\n  \
          - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n  \
          - name: {SKILL}\n    source: ./skills/{SKILL}/skill.md\n    runtime: skill\n\
-         capabilities:\n  network:\n    allow:\n      - {endpoint}\n{plan_block}{shell_block}\
+         capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
+         {plan_block}{shell_block}{filesystem_block}\
          inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
          api_key: test-key\n  driver:\n    artifact: {DRIVER}\n"
     );
@@ -301,11 +324,22 @@ fn independent_shell_steps_run_together_and_a_later_step_reads_both() {
     ) {
         return;
     }
+    // Each command announces itself and then waits for the other, using nothing but `bash`
+    // builtins — the sandbox permits executing only the allowlisted binary, so `sleep` and
+    // `touch` are not available. A step that reaches the printf has seen the other step's marker
+    // while its own was still running, which serial execution cannot produce; the `SECONDS`
+    // bound is what stops a serial run from spinning forever instead of failing.
+    let rendezvous = |mine: &str, theirs: &str, output: &str| {
+        format!(
+            "bash -c ': > {mine}; while [ ! -e {theirs} ] && [ $SECONDS -lt 20 ]; do :; done; \
+             [ -e {theirs} ] && printf {output} || printf alone'"
+        )
+    };
     let plan = json!({
         "id": "tail",
         "steps": [
-            {"id": "w1", "shell": "bash -c 'printf one'"},
-            {"id": "w2", "shell": "bash -c 'printf two'"},
+            {"id": "w1", "shell": rendezvous("w1.started", "w2.started", "one")},
+            {"id": "w2", "shell": rendezvous("w2.started", "w1.started", "two")},
             {
                 "id": "join",
                 "tool": SKILL,
@@ -343,8 +377,17 @@ fn independent_shell_steps_run_together_and_a_later_step_reads_both() {
         Some(json!("one")),
         "{report}"
     );
+    assert_eq!(
+        steps
+            .iter()
+            .find(|step| step["step_id"] == "w2")
+            .map(|step| step["output"].clone()),
+        Some(json!("two")),
+        "{report}"
+    );
 
-    // Both outputs reached the joining step, which is only possible if both had settled.
+    // Both outputs reached the joining step, which is only possible if both had settled — and
+    // neither is `alone`, which is only possible if both were running at the same time.
     let join = trace_events(&workdir, "plan_step")
         .into_iter()
         .find(|event| event["step_id"] == "join")
@@ -354,6 +397,122 @@ fn independent_shell_steps_run_together_and_a_later_step_reads_both() {
         json!({"first": "one", "second": "two"}),
         "{join}"
     );
+}
+
+// ── the decision point ───────────────────────────────────────────────────────
+
+/// Every file called `name` anywhere under `root`.
+fn find_all(root: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(find_all(&path, name));
+        } else if entry.file_name() == name {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// The plan submitted by both halves of the case below: one command, writing one file.
+fn one_write_plan() -> Value {
+    json!({
+        "id": "write",
+        "steps": [{"id": "w", "shell": format!("bash -c ': > {PROTECTED}'")}]
+    })
+}
+
+/// The file the write step targets, and the single `read_only` entry that covers it.
+const PROTECTED: &str = "protected.txt";
+
+/// A plan step is refused by `capabilities.filesystem.read_only`, exactly as the same command is
+/// when the model runs it directly.
+///
+/// Asserted against a control run of the identical plan with the declaration removed, because the
+/// measurement that matters is the difference: without it the file appears, with it the file does
+/// not and the step carries the manifest's refusal. A step that entered underneath the decision
+/// point would write the file in both runs.
+///
+/// Gated on host support for the same reason the mechanical tail above is: the capsule declares
+/// `capabilities.shell.allow`.
+#[test]
+fn a_plan_step_is_refused_by_the_read_only_declaration() {
+    if common::skip_without_host_support("a_plan_step_is_refused_by_the_read_only_declaration") {
+        return;
+    }
+
+    // ── control: no declaration, so the write lands ──
+    let server = common::ScriptedServer::start(vec![
+        tool_use_turn(
+            "toolu_write",
+            "submit-plan",
+            json!({"plan": one_write_plan()}),
+        ),
+        end_turn("Written."),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    publish_driver(&home, artifacts.path());
+    let manifest = write_project(project.path(), &server.endpoint, true, &["bash"]);
+
+    let assert = run(&home, &manifest, "write the file").success();
+    let workdir = workdir_from(&assert);
+    let report = plan_report(&server.requests(), "toolu_write");
+    assert_eq!(report["completed"], true, "{report}");
+    assert!(
+        !find_all(&workdir, PROTECTED).is_empty(),
+        "the control run must actually write {PROTECTED} under {workdir:?}"
+    );
+
+    // ── the same plan, with the path declared read-only ──
+    let server = common::ScriptedServer::start(vec![
+        tool_use_turn(
+            "toolu_write",
+            "submit-plan",
+            json!({"plan": one_write_plan()}),
+        ),
+        end_turn("Refused."),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    publish_driver(&home, artifacts.path());
+    let manifest = write_project_with(
+        project.path(),
+        &server.endpoint,
+        true,
+        &["bash"],
+        &[PROTECTED],
+    );
+
+    let assert = run(&home, &manifest, "write the file").success();
+    let workdir = workdir_from(&assert);
+    let report = plan_report(&server.requests(), "toolu_write");
+
+    assert_eq!(report["completed"], false, "{report}");
+    assert_eq!(report["failed_step"], "w", "{report}");
+    let error = report["steps"][0]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refused step carries an error: {report}"));
+    assert!(
+        error.contains("Refused by the capsule manifest") && error.contains(PROTECTED),
+        "the step names the manifest rule that refused it: {error}"
+    );
+    assert!(
+        find_all(&workdir, PROTECTED).is_empty(),
+        "a refused step must not have written anything: {workdir:?}"
+    );
+
+    // Recorded where a direct call's refusal is recorded, so an audit reads one kind of line.
+    let denials = trace_events(&workdir, "protected_path_denied");
+    assert_eq!(denials.len(), 1, "{denials:#?}");
+    assert_eq!(denials[0]["call"], "shell", "{}", denials[0]);
+    assert_eq!(denials[0]["rule"], PROTECTED, "{}", denials[0]);
 }
 
 // ── absence, not failure ─────────────────────────────────────────────────────

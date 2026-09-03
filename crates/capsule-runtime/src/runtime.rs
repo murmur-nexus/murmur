@@ -4358,8 +4358,9 @@ impl CapsuleStoreState {
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
+        gate: Option<&mut crate::agent::CallGate<'_>>,
     ) -> Result<DispatchOutcome, String> {
-        let mut outcome = self.dispatch_agent_tool_unfenced(name, input).await?;
+        let mut outcome = self.dispatch_agent_tool_unfenced(name, input, gate).await?;
         // Every branch is fenced except the skill branch. A skill result is `skill.md`, read off
         // disk from inside the capsule, staged at install and fixed for the whole run: it is the
         // capsule author's own guidance and its entire purpose is to be followed as instruction,
@@ -4373,13 +4374,21 @@ impl CapsuleStoreState {
         Ok(outcome)
     }
 
-    /// [`Self::dispatch_agent_tool_async`]'s branches, before the fence. Private, and called
-    /// from exactly one place: a caller that reached this directly would hand the model
-    /// unfenced tool output.
+    /// [`Self::dispatch_agent_tool_async`]'s branches, before the fence. Private: whatever this
+    /// returns reaches the model unfenced unless the caller fences it.
+    ///
+    /// Two callers. [`Self::dispatch_agent_tool_async`] fences the result and is the agent loop's
+    /// route. [`Self::dispatch_submit_plan`] deliberately does not, because a plan step's output
+    /// becomes one field of a report that is fenced as a whole.
+    ///
+    /// `gate` is carried through rather than consulted here: this is the branch table, and the
+    /// decision point is applied by whoever is about to dispatch a call — the agent loop for its
+    /// own turn, and [`crate::plan`] for each step of a submitted plan.
     async fn dispatch_agent_tool_unfenced(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
+        gate: Option<&mut crate::agent::CallGate<'_>>,
     ) -> Result<DispatchOutcome, String> {
         // The two runtime-provided peer-handoff tools, intercepted ahead of every other path.
         // They have no artifact, no binary and no component: the manifests under
@@ -4405,7 +4414,7 @@ impl CapsuleStoreState {
         }
         if name == SUBMIT_PLAN_TOOL {
             return self
-                .dispatch_submit_plan(input)
+                .dispatch_submit_plan(input, gate)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -4832,9 +4841,12 @@ impl CapsuleStoreState {
     ///
     /// The scheduler is `crate::plan`, and every `tool` step it runs comes back through
     /// [`Self::dispatch_agent_tool_unfenced`] — this session's own dispatch, with this session's
-    /// own allowlist, shell grant and protected paths. A plan therefore reaches exactly the tools
-    /// the model could already call one at a time, and nothing else. `submit-plan` itself is
-    /// refused as a step by `plan::validate_plan`, so a plan cannot submit a plan.
+    /// own allowlist and shell grant. Every `tool` and `shell` step is put to `gate` first, which
+    /// is the same decision point the agent loop applies to its own calls, so a plan step is
+    /// subject to `capabilities.filesystem.read_only` and to a `commit_policy: deny` policy hook
+    /// exactly as the equivalent direct call is. A plan therefore reaches exactly what the model
+    /// could already call one turn at a time, and nothing else. `submit-plan` itself is refused
+    /// as a step by `plan::validate_plan`, so a plan cannot submit a plan.
     ///
     /// The scheduler is blocking and thread-scoped, so it runs on `spawn_blocking` while this
     /// side services its tool calls over a channel — the shape [`Self::dispatch_delegate_task`]
@@ -4843,6 +4855,7 @@ impl CapsuleStoreState {
     async fn dispatch_submit_plan(
         &self,
         input: murmur::tool::run::ToolInput,
+        mut gate: Option<&mut crate::agent::CallGate<'_>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         if !self.capability_policy.plan_submit {
             return Err(format!(
@@ -4877,11 +4890,15 @@ impl CapsuleStoreState {
             .filter(|name| name != SUBMIT_PLAN_TOOL)
             .collect();
 
-        // The blocking side asks for a tool call and waits; this side answers it. Unbounded
-        // because a plan's fan-out is its own bound: every request in flight is one scheduler
-        // thread already parked on its reply.
-        let (request_tx, mut request_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PlanToolRequest>();
+        // The blocking side asks for a decision or a tool call and waits; this side answers it.
+        // Unbounded because a plan's fan-out is its own bound: every request in flight is one
+        // scheduler thread already parked on its reply.
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel::<PlanRequest>();
+
+        // The same short-circuit the agent loop applies to its own calls: with neither a policy
+        // hook nor a `read_only` declaration there is nothing that can refuse a step, so no step
+        // resolves a call and no step crosses the channel to ask.
+        let gates = gate.as_ref().is_some_and(|gate| gate.gates(self));
 
         let capability_policy = self.capability_policy.clone();
         let scheduler_workdir = self.accessible_workdir.clone();
@@ -4891,11 +4908,32 @@ impl CapsuleStoreState {
         let spawn_credential = self.delegation.as_ref().map(|plane| plane.credential());
         let plan_trace = self.plan_trace.clone();
         let registry = Arc::clone(&self.registry);
+        let gate_tx = request_tx.clone();
         let mut scheduling = tokio::task::spawn_blocking(move || {
+            let gate_step = move |call: &crate::plan::PlannedCall<'_>| -> Option<String> {
+                if !gates {
+                    return None;
+                }
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                // Fail closed on both arms: a decision point that cannot be reached refuses, so
+                // a session shutting down mid-plan cannot let a step through ungated.
+                if gate_tx
+                    .send(PlanRequest::Gate(
+                        GatedStepCall::from_planned(call),
+                        reply_tx,
+                    ))
+                    .is_err()
+                {
+                    return Some(PLAN_GATE_UNREACHABLE.to_string());
+                }
+                reply_rx
+                    .blocking_recv()
+                    .unwrap_or_else(|_| Some(PLAN_GATE_UNREACHABLE.to_string()))
+            };
             let invoke_tool = move |name: &str, input: murmur::tool::run::ToolInput| {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 request_tx
-                    .send((name.to_string(), input, reply_tx))
+                    .send(PlanRequest::Invoke(name.to_string(), input, reply_tx))
                     .map_err(|_| "the session stopped answering plan tool calls".to_string())?;
                 reply_rx
                     .blocking_recv()
@@ -4913,6 +4951,7 @@ impl CapsuleStoreState {
                 registry,
                 spawn_credential,
                 trace: plan_trace.as_deref(),
+                gate_step: &gate_step,
                 invoke_tool: &invoke_tool,
             };
             crate::plan::execute(&plan_path, &ctx)
@@ -4922,21 +4961,8 @@ impl CapsuleStoreState {
         let joined = loop {
             tokio::select! {
                 request = request_rx.recv(), if requests_open => match request {
-                    Some((name, input, reply)) => {
-                        // Unfenced deliberately: this result becomes one field of the plan report,
-                        // and `dispatch_agent_tool_async` fences that report once on its way to
-                        // the model. Fencing here would wrap every step's output a second time.
-                        //
-                        // Boxed because this reaches back into the dispatcher that called this
-                        // function: the two futures are mutually recursive and one of them has to
-                        // be behind a pointer for either to have a size. `validate_plan` refuses a
-                        // `submit-plan` step, so the recursion is one level deep in practice.
-                        let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input))
-                            .await
-                            .map(|outcome| outcome.result);
-                        let _ = reply.send(outcome);
-                    }
-                    // The sender lives in the blocking closure, so this is that closure ending.
+                    Some(request) => self.answer_plan_request(request, gate.as_deref_mut()).await,
+                    // The senders live in the blocking closure, so this is that closure ending.
                     None => requests_open = false,
                 },
                 joined = &mut scheduling => break joined,
@@ -4944,11 +4970,8 @@ impl CapsuleStoreState {
         };
         // A request that arrived between the two arms being polled still has a scheduler thread
         // parked on its reply, and the join above only means the outer closure returned.
-        while let Ok((name, input, reply)) = request_rx.try_recv() {
-            let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input))
-                .await
-                .map(|outcome| outcome.result);
-            let _ = reply.send(outcome);
+        while let Ok(request) = request_rx.try_recv() {
+            self.answer_plan_request(request, gate.as_deref_mut()).await;
         }
         let report = joined.map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' panicked: {error}"))?;
 
@@ -4997,6 +5020,49 @@ impl CapsuleStoreState {
             truncated: false,
             metadata: Vec::new(),
         })
+    }
+
+    /// Answer one request from a running plan: a decision point, or a `tool` step's call.
+    ///
+    /// Split out of the servicing loop because the loop asks twice — once while the scheduler is
+    /// still running and once to drain what arrived as it joined — and a request answered on one
+    /// path but not the other would leave a scheduler thread parked forever.
+    async fn answer_plan_request(
+        &self,
+        request: PlanRequest,
+        gate: Option<&mut crate::agent::CallGate<'_>>,
+    ) {
+        match request {
+            PlanRequest::Gate(call, reply) => {
+                let verdict = match gate {
+                    Some(gate) => {
+                        let resolved = call.resolve(&self.accessible_workdir);
+                        // A refusal that could not be recorded refuses anyway: an unaudited call
+                        // is the thing the decision point exists to prevent.
+                        match gate.check(self, &resolved).await {
+                            Ok(verdict) => verdict,
+                            Err(error) => Some(error.to_string()),
+                        }
+                    }
+                    None => None,
+                };
+                let _ = reply.send(verdict);
+            }
+            PlanRequest::Invoke(name, input, reply) => {
+                // Unfenced deliberately: this result becomes one field of the plan report, and
+                // `dispatch_agent_tool_async` fences that report once on its way to the model.
+                // Fencing here would wrap every step's output a second time.
+                //
+                // Boxed because this reaches back into the dispatcher that called it: the two
+                // futures are mutually recursive and one of them has to be behind a pointer for
+                // either to have a size. `validate_plan` refuses a `submit-plan` step, so the
+                // recursion is one level deep in practice.
+                let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input, gate))
+                    .await
+                    .map(|outcome| outcome.result);
+                let _ = reply.send(outcome);
+            }
+        }
     }
 
     /// Write one submitted plan into `<workdir>/plans/plan-<n>.json` and return its path.
@@ -5775,22 +5841,107 @@ fn write_submit_plan_tool_manifest(workdir: &Path, plan_submit: bool) -> Result<
     write_runtime_provided_tool_manifest(workdir, SUBMIT_PLAN_TOOL, SUBMIT_PLAN_TOOL_MANIFEST)
 }
 
-/// One `tool` step of a running plan asking the session to dispatch it: the tool's name, the
-/// step's input, and where the answer goes. The scheduler thread that sent it is parked on the
-/// `oneshot` until this session replies.
-type PlanToolRequest = (
-    String,
-    murmur::tool::run::ToolInput,
-    tokio::sync::oneshot::Sender<Result<murmur::tool::run::ToolResult, String>>,
-);
+/// What a running plan asks of the session that was handed it. The scheduler thread that sent
+/// one is parked on its `oneshot` until this session replies.
+enum PlanRequest {
+    /// A step about to be dispatched, reaching the session's decision point first. The answer is
+    /// the refusal text, or `None` to let the step run.
+    Gate(GatedStepCall, tokio::sync::oneshot::Sender<Option<String>>),
+    /// A `tool` step's call: the tool's name, the step's input, and where the answer goes.
+    Invoke(
+        String,
+        murmur::tool::run::ToolInput,
+        tokio::sync::oneshot::Sender<Result<murmur::tool::run::ToolResult, String>>,
+    ),
+}
+
+/// An owned [`crate::plan::PlannedCall`], because the gate's answer comes from another thread.
+enum GatedStepCall {
+    Tool {
+        name: String,
+        input_json: String,
+    },
+    Shell {
+        binary: String,
+        command: String,
+        argv: Vec<String>,
+    },
+}
+
+impl GatedStepCall {
+    fn from_planned(call: &crate::plan::PlannedCall<'_>) -> Self {
+        match call {
+            crate::plan::PlannedCall::Tool { name, input_json } => Self::Tool {
+                name: (*name).to_string(),
+                input_json: (*input_json).to_string(),
+            },
+            crate::plan::PlannedCall::Shell {
+                binary,
+                command,
+                argv,
+            } => Self::Shell {
+                binary: (*binary).to_string(),
+                command: (*command).to_string(),
+                argv: argv.to_vec(),
+            },
+        }
+    }
+
+    /// The same [`ResolvedCall`] the decision point is shown for the equivalent call made
+    /// directly, so a plan step and an agent turn are judged on the same values.
+    ///
+    /// The shell arm is resolved here rather than through [`resolve_shell_call`] because the two
+    /// forms differ: a shell *tool* call carries a `command` string the runtime always hands to
+    /// the interpreter as `-c`, while a plan step carries a whole argv the scheduler execs
+    /// directly. `script` is therefore set only for the `-c` form that actually reaches a shell —
+    /// which is exactly the distinction `ProtectedPaths::check_shell` draws between a body whose
+    /// redirections are live and an argv where `>` is a literal argument.
+    fn resolve(&self, workdir: &Path) -> ResolvedCall {
+        match self {
+            Self::Tool { name, input_json } => ResolvedCall::Tool {
+                tool_name: name.clone(),
+                input_bytes: input_json.len() as u64,
+                input: input_json.clone(),
+            },
+            Self::Shell {
+                binary,
+                command,
+                argv,
+            } => {
+                let script = (is_shell_interpreter(binary)
+                    && argv.first().is_some_and(|first| first == "-c"))
+                .then(|| argv.get(1).cloned().unwrap_or_default());
+                let recipe = match script {
+                    Some(_) => None,
+                    None => crate::recipes::resolve_recipe(workdir, binary, argv),
+                };
+                ResolvedCall::Shell {
+                    binary: crate::sandbox::resolve_invoked_binary_path(binary),
+                    command: command.clone(),
+                    argv: argv.clone(),
+                    script,
+                    recipe,
+                }
+            }
+        }
+    }
+}
 
 /// Tool a capsule gains from `capabilities.plan.submit`.
 pub(crate) const SUBMIT_PLAN_TOOL: &str = "submit-plan";
 
+/// What a plan step is refused with when the session's decision point cannot be reached at all.
+///
+/// Fail closed: the alternative is a step running because the thing that would have refused it
+/// went away.
+const PLAN_GATE_UNREACHABLE: &str =
+    "Refused: the session stopped answering policy checks, so this step was not dispatched.";
+
 /// `submit-plan`'s manifest. Its schema names one argument and says nothing about a step, because
 /// the plan format is documented rather than schema-checked here; the description carries the
-/// three things the schema cannot — that the call blocks until the whole plan has settled, that
-/// independent steps run at the same time, and how a later step reads an earlier one's output.
+/// three things the schema cannot — that the call blocks until the whole plan has settled, which
+/// independent steps overlap and which do not, and how a later step reads an earlier one's
+/// output.
 const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "name: submit-plan\n",
     "version: 0.0.0\n",
@@ -5799,8 +5950,9 @@ const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
     "description: \"Hand one plan to the runtime and get back every step's result. `plan` is an ",
     "object with an `id` and a `steps` array; each step has an `id` and exactly one of `tool`, ",
     "`shell` or `capsule`, plus optional `input`, `depends_on`, `if`, `on_error` and `retries`. ",
-    "The call does not return until every step has finished. Steps that do not depend on each ",
-    "other run at the same time. A step's output is reachable from a later step as ",
+    "The call does not return until every step has finished. Independent `shell` and `capsule` ",
+    "steps run at the same time; `tool` steps are dispatched one at a time even when nothing ",
+    "orders them. A step's output is reachable from a later step as ",
     "$<step id>.output and its status as $<step id>.status, anywhere in that step's input.\"\n",
     "input_schema: '",
     r#"{"type":"object","properties":{"plan":{"type":"object"}},"required":["plan"]}"#,
@@ -8239,6 +8391,53 @@ inference:
         fs::write(&script_path, script).unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
         script_path
+    }
+
+    /// A plan `shell` step and the equivalent direct shell tool call are shown the decision
+    /// point the same way, so a command refused as one is refused as the other.
+    ///
+    /// The two resolvers are separate because the two forms are: a tool call carries a `command`
+    /// string the runtime always hands to the interpreter as `-c`, a plan step carries a whole
+    /// argv the scheduler execs directly. What must agree is the value the checks read — the
+    /// binary, the argv, and the `-c` body whose redirections are live.
+    #[test]
+    fn a_plan_shell_step_resolves_as_the_equivalent_shell_tool_call_does() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let direct = resolve_shell_call(
+            "bash",
+            &murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"printf x > out.txt"}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            &policy,
+        )
+        .expect("a declared binary with a usable command resolves");
+
+        let step = GatedStepCall::Shell {
+            binary: "bash".to_string(),
+            command: "bash -c 'printf x > out.txt'".to_string(),
+            argv: vec!["-c".to_string(), "printf x > out.txt".to_string()],
+        }
+        .resolve(tmp.path());
+
+        let ResolvedCall::Shell {
+            binary,
+            argv,
+            script,
+            ..
+        } = step
+        else {
+            panic!("a shell step resolves to a shell call");
+        };
+        assert_eq!(binary, direct.binary);
+        assert_eq!(argv, direct.argv);
+        assert_eq!(script, direct.script);
     }
 
     /// The wiring the shell-event fix depends on: `dispatch_shell_tool` carries the resolved

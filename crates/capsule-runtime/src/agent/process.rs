@@ -170,8 +170,9 @@ pub(super) fn build_process_system_prompt(
     system_prompt: Option<&str>,
     plan_tool_present: bool,
 ) -> String {
-    // Appended rather than interpolated as an empty string, so an ungranted capsule's prompt is
-    // byte-identical to what it was before the plan tool existed.
+    // The separating newline belongs to the notice, not to the template below, so an ungranted
+    // capsule's prompt carries no blank line where the guidance would go. A single stray byte here
+    // is enough to miss the provider's cached prefix on every request.
     let plan = if plan_tool_present {
         format!("\n{PLAN_TOOL_NOTICE}")
     } else {

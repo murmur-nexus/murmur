@@ -293,12 +293,16 @@ impl BridgeHandle {
         let input_json = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
 
         match store
+            // No decision point on this transport: `on-tool-call` denial and the
+            // `capabilities.filesystem.read_only` check are the agent loop's, and this bridge is
+            // a tool server for an external process that owns neither a hook runtime nor a turn.
             .dispatch_agent_tool_async(
                 &name,
                 ToolInput {
                     data: Some(input_json),
                     log_path: None,
                 },
+                None,
             )
             .await
         {

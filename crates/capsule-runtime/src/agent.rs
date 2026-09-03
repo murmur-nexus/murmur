@@ -785,13 +785,11 @@ pub(crate) async fn run_agent_loop(
 
                     // The decision point: after the manifest's capability check has already
                     // decided what this capsule may do, and immediately before the call is
-                    // dispatched. Neither check here can grant anything — the one possible effect
-                    // either has on the loop is that the call does not happen.
-                    //
-                    // Gated on a single boolean pair, so a capsule with neither a policy hook nor
-                    // a `read_only` declaration resolves nothing and dispatches nothing extra; and
-                    // the call is resolved exactly once for both.
-                    if hooks.gates_calls() || store_state.has_protected_paths() {
+                    // dispatched. The same gate is handed to the dispatch below, so a plan step
+                    // this call submits reaches it too rather than entering underneath.
+                    let mut gate = CallGate::new(hooks, trace, workdir, turn_u32);
+                    if gate.gates(store_state) {
+                        // Resolved exactly once, for both checks.
                         let resolved = store_state.resolve_call(
                             &tool_name,
                             &ToolInput {
@@ -799,71 +797,14 @@ pub(crate) async fn run_agent_loop(
                                 log_path: None,
                             },
                         );
-                        // The manifest is asked first, and its refusal is final: a hook can only
-                        // narrow further, so a call the manifest already refuses costs no hook
-                        // dispatch.
-                        if let Some(refusal) = store_state.check_protected_paths(&resolved) {
-                            let signal = refusal.signal.describe();
-                            let reason = protected_path_reason(&refusal);
-                            // Nothing ran, so nothing is recorded as having run: no `tool_call`
-                            // record and no `shell` record for this call.
-                            trace
-                                .write_protected_path_denied(
-                                    turn_u32,
-                                    protected_path_call_kind(&resolved),
-                                    resolved.target(),
-                                    &refusal.path,
-                                    &refusal.rule,
-                                    &signal,
-                                    &reason,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    RuntimeError::AgentLoopFailed(format!(
-                                        "trace write failed: {e}"
-                                    ))
-                                })?;
+                        // Nothing ran, so nothing is recorded as having run: no observation
+                        // event, no `tool_call` record and no `shell` record for this call.
+                        if let Some(refusal) = gate.check(store_state, &resolved).await? {
                             tool_messages.push(with_new_id(json!({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
                                 "is_error": true,
-                                "content": [{
-                                    "type": "text",
-                                    "text": protected_path_tool_result(&refusal),
-                                }],
-                            })));
-                            continue;
-                        }
-                        if let CallDecision::Denied { hook_name, reason } =
-                            hooks.decide(workdir, turn_u32, &resolved).await
-                        {
-                            // Nothing ran, so nothing is recorded as having run: no observation
-                            // event, no `tool_call` record and no `shell` record for this call.
-                            trace
-                                .write_call_denied(
-                                    turn_u32,
-                                    resolved.event_name(),
-                                    &hook_name,
-                                    resolved.target(),
-                                    &reason,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    RuntimeError::AgentLoopFailed(format!(
-                                        "trace write failed: {e}"
-                                    ))
-                                })?;
-                            // An unsupported arm returned at the decision point is a fault as
-                            // well as a refusal; drain it now so both reach the trace.
-                            flush_hook_dispatch_faults(hooks, trace).await;
-                            tool_messages.push(with_new_id(json!({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "is_error": true,
-                                "content": [{
-                                    "type": "text",
-                                    "text": denial_tool_result(&hook_name, &reason),
-                                }],
+                                "content": [{ "type": "text", "text": refusal }],
                             })));
                             continue;
                         }
@@ -876,6 +817,7 @@ pub(crate) async fn run_agent_loop(
                                 data: Some(input_json.clone()),
                                 log_path: None,
                             },
+                            Some(&mut gate),
                         )
                         .await
                     {
@@ -1299,6 +1241,98 @@ async fn flush_hook_inference_records(
             record.usage.as_ref(),
         )
         .await;
+    }
+}
+
+/// The session's pre-dispatch decision point, in one place so every route to a call reaches the
+/// same two refusals in the same order.
+///
+/// The manifest's `capabilities.filesystem.read_only` check is asked first and its refusal is
+/// final: a policy hook can only narrow further, so a call the manifest already refuses costs no
+/// hook dispatch. Neither check can grant anything — the one effect either has is that the call
+/// does not happen.
+///
+/// Not private to the agent loop, because a plan step is the same call one indirection removed:
+/// `submit-plan` runs `tool` and `shell` steps through this session's own executors, so those
+/// steps are gated here too rather than entering underneath.
+pub(crate) struct CallGate<'a> {
+    hooks: &'a mut HookRuntime,
+    trace: &'a mut TraceWriter,
+    workdir: &'a Path,
+    turn: u32,
+}
+
+impl<'a> CallGate<'a> {
+    pub(crate) fn new(
+        hooks: &'a mut HookRuntime,
+        trace: &'a mut TraceWriter,
+        workdir: &'a Path,
+        turn: u32,
+    ) -> Self {
+        Self {
+            hooks,
+            trace,
+            workdir,
+            turn,
+        }
+    }
+
+    /// Whether anything here can refuse a call at all.
+    ///
+    /// A single boolean pair, so a capsule with neither a policy hook nor a `read_only`
+    /// declaration resolves no call and dispatches nothing extra — on the agent loop's path and
+    /// on a plan's alike.
+    pub(crate) fn gates(&self, store: &CapsuleStoreState) -> bool {
+        self.hooks.gates_calls() || store.has_protected_paths()
+    }
+
+    /// `Some(text)` is a refusal, and `text` is what the caller hands the model — or writes into
+    /// a plan step's `error` — in place of the call's result.
+    ///
+    /// Nothing ran when it answers `Some`, and nothing is recorded as having run: the refusal's
+    /// own trace line is the only thing this writes. `Err` is a trace write that failed, which is
+    /// fatal on purpose — an unrecorded refusal is an unaudited call.
+    pub(crate) async fn check(
+        &mut self,
+        store: &CapsuleStoreState,
+        resolved: &ResolvedCall,
+    ) -> Result<Option<String>, RuntimeError> {
+        if let Some(refusal) = store.check_protected_paths(resolved) {
+            let signal = refusal.signal.describe();
+            let reason = protected_path_reason(&refusal);
+            self.trace
+                .write_protected_path_denied(
+                    self.turn,
+                    protected_path_call_kind(resolved),
+                    resolved.target(),
+                    &refusal.path,
+                    &refusal.rule,
+                    &signal,
+                    &reason,
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+            return Ok(Some(protected_path_tool_result(&refusal)));
+        }
+        if let CallDecision::Denied { hook_name, reason } =
+            self.hooks.decide(self.workdir, self.turn, resolved).await
+        {
+            self.trace
+                .write_call_denied(
+                    self.turn,
+                    resolved.event_name(),
+                    &hook_name,
+                    resolved.target(),
+                    &reason,
+                )
+                .await
+                .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+            // An unsupported arm returned at the decision point is a fault as well as a refusal;
+            // drain it now so both reach the trace.
+            flush_hook_dispatch_faults(self.hooks, self.trace).await;
+            return Ok(Some(denial_tool_result(&hook_name, &reason)));
+        }
+        Ok(None)
     }
 }
 
@@ -2600,8 +2634,9 @@ marker.";
 /// reach for it while it is still deciding what to do, and a plan written before the reading that
 /// decides the work runs perfectly and does the wrong thing.
 pub(crate) const PLAN_TOOL_NOTICE: &str =
-    "You have a submit-plan tool. It takes one plan of steps, runs them itself — steps that do \
-not depend on each other at the same time — and returns every step's result in a single reply. \
+    "You have a submit-plan tool. It takes one plan of steps, runs them itself — independent \
+shell and sub-capsule steps at the same time, tool steps one at a time — and returns every step's \
+result in a single reply. \
 Plan the mechanical tail of a piece of work, where the shape of every step is known before any of \
 them runs: build, test and lint; collecting or checking a set of files; fanning the same operation \
 out across many of them.\n\nNever plan the investigation. What edit to make depends on what \
@@ -2629,8 +2664,9 @@ fn build_augmented_system_prompt(
     plan_tool_present: bool,
 ) -> String {
     let base = system_prompt.unwrap_or("");
-    // Appended rather than interpolated as an empty string, so an ungranted capsule's block is
-    // byte-identical to what it was before the plan tool existed.
+    // The separating newline belongs to the notice, not to the template below, so an ungranted
+    // capsule's block carries no blank line where the guidance would go. A single stray byte here
+    // is enough to miss the provider's cached prefix on every request.
     let plan = if plan_tool_present {
         format!("\n{PLAN_TOOL_NOTICE}")
     } else {
@@ -2852,8 +2888,9 @@ forgery: {prompt}"
         }
     }
 
-    /// An ungranted capsule's prompt is byte-identical to what it was before the plan tool
-    /// existed: the guidance is appended, so nothing about the block moved to make room for it.
+    /// An ungranted capsule's prompt carries no trace of the plan tool — not even the blank line
+    /// the guidance would sit on, which alone would miss the provider's cached prefix. Pinned as
+    /// an exact string on both transports, because a spare byte is invisible to a `contains`.
     #[test]
     fn the_ungranted_prompt_is_unchanged_on_both_transports() {
         assert_eq!(

@@ -86,6 +86,7 @@ fn create_manifest(
     hooks: &[Hook<'_>],
     tools: &[(&str, &str)],
     deadline_seconds: Option<u64>,
+    plan_submit: bool,
 ) -> PathBuf {
     let hook_yaml: String = hooks
         .iter()
@@ -105,6 +106,11 @@ fn create_manifest(
     let limits = deadline_seconds
         .map(|s| format!("  limits:\n    deadline_seconds: {s}\n"))
         .unwrap_or_default();
+    let plan = if plan_submit {
+        "  plan:\n    submit: true\n"
+    } else {
+        ""
+    };
 
     let manifest = format!(
         concat!(
@@ -124,6 +130,7 @@ fn create_manifest(
             "    allow:\n",
             "      - bash\n",
             "{limits}",
+            "{plan}",
             "inference:\n",
             "  transport: http\n",
             "  endpoint: {endpoint}\n",
@@ -138,6 +145,7 @@ fn create_manifest(
         tool_yaml = tool_yaml,
         endpoint = endpoint,
         limits = limits,
+        plan = plan,
     );
     fs::write(project_dir.join("murmur.yaml"), manifest).unwrap();
     project_dir.join("murmur.yaml")
@@ -193,6 +201,18 @@ fn run_session(
     native_tools: &[(&str, &str)],
     deadline_seconds: Option<u64>,
 ) -> Session {
+    run_session_with(responses, hooks, native_tools, deadline_seconds, false)
+}
+
+/// [`run_session`] for a capsule that also declares `capabilities.plan.submit`, so the model can
+/// hand the runtime a plan and the hook is asked about the steps inside it.
+fn run_session_with(
+    responses: Vec<String>,
+    hooks: &[Hook<'_>],
+    native_tools: &[(&str, &str)],
+    deadline_seconds: Option<u64>,
+    plan_submit: bool,
+) -> Session {
     let server = common::ScriptedServer::start(responses);
     let home = tempfile::tempdir().unwrap();
     let artifact_dir = tempfile::tempdir().unwrap();
@@ -237,6 +257,7 @@ fn run_session(
         hooks,
         &tool_refs,
         deadline_seconds,
+        plan_submit,
     );
     let staged = common::stage_agent_session(&home, project.path(), &manifest_path);
     let workdir = staged.workdir.clone();
@@ -272,6 +293,58 @@ fn one_shell_call(command: &str) -> Vec<String> {
 
 /// A denying `on-shell` hook stops the command: nothing runs, the agent is told which hook
 /// refused and why, and the trace carries a `call_denied` and no `shell` record.
+/// A plan step reaches the same decision point a direct call does.
+///
+/// `submit-plan` runs its steps through the session's own executors, so a step that entered
+/// underneath the decision point would run the very command the hook exists to stop. The hook is
+/// bound to `on-shell`, which is the plan step's binding and not `submit-plan`'s: the model's own
+/// call to `submit-plan` is an `on-tool-call` and passes untouched, so what the single
+/// `call_denied` line records is the step.
+#[test]
+fn denying_on_shell_hook_stops_a_plan_step() {
+    if common::skip_without_host_support("denying_on_shell_hook_stops_a_plan_step") {
+        return;
+    }
+    let plan = json!({
+        "id": "denied",
+        "steps": [{"id": "w", "shell": format!("bash -c '{}'", marker_command())}]
+    });
+    let session = run_session_with(
+        vec![
+            tool_call("msg_1", "toolu_plan", "submit-plan", json!({"plan": plan})),
+            end_turn("msg_2", "Understood."),
+        ],
+        &[hook(
+            "branch-policy",
+            "on-shell",
+            "deny",
+            deny_hook_wasm("on-shell", "protected branch"),
+        )],
+        &[],
+        None,
+        true,
+    );
+
+    assert!(
+        !session.marker_exists(),
+        "a denied plan step must not have run"
+    );
+
+    let denial = session.denial();
+    assert_eq!(denial["event"], "on-shell");
+    assert_eq!(denial["hook_name"], "branch-policy");
+    assert_eq!(denial["reason"], "protected branch");
+
+    // The refusal is the step's own error, so the model is told which step did not run and why.
+    let text = session.tool_result_text("toolu_plan");
+    assert!(text.contains("branch-policy"), "{text}");
+    assert!(text.contains("protected branch"), "{text}");
+    assert!(
+        text.contains(r#""completed":false"#),
+        "the plan must be reported as not completed: {text}"
+    );
+}
+
 #[test]
 fn denying_on_shell_hook_stops_the_command() {
     if common::skip_without_host_support("denying_on_shell_hook_stops_the_command") {
@@ -792,6 +865,7 @@ fn stage_failure(binding: &str, commit_policy: &str, execution_mode: &str) -> St
         &[hook("bad-policy", binding, commit_policy, Vec::new())],
         &[],
         None,
+        false,
     );
     fs::write(project.path().join("task.md"), "Do the thing.").unwrap();
     let assert = common::run_capsule(&home, &manifest_path).failure();

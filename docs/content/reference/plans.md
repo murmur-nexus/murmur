@@ -5,8 +5,9 @@ granted [`capabilities.plan.submit`](manifest.md#field-capabilities) gains the
 [runtime-provided tool](runtime-provided-tools.md) `submit-plan`, which takes one plan, runs every
 step, and returns one report.
 
-Steps that do not depend on each other run at the same time. The call returns when every step has
-settled.
+The call returns when every step has settled. `shell` and `capsule` steps that do not depend on
+each other run at the same time; `tool` steps are dispatched one at a time even when the plan
+places no dependency between them.
 
 ## Shape
 
@@ -139,9 +140,25 @@ tool step goes through the same dispatch an agent-loop tool call does, a shell s
 allowlisted binaries in the same accessible workdir, and a capsule step presents the same
 registration. A plan reaches exactly what the model could already call one turn at a time.
 
+Every `tool` and `shell` step also passes the same two refusals a direct call passes, before it is
+dispatched:
+
+| Refusal | Applies to |
+|---|---|
+| [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) | A step the runtime identifies as writing a declared read-only path |
+| A [hook](manifest.md#hook-contract-fields) bound to `on-tool-call` or `on-shell` with `commit_policy: deny` | Every `tool` step and every `shell` step respectively |
+
+A refused step settles as `failed`, carrying the refusal as its `error`, and nothing it would have
+run happens. The refusal is recorded as the `protected_path_denied` or `call_denied` line a direct
+call's refusal is recorded as. Steps that had already run stay run: a plan is refused a step at a
+time, not as a whole.
+
+A `capsule` step is not put to either check. It runs nothing in this session, and the sub-capsule
+it delegates to applies its own manifest to whatever it does.
+
 A plan whose steps can start a subprocess needs a delegated cgroup v2 scope on Linux, on the same
-terms a launch does — see [`E-RUN-012`](diagnostics.md) and
-[Platform behavior](resource-limits.md#platform-behavior).
+terms a launch does: without one the launch is refused with `E-RUN-012` before the plan is ever
+submitted. See [Platform behavior](resource-limits.md#platform-behavior).
 
 ## In the trace
 
