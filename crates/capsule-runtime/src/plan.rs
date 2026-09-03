@@ -3,6 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     thread,
+    time::Instant,
 };
 
 use serde::Deserialize;
@@ -18,6 +19,7 @@ use crate::{
     sandbox,
     shell::{execute_shell, split_shell_words},
     spawn_credential::SpawnCredential,
+    trace::{PlanEndRecord, PlanStepRecord, PlanStepShape, PlanTraceAppender},
     types::CapabilityPolicy,
 };
 
@@ -52,6 +54,18 @@ enum StepKind {
     Tool,
     Shell,
     Spawn,
+}
+
+impl StepKind {
+    /// The name a trace line carries for this kind. `"capsule"` rather than `"spawn"`: a trace
+    /// names the plan key its author wrote, not the host's word for what it does.
+    fn as_str(self) -> &'static str {
+        match self {
+            StepKind::Tool => "tool",
+            StepKind::Shell => "shell",
+            StepKind::Spawn => "capsule",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,28 +103,55 @@ pub struct SchedulerContext<'a> {
     /// exactly twice — into the two request headers below — so nothing that formats this context,
     /// a step result or a trace record can carry it.
     pub spawn_credential: Option<SpawnCredential>,
+    /// Where this run's per-step lifecycle records go, or `None` to record nothing.
+    ///
+    /// Emission is opt-in at the call site: with `None` no file is opened, no line is written,
+    /// and the run behaves byte-for-byte as it did before a plan could be traced at all.
+    pub trace: Option<&'a PlanTraceAppender>,
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
 }
 
 pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport {
-    match execute_inner(plan_path, ctx) {
+    let started = Instant::now();
+    match execute_inner(plan_path, ctx, started) {
         Ok(report) => report,
-        Err((failed_step, error)) => ExecutionReport {
-            results: vec![StepResult {
-                step_id: failed_step.clone(),
-                status: StepStatus::Failed,
-                output: None,
-                error: Some(error),
-            }],
-            completed: false,
-            failed_step: Some(failed_step),
-        },
+        // The only failures that reach here are a plan file that could not be read or parsed, so
+        // there is no DAG to have described and no plan node for the summary to hang off.
+        Err((failed_step, error)) => {
+            if let Some(appender) = ctx.trace {
+                appender.write_plan_end(
+                    None,
+                    PlanEndRecord {
+                        plan_id: String::new(),
+                        outcome: "failed",
+                        failed_step: Some(failed_step.clone()),
+                        steps_total: 0,
+                        steps_succeeded: 0,
+                        steps_failed: 0,
+                        steps_skipped: 0,
+                        duration_ms: elapsed_ms(started),
+                        reason: Some(error.clone()),
+                    },
+                );
+            }
+            ExecutionReport {
+                results: vec![StepResult {
+                    step_id: failed_step.clone(),
+                    status: StepStatus::Failed,
+                    output: None,
+                    error: Some(error),
+                }],
+                completed: false,
+                failed_step: Some(failed_step),
+            }
+        }
     }
 }
 
 fn execute_inner(
     plan_path: &Path,
     ctx: &SchedulerContext<'_>,
+    started: Instant,
 ) -> Result<ExecutionReport, (String, String)> {
     let raw = fs::read_to_string(plan_path).map_err(|error| {
         (
@@ -125,7 +166,29 @@ fn execute_inner(
         )
     })?;
 
+    // The DAG is described the moment the file parses, before it is validated: a plan the
+    // validator refuses still has a structure worth reading, and the refusal is only legible
+    // beside the steps it names.
+    let plan_node = ctx
+        .trace
+        .map(|appender| appender.write_plan_start(&plan.id, plan_shape(&plan)));
+
     if let Err((step_id, error)) = validate_plan(&plan, ctx) {
+        trace_plan_end(
+            ctx,
+            plan_node.as_deref(),
+            PlanEndRecord {
+                plan_id: plan.id.clone(),
+                outcome: "failed",
+                failed_step: Some(step_id.clone()),
+                steps_total: plan.steps.len(),
+                steps_succeeded: 0,
+                steps_failed: 0,
+                steps_skipped: 0,
+                duration_ms: elapsed_ms(started),
+                reason: Some(error.clone()),
+            },
+        );
         return Ok(ExecutionReport {
             results: vec![StepResult {
                 step_id: step_id.clone(),
@@ -151,19 +214,15 @@ fn execute_inner(
     ) {
         Ok(scope) => scope,
         Err(reason) => {
-            return Ok(ExecutionReport {
-                results: vec![StepResult {
-                    step_id: "plan".to_string(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(
-                        crate::errors::RuntimeError::CgroupDelegationUnavailable { reason }
-                            .to_string(),
-                    ),
-                }],
-                completed: false,
-                failed_step: Some("plan".to_string()),
-            });
+            let error =
+                crate::errors::RuntimeError::CgroupDelegationUnavailable { reason }.to_string();
+            return Ok(refused_before_any_step(
+                &plan,
+                ctx,
+                plan_node.as_deref(),
+                started,
+                error,
+            ));
         }
     };
     let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
@@ -180,18 +239,14 @@ fn execute_inner(
     ) {
         Ok(enforcement) => enforcement.with_host_bounding(cgroup_scope, workdir_guard),
         Err(error) => {
-            return Ok(ExecutionReport {
-                results: vec![StepResult {
-                    step_id: "plan".to_string(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some(format!(
-                        "failed to resolve shell subprocess sandbox enforcement: {error}"
-                    )),
-                }],
-                completed: false,
-                failed_step: Some("plan".to_string()),
-            });
+            let error = format!("failed to resolve shell subprocess sandbox enforcement: {error}");
+            return Ok(refused_before_any_step(
+                &plan,
+                ctx,
+                plan_node.as_deref(),
+                started,
+                error,
+            ));
         }
     };
 
@@ -218,6 +273,9 @@ fn execute_inner(
             match condition::evaluate(step.condition.as_deref(), &results) {
                 Ok(true) => ready.push(step.clone()),
                 Ok(false) => {
+                    // Never dispatched, so it writes no `plan_step_start` and no attempt: a step
+                    // that did not run must not read like one that did.
+                    trace_undispatched(ctx, plan_node.as_deref(), &plan.id, step, "skipped", None);
                     insert_result(
                         &mut results,
                         &mut result_order,
@@ -231,6 +289,14 @@ fn execute_inner(
                     progressed = true;
                 }
                 Err(error) => {
+                    trace_undispatched(
+                        ctx,
+                        plan_node.as_deref(),
+                        &plan.id,
+                        step,
+                        "failed",
+                        Some(error.clone()),
+                    );
                     insert_result(
                         &mut results,
                         &mut result_order,
@@ -256,12 +322,24 @@ fn execute_inner(
             if progressed {
                 continue;
             }
-            let blocked = plan
+            const BLOCKED: &str = "plan is blocked by a dependency cycle or missing dependency";
+            let blocked_step = plan
                 .steps
                 .iter()
-                .find(|step| !results.contains_key(&step.id))
+                .find(|step| !results.contains_key(&step.id));
+            let blocked = blocked_step
                 .map(|step| step.id.clone())
                 .unwrap_or_else(|| "plan".to_string());
+            if let Some(step) = blocked_step {
+                trace_undispatched(
+                    ctx,
+                    plan_node.as_deref(),
+                    &plan.id,
+                    step,
+                    "failed",
+                    Some(BLOCKED.to_string()),
+                );
+            }
             insert_result(
                 &mut results,
                 &mut result_order,
@@ -269,13 +347,15 @@ fn execute_inner(
                     step_id: blocked.clone(),
                     status: StepStatus::Failed,
                     output: None,
-                    error: Some(
-                        "plan is blocked by a dependency cycle or missing dependency".to_string(),
-                    ),
+                    error: Some(BLOCKED.to_string()),
                 },
             );
             failed_step = Some(blocked);
             break;
+        }
+
+        for step in &ready {
+            trace_step_start(ctx, plan_node.as_deref(), &plan.id, step);
         }
 
         let mut completed = Vec::new();
@@ -289,57 +369,99 @@ fn execute_inner(
                 }));
             }
             for handle in handles {
-                completed.push(handle.join().unwrap_or_else(|_| StepResult {
-                    step_id: "unknown".to_string(),
-                    status: StepStatus::Failed,
-                    output: None,
-                    error: Some("step dispatch thread panicked".to_string()),
+                completed.push(handle.join().unwrap_or_else(|_| {
+                    StepOutcome::undispatched(failed("unknown", "step dispatch thread panicked"))
                 }));
             }
         });
 
-        for result in completed {
-            let Some(step) = plan.steps.iter().find(|step| step.id == result.step_id) else {
-                insert_result(&mut results, &mut result_order, result);
+        for outcome in completed {
+            let Some(step) = plan
+                .steps
+                .iter()
+                .find(|step| step.id == outcome.result.step_id)
+            else {
+                // A dispatch thread that panicked names no step this plan declared.
+                trace_step(
+                    ctx,
+                    plan_node.as_deref(),
+                    PlanStepRecord {
+                        plan_id: plan.id.clone(),
+                        step_id: outcome.result.step_id.clone(),
+                        kind: "unknown",
+                        status: outcome.result.status.as_str(),
+                        attempts: outcome.attempts,
+                        duration_ms: outcome.duration_ms,
+                        error: outcome.result.error.clone(),
+                        input: None,
+                        state_effect: None,
+                        resource_id: None,
+                    },
+                );
+                insert_result(&mut results, &mut result_order, outcome.result);
                 failed_step = Some("unknown".to_string());
                 break;
             };
 
-            if result.status == StepStatus::Failed {
+            let kind = step_kind_name(step);
+            let StepOutcome {
+                result,
+                attempts,
+                duration_ms,
+                input,
+                state_effect,
+                resource_id,
+            } = outcome;
+
+            // The `on_error` policy is applied here, before the step is recorded either way, so
+            // the trace and the returned report can never disagree about what a step settled as.
+            let (settled, stops) = if result.status == StepStatus::Failed {
                 match step.on_error.as_str() {
-                    "fail" => {
-                        let id = result.step_id.clone();
-                        insert_result(&mut results, &mut result_order, result);
-                        failed_step = Some(id);
-                        break;
-                    }
-                    "skip" => insert_result(
-                        &mut results,
-                        &mut result_order,
+                    "fail" => (result, true),
+                    "skip" => (
                         StepResult {
                             step_id: result.step_id,
                             status: StepStatus::Skipped,
                             output: None,
                             error: result.error,
                         },
+                        false,
                     ),
-                    "continue" => insert_result(&mut results, &mut result_order, result),
-                    _ => {
-                        let id = result.step_id.clone();
-                        insert_result(
-                            &mut results,
-                            &mut result_order,
-                            StepResult {
-                                error: Some(format!("invalid on_error policy '{}'", step.on_error)),
-                                ..result
-                            },
-                        );
-                        failed_step = Some(id);
-                        break;
-                    }
+                    "continue" => (result, false),
+                    policy => (
+                        StepResult {
+                            error: Some(format!("invalid on_error policy '{policy}'")),
+                            ..result
+                        },
+                        true,
+                    ),
                 }
             } else {
-                insert_result(&mut results, &mut result_order, result);
+                (result, false)
+            };
+
+            trace_step(
+                ctx,
+                plan_node.as_deref(),
+                PlanStepRecord {
+                    plan_id: plan.id.clone(),
+                    step_id: settled.step_id.clone(),
+                    kind,
+                    status: settled.status.as_str(),
+                    attempts,
+                    duration_ms,
+                    error: settled.error.clone(),
+                    input,
+                    state_effect,
+                    resource_id,
+                },
+            );
+
+            let id = settled.step_id.clone();
+            insert_result(&mut results, &mut result_order, settled);
+            if stops {
+                failed_step = Some(id);
+                break;
             }
         }
     }
@@ -349,11 +471,159 @@ fn execute_inner(
         .filter_map(|id| results.remove(&id))
         .collect::<Vec<_>>();
 
+    trace_plan_end(
+        ctx,
+        plan_node.as_deref(),
+        PlanEndRecord {
+            plan_id: plan.id.clone(),
+            outcome: if failed_step.is_none() {
+                "completed"
+            } else {
+                "failed"
+            },
+            failed_step: failed_step.clone(),
+            steps_total: plan.steps.len(),
+            steps_succeeded: count_status(&ordered_results, StepStatus::Success),
+            steps_failed: count_status(&ordered_results, StepStatus::Failed),
+            steps_skipped: count_status(&ordered_results, StepStatus::Skipped),
+            duration_ms: elapsed_ms(started),
+            reason: None,
+        },
+    );
+
     Ok(ExecutionReport {
         results: ordered_results,
         completed: failed_step.is_none(),
         failed_step,
     })
+}
+
+// ── Trace emission ───────────────────────────────────────────────────────────
+
+/// The name a step's trace lines carry for its kind. `"unknown"` only for a step declaring
+/// none or several of `tool`/`shell`/`capsule`, which `validate_plan` refuses — it can reach a
+/// line only through `plan_start`, which is written before validation.
+fn step_kind_name(step: &StepDef) -> &'static str {
+    infer_kind(step).map(StepKind::as_str).unwrap_or("unknown")
+}
+
+/// The DAG as authored, for `plan_start`.
+fn plan_shape(plan: &PlanFile) -> Vec<PlanStepShape> {
+    plan.steps
+        .iter()
+        .map(|step| PlanStepShape {
+            step_id: step.id.clone(),
+            kind: step_kind_name(step),
+            depends_on: step.depends_on.clone(),
+            has_condition: step.condition.is_some(),
+        })
+        .collect()
+}
+
+fn trace_step_start(
+    ctx: &SchedulerContext<'_>,
+    plan_node: Option<&str>,
+    plan_id: &str,
+    step: &StepDef,
+) {
+    if let (Some(appender), Some(node)) = (ctx.trace, plan_node) {
+        appender.write_plan_step_start(
+            node,
+            plan_id,
+            &step.id,
+            step_kind_name(step),
+            step.depends_on.clone(),
+        );
+    }
+}
+
+fn trace_step(ctx: &SchedulerContext<'_>, plan_node: Option<&str>, record: PlanStepRecord) {
+    if let (Some(appender), Some(node)) = (ctx.trace, plan_node) {
+        appender.write_plan_step(node, record);
+    }
+}
+
+/// The terminal line for a step that settled without ever being dispatched: a false `if`, a
+/// condition that would not evaluate, a step the DAG left unreachable. No attempt was made, so
+/// none is claimed.
+fn trace_undispatched(
+    ctx: &SchedulerContext<'_>,
+    plan_node: Option<&str>,
+    plan_id: &str,
+    step: &StepDef,
+    status: &'static str,
+    error: Option<String>,
+) {
+    trace_step(
+        ctx,
+        plan_node,
+        PlanStepRecord {
+            plan_id: plan_id.to_string(),
+            step_id: step.id.clone(),
+            kind: step_kind_name(step),
+            status,
+            attempts: 0,
+            duration_ms: 0,
+            error,
+            input: None,
+            state_effect: None,
+            resource_id: None,
+        },
+    );
+}
+
+fn trace_plan_end(ctx: &SchedulerContext<'_>, plan_node: Option<&str>, record: PlanEndRecord) {
+    if let Some(appender) = ctx.trace {
+        appender.write_plan_end(plan_node, record);
+    }
+}
+
+/// The report and the trace for a plan the host refused before any step ran: a cgroup scope it
+/// could not delegate, a shell sandbox it could not resolve. The DAG is already described, so
+/// the summary hangs off the plan node and names the plan — only the reason is new.
+fn refused_before_any_step(
+    plan: &PlanFile,
+    ctx: &SchedulerContext<'_>,
+    plan_node: Option<&str>,
+    started: Instant,
+    error: String,
+) -> ExecutionReport {
+    trace_plan_end(
+        ctx,
+        plan_node,
+        PlanEndRecord {
+            plan_id: plan.id.clone(),
+            outcome: "failed",
+            failed_step: Some("plan".to_string()),
+            steps_total: plan.steps.len(),
+            steps_succeeded: 0,
+            steps_failed: 0,
+            steps_skipped: 0,
+            duration_ms: elapsed_ms(started),
+            reason: Some(error.clone()),
+        },
+    );
+    ExecutionReport {
+        results: vec![StepResult {
+            step_id: "plan".to_string(),
+            status: StepStatus::Failed,
+            output: None,
+            error: Some(error),
+        }],
+        completed: false,
+        failed_step: Some("plan".to_string()),
+    }
+}
+
+fn count_status(results: &[StepResult], status: StepStatus) -> usize {
+    results
+        .iter()
+        .filter(|result| result.status == status)
+        .count()
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
 }
 
 fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (String, String)> {
@@ -456,28 +726,71 @@ fn collect_references(value: &Value, references: &mut Vec<String>) {
     }
 }
 
+/// What a worker thread reports back to the scheduler loop about the step it ran: the verdict,
+/// plus the facts only the worker observed and the terminal `plan_step` line needs.
+///
+/// [`execute_step_once`] returns one attempt's own `attempts: 1` and duration;
+/// [`execute_step_with_retries`] overwrites both with the totals for the step.
+struct StepOutcome {
+    result: StepResult,
+    attempts: u32,
+    duration_ms: u64,
+    /// The interpolated input the attempt dispatched. `Some` for a tool step; `None` for every
+    /// other kind, and for a failure that never reached a dispatch.
+    input: Option<Value>,
+    /// What the tool declared about this call in `tool-result.metadata`. Both `None` for every
+    /// kind but a tool step, and for a tool that declared nothing.
+    state_effect: Option<String>,
+    resource_id: Option<String>,
+}
+
+impl StepOutcome {
+    /// One attempt of a step that declares nothing about itself: every kind but a tool step, and
+    /// every failure that never reached a dispatch.
+    fn plain(result: StepResult, started: Instant) -> Self {
+        Self {
+            result,
+            attempts: 1,
+            duration_ms: elapsed_ms(started),
+            input: None,
+            state_effect: None,
+            resource_id: None,
+        }
+    }
+
+    /// A verdict reached without a dispatch, and so without an attempt to count or time.
+    fn undispatched(result: StepResult) -> Self {
+        Self {
+            result,
+            attempts: 0,
+            duration_ms: 0,
+            input: None,
+            state_effect: None,
+            resource_id: None,
+        }
+    }
+}
+
 fn execute_step_with_retries(
     step: &StepDef,
     ctx: &SchedulerContext<'_>,
     results: &HashMap<String, StepResult>,
     enforcement: &sandbox::ShellEnforcement,
-) -> StepResult {
+) -> StepOutcome {
+    let started = Instant::now();
     let attempts = step.retries.saturating_add(1);
     let mut last = None;
-    for _ in 0..attempts {
-        let result = execute_step_once(step, ctx, results, enforcement);
-        if result.status != StepStatus::Failed {
-            return result;
+    for attempt in 1..=attempts {
+        let mut outcome = execute_step_once(step, ctx, results, enforcement);
+        outcome.attempts = attempt;
+        outcome.duration_ms = elapsed_ms(started);
+        if outcome.result.status != StepStatus::Failed {
+            return outcome;
         }
-        last = Some(result);
+        last = Some(outcome);
     }
 
-    last.unwrap_or_else(|| StepResult {
-        step_id: step.id.clone(),
-        status: StepStatus::Failed,
-        output: None,
-        error: Some("step was not attempted".to_string()),
-    })
+    last.unwrap_or_else(|| StepOutcome::undispatched(failed(&step.id, "step was not attempted")))
 }
 
 fn execute_step_once(
@@ -485,26 +798,42 @@ fn execute_step_once(
     ctx: &SchedulerContext<'_>,
     results: &HashMap<String, StepResult>,
     enforcement: &sandbox::ShellEnforcement,
-) -> StepResult {
+) -> StepOutcome {
+    let started = Instant::now();
     let mut input = step.input.clone();
     if let Err(error) = interpolate_value(&mut input, results) {
-        return failed(&step.id, error);
+        return StepOutcome::plain(failed(&step.id, error), started);
     }
     let input_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
 
     match infer_kind(step) {
-        Ok(StepKind::Tool) => dispatch_tool_step(step, ctx, input_json),
-        Ok(StepKind::Shell) => dispatch_shell_step(step, ctx, enforcement),
-        Ok(StepKind::Spawn) => dispatch_capsule_step(step, ctx, input),
-        Err(error) => failed(&step.id, error),
+        Ok(StepKind::Tool) => {
+            let (result, state_effect, resource_id) = dispatch_tool_step(step, ctx, input_json);
+            StepOutcome {
+                result,
+                attempts: 1,
+                duration_ms: elapsed_ms(started),
+                input: Some(input),
+                state_effect,
+                resource_id,
+            }
+        }
+        Ok(StepKind::Shell) => {
+            StepOutcome::plain(dispatch_shell_step(step, ctx, enforcement), started)
+        }
+        Ok(StepKind::Spawn) => StepOutcome::plain(dispatch_capsule_step(step, ctx, input), started),
+        Err(error) => StepOutcome::plain(failed(&step.id, error), started),
     }
 }
 
+/// Dispatches one tool step, and returns the verdict beside the `state_effect` and `resource_id`
+/// the tool declared about the call. Both are read through the agent loop's own extractors, so
+/// a plan step and an agent turn read one tool's self-description the same way.
 fn dispatch_tool_step(
     step: &StepDef,
     ctx: &SchedulerContext<'_>,
     input_json: String,
-) -> StepResult {
+) -> (StepResult, Option<String>, Option<String>) {
     let name = step.tool.as_deref().unwrap_or_default();
     match (ctx.invoke_tool)(
         name,
@@ -513,25 +842,32 @@ fn dispatch_tool_step(
             log_path: None,
         },
     ) {
-        Ok(result) if matches!(result.status, ToolStatus::Passed) => {
-            match tool_step_output(name, &ctx.workdir, result.data, result.data_path.as_deref()) {
-                Ok(output) => StepResult {
-                    step_id: step.id.clone(),
-                    status: StepStatus::Success,
-                    output,
-                    error: None,
-                },
-                Err(error) => failed(&step.id, error),
-            }
+        Ok(result) => {
+            let state_effect = crate::agent::extract_state_effect(&result.metadata);
+            let resource_id = crate::agent::extract_resource_id(&result.metadata);
+            let verdict = if matches!(result.status, ToolStatus::Passed) {
+                match tool_step_output(name, &ctx.workdir, result.data, result.data_path.as_deref())
+                {
+                    Ok(output) => StepResult {
+                        step_id: step.id.clone(),
+                        status: StepStatus::Success,
+                        output,
+                        error: None,
+                    },
+                    Err(error) => failed(&step.id, error),
+                }
+            } else {
+                failed(
+                    &step.id,
+                    result
+                        .summary
+                        .or(result.data)
+                        .unwrap_or_else(|| "tool step failed".to_string()),
+                )
+            };
+            (verdict, state_effect, resource_id)
         }
-        Ok(result) => failed(
-            &step.id,
-            result
-                .summary
-                .or(result.data)
-                .unwrap_or_else(|| "tool step failed".to_string()),
-        ),
-        Err(error) => failed(&step.id, error),
+        Err(error) => (failed(&step.id, error), None, None),
     }
 }
 
@@ -867,6 +1203,7 @@ mod tests {
             capsule_versions: HashMap::new(),
             current_session_id: None,
             spawn_credential: None,
+            trace: None,
             invoke_tool,
         }
     }

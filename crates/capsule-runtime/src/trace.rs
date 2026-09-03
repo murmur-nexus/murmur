@@ -2341,6 +2341,286 @@ pub(crate) fn timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+// ── Plan-scheduler events ────────────────────────────────────────────────────
+
+/// One step of a plan's DAG as authored, written into `plan_start`.
+///
+/// The shape is recorded once, up front, so the run stays legible for a step that never ran:
+/// the trace names every step the plan declared whether or not the scheduler reached it.
+#[derive(Serialize, Clone)]
+pub(crate) struct PlanStepShape {
+    pub(crate) step_id: String,
+    /// `"tool"`, `"shell"` or `"capsule"`; `"unknown"` for a step whose kind cannot be inferred,
+    /// which is a step the plan validator refuses.
+    pub(crate) kind: &'static str,
+    pub(crate) depends_on: Vec<String>,
+    /// Whether the step carries an `if`, and so may settle without ever being dispatched.
+    pub(crate) has_condition: bool,
+}
+
+/// The plan's structure, written once before any step runs. Its `event_id` is the plan node
+/// every other line of the run hangs off.
+#[derive(Serialize)]
+struct PlanStartEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    plan_id: String,
+    step_count: usize,
+    steps: Vec<PlanStepShape>,
+}
+
+/// One dispatched step, written as the scheduler hands it to a worker.
+///
+/// A step that settled without ever being dispatched — an `if` that evaluated false, a
+/// dependency that never resolved — writes no line here, only a terminal `plan_step`. Joins to
+/// that line on `(plan_id, step_id)`.
+#[derive(Serialize)]
+struct PlanStepStartEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    plan_id: String,
+    step_id: String,
+    kind: &'static str,
+    depends_on: Vec<String>,
+}
+
+/// A settled step, written by the scheduler loop after the step's `on_error` policy has been
+/// applied — which is why the worker thread does not write it: a step that failed under
+/// `on_error: skip` settles as skipped in the returned report and must read as skipped here.
+#[derive(Serialize)]
+struct PlanStepEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    plan_id: String,
+    step_id: String,
+    kind: &'static str,
+    status: &'static str,
+    attempts: u32,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    /// The interpolated input the step dispatched, with peer handle tokens redacted. Tool steps
+    /// only — a shell step's command and a capsule step's task text are not carried here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<Value>,
+    /// The tool's self-declared `state_effect` for this step, lifted verbatim from
+    /// `tool-result.metadata`. Absent when the tool declared nothing. Feeds the same
+    /// redundant-call analysis `tool_call.state_effect` does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_effect: Option<String>,
+    /// The resource this step addressed, as the tool declared it. Opaque and never parsed here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_id: Option<String>,
+}
+
+/// The run's summary, written once as `plan::execute` returns, whatever ended it.
+#[derive(Serialize)]
+struct PlanEndEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    plan_id: String,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failed_step: Option<String>,
+    steps_total: usize,
+    steps_succeeded: usize,
+    steps_failed: usize,
+    steps_skipped: usize,
+    duration_ms: u64,
+    /// Why the run ended when the reason was not a step's own failure: a plan that would not
+    /// parse, a cgroup scope the host refused, a DAG with nothing left to run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Everything the scheduler loop knows about a settled step, as one argument rather than ten.
+pub(crate) struct PlanStepRecord {
+    pub(crate) plan_id: String,
+    pub(crate) step_id: String,
+    pub(crate) kind: &'static str,
+    /// `"success"`, `"failed"` or `"skipped"` — the status the returned `ExecutionReport` carries
+    /// for this step, so the two can never disagree.
+    pub(crate) status: &'static str,
+    /// How many times the step was dispatched. `0` for a step that settled without dispatch.
+    pub(crate) attempts: u32,
+    pub(crate) duration_ms: u64,
+    pub(crate) error: Option<String>,
+    pub(crate) input: Option<Value>,
+    pub(crate) state_effect: Option<String>,
+    pub(crate) resource_id: Option<String>,
+}
+
+/// Everything the scheduler knows about a finished run, as one argument rather than nine.
+pub(crate) struct PlanEndRecord {
+    pub(crate) plan_id: String,
+    pub(crate) outcome: &'static str,
+    pub(crate) failed_step: Option<String>,
+    pub(crate) steps_total: usize,
+    pub(crate) steps_succeeded: usize,
+    pub(crate) steps_failed: usize,
+    pub(crate) steps_skipped: usize,
+    pub(crate) duration_ms: u64,
+    pub(crate) reason: Option<String>,
+}
+
+/// A third `O_APPEND` handle to the session's `trace.jsonl`, held by a plan run.
+///
+/// Synchronous where [`ResourceTraceAppender`] is async, because [`crate::plan::execute`] is: it
+/// runs its ready set on plain threads inside a `thread::scope`, so there is no runtime to await
+/// on and no `await` for a lock to be held across. Interleaving with [`TraceWriter`] and with
+/// the resource plane is safe on the same terms they interleave with each other — one complete
+/// line per `write_all`, then flush, which `O_APPEND` makes atomic against the other writers.
+///
+/// Handing one of these to a [`crate::plan::SchedulerContext`] is the whole of the opt-in: a
+/// context carrying `None` opens no file and writes no line.
+pub struct PlanTraceAppender {
+    file: std::sync::Mutex<std::fs::File>,
+    session_id: String,
+    /// The session node a run's `plan_start` hangs off — [`TraceWriter`]'s own
+    /// `session_start`, handed over at open time so an appended line names a real parent.
+    session_event_id: String,
+}
+
+impl PlanTraceAppender {
+    pub fn open(
+        workdir: &Path,
+        session_id: String,
+        session_event_id: String,
+    ) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(workdir.join("trace.jsonl"))?;
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+            session_id,
+            session_event_id,
+        })
+    }
+
+    /// Records the plan's DAG and returns the plan node every later line of this run hangs off.
+    pub(crate) fn write_plan_start(&self, plan_id: &str, steps: Vec<PlanStepShape>) -> String {
+        let event_id = new_event_id();
+        let event = PlanStartEvent {
+            event_type: "plan_start",
+            event_id: event_id.clone(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            plan_id: plan_id.to_string(),
+            step_count: steps.len(),
+            steps,
+        };
+        self.append(&event);
+        event_id
+    }
+
+    pub(crate) fn write_plan_step_start(
+        &self,
+        plan_node: &str,
+        plan_id: &str,
+        step_id: &str,
+        kind: &'static str,
+        depends_on: Vec<String>,
+    ) {
+        let event = PlanStepStartEvent {
+            event_type: "plan_step_start",
+            event_id: new_event_id(),
+            parent_id: Some(plan_node.to_string()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            plan_id: plan_id.to_string(),
+            step_id: step_id.to_string(),
+            kind,
+            depends_on,
+        };
+        self.append(&event);
+    }
+
+    pub(crate) fn write_plan_step(&self, plan_node: &str, record: PlanStepRecord) {
+        // On the same terms `TraceWriter::write_tool_call` redacts a tool call's input: a peer
+        // handle is a credential and this file is durable.
+        let input = record.input.map(|mut value| {
+            crate::peer_handoff::redact_handles_in_json(&mut value);
+            value
+        });
+        let event = PlanStepEvent {
+            event_type: "plan_step",
+            event_id: new_event_id(),
+            parent_id: Some(plan_node.to_string()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            plan_id: record.plan_id,
+            step_id: record.step_id,
+            kind: record.kind,
+            status: record.status,
+            attempts: record.attempts,
+            duration_ms: record.duration_ms,
+            error: record.error,
+            input,
+            state_effect: record.state_effect,
+            resource_id: record.resource_id,
+        };
+        self.append(&event);
+    }
+
+    /// Records the run's summary. `plan_node` is `None` for a run that never had one — a plan
+    /// file that would not parse describes no DAG — and the line hangs off the session instead.
+    pub(crate) fn write_plan_end(&self, plan_node: Option<&str>, record: PlanEndRecord) {
+        let event = PlanEndEvent {
+            event_type: "plan_end",
+            event_id: new_event_id(),
+            parent_id: Some(
+                plan_node
+                    .map(str::to_string)
+                    .unwrap_or_else(|| self.session_event_id.clone()),
+            ),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            plan_id: record.plan_id,
+            outcome: record.outcome,
+            failed_step: record.failed_step,
+            steps_total: record.steps_total,
+            steps_succeeded: record.steps_succeeded,
+            steps_failed: record.steps_failed,
+            steps_skipped: record.steps_skipped,
+            duration_ms: record.duration_ms,
+            reason: record.reason,
+        };
+        self.append(&event);
+    }
+
+    /// Writes one complete line and flushes it. Every failure is swallowed, exactly as
+    /// [`ResourceTraceAppender::append`] swallows one: a trace that cannot be written must never
+    /// turn a step that ran into a step that failed.
+    fn append(&self, event: &impl Serialize) {
+        use std::io::Write as _;
+
+        let Ok(mut line) = serde_json::to_string(event) else {
+            return;
+        };
+        line.push('\n');
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        if file.write_all(line.as_bytes()).is_ok() {
+            let _ = file.flush();
+        }
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
