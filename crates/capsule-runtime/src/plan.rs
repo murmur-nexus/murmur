@@ -96,6 +96,10 @@ pub struct SchedulerContext<'a> {
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
     pub current_session_id: Option<String>,
+    /// Where a `capsule` step reads a sub-capsule's manifest from, to learn which host variables
+    /// that sub-capsule declares. The session's own store, so a step resolves the artifact its
+    /// child will run.
+    pub registry: std::sync::Arc<dyn murmur_artifact::Registry>,
     /// The credential this session presents to `mur-roost` when a `capsule` step delegates.
     ///
     /// `None` for every session that was not granted `capabilities.spawn.allow`, and a `capsule`
@@ -963,6 +967,8 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         ctx.workdir.clone(),
         ctx.current_session_id.clone().unwrap_or_default(),
         crate::delegation_plane::DELEGATION_RESULT_TIMEOUT,
+        std::sync::Arc::clone(&ctx.registry),
+        ctx.capability_policy.env_allow.clone(),
     );
     // A plan step holds no conversation id and no trace appender, so its child is launched
     // without a handle and the step writes no delegation records — the same as before lineage
@@ -1204,6 +1210,10 @@ mod tests {
             ]),
             capsule_versions: HashMap::new(),
             current_session_id: None,
+            // Nothing in these cases delegates, so no artifact is ever resolved through it.
+            registry: std::sync::Arc::new(murmur_artifact::LocalRegistry::new(
+                tempdir().unwrap().keep(),
+            )),
             spawn_credential: None,
             trace: None,
             invoke_tool,

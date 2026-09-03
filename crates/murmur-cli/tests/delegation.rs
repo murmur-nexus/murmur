@@ -61,6 +61,19 @@ const LATE_WORKER: &str = "late-worker";
 /// depth-bound sentence. Never launched, so nothing about it beyond the name matters.
 const DEEP_WORKER: &str = "deep-worker";
 
+/// The sub-capsule declaring a host variable its parent does not, so the referee refuses it on the
+/// env axis.
+const THIRSTY_WORKER: &str = "thirsty-worker";
+
+/// The host variable both the parent and [`WORKER`] declare, and the whole of what a delegated
+/// child is handed beyond the names the runtime owns.
+const PROVIDER_KEY_VAR: &str = "MURMUR_TEST_PROVIDER_KEY";
+/// Its value: distinctive enough that a substring sweep over a whole workdir tree, and over every
+/// request the parent's model saw, is a meaningful search.
+const PROVIDER_KEY_VALUE: &str = "sk-test-PROVIDERKEY-8W3M-DELEGATED";
+/// The variable [`THIRSTY_WORKER`] declares and no parent here does.
+const UNGRANTED_VAR: &str = "MURMUR_TEST_UNGRANTED_KEY";
+
 const WORKER_ANSWER: &str = "WORKER-ANSWER-4K2P-DELEGATED";
 /// The late sub-capsule's answer. Spelled nowhere else, so finding it in a task the parent's agent
 /// was handed would mean the child's output travelled with the report rather than staying in its
@@ -377,14 +390,33 @@ fn publish_driver(registry_root: &Path) {
 
 /// An inference endpoint that answers every request with the same text, for a sub-capsule whose
 /// only job is to have an answer.
-fn always_replying(text: &str) -> String {
+///
+/// Every request is kept as the bytes it arrived as, so a case can assert what a child put on the
+/// wire — a resolved key travels in a header, which a parsed body would not carry.
+struct AlwaysReplying {
+    endpoint: String,
+    requests: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl AlwaysReplying {
+    /// The raw bytes of every request this endpoint has received.
+    fn requests(&self) -> Vec<Vec<u8>> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+fn always_replying(text: &str) -> AlwaysReplying {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let body = end_turn_response(text);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut stream = stream;
-            let _ = read_framed_request(&mut stream);
+            if let Some(raw) = read_framed_request(&mut stream) {
+                seen.lock().unwrap().push(raw);
+            }
             let raw = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -394,7 +426,7 @@ fn always_replying(text: &str) -> String {
             let _ = stream.flush();
         }
     });
-    endpoint
+    AlwaysReplying { endpoint, requests }
 }
 
 /// An inference endpoint that answers, eventually — for a sub-capsule that finishes only after its
@@ -553,6 +585,9 @@ fn end_turn_response(text: &str) -> String {
 struct Suite {
     roost: RecordingRoost,
     registry: PathBuf,
+    /// The answering sub-capsule's own inference endpoint, held so a case can read what that
+    /// child put on the wire.
+    worker_inference: AlwaysReplying,
     /// Kept for the life of the process: `HOME` points inside it.
     _home: TempDir,
 }
@@ -568,6 +603,10 @@ fn suite() -> &'static Suite {
             capsule_runtime::DELEGATION_TIMEOUT_ENV,
             TIMEOUT_SECS.to_string(),
         );
+        // The provider key every capsule here references rather than bakes in. Set before
+        // anything launches, because the daemon resolves a child manifest's `${VAR}` against this
+        // same process environment when it referees a spawn.
+        std::env::set_var(PROVIDER_KEY_VAR, PROVIDER_KEY_VALUE);
 
         let registry = home.path().join(".murmur").join("artifacts");
         std::fs::create_dir_all(&registry).unwrap();
@@ -587,8 +626,9 @@ fn suite() -> &'static Suite {
             &format!(
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [127.0.0.1]\n  \
+                 env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
                  spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}, {LATE_WORKER}, \
-                 {DEEP_WORKER}]\n"
+                 {DEEP_WORKER}, {THIRSTY_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
@@ -597,10 +637,11 @@ fn suite() -> &'static Suite {
 
         // The sub-capsule that answers. It stays up between tasks so it is still reachable when
         // its parent reads the answer, which is what an A2A `tasks/get` needs.
+        let worker_inference = always_replying(WORKER_ANSWER);
         roost.publish(
             WORKER,
             VERSION,
-            &agent_capsule_manifest(&always_replying(WORKER_ANSWER)),
+            &agent_capsule_manifest(&worker_inference.endpoint),
             None,
         );
         // The sub-capsule the referee refuses: one grant beyond its parent's envelope. It never
@@ -644,9 +685,21 @@ fn suite() -> &'static Suite {
             )),
         );
 
+        // The sub-capsule the referee refuses on the env axis: one host variable beyond its
+        // parent's declaration. It never launches, so its component only has to resolve.
+        roost.publish(
+            THIRSTY_WORKER,
+            VERSION,
+            &format!("artifacts: []\ncapabilities:\n  env:\n    allow: [{UNGRANTED_VAR}]\n"),
+            Some(&common::fixture_path(
+                "run/components/capsule-env-echo.wasm",
+            )),
+        );
+
         Suite {
             roost,
             registry,
+            worker_inference,
             _home: home,
         }
     })
@@ -673,10 +726,11 @@ fn agent_capsule_manifest(endpoint: &str) -> String {
 fn agent_capsule_manifest_with(endpoint: &str, lifecycle: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
-         capabilities:\n  network:\n    allow: [{authority}]\n\
+         capabilities:\n  network:\n    allow: [{authority}]\n  \
+         env:\n    allow: [{PROVIDER_KEY_VAR}]\n\
          lifecycle:\n  {lifecycle}\n\
          inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
-         api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
+         api_key: ${{{PROVIDER_KEY_VAR}}}\n  driver:\n    artifact: {DRIVER}\n",
         authority = endpoint.trim_start_matches("http://"),
     )
 }
@@ -716,7 +770,8 @@ impl Parent {
         let manifest_body = format!(
             "name: {name}\nversion: {VERSION}\n\
              artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
-             capabilities:\n  network:\n    allow: [127.0.0.1]\n{spawn_yaml}\
+             capabilities:\n  network:\n    allow: [127.0.0.1]\n  \
+             env:\n    allow: [{PROVIDER_KEY_VAR}]\n{spawn_yaml}\
              lifecycle:\n  task_acceptance: queue\n  after_task: sleep\n\
              inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
              api_key: test-key\n  driver:\n    artifact: {DRIVER}\n",
@@ -1191,8 +1246,8 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
-const SPAWN_YAML: &str =
-    "  spawn:\n    allow: [worker, greedy-worker, mute-worker, late-worker, deep-worker]\n";
+const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, greedy-worker, mute-worker, late-worker, \
+                          deep-worker, thirsty-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
 
@@ -1230,7 +1285,14 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     );
     assert_eq!(
         schema["properties"]["capsule"]["enum"],
-        json!([WORKER, GREEDY_WORKER, MUTE_WORKER, LATE_WORKER, DEEP_WORKER]),
+        json!([
+            WORKER,
+            GREEDY_WORKER,
+            MUTE_WORKER,
+            LATE_WORKER,
+            DEEP_WORKER,
+            THIRSTY_WORKER
+        ]),
         "the enum is this capsule's own spawn.allow"
     );
 
@@ -1379,8 +1441,22 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "the harness must have seen a real approval to assert about: {tokens:?}"
     );
 
+    // The child reached its provider with the key its manifest referenced. The parent held the
+    // variable and both manifests declared it, so the launcher copied it across a cleared
+    // environment and the child resolved `${…}` against what it was handed — a child that merely
+    // started would have died at its own manifest load instead.
+    let outbound = suite.worker_inference.requests();
+    assert!(
+        outbound.iter().any(|request| request
+            .windows(PROVIDER_KEY_VALUE.len())
+            .any(|window| window == PROVIDER_KEY_VALUE.as_bytes())),
+        "the sub-capsule's inference endpoint saw {} requests, none carrying the resolved key",
+        outbound.len()
+    );
+
     let model_context = serde_json::to_string(&parent.server.requests()).unwrap();
     let mut needles: Vec<String> = vec![CREDENTIAL_PREFIX.to_string(), APPROVAL_PREFIX.to_string()];
+    needles.push(PROVIDER_KEY_VALUE.to_string());
     needles.extend(tokens);
     for needle in needles {
         if let Some(path) = find_in_files(&parent.project, &needle) {
@@ -1499,6 +1575,42 @@ fn a_referee_refusal_names_the_axis_and_the_entry() {
         parent.events("delegation_start").is_empty(),
         "a refused delegation launched no child"
     );
+}
+
+/// The env axis refuses like every other axis: a sub-capsule naming a host variable its parent
+/// does not declare is refused before anything launches, and the sentence names the key and the
+/// variable.
+#[test]
+fn a_child_naming_an_undeclared_variable_is_refused_on_the_env_axis() {
+    if common::skip_without_host_support(
+        "a_child_naming_an_undeclared_variable_is_refused_on_the_env_axis",
+    ) {
+        return;
+    }
+    let parent = Parent::launch(PARENT, SPAWN_YAML);
+
+    let text = parent.delegate("toolu_thirsty", THIRSTY_WORKER, VERSION, "hand me a key");
+
+    assert!(
+        text.contains("capabilities.env.allow"),
+        "the refusal names the axis: {text}"
+    );
+    assert!(
+        text.contains(UNGRANTED_VAR),
+        "the refusal names the entry: {text}"
+    );
+
+    // Refused, so nothing was launched and nothing was composed beneath the parent's workdir.
+    assert!(parent.child_dirs().is_empty(), "no child directory exists");
+    assert!(
+        parent.events("delegation_start").is_empty(),
+        "a refused delegation launched no child"
+    );
+
+    let events = parent.events("delegation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["outcome"], "refused", "{}", events[0]);
+    assert_eq!(events[0]["reason"], json!(text), "{}", events[0]);
 }
 
 /// A bound the daemon refuses on reaches the parent's trace as the daemon's own sentence, unedited.

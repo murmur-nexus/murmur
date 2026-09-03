@@ -16,7 +16,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use capsule_runtime::{
-    child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, SpawnApproval,
+    child_workdir_for, delegation::SPAWNER_ENV, launch_child_capsule, ChildLaunchRequest,
+    LaunchedChild, SpawnApproval, Spawner,
 };
 use common::{component, files_under, find_in_files, mur_binary, Roost, ScriptedServer};
 use serde_json::{json, Value};
@@ -402,6 +403,43 @@ fn two_children_of_the_same_parent_are_independent() {
     assert!(a.workdir.join(".murmur").join(&a.session_id).is_dir());
     assert!(b.workdir.join(".murmur").join(&b.session_id).is_dir());
     assert!(!a.workdir.join(".murmur").join(&b.session_id).exists());
+}
+
+/// The environment a child that declares nothing is handed: the names the runtime owns, and
+/// nothing else. An empty `capabilities.env.allow` is a complete answer rather than a hole, so a
+/// list that arrives empty — which is what a child declaring none of its parent's variables
+/// yields — leaves the child holding the runtime-owned names alone.
+#[test]
+fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
+    let parent = Parent::new();
+    let keys = |child: &LaunchedChild| -> Vec<String> {
+        child.env.iter().map(|(key, _)| key.clone()).collect()
+    };
+
+    let plain = parent.launch("child-a", &[]);
+    assert_eq!(keys(&plain), ["PATH", "HOME", "MURMUR_ROOST_URL"]);
+
+    // The same launch with lineage. It reports to nobody, so the handle is the whole of what the
+    // spawner adds and no watcher runs.
+    let (grant, _) = parent.approve("child-b");
+    let delegated = launch_child_capsule(ChildLaunchRequest {
+        parent_accessible_workdir: parent.dir().to_path_buf(),
+        capsule_name: "child-b".to_string(),
+        capsule_version: "0.1.0".to_string(),
+        grant,
+        child_env_allow: Vec::new(),
+        roost_url: suite().roost.url.clone(),
+        spawner: Some(Spawner {
+            session_id: PARENT_SESSION.to_string(),
+            context_id: "ctx_runtime_owned_names".to_string(),
+            report_to: None,
+        }),
+    })
+    .expect("a child that declares no variables launches");
+    assert_eq!(
+        keys(&delegated),
+        ["PATH", "HOME", "MURMUR_ROOST_URL", SPAWNER_ENV]
+    );
 }
 
 // ── 3. A child cannot reach out of its own directory ──────────────────────────

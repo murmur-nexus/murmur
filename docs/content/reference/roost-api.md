@@ -287,6 +287,34 @@ a hole in. It is convenient — it is how a parent streams inputs to a child tha
 directory, so nothing flows the other way, but a parent can write into a running child's workspace
 without any grant saying so.
 
+### The child's environment
+
+A delegated child starts from a cleared environment. Its parent's runtime builds the whole of what
+the child holds:
+
+| Name | Present when |
+|---|---|
+| `PATH` | Always, from the parent's own value |
+| `HOME` | Always, from the parent's own value |
+| `MURMUR_ROOST_URL` | Always, so the child registers at the same daemon its parent asked |
+| `MURMUR_SPAWNER` | The child was given a spawner handle — see [The completion path](#the-completion-path) |
+| Any other name | The name appears in both the child's and the parent's `capabilities.env.allow`, and the parent's own process environment holds it |
+
+Every other variable the parent holds is absent from the child. A name a child declares that its
+parent does not is refused at `POST /spawn` on the [`capabilities.env.allow` axis](#spawn-envelope).
+The four names above are the runtime's, and a child that lists one of them under
+`capabilities.env.allow` does not displace the runtime's value.
+
+The value copied is the value the parent's process holds at launch. A variable the parent itself
+does not hold is absent from the child even where both manifests declare it, and a child whose
+`inference.api_key` references it fails at manifest load with
+[`E-MAN-003`](diagnostics.md#index).
+
+The daemon resolves a child manifest's `${VARIABLE}` references against its own process
+environment when it referees a spawn. Start `mur-roost` in an environment holding every variable
+the capsules it referees reference: a reference the daemon cannot resolve fails the spawn, for a
+manifest the child itself would have loaded.
+
 ---
 
 ## The delegation tool

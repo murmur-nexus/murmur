@@ -18,7 +18,9 @@ use capsule_runtime::{
     CapabilityPolicy, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
 use serde_json::{json, Value};
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
+
+mod common;
 
 /// A credential distinctive enough that a substring search over a whole workdir tree, and over
 /// every step result, is a meaningful search.
@@ -49,10 +51,27 @@ fn ctx<'a>(
         ]),
         capsule_versions: HashMap::from([("worker".to_string(), "0.1.0".to_string())]),
         current_session_id: Some(TEST_SESSION.to_string()),
+        registry: worker_registry(),
         spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
         trace: None,
         invoke_tool,
     }
+}
+
+/// A store holding the `worker` artifact every capsule step here delegates to.
+///
+/// A capsule step reads its child's declared `capabilities.env.allow` out of the packed manifest
+/// before it launches, so the artifact has to resolve even where the child is a stub `mur` that
+/// never loads it. This one declares no variables, which is the case that leaves a child holding
+/// the runtime's own names and nothing else.
+fn worker_registry() -> Arc<dyn murmur_artifact::Registry> {
+    static REGISTRY: OnceLock<TempDir> = OnceLock::new();
+    let root = REGISTRY.get_or_init(|| {
+        let dir = tempdir().unwrap();
+        common::publish_capsule(dir.path(), "worker", "0.1.0", "artifacts: []\n", None);
+        dir
+    });
+    Arc::new(murmur_artifact::LocalRegistry::new(root.path()))
 }
 
 fn tool_result(status: ToolStatus, data: Option<String>, summary: Option<String>) -> ToolResult {
