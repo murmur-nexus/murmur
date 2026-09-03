@@ -9033,7 +9033,7 @@ capabilities:
             );
             for field in &owned {
                 assert!(
-                    block.contains(&format!("self.{field}")),
+                    mentions_field(&block, field),
                     "{name}'s `walk_children` never touches `self.{field}`, so every key written \
                      inside that block would go unreported — descend into it with \
                      `collect_block(.., &child_path(path, \"{field}\"), out)`"
@@ -9049,6 +9049,19 @@ capabilities:
             children >= 31,
             "expected every nested block field to be scanned, found only {children}"
         );
+    }
+
+    /// Whether `impl` reads `self.<field>` as that whole field, not as the head of a longer one:
+    /// a plain substring test lets a struct owning both `foo` and `foo_bar` walk only `foo_bar`
+    /// and still be called covered, which is the silent pass this scan exists to deny.
+    fn mentions_field(impl_body: &str, field: &str) -> bool {
+        let needle = format!("self.{field}");
+        impl_body.match_indices(&needle).any(|(at, _)| {
+            impl_body[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric() && next != '_')
+        })
     }
 
     /// The fields of one struct body whose declared type names another `Raw*` type, in
@@ -9110,7 +9123,7 @@ capabilities:
     }
 
     /// Every block the manifest type owns, each carrying one key no field of it claims, reported
-    /// once and at its own dotted path. The blocks a later slice adds are held to this by
+    /// once and at its own dotted path. A block added after this one is held to the same rule by
     /// `every_raw_struct_descends_into_the_blocks_it_owns`; this is what "descended into" means.
     #[test]
     fn every_block_reports_its_own_unknown_key_at_its_own_path() {
