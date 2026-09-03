@@ -17,13 +17,40 @@
 //! is the mirror image and is best effort — a session that has already finished has nothing left
 //! to refuse.
 
+use std::time::Duration;
+
 use serde_json::json;
 
 use crate::errors::RuntimeError;
-use crate::http_client::http_json;
+use crate::http_client::{http_json, http_json_with_timeout};
 use crate::spawn_credential::{
     SpawnApproval, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
+
+/// Deadline [`check_roost_health`] asks under. Its callers report to a person waiting on the
+/// answer, so an unreachable address has to fail in seconds rather than at the deadline a
+/// registration is allowed.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a daemon answers `GET /health` at `roost_url`, asked over the client
+/// [`register_session`] registers with — so the answer is the one a launch would get rather than a
+/// second client's opinion.
+///
+/// `Err` carries the transport or response reason: an unparseable URL, a refused or timed-out
+/// connection, a non-2xx status, or a body that is not JSON. It never carries a request header or
+/// a request body, for the reason [`crate::http_client`] states. Fails within [`HEALTH_TIMEOUT`]
+/// rather than at the deadline a registration gets.
+pub fn check_roost_health(roost_url: &str) -> Result<(), String> {
+    let roost_url = roost_url.trim_end_matches('/');
+    http_json_with_timeout(
+        "GET",
+        &format!("{roost_url}/health"),
+        None,
+        &[],
+        HEALTH_TIMEOUT,
+    )
+    .map(|_| ())
+}
 
 /// How a session ended, as `POST /deregister` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

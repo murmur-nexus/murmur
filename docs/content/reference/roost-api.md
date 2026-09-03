@@ -17,6 +17,14 @@ readable from inside the capsule, so a shell tool cannot make the call itself.
 
 ## Start the daemon
 
+The installer ships `mur-roost` beside `mur`, in the same directory and at the same version:
+
+```bash
+curl -fsSL https://install.murmur.rs | sh
+```
+
+Start it on loopback:
+
 ```bash
 mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 ```

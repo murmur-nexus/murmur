@@ -1,7 +1,11 @@
 mod common;
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use assert_cmd::Command;
 use murmur_artifact::{
@@ -9,6 +13,77 @@ use murmur_artifact::{
 };
 use predicates::prelude::*;
 use tempfile::TempDir;
+
+// ── mur-roost fixture helpers ─────────────────────────────────────────────────
+
+/// A capsule declaring `capabilities.spawn.allow`, the one declaration that makes the daemon a
+/// dependency of the run and doctor's roost report fire.
+fn create_delegating_project(project_dir: &Path) {
+    fs::write(
+        project_dir.join("murmur.yaml"),
+        "name: doctor-fixture\nversion: 0.0.1\nartifacts: []\n\
+         capabilities:\n  spawn:\n    allow:\n      - worker\n",
+    )
+    .unwrap();
+}
+
+/// A `PATH` holding one executable named `mur-roost`. Doctor resolves the name and reports the
+/// path it found; it never runs the binary, so any executable file answers the question.
+fn path_with_roost(dir: &Path) -> PathBuf {
+    let binary = dir.join("mur-roost");
+    fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir.to_path_buf()
+}
+
+/// A real daemon on a loopback port, serving from `mur_roost`'s own router so `GET /health`
+/// answers exactly as the shipped binary answers it.
+fn start_roost() -> (String, TempDir) {
+    let registry = TempDir::new().unwrap();
+    let state = Arc::new(mur_roost::State {
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        registry_path: registry.path().to_path_buf(),
+        spawn_allow: vec!["doctor-fixture".to_string()],
+        max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
+        max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
+        authority: Arc::new(mur_roost::authority::SpawnAuthority::generate().unwrap()),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let state = Arc::clone(&state);
+            thread::spawn(move || mur_roost::handle_connection(stream, state));
+        }
+    });
+    (url, registry)
+}
+
+/// `mur doctor` with the two inputs the roost report reads named explicitly, rather than whatever
+/// the machine running the suite has installed and exported.
+fn mur_doctor_with_roost_env(
+    home: &TempDir,
+    project_dir: &Path,
+    path: &Path,
+    roost_url: Option<&str>,
+) -> assert_cmd::assert::Assert {
+    let mut command = Command::cargo_bin("mur").unwrap();
+    command
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .env("PATH", path)
+        .env_remove("MURMUR_ROOST_URL")
+        .current_dir(project_dir)
+        .arg("doctor");
+    if let Some(url) = roost_url {
+        command.env("MURMUR_ROOST_URL", url);
+    }
+    command.assert()
+}
 
 // ── Project fixture helpers ───────────────────────────────────────────────────
 
@@ -608,4 +683,127 @@ fn doctor_names_the_userns_grant_and_never_changes_the_exit_code() {
         stdout.contains("/etc/apparmor.d/mur-sealed:"),
         "the installed-profile comparison must be reported, got:\n{stdout}"
     );
+}
+
+// ── The daemon a delegating capsule registers with ────────────────────────────
+
+/// A capsule that can delegate, on a host where the daemon cannot be obtained at all: the state
+/// an operator would otherwise meet as an `E-RUN-019` mid-run. Doctor names the code, says the
+/// binary is missing, and says where it comes from — and changes neither the checklist nor the
+/// exit status.
+#[test]
+fn doctor_warns_when_a_delegating_capsule_has_no_mur_roost_on_path() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let empty_path = TempDir::new().unwrap();
+    create_delegating_project(project.path());
+
+    let assert =
+        mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(
+        stderr.contains("mur-roost was not found on PATH"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("install.murmur.rs"), "{stderr}");
+    assert!(
+        stdout.contains("All checks passed."),
+        "the report must not touch the tally, got:\n{stdout}"
+    );
+}
+
+/// The daemon is installed and nothing names it. Distinct wording from the missing-binary arm:
+/// the fix is an environment variable, not an install.
+#[test]
+fn doctor_names_the_unset_roost_url_when_the_daemon_is_installed() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    create_delegating_project(project.path());
+
+    let assert =
+        mur_doctor_with_roost_env(&home, project.path(), &path_with_roost(bin.path()), None)
+            .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(stderr.contains("MURMUR_ROOST_URL"), "{stderr}");
+    assert!(stderr.contains("is not set"), "{stderr}");
+    assert!(!stderr.contains("was not found on PATH"), "{stderr}");
+}
+
+/// The daemon is installed, a URL names it, and nothing answers there. Port 1 is reserved and
+/// nothing listens on it.
+#[test]
+fn doctor_reports_an_unreachable_daemon_separately_from_a_missing_one() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    create_delegating_project(project.path());
+
+    let assert = mur_doctor_with_roost_env(
+        &home,
+        project.path(),
+        &path_with_roost(bin.path()),
+        Some("http://127.0.0.1:1"),
+    )
+    .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("warning[E-RUN-019]"), "{stderr}");
+    assert!(
+        stderr.contains("no daemon answered at http://127.0.0.1:1"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("was not found on PATH"), "{stderr}");
+    assert!(
+        !stderr.contains("MURMUR_ROOST_URL — the variable"),
+        "{stderr}"
+    );
+}
+
+/// A daemon that answers is the state doctor has nothing to say about.
+#[test]
+fn doctor_says_nothing_about_roost_when_the_daemon_answers() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    create_delegating_project(project.path());
+    let (url, _registry) = start_roost();
+
+    let assert = mur_doctor_with_roost_env(
+        &home,
+        project.path(),
+        &path_with_roost(bin.path()),
+        Some(&url),
+    )
+    .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(!stderr.contains("E-RUN-019"), "{stderr}");
+    assert!(!stderr.contains("mur-roost"), "{stderr}");
+    assert!(!stdout.contains("mur-roost"), "{stdout}");
+}
+
+/// A capsule declaring no `capabilities.spawn` block never depends on the daemon, so it is never
+/// told about one — with no daemon installed and none named.
+#[test]
+fn doctor_says_nothing_about_roost_for_a_capsule_that_cannot_delegate() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let empty_path = TempDir::new().unwrap();
+    create_project(project.path(), " []\n");
+
+    let assert =
+        mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(!stderr.contains("E-RUN-019"), "{stderr}");
+    assert!(!stderr.contains("mur-roost"), "{stderr}");
+    assert!(!stdout.contains("mur-roost"), "{stdout}");
 }

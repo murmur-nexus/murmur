@@ -254,6 +254,11 @@ error[E-RUN-019]: failed to register this session with mur-roost at http://127.0
 `MURMUR_ROOST_URL` unset or blank reports the same code with `MURMUR_ROOST_URL is not set` as the
 reason. The message names the daemon and the reason, never a token.
 
+`mur doctor` reports the same three states — `mur-roost` not installed, `MURMUR_ROOST_URL` not set,
+and nothing answering at the URL it names — for a capsule declaring `capabilities.spawn.allow`, so
+the refusal is visible before a run meets it. See
+[Start the daemon](roost-api.md#start-the-daemon) for how to obtain `mur-roost` and start it.
+
 A capsule that declares no spawn capability never reaches this — it opens no connection to the
 daemon at all, and `mur run` succeeds with nothing listening.
 

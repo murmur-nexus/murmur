@@ -439,6 +439,18 @@ pub(crate) fn resolve_invoked_binary_path_in(binary: &str, path_dirs: &[PathBuf]
     fallback()
 }
 
+/// The first executable named `binary` on this process's `PATH`, or `None` when there is none.
+///
+/// First match wins, which is the one `execvp` would run — the same rule
+/// [`resolve_invoked_binary_path_in`] reports under, so a caller naming a binary and a caller
+/// reporting one cannot disagree about which file `PATH` means. The path is returned as found,
+/// not canonicalized: callers here name a binary to a person rather than derive a grant from it.
+pub fn find_on_path(binary: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| is_executable_file(candidate))
+}
+
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)

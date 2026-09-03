@@ -425,6 +425,8 @@ There is no hardcoded artifact list: the checklist is derived entirely from `mur
 
 Ahead of the checklist it prints three blocks, none of which affects the exit code: `AppArmor / user namespaces` (see [Where the user namespace comes from](containment.md#userns-grant)); `Filesystem preopens`, one line per `runtime: tool`, `runtime: driver` and `runtime: hook` entry, naming the directory that artifact works out of — see [The filesystem default](../concepts/access-control.md#filesystem-default) for which directory each role gets. An entry whose `capabilities.filesystem.scope` `mur run` would refuse prints `<unresolved>` there, with an [`E-CAP-002`](diagnostics.md#e-cap-002) warning on stderr naming it; the exit code is still the checklist's alone. Last, `Read-only paths` lists the subtrees [`capabilities.filesystem.read_only`](manifest.md#read-only-paths) protects and whether that protection is enforced for every call the runtime can read as a write or advisory against a named interpreter — the same block, in the same words, that [`mur run --explain-scope`](#mur-run) prints.
 
+For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilities), `mur doctor` also reports whether `mur-roost` — the daemon that capsule registers with at launch — is installed and answering, naming [`E-RUN-019`](diagnostics.md#e-run-019) as the error a `mur run` would meet. It tells apart three states: the binary is not on `PATH`, `MURMUR_ROOST_URL` is not set, and nothing answers at the URL that variable names. A reachable daemon prints nothing, and a capsule declaring no `spawn.allow` gets no such line. Like the blocks above, this warning goes to stderr and never changes the exit code.
+
 **Output — happy path:**
 
 ```text

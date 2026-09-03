@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check tag against Cargo.toml version
+        # murmur-cli and mur-roost both take `version.workspace = true` from the root
+        # Cargo.toml, so pinning one of them to the tag pins the version both assets carry.
         run: |
           TAG_VERSION="${{ github.ref_name }}"
           TAG_VERSION="${TAG_VERSION#v}"
@@ -44,18 +46,24 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Build
-        run: cargo build -p murmur-cli --release --target ${{ matrix.target }}
-      - name: Rename binary
+        run: cargo build -p murmur-cli -p mur-roost --release --target ${{ matrix.target }}
+      - name: Rename binaries
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           cp target/${{ matrix.target }}/release/mur \
              mur-${VERSION}-${{ matrix.platform }}
-      - name: Upload binary
+          cp target/${{ matrix.target }}/release/mur-roost \
+             mur-roost-${VERSION}-${{ matrix.platform }}
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: mur-${{ matrix.platform }}
-          path: mur-*-${{ matrix.platform }}
+          # Both binaries are release assets. `mur-roost-` carries the version one field
+          # later than `mur-`, so a `mur-<version>-*` glob does not match it.
+          path: |
+            mur-*-${{ matrix.platform }}
+            mur-roost-*-${{ matrix.platform }}
           if-no-files-found: error
 
   build-linux:
@@ -67,18 +75,22 @@ jobs:
       - name: Install libseccomp-dev
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
       - name: Build
-        run: cargo build -p murmur-cli --release --target x86_64-unknown-linux-gnu
-      - name: Rename binary
+        run: cargo build -p murmur-cli -p mur-roost --release --target x86_64-unknown-linux-gnu
+      - name: Rename binaries
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           cp target/x86_64-unknown-linux-gnu/release/mur \
              mur-${VERSION}-linux-x86_64
-      - name: Upload binary
+          cp target/x86_64-unknown-linux-gnu/release/mur-roost \
+             mur-roost-${VERSION}-linux-x86_64
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: mur-linux-x86_64
-          path: mur-*-linux-x86_64
+          path: |
+            mur-*-linux-x86_64
+            mur-roost-*-linux-x86_64
           if-no-files-found: error
 
   release:
@@ -108,12 +120,12 @@ jobs:
           # Machine-readable SHA256 manifest, published as a release asset and
           # consumed by scripts/install.sh. Standard `sha256sum -c` format, so it
           # can also be verified by hand: sha256sum -c checksums.txt
-          sha256sum mur-${VERSION}-* > checksums.txt
+          sha256sum mur-${VERSION}-* mur-roost-${VERSION}-* > checksums.txt
           cat checksums.txt
 
           # SHA256 for release notes
           NOTES="## Checksums\n\`\`\`"
-          for f in mur-${VERSION}-*; do
+          for f in mur-${VERSION}-* mur-roost-${VERSION}-*; do
             HASH=$(sha256sum "$f" | awk '{print $1}')
             NOTES="${NOTES}\nsha256  ${f}  ${HASH}"
           done
@@ -124,7 +136,7 @@ jobs:
 
           # SHA512 for changelog (space-separated to work with shell expansion)
           BINARIES_ARGS=""
-          for f in mur-${VERSION}-*; do
+          for f in mur-${VERSION}-* mur-roost-${VERSION}-*; do
             SIZE=$(du -h "$f" | awk '{print $1}')B
             SHA512=$(sha512sum "$f" | awk '{print $1}')
             BINARIES_ARGS="${BINARIES_ARGS} ${f}:${SHA512}:${SIZE}"
@@ -193,6 +205,9 @@ jobs:
             mur-${VERSION_NO_V}-darwin-aarch64 \
             mur-${VERSION_NO_V}-darwin-x86_64 \
             mur-${VERSION_NO_V}-linux-x86_64 \
+            mur-roost-${VERSION_NO_V}-darwin-aarch64 \
+            mur-roost-${VERSION_NO_V}-darwin-x86_64 \
+            mur-roost-${VERSION_NO_V}-linux-x86_64 \
             checksums.txt \
             --repo "${{ github.repository }}" \
             --title "murmur v${VERSION_NO_V}" \
