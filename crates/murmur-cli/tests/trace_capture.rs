@@ -280,30 +280,163 @@ fn no_message_identity_reaches_a_blob() {
     );
 }
 
-/// Two runs of the same capsule send byte-identical messages, so their `message_shas` agree
-/// pairwise and the divergence index is `None`. Their `message_ids`, by contrast, differ at
-/// every position, which is why an id array cannot locate a divergence.
+// ── The request prefix a provider matches its cache against ──────────────────
+//
+// A provider matches a cached prefix from the first token, in the order the request carries its
+// pieces: the system prompt, then the tool schemas, then the messages in send order. The trace's
+// per-turn content hashes are taken from that same payload after message identity is stripped, so
+// comparing two launches position by position answers whether a second launch could have hit the
+// cache the first one filled. Nothing else in the repo answers it: a volatile value in the prefix
+// changes no behaviour and fails no other test — the only symptom is the bill.
+
+/// The pieces a provider matches, as `(label, sha)` in wire order: the system prompt at index 0,
+/// the tool schemas at index 1, then one entry per message from index 2. Leaving the tool schemas
+/// out would leave the cheapest cache break — a reordered tool array — unguarded.
+///
+/// `response_sha` is deliberately absent: it hashes what came back, not what was sent.
+///
+/// Requires `trace.capture` to be `meta` or `content`. Under `none` the event carries no hash at
+/// all and there is no prefix to compare, so this panics naming the missing key.
+fn request_prefix(event: &Value) -> Vec<(String, String)> {
+    let hash = |key: &str| {
+        event[key]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{key} missing from {event}; trace.capture must record hashes")
+            })
+            .to_string()
+    };
+    let mut prefix = vec![
+        ("system prompt".to_string(), hash("system_sha")),
+        ("tool schemas".to_string(), hash("tools_sha")),
+    ];
+    prefix.extend(
+        shas(event, "message_shas")
+            .into_iter()
+            .enumerate()
+            .map(|(i, sha)| (format!("message {i}"), sha)),
+    );
+    prefix
+}
+
+/// The index of the first position whose shas differ, over the common prefix only.
+///
+/// `None` when one prefix is a prefix of the other: a longer run that agrees on everything the
+/// shorter one sent has broken no cache, because the provider still matches up to the first
+/// genuinely new content. Labels are ignored — a sha is what a cache compares.
+fn first_prefix_divergence(a: &[(String, String)], b: &[(String, String)]) -> Option<usize> {
+    a.iter().zip(b.iter()).position(|((_, x), (_, y))| x != y)
+}
+
+/// Two launches of one task must hand the driver a byte-identical request prefix, so the second
+/// hits the prompt cache the first filled. The runs use separate temp homes and separate project
+/// directories, so any absolute path, session id or timestamp that leaked into a hashed piece
+/// shows up here as a differing sha.
 #[test]
-fn two_runs_of_one_capsule_agree_on_every_message_sha_and_on_no_message_id() {
+fn request_prefix_is_identical_across_two_launches() {
     let first = run_session("trace:\n  capture: meta\n");
     let second = run_session("trace:\n  capture: meta\n");
+    let first_event = first.sole_inference();
+    let second_event = second.sole_inference();
 
-    let a = shas(&first.sole_inference(), "message_shas");
-    let b = shas(&second.sole_inference(), "message_shas");
+    let a = request_prefix(&first_event);
+    let b = request_prefix(&second_event);
+
+    if let Some(i) = first_prefix_divergence(&a, &b) {
+        panic!(
+            "request prefix diverges at index {i} ({label}): A {x}… B {y}…\n\
+             A per-launch value reached the cached prefix, so every request after the first \
+             misses the provider's prompt cache — no error, no changed behaviour, only the bill.\n\
+             `mur trace diff <run A>/trace.jsonl <run B>/trace.jsonl` renders the same index \
+             against the same data, and under `trace.capture: content` names the blobs holding \
+             both bodies.",
+            label = a[i].0,
+            x = &a[i].1[..12],
+            y = &b[i].1[..12],
+        );
+    }
     assert_eq!(
-        a.iter().zip(&b).position(|(x, y)| x != y),
-        None,
-        "two runs of the same task send the same messages: {a:?} vs {b:?}"
+        a.len(),
+        b.len(),
+        "two runs of one task sent a different number of prefix pieces ({} vs {}) — \
+         that is a red flag in the fixture, not a caching regression: one run saw an extra \
+         installed tool or an extra message",
+        a.len(),
+        b.len(),
     );
 
-    // The message ids, by contrast, are freshly minted every run and say nothing about content.
-    let ids_a = shas(&first.sole_inference(), "message_ids");
-    let ids_b = shas(&second.sole_inference(), "message_ids");
+    // ── The envelope-vs-prefix boundary ──────────────────────────────────────
+    //
+    // Identity distinguishes the runs on the trace envelope; nothing that identifies a launch
+    // may reach a hashed prefix piece.
+    //
+    //   Envelope identity — must differ: `session_id`, `event_id`, `message_ids[*]`,
+    //     `timestamp`. Freshly minted per launch. These say *which run*, never *what was sent*.
+    //   Hashed prefix — must agree: `system_sha`, `tools_sha`, `message_shas[*]`. Derived only
+    //     from capsule identity, the manifest, the installed tool set and the task input.
+    //
+    // A field added to the request later belongs on the envelope side unless it is a pure
+    // function of those four inputs: a path, a timestamp, a UUID, a counter, or anything read
+    // out of an unordered map belongs on the envelope side, or nowhere.
+    //
+    // Asserting the envelope side is what stops the agreement above from being vacuous — two
+    // launches that somehow shared one session directory would agree on every hash for the
+    // wrong reason. `timestamp` is on the must-differ side of the boundary but is not asserted
+    // here: two sessions can legitimately land in the same clock tick.
+    for key in ["session_id", "event_id"] {
+        assert_ne!(
+            first_event[key], second_event[key],
+            "{key} is minted per launch and must distinguish the two runs"
+        );
+    }
+    let ids_a = shas(&first_event, "message_ids");
+    let ids_b = shas(&second_event, "message_ids");
     assert_eq!(ids_a.len(), ids_b.len());
     assert!(
         ids_a.iter().zip(&ids_b).all(|(x, y)| x != y),
-        "every id differs between runs, which is why ids cannot locate a divergence"
+        "every message id differs between runs, which is why an id array cannot locate a \
+         divergence and a sha array can: {ids_a:?} vs {ids_b:?}"
     );
+}
+
+/// The index contract of `first_prefix_divergence`, over synthetic values and no session: it
+/// reports the *first* disagreement, not the last and not a count, and treats one side being a
+/// strict prefix of the other as no divergence. This is what keeps the failure message above
+/// honest while nothing in the repo is broken.
+#[test]
+fn first_prefix_divergence_names_the_first_differing_index() {
+    let piece = |label: &str, sha: &str| (label.to_string(), sha.to_string());
+    let base = vec![
+        piece("system prompt", "aa"),
+        piece("tool schemas", "bb"),
+        piece("message 0", "cc"),
+        piece("message 1", "dd"),
+    ];
+
+    assert_eq!(first_prefix_divergence(&base, &base), None);
+
+    // Two positions disagree: the answer is the first of them, not the last and not a count.
+    let mut two_differ = base.clone();
+    two_differ[1].1 = "zz".to_string();
+    two_differ[3].1 = "zz".to_string();
+    assert_eq!(first_prefix_divergence(&base, &two_differ), Some(1));
+    assert_eq!(first_prefix_divergence(&two_differ, &base), Some(1));
+
+    // Index 0 — the system prompt, the first piece a provider matches.
+    let mut head_differs = base.clone();
+    head_differs[0].1 = "zz".to_string();
+    assert_eq!(first_prefix_divergence(&base, &head_differs), Some(0));
+
+    // A strict prefix diverges nowhere: everything the shorter run sent still agrees.
+    let short = base[..2].to_vec();
+    assert_eq!(first_prefix_divergence(&base, &short), None);
+    assert_eq!(first_prefix_divergence(&short, &base), None);
+    assert_eq!(first_prefix_divergence(&[], &base), None);
+
+    // A shorter side that disagrees inside the common prefix still reports that index.
+    let mut short_differs = short.clone();
+    short_differs[1].1 = "zz".to_string();
+    assert_eq!(first_prefix_divergence(&short_differs, &base), Some(1));
 }
 
 /// The retired boolean maps as documented — `true` stores bodies, `false` does not — and both
