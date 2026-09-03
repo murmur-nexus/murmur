@@ -93,22 +93,46 @@ fn an_allowlisted_interpreter_is_named_as_advisory() {
     );
 }
 
-/// `mur doctor` prints the same block, from the same renderer.
-#[test]
-fn doctor_states_the_declaration_in_the_same_words() {
-    let home = TempDir::new().unwrap();
-    let dir = TempDir::new().unwrap();
-    project(dir.path(), &format!("{DECLARED}      - python3\n"));
+/// The contiguous `read_only` block of a surface's stdout: the list itself and, when one is
+/// printed, the enforcement sentence under it.
+fn read_only_block(stdout: &str) -> String {
+    stdout
+        .lines()
+        .skip_while(|line| !line.trim_start().starts_with("read_only:"))
+        .take_while(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("read_only:")
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("read_only enforcement:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    let doctor = doctor_stdout(&home, dir.path());
-    assert!(doctor.contains("Read-only paths"), "{doctor}");
-    assert!(
-        doctor.contains(
-            "  read_only:\n    - tests\n    - bench/fixtures\n  read_only enforcement: advisory \
-             against python3"
-        ),
-        "{doctor}"
-    );
+/// `mur doctor` prints the same block, asserted as identity rather than against a second
+/// hand-written copy of the wording: a copy is what drifts, and a drifted copy is two surfaces
+/// telling an operator two different things about the same declaration.
+#[test]
+fn run_and_doctor_print_the_same_read_only_block() {
+    let home = TempDir::new().unwrap();
+
+    for interpreter in ["git", "python3"] {
+        let dir = TempDir::new().unwrap();
+        project(dir.path(), &format!("{DECLARED}      - {interpreter}\n"));
+
+        let from_run = read_only_block(&explain_scope(&home, dir.path(), &[]));
+        let from_doctor = read_only_block(&doctor_stdout(&home, dir.path()));
+        // Load-bearing: two failed extractions are both empty, and equal to each other.
+        assert!(
+            !from_run.is_empty(),
+            "no read_only block on `mur run --explain-scope` stdout for {interpreter}"
+        );
+        assert!(
+            !from_doctor.is_empty(),
+            "no read_only block on `mur doctor` stdout for {interpreter}"
+        );
+        assert_eq!(from_run, from_doctor, "surfaces disagree for {interpreter}");
+    }
 }
 
 /// Both keys are always arrays, including for a capsule that declares no `capabilities.filesystem`
