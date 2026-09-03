@@ -629,8 +629,8 @@ was spawned. The lineage is in the session it continues, one `resumed_from` hop 
 one — most obviously as the recorded `handle` argument of a `fetch-peer-file` `tool_call` — it is
 replaced with `<handle:<handle_id>>`.
 
-**`plan_start`** — written once by [`mur run`](cli.md#mur-run)'s plan scheduler, as soon as the
-plan file parses
+**`plan_start`**{ #plan-events } — written once by the plan scheduler, as soon as the plan file
+parses
 
 | Field | Type | Notes |
 |---|---|---|

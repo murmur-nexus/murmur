@@ -890,7 +890,7 @@ Output sections, in the order they are printed:
 | Tokens | always | Input tokens, output tokens, total, per-turn averages, and a `provider:` line summing the provider's own counts over the turns that reported them |
 | Wire | one or more turns carrying content hashes | Per turn: the abbreviated `system`, `tools` and `response` hashes and how many messages the request carried, then the `--body` command that prints one of them |
 | Tool calls | always | Count, ok/error breakdown, success rate, average latency, plus a per-turn breakdown of every call |
-| Redundant calls | always | Calls that re-read a resource nothing had changed since |
+| Redundant calls | always | Calls that re-read a resource nothing had changed since. Agent turns and plan steps are scored against one shared history, so either can be named as the call or as the earlier read it duplicates |
 | Skill calls | always | Count, ok/error breakdown, success rate, average latency |
 | Shell calls | always | Count, exit code distribution, average latency |
 | Compaction | always | Whether it fired, with turn number and before/after token counts, followed by one `declined:` row per turn that crossed the compaction threshold and was left uncompacted, naming its turn, the context occupancy and the reason |
@@ -898,6 +898,7 @@ Output sections, in the order they are printed:
 | Resource plane | one or more `resource_list`/`resource_read` records | Counts by outcome |
 | Peer files | one or more `peer_handle_mint`/`peer_handle_redeem`/`peer_file_fetch` records | Counts by outcome |
 | Delegations | one or more [`delegation_start`](observability-schemas.md#delegation-lineage)/`delegation` records | One row per delegation: its `dlg_` id, `capsule@version`, the child session, and the outcome — `in flight` for a delegation this trace never saw end. The reason follows on any outcome that is not `completed`, and the path to the child's own trace follows on any delegation that launched one |
+| Plan | one or more [`plan_start`](observability-schemas.md#plan-events)/`plan_step`/`plan_end` records | Per plan run: its id, outcome, duration and step totals by status, the step that ended it, and one row per step in the order the plan declared them — kind, status, duration, attempt count when it retried more than once, what it waited on, and its error. A step the run never reached reads `not run` |
 | A2A | one or more `a2a_task_received`/`a2a_send` records | Tasks received, messages sent, and the peer URLs they went to |
 | Tasks | more than one task in the session | Per-task breakdown |
 
@@ -1047,6 +1048,20 @@ as a `call_denied` row under its turn instead:
 ```text
   turn 0  tool_call  bash
     call_denied on-shell  /usr/bin/bash  denied by branch-policy
+```
+
+A [plan run](observability-schemas.md#plan-events) renders as its own subtree: a `plan_start` row
+naming the plan and its step count, then a `plan_step_start` row as each step is handed to a
+worker and a `plan_step` row when it settles, then `plan_end` with the outcome. A step that was
+never dispatched has only the `plan_step` row.
+
+```text
+plan_start release  3 steps
+  plan_step_start build  tool
+  plan_step  build  tool  success  300ms
+  plan_step_start ship  capsule  after build
+  plan_step  ship  capsule  failed  900ms
+  plan_end   failed  failed at ship
 ```
 
 A trace whose lines carry no `event_id` renders one row per turn: turn number, decision, tool

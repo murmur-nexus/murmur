@@ -105,8 +105,8 @@ pub struct SchedulerContext<'a> {
     pub spawn_credential: Option<SpawnCredential>,
     /// Where this run's per-step lifecycle records go, or `None` to record nothing.
     ///
-    /// Emission is opt-in at the call site: with `None` no file is opened, no line is written,
-    /// and the run behaves byte-for-byte as it did before a plan could be traced at all.
+    /// Emission is opt-in at the call site: with `None` no file is opened and no line is
+    /// written, and the run's `ExecutionReport` is identical either way.
     pub trace: Option<&'a PlanTraceAppender>,
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
 }
@@ -813,7 +813,9 @@ fn execute_step_once(
                 result,
                 attempts: 1,
                 duration_ms: elapsed_ms(started),
-                input: Some(input),
+                // A step declaring no `input` interpolates to JSON null, which would write
+                // `"input": null` rather than omitting the key. Absent means absent.
+                input: (!input.is_null()).then_some(input),
                 state_effect,
                 resource_id,
             }

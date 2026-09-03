@@ -2445,7 +2445,7 @@ struct PlanEndEvent {
     reason: Option<String>,
 }
 
-/// Everything the scheduler loop knows about a settled step, as one argument rather than ten.
+/// Everything the scheduler loop knows about a settled step, as one argument.
 pub(crate) struct PlanStepRecord {
     pub(crate) plan_id: String,
     pub(crate) step_id: String,
@@ -2462,7 +2462,7 @@ pub(crate) struct PlanStepRecord {
     pub(crate) resource_id: Option<String>,
 }
 
-/// Everything the scheduler knows about a finished run, as one argument rather than nine.
+/// Everything the scheduler knows about a finished run, as one argument.
 pub(crate) struct PlanEndRecord {
     pub(crate) plan_id: String,
     pub(crate) outcome: &'static str,

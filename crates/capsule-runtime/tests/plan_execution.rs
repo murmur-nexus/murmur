@@ -1503,6 +1503,8 @@ fn test_trace_records_a_two_step_plan_run() {
         assert!(step.get("error").is_none(), "{step}");
     }
     assert_eq!(steps[0]["input"], json!({"x":1}));
+    // `b` declares no input, so the key is absent rather than written as null.
+    assert!(steps[1].get("input").is_none(), "{}", steps[1]);
 
     // The first step settles before the second is dispatched: the dependency edge is legible
     // from the file order alone.
