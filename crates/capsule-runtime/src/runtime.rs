@@ -926,6 +926,10 @@ pub fn stage_session(
     // model is offered the names the operator granted and cannot name anything else.
     write_delegate_task_tool_manifest(&workdir, &request.capability_policy.spawn_allow)?;
 
+    // And the plan tool, on the same terms once more. Its schema is fixed rather than built: a
+    // plan reaches this session's own tools, so there is no granted list to fold into it.
+    write_submit_plan_tool_manifest(&workdir, request.capability_policy.plan_submit)?;
+
     // Read once, here, from the manifests just staged: the schema is fixed before the session
     // starts, so an annotation is the tool author's statement and never a call-time choice. A
     // capsule that declared nothing read-only reads no schema at all — the analyser it would feed
@@ -1458,6 +1462,16 @@ pub fn launch_session(
             .await
             .ok()
             .map(std::sync::Arc::new);
+            // The same file again, for the same reason and on the same terms: a plan's steps run
+            // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
+            // that cannot be opened leaves a plan unrecorded and still runs it.
+            let plan_trace = crate::trace::PlanTraceAppender::open(
+                &workdir,
+                session_id.clone(),
+                trace.session_event_id().to_string(),
+            )
+            .ok()
+            .map(std::sync::Arc::new);
             let resource_plane = std::sync::Arc::new(crate::resource_plane::ResourcePlane::new(
                 &resource_accessible_workdir,
                 exports_files.as_ref(),
@@ -1545,6 +1559,8 @@ pub fn launch_session(
                         peer_own_audience: own_peer_audience,
                         peer_trace: resource_trace,
                         delegation: delegation_plane,
+                        plan_trace,
+                        plan_counter: AtomicU64::new(0),
                         inference_env: all_env,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
@@ -2318,6 +2334,10 @@ pub fn launch_session(
         peer_plane: None,
         peer_own_audience: String::new(),
         peer_trace: None,
+        // Nor a plan surface: `submit-plan` is an agent-loop tool too, so a script capsule that
+        // declares `capabilities.plan.submit` has nothing to call and nothing to record.
+        plan_trace: None,
+        plan_counter: AtomicU64::new(0),
         // Nor a delegation surface: `delegate-task` is an agent-loop tool and no WIT import
         // exposes delegation to a wasm component. A script capsule that declares
         // `capabilities.spawn.allow` still registers, and its credential is still what a
@@ -3495,6 +3515,14 @@ pub(crate) struct CapsuleStoreState {
     /// dispatch branch still refuses on `None` rather than assuming the tool could not have been
     /// called.
     pub(crate) delegation: Option<Arc<crate::delegation_plane::DelegationPlane>>,
+    /// Where a submitted plan's per-step lifecycle records go, or `None` for a session that keeps
+    /// no trace. A second handle to the same `trace.jsonl` the agent loop's writer holds, for the
+    /// same reason [`Self::peer_trace`] is one: a plan runs on blocking threads that the loop's
+    /// writer cannot be lent to.
+    pub(crate) plan_trace: Option<Arc<crate::trace::PlanTraceAppender>>,
+    /// How many plans this session has submitted. The plan file is named from this and never from
+    /// anything the model wrote, so a plan `id` reaches no path.
+    pub(crate) plan_counter: AtomicU64,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) engine: Engine,
     pub(crate) workdir: PathBuf,
@@ -4262,7 +4290,11 @@ impl CapsuleStoreState {
                 input: json,
             }
         };
-        if name == SHARE_FILE_TOOL || name == FETCH_PEER_FILE_TOOL || name == DELEGATE_TASK_TOOL {
+        if name == SHARE_FILE_TOOL
+            || name == FETCH_PEER_FILE_TOOL
+            || name == DELEGATE_TASK_TOOL
+            || name == SUBMIT_PLAN_TOOL
+        {
             return as_tool();
         }
         let native_bin = self.workdir.join("tools").join(name).join(name);
@@ -4368,6 +4400,12 @@ impl CapsuleStoreState {
         if name == DELEGATE_TASK_TOOL {
             return self
                 .dispatch_delegate_task(input)
+                .await
+                .map(DispatchOutcome::tool);
+        }
+        if name == SUBMIT_PLAN_TOOL {
+            return self
+                .dispatch_submit_plan(input)
                 .await
                 .map(DispatchOutcome::tool);
         }
@@ -4790,6 +4828,200 @@ impl CapsuleStoreState {
         })
     }
 
+    /// `submit-plan`: run one plan of steps to completion and return every step's result.
+    ///
+    /// The scheduler is `crate::plan`, and every `tool` step it runs comes back through
+    /// [`Self::dispatch_agent_tool_unfenced`] — this session's own dispatch, with this session's
+    /// own allowlist, shell grant and protected paths. A plan therefore reaches exactly the tools
+    /// the model could already call one at a time, and nothing else. `submit-plan` itself is
+    /// refused as a step by `plan::validate_plan`, so a plan cannot submit a plan.
+    ///
+    /// The scheduler is blocking and thread-scoped, so it runs on `spawn_blocking` while this
+    /// side services its tool calls over a channel — the shape [`Self::dispatch_delegate_task`]
+    /// uses for its launch notices, for the same reason: the blocking side has no runtime handle
+    /// and the `!Send` WASI state it needs lives on this `LocalSet`.
+    async fn dispatch_submit_plan(
+        &self,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        if !self.capability_policy.plan_submit {
+            return Err(format!(
+                "'{SUBMIT_PLAN_TOOL}' needs a capabilities.plan.submit: true declaration in \
+                 murmur.yaml; this capsule declares none"
+            ));
+        }
+
+        let args = parse_tool_json_input(SUBMIT_PLAN_TOOL, &input)?;
+        let Some(serde_json::Value::Object(plan)) = args.get("plan") else {
+            return Err(format!(
+                "'{SUBMIT_PLAN_TOOL}' requires a 'plan' argument holding a JSON object with an \
+                 'id' and a 'steps' array"
+            ));
+        };
+        let plan_id = plan
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let plan_path = self.write_plan_file(plan)?;
+
+        // Every directory under `tools/` is a tool this session can dispatch, which is what
+        // `validate_plan` checks a `tool` step against. `submit-plan` is left out so a plan
+        // naming it is refused for what it is rather than for the tool being absent.
+        let installed_tools: HashSet<String> = fs::read_dir(self.workdir.join("tools"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name != SUBMIT_PLAN_TOOL)
+            .collect();
+
+        // The blocking side asks for a tool call and waits; this side answers it. Unbounded
+        // because a plan's fan-out is its own bound: every request in flight is one scheduler
+        // thread already parked on its reply.
+        let (request_tx, mut request_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PlanToolRequest>();
+
+        let capability_policy = self.capability_policy.clone();
+        let scheduler_workdir = self.accessible_workdir.clone();
+        let session_id = self.session_id.clone();
+        // Cloned off the plane rather than held a second time on this state: one registration's
+        // authority stays in one place.
+        let spawn_credential = self.delegation.as_ref().map(|plane| plane.credential());
+        let plan_trace = self.plan_trace.clone();
+        let registry = Arc::clone(&self.registry);
+        let mut scheduling = tokio::task::spawn_blocking(move || {
+            let invoke_tool = move |name: &str, input: murmur::tool::run::ToolInput| {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                request_tx
+                    .send((name.to_string(), input, reply_tx))
+                    .map_err(|_| "the session stopped answering plan tool calls".to_string())?;
+                reply_rx
+                    .blocking_recv()
+                    .map_err(|_| "the session stopped answering plan tool calls".to_string())?
+            };
+            let ctx = crate::plan::SchedulerContext {
+                workdir: scheduler_workdir,
+                capability_policy,
+                installed_tools,
+                // A `capsule` step's version is the daemon's question, not this session's: the
+                // scheduler falls back to `0.1.0` for a name it holds no version for, and a
+                // session holds none for any of them.
+                capsule_versions: HashMap::new(),
+                current_session_id: Some(session_id),
+                registry,
+                spawn_credential,
+                trace: plan_trace.as_deref(),
+                invoke_tool: &invoke_tool,
+            };
+            crate::plan::execute(&plan_path, &ctx)
+        });
+
+        let mut requests_open = true;
+        let joined = loop {
+            tokio::select! {
+                request = request_rx.recv(), if requests_open => match request {
+                    Some((name, input, reply)) => {
+                        // Unfenced deliberately: this result becomes one field of the plan report,
+                        // and `dispatch_agent_tool_async` fences that report once on its way to
+                        // the model. Fencing here would wrap every step's output a second time.
+                        //
+                        // Boxed because this reaches back into the dispatcher that called this
+                        // function: the two futures are mutually recursive and one of them has to
+                        // be behind a pointer for either to have a size. `validate_plan` refuses a
+                        // `submit-plan` step, so the recursion is one level deep in practice.
+                        let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input))
+                            .await
+                            .map(|outcome| outcome.result);
+                        let _ = reply.send(outcome);
+                    }
+                    // The sender lives in the blocking closure, so this is that closure ending.
+                    None => requests_open = false,
+                },
+                joined = &mut scheduling => break joined,
+            }
+        };
+        // A request that arrived between the two arms being polled still has a scheduler thread
+        // parked on its reply, and the join above only means the outer closure returned.
+        while let Ok((name, input, reply)) = request_rx.try_recv() {
+            let outcome = Box::pin(self.dispatch_agent_tool_unfenced(&name, input))
+                .await
+                .map(|outcome| outcome.result);
+            let _ = reply.send(outcome);
+        }
+        let report = joined.map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' panicked: {error}"))?;
+
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        let steps: Vec<serde_json::Value> = report
+            .results
+            .iter()
+            .map(|result| {
+                match result.status {
+                    crate::plan::StepStatus::Success => succeeded += 1,
+                    crate::plan::StepStatus::Failed => failed += 1,
+                    crate::plan::StepStatus::Skipped => skipped += 1,
+                }
+                serde_json::json!({
+                    "step_id": result.step_id,
+                    "status": result.status.as_str(),
+                    "output": result.output,
+                    "error": result.error,
+                })
+            })
+            .collect();
+        let data = serde_json::json!({
+            "plan_id": plan_id,
+            "completed": report.completed,
+            "failed_step": report.failed_step,
+            "steps": steps,
+        });
+        let summary = format!(
+            "Plan '{plan_id}': {} steps, {succeeded} succeeded, {failed} failed, {skipped} skipped",
+            report.results.len()
+        );
+
+        Ok(murmur::tool::run::ToolResult {
+            // The status carries the plan's outcome so the model is told the plan did not
+            // complete, rather than having to read the report to notice.
+            status: if report.completed {
+                murmur::tool::run::Status::Passed
+            } else {
+                murmur::tool::run::Status::Failed
+            },
+            summary: Some(summary),
+            data: Some(data.to_string()),
+            data_path: None,
+            truncated: false,
+            metadata: Vec::new(),
+        })
+    }
+
+    /// Write one submitted plan into `<workdir>/plans/plan-<n>.json` and return its path.
+    ///
+    /// `n` is this session's own counter and the plan's `id` reaches no part of the name: the id
+    /// is model-supplied, and a file named from it could collide or traverse.
+    fn write_plan_file(
+        &self,
+        plan: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<PathBuf, String> {
+        let plans_dir = self.workdir.join("plans");
+        fs::create_dir_all(&plans_dir)
+            .map_err(|error| format!("'{SUBMIT_PLAN_TOOL}' could not create plans/: {error}"))?;
+        let ordinal = self.plan_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let plan_path = plans_dir.join(format!("plan-{ordinal}.json"));
+        let body = serde_json::Value::Object(plan.clone()).to_string();
+        fs::write(&plan_path, body).map_err(|error| {
+            format!(
+                "'{SUBMIT_PLAN_TOOL}' could not write {}: {error}",
+                plan_path.display()
+            )
+        })?;
+        Ok(plan_path)
+    }
+
     /// The audience a handle for `peer` must be minted for, read off that peer's own agent card.
     async fn peer_audience_for(&self, peer: &str) -> Result<String, String> {
         check_destination_allowed(
@@ -5160,8 +5392,12 @@ impl WasiHttpView for ToolStoreState {
 /// Shell binary names are deliberately absent: they are operator-chosen through
 /// `capabilities.shell.allow`, so there is no fixed set to reserve, and
 /// `write_shell_tool_manifests` already yields to an artifact manifest that is already on disk.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 3] =
-    [SHARE_FILE_TOOL, FETCH_PEER_FILE_TOOL, DELEGATE_TASK_TOOL];
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 4] = [
+    SHARE_FILE_TOOL,
+    FETCH_PEER_FILE_TOOL,
+    DELEGATE_TASK_TOOL,
+    SUBMIT_PLAN_TOOL,
+];
 
 /// Whether `name` is answered by the runtime itself rather than by an artifact.
 ///
@@ -5214,9 +5450,9 @@ fn write_tool_manifest(
 
 /// Write one runtime-provided tool's synthetic `murmur.yaml`, carrying the inverse guard.
 ///
-/// A name absent from [`RESERVED_TOOL_NAMES`] is refused, so a fifth runtime-provided tool routed
-/// through here without being added to the list fails loudly instead of shipping shadowable by an
-/// artifact of the same name.
+/// A name absent from [`RESERVED_TOOL_NAMES`] is refused, so a further runtime-provided tool
+/// routed through here without being added to the list fails loudly instead of shipping shadowable
+/// by an artifact of the same name.
 fn write_runtime_provided_tool_manifest(
     workdir: &Path,
     name: &str,
@@ -5525,6 +5761,51 @@ fn delegate_task_tool_manifest(spawn_allow: &[String]) -> String {
          input_schema: '{schema}'\n",
     )
 }
+
+/// Writes the plan tool's synthetic manifest, only for a capsule that declares
+/// `capabilities.plan.submit: true`.
+///
+/// A capsule that declares nothing gets no file, so `submit-plan` is absent from its tool
+/// inventory and from `session_start`'s `tools_declared` — the grant governs the tool's existence
+/// rather than its success, exactly as [`write_delegate_task_tool_manifest`] does.
+fn write_submit_plan_tool_manifest(workdir: &Path, plan_submit: bool) -> Result<(), RuntimeError> {
+    if !plan_submit {
+        return Ok(());
+    }
+    write_runtime_provided_tool_manifest(workdir, SUBMIT_PLAN_TOOL, SUBMIT_PLAN_TOOL_MANIFEST)
+}
+
+/// One `tool` step of a running plan asking the session to dispatch it: the tool's name, the
+/// step's input, and where the answer goes. The scheduler thread that sent it is parked on the
+/// `oneshot` until this session replies.
+type PlanToolRequest = (
+    String,
+    murmur::tool::run::ToolInput,
+    tokio::sync::oneshot::Sender<Result<murmur::tool::run::ToolResult, String>>,
+);
+
+/// Tool a capsule gains from `capabilities.plan.submit`.
+pub(crate) const SUBMIT_PLAN_TOOL: &str = "submit-plan";
+
+/// `submit-plan`'s manifest. Its schema names one argument and says nothing about a step, because
+/// the plan format is documented rather than schema-checked here; the description carries the
+/// three things the schema cannot — that the call blocks until the whole plan has settled, that
+/// independent steps run at the same time, and how a later step reads an earlier one's output.
+const SUBMIT_PLAN_TOOL_MANIFEST: &str = concat!(
+    "name: submit-plan\n",
+    "version: 0.0.0\n",
+    "runtime: tool\n",
+    "implementation: native\n",
+    "description: \"Hand one plan to the runtime and get back every step's result. `plan` is an ",
+    "object with an `id` and a `steps` array; each step has an `id` and exactly one of `tool`, ",
+    "`shell` or `capsule`, plus optional `input`, `depends_on`, `if`, `on_error` and `retries`. ",
+    "The call does not return until every step has finished. Steps that do not depend on each ",
+    "other run at the same time. A step's output is reachable from a later step as ",
+    "$<step id>.output and its status as $<step id>.status, anywhere in that step's input.\"\n",
+    "input_schema: '",
+    r#"{"type":"object","properties":{"plan":{"type":"object"}},"required":["plan"]}"#,
+    "'\n",
+);
 
 fn write_shell_tool_manifests(workdir: &Path, shell_allow: &[String]) -> Result<(), RuntimeError> {
     for binary in shell_allow {
@@ -6276,16 +6557,58 @@ mod tests {
             .exists());
     }
 
+    // ── submit-plan's synthetic manifest ─────────────────────────────────────
+
+    /// The plan tool's contract, pinned: one object argument, and a description carrying the
+    /// three things the schema cannot say.
+    #[test]
+    fn the_plan_manifest_declares_one_object_argument() {
+        let parsed: serde_yaml::Value =
+            serde_yaml::from_str(super::SUBMIT_PLAN_TOOL_MANIFEST).expect("the manifest is YAML");
+        assert_eq!(parsed["name"].as_str(), Some("submit-plan"));
+        assert_eq!(parsed["version"].as_str(), Some("0.0.0"));
+        assert_eq!(parsed["runtime"].as_str(), Some("tool"));
+        assert_eq!(parsed["implementation"].as_str(), Some("native"));
+
+        let schema: serde_json::Value =
+            serde_json::from_str(parsed["input_schema"].as_str().expect("a schema string"))
+                .expect("the schema is JSON");
+        assert_eq!(schema["required"], serde_json::json!(["plan"]));
+        assert_eq!(schema["properties"]["plan"]["type"], "object");
+
+        let description = parsed["description"].as_str().expect("a description");
+        assert!(description.contains("does not return until every step has finished"));
+        assert!(description.contains("at the same time"));
+        assert!(description.contains("$<step id>.output"));
+    }
+
+    /// A capsule that declares no `capabilities.plan.submit` gets no file, so the tool is absent
+    /// from its inventory rather than present and failing.
+    #[test]
+    fn an_ungranted_capsule_is_written_no_plan_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        super::write_submit_plan_tool_manifest(dir.path(), false).unwrap();
+        assert!(!dir.path().join("tools").join("submit-plan").exists());
+
+        super::write_submit_plan_tool_manifest(dir.path(), true).unwrap();
+        assert!(dir
+            .path()
+            .join("tools")
+            .join("submit-plan")
+            .join(PACKED_MANIFEST_ENTRY)
+            .exists());
+    }
+
     // ── reserved tool names ──────────────────────────────────────────────────
 
-    /// The list is what every runtime-provided writer is routed through, so a fifth synthetic
+    /// The list is what every runtime-provided writer is routed through, so a further synthetic
     /// tool added without extending it has to fail here rather than ship shadowed by an artifact
     /// of the same name. The arity assertion is the part that catches that.
     #[test]
     fn the_reserved_set_covers_every_runtime_provided_tool() {
         assert_eq!(
             super::RESERVED_TOOL_NAMES.len(),
-            3,
+            4,
             "a new runtime-provided tool must be added to RESERVED_TOOL_NAMES, and this arity \
              raised, before its writer can succeed"
         );
@@ -6293,6 +6616,7 @@ mod tests {
             super::SHARE_FILE_TOOL,
             super::FETCH_PEER_FILE_TOOL,
             super::DELEGATE_TASK_TOOL,
+            super::SUBMIT_PLAN_TOOL,
         ] {
             assert!(
                 super::is_reserved_tool_name(name),
@@ -7516,6 +7840,8 @@ inference:
             peer_plane: None,
             peer_own_audience: String::new(),
             peer_trace: None,
+            plan_trace: None,
+            plan_counter: AtomicU64::new(0),
             delegation: None,
             inference_env: Vec::new(),
             engine,
@@ -8545,6 +8871,7 @@ inference:
             state: None,
             task_io: None,
             conversation: None,
+            plan: None,
             containment: None,
         };
         ToolCapabilityGrant::derive(Some(&caps), &narrowing_ceiling(), "test-capsule")
@@ -8842,6 +9169,7 @@ inference:
                 state: None,
                 task_io: None,
                 conversation: None,
+                plan: None,
                 containment: None,
             }),
         };
@@ -9004,6 +9332,7 @@ inference:
                 state: None,
                 task_io: None,
                 conversation: None,
+                plan: None,
                 containment: None,
             }),
         };
@@ -9047,6 +9376,7 @@ inference:
             state: Some(murmur_artifact::StateCapabilities { store: None }),
             task_io: None,
             conversation: None,
+            plan: None,
             containment: Some(murmur_artifact::ContainmentClass::Sealed),
         };
 

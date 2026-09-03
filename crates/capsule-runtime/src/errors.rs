@@ -231,7 +231,7 @@ pub enum RuntimeError {
     /// A capsule declares an artifact whose name collides with a tool the runtime provides
     /// itself.
     ///
-    /// The three names in [`crate::runtime::RESERVED_TOOL_NAMES`] are answered inside
+    /// The four names in [`crate::runtime::RESERVED_TOOL_NAMES`] are answered inside
     /// `dispatch_agent_tool_unfenced` before any allowlist check is reached, and their synthetic
     /// manifests are written after the staging loop. An artifact installed under one of them would
     /// have its manifest overwritten and every call to it answered by the runtime, so the collision
@@ -249,7 +249,7 @@ pub enum RuntimeError {
     /// A synthetic tool manifest was written under a name absent from
     /// [`crate::runtime::RESERVED_TOOL_NAMES`].
     ///
-    /// The inverse of [`Self::ReservedToolName`], and the reason a fifth runtime-provided tool
+    /// The inverse of [`Self::ReservedToolName`], and the reason a further runtime-provided tool
     /// cannot be added without reserving its name: an unreserved name is claimable by an artifact,
     /// which would then be installed and silently shadowed at dispatch.
     #[error(

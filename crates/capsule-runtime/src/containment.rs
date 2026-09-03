@@ -415,6 +415,14 @@ pub struct ScopeReport {
     pub spawn_allow: Vec<String>,
     /// `capabilities.env.allow`, verbatim.
     pub env_allow: Vec<String>,
+    /// `capabilities.plan.submit` — whether the model is offered the `submit-plan` tool. Always
+    /// serialized (never skipped when `false`), on the same terms as [`Self::workdir_exec`]: an
+    /// absent key identifies a runtime that predates the grant, not a capsule that declined it.
+    ///
+    /// It opens no host resource of its own. It is reported beside the grants because it changes
+    /// *how much* of every other grant one model turn can reach: a plan runs many steps against
+    /// this capsule's own tools, shell allowlist and spawn grant without a turn in between.
+    pub plan_submit: bool,
     /// Every host directory a `capabilities.shell.interpreter_runtime` grant opens, rendered as
     /// `<binary>: <dir>[ (list_dir)]`. These are the paths outside the workdir that stay
     /// reachable even at `scoped`.
@@ -526,6 +534,7 @@ impl ScopeReport {
         push_list(&mut out, "shell allow", &self.shell_allow);
         push_list(&mut out, "spawn allow", &self.spawn_allow);
         push_list(&mut out, "env allow", &self.env_allow);
+        out.push_str(&format!("  plan submit:      {}\n", self.plan_submit));
         push_list(
             &mut out,
             "interpreter runtime",
@@ -737,6 +746,7 @@ pub(crate) fn scope_report_for_tier(
         shell_allow: policy.shell_allow.clone(),
         spawn_allow: policy.spawn_allow.clone(),
         env_allow: policy.env_allow.clone(),
+        plan_submit: policy.plan_submit,
         interpreter_runtime_grants: policy
             .shell_interpreter_runtime
             .iter()
@@ -2134,6 +2144,7 @@ mod tests {
             ("shell_interpreter_runtime", "interpreter_runtime_grants"),
             ("shell_staged_runtime", "staged_runtime_grants"),
             ("env_allow", "env_allow"),
+            ("plan_submit", "plan_submit"),
             ("containment_floor", "declared_containment"),
         ];
 

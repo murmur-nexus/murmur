@@ -269,6 +269,7 @@ mod tests {
             }),
             task_io: None,
             conversation: None,
+            plan: None,
             containment: None,
         }
     }

@@ -640,6 +640,18 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
         match infer_kind(step) {
             Ok(StepKind::Tool) => {
                 let tool = step.tool.as_ref().unwrap();
+                // Refused here rather than bounded by a depth counter: a plan that could submit a
+                // plan would nest one scheduler inside another's worker thread, and the outer
+                // report would carry the inner one as a step's output text.
+                if tool == crate::runtime::SUBMIT_PLAN_TOOL {
+                    return Err((
+                        step.id.clone(),
+                        format!(
+                            "a plan step cannot submit another plan: '{tool}' is not callable \
+                             from inside a plan"
+                        ),
+                    ));
+                }
                 if !ctx.installed_tools.contains(tool) {
                     return Err((step.id.clone(), format!("tool '{tool}' is not installed")));
                 }

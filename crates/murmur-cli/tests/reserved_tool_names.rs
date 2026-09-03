@@ -1,4 +1,4 @@
-//! The three tool names the runtime answers itself are not available to artifacts, and a capsule
+//! The four tool names the runtime answers itself are not available to artifacts, and a capsule
 //! that declares one is refused before anything is resolved, pulled or created.
 //!
 //! Every case here runs the real `mur` binary against an empty artifact store. That the store is
@@ -16,7 +16,12 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 const CAPSULE_NAME: &str = "reserved-name-capsule";
-const RESERVED: [&str; 3] = ["share-file", "fetch-peer-file", "delegate-task"];
+const RESERVED: [&str; 4] = [
+    "share-file",
+    "fetch-peer-file",
+    "delegate-task",
+    "submit-plan",
+];
 
 /// An agent capsule declaring one tool artifact under `artifact_name`, plus whatever extra
 /// top-level YAML the case needs. Nothing it names is published anywhere.
@@ -102,6 +107,7 @@ fn the_refusal_does_not_depend_on_the_grant_that_provides_the_tool() {
             "delegate-task",
             "capabilities:\n  spawn:\n    allow:\n      - worker\n",
         ),
+        ("submit-plan", "capabilities:\n  plan:\n    submit: true\n"),
     ];
 
     for (name, blocks) in grants {

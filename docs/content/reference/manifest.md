@@ -553,6 +553,7 @@ no longer in the system prompt, so there is nothing to double-inject.
 | `capabilities.containment` | `advisory \| scoped \| sealed` | no | Minimum containment class this capsule requires, in ascending strength. Omitted, the capsule states no requirement — see [Containment class](containment.md#field-containment). Capsule-wide only; declaring it on a per-artifact entry has no effect and warns at staging — [What bounds a WASM artifact](containment.md#artifact-boundary) names the grant that scopes one artifact. |
 | `capabilities.conversation.read` | bool | no | Grant of the `murmur:conversation/read` import, applied **per hook only**. Declaring it in this capsule-wide block reaches nothing — no artifact can read the conversation record — and prints [`W-SEC-016`](diagnostics.md#w-sec-016) at staging. Put it on the hook entry that needs it: [Hook capabilities](#hook-capabilities). |
 | `capabilities.state.store` | string | no | Durable store name, applied **per artifact only**. Declaring it in this capsule-wide block reaches nothing — no store is created and no `state` preopen exists — and prints [`W-SEC-014`](diagnostics.md#w-sec-014) at staging. Put it on the tool, driver or hook entry that needs it: [Tool and driver capabilities](#tool-capabilities), [Hook capabilities](#hook-capabilities). See [Durable state](workdir.md#state-store). |
+| `capabilities.plan.submit` | bool | see notes | Default: absent, which is deny. `true` puts the [runtime-provided tool](runtime-provided-tools.md) `submit-plan` in the capsule's inventory, and the runtime's guidance on when to plan in its system prompt; a capsule that declares nothing is offered neither. Required when the `plan:` block is present — a block that omits it is refused at parse. It grants no reach of its own: every step of a plan runs through this capsule's own tools, `capabilities.shell.allow` and `capabilities.spawn.allow`. See [Plans](plans.md). `mur run --explain-scope` reports it as `plan submit`. |
 | `capabilities.spawn.allow` | list<string> | no | Capsule names this capsule may spawn as sub-capsules. `mur-roost` matches each spawn request's capsule name against this list and refuses a name that is absent from it — see [Per-session allow lists](roost-api.md#per-session-allow-lists) for the worked example. `capabilities.shell.allow` governs the executables the capsule runs itself. A non-empty list means the capsule has a subprocess tree, so it is bound by `capabilities.resources` and needs a network namespace on Linux ([`E-CAP-005`](diagnostics.md#e-cap-005)). It also means the session registers with `mur-roost` at launch, so the daemon holds the ceiling it referees against: with no daemon reachable at `MURMUR_ROOST_URL` the launch is refused with [`E-RUN-019`](diagnostics.md#e-run-019). A non-empty list is also what puts the [runtime-provided tool](runtime-provided-tools.md) `delegate-task` in the capsule's inventory, with these names as the tool's `capsule` argument — see [The delegation tool](roost-api.md#the-delegation-tool). A capsule that declares none is offered no such tool. How deep a chain of delegations may go and how many children one session may hold at once are the daemon's, not this field's — see [Delegation bounds](roost-api.md#delegation-bounds). `mur run --explain-scope` reports it as `spawn allow`, and `trace.jsonl`'s `session_start` carries it as `effective_grants.spawn_allow`. |
 
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
@@ -567,6 +568,30 @@ way to expose a host variable, and even a name declared there is dropped if it i
 (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)
 for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
 is omitted rather than reported.
+
+#### `capabilities.plan` { #field-plan }
+
+Grants the capsule's agent one [runtime-provided tool](runtime-provided-tools.md), `submit-plan`,
+which runs a plan of steps and returns every step's result in one reply. The plan JSON format is
+[Plans](plans.md).
+
+```yaml
+capabilities:
+  plan:
+    submit: true
+```
+
+`submit` is never inferred: a `plan:` block that omits it is a parse error naming
+`capabilities.plan.submit`, and `submit: false` is the same grant as an absent block.
+
+The grant is capsule-wide. Declaring it on a per-artifact entry reaches nothing — a plan is
+submitted by the agent, not by an artifact.
+
+A plan opens no path this capsule does not already have. Each step is dispatched by the session
+that submitted it: a `tool` step reaches the tools in the capsule's own inventory, a `shell` step
+the binaries in `capabilities.shell.allow`, and a `capsule` step the names in
+`capabilities.spawn.allow`. What the grant changes is how much of that one model turn can reach
+without another turn in between.
 
 #### `capabilities.peer_fetch` { #field-peer-fetch }
 

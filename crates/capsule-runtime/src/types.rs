@@ -226,6 +226,15 @@ pub struct CapabilityPolicy {
     /// `murmur:conversation/read` grant is per artifact, so a capsule-wide declaration reaches
     /// nothing and `stage_session` says so once (`W-SEC-016`).
     pub conversation_declared: bool,
+    /// From `capabilities.plan.submit`: whether this capsule's model is offered the
+    /// runtime-provided `submit-plan` tool. `false` by default, which is deny — and which is also
+    /// why no `submit-plan` tool manifest is written and the capsule's model never sees the tool
+    /// exists.
+    ///
+    /// It grants no reach of its own: every step of a submitted plan runs through this same
+    /// session's tool dispatch, its shell allowlist and its spawn grant, so a plan reaches exactly
+    /// what the model could already call one call at a time.
+    pub plan_submit: bool,
     /// `capabilities.limits.deadline_seconds` exactly as the manifest declared it — `None`
     /// when it declared nothing. Retained undefaulted alongside the fully-resolved `limits`
     /// above purely so hook calls can apply their own, lower default without mistaking an
@@ -536,6 +545,11 @@ pub fn capability_policy_from_runtime_manifest(
         .and_then(|c| c.network.as_ref())
         .is_some_and(|network| network.unix_sockets);
 
+    // Absent `capabilities.plan` block, or `submit: false` within it, both mean denied.
+    let plan_submit = caps
+        .and_then(|c| c.plan.as_ref())
+        .is_some_and(|plan| plan.submit);
+
     // Recorded, never applied: see `CapabilityPolicy::state_declared`.
     let state_declared = caps.is_some_and(|c| c.state.is_some());
     let conversation_declared = caps.is_some_and(|c| c.conversation.is_some());
@@ -611,6 +625,7 @@ pub fn capability_policy_from_runtime_manifest(
         containment_floor: caps.and_then(|c| c.containment).unwrap_or_default(),
         state_declared,
         conversation_declared,
+        plan_submit,
         declared_deadline_seconds,
     }
 }

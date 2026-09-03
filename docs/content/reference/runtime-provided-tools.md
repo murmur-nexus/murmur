@@ -8,7 +8,7 @@ The model sees no difference. A runtime-provided tool has the same manifest shap
 same inventory, and is called the same way as a tool artifact. What differs is where it comes from
 and what decides whether it may run.
 
-## The four
+## The five
 
 Each one appears only when the manifest declaration in the second column is present.
 
@@ -18,6 +18,7 @@ Each one appears only when the manifest declaration in the second column is pres
 | `share-file` | [`exports.peer_files`](manifest.md#field-exports-peer-files) | Mints a [peer-file handle](resource-plane.md#peer-plane) for one file under the declared export root |
 | `fetch-peer-file` | [`capabilities.peer_fetch`](manifest.md#field-peer-fetch) | Redeems a handle a peer sent and stores the file in this capsule's workdir |
 | `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; the outcome arrives afterwards as a background task — see [The delegation tool](roost-api.md#the-delegation-tool) |
+| `submit-plan` | [`capabilities.plan.submit`](manifest.md#field-capabilities) | Runs one plan of steps against this session's own tools and returns every step's result — see [Plans](plans.md) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is
@@ -25,8 +26,9 @@ hash-verified, and no entry appears for them in `murmur.lock` or in `mur list`.
 
 ## The grant is the tool's existence
 
-`share-file`, `fetch-peer-file` and `delegate-task` are answered before the tool allowlist is
-consulted. The allowlist governs which tool *artifacts* may run; it has no say over these three.
+`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` are answered before the tool
+allowlist is consulted. The allowlist governs which tool *artifacts* may run; it has no say over
+these four.
 
 **The gate is whether the manifest file was written at all.** With the grant absent, staging writes
 nothing under `workdir/tools/<name>/`, so:
@@ -36,15 +38,19 @@ nothing under `workdir/tools/<name>/`, so:
 - A call naming it anyway is refused with a message naming the declaration that is missing.
 
 So `capabilities.spawn.allow` decides whether `delegate-task` exists, rather than whether a call to
-it succeeds. The same holds for the two peer-handoff tools and their grants.
+it succeeds. The same holds for the two peer-handoff tools, for `submit-plan`, and for their
+grants.
+
+`capabilities.plan.submit` also decides whether the model is told *when* to plan: the runtime's
+plan guidance is part of the system prompt exactly when the tool exists.
 
 Shell binaries are gated the same way — one manifest per name in `capabilities.shell.allow` — and
 are additionally checked against that list again at dispatch.
 
 ## Reserved names
 
-`share-file`, `fetch-peer-file` and `delegate-task` are reserved. A capsule declaring an artifact
-under one of them is refused at staging, before any artifact is resolved, pulled or hash-verified,
+`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` are reserved. A capsule declaring
+an artifact under one of them is refused at staging, before any artifact is resolved, pulled or hash-verified,
 with [`E-CAP-013`](diagnostics.md#e-cap-013). The same refusal covers an in-session
 `manage.pull()` of that name.
 

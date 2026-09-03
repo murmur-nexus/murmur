@@ -56,7 +56,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::{AgentLoopExit, UNTRUSTED_CONTENT_NOTICE},
+    agent::{AgentLoopExit, PLAN_TOOL_NOTICE, UNTRUSTED_CONTENT_NOTICE},
     errors::RuntimeError,
     hooks::{HookEvent, HookRuntime},
     murmur_md::MURMUR_MD_TRUST_NOTICE,
@@ -160,13 +160,24 @@ fn read_task_from_workdir(workdir: &Path) -> String {
 /// It carries no `[Capsule]` block, unlike the http transport's
 /// `agent::build_augmented_system_prompt`: on this transport murmur does not render the system
 /// prompt at all — it hands the CLI one argument and the CLI frames everything around it, so
-/// the two unconditional notices are the only part that is murmur's to inject. That is why
+/// the two unconditional notices, plus `PLAN_TOOL_NOTICE` where `plan_tool_present` says the
+/// capsule was granted the plan tool, are the only part that is murmur's to inject. That is why
 /// `run_process_inference_loop` takes the capsule identity as `_name` / `_version` and ignores
 /// both. The value must nonetheless stay launch-invariant, for the same prompt caching reason
 /// as the http path: the CLI puts it at the head of the prompt, and every provider matches its
 /// cache on an exact prefix, so a per-launch value here would miss the cache on every request.
-pub(super) fn build_process_system_prompt(system_prompt: Option<&str>) -> String {
-    let notices = format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}");
+pub(super) fn build_process_system_prompt(
+    system_prompt: Option<&str>,
+    plan_tool_present: bool,
+) -> String {
+    // Appended rather than interpolated as an empty string, so an ungranted capsule's prompt is
+    // byte-identical to what it was before the plan tool existed.
+    let plan = if plan_tool_present {
+        format!("\n{PLAN_TOOL_NOTICE}")
+    } else {
+        String::new()
+    };
+    let notices = format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}{plan}");
     match system_prompt.filter(|sp| !sp.is_empty()) {
         Some(sp) => format!("{notices}\n\n{sp}"),
         None => notices,
@@ -181,9 +192,10 @@ fn build_process_args(
     inference: &InferenceConfig,
     bridge: &Option<claude_bridge::BridgeHandle>,
     system_prompt: Option<&str>,
+    plan_tool_present: bool,
     task: &str,
 ) -> Vec<String> {
-    let system = build_process_system_prompt(system_prompt);
+    let system = build_process_system_prompt(system_prompt, plan_tool_present);
     match dialect {
         ProcessDialect::Claude => {
             let mut args: Vec<String> = vec![
@@ -315,7 +327,14 @@ pub(crate) async fn run_process_inference_loop(
     // Build subprocess arguments for the selected CLI dialect. Claude takes the task on stdin
     // as a JSON message; codex takes it as a positional prompt arg (stdin stays closed).
     let dialect = ProcessDialect::from_command(command_name);
-    let args = build_process_args(dialect, inference, &bridge, system_prompt.as_deref(), &task);
+    let args = build_process_args(
+        dialect,
+        inference,
+        &bridge,
+        system_prompt.as_deref(),
+        store_state.capability_policy.plan_submit,
+        &task,
+    );
 
     let child_stdin = match dialect {
         ProcessDialect::Claude => std::process::Stdio::piped(),
@@ -1012,8 +1031,8 @@ mod tests {
     #[test]
     fn process_system_prompt_is_launch_invariant() {
         for arg in [None, Some("You are a helpful assistant.")] {
-            let first = build_process_system_prompt(arg);
-            let second = build_process_system_prompt(arg);
+            let first = build_process_system_prompt(arg, false);
+            let second = build_process_system_prompt(arg, false);
             assert_eq!(first, second, "same input must yield the same string");
             assert!(first.contains(MURMUR_MD_TRUST_NOTICE));
             assert!(first.contains(UNTRUSTED_CONTENT_NOTICE));
@@ -1038,7 +1057,7 @@ mod tests {
         // MURMUR_MD_TRUST_NOTICE. The `--system-prompt` value now always also carries
         // UNTRUSTED_CONTENT_NOTICE (C-4/C-7 posture), so the exact-equality assertion is
         // rewritten to check for both notices rather than deleted.
-        let prompt = build_process_system_prompt(None);
+        let prompt = build_process_system_prompt(None, false);
         assert_eq!(
             prompt,
             format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
@@ -1047,7 +1066,7 @@ mod tests {
 
     #[test]
     fn process_system_prompt_carries_trust_notice_alongside_custom_prompt() {
-        let prompt = build_process_system_prompt(Some("You are a helpful assistant."));
+        let prompt = build_process_system_prompt(Some("You are a helpful assistant."), false);
         assert!(prompt.contains(MURMUR_MD_TRUST_NOTICE));
         assert!(prompt.contains(UNTRUSTED_CONTENT_NOTICE));
         assert!(prompt.contains("You are a helpful assistant."));
@@ -1086,7 +1105,14 @@ mod tests {
     #[test]
     fn codex_args_disable_host_tools_and_carry_task_as_positional() {
         let inf = test_inference("codex", "gpt-5.5");
-        let args = build_process_args(ProcessDialect::Codex, &inf, &None, None, "do the thing");
+        let args = build_process_args(
+            ProcessDialect::Codex,
+            &inf,
+            &None,
+            None,
+            false,
+            "do the thing",
+        );
         assert_eq!(args[0], "exec");
         assert!(args.iter().any(|a| a == "--json"));
         // host-execution tools disabled + apply_patch off → murmur is the sole executor
@@ -1105,7 +1131,7 @@ mod tests {
     #[test]
     fn codex_args_omit_model_when_empty() {
         let inf = test_inference("codex", "");
-        let args = build_process_args(ProcessDialect::Codex, &inf, &None, None, "t");
+        let args = build_process_args(ProcessDialect::Codex, &inf, &None, None, false, "t");
         assert!(
             !args.iter().any(|a| a == "-m"),
             "empty model must not pass -m (uses account default)"
@@ -1115,7 +1141,7 @@ mod tests {
     #[test]
     fn claude_args_unchanged_shape() {
         let inf = test_inference("claude", "claude-opus-4-8");
-        let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, "t");
+        let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, false, "t");
         assert_eq!(args[0], "--print");
         assert!(args
             .windows(2)
@@ -1130,7 +1156,7 @@ mod tests {
     #[test]
     fn claude_args_omit_model_when_empty() {
         let inf = test_inference("claude", "");
-        let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, "t");
+        let args = build_process_args(ProcessDialect::Claude, &inf, &None, None, false, "t");
         // `--model ""` is a hard 400; empty model must omit the flag so claude uses its default.
         assert!(
             !args.iter().any(|a| a == "--model"),
@@ -1192,7 +1218,7 @@ mod tests {
     fn process_system_prompt_treats_empty_string_as_absent() {
         // Behavior change: same rewrite as above — empty custom prompt still yields
         // both always-present notices, not just MURMUR_MD_TRUST_NOTICE.
-        let prompt = build_process_system_prompt(Some(""));
+        let prompt = build_process_system_prompt(Some(""), false);
         assert_eq!(
             prompt,
             format!("{MURMUR_MD_TRUST_NOTICE}\n{UNTRUSTED_CONTENT_NOTICE}")
