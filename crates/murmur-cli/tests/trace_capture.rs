@@ -422,7 +422,7 @@ fn first_prefix_divergence_names_the_first_differing_index() {
     assert_eq!(first_prefix_divergence(&base, &two_differ), Some(1));
     assert_eq!(first_prefix_divergence(&two_differ, &base), Some(1));
 
-    // Index 0 — the system prompt, where the original regression lived.
+    // Index 0 — the system prompt, the first piece a provider matches.
     let mut head_differs = base.clone();
     head_differs[0].1 = "zz".to_string();
     assert_eq!(first_prefix_divergence(&base, &head_differs), Some(0));
