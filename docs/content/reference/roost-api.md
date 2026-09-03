@@ -301,10 +301,9 @@ the child holds:
 | Any other name | The name appears in both the child's and the parent's `capabilities.env.allow`, and the parent's own process environment holds it |
 
 Every other variable the parent holds is absent from the child. A name a child declares that its
-parent does not is refused at `POST /spawn` on the [`capabilities.env.allow` axis](#spawn-envelope),
-and the parent applies the same rule again when it builds the environment, so the refusal and the
-clamp each hold on their own. The four names above are the runtime's, and a child that lists one of
-them under `capabilities.env.allow` does not displace the runtime's value.
+parent does not is refused at `POST /spawn` on the [`capabilities.env.allow` axis](#spawn-envelope).
+The four names above are the runtime's, and a child that lists one of them under
+`capabilities.env.allow` does not displace the runtime's value.
 
 The value copied is the value the parent's process holds at launch. A variable the parent itself
 does not hold is absent from the child even where both manifests declare it, and a child whose

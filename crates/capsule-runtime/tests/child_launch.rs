@@ -408,7 +408,7 @@ fn two_children_of_the_same_parent_are_independent() {
 /// The environment a child that declares nothing is handed: the names the runtime owns, and
 /// nothing else. An empty `capabilities.env.allow` is a complete answer rather than a hole, so a
 /// list that arrives empty — which is what a child declaring none of its parent's variables
-/// yields — leaves the child exactly as it has always been.
+/// yields — leaves the child holding the runtime-owned names alone.
 #[test]
 fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
     let parent = Parent::new();

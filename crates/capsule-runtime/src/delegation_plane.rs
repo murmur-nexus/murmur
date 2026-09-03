@@ -862,6 +862,32 @@ mod tests {
         );
     }
 
+    /// A capsule the parent's own store cannot resolve fails the read by name.
+    ///
+    /// The delegation ends there rather than launching a child without the variables its manifest
+    /// declares: that child would die at its own manifest load, in a process nobody is reading.
+    #[test]
+    fn a_capsule_the_store_cannot_resolve_fails_the_read_by_name() {
+        let store = tempfile::tempdir().unwrap();
+        let plane = DelegationPlane::new(
+            "http://127.0.0.1:7700".to_string(),
+            SpawnCredential::new("msc1.test".to_string()),
+            PathBuf::from("/tmp"),
+            "ses_parent".to_string(),
+            DELEGATION_RESULT_TIMEOUT,
+            std::sync::Arc::new(murmur_artifact::LocalRegistry::new(store.path())),
+            vec!["MURMUR_TEST_PROVIDER_KEY".to_string()],
+        );
+
+        let error = plane
+            .child_env_allow("worker", "0.1.0")
+            .expect_err("an empty store resolves nothing");
+        let message = error.to_string();
+        assert!(message.contains("worker"), "{message}");
+        assert!(message.contains("0.1.0"), "{message}");
+        assert!(message.contains("capabilities.env.allow"), "{message}");
+    }
+
     /// The trailing slash is taken off once, so no request is built against `//spawn`.
     #[test]
     fn a_trailing_slash_on_the_daemon_url_is_trimmed_once() {
