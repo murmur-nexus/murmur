@@ -215,25 +215,38 @@ mod tests {
         assert_eq!(map_platform("", ""), "unknown");
     }
 
-    // ── SUPPORTED_PLATFORMS / tag splitting ───────────────────────────────────
+    // ── SUPPORTED_PLATFORMS / tag splitting ───────────────────────
 
     use super::{split_platform_suffix, split_platform_tag, SUPPORTED_PLATFORMS};
+    use std::collections::BTreeSet;
 
     /// The constant and the mapping are the same set. A platform `current_platform` can return
-    /// but the constant does not list would be filed at a path nothing recognises.
+    /// but the constant does not list would be filed at a path nothing recognises. The cross
+    /// product covers the os/arch pairs that map to `"unknown"` too, so mapping a new pair
+    /// without listing it here fails.
     #[test]
     fn supported_platforms_matches_what_current_platform_returns() {
-        let mapped = [
-            map_platform("macos", "aarch64"),
-            map_platform("macos", "x86_64"),
-            map_platform("linux", "aarch64"),
-            map_platform("linux", "x86_64"),
-        ];
-        let mut expected = mapped.to_vec();
-        expected.sort_unstable();
-        let mut actual = SUPPORTED_PLATFORMS.to_vec();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
+        let produced: BTreeSet<&str> = ["macos", "linux", "windows", "freebsd"]
+            .into_iter()
+            .flat_map(|os| {
+                ["aarch64", "x86_64", "riscv64"]
+                    .into_iter()
+                    .map(move |arch| map_platform(os, arch))
+            })
+            .filter(|platform| *platform != "unknown")
+            .collect();
+        let declared: BTreeSet<&str> = SUPPORTED_PLATFORMS.into_iter().collect();
+        assert_eq!(produced, declared);
+        assert_eq!(SUPPORTED_PLATFORMS.len(), declared.len(), "duplicate tag");
+    }
+
+    #[test]
+    fn this_host_is_a_supported_platform_or_unknown() {
+        let host = super::current_platform();
+        assert!(
+            host == "unknown" || SUPPORTED_PLATFORMS.contains(&host),
+            "current_platform() returned {host}, which SUPPORTED_PLATFORMS does not list"
+        );
     }
 
     #[test]
@@ -253,32 +266,37 @@ mod tests {
 
     #[test]
     fn platform_suffix_splits_off_a_recognised_tag() {
-        assert_eq!(
-            split_platform_suffix("nativetool-0.1.0-linux-x86_64.mur.zip"),
-            Some(("nativetool-0.1.0", "linux-x86_64"))
-        );
-        assert_eq!(
-            split_platform_suffix("nativetool-0.1.0-darwin-aarch64.mur.zip"),
-            Some(("nativetool-0.1.0", "darwin-aarch64"))
-        );
+        for platform in SUPPORTED_PLATFORMS {
+            assert_eq!(
+                split_platform_suffix(&format!("nativetool-0.1.0-{platform}.mur.zip")),
+                Some(("nativetool-0.1.0", platform))
+            );
+        }
     }
 
     #[test]
     fn an_untagged_or_unrecognised_name_carries_no_platform() {
         // A WASM artifact published under its plain versioned name.
         assert_eq!(split_platform_suffix("wasmtool-0.1.0.mur.zip"), None);
+        assert_eq!(split_platform_suffix("wasmtool.mur.zip"), None);
         // A tag outside the recognised set is not a tag.
         assert_eq!(
             split_platform_suffix("tool-0.1.0-windows-x86_64.mur.zip"),
             None
         );
-        // The tag must be preceded by a name.
+        assert_eq!(
+            split_platform_suffix("tool-0.1.0-linux-riscv64.mur.zip"),
+            None
+        );
+        // The tag must be preceded by a name, and separated from it by a hyphen.
         assert_eq!(split_platform_suffix("linux-x86_64.mur.zip"), None);
+        assert_eq!(split_platform_suffix("toollinux-x86_64.mur.zip"), None);
         // Not a .mur.zip at all.
         assert_eq!(
             split_platform_suffix("tool-0.1.0-linux-x86_64.sha256"),
             None
         );
+        assert_eq!(split_platform_suffix("tool-0.1.0-linux-x86_64.zip"), None);
     }
 
     // ── binary_platform / native_binary_verdict ───────────────────────────────

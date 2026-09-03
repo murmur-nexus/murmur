@@ -29,7 +29,9 @@ Use a name reference to take a single artifact out of a release that contains se
 | Reference | Filenames tried, in order |
 |---|---|
 | `<name>@<version>` | `<name>-<version>-<platform>.mur.zip`, `<name>-<version>.mur.zip` |
-| `<name>` | `<name>-*-<platform>.mur.zip`, `<name>.mur.zip`, `<name>-*.mur.zip` |
+| `<name>` | `<name>-*-<platform>.mur.zip`, `<name>.mur.zip`, `<name>-*.mur.zip` — the last pattern matches only assets whose filename carries no platform tag |
+
+A platform tag in an asset filename is the publisher's declaration of which platform those bytes are for, so a tagged asset is only ever installed on the platform it names. When no filename matches, the install fails with [`E-REG-001`](diagnostics.md) naming the host platform and the platforms the release publishes that artifact for. `linux-aarch64` is a supported target for which Murmur's own releases publish no asset: an artifact needed there is built on that host with [`mur build`](cli.md#mur-build) and installed from the resulting path.
 
 ## Authentication
 
