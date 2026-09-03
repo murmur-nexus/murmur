@@ -151,7 +151,7 @@ pub use staged_runtime::check_staged_runtime_floor;
 pub use state_store::{
     ensure_state_store, state_store_reports, validate_store_name, STATE_PREOPEN_NAME,
 };
-pub use trace::ResourceTraceAppender;
+pub use trace::{PlanTraceAppender, ResourceTraceAppender};
 pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, ResumeMode,

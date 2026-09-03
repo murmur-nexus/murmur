@@ -38,6 +38,9 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
+| `plan_start` | The session node. Its `event_id` is the plan node |
+| `plan_step_start`, `plan_step` | The plan node |
+| `plan_end` | The plan node, or the session node for a plan file that never parsed and so has none |
 
 A trace with no `session_start` line — a script capsule flushing buffered `a2a_send` records into
 a file that has no session frame — writes `parent_id: null` on every line, rather than naming a
@@ -625,6 +628,69 @@ was spawned. The lineage is in the session it continues, one `resumed_from` hop 
 **The handle itself never appears in a trace, on either side.** Where a token would otherwise reach
 one — most obviously as the recorded `handle` argument of a `fetch-peer-file` `tool_call` — it is
 replaced with `<handle:<handle_id>>`.
+
+**`plan_start`**{ #plan-events } — written once by the plan scheduler, as soon as the plan file
+parses
+
+| Field | Type | Notes |
+|---|---|---|
+| `plan_id` | string | The plan's authored `id` |
+| `step_count` | usize | How many steps the plan declares |
+| `steps` | array of object | The DAG as authored, one entry per step in file order: `step_id`, `kind` (`"tool"`, `"shell"` or `"capsule"`; `"unknown"` for a step declaring none or several, which the scheduler refuses), `depends_on`, and `has_condition` — whether the step carries an `if` and so may settle without ever being dispatched |
+
+Written before the plan is validated, so a plan the scheduler refuses still records the shape it
+was refused for. The structure is recorded once, up front, which is what keeps a run legible for a
+step that never ran.
+
+**`plan_step_start`** — written once per step the scheduler dispatches, as it hands the step to a
+worker
+
+| Field | Type | Notes |
+|---|---|---|
+| `plan_id` | string | The run this step belongs to |
+| `step_id` | string | The step's authored id |
+| `kind` | string | `"tool"`, `"shell"` or `"capsule"` |
+| `depends_on` | string[] | The steps this one waited on. `[]` when it waited on none |
+
+A step that settled without being dispatched — an `if` that evaluated false, a dependency that
+never resolved, a plan the validator refused — writes none of these, only its terminal
+`plan_step`. Joins to that line on `(plan_id, step_id)`.
+
+**`plan_step`** — written once per settled step, after the step's `on_error` policy has been
+applied
+
+| Field | Type | Notes |
+|---|---|---|
+| `plan_id` | string | The run this step belongs to |
+| `step_id` | string | The step's authored id |
+| `kind` | string | `"tool"`, `"shell"` or `"capsule"`; `"unknown"` for a step whose dispatch thread died and named nothing the plan declared |
+| `status` | string | `"success"`, `"failed"` or `"skipped"` — the status the run's own report carries for this step. A step that failed under `on_error: skip` reads `"skipped"` here, because that is what the report settled it as |
+| `attempts` | u32 | How many times the step was dispatched, `retries` included. `0` for a step that settled without dispatch |
+| `duration_ms` | u64 | Wall-clock time across every attempt. `0` for a step that settled without dispatch |
+| `error` | string | The step's own error text. Absent when there is none, including on a step demoted to `"skipped"` by a policy that carried no text |
+| `input` | object | The interpolated step input, with peer handle tokens redacted. Written for a tool step only |
+| `state_effect` | string | `"read"` \| `"mutate"`, as the tool declared it. Absent when the tool declared none. Feeds the same redundant-call analysis `tool_call.state_effect` does, against the same resource history — a plan step that re-reads what an agent turn already read is flagged, and the other way round |
+| `resource_id` | string | The resource this step addressed, as the tool declared it. An opaque, tool-defined string. Absent when the tool declared none. Read on the same terms as `tool_call.resource_id`, falling back to a path sniffed out of `input` |
+
+Only a step that succeeded takes part in the redundancy analysis: a step that failed or was
+skipped observed nothing.
+
+**`plan_end`** — written once as the run returns, whatever ended it
+
+| Field | Type | Notes |
+|---|---|---|
+| `plan_id` | string | The plan's authored `id`. The empty string for a plan file that never parsed |
+| `outcome` | string | `"completed"` or `"failed"` |
+| `failed_step` | string | The step that ended the run. `"plan"` when the run failed before any step could — a file that would not parse or validate, a cgroup scope the host refused. Absent on `"completed"` |
+| `steps_total` | usize | How many steps the plan declared |
+| `steps_succeeded` | usize | |
+| `steps_failed` | usize | |
+| `steps_skipped` | usize | |
+| `duration_ms` | u64 | Wall-clock time for the whole run, the plan file read included |
+| `reason` | string | Why the run ended when the reason was not a step's own failure. Absent otherwise |
+
+The three counts cover the steps that settled, and sum to less than `steps_total` on a run that
+stopped early.
 
 **Guarantees:**
 

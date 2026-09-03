@@ -250,6 +250,138 @@ const FIXTURE_CHILD: &str = concat!(
     "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":800,\"exit_status\":\"ok\"}\n"
 );
 
+/// A plan run: three steps, the last waiting on the other two, and a conditional step that never
+/// ran. The session itself made no tool call, so `mur trace show` must still report zero of them.
+const FIXTURE_PLAN: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_44444444444444448444000000000001\",\"parent_id\":null,",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8000,",
+    "\"capsule_name\":\"planner\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[]}\n",
+
+    "{\"event_type\":\"plan_start\",\"event_id\":\"evt_44444444444444448444000000000002\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000001\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8010,",
+    "\"plan_id\":\"release\",\"step_count\":4,\"steps\":[",
+    "{\"step_id\":\"build\",\"kind\":\"tool\",\"depends_on\":[],\"has_condition\":false},",
+    "{\"step_id\":\"lint\",\"kind\":\"shell\",\"depends_on\":[],\"has_condition\":false},",
+    "{\"step_id\":\"ship\",\"kind\":\"capsule\",\"depends_on\":[\"build\",\"lint\"],\"has_condition\":false},",
+    "{\"step_id\":\"rollback\",\"kind\":\"shell\",\"depends_on\":[\"ship\"],\"has_condition\":true}]}\n",
+
+    "{\"event_type\":\"plan_step_start\",\"event_id\":\"evt_44444444444444448444000000000003\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8020,",
+    "\"plan_id\":\"release\",\"step_id\":\"build\",\"kind\":\"tool\",\"depends_on\":[]}\n",
+
+    "{\"event_type\":\"plan_step_start\",\"event_id\":\"evt_44444444444444448444000000000004\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8021,",
+    "\"plan_id\":\"release\",\"step_id\":\"lint\",\"kind\":\"shell\",\"depends_on\":[]}\n",
+
+    "{\"event_type\":\"plan_step\",\"event_id\":\"evt_44444444444444448444000000000005\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8320,",
+    "\"plan_id\":\"release\",\"step_id\":\"build\",\"kind\":\"tool\",\"status\":\"success\",",
+    "\"attempts\":2,\"duration_ms\":300,\"input\":{\"target\":\"wasm32-wasip2\"}}\n",
+
+    "{\"event_type\":\"plan_step\",\"event_id\":\"evt_44444444444444448444000000000006\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8330,",
+    "\"plan_id\":\"release\",\"step_id\":\"lint\",\"kind\":\"shell\",\"status\":\"success\",",
+    "\"attempts\":1,\"duration_ms\":120}\n",
+
+    "{\"event_type\":\"plan_step_start\",\"event_id\":\"evt_44444444444444448444000000000007\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":8340,",
+    "\"plan_id\":\"release\",\"step_id\":\"ship\",\"kind\":\"capsule\",\"depends_on\":[\"build\",\"lint\"]}\n",
+
+    "{\"event_type\":\"plan_step\",\"event_id\":\"evt_44444444444444448444000000000008\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":9240,",
+    "\"plan_id\":\"release\",\"step_id\":\"ship\",\"kind\":\"capsule\",\"status\":\"failed\",",
+    "\"attempts\":1,\"duration_ms\":900,\"error\":\"the child refused the task\"}\n",
+
+    "{\"event_type\":\"plan_end\",\"event_id\":\"evt_44444444444444448444000000000009\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000002\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":9250,",
+    "\"plan_id\":\"release\",\"outcome\":\"failed\",\"failed_step\":\"ship\",\"steps_total\":4,",
+    "\"steps_succeeded\":2,\"steps_failed\":1,\"steps_skipped\":0,\"duration_ms\":1240}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_4444444444444444844400000000000a\",",
+    "\"parent_id\":\"evt_44444444444444448444000000000001\",",
+    "\"session_id\":\"ses_44444444444444448444000000000009\",\"timestamp\":9260,",
+    "\"total_turns\":1,\"total_input_tokens\":100,\"total_output_tokens\":20,",
+    "\"total_tool_calls\":0,\"total_shell_calls\":0,\"duration_ms\":1300,\"exit_status\":\"ok\"}\n"
+);
+
+/// A turn and a plan step that read the same resource, scored on one history. `{effect}` is the
+/// plan step's declared `state_effect` line fragment, and `{tail}` whatever follows the run.
+fn plan_redundancy_fixture(step_metadata: &str, tail: &str) -> String {
+    format!(
+        concat!(
+            "{{\"event_type\":\"session_start\",\"event_id\":\"evt_55555555555555558555000000000001\",\"parent_id\":null,",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9000,",
+            "\"capsule_name\":\"planner\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+            "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[\"read-file\"]}}\n",
+
+            "{{\"event_type\":\"inference\",\"event_id\":\"evt_55555555555555558555000000000002\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000001\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9010,",
+            "\"turn\":1,\"input_tokens\":10,\"output_tokens\":5,\"decision\":\"tool_call\",\"tool_name\":\"read-file\"}}\n",
+
+            "{{\"event_type\":\"tool_call\",\"event_id\":\"evt_55555555555555558555000000000003\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000002\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9020,",
+            "\"turn\":1,\"tool_name\":\"read-file\",\"input\":{{\"path\":\"src/lib.rs\"}},\"input_bytes\":20,",
+            "\"output_bytes\":40,\"duration_ms\":10,\"status\":\"ok\",",
+            "\"state_effect\":\"read\",\"resource_id\":\"src/lib.rs\"}}\n",
+
+            "{{\"event_type\":\"plan_start\",\"event_id\":\"evt_55555555555555558555000000000004\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000001\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9030,",
+            "\"plan_id\":\"audit\",\"step_count\":1,\"steps\":[",
+            "{{\"step_id\":\"recheck\",\"kind\":\"tool\",\"depends_on\":[],\"has_condition\":false}}]}}\n",
+
+            "{{\"event_type\":\"plan_step\",\"event_id\":\"evt_55555555555555558555000000000005\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000004\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9040,",
+            "\"plan_id\":\"audit\",\"step_id\":\"recheck\",\"kind\":\"tool\",\"status\":\"success\",",
+            "\"attempts\":1,\"duration_ms\":15,\"resource_id\":\"src/lib.rs\"{step_metadata}}}\n",
+
+            "{{\"event_type\":\"plan_end\",\"event_id\":\"evt_55555555555555558555000000000006\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000004\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9050,",
+            "\"plan_id\":\"audit\",\"outcome\":\"completed\",\"steps_total\":1,",
+            "\"steps_succeeded\":1,\"steps_failed\":0,\"steps_skipped\":0,\"duration_ms\":20}}\n",
+
+            "{tail}",
+
+            "{{\"event_type\":\"session_end\",\"event_id\":\"evt_5555555555555555855500000000000f\",",
+            "\"parent_id\":\"evt_55555555555555558555000000000001\",",
+            "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9900,",
+            "\"total_turns\":1,\"total_input_tokens\":10,\"total_output_tokens\":5,",
+            "\"total_tool_calls\":1,\"total_shell_calls\":0,\"duration_ms\":900,\"exit_status\":\"ok\"}}\n"
+        ),
+        step_metadata = step_metadata,
+        tail = tail,
+    )
+}
+
+/// A second turn re-reading what the plan step touched, so the plan step's declared effect
+/// decides whether it counts as redundant.
+const SECOND_TURN_READ: &str = concat!(
+    "{\"event_type\":\"inference\",\"event_id\":\"evt_55555555555555558555000000000007\",",
+    "\"parent_id\":\"evt_55555555555555558555000000000001\",",
+    "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9060,",
+    "\"turn\":2,\"input_tokens\":10,\"output_tokens\":5,\"decision\":\"tool_call\",\"tool_name\":\"read-file\"}\n",
+
+    "{\"event_type\":\"tool_call\",\"event_id\":\"evt_55555555555555558555000000000008\",",
+    "\"parent_id\":\"evt_55555555555555558555000000000007\",",
+    "\"session_id\":\"ses_55555555555555558555000000000009\",\"timestamp\":9070,",
+    "\"turn\":2,\"tool_name\":\"read-file\",\"input\":{\"path\":\"src/lib.rs\"},\"input_bytes\":20,",
+    "\"output_bytes\":40,\"duration_ms\":10,\"status\":\"ok\",",
+    "\"state_effect\":\"read\",\"resource_id\":\"src/lib.rs\"}\n"
+);
+
 fn write_fixture(dir: &Path, name: &str, content: &str) -> std::path::PathBuf {
     let path = dir.join(name);
     fs::write(&path, content).unwrap();
@@ -3693,4 +3825,180 @@ fn show_names_the_session_that_spawned_a_child() {
         .stdout(predicate::str::contains(
             "Spawned by ses_11111111111141118111000000000009 (delegation dlg_aaaa0001)",
         ));
+}
+
+// ── plan run tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn steps_renders_the_plan_dag_beneath_its_plan_start() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "plan.jsonl", FIXTURE_PLAN);
+
+    let out = mur()
+        .args(["trace", "steps", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("plan_start release  4 steps"), "{stdout}");
+    assert!(stdout.contains("plan_step_start build  tool"), "{stdout}");
+    // A step names what it waited on where the scheduler dispatched it.
+    assert!(
+        stdout.contains("plan_step_start ship  capsule  after build, lint"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("plan_step  build  tool  success  300ms"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("plan_step  ship  capsule  failed  900ms"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("plan_end   failed  failed at ship"),
+        "{stdout}"
+    );
+
+    // The step rows indent one level beneath the `plan_start` they hang off.
+    let plan_line = stdout
+        .lines()
+        .find(|line| line.contains("plan_start"))
+        .unwrap();
+    let step_line = stdout
+        .lines()
+        .find(|line| line.contains("plan_step_start build"))
+        .unwrap();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    assert_eq!(indent(step_line), indent(plan_line) + 2, "{stdout}");
+}
+
+#[test]
+fn show_reports_a_plan_run_with_its_outcome_and_every_step() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "plan.jsonl", FIXTURE_PLAN);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("── Plan ──"), "{stdout}");
+    assert!(
+        stdout.contains("release  failed  4 steps  1.2s"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("steps:      2 succeeded, 1 failed, 0 skipped"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("failed at:  ship"), "{stdout}");
+    assert!(
+        stdout.contains("build  tool  success  300ms  2 attempts"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ship  capsule  failed  900ms  after build, lint"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("the child refused the task"), "{stdout}");
+    // A step the run never reached is still listed, because `plan_start` named it.
+    assert!(
+        stdout.contains("rollback  shell  not run  after ship  conditional"),
+        "{stdout}"
+    );
+    // Plan steps are their own section: they are not tool calls, shell calls or turns.
+    assert!(stdout.contains("── Tool calls ──"), "{stdout}");
+    assert!(stdout.contains("count:      0"), "{stdout}");
+}
+
+#[test]
+fn show_omits_the_plan_section_when_the_trace_holds_no_plan_run() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(tmp.path(), "a.jsonl", FIXTURE_A);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(!stdout.contains("── Plan ──"), "{stdout}");
+    assert!(!stdout.contains("plan_step"), "{stdout}");
+}
+
+/// One resource history, not two: a plan step that re-reads what an agent turn already read is
+/// flagged, and the record names the plan step as the site and the turn as the prior one.
+#[test]
+fn show_flags_a_plan_step_that_re_reads_what_a_turn_read() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = plan_redundancy_fixture(",\"state_effect\":\"read\"", "");
+    let path = write_fixture(tmp.path(), "redundant.jsonl", &fixture);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("── Redundant calls ──"), "{stdout}");
+    assert!(stdout.contains("count:      1"), "{stdout}");
+    assert!(
+        stdout.contains("plan audit/recheck  src/lib.rs  (re-reads turn 1)"),
+        "{stdout}"
+    );
+}
+
+/// A plan step that declared a mutate invalidates the resource's history, so the turn that reads
+/// it afterwards is reading something that changed.
+#[test]
+fn show_lets_a_plan_step_mutation_clear_the_resource_history() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = plan_redundancy_fixture(",\"state_effect\":\"mutate\"", SECOND_TURN_READ);
+    let path = write_fixture(tmp.path(), "mutate.jsonl", &fixture);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("count:      0"), "{stdout}");
+    assert!(!stdout.contains("re-reads"), "{stdout}");
+}
+
+/// A plan step that declared no effect at all is treated conservatively: it clears the history
+/// like a mutate, and is never itself credited as a redundant read.
+#[test]
+fn show_never_credits_a_plan_step_that_declared_no_state_effect() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = plan_redundancy_fixture("", SECOND_TURN_READ);
+    let path = write_fixture(tmp.path(), "undeclared.jsonl", &fixture);
+
+    let out = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("count:      0"), "{stdout}");
+    assert!(!stdout.contains("re-reads"), "{stdout}");
+}
+
+/// A trace holding a plan run reports on it through every subcommand that reads one.
+#[test]
+fn report_and_diff_still_run_over_a_trace_holding_a_plan() {
+    let tmp = TempDir::new().unwrap();
+    let plan = write_fixture(tmp.path(), "plan.jsonl", FIXTURE_PLAN);
+    let a = write_fixture(tmp.path(), "a.jsonl", FIXTURE_A);
+
+    mur()
+        .args(["trace", "report", plan.to_str().unwrap()])
+        .assert()
+        .success();
+    mur()
+        .args(["trace", "diff", a.to_str().unwrap(), plan.to_str().unwrap()])
+        .assert()
+        .success();
 }

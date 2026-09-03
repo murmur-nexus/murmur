@@ -469,6 +469,80 @@ struct DelegationLateEvent {
     result_path: Option<String>,
 }
 
+/// One step of a plan's DAG as `plan_start` recorded it.
+#[derive(Debug, Deserialize)]
+struct PlanStepShape {
+    step_id: String,
+    /// `"tool"`, `"shell"` or `"capsule"`.
+    kind: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    has_condition: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanStartEvent {
+    plan_id: String,
+    step_count: usize,
+    #[serde(default)]
+    steps: Vec<PlanStepShape>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanStepStartEvent {
+    step_id: String,
+    kind: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanStepEvent {
+    plan_id: String,
+    step_id: String,
+    kind: String,
+    /// `"success"`, `"failed"` or `"skipped"` — what the plan's own report settled this step as.
+    status: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    error: Option<String>,
+    /// The interpolated tool input. Absent for every kind but a tool step.
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    /// What the tool declared about the call. Both absent when it declared nothing; both feed
+    /// the same redundant-call analysis `tool_call` does.
+    #[serde(default)]
+    state_effect: Option<String>,
+    #[serde(default)]
+    resource_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanEndEvent {
+    plan_id: String,
+    /// `"completed"` or `"failed"`.
+    outcome: String,
+    #[serde(default)]
+    failed_step: Option<String>,
+    #[serde(default)]
+    steps_total: usize,
+    #[serde(default)]
+    steps_succeeded: usize,
+    #[serde(default)]
+    steps_failed: usize,
+    #[serde(default)]
+    steps_skipped: usize,
+    #[serde(default)]
+    duration_ms: u64,
+    /// Why the run ended when the reason was not a step's own failure.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 enum TraceEvent {
@@ -504,6 +578,10 @@ enum TraceEvent {
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
     DelegationLate(DelegationLateEvent),
+    PlanStart(PlanStartEvent),
+    PlanStepStart(PlanStepStartEvent),
+    PlanStep(PlanStepEvent),
+    PlanEnd(PlanEndEvent),
     #[serde(other)]
     Unknown,
 }
@@ -606,13 +684,66 @@ struct SkillCallRecord {
 /// comes from [`resolve_resource_identity`]. The detector recognizes no tool or operation by
 /// name, so a brand-new tool is handled correctly the moment its author declares its effects.
 struct RedundantCallRecord {
-    turn: u32,
-    tool_name: String,
+    site: CallSite,
+    /// The tool that made the call. `None` for a plan step, whose record names the step rather
+    /// than the tool behind it — [`CallSite::label`] already identifies it.
+    tool_name: Option<String>,
     /// The resolved resource identity — a tool-declared `resource_id` when present,
     /// otherwise a path sniffed from the call's input. Rendered verbatim, unlabeled.
     resource_id: String,
-    /// The earlier turn whose read of the same resource this call duplicates.
-    prior_turn: u32,
+    /// The earlier site whose read of the same resource this call duplicates.
+    prior: CallSite,
+}
+
+/// Where a call that touched a resource happened: a turn of the agent loop, or a step of a plan
+/// run. Both are scored against one resource history, so a plan step that re-reads what an agent
+/// turn already read is flagged, and the other way round.
+#[derive(Clone)]
+enum CallSite {
+    Turn(u32),
+    PlanStep { plan_id: String, step_id: String },
+}
+
+impl CallSite {
+    fn label(&self) -> String {
+        match self {
+            CallSite::Turn(turn) => format!("turn {turn}"),
+            CallSite::PlanStep { plan_id, step_id } => format!("plan {plan_id}/{step_id}"),
+        }
+    }
+}
+
+/// One plan run, as its `plan_start`, per-step lines and `plan_end` join up on the plan id.
+///
+/// A run with no `plan_end` is one this trace never saw finish; a step line naming a plan with no
+/// `plan_start` opens a run of its own rather than being dropped.
+struct PlanRunRecord {
+    plan_id: String,
+    /// How many steps the plan declared, from `plan_start`. `0` for a run with none.
+    step_count: usize,
+    /// The DAG as authored, from `plan_start`. Rendered in this order, so a step that never ran
+    /// is still listed with what it would have waited on.
+    declared: Vec<PlanStepShape>,
+    /// Every settled step, in the order they settled.
+    steps: Vec<PlanStepRecord>,
+    /// `None` while a run is still in flight — the shape a process that died mid-plan leaves.
+    outcome: Option<String>,
+    failed_step: Option<String>,
+    steps_succeeded: usize,
+    steps_failed: usize,
+    steps_skipped: usize,
+    duration_ms: u64,
+    reason: Option<String>,
+}
+
+/// One settled step of a plan run, surfaced in `mur trace show`.
+struct PlanStepRecord {
+    step_id: String,
+    kind: String,
+    status: String,
+    attempts: u32,
+    duration_ms: u64,
+    error: Option<String>,
 }
 
 struct TraceMetrics {
@@ -681,6 +812,8 @@ struct TraceMetrics {
     spawned_by_delegation: Option<String>,
     /// Every delegation this session made, in the order it started them.
     delegations: Vec<DelegationRecord>,
+    /// Every plan run this trace records, in the order they started.
+    plan_runs: Vec<PlanRunRecord>,
 }
 
 /// One delegation this session made, as the two lines that record it join up.
@@ -998,6 +1131,32 @@ impl StateEffect {
     }
 }
 
+/// The run a step or summary line belongs to: the most recent one opened under the same plan id.
+///
+/// A line naming a plan this trace holds no `plan_start` for opens a run of its own — a partial
+/// trace still reports the steps it does hold rather than dropping them.
+fn plan_run_mut<'a>(runs: &'a mut Vec<PlanRunRecord>, plan_id: &str) -> &'a mut PlanRunRecord {
+    match runs.iter().rposition(|run| run.plan_id == plan_id) {
+        Some(index) => &mut runs[index],
+        None => {
+            runs.push(PlanRunRecord {
+                plan_id: plan_id.to_string(),
+                step_count: 0,
+                declared: Vec::new(),
+                steps: Vec::new(),
+                outcome: None,
+                failed_step: None,
+                steps_succeeded: 0,
+                steps_failed: 0,
+                steps_skipped: 0,
+                duration_ms: 0,
+                reason: None,
+            });
+            runs.last_mut().expect("just pushed")
+        }
+    }
+}
+
 fn compute_metrics(
     path: &Path,
     events: Vec<TraceEvent>,
@@ -1009,10 +1168,11 @@ fn compute_metrics(
     let mut tool_latencies: Vec<u64> = Vec::new();
     let mut tool_call_records: Vec<ToolCallRecord> = Vec::new();
     let mut redundant_calls: Vec<RedundantCallRecord> = Vec::new();
-    // resource → the turn of the most recent call that declared it *read* that resource;
+    // resource → the site of the most recent call that declared it *read* that resource;
     // invalidated when a later call declares it *mutated* (or is undeclared, treated
-    // conservatively as a mutate) against the same resource.
-    let mut resource_last_access: HashMap<String, u32> = HashMap::new();
+    // conservatively as a mutate) against the same resource. One map for both kinds of site: a
+    // plan-driven run and an ad-hoc run are measured on one efficiency axis, not two.
+    let mut resource_last_access: HashMap<String, CallSite> = HashMap::new();
     let mut inference_records: Vec<InferenceRecord> = Vec::new();
     let mut provider_tokens: Option<ProviderTokens> = None;
     let mut shell_exit_codes: HashMap<i32, u32> = HashMap::new();
@@ -1041,6 +1201,7 @@ fn compute_metrics(
     let mut a2a_tasks_received = 0u32;
     let mut a2a_sends: Vec<String> = Vec::new();
     let mut delegations: Vec<DelegationRecord> = Vec::new();
+    let mut plan_runs: Vec<PlanRunRecord> = Vec::new();
 
     for event in events {
         match event {
@@ -1087,15 +1248,15 @@ fn compute_metrics(
                 {
                     match StateEffect::classify(e.state_effect.as_deref()) {
                         StateEffect::Read => {
-                            if let Some(&prior_turn) = resource_last_access.get(&resource) {
+                            if let Some(prior) = resource_last_access.get(&resource) {
                                 redundant_calls.push(RedundantCallRecord {
-                                    turn: e.turn,
-                                    tool_name: e.tool_name.clone(),
+                                    site: CallSite::Turn(e.turn),
+                                    tool_name: Some(e.tool_name.clone()),
                                     resource_id: resource.clone(),
-                                    prior_turn,
+                                    prior: prior.clone(),
                                 });
                             }
-                            resource_last_access.insert(resource, e.turn);
+                            resource_last_access.insert(resource, CallSite::Turn(e.turn));
                         }
                         StateEffect::Mutate | StateEffect::Unknown => {
                             resource_last_access.remove(&resource);
@@ -1276,6 +1437,76 @@ fn compute_metrics(
                     record.late = Some((e.status, e.after_deadline_ms, e.result_path));
                 }
             }
+            TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
+                plan_id: e.plan_id,
+                step_count: e.step_count,
+                declared: e.steps,
+                steps: Vec::new(),
+                outcome: None,
+                failed_step: None,
+                steps_succeeded: 0,
+                steps_failed: 0,
+                steps_skipped: 0,
+                duration_ms: 0,
+                reason: None,
+            }),
+            // The dispatch line carries nothing the terminal line does not; it exists so
+            // `mur trace steps` can show when a step was handed to a worker and what it waited on.
+            TraceEvent::PlanStepStart(_) => {}
+            TraceEvent::PlanStep(e) => {
+                // A plan step's declared read shares the agent loop's resource history, on the
+                // same terms and through the same resolver. Only a step that succeeded took part:
+                // one that failed or was skipped observed nothing.
+                if e.status == "success" {
+                    if let Some(resource) =
+                        resolve_resource_identity(e.resource_id.as_deref(), e.input.as_ref())
+                    {
+                        let site = CallSite::PlanStep {
+                            plan_id: e.plan_id.clone(),
+                            step_id: e.step_id.clone(),
+                        };
+                        match StateEffect::classify(e.state_effect.as_deref()) {
+                            StateEffect::Read => {
+                                if let Some(prior) = resource_last_access.get(&resource) {
+                                    redundant_calls.push(RedundantCallRecord {
+                                        site: site.clone(),
+                                        tool_name: None,
+                                        resource_id: resource.clone(),
+                                        prior: prior.clone(),
+                                    });
+                                }
+                                resource_last_access.insert(resource, site);
+                            }
+                            StateEffect::Mutate | StateEffect::Unknown => {
+                                resource_last_access.remove(&resource);
+                            }
+                        }
+                    }
+                }
+                plan_run_mut(&mut plan_runs, &e.plan_id)
+                    .steps
+                    .push(PlanStepRecord {
+                        step_id: e.step_id,
+                        kind: e.kind,
+                        status: e.status,
+                        attempts: e.attempts,
+                        duration_ms: e.duration_ms,
+                        error: e.error,
+                    });
+            }
+            TraceEvent::PlanEnd(e) => {
+                let run = plan_run_mut(&mut plan_runs, &e.plan_id);
+                run.outcome = Some(e.outcome);
+                run.failed_step = e.failed_step;
+                run.steps_succeeded = e.steps_succeeded;
+                run.steps_failed = e.steps_failed;
+                run.steps_skipped = e.steps_skipped;
+                run.duration_ms = e.duration_ms;
+                run.reason = e.reason;
+                if run.step_count == 0 {
+                    run.step_count = e.steps_total;
+                }
+            }
             TraceEvent::Unknown => {}
         }
     }
@@ -1346,6 +1577,7 @@ fn compute_metrics(
             spawned_by: ss.spawned_by,
             spawned_by_delegation: ss.delegation_id,
             delegations,
+            plan_runs,
         },
         task_metrics,
     ))
@@ -1764,9 +1996,18 @@ fn print_show(m: &TraceMetrics) {
     println!("── Redundant calls ──────────────────────────────");
     println!("count:      {}", m.redundant_calls.len());
     for rec in &m.redundant_calls {
+        // A plan step names no tool of its own, so its row is the site, the resource and the
+        // prior site — one column shorter than a turn's.
+        let caller = match &rec.tool_name {
+            Some(name) => format!("{name}  "),
+            None => String::new(),
+        };
         println!(
-            "  turn {}  {}  {}  (re-reads turn {})",
-            rec.turn, rec.tool_name, rec.resource_id, rec.prior_turn
+            "  {}  {}{}  (re-reads {})",
+            rec.site.label(),
+            caller,
+            rec.resource_id,
+            rec.prior.label()
         );
     }
     println!();
@@ -1927,6 +2168,75 @@ fn print_show(m: &TraceMetrics) {
             // in this file that points outside it. Relative to this capsule's accessible workdir.
             if let (Some(workdir), Some(child)) = (&d.child_workdir, &d.child_session_id) {
                 println!("  child trace: {workdir}/.murmur/{child}/trace.jsonl");
+            }
+        }
+    }
+
+    if !m.plan_runs.is_empty() {
+        println!();
+        println!("── Plan ─────────────────────────────────────────");
+        for run in &m.plan_runs {
+            println!(
+                "{}  {}  {} step{}  {}",
+                run.plan_id,
+                run.outcome.as_deref().unwrap_or("in flight"),
+                run.step_count,
+                if run.step_count == 1 { "" } else { "s" },
+                fmt_dur(run.duration_ms)
+            );
+            println!(
+                "steps:      {} succeeded, {} failed, {} skipped",
+                run.steps_succeeded, run.steps_failed, run.steps_skipped
+            );
+            if let Some(step) = &run.failed_step {
+                println!("failed at:  {step}");
+            }
+            // Written only when the run ended for a reason no step's own line carries — a plan
+            // that would not parse, a host that refused the scope, a DAG with nothing to run.
+            if let Some(reason) = &run.reason {
+                println!("  {reason}");
+            }
+            // In authored order, so the DAG reads the way it was written and a step that never
+            // ran is still listed. A settled step the `plan_start` does not name — a partial
+            // trace, or one holding only step lines — is appended rather than dropped.
+            let declared: Vec<&str> = run
+                .declared
+                .iter()
+                .map(|shape| shape.step_id.as_str())
+                .collect();
+            let extra = run
+                .steps
+                .iter()
+                .map(|step| step.step_id.as_str())
+                .filter(|id| !declared.contains(id));
+            for step_id in declared.iter().copied().chain(extra) {
+                let shape = run.declared.iter().find(|shape| shape.step_id == step_id);
+                let settled = run.steps.iter().find(|step| step.step_id == step_id);
+                let kind = settled
+                    .map(|step| step.kind.as_str())
+                    .or(shape.map(|shape| shape.kind.as_str()))
+                    .unwrap_or("—");
+                let status = match settled {
+                    Some(step) => format!("{}  {}", step.status, fmt_dur(step.duration_ms)),
+                    None => "not run".to_string(),
+                };
+                let attempts = match settled {
+                    Some(step) if step.attempts > 1 => format!("  {} attempts", step.attempts),
+                    _ => String::new(),
+                };
+                let depends_on = shape
+                    .map(|shape| fmt_depends_on(&shape.depends_on))
+                    .unwrap_or_default();
+                // Marked because it is the one kind of step whose `skipped` needs no failure to
+                // explain it: an `if` that evaluated false settles the step without dispatch.
+                let conditional = match shape {
+                    Some(shape) if shape.has_condition => "  conditional",
+                    _ => "",
+                };
+                println!("  {step_id}  {kind}  {status}{attempts}{depends_on}{conditional}");
+                if let Some(error) = settled.and_then(|step| step.error.as_deref()) {
+                    println!("    {error}");
+                }
             }
         }
     }
@@ -2313,6 +2623,16 @@ pub(crate) fn run_trace_steps(
     Ok(())
 }
 
+/// The dependency edges a plan step waited on, as they read on its `steps` row. Empty for a step
+/// that depends on nothing.
+fn fmt_depends_on(depends_on: &[String]) -> String {
+    if depends_on.is_empty() {
+        String::new()
+    } else {
+        format!("  after {}", depends_on.join(", "))
+    }
+}
+
 /// The column a `steps` tree row's own detail starts in, after the event type that opens it.
 const STEPS_KIND_WIDTH: usize = 11;
 
@@ -2486,6 +2806,37 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.call,
             e.path,
             e.rule
+        ),
+        TraceEvent::PlanStart(e) => format!(
+            "{}{}  {} step{}",
+            kind("plan_start"),
+            e.plan_id,
+            e.step_count,
+            if e.step_count == 1 { "" } else { "s" }
+        ),
+        TraceEvent::PlanStepStart(e) => format!(
+            "{}{}  {}{}",
+            kind("plan_step_start"),
+            e.step_id,
+            e.kind,
+            fmt_depends_on(&e.depends_on)
+        ),
+        TraceEvent::PlanStep(e) => format!(
+            "{}{}  {}  {}  {}",
+            kind("plan_step"),
+            e.step_id,
+            e.kind,
+            e.status,
+            fmt_dur(e.duration_ms)
+        ),
+        TraceEvent::PlanEnd(e) => format!(
+            "{}{}{}",
+            kind("plan_end"),
+            e.outcome,
+            match &e.failed_step {
+                Some(step) => format!("  failed at {step}"),
+                None => String::new(),
+            }
         ),
         _ => return None,
     })
