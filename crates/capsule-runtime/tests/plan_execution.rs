@@ -201,7 +201,7 @@ fn test_capsule_step_spawns_and_reads_result() {
     };
     let plan = write_plan(
         dir.path(),
-        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"task":"hello"}}]}),
+        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":"hello"}]}),
     );
 
     let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
@@ -257,12 +257,12 @@ fn test_capsule_step_sends_objective_as_plain_text() {
     assert_eq!(fake_roost.sent_text(), "Echo this task");
 }
 
-/// Input this runtime does not model is passed through as the author's own JSON rather than
-/// flattened into one field, so nothing they wrote is dropped on the way to the child.
+/// A bare string is the task text, delivered without the quote marks that serializing it would
+/// add.
 #[test]
-fn test_capsule_step_passes_unmodelled_input_through_as_json() {
+fn test_capsule_step_sends_a_bare_string_as_plain_text() {
     if capsule_runtime::skip_without_host_support(
-        "test_capsule_step_passes_unmodelled_input_through_as_json",
+        "test_capsule_step_sends_a_bare_string_as_plain_text",
     ) {
         return;
     }
@@ -282,48 +282,7 @@ fn test_capsule_step_passes_unmodelled_input_through_as_json() {
         dir.path(),
         json!({
             "id":"p",
-            "steps":[{"id":"worker","capsule":"worker","input":{"task":"fallback task"}}]
-        }),
-    );
-
-    let report = plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke));
-    std::env::remove_var("MURMUR_ROOST_URL");
-
-    assert!(report.completed, "{report:?}");
-    assert_eq!(fake_roost.sent_text(), "{\"task\":\"fallback task\"}");
-}
-
-/// Only `instructions` and `context` alongside an `objective` force the whole input through as
-/// JSON. Any other companion key leaves the objective delivered as plain text, so a plan author
-/// adding a key this runtime does not model does not silently change how the objective arrives.
-#[test]
-fn test_capsule_step_objective_survives_an_unmodelled_companion_key() {
-    if capsule_runtime::skip_without_host_support(
-        "test_capsule_step_objective_survives_an_unmodelled_companion_key",
-    ) {
-        return;
-    }
-    let _guard = roost_env_lock().lock().unwrap();
-    let dir = tempdir().unwrap();
-    let fake_roost = FakeRoost::start();
-    let _stub = StubMur::install(fake_roost.authority());
-    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
-    let plan = write_plan(
-        dir.path(),
-        json!({
-            "id":"p",
-            "steps":[{
-                "id":"worker",
-                "capsule":"worker",
-                "input":{"objective":"Echo this task","render_as":"json"}
-            }]
+            "steps":[{"id":"worker","capsule":"worker","input":"Echo this task"}]
         }),
     );
 
@@ -334,11 +293,12 @@ fn test_capsule_step_objective_survives_an_unmodelled_companion_key() {
     assert_eq!(fake_roost.sent_text(), "Echo this task");
 }
 
-/// `instructions` beside an `objective` sends the whole input as JSON.
+/// The shape is fixed at load time; the value is not. A capsule step therefore still takes its
+/// task text from an upstream step's output.
 #[test]
-fn test_capsule_step_instructions_force_json_passthrough() {
+fn test_capsule_step_receives_interpolated_upstream_output() {
     if capsule_runtime::skip_without_host_support(
-        "test_capsule_step_instructions_force_json_passthrough",
+        "test_capsule_step_receives_interpolated_upstream_output",
     ) {
         return;
     }
@@ -350,7 +310,7 @@ fn test_capsule_step_instructions_force_json_passthrough() {
     let invoke = |_name: &str, _input: ToolInput| {
         Ok(tool_result(
             ToolStatus::Passed,
-            Some("unused".to_string()),
+            Some("analysed the thing".to_string()),
             None,
         ))
     };
@@ -358,11 +318,15 @@ fn test_capsule_step_instructions_force_json_passthrough() {
         dir.path(),
         json!({
             "id":"p",
-            "steps":[{
-                "id":"worker",
-                "capsule":"worker",
-                "input":{"objective":"Echo this task","instructions":"Be brief"}
-            }]
+            "steps":[
+                {"id":"analyse","tool":"echo"},
+                {
+                    "id":"worker",
+                    "capsule":"worker",
+                    "depends_on":["analyse"],
+                    "input":{"objective":"$analyse.output"}
+                }
+            ]
         }),
     );
 
@@ -370,10 +334,89 @@ fn test_capsule_step_instructions_force_json_passthrough() {
     std::env::remove_var("MURMUR_ROOST_URL");
 
     assert!(report.completed, "{report:?}");
-    assert_eq!(
-        fake_roost.sent_text(),
-        "{\"instructions\":\"Be brief\",\"objective\":\"Echo this task\"}"
+    assert_eq!(fake_roost.sent_text(), "analysed the thing");
+}
+
+/// Runs a one-step plan whose only step is the given capsule step.
+///
+/// `plan::execute` validates a plan before it takes a cgroup scope or reads `MURMUR_ROOST_URL`,
+/// so a refused input shape needs neither host process bounding nor a daemon to reproduce.
+fn capsule_step_report(step: Value) -> plan::ExecutionReport {
+    let dir = tempdir().unwrap();
+    let invoke = |_name: &str, _input: ToolInput| Ok(tool_result(ToolStatus::Passed, None, None));
+    let plan = write_plan(dir.path(), json!({"id": "p", "steps": [step]}));
+
+    plan::execute(&plan, &ctx(dir.path().to_path_buf(), &invoke))
+}
+
+/// The plan is refused whole: one failed result for the offending step, and nothing ran.
+fn assert_capsule_input_refused(input_key: Option<Value>, expected: &str) {
+    let mut step = json!({"id": "worker", "capsule": "worker"});
+    if let Some(input) = input_key {
+        step["input"] = input;
+    }
+    let report = capsule_step_report(step);
+
+    assert!(!report.completed, "{report:?}");
+    assert_eq!(report.failed_step.as_deref(), Some("worker"), "{report:?}");
+    assert_eq!(report.results.len(), 1, "{report:?}");
+    assert_eq!(report.results[0].status, StepStatus::Failed, "{report:?}");
+    let error = report.results[0].error.as_deref().unwrap_or_default();
+    assert!(error.contains(expected), "{error}");
+}
+
+/// An envelope for the child's model to decode is refused rather than delivered as prose.
+#[test]
+fn test_capsule_step_input_refuses_a_task_envelope() {
+    assert_capsule_input_refused(
+        Some(json!({"task": "hello"})),
+        "capsule step input has keys the child cannot receive: task",
     );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_instructions_beside_an_objective() {
+    assert_capsule_input_refused(
+        Some(json!({"objective": "x", "instructions": "y"})),
+        "capsule step input has keys the child cannot receive: instructions",
+    );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_a_companion_key_beside_an_objective() {
+    assert_capsule_input_refused(
+        Some(json!({"objective": "x", "render_as": "json"})),
+        "capsule step input has keys the child cannot receive: render_as",
+    );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_a_number() {
+    assert_capsule_input_refused(
+        Some(json!(7)),
+        "capsule step input must be a string or { \"objective\": \"<text>\" }, not a number",
+    );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_an_array() {
+    assert_capsule_input_refused(
+        Some(json!(["a"])),
+        "capsule step input must be a string or { \"objective\": \"<text>\" }, not an array",
+    );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_a_non_string_objective() {
+    assert_capsule_input_refused(
+        Some(json!({"objective": 7})),
+        "capsule step input \"objective\" must be a string",
+    );
+}
+
+#[test]
+fn test_capsule_step_input_refuses_an_absent_input() {
+    assert_capsule_input_refused(None, "capsule step has no input");
 }
 
 #[test]

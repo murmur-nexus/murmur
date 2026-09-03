@@ -384,6 +384,13 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
             Ok(StepKind::Spawn) => {
                 // spawn_allow is enforced by mur-roost from the parent's CapabilityPolicy.
                 // No local check here — the capsule cannot self-authorize its own spawn rights.
+
+                // The input shape is settled before any step runs, so a plan that could only
+                // hand its child an envelope is refused without taking a cgroup scope, without
+                // spawning anything, and without the earlier steps having already had effects.
+                if let Err(error) = capsule_task_text(&step.input) {
+                    return Err((step.id.clone(), error));
+                }
             }
             Err(error) => return Err((step.id.clone(), error)),
         }
@@ -583,6 +590,12 @@ fn dispatch_shell_step(
 
 fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Value) -> StepResult {
     let capsule = step.capsule.as_deref().unwrap_or_default();
+    // `validate_plan` already accepted this step's un-interpolated input, and interpolation
+    // replaces a string with a string, so the refusal here is unreachable through `execute`.
+    let task = match capsule_task_text(&input) {
+        Ok(task) => task,
+        Err(error) => return failed(&step.id, error),
+    };
     let roost_url = match std::env::var("MURMUR_ROOST_URL") {
         Ok(value) if !value.trim().is_empty() => value,
         _ => {
@@ -623,7 +636,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
                 .get(capsule)
                 .cloned()
                 .unwrap_or_else(|| "0.1.0".to_string()),
-            task: capsule_step_input_text(input),
+            task,
         },
         &DelegationOrigin::default(),
     );
@@ -639,29 +652,59 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     }
 }
 
-/// The task text a capsule step hands to the child capsule.
+/// The task text a capsule step hands to the child capsule, or the reason the step's `input`
+/// cannot become task text.
 ///
-/// Whatever this returns becomes the child's user message verbatim: the receiving side pushes
-/// the delivered text straight at the model (`agent::process`), and nothing anywhere parses a
-/// task envelope. Wrapping the objective in one therefore does not deliver structure — it
-/// delivers prose that happens to be JSON, and spends the child's first turn on decoding it.
-/// So a plain `objective` is sent as plain text.
+/// Whatever this returns becomes the child's first user message verbatim: `DelegationPlane`
+/// sends it as the sole text part of an A2A `message/send`, the receiving runtime writes that
+/// text to `task.md`, and `agent::read_task` pushes it at the model. Nothing on the receiving
+/// side parses a task envelope, so an envelope is not structure — it is prose that happens to be
+/// JSON, and it spends the child's first turn on decoding. A capsule step's `input` is therefore
+/// the task text and nothing else, in one of two shapes:
 ///
-/// Any richer shape is passed through as its own JSON rather than flattened to one field, so a
-/// plan carrying data this runtime does not model still delivers everything its author wrote.
-/// The routing design that would give such structure a real reader — mur-roost staging a workdir
-/// the worker reads from — is still unbuilt; see
-/// `.nexus/roadmap/dag-capsule-step-workdir-and-input-routing-gap.md`.
-fn capsule_step_input_text(input: Value) -> String {
-    let bare_objective = input.get("objective").and_then(Value::as_str).filter(|_| {
-        ["instructions", "context"]
-            .iter()
-            .all(|key| input.get(key).is_none_or(Value::is_null))
-    });
+/// | `input` | task text |
+/// | --- | --- |
+/// | a JSON string | that string, verbatim |
+/// | `{ "objective": "<text>" }`, and no other key | `<text>`, verbatim |
+///
+/// Every other shape is refused rather than serialized into the message. Interpolation replaces
+/// a string with a string and so cannot change the shape, which is what lets `validate_plan`
+/// refuse the whole plan before a cgroup scope is taken or a child is spawned.
+fn capsule_task_text(input: &Value) -> Result<String, String> {
+    const ACCEPTS: &str = "capsule step input must be a string or { \"objective\": \"<text>\" }";
+    const NO_INPUT: &str = "capsule step has no input; its input is the task text the child \
+                            receives, given as a string or as { \"objective\": \"<text>\" }";
 
-    match bare_objective {
-        Some(objective) => objective.to_string(),
-        None => serde_json::to_string(&input).unwrap_or_default(),
+    match input {
+        Value::String(text) => Ok(text.clone()),
+        Value::Object(map) => {
+            // serde_json's map is a BTreeMap or an IndexMap depending on the `preserve_order`
+            // feature, so the listed keys are sorted here rather than taken in iteration order.
+            let mut unknown = map
+                .keys()
+                .filter(|key| key.as_str() != "objective")
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            unknown.sort_unstable();
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "capsule step input has keys the child cannot receive: {}; nothing on the \
+                     receiving side parses a task envelope, so put the whole instruction in \
+                     \"objective\"",
+                    unknown.join(", ")
+                ));
+            }
+
+            match map.get("objective") {
+                Some(Value::String(text)) => Ok(text.clone()),
+                Some(_) => Err("capsule step input \"objective\" must be a string".to_string()),
+                None => Err(ACCEPTS.to_string()),
+            }
+        }
+        Value::Null => Err(NO_INPUT.to_string()),
+        Value::Bool(_) => Err(format!("{ACCEPTS}, not a boolean")),
+        Value::Number(_) => Err(format!("{ACCEPTS}, not a number")),
+        Value::Array(_) => Err(format!("{ACCEPTS}, not an array")),
     }
 }
 
@@ -840,6 +883,108 @@ mod tests {
         let path = workdir.join("plan.json");
         fs::write(&path, serde_json::to_string(&plan).unwrap()).unwrap();
         path
+    }
+
+    #[test]
+    fn capsule_task_text_delivers_a_bare_string_verbatim() {
+        assert_eq!(
+            capsule_task_text(&json!("do the thing")).unwrap(),
+            "do the thing"
+        );
+    }
+
+    #[test]
+    fn capsule_task_text_delivers_a_lone_objective_verbatim() {
+        assert_eq!(
+            capsule_task_text(&json!({"objective": "do the thing"})).unwrap(),
+            "do the thing"
+        );
+    }
+
+    /// An empty task is a well-shaped one. What a child does with nothing to do is the child's
+    /// business, not this contract's.
+    #[test]
+    fn capsule_task_text_accepts_empty_task_text() {
+        assert_eq!(capsule_task_text(&json!("")).unwrap(), "");
+        assert_eq!(capsule_task_text(&json!({"objective": ""})).unwrap(), "");
+    }
+
+    #[test]
+    fn capsule_task_text_refuses_a_task_envelope() {
+        let error = capsule_task_text(&json!({"task": "hello"})).unwrap_err();
+        assert!(
+            error.contains("keys the child cannot receive: task"),
+            "{error}"
+        );
+        assert!(error.contains("\"objective\""), "{error}");
+    }
+
+    #[test]
+    fn capsule_task_text_lists_unaccepted_keys_in_sorted_order() {
+        let error =
+            capsule_task_text(&json!({"render_as": "json", "objective": "x", "instructions": "y"}))
+                .unwrap_err();
+        assert!(
+            error.contains("keys the child cannot receive: instructions, render_as"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn capsule_task_text_refuses_a_non_string_objective() {
+        for input in [json!({"objective": 7}), json!({"objective": null})] {
+            assert_eq!(
+                capsule_task_text(&input).unwrap_err(),
+                "capsule step input \"objective\" must be a string"
+            );
+        }
+    }
+
+    #[test]
+    fn capsule_task_text_refuses_an_object_without_an_objective() {
+        assert_eq!(
+            capsule_task_text(&json!({})).unwrap_err(),
+            "capsule step input must be a string or { \"objective\": \"<text>\" }"
+        );
+    }
+
+    #[test]
+    fn capsule_task_text_names_the_type_it_was_handed() {
+        assert!(capsule_task_text(&json!(7))
+            .unwrap_err()
+            .ends_with("not a number"));
+        assert!(capsule_task_text(&json!(true))
+            .unwrap_err()
+            .ends_with("not a boolean"));
+        assert!(capsule_task_text(&json!(["a"]))
+            .unwrap_err()
+            .ends_with("not an array"));
+    }
+
+    /// `StepDef::input` defaults to `Value::Null`, so an omitted `input` and an explicit null
+    /// are the same value and get the same refusal.
+    #[test]
+    fn capsule_task_text_refuses_an_absent_input() {
+        let error = capsule_task_text(&Value::Null).unwrap_err();
+        assert_eq!(
+            error,
+            "capsule step has no input; its input is the task text the child receives, given as \
+             a string or as { \"objective\": \"<text>\" }"
+        );
+    }
+
+    /// A `$reference` is a string, so both accepted shapes survive load-time validation and are
+    /// resolved at dispatch.
+    #[test]
+    fn capsule_task_text_accepts_an_uninterpolated_reference() {
+        assert_eq!(
+            capsule_task_text(&json!("$analyse.output")).unwrap(),
+            "$analyse.output"
+        );
+        assert_eq!(
+            capsule_task_text(&json!({"objective": "$analyse.output"})).unwrap(),
+            "$analyse.output"
+        );
     }
 
     #[test]
