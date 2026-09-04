@@ -20,7 +20,7 @@ Each tool call is resolved in a fixed precedence order:
 4. A WASM-artifact tool
 5. Otherwise, an error
 
-`share-file`, `fetch-peer-file` and `delegate-task` sit ahead of all five: they are
+`share-file`, `fetch-peer-file`, `delegate-task` and `submit-plan` sit ahead of all five: they are
 [runtime-provided tools](../reference/runtime-provided-tools.md), answered by the runtime rather
 than by an artifact, and their names are reserved.
 

@@ -352,6 +352,16 @@ impl DelegationPlane {
         Ok(env_allow_intersection(&declared, &self.parent_env_allow))
     }
 
+    /// This session's credential, cloned for a caller that delegates through a plane of its own.
+    ///
+    /// The one such caller is `plan::execute`, which builds its own [`DelegationPlane`] per
+    /// `capsule` step. Handing it this token rather than storing a second copy beside the plane
+    /// keeps one registration's authority in one place; the clone is still a
+    /// [`SpawnCredential`], so it cannot be formatted, serialized or traced into anything.
+    pub(crate) fn credential(&self) -> SpawnCredential {
+        self.credential.clone()
+    }
+
     /// A child's directory named from the parent's accessible workdir, which is the only root the
     /// parent's own tools address.
     fn workdir_relative(&self, workdir: &Path) -> String {

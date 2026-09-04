@@ -334,6 +334,7 @@ Effective grants
     - bash
   spawn allow: <none>
   env allow: <none>
+  plan submit:      false
   interpreter runtime: <none>
   staged runtime: <none>
 ```
@@ -363,6 +364,7 @@ Effective grants
     - bash
   spawn allow: <none>
   env allow: <none>
+  plan submit:      false
   interpreter runtime: <none>
   staged runtime: <none>
 ```

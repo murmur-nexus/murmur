@@ -63,12 +63,13 @@ pub use runtime_manifest::{
     HookExecutionMode, HookOverflowPolicy, InferenceConfig, InferenceDriver, InterpreterRuntimeDir,
     InterpreterRuntimeGrant, LifecycleConfig, LifecycleOverride, NetworkCapabilities,
     NetworkConfig, ObservabilityConfig, ParseContainmentClassError, PeerFetchCapabilities,
-    PeerFilesExport, ResourceCapabilities, ResourceLimits, RuntimeArtifact, RuntimeManifest,
-    RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant, StateCapabilities,
-    TaskAcceptance, TaskIoCapabilities, TraceConfig, TraceRetainConfig, BYTE_SIZE_ACCEPTED_FORM,
-    DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES, DEFAULT_PEER_HANDLE_TTL_SECS,
-    DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN, DURATION_ACCEPTED_FORM,
-    PEER_FETCH_ALLOW_ACCEPTED_FORM, PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
+    PeerFilesExport, PlanCapabilities, ResourceCapabilities, ResourceLimits, RuntimeArtifact,
+    RuntimeManifest, RuntimeManifestError, ScorerConfig, ShellCapabilities, StagedRuntimeGrant,
+    StateCapabilities, TaskAcceptance, TaskIoCapabilities, TraceConfig, TraceRetainConfig,
+    BYTE_SIZE_ACCEPTED_FORM, DEFAULT_EXPORT_MAX_BYTES, DEFAULT_PEER_FILES_MAX_BYTES,
+    DEFAULT_PEER_HANDLE_TTL_SECS, DEFAULT_SEED_BUDGET, DEFAULT_SEED_OVERFLOW_MARGIN,
+    DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
+    PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{

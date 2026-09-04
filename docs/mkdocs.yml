@@ -172,6 +172,7 @@ nav:
       - Diagnostics: reference/diagnostics.md
       - Session Workdir: reference/workdir.md
       - Runtime-Provided Tools: reference/runtime-provided-tools.md
+      - Plans: reference/plans.md
       - Resource Plane: reference/resource-plane.md
       - Observability Schemas: reference/observability-schemas.md
       - Default Artifacts: reference/default-artifacts.md

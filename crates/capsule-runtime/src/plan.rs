@@ -112,7 +112,41 @@ pub struct SchedulerContext<'a> {
     /// Emission is opt-in at the call site: with `None` no file is opened and no line is
     /// written, and the run's `ExecutionReport` is identical either way.
     pub trace: Option<&'a PlanTraceAppender>,
+    /// The session's own pre-dispatch decision point, asked about every `tool` and `shell` step
+    /// before it runs. `Some(reason)` fails that step with `reason` as its error and dispatches
+    /// nothing.
+    ///
+    /// A plan step is a call the model made, one indirection removed, so it is subject to the
+    /// same two refusals a direct call is: `capabilities.filesystem.read_only` and a
+    /// `commit_policy: deny` policy hook. Without this the scheduler would reach the session's
+    /// executors underneath both, and a command the session refuses would run as a plan step.
+    ///
+    /// A `capsule` step is not asked about: it runs nothing in this session, and the child it
+    /// delegates to applies its own manifest to whatever it does.
+    pub gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
     pub invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+}
+
+/// What a step is about to dispatch, as [`SchedulerContext::gate_step`] is shown it.
+///
+/// The scheduler holds no session state and resolves nothing itself: it hands over the same
+/// values it is about to hand the executor, and the gate turns them into whatever its own
+/// decision point reads.
+pub enum PlannedCall<'a> {
+    Tool {
+        name: &'a str,
+        /// The step's `input`, interpolated, exactly as the tool will receive it.
+        input_json: &'a str,
+    },
+    Shell {
+        /// The first word of the step's `shell` command.
+        binary: &'a str,
+        /// The step's `shell` command as written, untruncated.
+        command: &'a str,
+        /// The argument list the executable will receive, already split. No shell expands it, so
+        /// what is here is literally what runs.
+        argv: &'a [String],
+    },
 }
 
 pub fn execute(plan_path: &Path, ctx: &SchedulerContext<'_>) -> ExecutionReport {
@@ -640,6 +674,18 @@ fn validate_plan(plan: &PlanFile, ctx: &SchedulerContext<'_>) -> Result<(), (Str
         match infer_kind(step) {
             Ok(StepKind::Tool) => {
                 let tool = step.tool.as_ref().unwrap();
+                // Refused here rather than bounded by a depth counter: a plan that could submit a
+                // plan would nest one scheduler inside another's worker thread, and the outer
+                // report would carry the inner one as a step's output text.
+                if tool == crate::runtime::SUBMIT_PLAN_TOOL {
+                    return Err((
+                        step.id.clone(),
+                        format!(
+                            "a plan step cannot submit another plan: '{tool}' is not callable \
+                             from inside a plan"
+                        ),
+                    ));
+                }
                 if !ctx.installed_tools.contains(tool) {
                     return Err((step.id.clone(), format!("tool '{tool}' is not installed")));
                 }
@@ -841,6 +887,12 @@ fn dispatch_tool_step(
     input_json: String,
 ) -> (StepResult, Option<String>, Option<String>) {
     let name = step.tool.as_deref().unwrap_or_default();
+    if let Some(refusal) = (ctx.gate_step)(&PlannedCall::Tool {
+        name,
+        input_json: &input_json,
+    }) {
+        return (failed(&step.id, refusal), None, None);
+    }
     match (ctx.invoke_tool)(
         name,
         ToolInput {
@@ -886,6 +938,13 @@ fn dispatch_shell_step(
     let Some((binary, args)) = parse_shell_command(command) else {
         return failed(&step.id, "shell command is empty");
     };
+    if let Some(refusal) = (ctx.gate_step)(&PlannedCall::Shell {
+        binary: &binary,
+        command,
+        argv: &args,
+    }) {
+        return failed(&step.id, refusal);
+    }
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 
     match execute_shell(
@@ -920,6 +979,13 @@ fn dispatch_shell_step(
                 }
                 .to_string(),
             ),
+            // A command that fails without writing to stderr is the common case, not the odd
+            // one — `test`, `grep -q` and `diff` all report only through their exit status. The
+            // code is the whole of what failed, so the step carries it rather than an empty
+            // error the model has to guess at.
+            None if result.stderr.trim().is_empty() => {
+                failed(&step.id, format!("exit code {}", result.exit_code))
+            }
             None => failed(&step.id, result.stderr),
         },
         // Including a sealed composed-root failure, which fails the step carrying its full
@@ -1194,6 +1260,18 @@ mod tests {
         workdir: PathBuf,
         invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
     ) -> SchedulerContext<'a> {
+        test_ctx_gated(workdir, invoke_tool, &UNGATED)
+    }
+
+    /// A decision point that refuses nothing, which is what a session with neither a policy hook
+    /// nor a `capabilities.filesystem.read_only` declaration presents.
+    const UNGATED: fn(&PlannedCall<'_>) -> Option<String> = |_| None;
+
+    fn test_ctx_gated<'a>(
+        workdir: PathBuf,
+        invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+        gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
+    ) -> SchedulerContext<'a> {
         SchedulerContext {
             workdir,
             capability_policy: CapabilityPolicy {
@@ -1216,6 +1294,7 @@ mod tests {
             )),
             spawn_credential: None,
             trace: None,
+            gate_step,
             invoke_tool,
         }
     }
@@ -1337,6 +1416,140 @@ mod tests {
             capsule_task_text(&json!({"objective": "$analyse.output"})).unwrap(),
             "$analyse.output"
         );
+    }
+
+    /// [`test_ctx_gated`] with no `shell` or `spawn` grant, so the run needs no delegated cgroup
+    /// scope and holds on any host.
+    fn test_ctx_unbounded<'a>(
+        workdir: PathBuf,
+        invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+        gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
+    ) -> SchedulerContext<'a> {
+        SchedulerContext {
+            capability_policy: CapabilityPolicy::default(),
+            ..test_ctx_gated(workdir, invoke_tool, gate_step)
+        }
+    }
+
+    /// The decision point refuses, and the step it refused never reaches the executor.
+    ///
+    /// The refusal has to arrive as the step's own error rather than as an empty success, because
+    /// a plan whose steps quietly did nothing is indistinguishable from one that worked.
+    #[test]
+    fn a_refused_step_fails_with_the_refusal_and_is_never_dispatched() {
+        let dir = tempdir().unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&dispatched);
+        let invoke = move |_name: &str, _input: ToolInput| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(tool_result(ToolStatus::Passed, Some("ran".to_string())))
+        };
+        let gate = |call: &PlannedCall<'_>| match call {
+            PlannedCall::Tool { name: "a", .. } => Some("refused by the manifest".to_string()),
+            _ => None,
+        };
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [
+                    {"id": "refused", "tool": "a", "on_error": "continue"},
+                    {"id": "allowed", "tool": "b"}
+                ]
+            }),
+        );
+
+        let report = execute(
+            &plan,
+            &test_ctx_unbounded(dir.path().to_path_buf(), &invoke, &gate),
+        );
+        let refused = report
+            .results
+            .iter()
+            .find(|result| result.step_id == "refused")
+            .expect("the refused step settled");
+        assert_eq!(refused.status, StepStatus::Failed);
+        assert_eq!(refused.error.as_deref(), Some("refused by the manifest"));
+        assert_eq!(refused.output, None);
+        // The one dispatch is the step the gate let through.
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    /// A command that fails silently still says why. The model is handed the step's `error` as
+    /// the whole account of what went wrong, so an empty one reports a failure with no reason.
+    #[test]
+    fn a_shell_step_that_fails_without_stderr_reports_its_exit_code() {
+        if crate::cgroup::skip_without_host_support(
+            "plan::tests::a_shell_step_that_fails_without_stderr_reports_its_exit_code",
+        ) {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let invoke = |_name: &str, _input: ToolInput| Ok(tool_result(ToolStatus::Passed, None));
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [{"id": "quiet", "shell": "bash -c 'exit 3'"}]
+            }),
+        );
+
+        let report = execute(&plan, &test_ctx(dir.path().to_path_buf(), &invoke));
+        assert!(!report.completed);
+        assert_eq!(report.results[0].status, StepStatus::Failed);
+        assert_eq!(report.results[0].error.as_deref(), Some("exit code 3"));
+    }
+
+    /// A `shell` step is put to the same decision point, and a refused one starts no subprocess.
+    #[test]
+    fn a_refused_shell_step_starts_no_subprocess() {
+        if crate::cgroup::skip_without_host_support(
+            "plan::tests::a_refused_shell_step_starts_no_subprocess",
+        ) {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let invoke = |_name: &str, _input: ToolInput| Ok(tool_result(ToolStatus::Passed, None));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let gate = move |call: &PlannedCall<'_>| match call {
+            PlannedCall::Shell { binary, argv, .. } => {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((binary.to_string(), argv.to_vec()));
+                Some("refused by the manifest".to_string())
+            }
+            _ => None,
+        };
+        let marker = dir.path().join("written-by-a-refused-step");
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [{
+                    "id": "w",
+                    "shell": format!("bash -c 'printf x > {}'", marker.display()),
+                }]
+            }),
+        );
+
+        let report = execute(
+            &plan,
+            &test_ctx_gated(dir.path().to_path_buf(), &invoke, &gate),
+        );
+        assert!(!report.completed);
+        assert_eq!(report.failed_step.as_deref(), Some("w"));
+        assert_eq!(
+            report.results[0].error.as_deref(),
+            Some("refused by the manifest")
+        );
+        assert!(!marker.exists(), "a refused step must not have run");
+        // The gate is shown the argv the executable would have received, not the raw command.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "bash");
+        assert_eq!(seen[0].1[0], "-c");
     }
 
     #[test]

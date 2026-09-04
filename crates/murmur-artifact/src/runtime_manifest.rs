@@ -1062,6 +1062,16 @@ pub struct ConversationCapabilities {
     pub read: bool,
 }
 
+/// The `capabilities.plan` block — the operator's grant of the runtime-provided `submit-plan`
+/// tool to the capsule's agent loop. Read from the capsule-wide block only: an artifact entry
+/// declaring it grants nothing, because a plan is submitted by the agent and not by an artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanCapabilities {
+    /// Whether this capsule's model may submit a plan for the runtime to schedule. Never
+    /// inferred: a `plan:` block that omits `submit:` is rejected, exactly as `task_io:` is.
+    pub submit: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCapabilities {
     pub allow: Vec<String>,
@@ -1360,6 +1370,9 @@ pub struct Capabilities {
     /// Per-hook grant of the `murmur:conversation/read` host import — see
     /// [`ConversationCapabilities`].
     pub conversation: Option<ConversationCapabilities>,
+    /// Capsule-wide grant of the runtime-provided `submit-plan` tool. `None` is deny: the tool's
+    /// synthetic manifest is not written, so it is absent from the model's inventory entirely.
+    pub plan: Option<PlanCapabilities>,
     /// Minimum containment class this capsule declares. `None` (the overwhelmingly common
     /// case) means the capsule states no requirement and inherits whatever the workspace
     /// config or `--containment` asks for, defaulting to `advisory`.
@@ -1648,6 +1661,8 @@ struct RawCapabilities {
     task_io: Option<RawTaskIoCapabilities>,
     #[serde(default)]
     conversation: Option<RawConversationCapabilities>,
+    #[serde(default)]
+    plan: Option<RawPlanCapabilities>,
     /// Kept as a raw `String` rather than a `ContainmentClass` so a typo reports through
     /// `InvalidCapabilities` like every other bad capability value, instead of a bare serde
     /// "unknown variant" error attributed to the whole `capabilities:` block.
@@ -1673,6 +1688,16 @@ struct RawConversationCapabilities {
     // than defaulted.
     #[serde(default)]
     read: Option<bool>,
+    #[serde(flatten)]
+    unknown: UnknownKeys,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPlanCapabilities {
+    // `Option` for the reason `RawTaskIoCapabilities::read` is: an omitted key is refused rather
+    // than defaulted.
+    #[serde(default)]
+    submit: Option<bool>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2113,6 +2138,7 @@ impl RawBlock for RawCapabilities {
         "state",
         "task_io",
         "conversation",
+        "plan",
         "containment",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
@@ -2156,6 +2182,9 @@ impl RawBlock for RawCapabilities {
         if let Some(conversation) = &self.conversation {
             collect_block(conversation, &child_path(path, "conversation"), out);
         }
+        if let Some(plan) = &self.plan {
+            collect_block(plan, &child_path(path, "plan"), out);
+        }
     }
 }
 
@@ -2168,6 +2197,13 @@ impl RawBlock for RawTaskIoCapabilities {
 
 impl RawBlock for RawConversationCapabilities {
     const KNOWN_KEYS: &'static [&'static str] = &["read"];
+    fn unknown_keys(&self) -> &UnknownKeys {
+        &self.unknown
+    }
+}
+
+impl RawBlock for RawPlanCapabilities {
+    const KNOWN_KEYS: &'static [&'static str] = &["submit"];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
     }
@@ -3166,6 +3202,21 @@ fn parse_capabilities(
         })
         .transpose()?;
 
+    let plan = raw_caps
+        .plan
+        .map(|raw_plan| {
+            raw_plan
+                .submit
+                .map(|submit| PlanCapabilities { submit })
+                .ok_or_else(|| RuntimeManifestError::InvalidCapabilities {
+                    field: "capabilities.plan.submit".to_string(),
+                    message: "must be set explicitly to true or false — a capability is never \
+                              inferred"
+                        .to_string(),
+                })
+        })
+        .transpose()?;
+
     let containment = raw_caps
         .containment
         .as_deref()
@@ -3193,6 +3244,7 @@ fn parse_capabilities(
         state,
         task_io,
         conversation,
+        plan,
         containment,
     }))
 }
@@ -5233,6 +5285,66 @@ capabilities:
             "{msg}"
         );
         assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    // ── capabilities.plan (capsule-wide) ─────────────────────────────────────
+
+    /// A capsule manifest whose capsule-wide capabilities carry `plan: <block>`.
+    fn manifest_with_plan(block: &str) -> String {
+        format!("name: cap\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  plan:\n{block}")
+    }
+
+    #[test]
+    fn plan_submit_true_grants_the_capsule() {
+        let manifest = RuntimeManifest::from_yaml_str(&manifest_with_plan("    submit: true\n"))
+            .expect("a plan block parses");
+        assert_eq!(
+            manifest.capabilities.unwrap().plan,
+            Some(PlanCapabilities { submit: true })
+        );
+    }
+
+    /// `submit: false` and an absent `plan:` block both leave the capsule ungranted; the
+    /// difference between them is only whether the operator wrote the denial down.
+    #[test]
+    fn plan_submit_false_and_an_absent_block_both_leave_the_capsule_ungranted() {
+        let explicit = RuntimeManifest::from_yaml_str(&manifest_with_plan("    submit: false\n"))
+            .expect("an explicit denial parses");
+        assert_eq!(
+            explicit.capabilities.unwrap().plan,
+            Some(PlanCapabilities { submit: false })
+        );
+
+        let absent = RuntimeManifest::from_yaml_str("name: cap\nversion: 0.0.1\nartifacts: []\n")
+            .expect("no capabilities block parses");
+        assert!(absent.capabilities.is_none());
+    }
+
+    /// The capability is never inferred: a `plan:` block that omits `submit:` is a parse error
+    /// naming the key, exactly as `task_io:` without `read:` is.
+    #[test]
+    fn plan_without_submit_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(&manifest_with_plan("    {}\n"))
+            .expect_err("an empty plan block is refused");
+        let msg = err.to_string();
+        assert!(msg.contains("capabilities.plan.submit"), "{msg}");
+        assert!(msg.contains("never"), "{msg}");
+    }
+
+    /// An unknown key inside the block is reported by path, like every other capability block.
+    #[test]
+    fn an_unknown_plan_key_is_reported_by_path() {
+        let manifest =
+            RuntimeManifest::from_yaml_str(&manifest_with_plan("    submit: true\n    depth: 3\n"))
+                .expect("an unknown key is a warning, not a parse error");
+        assert!(
+            manifest
+                .unknown_keys
+                .iter()
+                .any(|key| key.block_path == "capabilities.plan" && key.key == "depth"),
+            "{:?}",
+            manifest.unknown_keys
+        );
     }
 
     // ── capabilities.task_io (per-hook, honored only on runtime: hook) ────────

@@ -14,7 +14,7 @@ use std::{
 
 use capsule_runtime::{
     bindings::host::murmur::tool::run::{Status as ToolStatus, ToolInput, ToolResult},
-    plan::{self, SchedulerContext, StepStatus},
+    plan::{self, PlannedCall, SchedulerContext, StepStatus},
     CapabilityPolicy, SpawnCredential, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER,
 };
 use serde_json::{json, Value};
@@ -36,6 +36,18 @@ fn ctx<'a>(
     workdir: PathBuf,
     invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
 ) -> SchedulerContext<'a> {
+    ctx_gated(workdir, invoke_tool, &UNGATED)
+}
+
+/// A decision point that refuses nothing, which is what a session with neither a policy hook nor
+/// a `capabilities.filesystem.read_only` declaration presents.
+const UNGATED: fn(&PlannedCall<'_>) -> Option<String> = |_| None;
+
+fn ctx_gated<'a>(
+    workdir: PathBuf,
+    invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+    gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
+) -> SchedulerContext<'a> {
     SchedulerContext {
         workdir,
         capability_policy: CapabilityPolicy {
@@ -54,6 +66,7 @@ fn ctx<'a>(
         registry: worker_registry(),
         spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
         trace: None,
+        gate_step,
         invoke_tool,
     }
 }
