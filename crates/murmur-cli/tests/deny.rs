@@ -291,8 +291,6 @@ fn one_shell_call(command: &str) -> Vec<String> {
 
 // ── Scenarios ────────────────────────────────────────────────────────────────
 
-/// A denying `on-shell` hook stops the command: nothing runs, the agent is told which hook
-/// refused and why, and the trace carries a `call_denied` and no `shell` record.
 /// A plan step reaches the same decision point a direct call does.
 ///
 /// `submit-plan` runs its steps through the session's own executors, so a step that entered
@@ -345,6 +343,8 @@ fn denying_on_shell_hook_stops_a_plan_step() {
     );
 }
 
+/// A denying `on-shell` hook stops the command: nothing runs, the agent is told which hook
+/// refused and why, and the trace carries a `call_denied` and no `shell` record.
 #[test]
 fn denying_on_shell_hook_stops_the_command() {
     if common::skip_without_host_support("denying_on_shell_hook_stops_the_command") {

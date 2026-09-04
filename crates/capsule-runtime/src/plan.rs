@@ -979,6 +979,13 @@ fn dispatch_shell_step(
                 }
                 .to_string(),
             ),
+            // A command that fails without writing to stderr is the common case, not the odd
+            // one — `test`, `grep -q` and `diff` all report only through their exit status. The
+            // code is the whole of what failed, so the step carries it rather than an empty
+            // error the model has to guess at.
+            None if result.stderr.trim().is_empty() => {
+                failed(&step.id, format!("exit code {}", result.exit_code))
+            }
             None => failed(&step.id, result.stderr),
         },
         // Including a sealed composed-root failure, which fails the step carrying its full
@@ -1466,6 +1473,31 @@ mod tests {
         assert_eq!(refused.output, None);
         // The one dispatch is the step the gate let through.
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    /// A command that fails silently still says why. The model is handed the step's `error` as
+    /// the whole account of what went wrong, so an empty one reports a failure with no reason.
+    #[test]
+    fn a_shell_step_that_fails_without_stderr_reports_its_exit_code() {
+        if crate::cgroup::skip_without_host_support(
+            "plan::tests::a_shell_step_that_fails_without_stderr_reports_its_exit_code",
+        ) {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let invoke = |_name: &str, _input: ToolInput| Ok(tool_result(ToolStatus::Passed, None));
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [{"id": "quiet", "shell": "bash -c 'exit 3'"}]
+            }),
+        );
+
+        let report = execute(&plan, &test_ctx(dir.path().to_path_buf(), &invoke));
+        assert!(!report.completed);
+        assert_eq!(report.results[0].status, StepStatus::Failed);
+        assert_eq!(report.results[0].error.as_deref(), Some("exit code 3"));
     }
 
     /// A `shell` step is put to the same decision point, and a refused one starts no subprocess.
