@@ -224,13 +224,21 @@ pub struct DelegationLaunch {
 ///
 /// Per call rather than per plane: a launch that mints one context id per task has no
 /// launch-scoped conversation to name, so the id is only knowable once a task is running.
-#[derive(Debug, Clone, Default)]
-pub struct DelegationOrigin {
+#[derive(Clone, Default)]
+pub struct DelegationOrigin<'a> {
     /// The conversation the delegation was made from. Empty when the caller has none, which
     /// injects no handle at all rather than one naming a conversation that does not exist.
     pub context_id: String,
-    /// Where the launch notice goes, or `None` for a caller that records no `delegation_start`.
-    pub launched: Option<tokio::sync::mpsc::UnboundedSender<DelegationLaunch>>,
+    /// What to do with the launch notice, or `None` for a caller that records no
+    /// `delegation_start`. Called on the delegating thread, before the delegation has ended.
+    ///
+    /// A callback rather than a channel because the two callers are not the same shape:
+    /// [`DelegationPlane::start`] runs on a blocking tokio worker with a task free to drain a
+    /// receiver, while `plan::execute` calls [`DelegationPlane::delegate`] directly on a
+    /// scheduler thread with no runtime to await on and nothing else running to drain anything.
+    /// Invoked in place, both surfaces get the record on disk while the child is still in flight,
+    /// which is the whole reason it is a record of its own.
+    pub launched: Option<std::sync::Arc<dyn Fn(DelegationLaunch) + Send + Sync + 'a>>,
     /// The trust class of the task that made the delegation, inherited by the completion this
     /// delegation eventually posts.
     ///
@@ -238,6 +246,18 @@ pub struct DelegationOrigin {
     /// is already given. Read only by [`DelegationPlane::start`]: a delegation that posts no
     /// completion has no trust to carry.
     pub trust: Option<TrustClass>,
+}
+
+/// Hand-written because [`DelegationOrigin::launched`] is a trait object and cannot derive one.
+/// A callback has no readable identity, so what is printed of it is whether there is one.
+impl std::fmt::Debug for DelegationOrigin<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationOrigin")
+            .field("context_id", &self.context_id)
+            .field("launched", &self.launched.is_some())
+            .field("trust", &self.trust)
+            .finish()
+    }
 }
 
 /// One session's authority to delegate, and everything a delegation needs beyond the three
@@ -408,7 +428,7 @@ impl DelegationPlane {
     fn announce(
         &self,
         request: &DelegationRequest,
-        origin: &DelegationOrigin,
+        origin: &DelegationOrigin<'_>,
         child: &crate::child_launch::LaunchedChild,
         delegation_id: &str,
     ) {
@@ -417,7 +437,7 @@ impl DelegationPlane {
             .as_ref()
             .filter(|_| !delegation_id.is_empty())
         {
-            let _ = launched.send(DelegationLaunch {
+            launched(DelegationLaunch {
                 delegation_id: delegation_id.to_string(),
                 capsule: request.capsule.clone(),
                 version: request.version.clone(),
@@ -445,7 +465,7 @@ impl DelegationPlane {
     pub fn start(
         &self,
         request: &DelegationRequest,
-        origin: &DelegationOrigin,
+        origin: &DelegationOrigin<'_>,
     ) -> DelegationResult {
         // Refused before the daemon is touched, because there is nothing to ask about: a
         // delegation started here would run to completion and post its outcome nowhere, which is
@@ -569,7 +589,7 @@ impl DelegationPlane {
     pub fn delegate(
         &self,
         request: &DelegationRequest,
-        origin: &DelegationOrigin,
+        origin: &DelegationOrigin<'_>,
     ) -> DelegationResult {
         // Step 1: ask whether this session may spawn that capsule.
         let grant = match self.approval_for(request) {

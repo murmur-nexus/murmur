@@ -63,7 +63,7 @@ before the first task begins
 | `workdir_exec` | bool | `capabilities.filesystem.workdir_exec`, always written. `true` means the session workdir kept its `Execute` right, so `capabilities.shell.allow` was advisory inside it — and it is why `containment_achieved` can read `"advisory"` on a Landlock-capable host. See [`W-SEC-011`](diagnostics.md#w-sec-011) |
 | `resumed_from` | string \| null | The session [`mur run --resume`](cli.md#mur-run) continued, verbatim as the address resolved it. `null` on an ordinary launch. Always written, so its absence identifies a trace from a runtime predating the field |
 | `context_id` | string \| null | The context id every task of this launch runs under: the `mur run --context` value, or the id `--resume` resolved to. `null` when each task mints its own — `task_start.context_id` carries the id a task actually ran under either way. Always written, on the same terms as `resumed_from` |
-| `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
+| `spawned_by` | string | `ses_…` — the session that spawned this one, for a capsule another capsule launched with [`delegate-task`](runtime-provided-tools.md) or with a plan's [`capsule` step](plans.md). Written only then; the field is absent from every other line rather than written as `null`, so a capsule nobody delegated produces a byte-identical record |
 | `delegation_id` | string | `dlg_…` — the delegation that created this session, character-identical to the id on the spawning session's own `delegation_start`. Present exactly when `spawned_by` is |
 | `system_prompt_source` | string | `"manifest"` \| `"cli"` \| `"none"` — where the system prompt in effect came from. `"cli"` whenever [`mur run --system-prompt`](cli.md#mur-run) was passed, including when its value was empty and therefore cleared the prompt. Always written, so its absence identifies a trace from a runtime predating the field rather than a session with no prompt |
 | `system_prompt_sha256` | string \| null | SHA-256 (lowercase hex) of the prompt as resolved — the manifest's or the override's own text, before the runtime prepends its `[Capsule]` identity block. `null` when no prompt was in effect. Always written, so two sessions can be compared for prompt equality without either trace carrying the prompt itself. Under [`trace.capture: content`](manifest.md#field-trace) those bytes are also stored as `blobs/<system_prompt_sha256>`. Deliberately a different value from `inference.system_sha`, which covers the augmented prompt that went on the wire |
@@ -547,8 +547,8 @@ refused
 by the listener, concurrently with any running task. All three are written at the moment of the
 event.
 
-**`delegation_start`** — written by the `delegate-task` tool once per launched child, as soon as
-that child's process is up and has reported its session id
+**`delegation_start`** — written once per launched child, as soon as that child's process is up
+and has reported its session id
 
 | Field | Type | Notes |
 |---|---|---|
@@ -558,12 +558,11 @@ that child's process is up and has reported its session id
 | `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
 | `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir. Join the two, then `.murmur/<child_session_id>/trace.jsonl`, to reach the child's own trace |
 
-Written when the child starts, which is also when the `delegate-task` call returns, so a child that
-then hangs, crashes or is ended is attributable from the parent's side whatever happens next. A
-delegation the daemon refused writes none of these — nothing was launched — and is recorded only by
-the `delegation` line below.
+Written when the child starts, so a child that then hangs, crashes or is ended is attributable
+from the parent's side whatever happens next. A delegation the daemon refused writes none of these
+— nothing was launched — and is recorded only by the `delegation` line below.
 
-**`delegation`** — written once per `delegate-task` call, when the delegation ends
+**`delegation`** — written once per delegation, when it ends
 
 | Field | Type | Notes |
 |---|---|---|
@@ -575,17 +574,27 @@ the `delegation` line below.
 | `outcome` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` for a delegation that started and ended; `"unknown"` when its sub-capsule left no readable `completion.json`; `"failed"` or `"refused"` for one that never started |
 | `reason` | string \| null | `null` on `"ok"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
 
+**Two surfaces launch children**, and both write both lines, off the same event structures and
+under the same session node: the [`delegate-task`](runtime-provided-tools.md) tool an agent calls,
+and a plan's [`capsule` step](plans.md). Neither record names the surface that launched the child,
+so a reader can tell that a delegation happened but not which one made it.
+
 **When each line is written.** A `delegate-task` call that starts a child writes `delegation_start`
 and nothing else: the delegation has not ended, and the call has returned. The terminal
 `delegation` line is written later, as the task carrying that delegation's outcome begins, out of
 the child's own [`completion.json`](roost-api.md#the-completion-path) rather than out of the text
 the agent reads. A call that never started a child — refused, or failed before the child held its
 task — writes only the terminal line, in the same turn, and names no `delegation_id`. A plan
-`capsule` step writes neither line: a plan run is recorded by its own `plan_step` events instead.
+`capsule` step waits for its child's answer, so it writes both lines within the step, and a step
+with `retries` writes one pair per attempt.
 
-One line per call either way. It carries neither the task text nor the child's answer — both are
-the agent's own conversation, which the `tool_call` line for the same call already records under
-the session's `trace.capture` setting.
+A `capsule` step's `plan_step` records are not a second copy of this: the plan-step pair records
+the scheduler's unit of work — its dependencies, its attempts, its status after `on_error` — and
+the delegation pair records one child launch.
+
+One line per delegation either way. It carries neither the task text nor the child's answer — both
+are the agent's own conversation, which the `tool_call` line for the same call already records
+under the session's `trace.capture` setting.
 
 ### Reading a formation { #delegation-lineage }
 

@@ -972,8 +972,11 @@ struct PeerFileFetchEvent {
     reason: Option<String>,
 }
 
-/// One `delegate-task` call, written the moment its child is up — which is also the moment the
-/// call returns.
+/// One launched child, written the moment it is up.
+///
+/// Two surfaces launch children — the agent's `delegate-task` tool and a plan's `capsule` step —
+/// and both write this line, off the same struct and off the same session node. Which one made a
+/// given delegation is not recorded, because it is not a fact about the delegation.
 ///
 /// Separate from the `delegation` line below because the two answer different questions and land
 /// at different times: this one reaches disk while the delegation is still in flight, so a child
@@ -1004,10 +1007,10 @@ struct DelegationStartEvent {
 /// asked for and not made is as much a fact of the run as one that produced an answer. When it is
 /// written depends on how far the delegation got — a `delegate-task` call that started a child
 /// writes it as that child's completion arrives, out of the child's own `completion.json`; one that
-/// never started a child writes it within the call. A plan `capsule` step writes neither this line
-/// nor the `delegation_start` above it: it holds no trace appender. Carries neither the task text
-/// nor the child's answer — both are the agent's own conversation, which the `tool_call` line for
-/// the same call already records under the session's `trace.capture` setting.
+/// never started a child writes it within the call. A plan `capsule` step waits for its child's
+/// answer, so it always writes this line within the step. Carries neither the task text nor the
+/// child's answer — both are the agent's own conversation, which the `tool_call` line for the
+/// same call already records under the session's `trace.capture` setting.
 #[derive(Serialize)]
 struct DelegationEvent {
     event_type: &'static str,
@@ -2545,6 +2548,70 @@ impl PlanTraceAppender {
             steps_skipped: record.steps_skipped,
             duration_ms: record.duration_ms,
             reason: record.reason,
+        };
+        self.append(&event);
+    }
+
+    /// Records one child a `capsule` step launched, while its delegation is still running.
+    ///
+    /// The synchronous twin of [`ResourceTraceAppender::write_delegation_start`], writing the
+    /// same [`DelegationStartEvent`] off the same session node. Which surface launched a child is
+    /// not a fact either record carries, so the two are identical but for their ids and clocks —
+    /// a construction property, held by there being one struct rather than by a test.
+    pub(crate) fn write_delegation_start(
+        &self,
+        delegation_id: &str,
+        capsule: &str,
+        version: &str,
+        child_session_id: &str,
+        child_workdir: &str,
+    ) {
+        let event = DelegationStartEvent {
+            event_type: "delegation_start",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            delegation_id: delegation_id.to_string(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            child_session_id: child_session_id.to_string(),
+            child_workdir: child_workdir.to_string(),
+        };
+        self.append(&event);
+    }
+
+    /// Records one `capsule` step's delegation ending. `delegation_id` and `child_session_id` are
+    /// `None` when no child was launched, on the same terms
+    /// [`ResourceTraceAppender::write_delegation`] passes them.
+    ///
+    /// One pair per *attempt*: a step with retries delegates once per attempt, so it writes one
+    /// of these per attempt. Two `failed` lines and a `completed` one is what happened, not a
+    /// duplicate of one thing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_delegation(
+        &self,
+        capsule: &str,
+        version: &str,
+        delegation_id: Option<String>,
+        child_session_id: Option<String>,
+        duration_ms: u64,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let event = DelegationEvent {
+            event_type: "delegation",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            delegation_id,
+            child_session_id,
+            duration_ms,
+            outcome: outcome.to_string(),
+            reason,
         };
         self.append(&event);
     }
@@ -4564,5 +4631,85 @@ mod tests {
             std::fs::read(blob_path(dir.path(), &sha)).unwrap(),
             serde_json::to_vec(&message).unwrap()
         );
+    }
+
+    /// A delegation record a plan's `capsule` step wrote and one `delegate-task` wrote are the
+    /// same record.
+    ///
+    /// Identical key sets and identical values on everything but the two fields that are
+    /// per-line by construction — the event id and the clock. That is what makes a trace
+    /// unable to say which surface launched a child, and it holds because both appenders
+    /// serialize the same struct rather than because this test watches them.
+    #[tokio::test]
+    async fn a_plan_written_delegation_record_matches_a_delegate_task_one() {
+        let plan_dir = tempfile::tempdir().unwrap();
+        let tool_dir = tempfile::tempdir().unwrap();
+        let session = "ses_0000000000004000800000000000plan".to_string();
+        let node = "evt_0000000000004000800000000000node".to_string();
+
+        let plan = PlanTraceAppender::open(plan_dir.path(), session.clone(), node.clone()).unwrap();
+        let tool = ResourceTraceAppender::open(tool_dir.path(), session.clone(), node.clone())
+            .await
+            .unwrap();
+
+        plan.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c");
+        tool.write_delegation_start("dlg_abc123", "worker", "0.1.0", "ses_child", ".murmur/c")
+            .await;
+        plan.write_delegation(
+            "worker",
+            "0.1.0",
+            Some("dlg_abc123".to_string()),
+            Some("ses_child".to_string()),
+            42,
+            "completed",
+            None,
+        );
+        tool.write_delegation(
+            "worker",
+            "0.1.0",
+            Some("dlg_abc123".to_string()),
+            Some("ses_child".to_string()),
+            42,
+            "completed",
+            None,
+        )
+        .await;
+
+        let read = |dir: &Path| -> Vec<serde_json::Map<String, Value>> {
+            std::fs::read_to_string(dir.join("trace.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Map<_, _>>(line).unwrap())
+                .collect()
+        };
+        let from_plan = read(plan_dir.path());
+        let from_tool = read(tool_dir.path());
+        assert_eq!(from_plan.len(), 2);
+        assert_eq!(from_tool.len(), 2);
+
+        for (planned, called, event_type) in [
+            (&from_plan[0], &from_tool[0], "delegation_start"),
+            (&from_plan[1], &from_tool[1], "delegation"),
+        ] {
+            assert_eq!(planned["event_type"], event_type);
+            assert_eq!(called["event_type"], event_type);
+            assert_eq!(
+                planned.keys().collect::<Vec<_>>(),
+                called.keys().collect::<Vec<_>>(),
+                "{planned:?} vs {called:?}"
+            );
+            assert_eq!(planned["parent_id"], node.as_str());
+            assert_eq!(called["parent_id"], node.as_str());
+            for (key, value) in planned {
+                if key == "event_id" || key == "timestamp" {
+                    continue;
+                }
+                assert_eq!(value, &called[key], "{key}: {planned:?} vs {called:?}");
+            }
+            for key in ["plan_id", "step_id", "surface", "kind"] {
+                assert!(!planned.contains_key(key), "{key} is on {planned:?}");
+                assert!(!called.contains_key(key), "{key} is on {called:?}");
+            }
+        }
     }
 }

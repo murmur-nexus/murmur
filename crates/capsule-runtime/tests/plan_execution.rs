@@ -29,6 +29,10 @@ const TEST_CREDENTIAL: &str = "msc1.CREDENTIALmustNEVERleakZZZ99.testsignature";
 /// The session id the delegating context asks as.
 const TEST_SESSION: &str = "ses_00000000000000000000000000000test";
 
+/// The conversation the delegating context is running the plan in, and therefore the one every
+/// `capsule` step's child is told it was spawned from.
+const TEST_CONTEXT: &str = "ctx_00000000000000000000000000000test";
+
 /// The `shell_allow` grant below is what makes every test built on this context need a delegated
 /// cgroup v2 scope: `plan::execute` bounds the plan's whole subprocess tree before running a step,
 /// and fails closed when it cannot.
@@ -63,6 +67,7 @@ fn ctx_gated<'a>(
         ]),
         capsule_versions: HashMap::from([("worker".to_string(), "0.1.0".to_string())]),
         current_session_id: Some(TEST_SESSION.to_string()),
+        current_context_id: Some(TEST_CONTEXT.to_string()),
         registry: worker_registry(),
         spawn_credential: Some(SpawnCredential::new(TEST_CREDENTIAL.to_string())),
         trace: None,
@@ -1877,4 +1882,289 @@ fn test_no_appender_writes_no_trace_file() {
 
     assert!(report.completed, "{report:?}");
     assert!(!dir.path().join("trace.jsonl").exists());
+}
+
+// ── Delegation records ───────────────────────────────────────────────────────
+//
+// A `capsule` step launches a child on the same terms the agent-facing `delegate-task` tool does,
+// and records it on the same terms: the same two event types, off the same session node, out of
+// the same event structs. Nothing here names the plan or the step, because a reader of a trace
+// must not be able to tell which surface launched a child.
+
+/// [`ctx`] with a trace appender attached and every subprocess grant kept.
+///
+/// Unlike [`traced_ctx`], which drops `spawn_allow` so its cases run on a host that cannot
+/// delegate a cgroup v2 scope, these cases delegate for real — so they keep the grant and stand
+/// down behind [`capsule_runtime::skip_without_host_support`] instead.
+fn traced_capsule_ctx<'a>(
+    workdir: PathBuf,
+    invoke_tool: &'a (dyn Fn(&str, ToolInput) -> Result<ToolResult, String> + Sync),
+    appender: &'a capsule_runtime::PlanTraceAppender,
+) -> SchedulerContext<'a> {
+    let mut context = ctx(workdir, invoke_tool);
+    context.trace = Some(appender);
+    context
+}
+
+/// A tool that no case in this section runs, because a `capsule` step dispatches no tool.
+fn unused_tool(_name: &str, _input: ToolInput) -> Result<ToolResult, String> {
+    Ok(tool_result(
+        ToolStatus::Passed,
+        Some("unused".to_string()),
+        None,
+    ))
+}
+
+/// Every `delegation_start`, paired with the `delegation` line carrying the same id and the
+/// positions of both in the file.
+fn delegation_pairs(lines: &[Value]) -> Vec<(usize, &Value, usize, &Value)> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line["event_type"] == "delegation_start")
+        .map(|(at, start)| {
+            let id = start["delegation_id"].as_str().unwrap();
+            let (end_at, end) = lines
+                .iter()
+                .enumerate()
+                .find(|(_, line)| line["event_type"] == "delegation" && line["delegation_id"] == id)
+                .unwrap_or_else(|| panic!("no delegation line joins {id}: {lines:#?}"));
+            (at, start, end_at, end)
+        })
+        .collect()
+}
+
+/// Three `capsule` steps with no `depends_on` between them run at once, and the parent's trace
+/// carries one record pair per child — three distinct `dlg_` ids, each opened before it is closed.
+#[test]
+fn test_three_concurrent_capsule_steps_record_three_delegations() {
+    if capsule_runtime::skip_without_host_support(
+        "test_three_concurrent_capsule_steps_record_three_delegations",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    let _stub = StubMur::install(fake_roost.authority());
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let plan = write_plan(
+        dir.path(),
+        json!({
+            "id": "fan-out",
+            "steps": [
+                {"id": "one", "capsule": "worker", "input": {"objective": "first"}},
+                {"id": "two", "capsule": "worker", "input": {"objective": "second"}},
+                {"id": "three", "capsule": "worker", "input": {"objective": "third"}}
+            ]
+        }),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_capsule_ctx(dir.path().to_path_buf(), &unused_tool, &trace),
+    );
+    std::env::remove_var("MURMUR_ROOST_URL");
+    assert!(report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    let starts = of_type(&lines, "delegation_start");
+    let ends = of_type(&lines, "delegation");
+    assert_eq!(starts.len(), 3, "{lines:#?}");
+    assert_eq!(ends.len(), 3, "{lines:#?}");
+    // The plan-step records this run also writes are a different pair describing a different
+    // thing; nothing else in the file is a delegation record.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line["event_type"]
+                .as_str()
+                .unwrap()
+                .starts_with("delegation"))
+            .count(),
+        6,
+        "{lines:#?}"
+    );
+
+    let mut ids = Vec::new();
+    for (start_at, start, end_at, end) in delegation_pairs(&lines) {
+        assert_identity(start, TEST_SESSION_EVENT);
+        assert_identity(end, TEST_SESSION_EVENT);
+        let id = start["delegation_id"].as_str().unwrap();
+        assert!(
+            id.strip_prefix("dlg_").is_some_and(|rest| !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())),
+            "{id}"
+        );
+        for key in ["capsule", "version", "child_session_id", "child_workdir"] {
+            assert!(!start[key].as_str().unwrap().is_empty(), "{key}: {start}");
+        }
+        // The start always reaches disk while the child is still in flight, so it is always the
+        // earlier of the two lines.
+        assert!(start_at < end_at, "{start} came after {end}");
+        assert_eq!(end["outcome"], "completed", "{end}");
+        assert!(end["reason"].is_null(), "{end}");
+        assert_eq!(end["capsule"], start["capsule"], "{end}");
+        assert_eq!(end["child_session_id"], start["child_session_id"], "{end}");
+        ids.push(id.to_string());
+    }
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "{lines:#?}");
+
+    // Nothing naming the plan, the step or the surface that launched the child is on either
+    // record: that is what makes a plan's delegation indistinguishable from a `delegate-task` one.
+    for line in starts.into_iter().chain(ends) {
+        for key in ["plan_id", "step_id", "surface", "kind"] {
+            assert!(line.get(key).is_none(), "{key} is on {line}");
+        }
+    }
+}
+
+/// Each child a `capsule` step launches is told which session and conversation spawned it, and
+/// under which delegation — the same handle a `delegate-task` child is launched with.
+#[test]
+fn test_a_capsule_step_launches_its_child_naming_its_parent() {
+    if capsule_runtime::skip_without_host_support(
+        "test_a_capsule_step_launches_its_child_naming_its_parent",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::start();
+    let stub = StubMur::install(fake_roost.authority());
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_capsule_ctx(dir.path().to_path_buf(), &unused_tool, &trace),
+    );
+    std::env::remove_var("MURMUR_ROOST_URL");
+    assert!(report.completed, "{report:?}");
+
+    let env = stub.recorded("env.txt");
+    let value = env
+        .lines()
+        .find_map(|line| line.strip_prefix("MURMUR_SPAWNER="))
+        .unwrap_or_else(|| panic!("the child was launched with no MURMUR_SPAWNER: {env}"));
+    let handle = capsule_runtime::SpawnerHandle::parse(value).unwrap();
+
+    assert_eq!(handle.session_id, TEST_SESSION);
+    assert_eq!(handle.context_id, TEST_CONTEXT);
+    // Lineage only: this delegation's answer arrives on the connection the step is holding, so
+    // there is nowhere for the child to report and no address for it to report to.
+    assert_eq!(handle.report_to, None);
+
+    let lines = trace_lines(dir.path());
+    assert_eq!(
+        only(&lines, "delegation_start")["delegation_id"]
+            .as_str()
+            .unwrap(),
+        handle.delegation_id,
+    );
+}
+
+/// A refusal launched nothing, so it opens no row: one terminal line naming no child, carrying
+/// the daemon's own sentence — the same sentence the step failed with.
+#[test]
+fn test_a_refused_capsule_step_delegation_is_traced_with_the_daemons_reason() {
+    if capsule_runtime::skip_without_host_support(
+        "test_a_refused_capsule_step_delegation_is_traced_with_the_daemons_reason",
+    ) {
+        return;
+    }
+    let _guard = roost_env_lock().lock().unwrap();
+    let dir = tempdir().unwrap();
+    let fake_roost = FakeRoost::refusing_spawn();
+    let _stub = StubMur::install(fake_roost.authority());
+    std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
+    let plan = write_plan(
+        dir.path(),
+        json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
+    );
+
+    let trace = appender(dir.path());
+    let report = plan::execute(
+        &plan,
+        &traced_capsule_ctx(dir.path().to_path_buf(), &unused_tool, &trace),
+    );
+    std::env::remove_var("MURMUR_ROOST_URL");
+    assert!(!report.completed, "{report:?}");
+
+    let lines = trace_lines(dir.path());
+    assert!(of_type(&lines, "delegation_start").is_empty(), "{lines:#?}");
+    let end = only(&lines, "delegation");
+    assert_identity(end, TEST_SESSION_EVENT);
+    assert_eq!(end["outcome"], "refused", "{end}");
+    assert!(end["delegation_id"].is_null(), "{end}");
+    assert!(end["child_session_id"].is_null(), "{end}");
+    assert_eq!(end["capsule"], "worker", "{end}");
+    assert_eq!(
+        end["reason"].as_str().unwrap(),
+        find(&report, "worker").error.as_deref().unwrap(),
+    );
+}
+
+/// A plan that delegates to nobody writes no delegation record and opens no file, whether it was
+/// handed an appender or not.
+#[test]
+fn test_a_plan_with_no_capsule_steps_writes_no_trace_file() {
+    // Its shell step is a real subprocess, so it wants the same bounded host every other case
+    // that starts one does.
+    if capsule_runtime::skip_without_host_support(
+        "test_a_plan_with_no_capsule_steps_writes_no_trace_file",
+    ) {
+        return;
+    }
+    let invoke = |_name: &str, _input: ToolInput| {
+        Ok(tool_result(
+            ToolStatus::Passed,
+            Some("out".to_string()),
+            None,
+        ))
+    };
+
+    for traced in [true, false] {
+        let dir = tempdir().unwrap();
+        let plan = write_plan(
+            dir.path(),
+            json!({
+                "id": "p",
+                "steps": [
+                    {"id": "a", "tool": "echo", "input": {"x": 1}},
+                    {"id": "b", "shell": "printf hello", "depends_on": ["a"]}
+                ]
+            }),
+        );
+
+        // `PlanTraceAppender::open` creates the file, so the traced run is asserted on the
+        // delegation records it holds rather than on the file not existing.
+        let report = if traced {
+            let trace = appender(dir.path());
+            let mut context = ctx(dir.path().to_path_buf(), &invoke);
+            context.capability_policy.spawn_allow = Vec::new();
+            context.trace = Some(&trace);
+            let report = plan::execute(&plan, &context);
+            let lines = trace_lines(dir.path());
+            assert!(of_type(&lines, "delegation_start").is_empty(), "{lines:#?}");
+            assert!(of_type(&lines, "delegation").is_empty(), "{lines:#?}");
+            report
+        } else {
+            let mut context = ctx(dir.path().to_path_buf(), &invoke);
+            context.capability_policy.spawn_allow = Vec::new();
+            let report = plan::execute(&plan, &context);
+            assert!(!dir.path().join("trace.jsonl").exists());
+            report
+        };
+        assert!(report.completed, "traced={traced}: {report:?}");
+    }
 }
