@@ -616,7 +616,9 @@ fn suite() -> &'static Suite {
             roost.publish(
                 name,
                 VERSION,
-                &agent_capsule_manifest(&always_replying(&format!("{WORKER_ANSWER}-{name}")).endpoint),
+                &agent_capsule_manifest(
+                    &always_replying(&format!("{WORKER_ANSWER}-{name}")).endpoint,
+                ),
                 None,
             );
         }
