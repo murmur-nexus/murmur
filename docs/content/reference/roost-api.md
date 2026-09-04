@@ -182,11 +182,13 @@ The session is now `running`, and the credential is what makes its `POST /spawn`
 An approval that does not verify is a failed exchange, not a request to be judged by the operator's
 list instead: it is refused rather than falling back to `--spawn-allow`.
 
-On the path that presents no approval, `--spawn-allow` is consulted before the registry is read, so
-a name the operator never listed is refused for not being listed rather than for whatever the
-registry would have said about it. The path that presents an approval resolves the artifact first,
-because the approval's check is a comparison against the name, version and content hash that
-coordinate resolves to now.
+The two paths check different things first, which decides the status an unusable request comes
+back with:
+
+| Request | Checked first | Checked next |
+|---|---|---|
+| No `x-murmur-spawn-approval` | `name` is in `--spawn-allow`, else `403` | Registry resolve, else `500` |
+| `x-murmur-spawn-approval` present | Registry resolve, else `500` | Approval matches the resolved name, version and content hash, else `403` |
 
 ---
 
