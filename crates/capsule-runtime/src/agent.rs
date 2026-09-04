@@ -2372,9 +2372,9 @@ fn extract_continuation_id(metadata: &[(String, String)]) -> Option<String> {
 pub(crate) const PROMPT_CACHE_KEY_KEY: &str = "prompt_cache_key";
 
 /// Longest `prompt_cache_key` a provider accepts. OpenAI's Chat and Responses APIs cap the
-/// field at 64 characters and reject a longer one with a 400, so every key the runtime emits
-/// is bounded to that — the smallest limit we know of. A key short enough everywhere costs
-/// nothing, where a per-driver limit would spread the concern across every driver.
+/// field at 64 characters and reject a longer one with a 400, and that is the tightest cap
+/// across the providers murmur drives, so the host bounds every key to it and no driver
+/// carries a limit of its own.
 pub(crate) const PROMPT_CACHE_KEY_MAX_LEN: usize = 64;
 
 /// Width of the hex digest that stands in for the part of an over-long key that does not fit.
@@ -3093,9 +3093,9 @@ forgery: {prompt}"
         );
     }
 
-    /// A realistic capsule name plus a minted `ctx_<32 hex>` already runs past the limit every
-    /// provider we know of enforces, which is the shape that turned every turn of a run into a
-    /// 400 before the bound existed.
+    /// A realistic capsule name plus a minted `ctx_<32 hex>` runs past
+    /// [`PROMPT_CACHE_KEY_MAX_LEN`]: the shape a provider answers with a 400 when the key
+    /// reaches it unbounded.
     const LONG_NAME: &str = "security-review-and-triage-capsule";
     const REAL_CTX: &str = "ctx_0192f3c4d5e6789abcdef0123456789a";
 

@@ -680,8 +680,8 @@ fn prompt_cache_key_is_not_forwarded_to_the_provider() {
 }
 
 /// `name:version:<context id>` runs past the 64 characters a provider accepts long before a
-/// capsule name reaches the 100 `mur build` allows, and a rejected key used to fail the whole
-/// turn. The session completing proves the key the host emits is one the provider took.
+/// capsule name reaches the 100 `mur build` allows, and a provider rejecting the key fails the
+/// whole turn. The session completing proves the key the host emits is one the provider took.
 #[test]
 fn prompt_cache_key_over_long_capsule_name_completes_a_session() {
     let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);

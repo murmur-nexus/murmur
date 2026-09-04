@@ -113,10 +113,10 @@ A provider that routes on the value keeps a task's turns on one machine, so each
 cache entry the previous turn warmed. Two runs of the same capsule get different values, because
 a context id is minted per task — including when the value was shortened.
 
-The emitted value is never longer than 64 characters, whatever the capsule is called: the OpenAI
-Chat and Responses APIs reject a longer one, and a capsule name of ordinary length already runs
-past that once a context id is appended. A shortened value still opens with the capsule's own
-name, so a key seen in a payload dump names the capsule that produced it.
+Shortening keeps the value inside the 64 characters the OpenAI Chat and Responses APIs accept; a
+capsule name of ordinary length already runs past that once a context id is appended. A shortened
+value still opens with the capsule's own name, so a key seen in a payload dump names the capsule
+that produced it.
 
 A driver reads the field only if it declares it, so a driver that ignores it runs unchanged.
 Forward it only where the provider defines a field of its own for it: the OpenAI Chat and
