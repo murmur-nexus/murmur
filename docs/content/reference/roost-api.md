@@ -47,6 +47,9 @@ unlimited: `0` refuses every delegation.
 Any other flag is rejected and the daemon exits. There is no `--max-total` — see
 [No total cap](#no-total-cap).
 
+The daemon's own environment holds no provider credential — see
+[Environment variables](#environment-variables).
+
 ---
 
 ## Endpoints
@@ -173,11 +176,17 @@ The session is now `running`, and the credential is what makes its `POST /spawn`
 | `400 Bad Request` | Body is not valid JSON, or `session_id` is empty |
 | `403 Forbidden` | The approval is not valid, or the session that earned it is no longer running, or `session_id` is already registered — see [Refusals](#refusals) |
 | `403 Forbidden` | The approval has expired, has already been redeemed, or names a different artifact |
-| `403 Forbidden` | No approval was presented and `name` is not in `--spawn-allow` |
+| `403 Forbidden` | No approval was presented and `name` is not in `--spawn-allow`, whether or not that name is published |
 | `500 Internal Server Error` | The capsule could not be resolved from the registry |
 
 An approval that does not verify is a failed exchange, not a request to be judged by the operator's
 list instead: it is refused rather than falling back to `--spawn-allow`.
+
+On the path that presents no approval, `--spawn-allow` is consulted before the registry is read, so
+a name the operator never listed is refused for not being listed rather than for whatever the
+registry would have said about it. The path that presents an approval resolves the artifact first,
+because the approval's check is a comparison against the name, version and content hash that
+coordinate resolves to now.
 
 ---
 
@@ -728,3 +737,9 @@ sessions also discards every credential and approval that could delegate under t
 The spawn credential and the spawn approval have no environment variable. Every request to this
 daemon is made by the capsule's runtime, which holds them; `MURMUR_SESSION_ID` authorises nothing
 on its own.
+
+The daemon's own environment needs no provider credential. It reads a capsule's manifest for the
+capability policy and declared state stores alone, leaving `inference.api_key` unresolved, so a
+registry of capsules referencing `${OPENAI_API_KEY}`, `${ANTHROPIC_API_KEY}` or any other variable
+resolves, registers and spawns in a daemon started with an empty environment. The provider key is
+read where the inference turn happens: in the capsule's own process, by `mur run`.

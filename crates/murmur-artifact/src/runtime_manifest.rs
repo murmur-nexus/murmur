@@ -2441,8 +2441,41 @@ pub fn load_runtime_manifest(path: &Path) -> Result<RuntimeManifest, RuntimeMani
     RuntimeManifest::from_yaml_str(&content)
 }
 
+/// Whether a parse is allowed to reach outside the manifest text for a secret it references.
+///
+/// The two [`RuntimeManifest`] constructors differ by this value and nothing else, so validation
+/// cannot drift between a manifest `mur run` accepts and one a referee accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecretResolution {
+    /// `inference.api_key` is resolved: an `${ENV_REF}` is looked up in the process environment
+    /// and a missing variable is an error.
+    Resolve,
+    /// `inference.api_key` is left unread. The parsed [`InferenceConfig::api_key`] is `None`
+    /// whatever the manifest wrote, and the process environment is never touched.
+    Skip,
+}
+
 impl RuntimeManifest {
     pub fn from_yaml_str(input: &str) -> Result<Self, RuntimeManifestError> {
+        Self::parse(input, SecretResolution::Resolve)
+    }
+
+    /// Parse a manifest without resolving any secret it references.
+    ///
+    /// Validation is identical to [`RuntimeManifest::from_yaml_str`] on every block, `inference`
+    /// included, with one difference: `inference.api_key` is never resolved and the resulting
+    /// [`InferenceConfig::api_key`] is always `None`, whether the manifest wrote an `${ENV_REF}`
+    /// or a literal key. Nothing on this path reads the process environment, so a manifest
+    /// referencing a variable this process does not hold still parses.
+    ///
+    /// For a caller that reads a foreign capsule's manifest for its capability policy alone —
+    /// `mur-roost` refereeing a delegation — and is entitled to none of the credentials that
+    /// manifest names.
+    pub fn from_yaml_str_without_secrets(input: &str) -> Result<Self, RuntimeManifestError> {
+        Self::parse(input, SecretResolution::Skip)
+    }
+
+    fn parse(input: &str, secrets: SecretResolution) -> Result<Self, RuntimeManifestError> {
         let raw: RawRuntimeManifest = serde_yaml::from_str(input).map_err(|err| {
             if let Some(location) = err.location() {
                 RuntimeManifestError::YamlSyntax(format!(
@@ -2711,7 +2744,7 @@ impl RuntimeManifest {
             });
         }
         let capabilities = parse_capabilities(raw.capabilities)?;
-        let inference = parse_inference(raw.inference)?;
+        let inference = parse_inference(raw.inference, secrets)?;
 
         // Validate system_prompt_artifact: must name a declared artifact whose payload may be
         // bound as the system prompt (`prompt_payload`, defaulted from the role when absent).
@@ -3529,6 +3562,7 @@ fn parse_resource_capabilities(
 
 fn parse_inference(
     raw: Option<RawInferenceConfig>,
+    secrets: SecretResolution,
 ) -> Result<Option<InferenceConfig>, RuntimeManifestError> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -3590,9 +3624,9 @@ fn parse_inference(
             validate_inference_endpoint(&endpoint)?;
             let model = required_inference_field(raw.model, "model")?;
 
-            let api_key = match raw.api_key {
-                None => None,
-                Some(value) => {
+            let api_key = match (raw.api_key, secrets) {
+                (None, _) | (Some(_), SecretResolution::Skip) => None,
+                (Some(value), SecretResolution::Resolve) => {
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
                         None
@@ -6295,6 +6329,77 @@ inference:
         );
 
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn parse_without_secrets_declines_a_resolvable_api_key() {
+        let key = "MURMUR_TEST_INFERENCE_KEY_WITHOUT_SECRETS";
+        std::env::set_var(key, "sentinel-secret");
+
+        let yaml = format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{key}}}\n  driver:\n    artifact: murmur-driver-anthropic\n"
+        );
+
+        let resolving = RuntimeManifest::from_yaml_str(&yaml).unwrap();
+        let without_secrets = RuntimeManifest::from_yaml_str_without_secrets(&yaml).unwrap();
+
+        std::env::remove_var(key);
+
+        // The variable was set and readable for both parses: the second holds no key because it
+        // declined to look, not because there was nothing to find.
+        assert_eq!(
+            resolving.inference.unwrap().api_key,
+            Some("sentinel-secret".to_string())
+        );
+        assert_eq!(without_secrets.inference.unwrap().api_key, None);
+    }
+
+    #[test]
+    fn parse_without_secrets_drops_a_literal_api_key() {
+        // Key assembled at runtime so the source never contains a
+        // credential-shaped literal that secret scanners could flag.
+        let literal = ["sk-", "ant-", "literal"].concat();
+        let yaml = format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: {literal}\n  driver:\n    artifact: murmur-driver-anthropic\n"
+        );
+
+        assert_eq!(
+            RuntimeManifest::from_yaml_str(&yaml)
+                .unwrap()
+                .inference
+                .unwrap()
+                .api_key,
+            Some(literal)
+        );
+        assert_eq!(
+            RuntimeManifest::from_yaml_str_without_secrets(&yaml)
+                .unwrap()
+                .inference
+                .unwrap()
+                .api_key,
+            None
+        );
+    }
+
+    /// The non-resolving parse is narrower only in what it resolves, never in what it validates:
+    /// a manifest roost accepts is a manifest `mur run` would also accept.
+    #[test]
+    fn parse_without_secrets_refuses_what_the_resolving_parse_refuses() {
+        let process_with_key = format!(
+            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: process\n  command: claude\n  model: test-model\n  api_key: {}\n",
+            ["sk-", "ant-", "secret"].concat()
+        );
+        let http_without_model = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  driver:\n    artifact: murmur-driver-anthropic\n";
+
+        for yaml in [process_with_key.as_str(), http_without_model] {
+            let resolving = RuntimeManifest::from_yaml_str(yaml)
+                .unwrap_err()
+                .to_string();
+            let without_secrets = RuntimeManifest::from_yaml_str_without_secrets(yaml)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(resolving, without_secrets);
+        }
     }
 
     #[test]

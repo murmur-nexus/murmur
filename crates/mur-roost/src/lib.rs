@@ -350,10 +350,13 @@ fn resolve_capsule(
         )
     })?;
 
-    // `from_yaml_str` rather than `load_runtime_manifest`: the manifest comes out of the artifact
-    // zip in memory and is never written to disk.
-    let manifest =
-        murmur_artifact::RuntimeManifest::from_yaml_str(&manifest_yaml).map_err(|e| {
+    // The daemon reads a foreign capsule's manifest for one thing — the capability policy and
+    // declared state stores `SpawnEnvelope::from_runtime_manifest` needs — and is entitled to none
+    // of the credentials that manifest names. `from_yaml_str_without_secrets` is what makes a
+    // referee holding no provider key at all able to resolve a capsule that references one, and
+    // keeps a `${VAR}` name out of every response body this function can produce.
+    let manifest = murmur_artifact::RuntimeManifest::from_yaml_str_without_secrets(&manifest_yaml)
+        .map_err(|e| {
             err(
                 500,
                 "Internal Server Error",
@@ -542,16 +545,23 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
         return identity_refused();
     }
 
-    let (resolved, manifest) = match resolve_capsule(state, &req.name, &req.version) {
-        Ok(pair) => pair,
-        Err(response) => return response,
-    };
-
     // The registrant's delegation budget, and whose census it counts against. Both come from the
     // approval it presented or, where there is none, from the operator's flag — never from the
     // body, which has no field either could arrive in.
-    let (depth_remaining, parent_session, redeemed_jti) = match headers.get(SPAWN_APPROVAL_HEADER) {
+    //
+    // Each arm resolves the artifact for itself, because the two arms ask their entitlement
+    // question at different points. The approval arm has to resolve first — its whole check is a
+    // comparison against what the coordinate resolves to *now*. The no-approval arm consults the
+    // operator's list first, on the same terms as `handle_spawn`: a name nobody listed is refused
+    // for not being listed, whatever the registry would have said about it.
+    let (manifest, depth_remaining, parent_session, redeemed_jti) = match headers
+        .get(SPAWN_APPROVAL_HEADER)
+    {
         Some(approval) => {
+            let (resolved, manifest) = match resolve_capsule(state, &req.name, &req.version) {
+                Ok(pair) => pair,
+                Err(response) => return response,
+            };
             // The approval is marked spent the moment it verifies, above every check below: an
             // approval covers one launch, and presenting it for the wrong artifact or from a
             // session that has since ended is an error rather than a near-miss to retry.
@@ -599,7 +609,12 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
                     ),
                 );
             }
-            (approved.depth, Some(approved.sid), Some(approved.jti))
+            (
+                manifest,
+                approved.depth,
+                Some(approved.sid),
+                Some(approved.jti),
+            )
         }
         // No approval: there is no parent to have been approved by, so the operator who started
         // the daemon is the only authority, and their list is the only gate. The top of a chain
@@ -612,7 +627,11 @@ fn handle_register(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> 
                     &format!("capsule '{}' is not in --spawn-allow", req.name),
                 );
             }
-            (state.max_depth, None, None)
+            let (_, manifest) = match resolve_capsule(state, &req.name, &req.version) {
+                Ok(pair) => pair,
+                Err(response) => return response,
+            };
+            (manifest, state.max_depth, None, None)
         }
     };
 

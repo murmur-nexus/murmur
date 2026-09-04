@@ -241,3 +241,70 @@ fn a_registration_with_an_empty_session_id_is_a_bad_request() {
     assert_eq!(response.status, 400);
     assert_eq!(response.error(), "session_id must not be empty");
 }
+
+/// The manifest of a capsule that talks to a provider: the key is an environment reference, and
+/// the variable it names is deliberately one no test process sets.
+const PROVIDER_WORKER_BODY: &str = "artifacts: []\ncapabilities:\n  network:\n    allow: [api.provider.internal]\ninference:\n  transport: http\n  endpoint: https://api.provider.internal/v1\n  model: test-model\n  api_key: ${ROOST_MUST_NEVER_READ}\n  driver:\n    artifact: murmur-driver-anthropic\n";
+
+/// The referee holds no provider credential, so it reads a capsule's manifest for its capability
+/// policy without resolving the key that manifest references.
+#[test]
+fn a_capsule_whose_key_the_daemon_does_not_hold_still_registers() {
+    let daemon = Daemon::with_spawn_allow(vec!["listed".to_string()]);
+    daemon.publish_body("listed", "0.1.0", PROVIDER_WORKER_BODY, "");
+    let session = daemon.child_session_id();
+
+    let response = daemon.register(&session, "listed", "0.1.0", None);
+
+    assert_eq!(response.status, 200, "{:?}", response.body);
+    assert_eq!(daemon.status(&session).body["status"], "running");
+    // Nothing the daemon says names a variable out of a capsule it does not own the secrets for.
+    assert!(!response.raw.contains("ROOST_MUST_NEVER_READ"));
+    assert!(!response.raw.contains("${"));
+}
+
+/// The operator's list is consulted before the registry is read, so a name nobody listed is
+/// refused for not being listed — whatever the registry would have said about it.
+#[test]
+fn an_unlisted_name_is_refused_before_the_registry_is_read() {
+    let daemon = Daemon::with_spawn_allow(vec!["listed".to_string()]);
+    daemon.publish_body("unlisted", "0.1.0", PROVIDER_WORKER_BODY, "");
+
+    let published = daemon.register(&daemon.child_session_id(), "unlisted", "0.1.0", None);
+    assert_eq!(published.status, 403, "{:?}", published.body);
+    assert_eq!(
+        published.error(),
+        "capsule 'unlisted' is not in --spawn-allow"
+    );
+
+    // The same refusal for a name that is in neither the list nor the registry: the allow list
+    // answers first, so this is not a registry error.
+    let absent = daemon.register(&daemon.child_session_id(), "unlisted", "9.9.9", None);
+    assert_eq!(absent.status, 403, "{:?}", absent.body);
+    assert_eq!(absent.error(), "capsule 'unlisted' is not in --spawn-allow");
+}
+
+/// The whole delegated exchange, between two capsules that both reference a provider key the
+/// daemon does not hold.
+#[test]
+fn a_delegation_between_two_provider_capsules_needs_no_key() {
+    let daemon = Daemon::with_spawn_allow(vec!["listed".to_string()]);
+    let parent_body = "artifacts: []\ncapabilities:\n  network:\n    allow: [api.provider.internal]\n  spawn:\n    allow: [child]\ninference:\n  transport: http\n  endpoint: https://api.provider.internal/v1\n  model: test-model\n  api_key: ${ROOST_MUST_NEVER_READ}\n  driver:\n    artifact: murmur-driver-anthropic\n";
+    daemon.publish_body("listed", "0.1.0", parent_body, "");
+    daemon.publish_body("child", "0.1.0", PROVIDER_WORKER_BODY, "");
+
+    let parent_session = daemon.child_session_id();
+    let registered = daemon.register(&parent_session, "listed", "0.1.0", None);
+    assert_eq!(registered.status, 200, "{:?}", registered.body);
+    let credential = registered.body["credential"].as_str().unwrap().to_string();
+
+    let permission = daemon.permission("child", "0.1.0", Some(&credential));
+    assert_eq!(permission.status, 200, "{:?}", permission.body);
+    assert!(!permission.raw.contains("ROOST_MUST_NEVER_READ"));
+
+    let child_session = daemon.child_session_id();
+    let approval = permission.body["approval"].as_str().unwrap().to_string();
+    let child = daemon.register(&child_session, "child", "0.1.0", Some(&approval));
+    assert_eq!(child.status, 200, "{:?}", child.body);
+    assert_eq!(daemon.status(&child_session).body["status"], "running");
+}
