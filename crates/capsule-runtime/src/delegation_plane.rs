@@ -98,10 +98,12 @@ pub struct DelegationRequest {
 
 /// Where a delegation got to, as the delegating caller sees it.
 ///
-/// The value vocabulary of the `delegation` trace event's `outcome` and of the `delegate-task`
-/// tool result's `status`, which are the same five words. Which of the two plane methods can
-/// produce each one is stated on the variant, because a caller that reads a word this method
-/// cannot produce is reading the wrong contract.
+/// The value vocabulary of the `delegate-task` tool result's `status`. The `delegation` trace
+/// event's `outcome` shares only `failed` and `refused` with it: a delegation that started is
+/// closed from the child's own completion instead, in
+/// [`crate::delegation::DelegationStatus`]'s words. Which of the two plane methods can produce
+/// each variant is stated on it, because a caller that reads a word this method cannot produce is
+/// reading the wrong contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DelegationStatus {
     /// The child is running and holding its task, and nothing is known yet about what it will do
@@ -552,8 +554,8 @@ impl DelegationPlane {
     ///
     /// Blocking from end to end, and never `Err`: every way a delegation can end here is one of
     /// four [`DelegationStatus`] words — `completed`, `timed_out`, `failed`, `refused` — because
-    /// the caller has to record all four in the trace the same way and a refusal is as much a
-    /// fact about the run as an answer is.
+    /// the step maps all four onto a step result the same way, and a refusal is as much a fact
+    /// about the run as an answer is.
     pub fn delegate(
         &self,
         request: &DelegationRequest,
@@ -813,7 +815,7 @@ fn deliver_task(
 /// Where a finished child left its answer, and what it says.
 ///
 /// The candidate list is [`crate::delegation::child_result_candidates`], so the file this plane
-/// reads and the file the released-child watcher names are found by one rule.
+/// reads and the file the completion watcher names are found by one rule.
 fn read_child_result(
     child_workdir: &Path,
     session_id: &str,
@@ -897,7 +899,7 @@ fn daemon_refusal(error: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The five words the trace and the tool result share.
+    /// The five words a tool result's `status` can carry.
     #[test]
     fn every_status_has_one_wire_word() {
         assert_eq!(DelegationStatus::Started.as_str(), "started");

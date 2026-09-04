@@ -12,7 +12,6 @@ use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -316,57 +315,6 @@ impl ScriptedServer {
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 1}
         }))
-    }
-
-    /// Answers the first request of a turn with `calls` tool calls and every request after it with
-    /// one end-of-turn message, so an agent issues the calls and then stops.
-    ///
-    /// The two responses are served by request order rather than by content, which is all a turn
-    /// needs: the agent sends its first request, gets the calls, dispatches them, sends the results
-    /// back and gets the end of the turn. `calls` is `(id, tool name, input)`.
-    pub fn calling_tools_once(calls: Vec<(String, String, serde_json::Value)>) -> Self {
-        let content: Vec<serde_json::Value> = calls
-            .into_iter()
-            .map(|(id, name, input)| {
-                json!({"type": "tool_use", "id": id, "name": name, "input": input})
-            })
-            .collect();
-        let first = json!({
-            "id": "msg_calls",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": content,
-            "stop_reason": "tool_use",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string();
-        let rest = json!({
-            "id": "msg_done",
-            "type": "message",
-            "role": "assistant",
-            "model": "test-model",
-            "content": [{"type": "text", "text": "delegations issued"}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string();
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let served = Arc::new(AtomicUsize::new(0));
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let body = if served.fetch_add(1, Ordering::SeqCst) == 0 {
-                    first.clone()
-                } else {
-                    rest.clone()
-                };
-                thread::spawn(move || answer(stream, &body));
-            }
-        });
-
-        Self { endpoint }
     }
 
     fn serving(response: serde_json::Value) -> Self {

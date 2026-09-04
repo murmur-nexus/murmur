@@ -1002,11 +1002,12 @@ struct DelegationStartEvent {
 ///
 /// One line per call whatever happened, including a call the daemon refused: a delegation that was
 /// asked for and not made is as much a fact of the run as one that produced an answer. When it is
-/// written depends on how the delegation was made — a `delegate-task` call that started a child
+/// written depends on how far the delegation got — a `delegate-task` call that started a child
 /// writes it as that child's completion arrives, out of the child's own `completion.json`; one that
-/// never started a child, and a plan `capsule` step, write it within the call. Carries neither the
-/// task text nor the child's answer — both are the agent's own conversation, which the `tool_call`
-/// line for the same call already records under the session's `trace.capture` setting.
+/// never started a child writes it within the call. A plan `capsule` step writes neither this line
+/// nor the `delegation_start` above it: it holds no trace appender. Carries neither the task text
+/// nor the child's answer — both are the agent's own conversation, which the `tool_call` line for
+/// the same call already records under the session's `trace.capture` setting.
 #[derive(Serialize)]
 struct DelegationEvent {
     event_type: &'static str,
@@ -1021,13 +1022,14 @@ struct DelegationEvent {
     delegation_id: Option<String>,
     /// The child's own session id, so its trace is findable. `null` when no child ran.
     child_session_id: Option<String>,
-    /// Wall-clock time from the first request to the daemon until the delegation ended.
+    /// How long the child ran, for a delegation that started; how long the call took, for one that
+    /// never started.
     duration_ms: u64,
     /// How the delegation ended, in one of two vocabularies depending on whether it got far
     /// enough to have an ending of its own: `ok`, `error`, `crashed` or `terminated` from
     /// [`crate::delegation::DelegationStatus`] for a started delegation whose completion arrived,
-    /// and `started`, `completed`, `failed`, `timed_out` or `refused` from
-    /// [`crate::delegation_plane::DelegationStatus`] otherwise.
+    /// `unknown` for one whose completion left no readable file, and `failed` or `refused` from
+    /// [`crate::delegation_plane::DelegationStatus`] for one that never started.
     outcome: String,
     /// `null` where nothing needs saying. Otherwise the completion's `detail`, or the same
     /// sentence the model was given.

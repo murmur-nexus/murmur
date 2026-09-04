@@ -572,8 +572,8 @@ the `delegation` line below.
 | `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one that was never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
 | `duration_ms` | u64 | How long the child ran, on an outcome; how long the call took, on one that never started |
-| `outcome` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` for a delegation that started and ended; `"failed"` or `"refused"` for one that never started; `"completed"`, `"failed"` or `"timed_out"` for a plan `capsule` step |
-| `reason` | string \| null | `null` on `"ok"` and `"completed"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
+| `outcome` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` for a delegation that started and ended; `"unknown"` when its sub-capsule left no readable `completion.json`; `"failed"` or `"refused"` for one that never started |
+| `reason` | string \| null | `null` on `"ok"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
 
 **When each line is written.** A `delegate-task` call that starts a child writes `delegation_start`
 and nothing else: the delegation has not ended, and the call has returned. The terminal
@@ -581,8 +581,7 @@ and nothing else: the delegation has not ended, and the call has returned. The t
 the child's own [`completion.json`](roost-api.md#the-completion-path) rather than out of the text
 the agent reads. A call that never started a child — refused, or failed before the child held its
 task — writes only the terminal line, in the same turn, and names no `delegation_id`. A plan
-`capsule` step, which waits for its answer rather than returning on start, writes both lines within
-the step.
+`capsule` step writes neither line: a plan run is recorded by its own `plan_step` events instead.
 
 One line per call either way. It carries neither the task text nor the child's answer — both are
 the agent's own conversation, which the `tool_call` line for the same call already records under

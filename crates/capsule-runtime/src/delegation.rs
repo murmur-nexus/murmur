@@ -350,8 +350,8 @@ pub(crate) fn bound_detail(detail: String) -> String {
 /// A capsule that stays up for more than one task overwrites the unsuffixed file, so the per-task
 /// one is preferred; and the agent loop writes into the session directory beneath the child's
 /// workdir while a script capsule writes into that workdir directly. One rule, read by the
-/// delegating plane when it takes the answer and by the released-child watcher when it names the
-/// file it did not read.
+/// delegating plane when it takes the answer and by the completion watcher when it names the file
+/// it did not read.
 pub fn child_result_candidates(
     child_workdir: &Path,
     session_id: &str,
@@ -392,11 +392,28 @@ pub fn read_completion(workdir: &Path) -> Option<DelegationOutcome> {
 }
 
 /// Write `outcome` to [`COMPLETION_FILE`], replacing whatever was there.
+///
+/// **Written to a sibling temporary file and renamed into place, never truncated in place.** The
+/// parent reads this file the moment the completion's task begins, and [`report_completion`]
+/// rewrites it immediately after posting that completion — so a plain truncating write leaves a
+/// window in which the parent reads an empty or half-written file and records the delegation's
+/// outcome as `unknown`. The rename makes every reader see either the whole previous content or
+/// the whole new content. The temporary name is unique because the child and the watcher behind
+/// it can both reach this function.
 pub fn write_completion(workdir: &Path, outcome: &DelegationOutcome) -> Result<(), String> {
     let body = serde_json::to_string_pretty(outcome)
         .map_err(|error| format!("failed to serialize the completion: {error}"))?;
-    std::fs::write(completion_path(workdir), format!("{body}\n"))
-        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))
+    let target = completion_path(workdir);
+    let temp = workdir.join(format!(
+        ".{COMPLETION_FILE}.{}.tmp",
+        uuid::Uuid::now_v7().simple()
+    ));
+    std::fs::write(&temp, format!("{body}\n"))
+        .map_err(|error| format!("failed to write {COMPLETION_FILE}: {error}"))?;
+    std::fs::rename(&temp, &target).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        format!("failed to write {COMPLETION_FILE}: {error}")
+    })
 }
 
 /// Post one completion to the parent's A2A door.
@@ -724,5 +741,47 @@ mod tests {
         let read = read_completion(dir.path()).expect("the record exists");
         assert!(!read.delivered);
         assert!(read.delivery_error.is_some());
+    }
+
+    /// A reader concurrent with a rewrite never sees a half-written file.
+    ///
+    /// `report_completion` rewrites the record immediately after posting it, and the parent reads
+    /// it the moment that completion's task begins — so the two overlap in ordinary use, and a
+    /// truncating write makes the parent record a successful delegation's outcome as `unknown`.
+    #[test]
+    fn a_rewrite_is_never_visible_half_written() {
+        let dir = tempfile::tempdir().unwrap();
+        write_completion(dir.path(), &outcome()).unwrap();
+
+        let path = dir.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            for turn in 0..400 {
+                let mut record = outcome();
+                record.delivered = turn % 2 == 0;
+                // A detail long enough that one write is several pages, so a truncating write
+                // leaves a wide window rather than a theoretical one.
+                record.detail = Some("x".repeat(64 * 1024));
+                write_completion(&path, &record).unwrap();
+            }
+        });
+
+        let mut reads = 0;
+        while !writer.is_finished() {
+            assert!(
+                read_completion(dir.path()).is_some(),
+                "a concurrent reader saw no readable completion after {reads} good reads"
+            );
+            reads += 1;
+        }
+        writer.join().unwrap();
+        assert!(reads > 0, "the reader never got to run");
+
+        // Nothing is left behind for the parent's file tools to trip over.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| name != COMPLETION_FILE)
+            .collect();
+        assert!(strays.is_empty(), "temporary files left behind: {strays:?}");
     }
 }

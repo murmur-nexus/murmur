@@ -395,14 +395,13 @@ How deep a chain of delegations may go and how many a capsule may have running a
 daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon
 refuses comes back as a failed tool call carrying the refusal.
 
-**A delegated capsule reports when its session ends.** A sub-capsule that sleeps between tasks
-never ends its session, so nothing about it reaches its parent until the child-watch bound stops it.
-Declare `lifecycle.after_task: exit` on a capsule meant to be delegated to with `delegate-task`.
+**What a capsule meant to be delegated to declares depends on which caller delegates to it**, and
+the two want opposite things:
 
-A plan's `capsule` step is the exception, and it runs the other way: that step waits on the
-connection it opened and reads the answer with an A2A `tasks/get`, so a capsule meant to be used as
-a plan step must still be listening when the read happens and declares
-`lifecycle.after_task: sleep` instead.
+| Delegated to by | [`lifecycle.after_task`](manifest.md#lifecycle-after-task) | Why |
+|---|---|---|
+| `delegate-task` | `exit` | A sub-capsule reports its outcome when its session ends. One that sleeps between tasks never ends, so nothing reaches its parent until the child-watch bound stops it |
+| A plan's `capsule` step | `sleep` | The step reads the answer with an A2A `tasks/get` after the task completes, so the sub-capsule has to still be listening |
 
 ---
 

@@ -371,8 +371,8 @@ pub(crate) struct IncomingTask {
     /// locally. The `a2a_task_received` record is written only for the former.
     pub source: &'static str,
     /// The delegation this task reports on: one the door classified `completion` and carrying
-    /// [`crate::delegation::DELEGATION_ID_HEADER`], or one this runtime's own deadline or
-    /// released-child watcher reported. `None` for every other task, including a locally produced
+    /// [`crate::delegation::DELEGATION_ID_HEADER`], posted by the sub-capsule itself or by the
+    /// completion watcher behind it. `None` for every other task, including a locally produced
     /// detached-shell completion, which reports on a work id rather than a delegation.
     pub delegation_id: Option<String>,
 }
