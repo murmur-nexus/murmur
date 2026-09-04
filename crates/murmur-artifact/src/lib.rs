@@ -74,7 +74,7 @@ pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{
     security_warning_link, W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006,
     W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014,
-    W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_019,
+    W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020,
 };
 pub use trace_capture::{
     resolve_trace_capture, ParseTraceCaptureError, TraceCapture, TRACE_CAPTURE_ACCEPTED_VALUES,

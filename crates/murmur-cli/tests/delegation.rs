@@ -48,15 +48,17 @@ const UNGRANTED_PARENT: &str = "solo";
 const VERSION: &str = "0.1.0";
 
 /// The sub-capsule that answers. Its model always replies with [`WORKER_ANSWER`], so text that
-/// reaches the parent's tool result came from the child and from nowhere else.
+/// reaches the parent came from the child and from nowhere else.
 const WORKER: &str = "worker";
+/// Two more of the same, so a fan-out case can name three distinct capsules and tell the three
+/// delegations apart by more than their ids.
+const WORKER_TWO: &str = "worker-two";
+const WORKER_THREE: &str = "worker-three";
 /// The sub-capsule that declares a grant its parent does not hold, so the referee refuses it.
 const GREEDY_WORKER: &str = "greedy-worker";
-/// The sub-capsule whose inference endpoint never answers, so its task never leaves `working`.
+/// The sub-capsule whose inference endpoint never answers, so its task never leaves `working` and
+/// its session never ends.
 const MUTE_WORKER: &str = "mute-worker";
-/// The sub-capsule whose inference endpoint answers only after the deadline has passed, and which
-/// then exits — so its parent is told twice about one delegation.
-const LATE_WORKER: &str = "late-worker";
 /// The sub-capsule the recording proxy refuses on the daemon's behalf, with the daemon's own
 /// depth-bound sentence. Never launched, so nothing about it beyond the name matters.
 const DEEP_WORKER: &str = "deep-worker";
@@ -75,16 +77,8 @@ const PROVIDER_KEY_VALUE: &str = "sk-test-PROVIDERKEY-8W3M-DELEGATED";
 const UNGRANTED_VAR: &str = "MURMUR_TEST_UNGRANTED_KEY";
 
 const WORKER_ANSWER: &str = "WORKER-ANSWER-4K2P-DELEGATED";
-/// The late sub-capsule's answer. Spelled nowhere else, so finding it in a task the parent's agent
-/// was handed would mean the child's output travelled with the report rather than staying in its
-/// file.
-const LATE_ANSWER: &str = "LATE-ANSWER-7Q9X-AFTER-DEADLINE";
 
-/// How long past [`TIMEOUT_SECS`] the late sub-capsule's endpoint holds its answer. Long enough
-/// that the parent's deadline is certainly reported first, short enough for a test.
-const LATE_ANSWER_DELAY_SECS: u64 = TIMEOUT_SECS + 12;
-
-/// The bound every delegation in this file runs under, short enough that the silent-child case
+/// The bound every delegation in this file runs under, short enough that the wedged-child case
 /// finishes in a test and long enough that a launched child gets its turn.
 const TIMEOUT_SECS: u64 = 20;
 
@@ -429,35 +423,6 @@ fn always_replying(text: &str) -> AlwaysReplying {
     AlwaysReplying { endpoint, requests }
 }
 
-/// An inference endpoint that answers, eventually — for a sub-capsule that finishes only after its
-/// parent has stopped waiting for it.
-///
-/// One thread per connection, because a capsule that is held here for half a minute must not hold
-/// up the next capsule's first turn.
-fn slowly_replying(delay: Duration, text: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let body = end_turn_response(text);
-    thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let body = body.clone();
-            thread::spawn(move || {
-                let mut stream = stream;
-                let _ = read_framed_request(&mut stream);
-                thread::sleep(delay);
-                let raw = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(raw.as_bytes());
-                let _ = stream.flush();
-            });
-        }
-    });
-    endpoint
-}
-
 /// An inference endpoint that accepts a connection and never answers on it, for a sub-capsule that
 /// goes silent mid-task.
 fn never_replying() -> String {
@@ -627,16 +592,17 @@ fn suite() -> &'static Suite {
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [127.0.0.1]\n  \
                  env:\n    allow: [{PROVIDER_KEY_VAR}]\n  \
-                 spawn:\n    allow: [{WORKER}, {GREEDY_WORKER}, {MUTE_WORKER}, {LATE_WORKER}, \
-                 {DEEP_WORKER}, {THIRSTY_WORKER}]\n"
+                 spawn:\n    allow: [{WORKER}, {WORKER_TWO}, {WORKER_THREE}, {GREEDY_WORKER}, \
+                 {MUTE_WORKER}, {DEEP_WORKER}, {THIRSTY_WORKER}]\n"
             ),
             Some(&common::fixture_path(
                 "run/components/capsule-env-echo.wasm",
             )),
         );
 
-        // The sub-capsule that answers. It stays up between tasks so it is still reachable when
-        // its parent reads the answer, which is what an A2A `tasks/get` needs.
+        // The sub-capsules that answer. Each takes one task and exits, which is what makes its
+        // outcome reach its parent: a delegated session reports its completion when the session
+        // ends, so a capsule that sleeps between tasks never ends and never reports.
         let worker_inference = always_replying(WORKER_ANSWER);
         roost.publish(
             WORKER,
@@ -644,6 +610,18 @@ fn suite() -> &'static Suite {
             &agent_capsule_manifest(&worker_inference.endpoint),
             None,
         );
+        // Two more of the same, so a fan-out case can tell the three delegations apart by more
+        // than their ids.
+        for name in [WORKER_TWO, WORKER_THREE] {
+            roost.publish(
+                name,
+                VERSION,
+                &agent_capsule_manifest(
+                    &always_replying(&format!("{WORKER_ANSWER}-{name}")).endpoint,
+                ),
+                None,
+            );
+        }
         // The sub-capsule the referee refuses: one grant beyond its parent's envelope. It never
         // launches, so its component only has to resolve.
         roost.publish(
@@ -655,22 +633,14 @@ fn suite() -> &'static Suite {
             )),
         );
         // The sub-capsule that goes quiet: it binds, accepts the task, and its model never
-        // answers, so the task never leaves `working`.
+        // answers, so the task never leaves `working` and the session never ends. Nothing but the
+        // delegation deadline ever stops it.
         roost.publish(
             MUTE_WORKER,
             VERSION,
-            &agent_capsule_manifest(&never_replying()),
-            None,
-        );
-        // The sub-capsule that answers after its parent has given up. `after_task: exit` is the
-        // point of it: a released child that never ends is never reported on, so this one finishes
-        // its task and goes, which is what the released-child watcher is waiting to see.
-        roost.publish(
-            LATE_WORKER,
-            VERSION,
             &agent_capsule_manifest_with(
-                &slowly_replying(Duration::from_secs(LATE_ANSWER_DELAY_SECS), LATE_ANSWER),
-                "task_acceptance: single\n  after_task: exit",
+                &never_replying(),
+                "task_acceptance: queue\n  after_task: sleep",
             ),
             None,
         );
@@ -713,16 +683,17 @@ fn mur_binary() -> PathBuf {
         .clone()
 }
 
-/// A sub-capsule that serves A2A and answers from `endpoint`.
+/// A sub-capsule that serves A2A, answers from `endpoint`, and then goes.
 ///
-/// `after_task: sleep` is not decoration: a delegation reads its answer with an A2A `tasks/get`,
-/// so the capsule that produced it has to still be listening when the read happens.
+/// `after_task: exit` is not decoration: a delegated session posts its completion when the session
+/// ends, so a sub-capsule that sleeps between tasks is one whose parent hears nothing until the
+/// delegation deadline stops it.
 fn agent_capsule_manifest(endpoint: &str) -> String {
-    agent_capsule_manifest_with(endpoint, "task_acceptance: queue\n  after_task: sleep")
+    agent_capsule_manifest_with(endpoint, "task_acceptance: single\n  after_task: exit")
 }
 
-/// The same, under a stated `lifecycle:` body — for the one sub-capsule that has to exit rather
-/// than stay up.
+/// The same, under a stated `lifecycle:` body — for the sub-capsule that has to stay up rather
+/// than exit.
 fn agent_capsule_manifest_with(endpoint: &str, lifecycle: &str) -> String {
     format!(
         "artifacts:\n  - name: {DRIVER}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
@@ -910,22 +881,70 @@ impl Parent {
 
     /// One delegation turn: the model calls `delegate-task`, then ends its turn. Returns the tool
     /// result text the runtime fed back, with the untrusted-content fence stripped.
+    ///
+    /// The turn is over once the sub-capsule is running and holding its task; the outcome arrives
+    /// later, in a task of its own, which [`Parent::await_outcome`] scripts and waits for.
     fn delegate(&self, tool_id: &str, capsule: &str, version: &str, task: &str) -> String {
-        self.server.push(tool_use_response(
-            tool_id,
-            "delegate-task",
-            json!({"capsule": capsule, "version": version, "task": task}),
-        ));
+        self.delegate_all(
+            &format!("msg-{tool_id}"),
+            &[(tool_id, capsule, version, task)],
+        )
+        .remove(0)
+    }
+
+    /// One turn in which the model issues several `delegate-task` calls before ending it, in the
+    /// order given. Returns each call's tool result text, in that order.
+    fn delegate_all(&self, message_id: &str, calls: &[(&str, &str, &str, &str)]) -> Vec<String> {
+        let blocks: Vec<Value> = calls
+            .iter()
+            .map(|(tool_id, capsule, version, task)| {
+                json!({
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "delegate-task",
+                    "input": {"capsule": capsule, "version": version, "task": task}
+                })
+            })
+            .collect();
+        self.server.push(
+            json!({
+                "id": "msg_tools",
+                "type": "message",
+                "role": "assistant",
+                "model": "test-model",
+                "content": blocks,
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string(),
+        );
         self.server.push(end_turn_response("delegated"));
-        let task_id = self.submit(&format!("msg-{tool_id}"), "delegate it");
+        let task_id = self.submit(message_id, "delegate it");
         self.await_task(&task_id, Duration::from_secs(300));
 
-        tool_result_text(&self.server.requests(), tool_id).unwrap_or_else(|| {
-            panic!(
-                "no tool_result for {tool_id}; requests: {:?}",
-                self.server.requests()
-            )
-        })
+        calls
+            .iter()
+            .map(|(tool_id, ..)| {
+                tool_result_text(&self.server.requests(), tool_id).unwrap_or_else(|| {
+                    panic!(
+                        "no tool_result for {tool_id}; requests: {:?}",
+                        self.server.requests()
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Script `count` further turns and wait until that many `completion`-origin tasks have
+    /// started, which is how a delegation's outcome reaches this parent.
+    ///
+    /// Each completion runs a turn of its own, so each needs its own scripted answer pushed before
+    /// it arrives — an unscripted turn blocks the endpoint rather than answering.
+    fn await_outcomes(&self, count: usize, within: Duration) -> Vec<Value> {
+        for _ in 0..count {
+            self.server.push(end_turn_response("noted the outcome"));
+        }
+        await_completion_starts(self, count, within)
     }
 }
 
@@ -1122,6 +1141,31 @@ fn await_completion_starts(parent: &Parent, count: usize, within: Duration) -> V
     }
 }
 
+/// Wait until the parent's trace holds at least `count` lines of `event_type`.
+///
+/// The terminal `delegation` line is written as the completion's task starts, so a case that has
+/// seen the `task_start` has not necessarily seen the line beside it yet.
+fn wait_for_events(
+    parent: &Parent,
+    event_type: &str,
+    count: usize,
+    within: Duration,
+) -> Vec<Value> {
+    let deadline = Instant::now() + within;
+    loop {
+        let events = parent.events(event_type);
+        if events.len() >= count {
+            return events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} {event_type} lines; the parent wrote {}",
+            events.len()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// The first user message the parent's model was shown that contains `needle` — the text the
 /// agent was actually handed, read from the wire rather than rebuilt.
 fn await_model_message(parent: &Parent, needle: &str, within: Duration) -> String {
@@ -1152,37 +1196,9 @@ fn await_model_message(parent: &Parent, needle: &str, within: Duration) -> Strin
     }
 }
 
-/// The line the parent's deadline report opens with, and the needle every case that waits for one
-/// looks for.
-const DEADLINE_OPENING: &str = "Delegated capsule did not answer before the delegation deadline.";
-
-/// End the capsule a deadline released, which is what nothing in the runtime will ever do.
-///
-/// A released capsule that never finishes its task never ends, so a suite that leaves one behind
-/// leaks a process for the life of the machine. The pid is read from the deadline report, because
-/// naming it is what makes an operator able to do this too.
-fn reap_released_child(parent: &Parent) {
-    let handed = await_model_message(parent, DEADLINE_OPENING, Duration::from_secs(240));
-    let pid = handed
-        .lines()
-        .find_map(|line| line.strip_prefix("pid: "))
-        .unwrap_or_else(|| panic!("the deadline report names the released process: {handed}"));
-    assert!(
-        std::process::Command::new("kill")
-            .arg(pid)
-            .status()
-            .is_ok_and(|status| status.success()),
-        "the released capsule is still running under pid {pid}"
-    );
-}
-
-/// The first line of a task's own text, with the untrusted-content fence the runtime wraps every
-/// completion in taken off.
-fn opening_line(text: &str) -> &str {
-    text.lines()
-        .find(|line| !line.starts_with("<untrusted-content"))
-        .unwrap_or_default()
-}
+/// The line every delegation outcome opens with, and the needle a case that waits for one looks
+/// for.
+const COMPLETION_OPENING: &str = "Delegated capsule finished.";
 
 /// Every text an Anthropic message `content` carries, whichever of its two shapes it is in.
 fn message_texts(content: Option<&Value>) -> Vec<String> {
@@ -1246,16 +1262,16 @@ fn find_in_files(root: &Path, needle: &str) -> Option<PathBuf> {
     })
 }
 
-const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, greedy-worker, mute-worker, late-worker, \
-                          deep-worker, thirsty-worker]\n";
+const SPAWN_YAML: &str = "  spawn:\n    allow: [worker, worker-two, worker-three, greedy-worker, \
+                          mute-worker, deep-worker, thirsty-worker]\n";
 
 // ── Cases ─────────────────────────────────────────────────────────────────────
 
 /// The happy path, and the leak sweep over what it left behind.
 ///
-/// The agent names a capsule, a version and a task. It is handed back the sub-capsule's own answer
-/// — text no runtime composed — and neither workdir, neither trace nor the model's own context
-/// holds a token of either kind.
+/// The agent names a capsule, a version and a task, and is handed back a delegation in flight. The
+/// sub-capsule's outcome reaches it afterwards as a task of its own, naming the file the answer is
+/// in; neither workdir, neither trace nor the model's own context holds a token of either kind.
 #[test]
 fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     if common::skip_without_host_support(
@@ -1287,9 +1303,10 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         schema["properties"]["capsule"]["enum"],
         json!([
             WORKER,
+            WORKER_TWO,
+            WORKER_THREE,
             GREEDY_WORKER,
             MUTE_WORKER,
-            LATE_WORKER,
             DEEP_WORKER,
             THIRSTY_WORKER
         ]),
@@ -1300,13 +1317,23 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
 
-    assert_eq!(result["status"], "completed", "{result}");
+    // The call returns when the child starts: a delegation in flight, named, with nowhere for an
+    // answer to be yet.
+    assert_eq!(result["status"], "started", "{result}");
     assert_eq!(result["capsule"], WORKER, "{result}");
     assert_eq!(result["version"], VERSION, "{result}");
     assert_eq!(
-        result["output"].as_str().unwrap_or_default().trim(),
-        WORKER_ANSWER,
-        "the answer is the child's own text"
+        result.get("output"),
+        None,
+        "a started delegation has no output: {result}"
+    );
+    assert_eq!(result.get("result_path"), None, "{result}");
+    assert!(
+        result["child_workdir"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with(&format!(".murmur/children/{WORKER}-")),
+        "{result}"
     );
     let delegation_id = result["delegation_id"].as_str().unwrap_or_default();
     assert!(delegation_id.starts_with("dlg_"), "{result}");
@@ -1328,16 +1355,13 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
         "{child_dir:?}"
     );
 
-    // One `delegation` event, naming the same delegation the model was told about.
-    let events = parent.events("delegation");
-    assert_eq!(events.len(), 1, "{events:?}");
-    let event = &events[0];
-    assert_eq!(event["outcome"], "completed", "{event}");
-    assert_eq!(event["delegation_id"], delegation_id, "{event}");
-    assert_eq!(event["capsule"], WORKER, "{event}");
-    assert_eq!(event["version"], VERSION, "{event}");
-    assert_eq!(event["child_session_id"], result["session_id"], "{event}");
-    assert_eq!(event["reason"], Value::Null, "{event}");
+    // The row is open: the launch is recorded and nothing has closed it, because nothing has
+    // happened yet.
+    assert!(
+        parent.events("delegation").is_empty(),
+        "a started delegation has not ended: {:?}",
+        parent.events("delegation")
+    );
 
     // The parent names the child at launch, not at completion.
     let started = parent.events("delegation_start");
@@ -1368,15 +1392,53 @@ fn a_task_crosses_to_a_sub_capsule_and_its_answer_comes_back() {
     assert_eq!(child_start["spawned_by"], json!(parent.session_id()));
     assert_eq!(child_start["delegation_id"], json!(delegation_id));
 
-    // A child that answered in time is reported once, as the tool result. Nothing about the
-    // delegation deadline runs: no `completion`-origin task is enqueued and no late outcome is
-    // recorded, so the parent is told exactly once.
+    // And the outcome arrives afterwards, as its own task in the background lane, carrying the
+    // same `dlg_` id the launch line opened.
+    let outcomes = parent.await_outcomes(1, Duration::from_secs(240));
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let outcome = &outcomes[0];
+    assert_eq!(outcome["origin"], "completion", "{outcome}");
+    assert_eq!(outcome["lane"], "bg", "{outcome}");
+    assert_eq!(outcome["source"], "a2a", "{outcome}");
+    assert_eq!(outcome["delegation_id"], json!(delegation_id), "{outcome}");
+
+    // What the agent was handed names the delegation and where the answer is, and never the
+    // answer itself.
+    let handed = await_model_message(&parent, COMPLETION_OPENING, Duration::from_secs(120));
     assert!(
-        completion_starts(&parent).is_empty(),
-        "a delegation that answered enqueues no completion-origin task: {:?}",
-        completion_starts(&parent)
+        handed.contains(&format!("delegation_id: {delegation_id}")),
+        "{handed}"
     );
-    assert!(parent.events("delegation_late").is_empty());
+    assert!(handed.contains("status: ok"), "{handed}");
+    assert!(
+        handed.contains("/out/result.txt (in that workdir)"),
+        "the outcome names the child's result file rather than carrying it: {handed}"
+    );
+    assert!(
+        !handed.contains(WORKER_ANSWER),
+        "the child's answer stays in its file: {handed}"
+    );
+
+    // The child recorded the same outcome for itself, and the delivery landed.
+    let completion: Value = serde_json::from_str(
+        &std::fs::read_to_string(child_dir.join("completion.json"))
+            .expect("the child records its own outcome"),
+    )
+    .unwrap();
+    assert_eq!(completion["reported_by"], "child", "{completion}");
+    assert_eq!(completion["delivered"], json!(true), "{completion}");
+    assert_eq!(completion["status"], "ok", "{completion}");
+
+    // Only now does the row close, and it closes out of that file rather than out of the text.
+    let events = parent.events("delegation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
+    assert_eq!(event["outcome"], "ok", "{event}");
+    assert_eq!(event["delegation_id"], json!(delegation_id), "{event}");
+    assert_eq!(event["capsule"], WORKER, "{event}");
+    assert_eq!(event["version"], VERSION, "{event}");
+    assert_eq!(event["child_session_id"], result["session_id"], "{event}");
+    assert_eq!(event["reason"], Value::Null, "{event}");
 
     // The relationship is recorded once, and by that name. `parent_id` is the event-tree edge and
     // names an `event_id`, never a session.
@@ -1645,99 +1707,62 @@ fn a_bound_refusal_reaches_the_parents_trace_unaltered() {
     assert!(parent.child_dirs().is_empty(), "no child directory exists");
 }
 
-/// A child that never answers ends the wait, not the child.
+/// A started child that never ends is stopped at the delegation deadline, and the parent is told.
 ///
-/// The call comes back `timed_out` rather than hanging, the capsule is left running, and the
-/// parent's agent is told so in a task of its own — because "it never answered" and "it failed"
-/// call for different next moves, and only one of them is a retry.
+/// The call itself returns promptly — nothing about the child's silence is the calling turn's
+/// problem any more. What the deadline bounds is the child's whole life, and reaching it produces
+/// the one thing an agent can act on: a `terminated` outcome naming the bound.
 #[test]
-fn a_silent_child_fails_the_call_rather_than_hanging_the_parent() {
-    if common::skip_without_host_support(
-        "a_silent_child_fails_the_call_rather_than_hanging_the_parent",
-    ) {
+fn a_wedged_started_child_is_ended_at_the_deadline() {
+    if common::skip_without_host_support("a_wedged_started_child_is_ended_at_the_deadline") {
         return;
     }
     let parent = Parent::launch(PARENT, SPAWN_YAML);
 
-    let started = Instant::now();
+    let started_at = Instant::now();
     let text = parent.delegate("toolu_mute", MUTE_WORKER, VERSION, "never answer this");
-    let elapsed = started.elapsed();
+    let call_took = started_at.elapsed();
 
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
-    assert_eq!(result["status"], "timed_out", "{result}");
-    assert!(
-        result["output"]
-            .as_str()
-            .unwrap_or_default()
-            .contains(MUTE_WORKER),
-        "the failure names the capsule: {result}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(TIMEOUT_SECS) + Duration::from_secs(180),
-        "the call returned rather than hanging, in {elapsed:?}"
-    );
+    assert_eq!(result["status"], "started", "{result}");
+    let delegation_id = result["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(delegation_id.starts_with("dlg_"), "{result}");
+    let child_session_id = result["session_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
 
-    let events = parent.events("delegation");
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0]["outcome"], "timed_out", "{}", events[0]);
-
-    // The child that never finished is still attributable, because the parent named it at launch
-    // — and named it first, in the file, rather than only once the delegation had ended.
+    // The launch is on disk, and nothing has closed it: the delegation is still running.
     let trace = parent.trace_events();
-    let started = only_event(&trace, "delegation_start");
+    let launch = only_event(&trace, "delegation_start");
+    assert_eq!(launch["delegation_id"], json!(delegation_id), "{launch}");
+    assert_eq!(launch["capsule"], MUTE_WORKER, "{launch}");
+    assert!(parent.events("delegation").is_empty());
+    // The call did not wait for the outcome: nothing has reported on this delegation yet, and
+    // this child will not report until the deadline ends it.
     assert!(
-        started["child_session_id"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("ses_"),
-        "{started}"
+        completion_starts(&parent).is_empty(),
+        "the call returned before any outcome arrived, in {call_took:?}: {:?}",
+        completion_starts(&parent)
     );
-    assert_eq!(started["capsule"], MUTE_WORKER, "{started}");
-    assert_eq!(
-        events[0]["delegation_id"], started["delegation_id"],
-        "{started}"
-    );
-    assert!(
-        position_of(&trace, "delegation_start") < position_of(&trace, "delegation"),
-        "the launch is on disk before the ending is"
-    );
-    let delegation_id = started["delegation_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let child_session_id = started["child_session_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    let child_workdir = started["child_workdir"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
 
-    // One further task, in the background lane, naming the deadline.
-    parent.server.push(end_turn_response("noted the deadline"));
-    let started_tasks = await_completion_starts(&parent, 1, Duration::from_secs(180));
-    assert_eq!(started_tasks.len(), 1, "{started_tasks:?}");
-    let deadline_start = &started_tasks[0];
-    assert_eq!(deadline_start["origin"], "completion", "{deadline_start}");
-    assert_eq!(deadline_start["lane"], "bg", "{deadline_start}");
+    // One task, at the deadline, saying the capsule was ended.
+    let outcomes = parent.await_outcomes(1, Duration::from_secs(TIMEOUT_SECS + 240));
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0]["origin"], "completion", "{}", outcomes[0]);
+    assert_eq!(outcomes[0]["lane"], "bg", "{}", outcomes[0]);
     assert_eq!(
-        deadline_start["source"], "delegation_deadline",
-        "{deadline_start}"
-    );
-    assert_eq!(
-        deadline_start["delegation_id"],
+        outcomes[0]["delegation_id"],
         json!(delegation_id),
-        "the deadline task joins the delegation the launch line opened: {deadline_start}"
+        "the outcome joins the delegation the launch line opened: {}",
+        outcomes[0]
     );
 
-    // And the text the agent was handed says what happened, in words that are not a failure.
-    let handed = await_model_message(&parent, DEADLINE_OPENING, Duration::from_secs(180));
-    assert!(
-        handed.contains(&format!("deadline_secs: {TIMEOUT_SECS}")),
-        "{handed}"
-    );
+    let handed = await_model_message(&parent, COMPLETION_OPENING, Duration::from_secs(120));
     assert!(
         handed.contains(&format!("delegation_id: {delegation_id}")),
         "{handed}"
@@ -1750,143 +1775,161 @@ fn a_silent_child_fails_the_call_rather_than_hanging_the_parent() {
         handed.contains(&format!("session_id: {child_session_id}")),
         "{handed}"
     );
-    assert!(handed.contains(&child_workdir), "{handed}");
-    assert!(handed.contains("was not stopped"), "{handed}");
-    assert!(handed.contains("still be running"), "{handed}");
-    assert!(handed.contains("did not answer"), "{handed}");
-
-    // The parent is still its own capsule afterwards: it answers the next turn.
-    parent.server.push(end_turn_response("still here"));
-    let task_id = parent.submit("msg-after-timeout", "are you there");
-    parent.await_task(&task_id, Duration::from_secs(120));
-    assert_eq!(parent.task_state(&task_id), "completed");
-
-    reap_released_child(&parent);
-}
-
-/// A child that answers after the deadline is reported a second time, and marked as second.
-///
-/// Two `completion`-origin tasks for one delegation and never a third: the deadline, then the
-/// outcome that arrived once nobody was waiting for it. Both carry the same `dlg_` id, and the
-/// second names the result file rather than carrying what is in it.
-#[test]
-fn a_late_answer_is_reported_once_more_and_told_apart_from_the_first() {
-    if common::skip_without_host_support(
-        "a_late_answer_is_reported_once_more_and_told_apart_from_the_first",
-    ) {
-        return;
-    }
-    let parent = Parent::launch(PARENT, SPAWN_YAML);
-
-    let text = parent.delegate("toolu_late", LATE_WORKER, VERSION, "take your time");
-    let result: Value = serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
-    assert_eq!(result["status"], "timed_out", "{result}");
-    let delegation_id = result["delegation_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    assert!(delegation_id.starts_with("dlg_"), "{result}");
-    let child_session_id = result["session_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-
-    // First the deadline, then the outcome. Each completion-origin task runs a turn of its own, so
-    // each needs its own scripted answer.
-    parent.server.push(end_turn_response("noted the deadline"));
-    let deadline_text = await_model_message(&parent, DEADLINE_OPENING, Duration::from_secs(180));
-    parent
-        .server
-        .push(end_turn_response("noted the late outcome"));
-    let late_text = await_model_message(
-        &parent,
-        "Delegated capsule finished after its deadline was already reported.",
-        Duration::from_secs(300),
-    );
-
-    // The two tasks, in that order, both joined to the one delegation.
-    let started = await_completion_starts(&parent, 2, Duration::from_secs(60));
-    assert_eq!(started.len(), 2, "{started:?}");
-    let sources: Vec<&str> = started
-        .iter()
-        .map(|event| event["source"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(sources, vec!["delegation_deadline", "delegation_late"]);
-    for event in &started {
-        assert_eq!(event["origin"], "completion", "{event}");
-        assert_eq!(event["lane"], "bg", "{event}");
-        assert_eq!(event["delegation_id"], json!(delegation_id), "{event}");
-    }
-    assert_ne!(
-        opening_line(&deadline_text),
-        opening_line(&late_text),
-        "the second telling opens differently from the first"
-    );
-
-    // What the late text says, and what it deliberately does not carry.
+    assert!(handed.contains("status: terminated"), "{handed}");
     assert!(
-        late_text.contains(&format!("delegation_id: {delegation_id}")),
-        "{late_text}"
-    );
-    assert!(
-        late_text.contains(&format!("capsule: {LATE_WORKER}@{VERSION}")),
-        "{late_text}"
-    );
-    assert!(
-        late_text.contains(&format!("session_id: {child_session_id}")),
-        "{late_text}"
-    );
-    assert!(late_text.contains("status: ok"), "{late_text}");
-    assert!(late_text.contains("duration_ms: "), "{late_text}");
-    assert!(late_text.contains("after_deadline_ms: "), "{late_text}");
-    assert!(
-        late_text.contains(&format!("result: .murmur/children/{LATE_WORKER}-")),
-        "the late report names the result file: {late_text}"
-    );
-    assert!(
-        !late_text.contains(LATE_ANSWER),
-        "the child's answer stays in its file: {late_text}"
+        handed.contains(&format!("{TIMEOUT_SECS}s")),
+        "the detail names the deadline in seconds: {handed}"
     );
 
-    // The child's own directory holds the launcher's record of the outcome, delivered.
-    let child_dir = parent.only_child_dir();
+    // The child's own directory records the same ending, delivered — the watcher wrote it, and
+    // posted it, because this ending was the runtime's own doing rather than the parent's.
     let completion: Value = serde_json::from_str(
-        &std::fs::read_to_string(child_dir.join("completion.json"))
-            .expect("the released child's outcome is recorded in its own directory"),
+        &std::fs::read_to_string(parent.only_child_dir().join("completion.json"))
+            .expect("the ended child's outcome is recorded in its own directory"),
     )
     .unwrap();
     assert_eq!(completion["reported_by"], "launcher", "{completion}");
     assert_eq!(completion["delivered"], json!(true), "{completion}");
-    assert_eq!(completion["status"], "ok", "{completion}");
+    assert_eq!(completion["status"], "terminated", "{completion}");
     assert_eq!(
         completion["delegation_id"],
         json!(delegation_id),
         "{completion}"
     );
 
-    // One `delegation_late` line, joined to the task that carried it.
-    let late_events = parent.events("delegation_late");
-    assert_eq!(late_events.len(), 1, "{late_events:?}");
-    assert_eq!(late_events[0]["delegation_id"], json!(delegation_id));
-    assert_eq!(late_events[0]["status"], "ok", "{}", late_events[0]);
-    assert_eq!(
-        late_events[0]["completion_task_id"], started[1]["task_id"],
-        "the record and the task it produced name each other"
+    // And the row closes with the same word, out of that file.
+    let ended = wait_for_events(&parent, "delegation", 1, Duration::from_secs(120));
+    assert_eq!(ended[0]["outcome"], "terminated", "{}", ended[0]);
+    assert_eq!(ended[0]["delegation_id"], json!(delegation_id));
+    let trace = parent.trace_events();
+    assert!(
+        position_of(&trace, "delegation_start") < position_of(&trace, "delegation"),
+        "the launch is on disk before the ending is"
     );
 
-    // And no third. The deadline branch runs once and the watcher sends once, so there is nothing
-    // left that could report a third time.
-    thread::sleep(Duration::from_secs(5));
-    assert_eq!(
-        completion_starts(&parent).len(),
-        2,
-        "no third report exists"
-    );
+    // The parent is still its own capsule afterwards: it answers the next turn.
+    parent.server.push(end_turn_response("still here"));
+    let task_id = parent.submit("msg-after-deadline", "are you there");
+    parent.await_task(&task_id, Duration::from_secs(120));
+    assert_eq!(parent.task_state(&task_id), "completed");
 }
 
-/// The parent stays reachable while a child runs: the wait is on a blocking thread, not on the
-/// `LocalSet` its own listener runs on.
+/// Three delegations in one turn, and the turn ends before any of them does.
+///
+/// This is what returning on start buys: the parent issues three calls, carries on, and collects
+/// three outcomes afterwards — each its own task in the background lane, each carrying its own
+/// `dlg_` id.
+#[test]
+fn three_delegations_leave_one_turn_and_their_outcomes_arrive_separately() {
+    if common::skip_without_host_support(
+        "three_delegations_leave_one_turn_and_their_outcomes_arrive_separately",
+    ) {
+        return;
+    }
+    let parent = Parent::launch(PARENT, SPAWN_YAML);
+
+    let results: Vec<Value> = parent
+        .delegate_all(
+            "msg-fanout",
+            &[
+                ("toolu_fan_1", WORKER, VERSION, "first"),
+                ("toolu_fan_2", WORKER_TWO, VERSION, "second"),
+                ("toolu_fan_3", WORKER_THREE, VERSION, "third"),
+            ],
+        )
+        .iter()
+        .map(|text| {
+            serde_json::from_str(text)
+                .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"))
+        })
+        .collect();
+
+    let mut ids = Vec::new();
+    for (result, capsule) in results.iter().zip([WORKER, WORKER_TWO, WORKER_THREE]) {
+        assert_eq!(result["status"], "started", "{result}");
+        assert_eq!(result["capsule"], capsule, "{result}");
+        assert!(
+            result["child_workdir"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(&format!(".murmur/children/{capsule}-")),
+            "{result}"
+        );
+        ids.push(
+            result["delegation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        3,
+        "three delegations, three ids: {results:?}"
+    );
+
+    // Three launches, three directories, and every launch on disk before the turn ended — the
+    // whole point of the shape.
+    let trace = parent.trace_events();
+    let launches: Vec<&Value> = trace
+        .iter()
+        .filter(|event| event["event_type"] == "delegation_start")
+        .collect();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    let workdirs: HashSet<&str> = launches
+        .iter()
+        .map(|event| event["child_workdir"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(workdirs.len(), 3, "{launches:?}");
+    assert_eq!(parent.child_dirs().len(), 3, "{:?}", parent.child_dirs());
+    assert!(
+        position_of(&trace, "delegation_start") < position_of(&trace, "task_end"),
+        "the launches are on disk before the turn ends"
+    );
+
+    // Three outcomes, one per delegation, each in the background lane.
+    let outcomes = parent.await_outcomes(3, Duration::from_secs(300));
+    assert_eq!(outcomes.len(), 3, "{outcomes:?}");
+    let mut carried: Vec<String> = outcomes
+        .iter()
+        .map(|event| {
+            assert_eq!(event["origin"], "completion", "{event}");
+            assert_eq!(event["lane"], "bg", "{event}");
+            event["delegation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    carried.sort();
+    assert_eq!(
+        carried, distinct,
+        "one outcome per delegation: {outcomes:?}"
+    );
+
+    // And three terminal lines, each closing the start it belongs to.
+    let ended = wait_for_events(&parent, "delegation", 3, Duration::from_secs(120));
+    let mut closed: Vec<String> = ended
+        .iter()
+        .map(|event| {
+            assert_eq!(event["outcome"], "ok", "{event}");
+            event["delegation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    closed.sort();
+    assert_eq!(closed, distinct, "{ended:?}");
+}
+
+/// The parent's turn does not wait on its child, and the parent stays reachable while it runs.
+///
+/// A delegation is over, from the turn's point of view, once the sub-capsule holds its task: the
+/// turn completes while the child is still working, and the listener answers throughout.
 #[test]
 fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
     if common::skip_without_host_support(
@@ -1904,8 +1947,8 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
     parent.server.push(end_turn_response("delegated"));
     let task_id = parent.submit("msg-inflight", "delegate it");
 
-    // Wait for the delegation to actually be under way — the child has to be launched before the
-    // parent is holding a turn open on it.
+    // Wait for the delegation to actually be under way — the child has to be launched before
+    // anything about the parent's availability during it means anything.
     let deadline = Instant::now() + Duration::from_secs(240);
     while parent.child_dirs().is_empty() {
         assert!(
@@ -1916,7 +1959,7 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    // The listener answers, repeatedly, for as long as the delegation is in flight.
+    // The listener answers, repeatedly, throughout.
     for _ in 0..5 {
         assert_eq!(
             agent_card_status(&parent.url),
@@ -1925,11 +1968,20 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
         );
         thread::sleep(Duration::from_millis(100));
     }
-    assert_eq!(parent.task_state(&task_id), "working");
 
+    // And the turn finishes while the child is still working: this child answers nothing, ever,
+    // so a turn that ended cannot have been waiting on it.
     parent.await_task(&task_id, Duration::from_secs(300));
-    // This delegation ended at its deadline, so its child was released rather than stopped.
-    reap_released_child(&parent);
+    assert_eq!(parent.task_state(&task_id), "completed");
+    assert!(
+        parent.events("delegation").is_empty(),
+        "the turn ended with the delegation still open: {:?}",
+        parent.events("delegation")
+    );
+
+    // The child this case wedged is ended by its own deadline; wait for that rather than leaving
+    // a capsule running for the rest of the binary.
+    parent.await_outcomes(1, Duration::from_secs(TIMEOUT_SECS + 240));
 }
 
 /// Lineage survives a resume of the parent, with no field added and nothing rewritten.
@@ -1958,6 +2010,9 @@ fn lineage_survives_a_resume_of_the_parent() {
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
     let child_session_id = result["session_id"].as_str().unwrap().to_string();
+    // The child's own `session_start` is what this case reads, so the delegation has to have run
+    // its course before the parent it names goes away.
+    first.await_outcomes(1, Duration::from_secs(240));
     let first_session_id = first.session_id();
     let child_dir = first.only_child_dir();
     drop(first);
@@ -1998,17 +2053,17 @@ fn lineage_survives_a_resume_of_the_parent() {
     );
 }
 
-/// A delegation the runtime cannot name writes no `delegation_start`, rather than one whose
-/// required `delegation_id` is the empty string.
+/// A delegation made from no conversation is refused before anything is launched.
 ///
 /// An A2A client may send an empty `contextId`, which is taken as the conversation rather than
-/// replaced by a minted one. There is then no conversation to name in a spawner handle, so the
-/// launcher mints no `dlg_` id — and the terminal `delegation` line writes `null` for it. The
-/// launch line has no `null` to write, so it is not written at all: the two records can never
-/// disagree about which delegation they describe.
+/// replaced by a minted one. There is then no conversation for a completion to run under, and a
+/// delegation whose outcome has nowhere to arrive is a way to lose work — so it is refused rather
+/// than started. No daemon request, no child directory, no launch line.
 #[test]
-fn a_delegation_with_no_id_writes_no_launch_line() {
-    if common::skip_without_host_support("a_delegation_with_no_id_writes_no_launch_line") {
+fn a_delegation_with_no_conversation_is_refused_rather_than_started() {
+    if common::skip_without_host_support(
+        "a_delegation_with_no_conversation_is_refused_rather_than_started",
+    ) {
         return;
     }
     let parent = Parent::launch_in(
@@ -2022,16 +2077,24 @@ fn a_delegation_with_no_id_writes_no_launch_line() {
     let result: Value = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("the tool result is JSON ({error}): {text}"));
 
-    // The delegation itself still happened: the child ran and its answer came back.
-    assert_eq!(result["status"], "completed", "{text}");
-    assert!(unfence(result["output"].as_str().unwrap_or_default()).contains(WORKER_ANSWER));
+    assert_eq!(result["status"], "failed", "{text}");
+    assert!(
+        result["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nowhere to be reported"),
+        "the sentence says why: {text}"
+    );
+    assert_eq!(result.get("child_workdir"), None, "{text}");
+    assert!(parent.child_dirs().is_empty(), "nothing was launched");
 
-    // Neither record names a delegation, and neither invents an empty id.
+    // One terminal line, closing nothing because nothing was opened, and naming no delegation.
     assert!(
         parent.events("delegation_start").is_empty(),
-        "an unnamed delegation opens no launch line"
+        "an unstarted delegation opens no launch line"
     );
     let ended = parent.events("delegation");
     assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0]["outcome"], "failed", "{}", ended[0]);
     assert_eq!(ended[0]["delegation_id"], Value::Null, "{}", ended[0]);
 }

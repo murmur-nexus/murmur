@@ -972,12 +972,13 @@ struct PeerFileFetchEvent {
     reason: Option<String>,
 }
 
-/// One `delegate-task` call, written the moment its child is up.
+/// One `delegate-task` call, written the moment its child is up — which is also the moment the
+/// call returns.
 ///
 /// Separate from the `delegation` line below because the two answer different questions and land
 /// at different times: this one reaches disk while the delegation is still in flight, so a child
-/// that hangs, crashes or is timed out is attributable from the parent's side whatever happens
-/// next. A delegation the daemon refused writes none of these — nothing was launched.
+/// that hangs, crashes or is ended at its deadline is attributable from the parent's side whatever
+/// happens next. A delegation the daemon refused writes none of these — nothing was launched.
 #[derive(Serialize)]
 struct DelegationStartEvent {
     event_type: &'static str,
@@ -997,12 +998,16 @@ struct DelegationStartEvent {
     child_workdir: String,
 }
 
-/// One `delegate-task` call, written when the delegation ends.
+/// One delegation, written when it ends.
 ///
 /// One line per call whatever happened, including a call the daemon refused: a delegation that was
-/// asked for and not made is as much a fact of the run as one that produced an answer. Carries
-/// neither the task text nor the child's answer — both are the agent's own conversation, which the
-/// `tool_call` line for the same call already records under the session's `trace.capture` setting.
+/// asked for and not made is as much a fact of the run as one that produced an answer. When it is
+/// written depends on how far the delegation got — a `delegate-task` call that started a child
+/// writes it as that child's completion arrives, out of the child's own `completion.json`; one that
+/// never started a child writes it within the call. A plan `capsule` step writes neither this line
+/// nor the `delegation_start` above it: it holds no trace appender. Carries neither the task text
+/// nor the child's answer — both are the agent's own conversation, which the `tool_call` line for
+/// the same call already records under the session's `trace.capture` setting.
 #[derive(Serialize)]
 struct DelegationEvent {
     event_type: &'static str,
@@ -1017,42 +1022,18 @@ struct DelegationEvent {
     delegation_id: Option<String>,
     /// The child's own session id, so its trace is findable. `null` when no child ran.
     child_session_id: Option<String>,
-    /// Wall-clock time from the first request to the daemon until the delegation ended.
+    /// How long the child ran, for a delegation that started; how long the call took, for one that
+    /// never started.
     duration_ms: u64,
-    /// `completed`, `failed`, `timed_out` or `refused` — `DelegationStatus::as_str`.
+    /// How the delegation ended, in one of two vocabularies depending on whether it got far
+    /// enough to have an ending of its own: `ok`, `error`, `crashed` or `terminated` from
+    /// [`crate::delegation::DelegationStatus`] for a started delegation whose completion arrived,
+    /// `unknown` for one whose completion left no readable file, and `failed` or `refused` from
+    /// [`crate::delegation_plane::DelegationStatus`] for one that never started.
     outcome: String,
-    /// `null` on `completed`. On every other outcome, the same sentence the model was given.
+    /// `null` where nothing needs saying. Otherwise the completion's `detail`, or the same
+    /// sentence the model was given.
     reason: Option<String>,
-}
-
-/// One released child ending after its deadline had already been reported, written by the task
-/// loop as it turns the late outcome into a task. Keyed on the same `dlg_` id the delegation's
-/// other two lines carry; no new id space exists for it.
-#[derive(Serialize)]
-struct DelegationLateEvent {
-    event_type: &'static str,
-    event_id: String,
-    parent_id: Option<String>,
-    session_id: String,
-    timestamp: u64,
-    /// The `dlg_` id the launcher minted. `null` for a delegation the launcher could not name.
-    delegation_id: Option<String>,
-    capsule: String,
-    version: String,
-    /// The child's own session id, so its trace is findable.
-    child_session_id: String,
-    /// `ok`, `error`, `crashed` or `terminated` — how the released child ended, in
-    /// `delegation::DelegationStatus`'s words rather than the four the `delegation` line uses.
-    status: String,
-    /// How long the child ran, from launch to ending.
-    duration_ms: u64,
-    /// How long after the deadline fired the child ended.
-    after_deadline_ms: u64,
-    /// The child's result file, relative to this capsule's accessible workdir. `null` when the
-    /// child wrote none.
-    result_path: Option<String>,
-    /// The `task_id` of the `completion`-origin task that carried this outcome to the agent.
-    completion_task_id: String,
 }
 
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
@@ -1489,41 +1470,6 @@ impl TraceWriter {
             output_bytes,
             resource_limit,
             status: status.to_string(),
-            completion_task_id: completion_task_id.to_string(),
-        };
-        self.write_event(&event).await
-    }
-
-    /// A released child ending after its deadline was already reported, written by the task loop
-    /// as it turns the late outcome into a task. `completion_task_id` is that task's id, so the
-    /// two records join.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn write_delegation_late(
-        &mut self,
-        delegation_id: Option<String>,
-        capsule: &str,
-        version: &str,
-        child_session_id: &str,
-        status: &str,
-        duration_ms: u64,
-        after_deadline_ms: u64,
-        result_path: Option<String>,
-        completion_task_id: &str,
-    ) -> std::io::Result<()> {
-        let event = DelegationLateEvent {
-            event_type: "delegation_late",
-            event_id: new_event_id(),
-            parent_id: self.session_parent(),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            delegation_id,
-            capsule: capsule.to_string(),
-            version: version.to_string(),
-            child_session_id: child_session_id.to_string(),
-            status: status.to_string(),
-            duration_ms,
-            after_deadline_ms,
-            result_path,
             completion_task_id: completion_task_id.to_string(),
         };
         self.write_event(&event).await
@@ -2194,8 +2140,9 @@ impl ResourceTraceAppender {
         self.append(&event).await;
     }
 
-    /// Records one delegation. `delegation_id` and `child_session_id` are `None` when no child was
-    /// launched — a refused delegation names no id, and an audit record must not imply one exists.
+    /// Records one delegation ending. `delegation_id` and `child_session_id` are `None` when no
+    /// child was launched — a delegation that never started names no id, and an audit record must
+    /// not imply one exists.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_delegation(
         &self,

@@ -382,6 +382,18 @@ fn launch(
     env_allow: &[&str],
     spawner: Option<Spawner>,
 ) -> LaunchedChild {
+    launch_bounded(parent_dir, name, env_allow, spawner, None)
+}
+
+/// The same launch under a completion deadline: how long the watcher observes the child before
+/// ending it and reporting a `terminated` outcome. `None` watches for as long as it runs.
+fn launch_bounded(
+    parent_dir: &Path,
+    name: &str,
+    env_allow: &[&str],
+    spawner: Option<Spawner>,
+    completion_deadline: Option<Duration>,
+) -> LaunchedChild {
     let suite = suite();
     let answer = suite.roost.permission(&suite.credential, name, "0.1.0");
     let approval = answer["approval"]
@@ -397,6 +409,7 @@ fn launch(
         child_env_allow: env_allow.iter().map(|name| name.to_string()).collect(),
         roost_url: suite.roost.url.clone(),
         spawner,
+        completion_deadline,
     })
     .unwrap_or_else(|error| panic!("launching '{name}' failed: {error}"))
 }
@@ -407,7 +420,12 @@ fn launch(
 /// briefly readable in a state that says neither that the completion arrived nor why it did not.
 /// Waiting for the settled one is what stops a case reading that intermediate write.
 fn wait_for_completion(child: &LaunchedChild) -> Value {
-    let path = child.workdir.join("completion.json");
+    wait_for_completion_at(&child.workdir)
+}
+
+/// The same, named by directory rather than by a handle a release has already consumed.
+fn wait_for_completion_at(workdir: &Path) -> Value {
+    let path = workdir.join("completion.json");
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -421,7 +439,32 @@ fn wait_for_completion(child: &LaunchedChild) -> Value {
             Instant::now() < deadline,
             "no settled {} appeared for the child at {}; what is there: {}",
             "completion.json",
-            child.workdir.display(),
+            workdir.display(),
+            std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The child's own record of how it ended, once it says the notification reached its parent.
+fn wait_for_delivered_completion(workdir: &Path) -> Value {
+    let path = workdir.join("completion.json");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+                if parsed["delivered"] == Value::Bool(true) {
+                    return parsed;
+                }
+                if !parsed["delivery_error"].is_null() {
+                    panic!("the completion was refused: {parsed}");
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no delivered completion appeared at {}; what is there: {}",
+            workdir.display(),
             std::fs::read_to_string(&path).unwrap_or_else(|_| "nothing".to_string())
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -964,4 +1007,69 @@ fn a_delegation_the_parent_ends_is_recorded_and_not_announced() {
             .any(|event| event["delegation_id"] == delegation_id.as_str()),
         "a terminated delegation is announced to nobody"
     );
+}
+
+// ── 8. A started child that never ends ────────────────────────────────────────
+
+/// A child that outruns the delegation deadline is ended by its watcher, and the parent is told —
+/// which is the only thing that stops a wedged sub-capsule running for as long as its parent does.
+///
+/// Unlike an ending the parent chose by hand, this one is posted: the delegating agent asked for
+/// an outcome, and this is the outcome.
+#[test]
+fn a_started_child_that_never_ends_is_stopped_at_its_deadline() {
+    if capsule_runtime::skip_without_host_support(
+        "a_started_child_that_never_ends_is_stopped_at_its_deadline",
+    ) {
+        return;
+    }
+    let parent = RunningParent::start();
+    let parent_dir = TempDir::new().unwrap();
+
+    // `slow-worker` binds a port and sleeps between tasks, so nothing it does ever ends its
+    // session. Released, exactly as a started delegation releases its child, so the watcher is
+    // the only thing left observing it.
+    let (delegation_id, workdir, pid) = {
+        let _slot = agent_child_slot();
+        let child = launch_bounded(
+            parent_dir.path(),
+            "slow-worker",
+            &[],
+            Some(parent.spawner(TrustClass::Untrusted)),
+            Some(Duration::from_secs(5)),
+        );
+        let named = (
+            child.delegation_id.clone().expect("a delegated launch"),
+            child.workdir.clone(),
+            child.pid(),
+        );
+        child.release();
+        named
+    };
+
+    // Waited for on `delivered` rather than through `is_settled`, which reads a `terminated`
+    // outcome as settled on sight — true of an ending the parent chose, which is posted to nobody,
+    // and false of this one, which is written once before the post and rewritten after it.
+    let completion = wait_for_delivered_completion(&workdir);
+    assert_eq!(completion["status"], DelegationStatus::Terminated.as_str());
+    assert_eq!(completion["reported_by"], Reporter::Launcher.as_str());
+    let detail = completion["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("5s") && detail.contains("deadline"),
+        "the detail names the bound in seconds: {completion}"
+    );
+
+    // The parent files it as a `completion`-origin task in the background lane, joined by the id.
+    let start = parent.wait_for_completion_task(&delegation_id);
+    assert_eq!(start["origin"], "completion", "{start}");
+    assert_eq!(start["lane"], "bg", "{start}");
+
+    // And the process is gone, reaped by the watcher and by nothing else.
+    #[cfg(target_os = "linux")]
+    wait_for(
+        "the ended child to be reaped",
+        Duration::from_secs(30),
+        || !Path::new(&format!("/proc/{pid}")).exists(),
+    );
+    let _ = pid;
 }

@@ -239,6 +239,7 @@ impl Parent {
             roost_url: suite().roost.url.clone(),
             // Nothing in this suite delegates: no handle is injected and no watcher runs.
             spawner: None,
+            completion_deadline: None,
         })
     }
 }
@@ -434,6 +435,7 @@ fn a_child_declaring_no_variables_gets_only_the_runtime_owned_names() {
             context_id: "ctx_runtime_owned_names".to_string(),
             report_to: None,
         }),
+        completion_deadline: None,
     })
     .expect("a child that declares no variables launches");
     assert_eq!(
@@ -640,6 +642,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         ],
         roost_url: suite.roost.url.clone(),
         spawner: None,
+        completion_deadline: None,
     })
     .expect("the leak fixture launches");
 
@@ -694,6 +697,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         child_env_allow: Vec::new(),
         roost_url: "http://127.0.0.1:1".to_string(),
         spawner: None,
+        completion_deadline: None,
     })
     .expect_err("a child cannot register with a daemon that is not listening");
     let message = error.to_string();
@@ -819,20 +823,19 @@ fn dropping_a_launched_child_terminates_and_reaps_it() {
     );
 }
 
-/// `release` is the one way out of that: the parent stops owning the child's lifetime, and
-/// dropping the handle afterwards signals nothing. The process keeps running, and this suite ends
-/// it itself, because after a release nothing in the runtime will.
+/// `release` is the one way out of that: the parent stops owning the child's lifetime, and the
+/// handle is consumed rather than dropped normally. The process keeps running, and this suite ends
+/// it itself, because these launches name no completion address and so start no watcher — after a
+/// release nothing else in the runtime will.
 #[test]
 fn a_released_child_survives_the_handle_that_launched_it() {
     let parent = Parent::new();
     let pid = {
-        let mut child = parent.launch("child-agent", &[]);
+        let child = parent.launch("child-agent", &[]);
         let pid = child.pid();
         assert!(process_is_alive(pid));
 
-        let released = child.release();
-        assert_eq!(released.pid(), pid, "the release names the same process");
-        assert_eq!(released.session_id, child.session_id);
+        child.release();
         pid
     };
 

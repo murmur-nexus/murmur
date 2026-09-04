@@ -61,16 +61,19 @@ pub struct LifecycleConfig {
     /// reports back later as a `completion`-origin task. `0` demotes at the first poll after the
     /// spawn, so effectively every command detaches.
     pub shell_grace_secs: u64,
-    /// How long a delegation waits for a sub-capsule's answer before the parent stops waiting.
-    /// Defaults to 600 seconds. Absent is a ceiling rather than an absence: a capsule that never
-    /// declares this one is still bounded, because an unbounded delegation strands the parent on
-    /// a child that has wedged. `0` gives up at the first poll after the task is delivered, the
-    /// same reading `shell_grace_secs: 0` has.
+    /// The single bound on a delegation, covering both waits one can have: how long a sub-capsule
+    /// started by `delegate-task` is watched, and how long a plan `capsule` step waits for its
+    /// answer. Defaults to 600 seconds. Absent is a ceiling rather than an absence: a capsule that
+    /// never declares this one is still bounded, because an unbounded delegation leaves a wedged
+    /// sub-capsule running for as long as the capsule that started it. `0` gives up at the first
+    /// poll after the task is delivered, the same reading `shell_grace_secs: 0` has.
     ///
-    /// Reaching the deadline stops the wait; it does not stop the child. The parent releases the
-    /// child's process, receives a `completion`-origin task naming the deadline, and receives a
-    /// second one if the released child later ends. `MURMUR_DELEGATION_TIMEOUT_SECS` overrides
-    /// this value when it names a positive number of seconds.
+    /// Reaching the deadline ends the sub-capsule. A `delegate-task` caller is told in a
+    /// `completion`-origin task carrying `status: terminated` and a detail naming the bound; a plan
+    /// step's call returns `timed_out`. The clock starts when the sub-capsule reports itself ready,
+    /// not when its process is spawned, so a slow host does not spend this window on staging.
+    /// `MURMUR_DELEGATION_TIMEOUT_SECS` overrides this value when it names a positive number of
+    /// seconds.
     pub delegation_deadline_secs: u64,
 }
 

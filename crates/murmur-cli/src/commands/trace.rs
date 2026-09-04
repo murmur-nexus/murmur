@@ -457,18 +457,6 @@ struct DelegationEvent {
     reason: Option<String>,
 }
 
-/// One `delegation_late` record: a released child that ended after its deadline had already been
-/// reported. Joined to the row its `delegation_start` opened by the same `dlg_` id.
-#[derive(Debug, Deserialize)]
-struct DelegationLateEvent {
-    #[serde(default)]
-    delegation_id: Option<String>,
-    status: String,
-    after_deadline_ms: u64,
-    #[serde(default)]
-    result_path: Option<String>,
-}
-
 /// One step of a plan's DAG as `plan_start` recorded it.
 #[derive(Debug, Deserialize)]
 struct PlanStepShape {
@@ -577,7 +565,6 @@ enum TraceEvent {
     A2aSend(A2aSendEvent),
     DelegationStart(DelegationStartEvent),
     Delegation(DelegationEvent),
-    DelegationLate(DelegationLateEvent),
     PlanStart(PlanStartEvent),
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
@@ -834,10 +821,6 @@ struct DelegationRecord {
     /// leaves behind.
     outcome: Option<String>,
     reason: Option<String>,
-    /// How a released child ended after its `timed_out` outcome was already recorded, and how long
-    /// after the deadline. `None` for every delegation that was not released, and for a released
-    /// one whose child has not ended.
-    late: Option<(String, u64, Option<String>)>,
 }
 
 /// One `retention` trace record, surfaced in `mur trace show`.
@@ -1400,7 +1383,6 @@ fn compute_metrics(
                 child_workdir: Some(e.child_workdir),
                 outcome: None,
                 reason: None,
-                late: None,
             }),
             TraceEvent::Delegation(e) => {
                 // The terminal line closes the row its `delegation_start` opened. A refusal names
@@ -1423,18 +1405,7 @@ fn compute_metrics(
                         child_workdir: None,
                         outcome: Some(e.outcome),
                         reason: e.reason,
-                        late: None,
                     }),
-                }
-            }
-            // Annotates the row it belongs to rather than opening one: a late outcome is the same
-            // delegation ending, never a second delegation.
-            TraceEvent::DelegationLate(e) => {
-                if let Some(record) = delegations
-                    .iter_mut()
-                    .find(|record| record.late.is_none() && record.delegation_id == e.delegation_id)
-                {
-                    record.late = Some((e.status, e.after_deadline_ms, e.result_path));
                 }
             }
             TraceEvent::PlanStart(e) => plan_runs.push(PlanRunRecord {
@@ -2155,14 +2126,6 @@ fn print_show(m: &TraceMetrics) {
             // runtime writes one: a delegation that did nothing shows why rather than nothing.
             if let Some(reason) = &d.reason {
                 println!("  {reason}");
-            }
-            // A released child that ended anyway. The parent was told twice about this one
-            // delegation, and the second telling is what this line is.
-            if let Some((status, after_deadline_ms, result_path)) = &d.late {
-                println!("  ended {status} {after_deadline_ms}ms after the deadline");
-                if let Some(path) = result_path {
-                    println!("  late result: {path}");
-                }
             }
             // The one join a reader would otherwise have to compose by hand, and the only thing
             // in this file that points outside it. Relative to this capsule's accessible workdir.

@@ -306,9 +306,7 @@ pub struct ScriptedServer {
 impl ScriptedServer {
     /// Answers every request with one end-of-turn assistant message.
     pub fn always_replying(text: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let body = json!({
+        Self::serving(json!({
             "id": "msg_1",
             "type": "message",
             "role": "assistant",
@@ -316,23 +314,18 @@ impl ScriptedServer {
             "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 1}
-        })
-        .to_string();
+        }))
+    }
+
+    fn serving(response: serde_json::Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let body = response.to_string();
 
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let body = body.clone();
-                thread::spawn(move || {
-                    let mut stream = stream;
-                    let mut buffer = [0u8; 65536];
-                    let _ = stream.read(&mut buffer);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                });
+                thread::spawn(move || answer(stream, &body));
             }
         });
 
@@ -343,6 +336,18 @@ impl ScriptedServer {
     pub fn authority(&self) -> &str {
         self.endpoint.trim_start_matches("http://")
     }
+}
+
+/// Read whatever the client sent and write one JSON body back, then close.
+fn answer(mut stream: TcpStream, body: &str) {
+    let mut buffer = [0u8; 65536];
+    let _ = stream.read(&mut buffer);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────

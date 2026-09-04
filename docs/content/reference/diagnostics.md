@@ -96,6 +96,7 @@ section that explains it.
 | `W-SEC-017` | `capabilities.filesystem.read_only` is advisory for an allowlisted interpreter | [W-SEC-017](#w-sec-017) |
 | `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
 | `W-SEC-019` | A key in `murmur.yaml` this build does not recognize was parsed and ignored | [W-SEC-019](#w-sec-019) |
+| `W-SEC-020` | The capsule can delegate, and its `lifecycle` block cannot receive a delegation's outcome | [W-SEC-020](#w-sec-020) |
 
 ---
 
@@ -777,7 +778,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
@@ -1426,3 +1427,38 @@ and upgrade rather than edit the manifest. A version-gap line answers that quest
 The pin is separate from this warning and unchanged by it: `mur_version` is compared for equality
 by `mur run`, which warns on any difference in either direction, and only a pin parsing as a
 numeric triple *higher* than the running version adds the third line above.
+
+### W-SEC-020 — a delegating capsule cannot receive an outcome { #w-sec-020 }
+
+**Fires when:** `capabilities.spawn.allow` is non-empty and the resolved `lifecycle` block cannot
+take an inbound completion — [`lifecycle.after_task`](manifest.md#lifecycle-after-task) is `exit`,
+or [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is anything but `queue`.
+Once per launch, on stderr and in the session's `logs/bootstrap.log`.
+
+```text
+[capsule-runtime] warning[W-SEC-020]: this capsule declares capabilities.spawn.allow, but its lifecycle block cannot receive a delegation's outcome: delegate-task returns as soon as the sub-capsule is running, and what the sub-capsule did arrives afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, and a lifecycle.queue_depth covering how many delegations one turn issues, or every outcome this capsule delegates for will be posted to a session that has already exited. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-020)
+```
+
+**Why it matters:** [`delegate-task`](roost-api.md#the-delegation-tool) returns as soon as the
+sub-capsule is running and holding its task. What the sub-capsule did arrives afterwards, as a
+`completion`-origin task in the `bg` lane. Under the default lifecycle the session ends with the
+task that made the delegation, so the sub-capsule runs, finishes, posts its outcome to an address
+nothing answers on, and records the failed delivery in its own `completion.json` — where nobody is
+looking. The work happens and the result is lost.
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The delegation
+still runs and the sub-capsule still does its work; only the report has nowhere to land.
+
+**What to do:** declare a lifecycle that outlives the delegating task.
+
+```yaml
+lifecycle:
+  task_acceptance: queue
+  queue_depth: 4
+  after_task: sleep
+```
+
+`queue_depth` covers how many delegations one turn issues, because each outcome in flight occupies
+a slot. A capsule that delegates and deliberately does not wait — one that hands work off and exits
+— is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
+declaring `capabilities.spawn.allow` on a capsule that does not delegate.

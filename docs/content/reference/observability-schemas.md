@@ -367,20 +367,19 @@ loop has exited, on every exit path
 |---|---|---|
 | `task_id` | string | UUID for this task (runtime-generated for A2A; synthesized for `task.md` path) |
 | `context_id` | string | Context UUID for this task |
-| `source` | string | Which door the task came through: `"a2a"` for a task from a peer, `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished, `"detached_lost"` for the report a resume enqueues about demoted commands the session it resumes never accounted for, `"delegation_deadline"` for the report the runtime enqueues when a delegation reaches [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs), `"delegation_late"` for the outcome of a released sub-capsule that ended after that deadline was reported |
+| `source` | string | Which door the task came through: `"a2a"` for a task from a peer — and for a delegated sub-capsule's outcome, which arrives at the same door — `"task_md"` for the task.md path, `"detached_shell"` for a completion the runtime enqueued for itself when a [demoted shell command](manifest.md#lifecycle-shell-grace-secs) finished, `"detached_lost"` for the report a resume enqueues about demoted commands the session it resumes never accounted for |
 | `origin` | string | `"user"` \| `"peer"` \| `"schedule"` \| `"event"` \| `"completion"` \| `"system"` — why the capsule woke. `"task_md"` tasks are `"user"`; an A2A task is whatever the peer door derived from the request headers. See [Task origin and trust class](../concepts/access-control.md#task-origin-and-trust-class) |
 | `trust` | string | `"trusted"` \| `"untrusted"` — derived from `origin` and, for `"peer"` and `"completion"`, from the sending capsule's own class. Never taken from a value a capsule component supplied |
 | `lane` | string | `"user"` \| `"peer"` \| `"bg"` — the queue lane the task waited in, derived from `origin`. See [Queue lanes](../concepts/session-loop.md#queue-lanes) for the mapping |
-| `delegation_id` | string | `dlg_…` — the delegation this task reports on, for a `"completion"`-origin task from a sub-capsule this session launched or from its own deadline. Written only then; the field is absent from every other line rather than written as `null`. It is the value that joins a completion to the delegation that produced it, and it is the id the child's own `completion.json` carries. See [The completion path](roost-api.md#the-completion-path) |
+| `delegation_id` | string | `dlg_…` — the delegation this task reports on, for a `"completion"`-origin task from a sub-capsule this session launched. Written only then; the field is absent from every other line rather than written as `null`. It is the value that joins a completion to the delegation that produced it, it is the id the child's own `completion.json` carries, and it is what the terminal `delegation` line for that delegation is written against. See [The completion path](roost-api.md#the-completion-path) |
 | `message_parts_bytes` | u64 | Byte length of the task message text |
 
 Resets all per-task counters. Follows `a2a_task_received` for A2A tasks; is the first event for
 `task.md` tasks. A `"detached_shell"` task follows the `shell_completed` line that enqueued it and
 has no `a2a_task_received` line, having never crossed the peer door. A `"detached_lost"` task
 names every lost work id in one message, and joins to the `shell_lost` lines in the resumed-from
-session's trace through `reconciled_task_id`. A `"delegation_deadline"` task follows the
-`delegation` line with `outcome: "timed_out"` that enqueued it; a `"delegation_late"` task follows
-its own `delegation_late` line.
+session's trace through `reconciled_task_id`. A delegated sub-capsule's outcome is followed by the
+terminal `delegation` line it closes.
 
 **`task_end`** — written after the agent loop returns and any hook-requested reopens are resolved,
 for every task, on every exit path
@@ -559,47 +558,34 @@ that child's process is up and has reported its session id
 | `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
 | `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir. Join the two, then `.murmur/<child_session_id>/trace.jsonl`, to reach the child's own trace |
 
-Written while the delegation is still running, not when it ends, so a child that hangs, crashes or
-is timed out is attributable from the parent's side whatever happens next. A delegation the daemon
-refused writes none of these — nothing was launched — and is recorded only by the `delegation` line
-below.
+Written when the child starts, which is also when the `delegate-task` call returns, so a child that
+then hangs, crashes or is ended is attributable from the parent's side whatever happens next. A
+delegation the daemon refused writes none of these — nothing was launched — and is recorded only by
+the `delegation` line below.
 
-**`delegation`** — written by the `delegate-task` tool when a delegation ends, whatever ended it
+**`delegation`** — written once per `delegate-task` call, when the delegation ends
 
 | Field | Type | Notes |
 |---|---|---|
 | `capsule` | string | The sub-capsule the agent named |
 | `version` | string | The version the agent named |
-| `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one whose approved child's process never started, was never made |
+| `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one that was never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
-| `duration_ms` | u64 | From the first request to the daemon until the delegation ended |
-| `outcome` | string | `"completed"`, `"failed"`, `"timed_out"` or `"refused"` |
-| `reason` | string \| null | `null` on `"completed"`; otherwise the same sentence the model was given |
+| `duration_ms` | u64 | How long the child ran, on an outcome; how long the call took, on one that never started |
+| `outcome` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` for a delegation that started and ended; `"unknown"` when its sub-capsule left no readable `completion.json`; `"failed"` or `"refused"` for one that never started |
+| `reason` | string \| null | `null` on `"ok"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
 
-One line per call. It carries neither the task text nor the child's answer — both are the agent's
-own conversation, which the `tool_call` line for the same call already records under the session's
-`trace.capture` setting.
+**When each line is written.** A `delegate-task` call that starts a child writes `delegation_start`
+and nothing else: the delegation has not ended, and the call has returned. The terminal
+`delegation` line is written later, as the task carrying that delegation's outcome begins, out of
+the child's own [`completion.json`](roost-api.md#the-completion-path) rather than out of the text
+the agent reads. A call that never started a child — refused, or failed before the child held its
+task — writes only the terminal line, in the same turn, and names no `delegation_id`. A plan
+`capsule` step writes neither line: a plan run is recorded by its own `plan_step` events instead.
 
-`"timed_out"` says the parent stopped waiting, not that the child was stopped: the child is
-released and keeps running, and the `delegation_late` line below records what it eventually did.
-
-**`delegation_late`** — written by the task loop when a released child ends after its
-[deadline](manifest.md#lifecycle-delegation-deadline-secs) was already reported
-
-| Field | Type | Notes |
-|---|---|---|
-| `delegation_id` | string \| null | `dlg_…`, the same id the `delegation_start` and `delegation` lines for this delegation carry. `null` for a delegation the launcher could not name |
-| `capsule` | string | The sub-capsule the agent named |
-| `version` | string | The version the agent named |
-| `child_session_id` | string | `ses_…`, the child's own session, so its trace is findable |
-| `status` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` — how the released child ended. A different vocabulary from `delegation.outcome`, because it describes an ending rather than a wait |
-| `duration_ms` | u64 | How long the child ran, from launch to ending |
-| `after_deadline_ms` | u64 | How long after the deadline fired the child ended |
-| `result_path` | string \| null | The child's result file, relative to this capsule's accessible workdir. `null` when the child wrote none |
-| `completion_task_id` | string | The `task_id` of the `completion`-origin task that carried this outcome to the agent |
-
-At most one per delegation, and only for a delegation whose `delegation` line reads `"timed_out"`.
-It carries no output: the child's answer stays in the file `result_path` names.
+One line per call either way. It carries neither the task text nor the child's answer — both are
+the agent's own conversation, which the `tool_call` line for the same call already records under
+the session's `trace.capture` setting.
 
 ### Reading a formation { #delegation-lineage }
 
@@ -610,8 +596,7 @@ The relationship between a parent and a child is recorded once, from both ends, 
 |---|---|---|
 | A parent's trace | `delegation_start.child_workdir` and `child_session_id` | `<accessible workdir>/<child_workdir>/.murmur/<child_session_id>/trace.jsonl` |
 | A child's trace | `session_start.spawned_by` | The `ses_` id of the session that spawned it |
-| A parent's trace | `delegation.delegation_id` | The `task_start` with `source: "delegation_deadline"` and the same `delegation_id`, for a delegation that reached its deadline |
-| A parent's trace | `delegation_late.completion_task_id` | The `task_start` that carried the released child's outcome to the agent |
+| A parent's trace | `delegation_start.delegation_id` | The `task_start` with origin `"completion"` and the same `delegation_id`, which is that delegation's outcome arriving |
 
 [`mur trace show`](cli.md#mur-trace-show) renders both ends within the one file it is given: a child's
 header names the session that spawned it and the delegation that created it, and a parent grows a

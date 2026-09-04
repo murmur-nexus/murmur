@@ -17,7 +17,7 @@ Each one appears only when the manifest declaration in the second column is pres
 | One per shell binary | [`capabilities.shell.allow`](manifest.md#shell-allow) | Runs that binary as a subprocess in the accessible workdir |
 | `share-file` | [`exports.peer_files`](manifest.md#field-exports-peer-files) | Mints a [peer-file handle](resource-plane.md#peer-plane) for one file under the declared export root |
 | `fetch-peer-file` | [`capabilities.peer_fetch`](manifest.md#field-peer-fetch) | Redeems a handle a peer sent and stores the file in this capsule's workdir |
-| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and waits for its answer, up to [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) — see [The delegation tool](roost-api.md#the-delegation-tool) |
+| `delegate-task` | [`capabilities.spawn.allow`](manifest.md#field-capabilities) | Hands one task to one sub-capsule and returns as soon as it is running and holding it; the outcome arrives afterwards as a background task — see [The delegation tool](roost-api.md#the-delegation-tool) |
 
 Every one of their manifests carries `version: 0.0.0`, `runtime: tool` and
 `implementation: native`. Nothing was fetched, so nothing is version-pinned, nothing is

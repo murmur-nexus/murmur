@@ -26,16 +26,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::UnboundedSender;
-
 use crate::delegation::{
     self, CompletionAddress, DelegationOutcome, DelegationStatus, Reporter, Spawner, SpawnerHandle,
     SPAWNER_ENV,
 };
-use crate::detached::{DelegationLateReport, DetachedReport};
 use crate::errors::RuntimeError;
 use crate::mac_token;
-use crate::origin::TaskProvenance;
 use crate::spawn_credential::SpawnApproval;
 
 /// Environment variable naming the `mur` binary to launch children with.
@@ -100,6 +96,14 @@ pub struct ChildLaunchRequest {
     /// [`CompletionAddress`] — a parent waiting on its own connection wants no completion.
     /// `None` injects nothing and starts nothing.
     pub spawner: Option<Spawner>,
+    /// How long the completion watcher observes this child before ending it, or `None` to observe
+    /// it for as long as it runs.
+    ///
+    /// Meaningful only alongside a [`CompletionAddress`], because the watcher that enforces it
+    /// starts only for a spawner that names one. On expiry the watcher stops the process and
+    /// posts a [`DelegationStatus::Terminated`] outcome naming the bound, which is the only thing
+    /// that tells a parent about a child that never ends.
+    pub completion_deadline: Option<Duration>,
 }
 
 /// How a child's process ended, as the watcher sees it.
@@ -107,7 +111,8 @@ enum Ending {
     /// The process exited on its own. `None` when it was reaped by someone who did not keep the
     /// status.
     Exited(Option<ExitStatus>),
-    /// The parent ended the delegation itself, through [`LaunchedChild::shutdown`] or `Drop`.
+    /// The delegation was ended on purpose rather than by the child: by the parent, through
+    /// [`LaunchedChild::shutdown`] or `Drop`, or by the completion watcher at its deadline.
     Deliberate,
 }
 
@@ -120,8 +125,9 @@ enum Ending {
 struct ChildProcess {
     /// `None` once [`LaunchedChild::shutdown`] or `Drop` has reaped the process.
     child: Option<Child>,
-    /// Set before the kill by whoever ended the delegation on purpose, so the watcher can tell a
-    /// termination the parent chose from a crash it did not.
+    /// Set before the kill by whoever ended the delegation on purpose, so a crash is never read
+    /// as a termination. It does not say *who*: the completion watcher sets it at its own
+    /// deadline too, and tells the two apart by a flag of its own.
     deliberate: bool,
     /// The exit status, once anyone has observed it.
     status: Option<ExitStatus>,
@@ -243,26 +249,18 @@ impl LaunchedChild {
         })
     }
 
-    /// Stop owning the child's lifetime without signalling it.
+    /// Stop owning the child's lifetime without signalling it, and let this handle go.
     ///
-    /// The one way out of [`Drop`]'s kill. After this the process keeps running and this handle
-    /// will neither end nor reap it; the returned [`ReleasedChild`] is the only remaining way to
-    /// learn what it eventually did, and reaping it is [`watch_released_child`]'s job. A caller
-    /// that releases without starting that watcher leaves a process nothing will ever wait on.
+    /// The one escape from [`Drop`]'s kill. After this the process keeps running and **only the
+    /// completion watcher started by [`launch_child_capsule`] will ever observe or reap it** — a
+    /// child released from a launch that named no [`CompletionAddress`] is a process nothing will
+    /// ever wait on.
     ///
-    /// Used by the delegation deadline, which stops the parent waiting rather than stopping the
-    /// child: killing a capsule mid-task destroys work that may be nearly done, and the parent
-    /// cannot tell the two apart from the outside.
-    pub fn release(&mut self) -> ReleasedChild {
+    /// This is how a delegation outlives the call that made it: `delegate-task` returns as soon as
+    /// the child is running and holding its task, and what the child eventually did arrives at the
+    /// parent as a completion the watcher either forwards or writes itself.
+    pub fn release(mut self) {
         self.released = true;
-        ReleasedChild {
-            workdir: self.workdir.clone(),
-            session_id: self.session_id.clone(),
-            delegation_id: self.delegation_id.clone().unwrap_or_default(),
-            process: Arc::clone(&self.process),
-            stderr_tail: Arc::clone(&self.stderr_tail),
-            started: self.started,
-        }
     }
 }
 
@@ -283,243 +281,10 @@ impl Drop for LaunchedChild {
     }
 }
 
-/// A child this parent no longer owns the lifetime of, and still wants the outcome of.
-///
-/// Produced by [`LaunchedChild::release`] at a delegation deadline. Holds the same process handle
-/// the dropped [`LaunchedChild`] held, so the process can still be observed and reaped — but
-/// nothing here signals it, and dropping this without watching simply forgets the process.
-pub struct ReleasedChild {
-    /// The directory the parent created for this child, absolute.
-    pub workdir: PathBuf,
-    /// The session id the child's runtime minted for itself.
-    pub session_id: String,
-    /// The `dlg_` id this delegation is named by, or empty for one the launcher could not name.
-    pub delegation_id: String,
-    process: Arc<Mutex<ChildProcess>>,
-    stderr_tail: Arc<Mutex<Vec<String>>>,
-    started: Instant,
-}
-
-impl std::fmt::Debug for ReleasedChild {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReleasedChild")
-            .field("workdir", &self.workdir)
-            .field("session_id", &self.session_id)
-            .field("delegation_id", &self.delegation_id)
-            .field("pid", &self.pid())
-            .finish()
-    }
-}
-
-impl ReleasedChild {
-    /// The child's operating-system process id. `0` once it has been reaped.
-    pub fn pid(&self) -> u32 {
-        lock(&self.process)
-            .child
-            .as_ref()
-            .map(Child::id)
-            .unwrap_or(0)
-    }
-
-    /// End a released child no watcher took, and reap it.
-    ///
-    /// The hand-over to [`watch_released_child`] is the only thing that ever reaps a released
-    /// process, so a release whose receiver was already gone leaves one nothing will wait on.
-    /// Stopping it is the lesser harm, and is what the caller's tool result then reports.
-    pub(crate) fn end(self) {
-        let mut process = lock(&self.process);
-        process.deliberate = true;
-        let _ = process.end();
-    }
-
-    /// A released child around a process this crate started itself, for the watcher's own tests.
-    #[cfg(test)]
-    pub(crate) fn adopt(child: Child, workdir: PathBuf, delegation_id: String) -> Self {
-        Self {
-            workdir,
-            session_id: "ses_released".to_string(),
-            delegation_id,
-            process: Arc::new(Mutex::new(ChildProcess {
-                child: Some(child),
-                deliberate: false,
-                status: None,
-            })),
-            stderr_tail: Arc::new(Mutex::new(Vec::new())),
-            started: Instant::now(),
-        }
-    }
-}
-
-/// Everything the released-child watcher needs beyond the child, decided by the parent's runtime
-/// at the instant the deadline fired.
-pub(crate) struct LateReportPlan {
-    pub capsule_name: String,
-    pub capsule_version: String,
-    /// The bound that expired, in whole seconds — carried so the late report can name it.
-    pub deadline_secs: u64,
-    /// When the deadline fired, so the report can say how much later the child ended.
-    pub deadline_at: Instant,
-    /// The conversation the delegation was made from.
-    pub context_id: String,
-    /// [`crate::origin::TaskOrigin::Completion`] with the delegating task's trust inherited.
-    pub provenance: TaskProvenance,
-    /// The parent's accessible workdir: the root the child's directory and its result file are
-    /// named relative to, because that is the root the parent's own tools address.
-    pub result_root: PathBuf,
-    /// The A2A task id the parent delivered, so the per-task result file is preferred over the
-    /// unsuffixed one.
-    pub child_task_id: String,
-    /// Where the late report goes. A closed channel is a parent whose task loop has ended.
-    pub reports: UnboundedSender<DetachedReport>,
-}
-
-/// Watch a released child until it ends, then tell the parent once.
-///
-/// Polls the shared process handle exactly as [`watch_for_completion`] does — never blocking on
-/// `wait`, so nothing contends for ownership of the `Child` — and reaps the process when it ends.
-/// The parent has already been told about the deadline by the time this thread exists, so the one
-/// report it sends is always the second word on this delegation and says so.
-///
-/// A report that cannot be handed over is recorded rather than dropped: the child's own
-/// [`crate::delegation::COMPLETION_FILE`] is written with `delivered: false` and a reason, and a
-/// line goes to stderr. That is the shape a parent whose task loop has already ended leaves
-/// behind, and it is the only record anything will have of the work.
-///
-/// Sends once, by construction: one thread, one loop exit, one send.
-pub(crate) fn watch_released_child(
-    child: ReleasedChild,
-    plan: LateReportPlan,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let ending = loop {
-            if let Some(ending) = lock(&child.process).poll() {
-                break ending;
-            }
-            std::thread::sleep(CHILD_WATCH_INTERVAL);
-        };
-        let duration_ms = child
-            .started
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-        let after_deadline_ms = plan
-            .deadline_at
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX);
-
-        let (status, detail) = match ending {
-            // Nothing sets `deliberate` on a released child — release is the opposite of ending
-            // it — so this is only reachable if some other owner stopped the process.
-            Ending::Deliberate => (
-                DelegationStatus::Terminated,
-                Some("the process was ended by its launcher after being released".to_string()),
-            ),
-            Ending::Exited(Some(status)) if status.success() => (DelegationStatus::Ok, None),
-            Ending::Exited(status) => {
-                let status_text = match status {
-                    Some(status) => status.to_string(),
-                    None => "unknown exit status".to_string(),
-                };
-                let tail = lock(&child.stderr_tail).join("\n");
-                let detail = if tail.is_empty() {
-                    format!("the released capsule ended with {status_text}")
-                } else {
-                    format!(
-                        "the released capsule ended with {status_text}; its last stderr lines \
-                         were:\n{tail}"
-                    )
-                };
-                (
-                    match status {
-                        Some(_) => DelegationStatus::Error,
-                        None => DelegationStatus::Crashed,
-                    },
-                    Some(detail),
-                )
-            }
-        };
-        let detail = detail.map(delegation::bound_detail);
-
-        // Two roots, both named from the same file. The completion the child's directory holds is
-        // relative to that directory, which is what every reader of a `completion.json` expects;
-        // the parent's task names it relative to the parent's own accessible workdir, which is the
-        // only root the parent's tools can address.
-        let found =
-            delegation::child_result_path(&child.workdir, &child.session_id, &plan.child_task_id);
-        let relative_to = |root: &Path| -> Option<String> {
-            found.as_ref().and_then(|path| {
-                path.strip_prefix(root)
-                    .ok()
-                    .map(|path| path.to_string_lossy().replace('\\', "/"))
-            })
-        };
-
-        let report = DelegationLateReport {
-            delegation_id: child.delegation_id.clone(),
-            capsule_name: plan.capsule_name.clone(),
-            capsule_version: plan.capsule_version.clone(),
-            child_session_id: child.session_id.clone(),
-            child_workdir: workdir_relative_to(&child.workdir, &plan.result_root),
-            status,
-            duration_ms,
-            after_deadline_ms,
-            deadline_secs: plan.deadline_secs,
-            result_path: relative_to(&plan.result_root),
-            detail: detail.clone(),
-            context_id: plan.context_id.clone(),
-            provenance: plan.provenance,
-        };
-
-        let delivery_error = plan
-            .reports
-            .send(DetachedReport::DelegationLate(report))
-            .err()
-            .map(|_| {
-                "the delegating session's task loop was no longer listening, so this outcome \
-                 reached no task"
-                    .to_string()
-            });
-        if let Some(reason) = &delivery_error {
-            eprintln!(
-                "[capsule-runtime] delegation {}: the released capsule ended after its deadline \
-                 but {reason}; recorded in {}",
-                child.delegation_id,
-                delegation::completion_path(&child.workdir).display(),
-            );
-        }
-
-        // Written whichever way the hand-over went, because a delegation nobody waited for is
-        // exactly the one whose only record is this file.
-        let outcome = DelegationOutcome {
-            delegation_id: child.delegation_id.clone(),
-            capsule_name: plan.capsule_name,
-            capsule_version: plan.capsule_version,
-            session_id: child.session_id.clone(),
-            status,
-            result_path: relative_to(&child.workdir),
-            workdir: child.workdir.display().to_string(),
-            duration_ms,
-            detail,
-            reported_by: Reporter::Launcher,
-            delivered: delivery_error.is_none(),
-            delivery_error,
-        };
-        if let Err(reason) = delegation::write_completion(&child.workdir, &outcome) {
-            eprintln!(
-                "[capsule-runtime] delegation {}: {reason}",
-                child.delegation_id
-            );
-        }
-    })
-}
-
 /// `workdir` named from `root`, falling back to the absolute path when it sits outside it.
 ///
-/// One rule, used by the delegating plane when it names a child's directory in a launch or a
-/// deadline notice and by the released-child watcher when it names the same directory later.
+/// One rule, used by the delegating plane wherever it names a child's directory to the parent's
+/// agent or to the parent's trace.
 pub(crate) fn workdir_relative_to(workdir: &Path, root: &Path) -> String {
     workdir
         .strip_prefix(root)
@@ -678,17 +443,30 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
                 address,
                 &request.capsule_name,
                 &request.capsule_version,
+                request.completion_deadline,
             );
         }
     }
     Ok(launched)
 }
 
-/// Report for a child that ended without reporting for itself.
+/// Report for a child that ended without reporting for itself, and stop one that never ends.
 ///
 /// Polls the shared process handle rather than blocking on `wait`, so it never contends with
-/// [`LaunchedChild::shutdown`] or `Drop` for ownership of the `Child`. What it does when the
-/// process ends is decided by what the child left behind:
+/// [`LaunchedChild::shutdown`] or `Drop` for ownership of the `Child`. For a released child this
+/// thread is the process's only remaining observer, and the only thing that will ever reap it.
+///
+/// `deadline` bounds how long the child is watched, from the instant this watcher starts — which
+/// is the instant the child reported itself ready, not the instant its process was spawned.
+/// Getting to that point is bounded separately by [`CHILD_READY_TIMEOUT`], and folding a cold
+/// host's staging time into the delegation deadline would end a child for being slow to start
+/// rather than slow to work. On expiry the watcher stops the child itself and posts a
+/// [`DelegationStatus::Terminated`] outcome naming the bound — the deadline is the watcher's own,
+/// held in a local flag rather than read back off [`ChildProcess::deliberate`], so an ending the
+/// *parent* chose stays distinguishable from one this thread imposed. `None` watches for as long
+/// as the child runs.
+///
+/// What it does when the process ends on its own is decided by what the child left behind:
 ///
 /// * A completion the child already delivered is left alone — exactly one completion per
 ///   delegation reaches the parent.
@@ -697,13 +475,15 @@ pub fn launch_child_capsule(request: ChildLaunchRequest) -> Result<LaunchedChild
 /// * No completion at all means the child died without a word: the watcher builds one with
 ///   `status: crashed`, carrying the exit status and the child's bounded stderr tail, and posts
 ///   it in the child's place.
-/// * An ending the parent chose is recorded as `terminated` and posted to nobody.
+/// * An ending the parent chose is recorded as `terminated` and posted to nobody, because the
+///   only party that would be told is the party that did it.
 fn watch_for_completion(
     launched: &LaunchedChild,
     handle: SpawnerHandle,
     address: CompletionAddress,
     capsule_name: &str,
     capsule_version: &str,
+    deadline: Option<Duration>,
 ) {
     let process = Arc::clone(&launched.process);
     let stderr_tail = Arc::clone(&launched.stderr_tail);
@@ -713,8 +493,20 @@ fn watch_for_completion(
     let capsule_version = capsule_version.to_string();
     let started = launched.started;
 
+    let watching_from = Instant::now();
     std::thread::spawn(move || {
+        let expires_at = deadline.map(|bound| watching_from + bound);
+        // Set here and read nowhere else: `ChildProcess::deliberate` is about to be set too, by
+        // this thread, so it can no longer say who chose the ending.
+        let mut expired = false;
         let ending = loop {
+            if expires_at.is_some_and(|at| Instant::now() >= at) {
+                let mut process = lock(&process);
+                process.deliberate = true;
+                let _ = process.end();
+                expired = true;
+                break Ending::Deliberate;
+            }
             if let Some(ending) = lock(&process).poll() {
                 break ending;
             }
@@ -755,6 +547,24 @@ fn watch_for_completion(
         };
 
         match ending {
+            // The deadline is the parent's runtime acting on the parent's behalf while the parent
+            // is elsewhere, so unlike an ending the parent chose by hand this one is posted: the
+            // delegating agent asked for an outcome and this is the outcome.
+            Ending::Deliberate if expired => {
+                let bound = deadline.map(|bound| bound.as_secs()).unwrap_or_default();
+                delegation::report_completion(
+                    &handle,
+                    &address,
+                    outcome(
+                        DelegationStatus::Terminated,
+                        format!(
+                            "the capsule was still running after {bound}s and was ended at the \
+                             delegation deadline"
+                        ),
+                    ),
+                    &workdir,
+                );
+            }
             Ending::Deliberate => {
                 delegation::record_terminated(
                     &workdir,
@@ -985,6 +795,7 @@ mod tests {
             child_env_allow: env_allow.iter().map(|name| name.to_string()).collect(),
             roost_url: "http://127.0.0.1:7700".to_string(),
             spawner,
+            completion_deadline: None,
         }
     }
 
@@ -1068,139 +879,6 @@ mod tests {
             "the handle is applied in the runtime-owned tail: {env:?}"
         );
         std::env::remove_var(SPAWNER_ENV);
-    }
-
-    fn late_plan(reports: UnboundedSender<DetachedReport>, workdir: &Path) -> LateReportPlan {
-        LateReportPlan {
-            capsule_name: "worker".to_string(),
-            capsule_version: "0.1.0".to_string(),
-            deadline_secs: 20,
-            deadline_at: Instant::now(),
-            context_id: "ctx_released".to_string(),
-            provenance: TaskProvenance::derive(crate::origin::TaskOrigin::Completion, None),
-            result_root: workdir.to_path_buf(),
-            child_task_id: "task-1".to_string(),
-            reports,
-        }
-    }
-
-    /// A released child that ends after its deadline is reported once, on the channel.
-    #[test]
-    fn a_released_child_that_ends_is_reported_once() {
-        let workdir = tempfile::tempdir().unwrap();
-        let child = Command::new("sh")
-            .args(["-c", "sleep 0.2"])
-            .spawn()
-            .expect("sh is on the test host");
-        let (reports, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-
-        let released =
-            ReleasedChild::adopt(child, workdir.path().to_path_buf(), "dlg_late".to_string());
-        watch_released_child(released, late_plan(reports, workdir.path()))
-            .join()
-            .expect("the watcher thread returns");
-
-        let report = match receiver.try_recv() {
-            Ok(DetachedReport::DelegationLate(report)) => report,
-            other => panic!("expected one late delegation report; got {other:?}"),
-        };
-        assert_eq!(report.delegation_id, "dlg_late");
-        assert_eq!(report.status, DelegationStatus::Ok);
-        assert_eq!(report.deadline_secs, 20);
-        assert!(report.detail.is_none(), "{report:?}");
-        // The watcher owned the only remaining sender, so the channel is closed behind its one
-        // report rather than empty: either way there is no second report on it.
-        assert!(
-            receiver.try_recv().is_err(),
-            "the watcher reports once and no more"
-        );
-
-        let recorded =
-            delegation::read_completion(workdir.path()).expect("a completion is written");
-        assert!(recorded.delivered, "{recorded:?}");
-        assert_eq!(recorded.reported_by, Reporter::Launcher);
-        assert!(recorded.delivery_error.is_none(), "{recorded:?}");
-    }
-
-    /// A release nobody took is ended here rather than left running: `end` is what the plane
-    /// falls back to when the hand-over fails, so the tool result's "the child was stopped" is
-    /// true.
-    #[test]
-    fn a_released_child_no_watcher_took_is_ended_and_reaped() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .expect("sh is on the test host");
-        let pid = child.id();
-        let workdir = tempfile::tempdir().unwrap();
-
-        ReleasedChild::adopt(
-            child,
-            workdir.path().to_path_buf(),
-            "dlg_undone".to_string(),
-        )
-        .end();
-
-        #[cfg(target_os = "linux")]
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "an ended release is reaped, leaving no zombie"
-        );
-        let _ = pid;
-    }
-
-    /// A late outcome with nowhere to go is recorded rather than dropped, and the released child is
-    /// still reaped. This is the shape a parent whose task loop has already ended leaves behind.
-    #[test]
-    fn a_late_outcome_with_no_listener_is_recorded_and_the_child_is_reaped() {
-        let workdir = tempfile::tempdir().unwrap();
-        let child = Command::new("sh")
-            .args(["-c", "sleep 0.2; exit 3"])
-            .spawn()
-            .expect("sh is on the test host");
-        let pid = child.id();
-        let (reports, receiver) = tokio::sync::mpsc::unbounded_channel();
-        // The parent's task loop is gone before the child ends.
-        drop(receiver);
-
-        let released = ReleasedChild::adopt(
-            child,
-            workdir.path().to_path_buf(),
-            "dlg_orphan".to_string(),
-        );
-        watch_released_child(released, late_plan(reports, workdir.path()))
-            .join()
-            .expect("the watcher thread returns rather than panicking");
-
-        let recorded =
-            delegation::read_completion(workdir.path()).expect("a completion is written");
-        assert!(!recorded.delivered, "{recorded:?}");
-        assert_eq!(recorded.status, DelegationStatus::Error);
-        assert_eq!(recorded.delegation_id, "dlg_orphan");
-        let reason = recorded
-            .delivery_error
-            .clone()
-            .expect("the refusal is recorded");
-        assert!(
-            reason.contains("no longer listening"),
-            "the reason names why the outcome reached no task: {reason}"
-        );
-        assert!(
-            recorded
-                .detail
-                .as_deref()
-                .is_some_and(|detail| detail.contains("exit status: 3")),
-            "{recorded:?}"
-        );
-
-        // Reaped by the watcher and by nobody else: a process the runtime waited on has no
-        // `/proc` entry at all, while a zombie would still have one.
-        #[cfg(target_os = "linux")]
-        assert!(
-            !Path::new(&format!("/proc/{pid}")).exists(),
-            "the released child is reaped by the watcher"
-        );
-        let _ = pid;
     }
 
     /// A launch with no spawner injects nothing, even from a decoy the launching process holds.
