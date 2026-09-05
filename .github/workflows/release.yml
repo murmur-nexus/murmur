@@ -70,10 +70,33 @@ jobs:
     name: Build Linux (linux-x86_64)
     needs: verify-version
     runs-on: ubuntu-latest
+    # A dynamically linked binary requires whatever versioned glibc symbols the glibc
+    # that built it offers, so the runner's own image decides the floor: on
+    # ubuntu-latest this job produced a `mur` requiring GLIBC_2.39, which starts on
+    # nothing older than Ubuntu 24.04. Building inside the image the floor names makes
+    # the floor a property of the build rather than of whichever runner GitHub rolls
+    # out next. The target and the linking are unchanged — only what it links against
+    # moves. The image is declared in scripts/lib/glibc-floor.sh and this line is
+    # checked against that declaration on every pull request.
+    container:
+      image: debian:bullseye
     steps:
+      # Runs before checkout: the base image has no git, and checkout@v4 without it
+      # silently falls back to a REST tarball. binutils is what the floor gate reads
+      # symbol versions with.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates curl git libseccomp-dev pkg-config
       - uses: actions/checkout@v4
-      - name: Install libseccomp-dev
-        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev
+      - name: Install Rust
+        # rustup rather than a setup action: bullseye's own rustc is far too old, and
+        # the toolchain has to be the one inside this container, not the runner's.
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo build -p murmur-cli -p mur-roost --release --target x86_64-unknown-linux-gnu
       - name: Rename binaries
@@ -84,6 +107,16 @@ jobs:
              mur-${VERSION}-linux-x86_64
           cp target/x86_64-unknown-linux-gnu/release/mur-roost \
              mur-roost-${VERSION}-linux-x86_64
+      - name: Enforce the glibc floor
+        # Between the build and the upload, over the assets exactly as they would be
+        # published: a build that raises the floor fails here, with no artifact for the
+        # release job to attach.
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          ./scripts/check-glibc-floor.sh \
+            mur-${VERSION}-linux-x86_64 \
+            mur-roost-${VERSION}-linux-x86_64
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:

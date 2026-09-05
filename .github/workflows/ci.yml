@@ -120,6 +120,18 @@ jobs:
       - name: WIT package versions are single-valued and documented
         run: ./scripts/check-wit-versions.sh
 
+  glibc-floor:
+    name: glibc-floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The declared glibc floor matches the release image and what we tell operators
+        # Configuration only, so it needs no toolchain and no binary. The floor moved
+        # once already by the release runner's image changing under it; this makes that
+        # arrive as a failing diff rather than as a published binary half our target
+        # distributions cannot exec.
+        run: ./scripts/check-glibc-floor.sh --config
+
   release-notes-cli:
     name: release-notes-cli
     runs-on: ubuntu-latest

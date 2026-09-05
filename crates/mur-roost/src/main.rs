@@ -67,6 +67,14 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<u32>()
                     .map_err(|e| format!("invalid --max-concurrent: {e}"))?;
             }
+            // The installer execs each binary it staged once before renaming it onto PATH, and
+            // refuses the whole install when one will not start. That needs an invocation which
+            // exits 0 without binding a port or taking a registry path: every other argument this
+            // daemon accepts leads to a listening socket.
+            "--version" => {
+                println!("mur-roost {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             other if other.starts_with("--spawn-allow=") => {
                 spawn_allow.push(other["--spawn-allow=".len()..].to_string());
             }
