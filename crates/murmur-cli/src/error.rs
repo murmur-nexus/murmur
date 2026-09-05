@@ -52,6 +52,8 @@ pub const E_CAP_010: &str = "E-CAP-010"; // an artifact entry's config: block ca
 pub const E_CAP_011: &str = "E-CAP-011"; // context.record_store or --context does not name one conversation record directory
 pub const E_CAP_012: &str = "E-CAP-012"; // capabilities.filesystem.read_only entry is not a usable workdir subpath
 pub const E_CAP_013: &str = "E-CAP-013"; // an artifact claims the name of a tool the runtime provides itself
+pub const E_CAP_014: &str = "E-CAP-014"; // a capsule in the spawn.allow closure declares an env.allow name unset in this environment
+pub const E_CAP_015: &str = "E-CAP-015"; // a capsule declares an env.allow entry the capsule that spawns it does not hold
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier

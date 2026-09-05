@@ -31,7 +31,7 @@ pub use build_lints::{
     build_warning_link, lint_build_warnings, BuildWarning, RESERVED_ROOT_ENTRIES, W_BLD_001,
     W_BLD_002, W_BLD_003,
 };
-pub use dotenv::{load_dotenv_non_override, DotenvError};
+pub use dotenv::{dotenv_variable_names, load_dotenv_non_override, DotenvError};
 pub use lockfile::{
     read_lockfile, write_lockfile_atomic, LockedArtifact, LockedSha256, LockfileError, MurmurLock,
     LOCK_VERSION,
@@ -52,7 +52,7 @@ pub use registry::{
     LocalRegistry, Platform, PlatformMatch, PublishResult, Registry, RegistryError,
     ResolvedArtifact, RuntimeType, RESERVED_VERSIONS,
 };
-pub use registry_warnings::{registry_warning_link, W_REG_001};
+pub use registry_warnings::{registry_warning_link, W_REG_001, W_REG_002};
 pub use runtime_manifest::{
     commit_policy_for_binding, effective_containment_floor, load_runtime_manifest, parse_byte_size,
     parse_duration_secs, parse_hook_config_from_yaml, parse_tool_implementation_from_yaml,

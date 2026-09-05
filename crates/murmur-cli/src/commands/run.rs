@@ -979,6 +979,10 @@ fn parse_lifecycle_override(
     }))
 }
 
+/// The nearest directory at or above `start` holding a `murmur.yaml`, falling back to `start`.
+///
+/// The root a run's `.env` is read from. `--project-dir` may name a directory below it, so the
+/// two are not always the same.
 fn find_workspace_root(start: &Path) -> PathBuf {
     let mut current = start.to_path_buf();
     loop {
