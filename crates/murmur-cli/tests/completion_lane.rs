@@ -350,6 +350,8 @@ impl CountingRoost {
             spawn_allow: Vec::new(),
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
+            // One daemon serves every case in this suite, so its host census is the suite's total.
+            max_live_capsules: u32::MAX,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

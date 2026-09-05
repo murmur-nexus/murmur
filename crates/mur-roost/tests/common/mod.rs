@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use capsule_runtime::{SpawnEnvelope, SPAWN_APPROVAL_HEADER, SPAWN_CREDENTIAL_HEADER};
-use mur_roost::bounds::{DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
+use mur_roost::bounds::{default_max_live_capsules, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
 use mur_roost::{authority::SpawnAuthority, JobRecord, JobStatus, RequestHeaders, State};
 use murmur_artifact::{ArtifactMeta, LocalRegistry, Registry, RuntimeManifest, RuntimeType};
 use tempfile::TempDir;
@@ -120,8 +120,25 @@ impl Daemon {
         Self::bounded(spawn_allow, DEFAULT_MAX_DEPTH, DEFAULT_MAX_CONCURRENT)
     }
 
-    /// A daemon with the operator's delegation bounds set explicitly.
+    /// A daemon with the operator's per-session bounds set explicitly, running under the same
+    /// host-derived machine ceiling a default install gets.
     pub fn bounded(spawn_allow: Vec<String>, max_depth: u32, max_concurrent: u32) -> Self {
+        Self::capped(
+            spawn_allow,
+            max_depth,
+            max_concurrent,
+            default_max_live_capsules(),
+        )
+    }
+
+    /// A daemon with all three of the operator's bounds set explicitly, including the machine
+    /// ceiling `--max-live-capsules` carries.
+    pub fn capped(
+        spawn_allow: Vec<String>,
+        max_depth: u32,
+        max_concurrent: u32,
+        max_live_capsules: u32,
+    ) -> Self {
         let registry = TempDir::new().unwrap();
         let workdir = TempDir::new().unwrap();
         let state = Arc::new(State {
@@ -130,6 +147,7 @@ impl Daemon {
             spawn_allow,
             max_depth,
             max_concurrent,
+            max_live_capsules,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
         Self {
