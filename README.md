@@ -23,7 +23,11 @@ MacOS (Apple Silicon / Intel) and Linux x86_64
 curl -fsSL https://install.murmur.rs | sh
 ```
 
-Or with Cargo
+The Linux x86_64 binaries are built against glibc 2.31 and run on Debian 11+, Ubuntu 20.04+ and RHEL 9+.
+The installer runs each binary once before putting it on your PATH, so an older host is refused with the
+loader's own message rather than a broken `mur`.
+
+On an older distribution, or on any platform without a published binary, build from source with Cargo
 ```bash
 cargo install murmur-cli
 ```

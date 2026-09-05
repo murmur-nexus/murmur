@@ -6,9 +6,12 @@
 //! directory and logs every URL the script asks for, which is also how "both binaries came from the
 //! same release" is asserted rather than assumed.
 //!
-//! The fixture assets are arbitrary bytes. The installer verifies and moves them; it executes
-//! neither, except to read the version of an install it is replacing, and these tests install into
-//! an empty directory.
+//! The fixture assets are real programs, because the installer runs each staged binary once before
+//! it is renamed onto PATH and refuses the whole install if either cannot exec. The payloads are
+//! shell scripts rather than compiled binaries: what the check asks is whether this host's kernel
+//! and loader accept the file and it exits 0, and a script answers that question the same way a
+//! linked ELF does — while letting a test hand the installer a file the loader refuses, which no
+//! compiled fixture could do portably.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,30 @@ cp "$FAKE_RELEASE_DIR/$asset" "$dest"
 /// rejected it warns and returns — which keeps the run from writing to `/etc/apparmor.d` when the
 /// suite happens to be running as root.
 const FAKE_APPARMOR_PARSER: &str = "#!/bin/sh\nexit 1\n";
+
+/// A release asset that runs: it answers `--version` and exits 0, which is all the installer's
+/// exec check asks of a staged binary.
+fn runnable_asset(name: &str, version: &str) -> Vec<u8> {
+    format!("#!/bin/sh\nprintf '%s\\n' \"{name} {version}\"\n").into_bytes()
+}
+
+/// ELF magic and then nothing that is a program. The kernel refuses the exec with `ENOEXEC` and
+/// the shell reports `Exec format error` — a truncated download that somehow checksummed, or an
+/// asset for the wrong architecture, reaches the installer looking exactly like this.
+const NOT_A_PROGRAM: &[u8] = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00not a program\x00";
+
+/// A binary this host's loader refuses, standing in for one built above the glibc floor: it writes
+/// the line the dynamic loader writes and exits 127, exactly as `mur` built against glibc 2.39
+/// does on Debian 11.
+const REFUSED_BY_LOADER: &str = r#"#!/bin/sh
+echo "$0: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.39' not found" >&2
+exit 127
+"#;
+
+/// The loader's own words, which the installer must pass through unedited: an operator who can see
+/// this line knows which library and which version, and no message the installer could write for
+/// them would say it.
+const LOADER_LINE: &str = "/lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found";
 
 /// The checkout this test file was compiled from, which is where `scripts/install.sh` lives.
 fn repo_root() -> PathBuf {
@@ -95,11 +122,14 @@ impl Installer {
         let bin = TempDir::new().unwrap();
         let platform = current_platform();
 
-        let mut assets = vec![(format!("mur-{version}-{platform}"), b"mur binary".to_vec())];
+        let mut assets = vec![(
+            format!("mur-{version}-{platform}"),
+            runnable_asset("mur", version),
+        )];
         if with_roost {
             assets.push((
                 format!("mur-roost-{version}-{platform}"),
-                b"mur-roost binary".to_vec(),
+                runnable_asset("mur-roost", version),
             ));
         }
         let mut checksums = String::new();
@@ -129,6 +159,26 @@ impl Installer {
 
     fn installed(&self, name: &str) -> PathBuf {
         self.install_dir.path().join(name)
+    }
+
+    /// Replaces a release asset's payload *and* its `checksums.txt` line, so the download and
+    /// checksum legs still pass and what the payload does when executed is the only thing the run
+    /// turns on.
+    fn replace_asset(&self, name: &str, bytes: &[u8]) {
+        fs::write(self.asset(name), bytes).unwrap();
+        let sums = self.release.path().join("checksums.txt");
+        let updated: String = fs::read_to_string(&sums)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.split_whitespace().nth(1) == Some(name) {
+                    format!("{}  {name}\n", sha256_hex(bytes))
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        fs::write(sums, updated).unwrap();
     }
 
     fn run(&self, version: &str) -> Output {
@@ -209,6 +259,15 @@ fn the_installer_puts_both_binaries_in_the_install_directory() {
         stdout.contains("installed mur-roost"),
         "the installer must report the daemon it installed, got:\n{stdout}"
     );
+    for asset in [
+        format!("mur-{VERSION}-{platform}"),
+        format!("mur-roost-{VERSION}-{platform}"),
+    ] {
+        assert!(
+            stdout.contains(&format!("{asset} runs on this host")),
+            "the installer must report that it ran {asset}, got:\n{stdout}"
+        );
+    }
 
     // One release tag, one checksums.txt, both binaries under it.
     let base = format!("https://github.com/{REPO}/releases/download/v{VERSION}/");
@@ -302,4 +361,137 @@ fn a_release_without_a_roost_asset_still_installs_mur() {
     );
     assert!(stderr.contains("capabilities.spawn.allow"), "{stderr}");
     assert!(stderr.contains("E-RUN-019"), "{stderr}");
+}
+
+/// An asset that is not a program: correctly listed, correctly checksummed, and refused by the
+/// kernel. Nothing is installed and nothing is left staged.
+#[test]
+fn a_mur_asset_that_cannot_exec_installs_nothing() {
+    if skip_unpublished_platform("a_mur_asset_that_cannot_exec_installs_nothing") {
+        return;
+    }
+    let installer = Installer::new(VERSION, true);
+    let asset = format!("mur-{VERSION}-{}", installer.platform);
+    installer.replace_asset(&asset, NOT_A_PROGRAM);
+
+    let output = installer.run(VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(&asset), "the asset must be named: {stderr}");
+    assert!(
+        stderr.contains("Exec format error"),
+        "the kernel's own refusal must reach the operator: {stderr}"
+    );
+    assert!(
+        stderr.contains("glibc 2.31"),
+        "the supported floor must be stated: {stderr}"
+    );
+    assert_eq!(
+        installer.install_dir_entries(),
+        Vec::<String>::new(),
+        "a binary that cannot exec must leave nothing behind, not even a staging file"
+    );
+}
+
+/// A `mur` the loader refuses, which is what a build above the glibc floor is on a target host.
+/// The loader's line reaches the operator unedited, unwrapped and unsummarised.
+#[test]
+fn a_mur_asset_the_loader_refuses_installs_nothing_and_quotes_the_loader() {
+    if skip_unpublished_platform(
+        "a_mur_asset_the_loader_refuses_installs_nothing_and_quotes_the_loader",
+    ) {
+        return;
+    }
+    let installer = Installer::new(VERSION, true);
+    let asset = format!("mur-{VERSION}-{}", installer.platform);
+    installer.replace_asset(&asset, REFUSED_BY_LOADER.as_bytes());
+
+    let output = installer.run(VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(&asset), "the asset must be named: {stderr}");
+    assert!(
+        stderr.contains(LOADER_LINE),
+        "the loader's own line must appear verbatim: {stderr}"
+    );
+    assert!(
+        stderr.contains("glibc 2.31"),
+        "the supported floor must be stated: {stderr}"
+    );
+    assert_eq!(
+        installer.install_dir_entries(),
+        Vec::<String>::new(),
+        "a binary the loader refuses must leave nothing behind, not even a staging file"
+    );
+}
+
+/// Refusing a bad install must never be worse than not having run the installer: a working `mur`
+/// already on PATH is byte-identical afterwards and still answers `--version`.
+#[test]
+fn a_failed_exec_check_leaves_a_working_previous_install_untouched() {
+    if skip_unpublished_platform("a_failed_exec_check_leaves_a_working_previous_install_untouched")
+    {
+        return;
+    }
+    let installer = Installer::new(VERSION, true);
+    let asset = format!("mur-{VERSION}-{}", installer.platform);
+    installer.replace_asset(&asset, REFUSED_BY_LOADER.as_bytes());
+
+    let previous = String::from_utf8(runnable_asset("mur", "0.0.1-previous")).unwrap();
+    let target = installer.installed("mur");
+    write_executable(&target, &previous);
+
+    let output = installer.run(VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        previous,
+        "the previous install must be byte-identical"
+    );
+    let ran = Command::new(&target).arg("--version").output().unwrap();
+    assert!(ran.status.success(), "the previous install must still run");
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains("mur 0.0.1-previous"),
+        "the previous install must still answer --version"
+    );
+    assert_eq!(
+        installer.install_dir_entries(),
+        vec!["mur".to_string()],
+        "the refused install must leave no staging file beside the previous binary"
+    );
+}
+
+/// A `mur-roost` that cannot exec refuses the whole install, the same all-or-nothing rule the
+/// checksum leg holds to: a daemon that will not start fails a delegation launch with something far
+/// less obvious than a loader error.
+#[test]
+fn a_roost_asset_that_cannot_exec_installs_neither_binary() {
+    if skip_unpublished_platform("a_roost_asset_that_cannot_exec_installs_neither_binary") {
+        return;
+    }
+    let installer = Installer::new(VERSION, true);
+    let roost_asset = format!("mur-roost-{VERSION}-{}", installer.platform);
+    installer.replace_asset(&roost_asset, REFUSED_BY_LOADER.as_bytes());
+
+    let output = installer.run(VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&roost_asset),
+        "the daemon asset must be named: {stderr}"
+    );
+    assert!(
+        stderr.contains(LOADER_LINE),
+        "the loader's own line must appear verbatim: {stderr}"
+    );
+    assert_eq!(
+        installer.install_dir_entries(),
+        Vec::<String>::new(),
+        "a daemon that cannot exec must take the whole install down with it"
+    );
 }

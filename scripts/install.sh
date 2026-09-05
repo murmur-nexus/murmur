@@ -5,7 +5,13 @@
 #   curl -fsSL https://install.murmur.rs | sh
 #
 # Detects the platform, resolves the latest release, verifies every download against
-# the release's checksums.txt, and installs `mur` and `mur-roost` onto PATH.
+# the release's checksums.txt, runs each binary once, and installs `mur` and `mur-roost`
+# onto PATH.
+#
+# The published linux-x86_64 binaries require glibc 2.31 or newer: Debian 11+, Ubuntu
+# 20.04+, RHEL 9+. On an older host, build from source with `cargo install murmur-cli`.
+# Nothing is installed unless it runs here — a binary this host's loader refuses leaves
+# no `mur` on PATH and no previous install disturbed.
 #
 # Environment overrides:
 #   MUR_VERSION      version to install, with or without the leading "v" (default: latest)
@@ -17,6 +23,12 @@ set -eu
 DEFAULT_REPO="murmur-nexus/murmur"
 REPO="${MUR_REPO:-$DEFAULT_REPO}"
 CHECKSUMS_FILE="checksums.txt"
+
+# The oldest glibc a published linux-x86_64 binary is built to run on, quoted back to
+# whoever a binary refused to start for. Declared in scripts/lib/glibc-floor.sh and
+# enforced over every asset at release time by scripts/check-glibc-floor.sh; this copy
+# is checked against that declaration by `scripts/check-glibc-floor.sh --config`.
+SUPPORTED_GLIBC="2.31"
 
 # AppArmor profile that lets `mur` create an unprivileged user namespace, which is
 # what `capabilities.containment: sealed` and every capsule's own network namespace
@@ -204,46 +216,96 @@ asset_in_checksums() {
 # doc comment promises it never aborts the install: with "soft", a bad checksum
 # warns and returns 1 instead of calling `die`, so a corrupt or tampered profile
 # download costs one containment class, not the whole run.
+#
+# `sh` has no local variables, so every name here is underscore-prefixed: an
+# unprefixed `asset` would overwrite main's, and main still needs its own after
+# the call to name the asset in later messages.
 verify_checksum() {
-    file="$1"
-    asset="$2"
-    sums="$3"
-    soft="${4:-}"
+    _sum_file="$1"
+    _sum_asset="$2"
+    _sums="$3"
+    _sum_soft="${4:-}"
 
-    expected="$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$sums")"
-    if [ -z "$expected" ]; then
-        if [ "$soft" = "soft" ]; then
-            warn "no checksum for ${asset} in ${CHECKSUMS_FILE} — not installing an unverified file."
+    _expected="$(awk -v name="$_sum_asset" '$2 == name || $2 == "*" name { print $1; exit }' "$_sums")"
+    if [ -z "$_expected" ]; then
+        if [ "$_sum_soft" = "soft" ]; then
+            warn "no checksum for ${_sum_asset} in ${CHECKSUMS_FILE} — not installing an unverified file."
             return 1
         fi
-        die "no checksum for ${asset} in ${CHECKSUMS_FILE} — refusing to install an unverified binary."
+        die "no checksum for ${_sum_asset} in ${CHECKSUMS_FILE} — refusing to install an unverified binary."
     fi
 
     if command -v sha256sum >/dev/null 2>&1; then
-        actual="$(sha256sum "$file" | awk '{print $1}')"
+        _actual="$(sha256sum "$_sum_file" | awk '{print $1}')"
     elif command -v shasum >/dev/null 2>&1; then
-        actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+        _actual="$(shasum -a 256 "$_sum_file" | awk '{print $1}')"
     else
-        if [ "$soft" = "soft" ]; then
-            warn "need sha256sum or shasum to verify ${asset}, found neither — not installing an unverified file."
+        if [ "$_sum_soft" = "soft" ]; then
+            warn "need sha256sum or shasum to verify ${_sum_asset}, found neither — not installing an unverified file."
             return 1
         fi
         die "need sha256sum or shasum to verify the download, found neither."
     fi
 
-    if [ "$actual" != "$expected" ]; then
-        if [ "$soft" = "soft" ]; then
-            warn "checksum mismatch for ${asset}
-  expected: ${expected}
-  actual:   ${actual}
+    if [ "$_actual" != "$_expected" ]; then
+        if [ "$_sum_soft" = "soft" ]; then
+            warn "checksum mismatch for ${_sum_asset}
+  expected: ${_expected}
+  actual:   ${_actual}
 The download may be corrupt or tampered with. Not installed."
             return 1
         fi
-        die "checksum mismatch for ${asset}
-  expected: ${expected}
-  actual:   ${actual}
+        die "checksum mismatch for ${_sum_asset}
+  expected: ${_expected}
+  actual:   ${_actual}
 The download may be corrupt or tampered with. Nothing was installed."
     fi
+}
+
+# ---------------------------------------------------------------- exec check
+
+# verify_runs <file> <asset_name>
+#
+#   <file>        the staged binary inside INSTALL_DIR, already chmod 755
+#   <asset_name>  the release asset it came from, for the failure message
+#
+# Runs the staged binary once and refuses the whole install if this host cannot
+# exec it. Every other check in this script asks whether the bytes are the right
+# bytes — the release resolves, the asset is listed, the sha256 matches — and none
+# of them asks whether the result starts. Without this one, a release built against
+# a newer glibc than it promises reports a successful install and leaves behind a
+# `mur` that can only ever print a loader error.
+#
+# Cause-agnostic by construction: it classifies nothing, so it catches a glibc
+# requirement above the floor, a missing libseccomp.so.2, the wrong architecture,
+# and a download that checksummed and still is not a program. The loader's own
+# message is printed verbatim rather than summarised — it names the exact library
+# and version that is missing, which no message written here could.
+#
+# Runs against the staged file, before the rename. The staged path is inside
+# INSTALL_DIR, so it has the same filesystem, the same mode and the same exec
+# semantics as the target: the check is exactly as strong as one run after the
+# rename, and nothing that cannot run ever reaches PATH. On failure it removes both
+# staging files and dies, so refusing a bad install is never worse than not having
+# run the installer at all.
+verify_runs() {
+    _file="$1"
+    _asset="$2"
+    _stderr_file="${TMPDIR_INSTALL}/${_asset}.exec-check"
+
+    if "$_file" --version >/dev/null 2>"$_stderr_file"; then
+        info "${_asset} runs on this host"
+        return 0
+    else
+        _status=$?
+    fi
+
+    rm -f "$staged" "$roost_staged"
+    die "${_asset} was downloaded and verified, but it does not run on this host (exit ${_status}):
+
+$(cat "$_stderr_file" 2>/dev/null)
+
+The published linux-x86_64 binaries require glibc ${SUPPORTED_GLIBC} or newer (Debian 11+, Ubuntu 20.04+, RHEL 9+), the shared libraries mur links (libseccomp.so.2), and a matching CPU architecture. Nothing was installed and no existing install was changed. On a host older than that, build from source with \`cargo install murmur-cli\`."
 }
 
 # ---------------------------------------------------------------- apparmor
@@ -440,6 +502,12 @@ mur is installed and works normally, but a capsule declaring capabilities.spawn.
         rm -f "$staged" "$roost_staged"
         die "could not write to ${INSTALL_DIR}"
     fi
+    # Both binaries are exec-verified before either is moved into place, the same
+    # all-or-nothing rule the checksum leg holds to: a mur-roost that cannot start
+    # fails a delegation launch with something far less obvious than a loader error.
+    verify_runs "$staged" "$asset"
+    [ -z "$install_roost" ] || verify_runs "$roost_staged" "$roost_asset"
+
     if ! mv -f "$staged" "$target"; then
         rm -f "$staged" "$roost_staged"
         die "could not install to ${target}"
