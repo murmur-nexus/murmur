@@ -979,7 +979,11 @@ fn parse_lifecycle_override(
     }))
 }
 
-fn find_workspace_root(start: &Path) -> PathBuf {
+/// The nearest directory at or above `start` holding a `murmur.yaml`, falling back to `start`.
+///
+/// The root a run's `.env` is read from, so `mur doctor` resolves the same one when it reports
+/// which of a formation's declared variables a run would find set.
+pub(crate) fn find_workspace_root(start: &Path) -> PathBuf {
     let mut current = start.to_path_buf();
     loop {
         if current.join("murmur.yaml").exists() {

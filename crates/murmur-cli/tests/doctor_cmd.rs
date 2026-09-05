@@ -18,7 +18,16 @@ use tempfile::TempDir;
 
 /// A capsule declaring `capabilities.spawn.allow`, the one declaration that makes the daemon a
 /// dependency of the run and doctor's roost report fire.
-fn create_delegating_project(project_dir: &Path) {
+///
+/// The capsule it names is installed, and declares nothing, so the formation block that fires on
+/// the same declaration finds nothing to report and the roost warning is the only finding.
+fn create_delegating_project(home: &TempDir, project_dir: &Path) {
+    install_capsule(
+        &global_store(home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\n",
+    );
     fs::write(
         project_dir.join("murmur.yaml"),
         "name: doctor-fixture\nversion: 0.0.1\nartifacts: []\n\
@@ -152,6 +161,100 @@ fn write_lock(project_dir: &Path, name: &str, resolved_version: &str, sha256: &s
 /// Asserting on this rather than a hardcoded tuple keeps the suite host-agnostic.
 fn platform() -> &'static str {
     murmur_artifact::current_platform()
+}
+
+// ── Formation environment fixture helpers ────────────────────────────────────
+
+/// Install a capsule into `store_root` whose packed `murmur.yaml` is exactly `manifest_yaml`.
+///
+/// `mur doctor`'s formation walk reads that one file and nothing else, so no payload is needed.
+/// Returns the sha256 of the stored bytes, which a lockfile fixture has to pin.
+fn install_capsule(store_root: &Path, name: &str, version: &str, manifest_yaml: &str) -> String {
+    use std::io::Write;
+
+    let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("murmur.yaml", options).unwrap();
+        zip.write_all(manifest_yaml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    let bytes = cursor.into_inner();
+    let sha256 = sha256_hex(&bytes);
+    murmur_artifact::LocalRegistry::new(store_root)
+        .store_installed_overwrite(
+            murmur_artifact::ArtifactMeta {
+                name: name.to_string(),
+                version: version.to_string(),
+                runtime: murmur_artifact::RuntimeType::Wasm,
+                artifact_runtime: "capsule".to_string(),
+                platforms: Vec::new(),
+                description: None,
+                tags: Vec::new(),
+                wit_contracts: None,
+            },
+            &bytes,
+            &sha256,
+        )
+        .unwrap();
+    sha256
+}
+
+fn global_store(home: &TempDir) -> PathBuf {
+    home.path().join(".murmur").join("artifacts")
+}
+
+/// `mur doctor` with every variable a case cares about named explicitly — each either exported or
+/// removed — so its set/unset expectations do not depend on what the machine running the suite
+/// happens to have in its shell.
+fn mur_doctor_with_env(
+    home: &TempDir,
+    project_dir: &Path,
+    variables: &[(&str, Option<&str>)],
+) -> assert_cmd::assert::Assert {
+    let mut command = Command::cargo_bin("mur").unwrap();
+    command
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .current_dir(project_dir)
+        // A cyclic spawn.allow must terminate. Bounded so a walk that recursed forever fails the
+        // case rather than hanging the suite.
+        .timeout(std::time::Duration::from_secs(120))
+        .arg("doctor");
+    for (name, value) in variables {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    command.assert()
+}
+
+/// The three-level formation Scenarios 1, 2, 3 and 8 share: a root declaring three variables and
+/// spawning `worker`, which declares two and spawns `deep-worker`, which declares one.
+fn create_three_level_formation(home: &TempDir, project_dir: &Path) {
+    let global = global_store(home);
+    install_capsule(
+        &global,
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [WORKER_KEY, DEEP_KEY]\n  \
+         spawn:\n    allow: [deep-worker]\n",
+    );
+    install_capsule(
+        &global,
+        "deep-worker",
+        "0.2.0",
+        "name: deep-worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [DEEP_KEY]\n",
+    );
+    fs::write(
+        project_dir.join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY, WORKER_KEY, DEEP_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -696,7 +799,7 @@ fn doctor_warns_when_a_delegating_capsule_has_no_mur_roost_on_path() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let empty_path = TempDir::new().unwrap();
-    create_delegating_project(project.path());
+    create_delegating_project(&home, project.path());
 
     let assert =
         mur_doctor_with_roost_env(&home, project.path(), empty_path.path(), None).success();
@@ -722,7 +825,7 @@ fn doctor_names_the_unset_roost_url_when_the_daemon_is_installed() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
-    create_delegating_project(project.path());
+    create_delegating_project(&home, project.path());
 
     let assert =
         mur_doctor_with_roost_env(&home, project.path(), &path_with_roost(bin.path()), None)
@@ -742,7 +845,7 @@ fn doctor_reports_an_unreachable_daemon_separately_from_a_missing_one() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
-    create_delegating_project(project.path());
+    create_delegating_project(&home, project.path());
 
     let assert = mur_doctor_with_roost_env(
         &home,
@@ -771,7 +874,7 @@ fn doctor_says_nothing_about_roost_when_the_daemon_answers() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let bin = TempDir::new().unwrap();
-    create_delegating_project(project.path());
+    create_delegating_project(&home, project.path());
     let (url, _registry) = start_roost();
 
     let assert = mur_doctor_with_roost_env(
@@ -806,4 +909,371 @@ fn doctor_says_nothing_about_roost_for_a_capsule_that_cannot_delegate() {
     assert!(!stderr.contains("E-RUN-019"), "{stderr}");
     assert!(!stderr.contains("mur-roost"), "{stderr}");
     assert!(!stdout.contains("mur-roost"), "{stdout}");
+}
+
+// ── Formation environment ────────────────────────────────────────────────────
+
+#[test]
+fn formation_env_reports_the_whole_closure_three_levels_deep() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_three_level_formation(&home, project.path());
+
+    mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("WORKER_KEY", Some("x")),
+            ("DEEP_KEY", Some("x")),
+        ],
+    )
+    .success()
+    .stdout(predicate::str::contains("Formation environment"))
+    .stdout(predicate::str::contains(
+        "capsules: root-capsule@0.0.1, worker@0.1.0, deep-worker@0.2.0",
+    ))
+    .stdout(predicate::str::contains("\u{2713}  ROOT_KEY"))
+    .stdout(predicate::str::contains("\u{2713}  WORKER_KEY"))
+    .stdout(predicate::str::contains("\u{2713}  DEEP_KEY"))
+    .stdout(predicate::str::contains("unset").not())
+    .stdout(predicate::str::contains("could not inspect").not())
+    .stdout(predicate::str::contains("mur-roost will refuse").not());
+}
+
+#[test]
+fn formation_env_fails_on_a_variable_nothing_sets() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_three_level_formation(&home, project.path());
+
+    mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("WORKER_KEY", Some("x")),
+            ("DEEP_KEY", None),
+        ],
+    )
+    .failure()
+    .stdout(predicate::str::contains("\u{2717}  DEEP_KEY"))
+    .stdout(predicate::str::contains("unset"))
+    .stdout(predicate::str::contains("deep-worker@0.2.0"))
+    .stdout(predicate::str::contains("Fix: export DEEP_KEY"))
+    .stderr(predicate::str::contains("E-CAP-014"));
+}
+
+#[test]
+fn formation_env_never_prints_a_variables_value() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_three_level_formation(&home, project.path());
+
+    let output = mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("WORKER_KEY", Some("x")),
+            ("DEEP_KEY", Some("sk-do-not-print-me-4c7e05b1")),
+        ],
+    )
+    .success()
+    .get_output()
+    .clone();
+
+    let streams = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(streams.contains("DEEP_KEY"), "{streams}");
+    assert!(
+        !streams.contains("sk-do-not-print-me-4c7e05b1"),
+        "{streams}"
+    );
+}
+
+#[test]
+fn formation_env_names_a_declaration_roost_will_refuse_on_both_sides() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    install_capsule(
+        &global_store(&home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY, WORKER_ONLY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+
+    mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_KEY", Some("x")), ("WORKER_ONLY", Some("x"))],
+    )
+    .failure()
+    .stdout(predicate::str::contains(
+        "declarations mur-roost will refuse:",
+    ))
+    .stdout(predicate::str::contains(
+        "worker@0.1.0 declares capabilities.env.allow 'WORKER_ONLY', which its parent \
+         root-capsule@0.0.1 does not",
+    ))
+    .stdout(predicate::str::contains("Fix: root-capsule@0.0.1"))
+    .stdout(predicate::str::contains("worker@0.1.0"))
+    .stderr(predicate::str::contains("E-CAP-015"));
+}
+
+#[test]
+fn formation_env_terminates_on_a_cyclic_spawn_allow_and_names_the_edge() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global = global_store(&home);
+    install_capsule(
+        &global,
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  spawn:\n    \
+         allow: [root-capsule]\n",
+    );
+    install_capsule(
+        &global,
+        "root-capsule",
+        "0.0.1",
+        "name: root-capsule\nversion: 0.0.1\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n  \
+         spawn:\n    allow: [worker]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+
+    let output = mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("spawn.allow cycle: worker@0.1.0 \u{2192} root-capsule@0.0.1"),
+        "{stdout}"
+    );
+    let capsules_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("capsules:"))
+        .unwrap();
+    assert_eq!(capsules_line.matches("root-capsule@0.0.1").count(), 1);
+}
+
+#[test]
+fn formation_env_counts_and_names_a_capsule_it_could_not_inspect() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    install_capsule(
+        &global_store(&home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [ROOT_KEY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker, ghost-worker]\n",
+    )
+    .unwrap();
+
+    mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
+        .success()
+        .stdout(predicate::str::contains(
+            "could not inspect 1 of 3 capsules in this formation",
+        ))
+        .stdout(predicate::str::contains(
+            "- ghost-worker (declared by root-capsule@0.0.1): not installed in the project or \
+             global store",
+        ))
+        .stdout(predicate::str::contains("Fix: ghost-worker:"))
+        .stderr(predicate::str::contains("W-REG-002"));
+}
+
+#[test]
+fn a_capsule_declaring_no_spawn_allow_gets_no_formation_output_at_all() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: plain\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [SOMETHING_UNSET]\n",
+    )
+    .unwrap();
+
+    let output = mur_doctor_with_env(&home, project.path(), &[("SOMETHING_UNSET", None)])
+        .success()
+        .stdout(predicate::str::contains("All checks passed."))
+        .get_output()
+        .clone();
+
+    let streams = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for absent in [
+        "Formation environment",
+        "E-CAP-014",
+        "E-CAP-015",
+        "W-REG-002",
+    ] {
+        assert!(!streams.contains(absent), "{absent} in:\n{streams}");
+    }
+}
+
+#[test]
+fn the_workspace_dotenv_counts_a_variable_as_set() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_three_level_formation(&home, project.path());
+    fs::write(project.path().join(".env"), "DEEP_KEY=from-dotenv\n").unwrap();
+
+    let output = mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("WORKER_KEY", Some("x")),
+            ("DEEP_KEY", None),
+        ],
+    )
+    .success()
+    .stdout(predicate::str::contains("\u{2713}  DEEP_KEY"))
+    .stdout(predicate::str::contains("Fix: export DEEP_KEY").not())
+    .get_output()
+    .clone();
+
+    let streams = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!streams.contains("from-dotenv"), "{streams}");
+}
+
+#[test]
+fn two_installed_versions_with_nothing_pinning_which_is_uninspectable() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global = global_store(&home);
+    install_capsule(
+        &global,
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [OLD_ONLY]\n",
+    );
+    install_capsule(
+        &global,
+        "worker",
+        "0.2.0",
+        "name: worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [NEW_ONLY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+
+    mur_doctor_with_env(&home, project.path(), &[("ROOT_KEY", Some("x"))])
+        .success()
+        .stdout(predicate::str::contains(
+            "could not inspect 1 of 2 capsules in this formation",
+        ))
+        .stdout(predicate::str::contains(
+            "2 versions installed (0.1.0, 0.2.0) and nothing pins which one a run would get",
+        ))
+        .stdout(predicate::str::contains("OLD_ONLY").not())
+        .stdout(predicate::str::contains("NEW_ONLY").not());
+}
+
+#[test]
+fn the_lockfile_decides_which_version_the_walk_reads() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let global = global_store(&home);
+    let pinned_sha256 = install_capsule(
+        &global,
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [OLD_ONLY]\n",
+    );
+    install_capsule(
+        &global,
+        "worker",
+        "0.2.0",
+        "name: worker\nversion: 0.2.0\ncapabilities:\n  env:\n    allow: [NEW_ONLY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY, OLD_ONLY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+    write_lock(project.path(), "worker", "0.1.0", &pinned_sha256);
+
+    mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("ROOT_KEY", Some("x")),
+            ("OLD_ONLY", Some("x")),
+            ("NEW_ONLY", None),
+        ],
+    )
+    .success()
+    .stdout(predicate::str::contains(
+        "capsules: root-capsule@0.0.1, worker@0.1.0",
+    ))
+    .stdout(predicate::str::contains("OLD_ONLY"))
+    .stdout(predicate::str::contains("NEW_ONLY").not())
+    .stdout(predicate::str::contains("could not inspect").not())
+    .stdout(predicate::str::contains("Fix:").not());
+}
+
+#[test]
+fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    install_capsule(
+        &global_store(&home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ninference:\n  driver: anthropic\n  model: claude-x\n  \
+         api_key: ${PROVIDER_KEY}\ncapabilities:\n  env:\n    allow: [PROVIDER_KEY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    \
+         allow: [ROOT_KEY, PROVIDER_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+
+    mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_KEY", Some("x")), ("PROVIDER_KEY", None)],
+    )
+    .failure()
+    .stdout(predicate::str::contains(
+        "capsules: root-capsule@0.0.1, worker@0.1.0",
+    ))
+    .stdout(predicate::str::contains("could not inspect").not())
+    .stdout(predicate::str::contains("\u{2717}  PROVIDER_KEY"))
+    .stdout(predicate::str::contains("worker@0.1.0"))
+    .stderr(predicate::str::contains("E-CAP-014"));
 }

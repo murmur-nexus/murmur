@@ -24,6 +24,8 @@ section that explains it.
 | `E-CAP-011` | `context.record_store`, or `mur run --context`, does not name one conversation record directory | [E-CAP-011](#e-cap-011) |
 | `E-CAP-012` | A `capabilities.filesystem.read_only` entry is not a usable workdir subpath | [E-CAP-012](#e-cap-012) |
 | `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
+| `E-CAP-014` | A variable the formation's `capabilities.env.allow` closure declares is unset | [E-CAP-014](#e-cap-014) |
+| `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -77,6 +79,7 @@ section that explains it.
 | `W-BLD-002` | `capsule.wasm` shadows another root `*.wasm` | [W-BLD-002](#w-bld-002) |
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
+| `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -560,6 +563,45 @@ same way, and the running capsule receives that refusal as an error string.
 Shell binary names are not reserved: they come from `capabilities.shell.allow`. See
 [Runtime-provided tools](runtime-provided-tools.md#reserved-names).
 
+### E-CAP-014 — a formation variable nothing sets { #e-cap-014 }
+
+A capsule in the `capabilities.spawn.allow` closure `mur doctor` walked declares a
+`capabilities.env.allow` name that neither this shell nor the workspace `.env` sets:
+
+```text
+error[E-CAP-014]: this formation declares 1 variable nothing in this environment sets: WORKER_TOKEN
+  Every name is copied from the launching shell at the moment of the spawn, so an unset one reaches the capsule that declared it as absent — export it, or declare it in the workspace .env.
+```
+
+Reported only for a capsule declaring a non-empty `capabilities.spawn.allow`, and only by
+[`mur doctor`](cli.md#mur-doctor) — the runtime omits an unset name at launch rather than refusing
+it, so nothing about `mur run` changes. Names only: no value is read into the report or printed. A
+name set to the empty string counts as set, because the runtime copies it through as-is. The
+matching stdout line is `✗ NAME   unset   — <capsule>@<version>`, naming every capsule in the
+closure that declared it. This is one of the two formation findings that make `mur doctor` exit
+non-zero.
+
+### E-CAP-015 — a declaration `mur-roost` will refuse { #e-cap-015 }
+
+A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold:
+
+```text
+error[E-CAP-015]: 1 declaration in this formation exceeds the envelope the capsule spawning it holds, and mur-roost refuses a spawn that widens one.
+  A child may declare no more than its parent does on capabilities.env.allow.
+```
+
+A spawn may narrow its parent's envelope, never widen it, so `mur-roost` refuses this delegation at
+the moment the parent reaches for it. [`mur doctor`](cli.md#mur-doctor) predicts that refusal
+offline, naming both capsules and the axis:
+
+```text
+  declarations mur-roost will refuse:
+    ✗  worker@0.1.0 declares capabilities.env.allow 'WORKER_ONLY', which its parent root-capsule@0.0.1 does not
+```
+
+Add the name to the parent's `capabilities.env.allow`, or drop it from the child's. The axis is
+spelled by the spawn envelope itself, so the prediction and the refusal cannot word it differently.
+
 ---
 
 ## Conversation record errors
@@ -758,6 +800,36 @@ store in place — `mur install` overwrites what is there.
 `mur doctor` marks that artifact's checklist line, prints the same `Fix:` line, and counts it as a
 warning rather than an error, so a store holding an untagged native payload does not fail a CI
 pre-flight check.
+
+### W-REG-002 — a capsule in a formation could not be inspected { #w-reg-002 }
+
+```text
+warning[W-REG-002]: 1 capsule in this formation could not be inspected, so what it declares is absent from the report above: ghost-worker
+  The walk not being able to read a capsule is not evidence that a run fails, so this does not change the exit code.
+  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-reg-002)
+```
+
+[`mur doctor`](cli.md#mur-doctor) walks a capsule's `capabilities.spawn.allow` closure to report
+what the whole formation needs from the operator's environment. A capsule it cannot open
+contributes nothing to that report, so the report is incomplete — and saying so is the point of
+this code. The matching stdout block names each one and why:
+
+```text
+  could not inspect 1 of 3 capsules in this formation:
+    - ghost-worker (declared by root-capsule@0.0.1): not installed in the project or global store
+```
+
+Three reasons:
+
+| Reason | What it means |
+|---|---|
+| not installed in the project or global store | Neither store holds any version of that name |
+| N versions installed (…) and nothing pins which one a run would get | More than one version is installed and no `murmur.lock` entry pins one; no version is chosen, because there is no `latest` alias and guessing would report the wrong capsule's requirement as fact |
+| installed but unreadable | A version resolved, but its archive or packed `murmur.yaml` could not be read |
+
+Install the capsule, or pin its version in `murmur.lock`, and `mur doctor` folds its declarations
+into the report. The exit code is unchanged either way: the walk not being able to read a capsule
+is not evidence that a run fails.
 
 ---
 

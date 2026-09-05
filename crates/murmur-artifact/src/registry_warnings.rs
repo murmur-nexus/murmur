@@ -14,6 +14,15 @@
 /// last. Reinstalling the artifact refiles it at its tagged path.
 pub const W_REG_001: &str = "W-REG-001";
 
+/// A capsule named in a formation's `capabilities.spawn.allow` closure whose own declarations
+/// could not be read from either artifact store.
+///
+/// `mur doctor` walks that closure to report what the whole formation needs from the operator's
+/// environment. A capsule it cannot open contributes nothing to that report, so the report is
+/// incomplete — but the walk not being able to read a capsule is not itself evidence that a run
+/// fails, so it is named and counted rather than raised.
+pub const W_REG_002: &str = "W-REG-002";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -30,7 +39,7 @@ mod tests {
     /// on. A duplicated or misspelled constant would silently point two warnings at one anchor.
     #[test]
     fn every_code_is_unique_and_well_formed() {
-        let codes = [W_REG_001];
+        let codes = [W_REG_001, W_REG_002];
         for code in codes {
             assert!(code.starts_with("W-REG-"), "malformed code: {code}");
             assert_eq!(code.len(), 9, "malformed code: {code}");
