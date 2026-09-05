@@ -1001,6 +1001,33 @@ struct DelegationStartEvent {
     child_workdir: String,
 }
 
+impl DelegationStartEvent {
+    /// The one place this record is built, so the two appenders that write it cannot drift into
+    /// two shapes. Which surface launched the child is not an argument, because it is not a field.
+    fn new(
+        session_id: &str,
+        session_event_id: &str,
+        delegation_id: &str,
+        capsule: &str,
+        version: &str,
+        child_session_id: &str,
+        child_workdir: &str,
+    ) -> Self {
+        Self {
+            event_type: "delegation_start",
+            event_id: new_event_id(),
+            parent_id: Some(session_event_id.to_string()),
+            session_id: session_id.to_string(),
+            timestamp: timestamp_ms(),
+            delegation_id: delegation_id.to_string(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            child_session_id: child_session_id.to_string(),
+            child_workdir: child_workdir.to_string(),
+        }
+    }
+}
+
 /// One delegation, written when it ends.
 ///
 /// One line per call whatever happened, including a call the daemon refused: a delegation that was
@@ -1028,15 +1055,51 @@ struct DelegationEvent {
     /// How long the child ran, for a delegation that started; how long the call took, for one that
     /// never started.
     duration_ms: u64,
-    /// How the delegation ended, in one of two vocabularies depending on whether it got far
-    /// enough to have an ending of its own: `ok`, `error`, `crashed` or `terminated` from
-    /// [`crate::delegation::DelegationStatus`] for a started delegation whose completion arrived,
-    /// `unknown` for one whose completion left no readable file, and `failed` or `refused` from
-    /// [`crate::delegation_plane::DelegationStatus`] for one that never started.
+    /// How the delegation ended. Which vocabulary it is drawn from depends on whether the
+    /// delegating call waited for the answer itself:
+    ///
+    /// - A delegation whose outcome arrived later as a completion reads `ok`, `error`, `crashed`
+    ///   or `terminated` from [`crate::delegation::DelegationStatus`], or `unknown` when the
+    ///   completion left no readable file.
+    /// - One the caller waited out reads `completed` or `timed_out` from
+    ///   [`crate::delegation_plane::DelegationStatus`].
+    /// - One that never started reads `failed` or `refused`, from that same enum, either way.
     outcome: String,
     /// `null` where nothing needs saying. Otherwise the completion's `detail`, or the same
     /// sentence the model was given.
     reason: Option<String>,
+}
+
+impl DelegationEvent {
+    /// The one place this record is built, so the two appenders that write it cannot drift into
+    /// two shapes. Which surface launched the child is not an argument, because it is not a field.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        session_id: &str,
+        session_event_id: &str,
+        capsule: &str,
+        version: &str,
+        delegation_id: Option<String>,
+        child_session_id: Option<String>,
+        duration_ms: u64,
+        outcome: &str,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            event_type: "delegation",
+            event_id: new_event_id(),
+            parent_id: Some(session_event_id.to_string()),
+            session_id: session_id.to_string(),
+            timestamp: timestamp_ms(),
+            capsule: capsule.to_string(),
+            version: version.to_string(),
+            delegation_id,
+            child_session_id,
+            duration_ms,
+            outcome: outcome.to_string(),
+            reason,
+        }
+    }
 }
 
 // ── TraceWriter impl ─────────────────────────────────────────────────────────
@@ -2128,18 +2191,15 @@ impl ResourceTraceAppender {
         child_session_id: &str,
         child_workdir: &str,
     ) {
-        let event = DelegationStartEvent {
-            event_type: "delegation_start",
-            event_id: new_event_id(),
-            parent_id: Some(self.session_event_id.clone()),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            delegation_id: delegation_id.to_string(),
-            capsule: capsule.to_string(),
-            version: version.to_string(),
-            child_session_id: child_session_id.to_string(),
-            child_workdir: child_workdir.to_string(),
-        };
+        let event = DelegationStartEvent::new(
+            &self.session_id,
+            &self.session_event_id,
+            delegation_id,
+            capsule,
+            version,
+            child_session_id,
+            child_workdir,
+        );
         self.append(&event).await;
     }
 
@@ -2157,20 +2217,17 @@ impl ResourceTraceAppender {
         outcome: &str,
         reason: Option<String>,
     ) {
-        let event = DelegationEvent {
-            event_type: "delegation",
-            event_id: new_event_id(),
-            parent_id: Some(self.session_event_id.clone()),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            capsule: capsule.to_string(),
-            version: version.to_string(),
+        let event = DelegationEvent::new(
+            &self.session_id,
+            &self.session_event_id,
+            capsule,
+            version,
             delegation_id,
             child_session_id,
             duration_ms,
-            outcome: outcome.to_string(),
+            outcome,
             reason,
-        };
+        );
         self.append(&event).await;
     }
 
@@ -2554,10 +2611,9 @@ impl PlanTraceAppender {
 
     /// Records one child a `capsule` step launched, while its delegation is still running.
     ///
-    /// The synchronous twin of [`ResourceTraceAppender::write_delegation_start`], writing the
-    /// same [`DelegationStartEvent`] off the same session node. Which surface launched a child is
-    /// not a fact either record carries, so the two are identical but for their ids and clocks —
-    /// a construction property, held by there being one struct rather than by a test.
+    /// The synchronous twin of [`ResourceTraceAppender::write_delegation_start`]. Both go through
+    /// [`DelegationStartEvent::new`], so the two lines are identical but for their ids and
+    /// clocks — held by there being one constructor rather than by a test.
     pub(crate) fn write_delegation_start(
         &self,
         delegation_id: &str,
@@ -2566,18 +2622,15 @@ impl PlanTraceAppender {
         child_session_id: &str,
         child_workdir: &str,
     ) {
-        let event = DelegationStartEvent {
-            event_type: "delegation_start",
-            event_id: new_event_id(),
-            parent_id: Some(self.session_event_id.clone()),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            delegation_id: delegation_id.to_string(),
-            capsule: capsule.to_string(),
-            version: version.to_string(),
-            child_session_id: child_session_id.to_string(),
-            child_workdir: child_workdir.to_string(),
-        };
+        let event = DelegationStartEvent::new(
+            &self.session_id,
+            &self.session_event_id,
+            delegation_id,
+            capsule,
+            version,
+            child_session_id,
+            child_workdir,
+        );
         self.append(&event);
     }
 
@@ -2599,20 +2652,17 @@ impl PlanTraceAppender {
         outcome: &str,
         reason: Option<String>,
     ) {
-        let event = DelegationEvent {
-            event_type: "delegation",
-            event_id: new_event_id(),
-            parent_id: Some(self.session_event_id.clone()),
-            session_id: self.session_id.clone(),
-            timestamp: timestamp_ms(),
-            capsule: capsule.to_string(),
-            version: version.to_string(),
+        let event = DelegationEvent::new(
+            &self.session_id,
+            &self.session_event_id,
+            capsule,
+            version,
             delegation_id,
             child_session_id,
             duration_ms,
-            outcome: outcome.to_string(),
+            outcome,
             reason,
-        };
+        );
         self.append(&event);
     }
 

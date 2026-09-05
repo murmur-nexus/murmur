@@ -488,6 +488,20 @@ impl DelegationPlane {
             Err(reason) => return DelegationResult::refused(request, reason),
         };
 
+        // What both manifests declare and nothing else, on the same terms as every other launch
+        // from this plane: a child started without the variables its manifest names dies at its
+        // own manifest load, before it can report anything. A read that fails starts no child.
+        let child_env_allow = match self.child_env_allow(&request.capsule, &request.version) {
+            Ok(names) => names,
+            Err(error) => {
+                return DelegationResult::unmade(
+                    request,
+                    DelegationStatus::Failed,
+                    error.to_string(),
+                )
+            }
+        };
+
         // The production caller of the completion path: this spawner names where the outcome goes
         // and under which trust, which is what starts the watcher behind the child. The deadline
         // is this plane's single bound, and here it bounds the watch rather than a poll.
@@ -496,7 +510,7 @@ impl DelegationPlane {
             capsule_name: request.capsule.clone(),
             capsule_version: request.version.clone(),
             grant,
-            child_env_allow: Vec::new(),
+            child_env_allow,
             roost_url: self.roost_url.clone(),
             spawner: Some(Spawner {
                 session_id: self.session_id.clone(),

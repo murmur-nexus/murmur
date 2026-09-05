@@ -553,8 +553,8 @@ and has reported its session id
 | Field | Type | Notes |
 |---|---|---|
 | `delegation_id` | string | `dlg_…`, the id the delegation is named by. Always present: a delegation with no id was never launched and writes no line here |
-| `capsule` | string | The sub-capsule the agent named |
-| `version` | string | The version the agent named |
+| `capsule` | string | The sub-capsule that was named |
+| `version` | string | The version that was named |
 | `child_session_id` | string | `ses_…`, the session the child's runtime minted for itself |
 | `child_workdir` | string | The child's directory, relative to this capsule's accessible workdir. Join the two, then `.murmur/<child_session_id>/trace.jsonl`, to reach the child's own trace |
 
@@ -566,35 +566,46 @@ from the parent's side whatever happens next. A delegation the daemon refused wr
 
 | Field | Type | Notes |
 |---|---|---|
-| `capsule` | string | The sub-capsule the agent named |
-| `version` | string | The version the agent named |
+| `capsule` | string | The sub-capsule that was named |
+| `version` | string | The version that was named |
 | `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one that was never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
 | `duration_ms` | u64 | How long the child ran, on an outcome; how long the call took, on one that never started |
-| `outcome` | string | `"ok"`, `"error"`, `"crashed"` or `"terminated"` for a delegation that started and ended; `"unknown"` when its sub-capsule left no readable `completion.json`; `"failed"` or `"refused"` for one that never started |
-| `reason` | string \| null | `null` on `"ok"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
+| `outcome` | string | One of the values in the table below |
+| `reason` | string \| null | `null` on `"ok"` and `"completed"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
 
-**Two surfaces launch children**, and both write both lines, off the same event structures and
-under the same session node: the [`delegate-task`](runtime-provided-tools.md) tool an agent calls,
-and a plan's [`capsule` step](plans.md). Neither record names the surface that launched the child,
-so a reader can tell that a delegation happened but not which one made it.
+`outcome` values:
 
-**When each line is written.** A `delegate-task` call that starts a child writes `delegation_start`
-and nothing else: the delegation has not ended, and the call has returned. The terminal
-`delegation` line is written later, as the task carrying that delegation's outcome begins, out of
-the child's own [`completion.json`](roost-api.md#the-completion-path) rather than out of the text
-the agent reads. A call that never started a child — refused, or failed before the child held its
-task — writes only the terminal line, in the same turn, and names no `delegation_id`. A plan
-`capsule` step waits for its child's answer, so it writes both lines within the step, and a step
-with `retries` writes one pair per attempt.
+| Value | Means |
+|---|---|
+| `"ok"`, `"error"`, `"crashed"`, `"terminated"` | The child ran and reported its own outcome in a [`completion.json`](roost-api.md#the-completion-path) |
+| `"unknown"` | The child ran and left no readable `completion.json` |
+| `"completed"` | The child answered the caller that was waiting for it |
+| `"timed_out"` | The child was still running at the delegation deadline and was stopped |
+| `"failed"` | The child was approved but never got far enough to answer |
+| `"refused"` | `mur-roost` refused the spawn, so no child was launched |
+
+**Two surfaces launch children**: the [`delegate-task`](runtime-provided-tools.md) tool an agent
+calls, and a plan's [`capsule` step](plans.md). Both write both lines under the session node, and
+neither line names the surface — a reader can tell that a delegation happened, but not which
+surface made it.
+
+They differ only in when the terminal line lands, because `delegate-task` returns as soon as the
+child is up while a `capsule` step waits for the answer:
+
+| | `delegate-task` | `capsule` step |
+|---|---|---|
+| Child started | `delegation_start` in the turn that called the tool; `delegation` later, as the task carrying the outcome begins | both lines within the step |
+| Child never started | `delegation` only, in the same turn, with no `delegation_id` | `delegation` only, within the step, with no `delegation_id` |
+| Repeat launches | one pair per call | one pair per attempt, so a step with `retries` writes several |
 
 A `capsule` step's `plan_step` records are not a second copy of this: the plan-step pair records
 the scheduler's unit of work — its dependencies, its attempts, its status after `on_error` — and
 the delegation pair records one child launch.
 
-One line per delegation either way. It carries neither the task text nor the child's answer — both
-are the agent's own conversation, which the `tool_call` line for the same call already records
-under the session's `trace.capture` setting.
+The `delegation` line carries neither the task text nor the child's answer — both are the agent's
+own conversation, which the `tool_call` line for the same call already records under the session's
+[`trace.capture`](manifest.md#field-trace) setting.
 
 ### Reading a formation { #delegation-lineage }
 

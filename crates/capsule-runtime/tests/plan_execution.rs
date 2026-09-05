@@ -2114,8 +2114,8 @@ fn test_a_refused_capsule_step_delegation_is_traced_with_the_daemons_reason() {
     );
 }
 
-/// A plan that delegates to nobody writes no delegation record and opens no file, whether it was
-/// handed an appender or not.
+/// A plan that delegates to nobody writes no delegation record, whether it was handed an appender
+/// or not — and with no appender it opens no `trace.jsonl` at all.
 #[test]
 fn test_a_plan_with_no_capsule_steps_writes_no_trace_file() {
     // Its shell step is a real subprocess, so it wants the same bounded host every other case
