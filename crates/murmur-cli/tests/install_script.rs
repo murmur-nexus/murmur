@@ -6,12 +6,12 @@
 //! directory and logs every URL the script asks for, which is also how "both binaries came from the
 //! same release" is asserted rather than assumed.
 //!
-//! The fixture assets are real programs. The installer runs each staged binary once before it is
-//! renamed onto PATH and refuses the whole install if either cannot exec, so an asset of arbitrary
-//! bytes no longer reaches the happy path. The payloads are shell scripts rather than compiled
-//! binaries: what the check asks is whether this host's kernel and loader accept the file and it
-//! exits 0, and a script answers that question the same way a linked ELF does — while letting a
-//! test hand the installer a file the loader refuses, which is the case that shipped.
+//! The fixture assets are real programs, because the installer runs each staged binary once before
+//! it is renamed onto PATH and refuses the whole install if either cannot exec. The payloads are
+//! shell scripts rather than compiled binaries: what the check asks is whether this host's kernel
+//! and loader accept the file and it exits 0, and a script answers that question the same way a
+//! linked ELF does — while letting a test hand the installer a file the loader refuses, which no
+//! compiled fixture could do portably.
 
 use std::fs;
 use std::path::{Path, PathBuf};

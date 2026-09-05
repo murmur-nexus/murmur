@@ -23,6 +23,11 @@ The installer ships `mur-roost` beside `mur`, in the same directory and at the s
 curl -fsSL https://install.murmur.rs | sh
 ```
 
+The published Linux x86_64 binaries need glibc 2.31 or newer — Debian 11+, Ubuntu 20.04+, RHEL 9+.
+The installer runs each binary once before putting it on your `PATH`, so a host that cannot start
+them is told so and left with whatever it already had. On an older distribution, build from source
+with `cargo install murmur-cli`.
+
 Start it on loopback:
 
 ```bash
@@ -36,6 +41,7 @@ mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 | `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
 | `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
 | `--max-concurrent` | `4` | Children one session may hold live at once |
+| `--version` | — | Print the daemon's version and exit without binding a port |
 
 `--spawn-allow` takes a single name per occurrence, not a comma-separated list. It gates the
 top-level path only — the registrations that present no approval. Started with no `--spawn-allow`

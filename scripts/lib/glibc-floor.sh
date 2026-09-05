@@ -9,10 +9,9 @@
 # The floor is a release promise: a published `linux-x86_64` binary must start on
 # every host whose glibc is at least GLIBC_FLOOR. Nothing in the toolchain holds
 # that promise on its own. A dynamically linked binary requires whatever versioned
-# symbols the glibc that built it offered, so the floor is silently whatever the
-# release runner happened to ship — which is how a runner image moving to glibc
-# 2.39 published a `mur` that will not exec on half the distributions this project
-# targets, with no build failure anywhere.
+# symbols the glibc that built it offered, so without a pinned build image the
+# floor is silently whatever the release runner ships, and a runner image moving
+# raises it with no build failure anywhere.
 #
 # Two declarations hold the promise, and they only mean anything together:
 #

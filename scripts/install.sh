@@ -272,8 +272,8 @@ The download may be corrupt or tampered with. Nothing was installed."
 # Runs the staged binary once and refuses the whole install if this host cannot
 # exec it. Every other check in this script asks whether the bytes are the right
 # bytes — the release resolves, the asset is listed, the sha256 matches — and none
-# of them asks whether the result starts. That is how a release built against a
-# newer glibc than it promises reports a successful install and leaves behind a
+# of them asks whether the result starts. Without this one, a release built against
+# a newer glibc than it promises reports a successful install and leaves behind a
 # `mur` that can only ever print a loader error.
 #
 # Cause-agnostic by construction: it classifies nothing, so it catches a glibc

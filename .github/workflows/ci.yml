@@ -126,10 +126,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: The declared glibc floor matches the release image and what we tell operators
-        # Configuration only, so it needs no toolchain and no binary. The floor moved
-        # once already by the release runner's image changing under it; this makes that
-        # arrive as a failing diff rather than as a published binary half our target
-        # distributions cannot exec.
+        # Configuration only, so it needs no toolchain and no binary. The release
+        # runner's image changing under the build raises the glibc floor silently; this
+        # makes that arrive as a failing diff rather than as a published binary half the
+        # target distributions cannot exec.
         run: ./scripts/check-glibc-floor.sh --config
 
   release-notes-cli:

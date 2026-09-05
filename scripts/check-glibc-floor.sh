@@ -20,10 +20,10 @@
 #       Configuration mode. Asserts that the release workflow still builds in the
 #       image the floor names, and that README.md and scripts/install.sh state
 #       the floor the build enforces. Reads no binary and needs no toolchain, so
-#       it runs on every pull request — the point being that a runner image
-#       moving away from the pinned distro, which is how the floor moved
-#       unnoticed before, arrives as a failing diff. --root checks a copy of the
-#       tree somewhere else; every path it reads is repo-relative to that root.
+#       it runs on every pull request: a runner image moving away from the pinned
+#       distro raises the floor silently, and this makes it arrive as a failing
+#       diff instead. --root checks a copy of the tree somewhere else; every path
+#       it reads is repo-relative to that root.
 #
 # Exit codes:
 #   0  every file is at or under the floor / the configuration agrees
