@@ -427,7 +427,7 @@ Ahead of the checklist it prints three blocks, none of which affects the exit co
 
 For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilities), `mur doctor` also reports whether `mur-roost` — the daemon that capsule registers with at launch — is installed and answering, naming [`E-RUN-019`](diagnostics.md#e-run-019) as the error a `mur run` would meet. It tells apart three states: the binary is not on `PATH`, `MURMUR_ROOST_URL` is not set, and nothing answers at the URL that variable names. A reachable daemon prints nothing, and a capsule declaring no `spawn.allow` gets no such line. Like the blocks above, this warning goes to stderr and never changes the exit code.
 
-For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule the way `mur run` resolves an installed one: `murmur.lock` pins the version if it holds an entry, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). Nothing is launched, no daemon is contacted, and a capsule declaring no `spawn.allow` gets no such block.
+For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched, no daemon is contacted, and a capsule declaring no `spawn.allow` gets no such block.
 
 Four findings, of which two change the exit code:
 
@@ -438,7 +438,7 @@ Four findings, of which two change the exit code:
 | A capsule the walk could not read: not installed, more than one version installed with nothing pinning which, or an unreadable archive | `could not inspect N of M capsules in this formation:` | `0`, [`W-REG-002`](diagnostics.md#w-reg-002) on stderr |
 | A `spawn.allow` edge pointing back at a capsule already on the walk | `spawn.allow cycle: a@1 → b@2` | `0` |
 
-This is stricter than the manifest blocks above, which report a refusal of the *root* as a warning. Those the operator meets seconds into a run for free; a formation failure lands at depth, after the parent has spent tokens reaching the point of delegating. Where the walk knows the run cannot succeed it fails; where it does not know — a capsule it could not open — it warns.
+This block is stricter than the manifest blocks above, which report a refusal of the root capsule as a warning: a formation failure lands at depth, after the parent has already spent tokens reaching the point of delegating.
 
 Only names are printed. No variable's value is read into the report or written anywhere, and set/unset is decided by presence alone, so a name set to the empty string counts as set. The workspace `.env` counts because `mur run` loads it; a `.env` that cannot be parsed is reported by file and line, adds a `Fix:` entry, and leaves the variable list computed from this shell's environment alone.
 
@@ -538,8 +538,8 @@ Fix: mur install murmur-tool-git@1.0.0
 
 **Exit codes:**
 
-- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform, and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
-- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, or hold a native binary this host cannot run (checklist printed to stdout first), or the formation block found an unset variable or a predicted refusal, or a setup failure (no checklist printed; error goes to stderr)
+- `0` — every declared artifact resolved (or is local-source), agrees with `murmur.lock` if one is present, and carries no binary built for another platform; and the formation block found no unset variable and no declaration `mur-roost` will refuse. Warnings do not change this
+- `1` — one or more declared artifacts missing, disagree with `murmur.lock`, or hold a native binary this host cannot run (checklist printed to stdout first); or the formation block found an unset variable or a predicted refusal; or a setup failure (no checklist printed; error goes to stderr)
 
 **Error codes:**
 

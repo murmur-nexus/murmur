@@ -7,7 +7,7 @@
 //! [`crate::commands::doctor`]; the split keeps the traversal testable without a terminal.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use capsule_runtime::EnvelopeAxis;
 use murmur_artifact::{
@@ -161,9 +161,9 @@ impl EnvironmentNames {
 
 /// Walk the `spawn.allow` closure from `root` and report what the whole formation declares.
 ///
-/// Depth-first, through the stores and the precedence `mur run` resolves an installed capsule
-/// through. Every failure is a finding rather than an error: a formation the walk cannot fully
-/// read is reported as partially read, never silently under-reported.
+/// Depth-first, through the same stores and store precedence a run resolves an installed capsule
+/// from. Every failure is a finding rather than an error: a formation the walk cannot fully read
+/// is reported as partially read, never silently under-reported.
 pub(crate) fn walk_formation_env(
     root: &RuntimeManifest,
     project_dir: &Path,
@@ -171,7 +171,6 @@ pub(crate) fn walk_formation_env(
     environment: &EnvironmentNames,
 ) -> FormationEnvReport {
     let mut walk = Walk {
-        project_dir: project_dir.to_path_buf(),
         project_registry: LocalRegistry::new(project_dir.join(".murmur").join("artifacts")),
         // Absent only on a host with no home directory, where nothing is installed globally
         // either. Every lookup then answers from the project store alone.
@@ -234,7 +233,6 @@ struct Declarations {
 }
 
 struct Walk<'a> {
-    project_dir: PathBuf,
     project_registry: LocalRegistry,
     global_registry: Option<LocalRegistry>,
     lock: Option<&'a MurmurLock>,
@@ -323,9 +321,11 @@ impl Walk<'_> {
         }
     }
 
-    /// Which version of `name` a run would get, by the precedence `mur run` resolves through:
-    /// the lockfile pins it, else the project store decides alone if it holds the name at all,
-    /// else the global store.
+    /// Which version of `name` a run would get: the lockfile pins it, else the project store
+    /// decides alone if it holds the name at all, else the global store.
+    ///
+    /// A spawn request carries an exact version, so nothing here may invent one — a name no
+    /// single source settles is reported unresolved rather than guessed at.
     fn resolve_version(&self, name: &str) -> Result<String, UninspectableReason> {
         if let Some(locked) = self.lock.and_then(|lock| lock.artifact_for(name)) {
             return Ok(locked.resolved_version.clone());
@@ -394,7 +394,7 @@ impl Walk<'_> {
         let platform = Some(current_platform());
         let resolved = match &self.global_registry {
             Some(global) => FallbackRegistry {
-                primary: LocalRegistry::new(self.project_dir.join(".murmur").join("artifacts")),
+                primary: self.project_registry.clone(),
                 secondary: global.clone(),
             }
             .resolve_with_platform(name, version, platform)?,

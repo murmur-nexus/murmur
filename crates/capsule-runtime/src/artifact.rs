@@ -368,6 +368,58 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_declared_spawn_allow_out_of_a_manifest() {
+        let manifest = "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    \
+                        allow: [OPENAI_API_KEY]\n  spawn:\n    allow: [deep-worker, sibling]\n";
+
+        assert_eq!(
+            extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["deep-worker".to_string(), "sibling".to_string()]
+        );
+        assert_eq!(
+            extract_declared_env_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["OPENAI_API_KEY".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_manifest_declaring_no_spawn_allow_declares_nothing() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A_KEY]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: []\n",
+        ] {
+            assert_eq!(
+                extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap(),
+                Vec::<String>::new(),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_spawn_allow_is_an_error_naming_the_artifact() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: deep-worker\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: [[deep]]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n\tspawn: broken\n",
+        ] {
+            match extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap_err() {
+                RuntimeError::ArtifactArchive {
+                    name,
+                    version,
+                    message,
+                } => {
+                    assert_eq!(name, "worker");
+                    assert_eq!(version, "0.1.0");
+                    assert!(message.contains("capabilities.spawn.allow"), "{message}");
+                }
+                other => panic!("expected ArtifactArchive error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn rejects_path_traversal_entry_as_root_wasm_candidate() {
         let archive = archive_with_files(&[
             ("../../evil.wasm", b"evil"),

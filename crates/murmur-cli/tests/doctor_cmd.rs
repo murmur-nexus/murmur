@@ -232,8 +232,8 @@ fn mur_doctor_with_env(
     command.assert()
 }
 
-/// The three-level formation Scenarios 1, 2, 3 and 8 share: a root declaring three variables and
-/// spawning `worker`, which declares two and spawns `deep-worker`, which declares one.
+/// A three-level formation: a root declaring three variables and spawning `worker`, which
+/// declares two and spawns `deep-worker`, which declares one.
 fn create_three_level_formation(home: &TempDir, project_dir: &Path) {
     let global = global_store(home);
     install_capsule(

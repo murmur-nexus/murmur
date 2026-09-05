@@ -18,7 +18,7 @@ use murmur_artifact::{
 };
 
 use crate::commands::install::find_project_root;
-use crate::commands::run::{artifact_presence, find_workspace_root, ArtifactPresence};
+use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
 use crate::error::{
@@ -353,8 +353,9 @@ fn report_formation_env(
         warnings: Vec::new(),
     };
 
-    let workspace_root = find_workspace_root(project_root);
-    let (environment, dotenv_error) = EnvironmentNames::for_workspace(&workspace_root);
+    // The project root is the workspace root here: `find_project_root` returns the nearest
+    // ancestor holding a `murmur.yaml`, which is the same directory a run reads its `.env` from.
+    let (environment, dotenv_error) = EnvironmentNames::for_workspace(project_root);
     let report = walk_formation_env(runtime_manifest, project_root, lock, &environment);
 
     println!("Formation environment");
@@ -371,11 +372,11 @@ fn report_formation_env(
     if let Some(error) = dotenv_error {
         println!(
             "  {}/.env could not be read, so set/unset below is this shell's environment alone: {error}",
-            workspace_root.display()
+            project_root.display()
         );
         findings
             .fixes
-            .push(format!("fix {}/.env — {error}", workspace_root.display()));
+            .push(format!("fix {}/.env — {error}", project_root.display()));
     }
 
     print_variables(&report, &mut findings);
@@ -725,12 +726,10 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // What the whole delegation closure needs from the operator's environment, gated on the same
     // `spawn_allows` as the roost report: a capsule that delegates to nobody has no formation.
     //
-    // This block departs from the E-CAP-004/005/006 precedent above, where a refusal `mur run`
-    // would make is a warning because doctor launches nothing. Those predict a refusal of the
-    // *root*, which the operator meets seconds into a run for free. These predict a failure at
-    // *depth*, after the parent has spent tokens reaching the point of delegating. Where the walk
-    // knows the run cannot succeed it fails; where it does not know — a capsule it could not read
-    // — it warns.
+    // Unlike the E-CAP-004/005/006 blocks above, this one fails rather than warns. Those predict
+    // a refusal of the root capsule, which a run surfaces within seconds; these predict one at
+    // depth, after the parent has already run. Where the walk knows the run cannot succeed it
+    // fails; where it does not know — a capsule it could not read — it warns.
     let formation_findings = if spawn_allows {
         Some(report_formation_env(
             &runtime_manifest,

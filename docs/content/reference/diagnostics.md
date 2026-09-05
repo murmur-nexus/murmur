@@ -599,8 +599,7 @@ offline, naming both capsules and the axis:
     ✗  worker@0.1.0 declares capabilities.env.allow 'WORKER_ONLY', which its parent root-capsule@0.0.1 does not
 ```
 
-Add the name to the parent's `capabilities.env.allow`, or drop it from the child's. The axis is
-spelled by the spawn envelope itself, so the prediction and the refusal cannot word it differently.
+Add the name to the parent's `capabilities.env.allow`, or drop it from the child's.
 
 ---
 
@@ -811,8 +810,8 @@ warning[W-REG-002]: 1 capsule in this formation could not be inspected, so what 
 
 [`mur doctor`](cli.md#mur-doctor) walks a capsule's `capabilities.spawn.allow` closure to report
 what the whole formation needs from the operator's environment. A capsule it cannot open
-contributes nothing to that report, so the report is incomplete — and saying so is the point of
-this code. The matching stdout block names each one and why:
+contributes nothing to that report, so the report is incomplete. The matching stdout block names
+each one and why:
 
 ```text
   could not inspect 1 of 3 capsules in this formation:

@@ -575,10 +575,10 @@ started by the operator's own shell and inherits that shell wholesale. So a root
 `env.allow` entry for a variable only its own process reads; the field is about what the capsule
 hands onward.
 
-Because the runtime omits an unset name at launch rather than refusing it, a formation can spend
-tokens reaching a delegation before an absent variable shows itself.
-[`mur doctor`](cli.md#mur-doctor) reports the whole `spawn.allow` closure's requirement ahead of a
-run, marking every declared name set or unset — by name only, never by value.
+The runtime omits an unset name at launch rather than refusing it, so a run reaches the delegation
+before an absent variable shows itself. [`mur doctor`](cli.md#mur-doctor) reports the whole
+`spawn.allow` closure's requirement ahead of a run, marking every declared name set or unset — by
+name only, never by value.
 
 #### `capabilities.plan` { #field-plan }
 
