@@ -679,6 +679,52 @@ fn prompt_cache_key_is_not_forwarded_to_the_provider() {
     );
 }
 
+/// `name:version:<context id>` runs past the 64 characters a provider accepts long before a
+/// capsule name reaches the 100 `mur build` allows, and a provider rejecting the key fails the
+/// whole turn. The session completing proves the key the host emits is one the provider took.
+#[test]
+fn prompt_cache_key_over_long_capsule_name_completes_a_session() {
+    let server = ScriptedServer::start(vec![one_shot_anthropic_reply()]);
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let driver_artifact = create_driver_artifact(
+        artifact_dir.path(),
+        DRIVER_ANTHROPIC_NAME,
+        &fixture_path("drivers/anthropic/driver/murmur-driver-anthropic.wasm"),
+    );
+    common::publish_local(&home, &driver_artifact).success();
+
+    // Written here rather than through `create_agent_project`, which hardcodes a short name.
+    let capsule_name = "security-review-and-triage-capsule";
+    assert!(
+        format!("{capsule_name}:0.1.0:ctx_0192f3c4d5e6789abcdef0123456789a").len() > 64,
+        "the capsule name must be long enough to have blown the limit"
+    );
+    let manifest_path = project.path().join("murmur.yaml");
+    fs::write(
+        &manifest_path,
+        format!(
+            "name: {capsule_name}\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER_ANTHROPIC_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\ncapabilities:\n  network:\n    allow:\n      - {endpoint}\ninference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  api_key: test-key\n  driver:\n    artifact: {DRIVER_ANTHROPIC_NAME}\n",
+            endpoint = server.endpoint
+        ),
+    )
+    .unwrap();
+
+    let staged = stage_agent_session(&home, project.path(), &manifest_path);
+    fs::write(staged.workdir.join("task.md"), "hello").unwrap();
+
+    launch_session(staged, |_| {}).expect("agent launch should succeed");
+
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "expected exactly one inference request"
+    );
+}
+
 fn stage_agent_session(home: &TempDir, project_dir: &Path, manifest_path: &Path) -> StagedSession {
     common::stage_agent_session(home, project_dir, manifest_path)
 }

@@ -105,12 +105,18 @@ held `continuation_id` is dropped:
 
 | Task | `prompt_cache_key` |
 |---|---|
-| Has a context id | `<capsule-name>:<version>:<context-id>` |
-| Has no context id | `<capsule-name>:<version>` |
+| Has a context id, and the value fits in 64 characters | `<capsule-name>:<version>:<context-id>` |
+| Has no context id, and the value fits in 64 characters | `<capsule-name>:<version>` |
+| The value would run past 64 characters | The leading characters of the same value, then `:` and a 16-character hex suffix |
 
 A provider that routes on the value keeps a task's turns on one machine, so each turn reaches the
 cache entry the previous turn warmed. Two runs of the same capsule get different values, because
-a context id is minted per task.
+a context id is minted per task — including when the value was shortened.
+
+Shortening keeps the value inside the 64 characters the OpenAI Chat and Responses APIs accept; a
+capsule name of ordinary length already runs past that once a context id is appended. A shortened
+value still opens with the capsule's own name, so a key seen in a payload dump names the capsule
+that produced it.
 
 A driver reads the field only if it declares it, so a driver that ignores it runs unchanged.
 Forward it only where the provider defines a field of its own for it: the OpenAI Chat and

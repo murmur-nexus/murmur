@@ -2371,8 +2371,23 @@ fn extract_continuation_id(metadata: &[(String, String)]) -> Option<String> {
 /// declare the field drops it when deserializing, and inference proceeds unchanged.
 pub(crate) const PROMPT_CACHE_KEY_KEY: &str = "prompt_cache_key";
 
+/// Longest `prompt_cache_key` a provider accepts. OpenAI's Chat and Responses APIs cap the
+/// field at 64 characters and reject a longer one with a 400, and that is the tightest cap
+/// across the providers murmur drives, so the host bounds every key to it and no driver
+/// carries a limit of its own.
+pub(crate) const PROMPT_CACHE_KEY_MAX_LEN: usize = 64;
+
+/// Width of the hex digest that stands in for the part of an over-long key that does not fit.
+const PROMPT_CACHE_KEY_DIGEST_HEX_LEN: usize = 16;
+
+/// Joins the readable head of a bounded key to its digest.
+const PROMPT_CACHE_KEY_DIGEST_SEPARATOR: &str = ":";
+
 /// Build the value of [`PROMPT_CACHE_KEY_KEY`]: `<name>:<version>:<context_id>`, or
-/// `<name>:<version>` when there is no context id.
+/// `<name>:<version>` when there is no context id. A value longer than
+/// [`PROMPT_CACHE_KEY_MAX_LEN`] is emitted as its own leading characters followed by
+/// `:<16 hex>`, the digest taken over the whole logical key so the context id still
+/// distinguishes it; a value that already fits is emitted verbatim.
 ///
 /// A provider routing on this value keeps the turns that carry it on one machine, so each
 /// turn lands on the machine already holding the previous turn's cache entry. It must stay
@@ -2388,10 +2403,36 @@ pub(crate) fn build_prompt_cache_key(
     version: &str,
     context_id: Option<&str>,
 ) -> String {
-    match context_id {
+    let key = match context_id {
         Some(cid) => format!("{name}:{version}:{cid}"),
         None => format!("{name}:{version}"),
+    };
+    if key.len() <= PROMPT_CACHE_KEY_MAX_LEN {
+        return key;
     }
+
+    let head_budget = PROMPT_CACHE_KEY_MAX_LEN
+        - PROMPT_CACHE_KEY_DIGEST_SEPARATOR.len()
+        - PROMPT_CACHE_KEY_DIGEST_HEX_LEN;
+    // The head keeps the capsule name legible; the digest carries what the head dropped, so two
+    // tasks whose keys agree up to `head_budget` still get different values.
+    let head = truncate_on_char_boundary(&key, head_budget);
+    let digest = &murmur_artifact::sha256_hex(key.as_bytes())[..PROMPT_CACHE_KEY_DIGEST_HEX_LEN];
+    format!("{head}{PROMPT_CACHE_KEY_DIGEST_SEPARATOR}{digest}")
+}
+
+/// Longest prefix of `text` that is at most `max_bytes` long and ends on a character boundary.
+/// `version` is manifest text that no validation restricts to ASCII, so a raw byte slice of a
+/// key built from it can land mid-character and panic.
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Reserved `tool-result.metadata` key by which a tool declares how a call affected the
@@ -3050,6 +3091,107 @@ forgery: {prompt}"
             after_drop["prompt_cache_key"],
             json!("my-capsule:1.0.0:ctx-7")
         );
+    }
+
+    /// A realistic capsule name plus a minted `ctx_<32 hex>` runs past
+    /// [`PROMPT_CACHE_KEY_MAX_LEN`]: the shape a provider answers with a 400 when the key
+    /// reaches it unbounded.
+    const LONG_NAME: &str = "security-review-and-triage-capsule";
+    const REAL_CTX: &str = "ctx_0192f3c4d5e6789abcdef0123456789a";
+
+    #[test]
+    fn prompt_cache_key_is_bounded_for_an_over_long_capsule_name() {
+        let key = build_prompt_cache_key(LONG_NAME, "1.0.0", Some(REAL_CTX));
+
+        assert!(
+            format!("{LONG_NAME}:1.0.0:{REAL_CTX}").len() > PROMPT_CACHE_KEY_MAX_LEN,
+            "the input must exceed the limit, or the test proves nothing"
+        );
+        assert!(
+            key.len() <= PROMPT_CACHE_KEY_MAX_LEN,
+            "emitted key is {} bytes: {key}",
+            key.len()
+        );
+        assert!(
+            key.chars().count() <= PROMPT_CACHE_KEY_MAX_LEN,
+            "emitted key is {} characters: {key}",
+            key.chars().count()
+        );
+    }
+
+    /// Nothing outside `(name, version, context_id)` reaches the emitted value, so every turn of
+    /// one task — before and after a compaction, before and after the held continuation id is
+    /// dropped — carries byte-identical bytes.
+    #[test]
+    fn prompt_cache_key_is_constant_across_continuation_state_when_bounded() {
+        let key = build_prompt_cache_key(LONG_NAME, "1.0.0", Some(REAL_CTX));
+        assert_eq!(
+            key,
+            build_prompt_cache_key(LONG_NAME, "1.0.0", Some(REAL_CTX)),
+            "the bounded key must be a pure function of its inputs"
+        );
+
+        let msgs = sample_messages();
+        let with_continuation =
+            build_driver_payload("m", 8192, &msgs, &[], "sys", Some(("c", 1)), Some(&key));
+        let after_drop = build_driver_payload("m", 8192, &msgs, &[], "sys", None, Some(&key));
+
+        assert_eq!(
+            with_continuation["prompt_cache_key"],
+            after_drop["prompt_cache_key"]
+        );
+        assert_eq!(after_drop["prompt_cache_key"], json!(key));
+    }
+
+    /// The context id is the only part that distinguishes two launches of one capsule, and in a
+    /// uuid-v7 it is the tail that differs. Plain tail truncation would collapse these two onto
+    /// one key.
+    #[test]
+    fn prompt_cache_key_still_separates_two_launches_of_one_capsule() {
+        let first = "ctx_0192f3c4d5e6789abcdef0123456789a";
+        let second = "ctx_0192f3c4d5e6789abcdef0123456789b";
+        assert_eq!(
+            first[..first.len() - 1],
+            second[..second.len() - 1],
+            "the ids must differ only at the very end, or the test proves nothing"
+        );
+
+        assert_ne!(
+            build_prompt_cache_key(LONG_NAME, "1.0.0", Some(first)),
+            build_prompt_cache_key(LONG_NAME, "1.0.0", Some(second))
+        );
+    }
+
+    /// A key read out of a payload dump has to be traceable back to the capsule that produced
+    /// it, so the name stays at the front and only what does not fit becomes digest.
+    #[test]
+    fn prompt_cache_key_keeps_the_capsule_name_readable() {
+        let key = build_prompt_cache_key(LONG_NAME, "1.0.0", Some(REAL_CTX));
+        assert!(key.starts_with(LONG_NAME), "got: {key}");
+
+        // A name past the readable budget keeps its own leading characters, and the emitted
+        // length does not grow with it: the digest suffix is fixed width.
+        let longer = "a".repeat(100);
+        let from_longer = build_prompt_cache_key(&longer, "1.0.0", Some(REAL_CTX));
+        assert!(from_longer.starts_with(&longer[..40]), "got: {from_longer}");
+        assert_eq!(from_longer.len(), key.len());
+    }
+
+    /// A version is manifest text that no validation restricts to ASCII, so the cut has to land
+    /// on a character boundary rather than a byte index.
+    #[test]
+    fn prompt_cache_key_truncates_on_a_character_boundary() {
+        let key = build_prompt_cache_key("capsule", &"é".repeat(60), Some(REAL_CTX));
+        assert!(key.len() <= PROMPT_CACHE_KEY_MAX_LEN, "got: {key}");
+        assert!(key.starts_with("capsule:é"), "got: {key}");
+    }
+
+    /// The `None` arm is bounded on the same terms: no context id does not mean no limit.
+    #[test]
+    fn prompt_cache_key_without_a_context_id_is_bounded_too() {
+        let key = build_prompt_cache_key(&"n".repeat(100), "1.0.0", None);
+        assert!(key.len() <= PROMPT_CACHE_KEY_MAX_LEN, "got: {key}");
+        assert!(key.starts_with(&"n".repeat(47)), "got: {key}");
     }
 
     // ── Continuation metadata extraction (Scenario 8: malformed/duplicate handling) ──
