@@ -115,6 +115,17 @@ fn tool_result_with_path(data: Option<String>, data_path: &str) -> ToolResult {
     }
 }
 
+/// The tool a case hands a plan that dispatches none — a `capsule` or `shell` step, or a `tool`
+/// step whose dispatch is refused before it runs. Reaching it means the plan dispatched a tool
+/// step the case did not expect.
+fn unused_tool(_name: &str, _input: ToolInput) -> Result<ToolResult, String> {
+    Ok(tool_result(
+        ToolStatus::Passed,
+        Some("unused".to_string()),
+        None,
+    ))
+}
+
 fn write_plan(workdir: &Path, plan: Value) -> PathBuf {
     let path = workdir.join("plan.json");
     fs::write(&path, serde_json::to_string(&plan).unwrap()).unwrap();
@@ -208,13 +219,7 @@ fn test_shell_step_executes() {
         return;
     }
     let dir = tempdir().unwrap();
-    let invoke = move |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({"id":"p","steps":[{"id":"sh","shell":"bash -c 'printf shell-ok'"}]}),
@@ -230,13 +235,7 @@ fn test_shell_step_executes() {
 #[ignore = "requires a running mur-roost and published worker capsule fixture"]
 fn test_capsule_step_spawns_and_reads_result() {
     let dir = tempdir().unwrap();
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":"hello"}]}),
@@ -264,13 +263,7 @@ fn test_capsule_step_sends_objective_as_plain_text() {
     let fake_roost = FakeRoost::start();
     let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({
@@ -309,13 +302,7 @@ fn test_capsule_step_sends_a_bare_string_as_plain_text() {
     let fake_roost = FakeRoost::start();
     let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({
@@ -675,13 +662,7 @@ fn test_capsule_step_asks_permission_then_launches_the_child_itself() {
     let fake_roost = FakeRoost::start();
     let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
@@ -760,13 +741,7 @@ fn test_capsule_step_without_a_credential_asks_for_nothing() {
     let fake_roost = FakeRoost::start();
     let _stub = StubMur::install(fake_roost.authority());
     std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-    let invoke = |_name: &str, _input: ToolInput| {
-        Ok(tool_result(
-            ToolStatus::Passed,
-            Some("unused".to_string()),
-            None,
-        ))
-    };
+    let invoke = unused_tool;
     let plan = write_plan(
         dir.path(),
         json!({"id":"p","steps":[{"id":"worker","capsule":"worker","input":{"objective":"go"}}]}),
@@ -816,13 +791,7 @@ fn test_the_spawn_credential_reaches_no_file_and_no_step_result() {
         };
         let _stub = StubMur::install(fake_roost.authority());
         std::env::set_var("MURMUR_ROOST_URL", &fake_roost.url);
-        let invoke = |_name: &str, _input: ToolInput| {
-            Ok(tool_result(
-                ToolStatus::Passed,
-                Some("unused".to_string()),
-                None,
-            ))
-        };
+        let invoke = unused_tool;
         let plan = write_plan(
             dir.path(),
             json!({
@@ -1904,15 +1873,6 @@ fn traced_capsule_ctx<'a>(
     let mut context = ctx(workdir, invoke_tool);
     context.trace = Some(appender);
     context
-}
-
-/// A tool that no case in this section runs, because a `capsule` step dispatches no tool.
-fn unused_tool(_name: &str, _input: ToolInput) -> Result<ToolResult, String> {
-    Ok(tool_result(
-        ToolStatus::Passed,
-        Some("unused".to_string()),
-        None,
-    ))
 }
 
 /// Every `delegation_start`, paired with the `delegation` line carrying the same id and the

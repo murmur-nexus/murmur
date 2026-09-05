@@ -166,13 +166,10 @@ A plan run writes `plan_start`, one `plan_step_start` and one `plan_step` per di
 `plan_end` to [`trace.jsonl`](observability-schemas.md), under the session that ran it. `mur trace
 steps` renders them as rows and `mur trace show` gives them their own section.
 
-A `capsule` step writes a second pair of records for the child it launches — `delegation_start`
-when the child comes up and `delegation` when the delegation ends — and `mur trace show` lists
-them under Delegations. The two pairs describe different things and are not duplicates: the
-plan-step pair covers the scheduler's unit of work, including any retried attempts, and the
-delegation pair covers one child launch. A step that retries writes one delegation pair per
-attempt. Both records are described in
-[Session trace schema](observability-schemas.md#session-trace-tracejsonl).
+A `capsule` step also writes `delegation_start` when its child comes up and `delegation` when the
+delegation ends, and `mur trace show` lists those under Delegations. Both records, and how they
+line up against the step's own `plan_step` line, are described in the
+[session trace schema](observability-schemas.md#session-trace-tracejsonl).
 
 The child is launched knowing which session and conversation started it, so its own
 `session_start` carries `spawned_by` and `delegation_id`. Joining a parent to its children is
