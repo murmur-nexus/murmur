@@ -190,7 +190,7 @@ pub fn extract_declared_env_allow(
     artifact_version: &str,
     manifest_yaml: &str,
 ) -> Result<Vec<String>, RuntimeError> {
-    let declared: DeclaredEnvAllow =
+    let declared: DeclaredAllows =
         serde_yaml::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
             name: artifact_name.to_string(),
             version: artifact_version.to_string(),
@@ -205,10 +205,40 @@ pub fn extract_declared_env_allow(
         .unwrap_or_default())
 }
 
-/// The one key [`extract_declared_env_allow`] reads. Every other manifest key deserializes into
-/// nothing here, so a child declaring anything at all is still readable.
+/// The `capabilities.spawn.allow` a packed manifest declares, read on its own.
+///
+/// The sibling of [`extract_declared_env_allow`], and narrow for the same reason: walking a
+/// formation's delegation graph means reading which capsules a child may in turn spawn, and a
+/// whole-manifest parse would demand that child's own `${VAR}` references be resolvable first.
+///
+/// A manifest with no `capabilities:` block, or none under `spawn:`, declares nothing and yields
+/// an empty list. Malformed YAML, or a `spawn.allow` that is not a list of strings, is an error
+/// naming the artifact and version.
+pub fn extract_declared_spawn_allow(
+    artifact_name: &str,
+    artifact_version: &str,
+    manifest_yaml: &str,
+) -> Result<Vec<String>, RuntimeError> {
+    let declared: DeclaredAllows =
+        serde_yaml::from_str(manifest_yaml).map_err(|err| RuntimeError::ArtifactArchive {
+            name: artifact_name.to_string(),
+            version: artifact_version.to_string(),
+            message: format!(
+                "cannot read capabilities.spawn.allow from {PACKED_MANIFEST_ENTRY}: {err}"
+            ),
+        })?;
+    Ok(declared
+        .capabilities
+        .and_then(|capabilities| capabilities.spawn)
+        .map(|spawn| spawn.allow)
+        .unwrap_or_default())
+}
+
+/// The only keys [`extract_declared_env_allow`] and [`extract_declared_spawn_allow`] read. Every
+/// other manifest key deserializes into nothing here, so a child declaring anything at all is
+/// still readable.
 #[derive(serde::Deserialize)]
-struct DeclaredEnvAllow {
+struct DeclaredAllows {
     #[serde(default)]
     capabilities: Option<DeclaredCapabilities>,
 }
@@ -216,11 +246,13 @@ struct DeclaredEnvAllow {
 #[derive(serde::Deserialize)]
 struct DeclaredCapabilities {
     #[serde(default)]
-    env: Option<DeclaredEnv>,
+    env: Option<DeclaredAllowList>,
+    #[serde(default)]
+    spawn: Option<DeclaredAllowList>,
 }
 
 #[derive(serde::Deserialize)]
-struct DeclaredEnv {
+struct DeclaredAllowList {
     #[serde(default)]
     allow: Vec<String>,
 }
@@ -329,6 +361,58 @@ mod tests {
                     assert_eq!(name, "worker");
                     assert_eq!(version, "0.1.0");
                     assert!(message.contains("capabilities.env.allow"), "{message}");
+                }
+                other => panic!("expected ArtifactArchive error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reads_the_declared_spawn_allow_out_of_a_manifest() {
+        let manifest = "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    \
+                        allow: [OPENAI_API_KEY]\n  spawn:\n    allow: [deep-worker, sibling]\n";
+
+        assert_eq!(
+            extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["deep-worker".to_string(), "sibling".to_string()]
+        );
+        assert_eq!(
+            extract_declared_env_allow("worker", "0.1.0", manifest).unwrap(),
+            vec!["OPENAI_API_KEY".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_manifest_declaring_no_spawn_allow_declares_nothing() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A_KEY]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: []\n",
+        ] {
+            assert_eq!(
+                extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap(),
+                Vec::<String>::new(),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_spawn_allow_is_an_error_naming_the_artifact() {
+        for manifest in [
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: deep-worker\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n  spawn:\n    allow: [[deep]]\n",
+            "name: worker\nversion: 0.1.0\ncapabilities:\n\tspawn: broken\n",
+        ] {
+            match extract_declared_spawn_allow("worker", "0.1.0", manifest).unwrap_err() {
+                RuntimeError::ArtifactArchive {
+                    name,
+                    version,
+                    message,
+                } => {
+                    assert_eq!(name, "worker");
+                    assert_eq!(version, "0.1.0");
+                    assert!(message.contains("capabilities.spawn.allow"), "{message}");
                 }
                 other => panic!("expected ArtifactArchive error, got {other:?}"),
             }

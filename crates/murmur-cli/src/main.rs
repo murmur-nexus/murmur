@@ -2,6 +2,7 @@ mod beta;
 mod commands;
 mod config;
 mod error;
+mod formation;
 mod registry_client;
 mod session_address;
 mod source;

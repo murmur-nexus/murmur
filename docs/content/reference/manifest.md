@@ -569,6 +569,17 @@ way to expose a host variable, and even a name declared there is dropped if it i
 for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
 is omitted rather than reported.
 
+The field governs WASM guests and capsules delegated to through
+[`capabilities.spawn.allow`](#field-capabilities) — never the capsule process itself, which is
+started by the operator's own shell and inherits that shell wholesale. So a root capsule needs no
+`env.allow` entry for a variable only its own process reads; the field is about what the capsule
+hands onward.
+
+The runtime omits an unset name at launch rather than refusing it, so a run reaches the delegation
+before an absent variable shows itself. [`mur doctor`](cli.md#mur-doctor) reports the whole
+`spawn.allow` closure's requirement ahead of a run, marking every declared name set or unset — by
+name only, never by value.
+
 #### `capabilities.plan` { #field-plan }
 
 Grants the capsule's agent one [runtime-provided tool](runtime-provided-tools.md), `submit-plan`,
