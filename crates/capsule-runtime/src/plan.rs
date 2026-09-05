@@ -96,6 +96,13 @@ pub struct SchedulerContext<'a> {
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
     pub current_session_id: Option<String>,
+    /// The conversation the task that started this plan is running in, named on the
+    /// `MURMUR_SPAWNER` handle every `capsule` step injects into its child.
+    ///
+    /// Nothing is minted here. `None` names no conversation and injects no handle at all, which
+    /// is the existing behaviour for a caller that has none, and not an error: a child told it
+    /// was spawned from a conversation that does not exist is worse than one told nothing.
+    pub current_context_id: Option<String>,
     /// Where a `capsule` step reads a sub-capsule's manifest from, to learn which host variables
     /// that sub-capsule declares. The session's own store, so a step resolves the artifact its
     /// child will run.
@@ -107,10 +114,16 @@ pub struct SchedulerContext<'a> {
     /// exactly twice — into the two request headers below — so nothing that formats this context,
     /// a step result or a trace record can carry it.
     pub spawn_credential: Option<SpawnCredential>,
-    /// Where this run's per-step lifecycle records go, or `None` to record nothing.
+    /// Where this run's per-step lifecycle records and its `capsule` steps' delegation records
+    /// go, or `None` to record nothing.
     ///
     /// Emission is opt-in at the call site: with `None` no file is opened and no line is
     /// written, and the run's `ExecutionReport` is identical either way.
+    ///
+    /// A `capsule` step writes into it twice over, and the two pairs describe different things:
+    /// the plan-step pair is the scheduler's unit of work — its dependencies, its attempts, its
+    /// status after `on_error` — and the delegation pair is one child launch, named by its `dlg_`
+    /// id. A retried step is one plan step and several delegations.
     pub trace: Option<&'a PlanTraceAppender>,
     /// The session's own pre-dispatch decision point, asked about every `tool` and `shell` step
     /// before it runs. `Some(reason)` fails that step with `reason` as its error and dispatches
@@ -1036,9 +1049,21 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
         std::sync::Arc::clone(&ctx.registry),
         ctx.capability_policy.env_allow.clone(),
     );
-    // A plan step holds no conversation id and no trace appender, so its child is launched
-    // without a handle and the step writes no delegation records — the same as before lineage
-    // existed. The agent-facing `delegate-task` tool is where both are recorded.
+    // The launch notice is written where it arrives, on this thread, while the child is still
+    // holding its task: `delegate` blocks until the child answers, so a notice parked for later
+    // would only reach disk once there was already a terminal line to write beside it.
+    let launched = ctx.trace.map(|trace| {
+        std::sync::Arc::new(move |notice: crate::delegation_plane::DelegationLaunch| {
+            trace.write_delegation_start(
+                &notice.delegation_id,
+                &notice.capsule,
+                &notice.version,
+                &notice.child_session_id,
+                &notice.child_workdir,
+            );
+        }) as std::sync::Arc<dyn Fn(_) + Send + Sync>
+    });
+    let started = Instant::now();
     let result = plane.delegate(
         &DelegationRequest {
             capsule: capsule.to_string(),
@@ -1051,8 +1076,31 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
                 .unwrap_or_else(|| "0.1.0".to_string()),
             task,
         },
-        &DelegationOrigin::default(),
+        &DelegationOrigin {
+            context_id: ctx.current_context_id.clone().unwrap_or_default(),
+            launched,
+            // `delegate` waits on the connection it holds, so nothing this delegation does posts
+            // a completion and there is no trust for one to inherit.
+            trust: None,
+        },
     );
+
+    if let Some(trace) = ctx.trace {
+        trace.write_delegation(
+            &result.capsule,
+            &result.version,
+            // Empty rather than absent is how a result names no child; the record says `null`,
+            // so nothing reading it can join against an id that was never minted.
+            Some(result.delegation_id.clone()).filter(|id| !id.is_empty()),
+            Some(result.session_id.clone()).filter(|id| !id.is_empty()),
+            elapsed_ms(started),
+            result.status.as_str(),
+            match result.status {
+                DelegationStatus::Completed => None,
+                _ => Some(result.output.clone()),
+            },
+        );
+    }
 
     match result.status {
         DelegationStatus::Completed => StepResult {
@@ -1288,6 +1336,7 @@ mod tests {
             ]),
             capsule_versions: HashMap::new(),
             current_session_id: None,
+            current_context_id: None,
             // Nothing in these cases delegates, so no artifact is ever resolved through it.
             registry: std::sync::Arc::new(murmur_artifact::LocalRegistry::new(
                 tempdir().unwrap().keep(),

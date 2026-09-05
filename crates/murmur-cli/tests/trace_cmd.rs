@@ -3769,6 +3769,35 @@ fn diff_omitted_args_print_the_same_bytes_as_at2_at1() {
     );
 }
 
+/// The three delegation records a plan's fan-out actually wrote, lifted out of the `trace.jsonl`
+/// `capsule-runtime`'s `test_three_concurrent_capsule_steps_record_three_delegations` produced
+/// rather than composed here — the point being that the renderer needs no knowledge that a plan
+/// wrote them.
+///
+/// Wrapped in a `session_start` and a `session_end`, which `mur trace show` requires and a plan
+/// run's own file does not carry: a plan writes into a live session's trace, and this fixture is
+/// that session reduced to its delegations.
+const FIXTURE_PLAN_DELEGATIONS: &str = concat!(
+    "{\"event_type\":\"session_start\",\"event_id\":\"evt_00000000000000000000000000session\",\"parent_id\":null,",
+    "\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541831800,",
+    "\"capsule_name\":\"planner\",\"capsule_version\":\"0.1.0\",\"model\":\"claude-haiku\",",
+    "\"max_turns\":10,\"capabilities\":[],\"tools_declared\":[]}\n",
+
+    "{\"event_type\":\"delegation_start\",\"event_id\":\"evt_01a06d668ab77801873b1cf409edcb54\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541831863,\"delegation_id\":\"dlg_01a06d668ab3736284dc61b015010293\",\"capsule\":\"worker\",\"version\":\"0.1.0\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"child_workdir\":\".murmur/children/worker-355b346856304f79\"}\n",
+    "{\"event_type\":\"delegation_start\",\"event_id\":\"evt_01a06d668ab77801873b1ce1929c74a6\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541831863,\"delegation_id\":\"dlg_01a06d668ab3736284dc619c339bfe5f\",\"capsule\":\"worker\",\"version\":\"0.1.0\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"child_workdir\":\".murmur/children/worker-6e935cec601146b7\"}\n",
+    "{\"event_type\":\"delegation_start\",\"event_id\":\"evt_01a06d668ab77801873b1d02944df8a6\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541831863,\"delegation_id\":\"dlg_01a06d668ab3736284dc61a775258dcb\",\"capsule\":\"worker\",\"version\":\"0.1.0\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"child_workdir\":\".murmur/children/worker-a4ce26673a685ee1\"}\n",
+
+    "{\"event_type\":\"delegation\",\"event_id\":\"evt_01a06d668cad76939bc2b10ee646ecc9\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541832365,\"capsule\":\"worker\",\"version\":\"0.1.0\",\"delegation_id\":\"dlg_01a06d668ab3736284dc619c339bfe5f\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"duration_ms\":509,\"outcome\":\"completed\",\"reason\":null}\n",
+    "{\"event_type\":\"delegation\",\"event_id\":\"evt_01a06d668cad76939bc2b1188d68a2cb\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541832365,\"capsule\":\"worker\",\"version\":\"0.1.0\",\"delegation_id\":\"dlg_01a06d668ab3736284dc61b015010293\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"duration_ms\":509,\"outcome\":\"completed\",\"reason\":null}\n",
+    "{\"event_type\":\"delegation\",\"event_id\":\"evt_01a06d668cad76939bc2b120ad219bc7\",\"parent_id\":\"evt_00000000000000000000000000session\",\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541832365,\"capsule\":\"worker\",\"version\":\"0.1.0\",\"delegation_id\":\"dlg_01a06d668ab3736284dc61a775258dcb\",\"child_session_id\":\"ses_stub00000000000000000000000\",\"duration_ms\":509,\"outcome\":\"completed\",\"reason\":null}\n",
+
+    "{\"event_type\":\"session_end\",\"event_id\":\"evt_00000000000000000000000000000end\",",
+    "\"parent_id\":\"evt_00000000000000000000000000session\",",
+    "\"session_id\":\"ses_00000000000000000000000000000test\",\"timestamp\":1788541832400,",
+    "\"total_turns\":1,\"total_input_tokens\":100,\"total_output_tokens\":20,",
+    "\"total_tool_calls\":1,\"total_shell_calls\":0,\"duration_ms\":600,\"exit_status\":\"ok\"}\n"
+);
+
 /// A parent's Delegations section lists every delegation it made, however each one ended: the
 /// `dlg_` id, the capsule, the child session, the outcome, and the reason on everything that is
 /// not `completed`.
@@ -3795,6 +3824,51 @@ fn show_lists_every_delegation_a_parent_made() {
         .stdout(predicate::str::contains(
             "dlg_aaaa0002  mute-worker@0.1.0  ses_33333333333343338333000000000009  in flight",
         ));
+}
+
+/// A plan's fan-out lists like any other delegation, because it is one: the renderer is told
+/// nothing about which surface launched a child, and there is nothing on the records to tell it.
+#[test]
+fn show_lists_the_delegations_a_plans_capsule_steps_made() {
+    let tmp = TempDir::new().unwrap();
+    let path = write_fixture(
+        tmp.path(),
+        "plan-delegations.jsonl",
+        FIXTURE_PLAN_DELEGATIONS,
+    );
+
+    let assert = mur()
+        .args(["trace", "show", path.to_str().unwrap()])
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    assert_eq!(out.matches("Delegations").count(), 1, "{out}");
+    for (id, workdir) in [
+        (
+            "dlg_01a06d668ab3736284dc61b015010293",
+            ".murmur/children/worker-355b346856304f79",
+        ),
+        (
+            "dlg_01a06d668ab3736284dc619c339bfe5f",
+            ".murmur/children/worker-6e935cec601146b7",
+        ),
+        (
+            "dlg_01a06d668ab3736284dc61a775258dcb",
+            ".murmur/children/worker-a4ce26673a685ee1",
+        ),
+    ] {
+        let row = format!("{id}  worker@0.1.0  ses_stub00000000000000000000000  completed");
+        let at = out
+            .find(&row)
+            .unwrap_or_else(|| panic!("no row for {id}:\n{out}"));
+        assert!(
+            out[at..].contains(&format!(
+                "child trace: {workdir}/.murmur/ses_stub00000000000000000000000/trace.jsonl"
+            )),
+            "no child trace line under {id}:\n{out}"
+        );
+    }
 }
 
 /// A capsule that delegated to nobody grows no section, so its output is what it always was.

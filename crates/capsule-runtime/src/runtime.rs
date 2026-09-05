@@ -4733,11 +4733,15 @@ impl CapsuleStoreState {
         // The launch notice leaves the blocking call on a channel whose `send` is synchronous, so
         // the parent's `delegation_start` reaches disk while the launch is still finishing rather
         // than after it returns — which is the whole point of the record, for a child that is
-        // about to be handed a task and may then hang or crash.
+        // about to be handed a task and may then hang or crash. This side of the plane's callback
+        // is a channel because the write is `async`: the notice has to cross back to the task
+        // loop below to be written at all.
         let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
         let origin = crate::delegation_plane::DelegationOrigin {
             context_id: self.current_context_id.clone().unwrap_or_default(),
-            launched: Some(launch_tx),
+            launched: Some(Arc::new(move |notice| {
+                let _ = launch_tx.send(notice);
+            })),
             // The completion this delegation posts inherits the delegating task's class, the same
             // derivation a demoted shell command's completion uses. `None` — the script-capsule
             // path — is read as untrusted by the plane.
@@ -4903,6 +4907,9 @@ impl CapsuleStoreState {
         let capability_policy = self.capability_policy.clone();
         let scheduler_workdir = self.accessible_workdir.clone();
         let session_id = self.session_id.clone();
+        // The conversation this plan was submitted from, named on the `MURMUR_SPAWNER` handle
+        // every `capsule` step injects into its child — the same value `delegate-task` names.
+        let current_context_id = self.current_context_id.clone();
         // Cloned off the plane rather than held a second time on this state: one registration's
         // authority stays in one place.
         let spawn_credential = self.delegation.as_ref().map(|plane| plane.credential());
@@ -4948,6 +4955,7 @@ impl CapsuleStoreState {
                 // session holds none for any of them.
                 capsule_versions: HashMap::new(),
                 current_session_id: Some(session_id),
+                current_context_id,
                 registry,
                 spawn_credential,
                 trace: plan_trace.as_deref(),

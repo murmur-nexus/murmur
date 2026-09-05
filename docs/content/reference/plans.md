@@ -165,3 +165,12 @@ submitted. See [Platform behavior](resource-limits.md#platform-behavior).
 A plan run writes `plan_start`, one `plan_step_start` and one `plan_step` per dispatched step, and
 `plan_end` to [`trace.jsonl`](observability-schemas.md), under the session that ran it. `mur trace
 steps` renders them as rows and `mur trace show` gives them their own section.
+
+A `capsule` step also writes `delegation_start` when its child comes up and `delegation` when the
+delegation ends, and `mur trace show` lists those under Delegations. Both records, and how they
+line up against the step's own `plan_step` line, are described in the
+[session trace schema](observability-schemas.md#session-trace-tracejsonl).
+
+The child is launched knowing which session and conversation started it, so its own
+`session_start` carries `spawned_by` and `delegation_id`. Joining a parent to its children is
+described under [Reading a formation](observability-schemas.md#delegation-lineage).
