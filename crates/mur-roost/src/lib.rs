@@ -33,7 +33,7 @@ use murmur_artifact::{current_platform, LocalRegistry, Registry};
 use serde::{Deserialize, Serialize};
 
 use crate::authority::{now_ms, AuthorityError, SpawnAuthority, SPAWN_APPROVAL_TTL_SECS};
-use crate::bounds::{live_children, BoundRefusal};
+use crate::bounds::{live_capsules, live_children, BoundRefusal};
 
 // ── Job store ─────────────────────────────────────────────────────────────────
 
@@ -99,6 +99,12 @@ pub struct State {
     /// Children one session may hold live at once, from `--max-concurrent`. `0` refuses every
     /// delegation.
     pub max_concurrent: u32,
+    /// Capsules this daemon may hold live on the host at once across every formation, from
+    /// `--max-live-capsules`. `0` refuses every delegation.
+    ///
+    /// One daemon's ceiling: two `mur-roost` processes on one host each enforce their own and
+    /// together exceed it, because nothing coordinates across processes.
+    pub max_live_capsules: u32,
     /// Mints and verifies every credential and approval this daemon issues. Generated once in
     /// `main` and dropped when the process exits, so a token from a previous daemon verifies
     /// against nothing.
@@ -165,6 +171,10 @@ struct StatusResponse {
     /// Children this session holds right now, counting one it has been approved to launch and has
     /// not launched yet.
     live_children: u32,
+    /// Capsules this daemon holds live across every formation at the moment of the read, against
+    /// `--max-live-capsules`. Unrelated to this session, and the same figure every session's
+    /// status reports.
+    live_capsules: u32,
 }
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -371,7 +381,7 @@ fn resolve_capsule(
 ///
 /// The two questions this answers — is the credential one of ours, and is the session it names
 /// running — collapse into one outcome on purpose: a caller learns nothing about which sessions
-/// exist. Both delegation bounds are decided from the record this returns, so a session that
+/// exist. The per-session bounds are decided from the record this returns, so a session that
 /// cannot be found is refused rather than judged against a default.
 fn session_record(state: &Arc<State>, session_id: &str) -> Result<JobRecord, String> {
     let jobs = state.jobs.lock().unwrap();
@@ -404,7 +414,8 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
         return identity_refused();
     };
     // Selected by the session id the credential names, never by one the body claims: the figures
-    // both bounds are decided from are this daemon's record of the asking session.
+    // the depth and concurrency bounds are decided from are this daemon's record of the asking
+    // session.
     let parent = match session_record(state, &session_id) {
         Ok(record) => record,
         Err(response) => return response,
@@ -426,14 +437,32 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
         );
     }
 
-    // The operator's two bounds, ahead of the registry: a spawn refused for depth or concurrency
-    // resolves no artifact and reads no manifest.
+    // The operator's three bounds, ahead of the registry: a spawn refused for depth, for the
+    // machine ceiling or for concurrency resolves no artifact and reads no manifest.
+    //
+    // Depth is asked first because it is permanent for the asking session: no amount of waiting
+    // gives a session at `0` another level, so answering it with *come back later* would be false.
     if parent.depth_remaining == 0 {
         return err(
             403,
             "Forbidden",
             &BoundRefusal::DepthExhausted {
                 max_depth: state.max_depth,
+            }
+            .to_string(),
+        );
+    }
+    // The machine ceiling ahead of the per-parent one: when both apply the caller hears the more
+    // fundamental restriction, the only one of the three whose answer does not depend on who is
+    // asking, and the only one where waiting helps and narrowing the formation does not.
+    let live = live_capsules(&state.jobs.lock().unwrap(), now_ms());
+    if live >= state.max_live_capsules {
+        return err(
+            403,
+            "Forbidden",
+            &BoundRefusal::MachineCeilingReached {
+                max_live_capsules: state.max_live_capsules,
+                live,
             }
             .to_string(),
         );
@@ -487,12 +516,25 @@ fn handle_spawn(headers: &RequestHeaders, body: &str, state: &Arc<State>) -> Str
     // The slot is taken at approval, not at the child's registration — see
     // [`bounds::live_children`].
     //
-    // The count is taken again here, under the same lock hold that records the reservation. The
-    // check above is the one an ordinary refusal comes from, but it releases the lock before the
-    // registry is read, so two requests from one session can both pass it; only a count and a push
-    // that cannot be interleaved keep a parent from taking every slot at once.
+    // Both counts are taken again here, under the same lock hold that records the reservation. The
+    // checks above are the ones an ordinary refusal comes from, but they release the lock before
+    // the registry is read, so two requests can both pass them; only a count and a push that
+    // cannot be interleaved keep one parent from taking every child slot, or several unrelated
+    // sessions from crossing the machine ceiling together.
     {
         let mut jobs = state.jobs.lock().unwrap();
+        let live = live_capsules(&jobs, now_ms());
+        if live >= state.max_live_capsules {
+            return err(
+                403,
+                "Forbidden",
+                &BoundRefusal::MachineCeilingReached {
+                    max_live_capsules: state.max_live_capsules,
+                    live,
+                }
+                .to_string(),
+            );
+        }
         let live = live_children(&jobs, &session_id, now_ms());
         if live >= state.max_concurrent {
             return err(
@@ -735,10 +777,14 @@ fn handle_status(session_id: &str, state: &Arc<State>) -> String {
                 JobStatus::Complete => "complete",
                 JobStatus::Failed => "failed",
             };
+            // One clock for both censuses, so a status read cannot report a child slot released
+            // by an expiry that the machine census had not yet reached.
+            let now = now_ms();
             ok_json(&StatusResponse {
                 status,
                 depth_remaining: job.depth_remaining,
-                live_children: live_children(&jobs, session_id, now_ms()),
+                live_children: live_children(&jobs, session_id, now),
+                live_capsules: live_capsules(&jobs, now),
             })
         }
         None => err(404, "Not Found", "session not found"),

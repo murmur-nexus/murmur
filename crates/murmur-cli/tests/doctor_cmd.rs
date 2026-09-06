@@ -59,6 +59,7 @@ fn start_roost() -> (String, TempDir) {
         spawn_allow: vec!["doctor-fixture".to_string()],
         max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
         max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
+        max_live_capsules: mur_roost::bounds::default_max_live_capsules(),
         authority: Arc::new(mur_roost::authority::SpawnAuthority::generate().unwrap()),
     });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

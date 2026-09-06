@@ -41,14 +41,29 @@ mur-roost --port 7700 --spawn-allow orchestrator --spawn-allow worker-a
 | `--spawn-allow` | *(empty)* | One capsule name that may register without an approval. Repeat the flag per name; `--spawn-allow=NAME` is also accepted |
 | `--max-depth` | `3` | Levels of delegation allowed below a top-level capsule — see [Delegation bounds](#delegation-bounds) |
 | `--max-concurrent` | `4` | Children one session may hold live at once |
+| `--max-live-capsules` | Derived from the host's core count | Capsules this daemon may hold live at once across every formation — see [The machine ceiling](#the-machine-ceiling) |
 | `--version` | — | Print the daemon's version and exit without binding a port |
 
 `--spawn-allow` takes a single name per occurrence, not a comma-separated list. It gates the
 top-level path only — the registrations that present no approval. Started with no `--spawn-allow`
 at all, the daemon admits only capsules launched under an approval it granted.
 
-`--max-depth` and `--max-concurrent` each take a whole number, and neither has a value meaning
-unlimited: `0` refuses every delegation.
+`--max-depth`, `--max-concurrent` and `--max-live-capsules` each take a whole number, and none has
+a value meaning unlimited: `0` refuses every delegation.
+
+The default for `--max-live-capsules` is derived at startup: the daemon multiplies the host's core
+count by 8 and clamps the result to between 16 and 256, so a laptop and a build VM run under
+different numbers. It prints the figure it arrived at:
+
+```
+mur-roost: listening on 127.0.0.1:7700
+mur-roost: machine ceiling 64 live capsules (--max-live-capsules)
+```
+
+!!! note "One daemon per host"
+    The ceiling is one daemon's. Two `mur-roost` processes on one host each enforce their own and
+    together exceed it, because roost coordinates nothing across processes and holds no state
+    outside its own memory. Run one daemon per host.
 
 Any other flag is rejected and the daemon exits. There is no `--max-total` — see
 [No total cap](#no-total-cap).
@@ -124,6 +139,7 @@ The response carries no `capsule_url` and no `session_id`, because nothing was s
 | `403 Forbidden` | The credential is absent or not valid, or names a session that is not running — see [Refusals](#refusals) |
 | `403 Forbidden` | `name` is not in the calling session's allow list |
 | `403 Forbidden` | The calling session has no delegation depth left — see [Delegation bounds](#delegation-bounds) |
+| `403 Forbidden` | This daemon already holds `--max-live-capsules` live capsules across every formation — see [The machine ceiling](#the-machine-ceiling) |
 | `403 Forbidden` | The calling session already holds `--max-concurrent` live children |
 | `403 Forbidden` | The capsule's manifest declares more capability than the calling session holds — see [Spawn envelope](#spawn-envelope) |
 | `500 Internal Server Error` | The capsule could not be resolved from the registry |
@@ -250,7 +266,8 @@ Poll a registered session.
 {
   "status":          "running",
   "depth_remaining": 2,
-  "live_children":   1
+  "live_children":   1,
+  "live_capsules":   7
 }
 ```
 
@@ -259,6 +276,7 @@ Poll a registered session.
 | `status` | string | `running` — registered and not yet retired; `complete` or `failed` — the session deregistered reporting that outcome |
 | `depth_remaining` | number | Levels of delegation still available below this session, against `--max-depth` |
 | `live_children` | number | Children this session holds right now, counting one it has been approved to launch and has not launched yet |
+| `live_capsules` | number | Capsules this daemon holds live across every formation at the moment of the read, against `--max-live-capsules`. The same figure whichever session is polled |
 
 **Error — `404 Not Found`**
 
@@ -408,9 +426,10 @@ refused: a capsule that delegates and deliberately does not wait is legitimate.
 The child-watch bound is the delegating capsule's own runtime's clock. No request is made to the
 daemon to decide or enforce it, so no daemon has to be reachable for it to fire.
 
-How deep a chain of delegations may go and how many a capsule may have running at once are the
-daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon
-refuses comes back as a failed tool call carrying the refusal.
+How deep a chain of delegations may go, how many a capsule may have running at once, and how many
+capsules the host carries are the daemon's, not this tool's — see
+[Delegation bounds](#delegation-bounds). A delegation the daemon refuses comes back as a failed
+tool call carrying the refusal.
 
 **What a capsule meant to be delegated to declares depends on which caller delegates to it**, and
 the two want opposite things:
@@ -651,16 +670,28 @@ The name-list refusals are their own, and name the list an operator has to edit:
 
 ## Delegation bounds
 
-Two bounds on delegation, both the operator's and both decided from the daemon's own records rather
+Three bounds on delegation, all the operator's and all decided from the daemon's own records rather
 than from anything a capsule says about itself.
 
 | Bound | Flag | Default | What it counts |
 |---|---|---|---|
 | Depth | `--max-depth` | `3` | Levels of delegation below a capsule that registered with no approval |
+| Machine ceiling | `--max-live-capsules` | Derived from the host's core count | Capsules this daemon holds live at once, across every formation |
 | Concurrency | `--max-concurrent` | `4` | Children one session holds live at once |
 
-Both are checked at `POST /spawn`, after the name check, and a refused spawn leaves no record
-anywhere — no session, no workdir and no trace.
+All three are checked at `POST /spawn`, after the name check and before the registry is read, and a
+refused spawn leaves no record anywhere — no session, no reservation, no workdir and no trace.
+Nothing is queued: a refused spawn is answered and forgotten, and the caller asks again if it wants
+another answer.
+
+The order they are asked in is the order of the table, and it decides which refusal a caller hears
+when more than one applies:
+
+| Asked | Bound | Why here |
+|---|---|---|
+| First | Depth | Permanent for the asking session. No amount of waiting gives a session at `0` another level, so telling it to come back later would be false |
+| Second | Machine ceiling | The one bound whose answer does not depend on who is asking, and the one that tells the caller the useful thing: waiting helps, narrowing the formation does not |
+| Third | Concurrency | About this formation alone |
 
 ### The depth budget
 
@@ -712,6 +743,43 @@ can exceed the number of sessions that have registered.
 A session's current figures are readable at [`GET /status/{session_id}`](#get-statussession_id) as
 `depth_remaining` and `live_children`.
 
+### The machine ceiling
+
+`--max-live-capsules` bounds what this daemon holds live on the host as a whole: every running
+session across every unrelated formation, plus every approval it has granted that nobody has
+redeemed yet. A parent comfortably inside its own `--max-concurrent` is refused when the host is
+full, and the refusal says so — it names a different flag from the concurrency one, because a
+caller acts differently on the two:
+
+```json
+{
+  "error": "machine capsule ceiling reached: this daemon allows 3 live capsules on this host across every formation (--max-live-capsules 3), and it is already holding 3 — this is the host's ceiling rather than this capsule's own --max-concurrent, so narrowing the formation does not help; the same request may be granted once other capsules finish"
+}
+```
+
+| Refusal | What it means | What acts on it |
+|---|---|---|
+| `--max-concurrent` | This formation is too wide | Narrow the formation, or raise the flag |
+| `--max-live-capsules` | The host is full | Come back later |
+
+Slots are taken and released on the same events as a parent's `live_children`: a granted
+`POST /spawn` reserves one, redeeming the approval turns the reservation into a running session
+without changing the count, and a `POST /deregister` or the approval's 60-second expiry gives it
+back. Expiry is evaluated when the census is read, not swept on a timer. A daemon that has cycled a
+hundred formations therefore refuses no more than one that has cycled none, even though it never
+removes a session's record from its store.
+
+**Enforced at `POST /spawn`, counted at every registration.** A `POST /register` presenting no
+approval is the operator starting a capsule from their own terminal. It counts toward the census
+once it is running, and the ceiling never refuses it — refusing would be `mur run` failing on a
+machine the operator has just chosen to use, and this daemon referees delegation rather than
+admitting the operator's own launches. An operator who starts more roots by hand than the ceiling
+allows exceeds it, and the next delegated spawn is refused until the census falls back under.
+
+**One daemon per host.** The ceiling counts what *this* daemon has admitted. Two `mur-roost`
+processes on one host each enforce their own ceiling and together exceed it; roost holds no state
+outside its own memory and coordinates with no other process. Run one daemon per host.
+
 ### A bound that cannot be evaluated refuses
 
 Every figure a bound is decided from is read from the record of a *running* session. Where that
@@ -726,9 +794,12 @@ There is no cap on the total number of delegations, and no `--max-total` flag. A
 tries to set one gets `unknown argument: --max-total` and the daemon exits.
 
 The job store is held in memory, so restarting the daemon discards every registration and every
-count a total would be kept in. `--max-depth` and `--max-concurrent` are unaffected: both are
-decided from the sessions the daemon is currently tracking, and a restart that discards those
-sessions also discards every credential and approval that could delegate under them.
+count a total would be kept in. The three bounds above are unaffected: each is decided from the
+sessions the daemon is currently tracking, and a restart that discards those sessions also discards
+every credential and approval that could delegate under them.
+
+`--max-live-capsules` is not a total. It is a census of what is live right now, so a capsule that
+ends gives its slot back — a total would only ever grow.
 
 ---
 

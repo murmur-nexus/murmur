@@ -118,6 +118,8 @@ impl RecordingRoost {
             spawn_allow: spawn_allow.iter().map(|name| name.to_string()).collect(),
             max_depth: mur_roost::bounds::DEFAULT_MAX_DEPTH,
             max_concurrent: mur_roost::bounds::DEFAULT_MAX_CONCURRENT,
+            // One daemon serves every case in this suite, so its host census is the suite's total.
+            max_live_capsules: u32::MAX,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 

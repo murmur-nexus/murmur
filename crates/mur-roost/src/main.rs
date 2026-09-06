@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use mur_roost::bounds::{DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
+use mur_roost::bounds::{default_max_live_capsules, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DEPTH};
 use mur_roost::{authority::SpawnAuthority, handle_connection, State};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
@@ -20,6 +20,7 @@ struct Args {
     spawn_allow: Vec<String>,
     max_depth: u32,
     max_concurrent: u32,
+    max_live_capsules: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -29,6 +30,9 @@ fn parse_args() -> Result<Args, String> {
     let mut spawn_allow: Vec<String> = Vec::new();
     let mut max_depth: u32 = DEFAULT_MAX_DEPTH;
     let mut max_concurrent: u32 = DEFAULT_MAX_CONCURRENT;
+    // Derived from this host's core count rather than fixed, so a laptop and a build VM run under
+    // different ceilings.
+    let mut max_live_capsules: u32 = default_max_live_capsules();
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -67,6 +71,14 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<u32>()
                     .map_err(|e| format!("invalid --max-concurrent: {e}"))?;
             }
+            "--max-live-capsules" => {
+                i += 1;
+                max_live_capsules = raw
+                    .get(i)
+                    .ok_or("--max-live-capsules requires a value")?
+                    .parse::<u32>()
+                    .map_err(|e| format!("invalid --max-live-capsules: {e}"))?;
+            }
             // The installer execs each binary it staged once before renaming it onto PATH, and
             // refuses the whole install when one will not start. That needs an invocation which
             // exits 0 without binding a port or taking a registry path: every other argument this
@@ -95,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
         spawn_allow,
         max_depth,
         max_concurrent,
+        max_live_capsules,
     })
 }
 
@@ -129,6 +142,7 @@ fn main() {
         spawn_allow: args.spawn_allow,
         max_depth: args.max_depth,
         max_concurrent: args.max_concurrent,
+        max_live_capsules: args.max_live_capsules,
         authority,
     });
 
@@ -141,6 +155,12 @@ fn main() {
     };
 
     eprintln!("mur-roost: listening on 127.0.0.1:{}", args.port);
+    // Printed whether the ceiling was set or derived, so an operator who never passed the flag can
+    // still read the number they are running under.
+    eprintln!(
+        "mur-roost: machine ceiling {} live capsules (--max-live-capsules)",
+        args.max_live_capsules,
+    );
 
     for stream in listener.incoming() {
         match stream {

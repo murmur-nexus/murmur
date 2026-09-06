@@ -178,6 +178,9 @@ impl Roost {
             // One parent session serves every case in a suite, so the children this daemon counts
             // are the suite's rather than one delegation's.
             max_concurrent: u32::MAX,
+            // And every case's sessions accumulate in one store, so the host census is the suite's
+            // total rather than one formation's.
+            max_live_capsules: u32::MAX,
             authority: Arc::new(SpawnAuthority::generate().unwrap()),
         });
 
