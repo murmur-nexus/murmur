@@ -51,9 +51,9 @@ at all, the daemon admits only capsules launched under an approval it granted.
 `--max-depth`, `--max-concurrent` and `--max-live-capsules` each take a whole number, and none has
 a value meaning unlimited: `0` refuses every delegation.
 
-`--max-live-capsules` has no fixed default. The daemon multiplies the host's core count by 8 and
-clamps the result to between 16 and 256, so a laptop and a build VM run under different numbers,
-and prints the figure it arrived at at startup:
+The default for `--max-live-capsules` is derived at startup: the daemon multiplies the host's core
+count by 8 and clamps the result to between 16 and 256, so a laptop and a build VM run under
+different numbers. It prints the figure it arrived at:
 
 ```
 mur-roost: listening on 127.0.0.1:7700
@@ -427,8 +427,9 @@ The child-watch bound is the delegating capsule's own runtime's clock. No reques
 daemon to decide or enforce it, so no daemon has to be reachable for it to fire.
 
 How deep a chain of delegations may go, how many a capsule may have running at once, and how many
-capsules the host carries are the daemon's, not this tool's — see [Delegation bounds](#delegation-bounds). A delegation the daemon
-refuses comes back as a failed tool call carrying the refusal.
+capsules the host carries are the daemon's, not this tool's — see
+[Delegation bounds](#delegation-bounds). A delegation the daemon refuses comes back as a failed
+tool call carrying the refusal.
 
 **What a capsule meant to be delegated to declares depends on which caller delegates to it**, and
 the two want opposite things:
