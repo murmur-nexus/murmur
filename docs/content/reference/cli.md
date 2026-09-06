@@ -14,6 +14,7 @@ Every `mur` command, its flags, and what each one does.
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
 | `mur watch` | Stream live events from a running capsule's output to stdout |
+| `mur cancel` | Stop one running task on a capsule, leaving the session running |
 | `mur deploy` | Upload a capsule to an existing VM and return its public URL |
 | `mur destroy` | Remove a deployment record from the local tracking list |
 | `mur ps` | List all deployed capsules |
@@ -639,6 +640,39 @@ Exit codes:
 
 - `0` — terminal state event received (`completed` or `failed`)
 - `1` — connection error or non-200 response from the capsule
+
+---
+
+## `mur cancel`
+
+Stop one running task on a capsule. The capsule's session, its conversation and its queue are
+untouched: queued tasks proceed, and the capsule keeps answering.
+
+```bash
+mur cancel <capsule_url> <task_id>
+```
+
+- `capsule_url` — the `localhost:<port>` URL printed by `mur run` (with or without `http://`)
+- `task_id` — the `tsk_` id `message/send` returned, or the one `tasks/get` reports
+
+The in-flight inference call is dropped rather than waited out, and the task reaches the terminal
+state `canceled`. Nothing else is stopped: a detached shell command keeps its own lifecycle and a
+delegated sub-capsule keeps running. Both are named in the output instead, one line each.
+
+```text
+task:    tsk_0199c4e2f1b7712a9d3e4f5061728394
+state:   canceled
+running: wrk_9f2a1c  detached shell  sleep 30
+running: dlg_7b31de  delegation  worker@0.1.0
+```
+
+Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` reports
+that state and changes nothing.
+
+Exit codes:
+
+- `0` — the capsule holds this task; the line printed says what state it is in
+- `1` — the capsule does not hold this task id, or the connection failed
 
 ---
 

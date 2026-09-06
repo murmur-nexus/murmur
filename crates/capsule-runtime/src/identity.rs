@@ -6,10 +6,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::a2a::{
-    A2aMessage, A2aTask, IncomingTask, JsonRpcRequest, JsonRpcResponse, TaskRegistry, TaskState,
-    TaskStatus,
+    A2aMessage, A2aTask, CancelOutcome, IncomingTask, JsonRpcRequest, JsonRpcResponse,
+    TaskRegistry, TaskState, TaskStatus,
 };
+use crate::cancel::{LiveDelegations, Residue};
 use crate::delegation::{COMPLETION_SESSION_HEADER, DELEGATION_ID_HEADER};
+use crate::detached::DetachedRegistry;
 use crate::errors::RuntimeError;
 use crate::origin::{self, TaskOrigin, TaskProvenance, PEER_ORIGIN_HEADER, PEER_TRUST_HEADER};
 use crate::peer_handoff::{handle_peer_request, is_peer_path, PeerPlane, AUDIENCE_HEADER};
@@ -108,6 +110,10 @@ pub(crate) async fn serve_http(
     // session, which is what stops a child's outcome landing on whatever session answers the
     // parent's old address after a restart.
     session_id: String,
+    // The two registries a cancel snapshots its residue from. `detached` is `None` for a launch
+    // that demotes nothing, which contributes no shell items rather than an empty set.
+    detached: Option<Arc<DetachedRegistry>>,
+    live_delegations: Arc<LiveDelegations>,
 ) {
     let conversation_mode_str = match conversation_mode {
         ConversationMode::Stateless => "stateless",
@@ -129,8 +135,10 @@ pub(crate) async fn serve_http(
                         let plane = Arc::clone(&resource_plane);
                         let peer = Arc::clone(&peer_plane);
                         let session = session_id.clone();
+                        let detached_for_conn = detached.clone();
+                        let live = Arc::clone(&live_delegations);
                         tokio::task::spawn_local(async move {
-                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session).await;
+                            handle_connection(stream, card, registry, tx, acceptance, sse, buf, mode_str, plane, peer, session, detached_for_conn, live).await;
                         });
                     }
                     Err(e) => {
@@ -158,6 +166,8 @@ async fn handle_connection(
     resource_plane: Arc<ResourcePlane>,
     peer_plane: Arc<PeerPlane>,
     session_id: String,
+    detached: Option<Arc<DetachedRegistry>>,
+    live_delegations: Arc<LiveDelegations>,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -331,6 +341,8 @@ async fn handle_connection(
             traceparent,
             provenance,
             delegation_id,
+            detached.as_ref(),
+            &live_delegations,
         );
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
@@ -602,6 +614,8 @@ fn handle_jsonrpc(
     traceparent: Option<String>,
     provenance: TaskProvenance,
     delegation_id: Option<String>,
+    detached: Option<&Arc<DetachedRegistry>>,
+    live_delegations: &LiveDelegations,
 ) -> String {
     let req: JsonRpcRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -623,6 +637,9 @@ fn handle_jsonrpc(
             delegation_id,
         ),
         "tasks/get" => handle_tasks_get(id, &req.params, task_registry),
+        "tasks/cancel" => {
+            handle_tasks_cancel(id, &req.params, task_registry, detached, live_delegations)
+        }
         _ => JsonRpcResponse::err(id, -32601, "Method not found").into_http_response(),
     }
 }
@@ -749,6 +766,51 @@ fn handle_tasks_get(id: Value, params: &Value, task_registry: &Arc<Mutex<TaskReg
     match reg.get_task(&task_id) {
         Some(task) => JsonRpcResponse::ok(id, task).into_http_response(),
         None => JsonRpcResponse::err(id, -32001, "Task not found").into_http_response(),
+    }
+}
+
+/// `tasks/cancel`: stop one task and report what is still running.
+///
+/// Runs on the connection task and never waits for the agent loop: it takes the registry lock,
+/// records the cancellation, snapshots the two work registries and answers. Whether the loop has
+/// noticed yet is not the caller's question — the recorded state is already `canceled`.
+///
+/// Every outcome but one is a JSON-RPC `result`. A task that had already ended is returned
+/// unchanged, because "do no more work on this" is already true of it. Only an id this capsule
+/// never held is an error, and it is the same `-32001` `tasks/get` answers with.
+fn handle_tasks_cancel(
+    id: Value,
+    params: &Value,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    detached: Option<&Arc<DetachedRegistry>>,
+    live_delegations: &LiveDelegations,
+) -> String {
+    let Some(task_id) = params.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return JsonRpcResponse::err(id, -32602, "Invalid params: tasks/cancel requires an id")
+            .into_http_response();
+    };
+
+    let (outcome, task) = {
+        let mut reg = task_registry.lock().unwrap();
+        let outcome = reg.request_cancel(&task_id);
+        (outcome, reg.get_task(&task_id))
+    };
+
+    match (outcome, task) {
+        (CancelOutcome::Unknown, _) | (_, None) => {
+            JsonRpcResponse::err(id, -32001, "Task not found").into_http_response()
+        }
+        (CancelOutcome::AlreadyTerminal, Some(task)) => {
+            JsonRpcResponse::ok(id, task).into_http_response()
+        }
+        (CancelOutcome::Accepted, Some(mut task)) => {
+            // Read after the state is recorded, so nothing this snapshot names can have been
+            // started by the cancelled task afterwards.
+            task.artifacts = Residue::snapshot(detached, live_delegations)
+                .into_artifact()
+                .map(|artifact| vec![artifact]);
+            JsonRpcResponse::ok(id, task).into_http_response()
+        }
     }
 }
 

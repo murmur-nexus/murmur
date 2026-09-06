@@ -1986,6 +1986,114 @@ fn the_parent_answers_its_card_while_a_delegation_is_in_flight() {
     parent.await_outcomes(1, Duration::from_secs(TIMEOUT_SECS + 240));
 }
 
+/// A cancel mid-delegation interrupts the parent and names the child it left running.
+///
+/// The child is not killed and not waited for: `tasks/cancel` answers while the sub-capsule is
+/// still holding its task, and the response carries the `dlg_` id the `delegation_start` opened,
+/// so whoever stopped the parent knows what is still out there.
+#[test]
+fn a_cancel_mid_delegation_names_the_child_and_leaves_it_running() {
+    if common::skip_without_host_support(
+        "a_cancel_mid_delegation_names_the_child_and_leaves_it_running",
+    ) {
+        return;
+    }
+    let parent = Parent::launch(PARENT, SPAWN_YAML);
+
+    // One turn that delegates, and no answer scripted for the turn after it: the parent is left
+    // in an inference call it will never get a reply to, with the delegation still open.
+    parent.server.push(tool_use_response(
+        "toolu_cancel",
+        "delegate-task",
+        json!({"capsule": MUTE_WORKER, "version": VERSION, "task": "hold the line"}),
+    ));
+    let task_id = parent.submit("msg-cancel", "delegate it");
+
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let launch = loop {
+        let started = parent.events("delegation_start");
+        if let Some(launch) = started.into_iter().next() {
+            break launch;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the delegation never started; task state: {}",
+            parent.task_state(&task_id)
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    let delegation_id = launch["delegation_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(delegation_id.starts_with("dlg_"), "{launch}");
+    let child_dir = parent.only_child_dir();
+
+    let started_at = Instant::now();
+    let response = post_json(
+        &parent.url,
+        &json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tasks/cancel", "params": {"id": task_id}
+        })
+        .to_string(),
+    );
+    let took = started_at.elapsed();
+
+    assert_eq!(
+        response["result"]["status"]["state"], "canceled",
+        "{response}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "the cancel queued behind the child ({took:?}); it must not wait on a delegation"
+    );
+
+    let artifacts = response["result"]["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a cancel with a live delegation carries residue: {response}"));
+    let items: Vec<Value> = artifacts
+        .iter()
+        .filter(|artifact| artifact["name"] == "residue")
+        .filter_map(|artifact| artifact["parts"].as_array())
+        .flatten()
+        .filter_map(|part| serde_json::from_str::<Value>(part["text"].as_str()?).ok())
+        .collect();
+    let delegation = items
+        .iter()
+        .find(|item| item["kind"] == "delegation")
+        .unwrap_or_else(|| panic!("no delegation residue in {items:?}"));
+    assert_eq!(
+        delegation["delegation_id"],
+        json!(delegation_id),
+        "{delegation}"
+    );
+    assert_eq!(delegation["capsule"], MUTE_WORKER, "{delegation}");
+
+    // Nothing was killed: the child is still the process the parent launched, running under the
+    // directory the parent composed for it.
+    assert!(
+        a_process_is_running_under(&child_dir),
+        "the delegated child was killed; a cancel names what is running rather than ending it"
+    );
+
+    // And the parent is still answering for itself.
+    assert_eq!(agent_card_status(&parent.url), 200);
+
+    // The child this case wedged is ended by its own deadline; wait for that rather than leaving
+    // a capsule running for the rest of the binary.
+    parent.await_outcomes(1, Duration::from_secs(TIMEOUT_SECS + 240));
+}
+
+/// Whether any process on this host was started against `workdir` — the child's launch names it
+/// on its own command line, and the directory is unique per delegation.
+fn a_process_is_running_under(workdir: &Path) -> bool {
+    std::process::Command::new("ps")
+        .args(["-eo", "args"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(&workdir.display().to_string()))
+        .unwrap_or(false)
+}
+
 /// Lineage survives a resume of the parent, with no field added and nothing rewritten.
 ///
 /// The child's `spawned_by` names the session that spawned it and is never revisited; the resumed

@@ -25,6 +25,7 @@ use commands::topology::{run_topology, TopologyArgs};
 use commands::{
     beta::{run_beta, BetaCommand},
     build::run_build,
+    cancel::run_cancel,
     config_cmd::{run_config, ConfigCommand},
     conversation::{
         run_conversation_ls, run_conversation_rm, run_conversation_truncate, ConversationCommand,
@@ -313,6 +314,13 @@ enum Commands {
         /// Capsule URL (e.g. localhost:12345)
         url: String,
     },
+    /// Stop one running task on a capsule, leaving the session running
+    Cancel {
+        /// Capsule URL (e.g. localhost:12345)
+        url: String,
+        /// Task to stop (e.g. tsk_0199...)
+        task_id: String,
+    },
     #[cfg(feature = "beta-mur-deploy")]
     /// Upload a capsule to an existing VM and start it
     Deploy {
@@ -580,6 +588,7 @@ fn main() {
             run_topology(&args)
         }
         Commands::Watch { url } => run_watch(&url),
+        Commands::Cancel { url, task_id } => run_cancel(&url, &task_id),
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy {
             host,
