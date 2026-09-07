@@ -1278,3 +1278,45 @@ fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
     .stdout(predicate::str::contains("worker@0.1.0"))
     .stderr(predicate::str::contains("E-CAP-014"));
 }
+
+/// AppArmor attaches profiles by executable path, so a `mur` at a bind mount, a build output or a
+/// test fixture gets no profile however correctly the shipped one is installed — and the userns
+/// grant alone cannot say so, because it reads `withheld` identically for "no profile is
+/// installed" and "a profile is installed and does not attach here". Doctor therefore names the
+/// running binary and what the kernel reports confining it.
+///
+/// The attachment is read from `/proc/self/attr/current`, never inferred from the path, so this
+/// asserts the shape of the finding rather than which branch this host is in. The exit status is
+/// unchanged: this block reaches no `fixes` entry.
+#[test]
+fn doctor_names_the_running_binary_and_what_attaches_to_it() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), "  []\n");
+
+    // Copied to an unusual path on purpose: no shipped profile attaches there, which is exactly
+    // the case the grant line alone leaves unexplained.
+    let unusual = project.path().join("mur-at-an-unusual-path");
+    fs::copy(assert_cmd::cargo::cargo_bin("mur"), &unusual).unwrap();
+
+    let assertion = Command::new(&unusual)
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .current_dir(project.path())
+        .arg("doctor")
+        .assert();
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains("AppArmor / user namespaces"),
+        "stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("this binary:  {}", unusual.display())),
+        "doctor must name the binary it is actually running as, stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("profile attached: "),
+        "doctor must say which profile, if any, attaches, stdout was:\n{stdout}"
+    );
+}

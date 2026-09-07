@@ -133,6 +133,152 @@ impl CgroupEventCounters {
     }
 }
 
+/// Whether the declared `capabilities.resources.cgroup_io_bytes_per_sec` ceiling is actually on
+/// this session's cgroup scope.
+///
+/// Four states rather than a `bool` because "the write failed" and "there was never a scope to
+/// write to" are different findings with different remediations, and neither is the same as "this
+/// value was never established". [`Self::NotProbed`] is the `Default` so a report nobody filled in
+/// claims nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IoMaxStatus {
+    /// The `io.max` write succeeded against the device backing the workdir. The ceiling is on the
+    /// scope.
+    Enforced,
+    /// A scope exists and the `io.max` write did not succeed. `memory.max`, `pids.max` and
+    /// `cpu.max` are still enforced on it; I/O bandwidth is not bounded. What `W-SEC-021` reports.
+    Unavailable,
+    /// No scope was asked for: either this capsule declares no way to reach a native subprocess,
+    /// or this is not Linux, where cgroups cannot exist. Not a shortfall — there is no process
+    /// tree for a ceiling to apply to.
+    NotRequired,
+    /// Nobody asked. The `Default`, so a [`IoMaxReport`] that was constructed rather than measured
+    /// asserts nothing about the host.
+    #[default]
+    NotProbed,
+}
+
+/// The declared I/O ceiling and what became of it, carried into `--explain-scope`, into
+/// `session_start.effective_grants` and into `W-SEC-021`.
+///
+/// A failed `io.max` write used to be one `eprintln!` note beside a scope report and a manifest
+/// that both went on implying an I/O ceiling. This is the value that makes the outcome travel with
+/// the claim.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct IoMaxReport {
+    /// The effective `capabilities.resources.cgroup_io_bytes_per_sec`, after
+    /// [`HostResourceLimits::resolve`] has applied its default. Reported whatever the status, so a
+    /// reader can see what was asked for as well as what happened to it.
+    pub declared_bytes_per_sec: u64,
+    /// What happened to it.
+    pub status: IoMaxStatus,
+    /// Why, for every status but [`IoMaxStatus::Enforced`]. Absent from the JSON when there is
+    /// nothing to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl IoMaxReport {
+    /// The ceiling applied.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn enforced(declared_bytes_per_sec: u64) -> Self {
+        Self {
+            declared_bytes_per_sec,
+            status: IoMaxStatus::Enforced,
+            reason: None,
+        }
+    }
+
+    /// A scope exists and the ceiling is not on it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn unavailable(declared_bytes_per_sec: u64, reason: impl Into<String>) -> Self {
+        Self {
+            declared_bytes_per_sec,
+            status: IoMaxStatus::Unavailable,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// No cgroup scope is required because this capsule can reach no native subprocess.
+    ///
+    /// Public and reason-free by design: `mur run --explain-scope` has to produce the byte-for-byte
+    /// report a launch produces — `trace.rs`'s `session_start_effective_grants_match_explain_scope_json`
+    /// asserts the two objects are equal — so the wording lives here rather than once per caller.
+    #[must_use]
+    pub fn no_scope_required(declared_bytes_per_sec: u64) -> Self {
+        Self::not_required(declared_bytes_per_sec, NO_SCOPE_REASON)
+    }
+
+    /// No scope was asked for. Always carries its reason: "not required" is the one status whose
+    /// two causes — a capsule that can spawn nothing, and a platform with no cgroups — a reader
+    /// cannot tell apart from the status alone.
+    fn not_required(declared_bytes_per_sec: u64, reason: impl Into<String>) -> Self {
+        Self {
+            declared_bytes_per_sec,
+            status: IoMaxStatus::NotRequired,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+/// Reason text for the two [`IoMaxStatus::NotRequired`] causes, in one place so `prepare_scope`
+/// and [`probe_io_max`] cannot word the same finding differently.
+const NO_SCOPE_REASON: &str = "this capsule declares no way to run a native subprocess, so it is \
+     given no cgroup scope and there is no process tree for an I/O ceiling to apply to";
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+const NOT_LINUX_REASON: &str =
+    "cgroups are a Linux mechanism and this host has none, so no io.max ceiling can exist here";
+
+/// The message `W-SEC-021` carries, minus the reason the host gave.
+const IO_MAX_UNAVAILABLE_WARNING: &str = "the declared \
+capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup \
+scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max \
+and cpu.max are still enforced on the scope";
+
+/// Pure decision for the unenforced-`io.max` warning, split out of
+/// [`warn_for_unenforced_io_max`] the same way `sandbox::aggregate_bounding_warning` is split out
+/// of its emitter, so a test can assert it without capturing stderr.
+///
+/// Fires on [`IoMaxStatus::Unavailable`] alone. `NotRequired` is not a shortfall and `NotProbed`
+/// is not a finding, so neither warns.
+pub(crate) fn io_max_warning(report: &IoMaxReport) -> Option<(&'static str, String)> {
+    if report.status != IoMaxStatus::Unavailable {
+        return None;
+    }
+    let declared = report.declared_bytes_per_sec;
+    let reason = report.reason.as_deref().unwrap_or("no reason reported");
+    Some((
+        murmur_artifact::W_SEC_021,
+        format!("{IO_MAX_UNAVAILABLE_WARNING} (declared {declared} bytes/s): {reason}"),
+    ))
+}
+
+/// Fires at every launch, not just once.
+pub(crate) fn warn_for_unenforced_io_max(workdir: &Path, report: &IoMaxReport) {
+    if let Some((code, message)) = io_max_warning(report) {
+        let link = murmur_artifact::security_warning_link(code);
+        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        crate::agent::append_bootstrap_log(
+            workdir,
+            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
+        );
+    }
+}
+
+/// What [`prepare_scope`] establishes: the scope, and what became of its I/O ceiling.
+///
+/// A struct rather than a tuple so the two values cannot be swapped at a call site, and so the
+/// report is impossible to drop on the floor the way the `eprintln!` note it replaced was.
+#[derive(Debug)]
+pub(crate) struct PreparedScope {
+    /// The scope, or `None` where none was required or none can exist.
+    pub(crate) scope: Option<Arc<CgroupScope>>,
+    /// Whether the declared `io.max` ceiling applied, established by performing the write rather
+    /// than by inferring it.
+    pub(crate) io_max: IoMaxReport,
+}
+
 /// Decide-and-create entry point, called once per launch before any WASM is instantiated.
 ///
 /// * `required == false` (the capsule declares no way to spawn a native subprocess) → `Ok(None)`
@@ -143,24 +289,88 @@ impl CgroupEventCounters {
 /// * Linux and required → probe delegation and create the scope; `Err(reason)` if the host
 ///   cannot delegate one, which the caller turns into
 ///   [`crate::errors::RuntimeError::CgroupDelegationUnavailable`].
+///
+/// The returned [`PreparedScope`] always carries an [`IoMaxReport`], on every one of those paths:
+/// the declared I/O ceiling is reported as applying, as not applying, or as not required, and
+/// never left silent.
 pub(crate) fn prepare_scope(
     required: bool,
     limits: &HostResourceLimits,
     session_id: &str,
     workdir: &Path,
-) -> Result<Option<Arc<CgroupScope>>, String> {
+) -> Result<PreparedScope, String> {
     if !required {
-        return Ok(None);
+        return Ok(PreparedScope {
+            scope: None,
+            io_max: IoMaxReport::no_scope_required(limits.cgroup_io_bytes_per_sec),
+        });
     }
     #[cfg(target_os = "linux")]
     {
-        let scope = CgroupScope::create(limits, session_id, workdir)?;
-        Ok(Some(Arc::new(scope)))
+        let (scope, io_max) = CgroupScope::create(limits, session_id, workdir)?;
+        Ok(PreparedScope {
+            scope: Some(Arc::new(scope)),
+            io_max,
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (limits, session_id, workdir);
-        Ok(None)
+        let _ = (session_id, workdir);
+        Ok(PreparedScope {
+            scope: None,
+            io_max: IoMaxReport::not_required(limits.cgroup_io_bytes_per_sec, NOT_LINUX_REASON),
+        })
+    }
+}
+
+/// Answers "would the declared `io.max` ceiling apply on this host?" by performing the write,
+/// against a throwaway cgroup created and removed inside this call.
+///
+/// The diagnostic half of [`prepare_scope`], for `mur run --explain-scope`, which runs before any
+/// workdir exists and before any session is staged. Inferring the answer from "is the `io`
+/// controller delegated" is exactly the mistake this card exists to remove: the write can fail for
+/// a device the block layer will not accept (tmpfs, overlayfs, a device-mapper stack) on a host
+/// whose `io` controller is delegated perfectly well.
+///
+/// `workdir` need not exist. The device is resolved from its nearest existing ancestor, so the
+/// probe names the device a launch would use without creating anything.
+///
+/// Off Linux it reports [`IoMaxStatus::NotRequired`]. Whatever the outcome, the throwaway
+/// directory does not survive the call.
+#[must_use]
+pub fn probe_io_max(limits: &HostResourceLimits, workdir: &Path) -> IoMaxReport {
+    let declared = limits.cgroup_io_bytes_per_sec;
+    #[cfg(target_os = "linux")]
+    {
+        let base = match delegated_base() {
+            Ok(base) => base,
+            Err(reason) => {
+                return IoMaxReport::unavailable(
+                    declared,
+                    format!("no delegated cgroup base to write io.max into: {reason}"),
+                )
+            }
+        };
+        let path = base.join(scope_dir_name("explain-scope"));
+        if let Err(error) = std::fs::create_dir(&path) {
+            return IoMaxReport::unavailable(
+                declared,
+                format!(
+                    "could not create a throwaway cgroup at {}: {error}",
+                    path.display()
+                ),
+            );
+        }
+        let report = write_io_max(&path, declared, workdir);
+        // Best-effort by necessity and not by preference: the scope holds no tasks, so the only
+        // way this fails is a host that took the directory away underneath us.
+        let _ = std::fs::remove_dir(&path);
+        report
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = workdir;
+        IoMaxReport::not_required(declared, NOT_LINUX_REASON)
     }
 }
 
@@ -169,7 +379,7 @@ pub(crate) fn prepare_scope(
 /// The exact condition the Linux fail-closed launch refusal keys on: `capabilities.shell.allow`,
 /// `capabilities.spawn.allow`, or a declared artifact whose implementation is native (passed in
 /// by the caller, which is the only place the installed-artifact list is in hand).
-pub(crate) fn requires_process_bounding(
+pub fn requires_process_bounding(
     policy: &crate::types::CapabilityPolicy,
     has_native_artifact: bool,
 ) -> bool {
@@ -421,7 +631,7 @@ impl CgroupScope {
         limits: &HostResourceLimits,
         session_id: &str,
         workdir: &Path,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, IoMaxReport), String> {
         let base = delegated_base()?;
 
         let path = base.join(scope_dir_name(session_id));
@@ -448,7 +658,7 @@ impl CgroupScope {
                 u64::from(limits.cgroup_cpu_percent) * (CPU_MAX_PERIOD_US / 100)
             ),
         )?;
-        scope.apply_io_max(limits.cgroup_io_bytes_per_sec, workdir);
+        let io_max = scope.apply_io_max(limits.cgroup_io_bytes_per_sec, workdir);
 
         // Opened last, so a scope that failed any of the fatal writes above is never handed out
         // with a usable join descriptor.
@@ -459,10 +669,13 @@ impl CgroupScope {
             )
         })?;
 
-        Ok(Self {
-            path: scope.take_path(),
-            procs_fd: Some(procs_fd),
-        })
+        Ok((
+            Self {
+                path: scope.take_path(),
+                procs_fd: Some(procs_fd),
+            },
+            io_max,
+        ))
     }
 
     /// Move the path out of a scope that must not run its `Drop` (which would `rmdir` the
@@ -479,32 +692,75 @@ impl CgroupScope {
             .map_err(|error| format!("could not write {} to {}: {error}", value, path.display()))
     }
 
-    /// Best-effort `io.max` on the workdir's backing block device.
+    /// Best-effort `io.max` on the workdir's backing block device, reported rather than printed.
     ///
     /// Non-fatal by design, and the only one of the four controllers treated that way: the
     /// backing device of a path cannot always be resolved to a real `MAJ:MIN` the block layer
     /// accepts (overlayfs, tmpfs, btrfs subvolumes and device-mapper stacks all break the
     /// assumption), and I/O throughput is the least safety-critical of the four — a capsule that
     /// saturates disk bandwidth is slow, where one that exhausts memory or pids is fatal.
-    fn apply_io_max(&self, bytes_per_sec: u64, workdir: &Path) {
-        use std::os::linux::fs::MetadataExt;
-
-        let Ok(metadata) = workdir.metadata() else {
-            eprintln!(
-                "[capsule-runtime] note: cgroup io.max not applied — could not stat workdir {}",
-                workdir.display()
-            );
-            return;
-        };
-        let (major, minor) = device_major_minor(metadata.st_dev());
-        let value = format!("{major}:{minor} rbps={bytes_per_sec} wbps={bytes_per_sec}");
-        if let Err(error) = std::fs::write(self.path.join("io.max"), format!("{value}\n")) {
-            eprintln!(
-                "[capsule-runtime] note: cgroup io.max not applied ({error}); memory.max, \
-                 pids.max and cpu.max are still enforced on this scope"
-            );
-        }
+    ///
+    /// Non-fatal is not the same as unreported: the returned [`IoMaxReport`] travels into
+    /// `--explain-scope`, into `session_start.effective_grants.io_max` and into `W-SEC-021`, so
+    /// the manifest's declared ceiling and what the kernel accepted cannot disagree in silence.
+    fn apply_io_max(&self, bytes_per_sec: u64, workdir: &Path) -> IoMaxReport {
+        write_io_max(&self.path, bytes_per_sec, workdir)
     }
+}
+
+/// Writes `io.max` into `scope_path` for the device behind `workdir`, and says what happened.
+///
+/// The one place the `io.max` line is composed, shared by [`CgroupScope::apply_io_max`] at launch
+/// and by [`probe_io_max`] under `--explain-scope`, so the diagnostic exercises the identical
+/// write the launch performs rather than a paraphrase of it.
+///
+/// The device is resolved from the nearest *existing* ancestor of `workdir`: `--explain-scope`
+/// runs before the workdir is created, and a launch's workdir sits on the same filesystem as the
+/// project directory it is created under.
+#[cfg(target_os = "linux")]
+fn write_io_max(scope_path: &Path, bytes_per_sec: u64, workdir: &Path) -> IoMaxReport {
+    use std::os::linux::fs::MetadataExt;
+
+    let Some(metadata) = nearest_existing_ancestor_metadata(workdir) else {
+        return IoMaxReport::unavailable(
+            bytes_per_sec,
+            format!(
+                "could not stat {} or any ancestor of it to find its backing device",
+                workdir.display()
+            ),
+        );
+    };
+    let (major, minor) = device_major_minor(metadata.st_dev());
+    let value = format!("{major}:{minor} rbps={bytes_per_sec} wbps={bytes_per_sec}");
+    match std::fs::write(scope_path.join("io.max"), format!("{value}\n")) {
+        Ok(()) => IoMaxReport::enforced(bytes_per_sec),
+        // The scope directory is deliberately not named: `--explain-scope` writes into a throwaway
+        // cgroup and a launch writes into the session's, so including it would make the two
+        // reports differ for no reason a reader could act on — and
+        // `session_start.effective_grants` has to be the byte-for-byte object `--explain-scope`
+        // prints. The `MAJ:MIN` and the errno are what identify the failure.
+        Err(error) => IoMaxReport::unavailable(
+            bytes_per_sec,
+            format!("writing `{value}` to the scope's io.max: {error}"),
+        ),
+    }
+}
+
+/// `metadata()` of `path`, or of the closest ancestor of it that exists.
+///
+/// `st_dev` is a property of the filesystem, not of the leaf, so an ancestor's answer is the
+/// answer for a path that has not been created yet — which is the state `--explain-scope` finds
+/// the would-be workdir in.
+#[cfg(target_os = "linux")]
+fn nearest_existing_ancestor_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if let Ok(metadata) = current.metadata() {
+            return Some(metadata);
+        }
+        candidate = current.parent();
+    }
+    None
 }
 
 /// The delegated cgroup root this process creates its scopes under, resolved once.
@@ -922,6 +1178,137 @@ mod tests {
     use super::*;
     use crate::types::CapabilityPolicy;
 
+    /// The wire spelling every consumer reads: `--explain-scope --json`, `mur doctor` and
+    /// `session_start.effective_grants.io_max` in `trace.jsonl`. Kebab-case, not the `Debug`
+    /// rendering, which is free to change.
+    #[test]
+    fn io_max_status_wire_names_are_kebab_case() {
+        let spellings: Vec<String> = [
+            IoMaxStatus::Enforced,
+            IoMaxStatus::Unavailable,
+            IoMaxStatus::NotRequired,
+            IoMaxStatus::NotProbed,
+        ]
+        .into_iter()
+        .map(|status| {
+            serde_json::to_value(status)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+        assert_eq!(
+            spellings,
+            vec!["enforced", "unavailable", "not-required", "not-probed"]
+        );
+    }
+
+    /// A report nobody filled in must claim nothing, which is what makes it safe to construct one
+    /// at stage time and overwrite it once the scope exists.
+    #[test]
+    fn an_unfilled_report_claims_nothing() {
+        let report = IoMaxReport::default();
+        assert_eq!(report.status, IoMaxStatus::NotProbed);
+        assert_eq!(report.declared_bytes_per_sec, 0);
+        assert_eq!(report.reason, None);
+        assert_eq!(io_max_warning(&report), None);
+    }
+
+    /// `reason` is the only optional key, and it is present for every status but `Enforced`.
+    #[test]
+    fn only_a_failed_write_omits_nothing_and_a_successful_one_explains_nothing() {
+        let enforced = serde_json::to_value(IoMaxReport::enforced(1_000)).unwrap();
+        assert_eq!(enforced["status"], "enforced");
+        assert_eq!(enforced["declared_bytes_per_sec"], 1_000);
+        assert!(
+            enforced.get("reason").is_none(),
+            "an applied ceiling has nothing to explain: {enforced}"
+        );
+
+        let unavailable =
+            serde_json::to_value(IoMaxReport::unavailable(1_000, "no io controller")).unwrap();
+        assert_eq!(unavailable["status"], "unavailable");
+        assert_eq!(unavailable["reason"], "no io controller");
+    }
+
+    /// `W-SEC-021` fires on the one status that is a shortfall, and its message names the
+    /// declared ceiling, the host's reason, and the three limits that *are* still enforced —
+    /// without which "io.max did not apply" reads as "this session is unbounded".
+    #[test]
+    fn the_warning_fires_only_where_a_declared_ceiling_did_not_apply() {
+        assert_eq!(io_max_warning(&IoMaxReport::enforced(4_096)), None);
+        assert_eq!(
+            io_max_warning(&IoMaxReport::not_required(4_096, NO_SCOPE_REASON)),
+            None
+        );
+
+        let (code, message) = io_max_warning(&IoMaxReport::unavailable(
+            4_096,
+            "device 0:24 is not a block device",
+        ))
+        .expect("an unapplied ceiling must be reported");
+        assert_eq!(code, murmur_artifact::W_SEC_021);
+        assert!(message.contains("4096 bytes/s"), "message was: {message}");
+        assert!(
+            message.contains("device 0:24 is not a block device"),
+            "message was: {message}"
+        );
+        assert!(message.contains("memory.max"), "message was: {message}");
+    }
+
+    /// `--explain-scope` runs before the workdir exists, so the probe has to name the device a
+    /// launch would use without creating anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_device_is_resolved_from_the_nearest_existing_ancestor() {
+        use std::os::linux::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp
+            .path()
+            .join("workdir")
+            .join("does")
+            .join("not")
+            .join("exist");
+        let resolved = nearest_existing_ancestor_metadata(&missing)
+            .expect("an ancestor of a tempdir always exists");
+        assert_eq!(resolved.st_dev(), temp.path().metadata().unwrap().st_dev());
+        assert!(!missing.exists(), "resolving a device must create nothing");
+    }
+
+    /// The diagnostic answers the question by exercising it, and leaves nothing behind whichever
+    /// way it answers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn probing_io_max_creates_nothing_that_survives_the_call() {
+        if skip_without_host_support("probing_io_max_creates_nothing_that_survives_the_call") {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let report = probe_io_max(&HostResourceLimits::default(), &temp.path().join("workdir"));
+        assert!(
+            matches!(
+                report.status,
+                IoMaxStatus::Enforced | IoMaxStatus::Unavailable
+            ),
+            "a performed probe must report what it performed, got {report:?}"
+        );
+
+        // Counted by name rather than by directory count: this binary's other tests create and
+        // remove scopes under the same base concurrently, and only `probe_io_max` names one
+        // `explain-scope`.
+        let leftovers: Vec<String> = std::fs::read_dir(delegated_base().expect("a delegated base"))
+            .unwrap()
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|name| name.contains("explain-scope"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the throwaway cgroup outlived the probe: {leftovers:?}"
+        );
+    }
+
     #[test]
     fn scope_is_required_by_any_route_to_a_native_subprocess() {
         let shell = CapabilityPolicy {
@@ -959,7 +1346,14 @@ mod tests {
             temp.path(),
         )
         .expect("a capsule with no subprocess capability must never be refused");
-        assert!(scope.is_none());
+        assert!(scope.scope.is_none());
+        // Not a shortfall and never a warning: there is no process tree for a ceiling to apply to.
+        assert_eq!(scope.io_max.status, IoMaxStatus::NotRequired);
+        assert!(
+            scope.io_max.reason.is_some(),
+            "not-required must say which cause"
+        );
+        assert_eq!(io_max_warning(&scope.io_max), None);
     }
 
     /// macOS can never have a cgroup, so a required scope there must be a silent `None` rather
@@ -975,7 +1369,14 @@ mod tests {
             temp.path(),
         )
         .expect("a non-Linux host must not refuse to launch for a missing cgroup");
-        assert!(scope.is_none());
+        assert!(scope.scope.is_none());
+        assert_eq!(scope.io_max.status, IoMaxStatus::NotRequired);
+        assert!(scope
+            .io_max
+            .reason
+            .as_deref()
+            .expect("not-required off Linux must say cgroups cannot exist here")
+            .contains("Linux"));
     }
 
     /// The point of asking systemd for a scope: a Linux host with a working user session hands
@@ -991,20 +1392,44 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let scope = prepare_scope(
+        let prepared = prepare_scope(
             true,
             &HostResourceLimits::default(),
             "ses_selftest",
             temp.path(),
         )
-        .expect("a Linux host with a systemd user session must be able to bound a subprocess tree")
-        .expect("a required scope on Linux is never `None`");
+        .expect("a Linux host with a systemd user session must be able to bound a subprocess tree");
+        let io_max = prepared.io_max.clone();
+        let scope = prepared
+            .scope
+            .expect("a required scope on Linux is never `None`");
 
         for file in ["memory.max", "pids.max", "cpu.max"] {
             let contents = std::fs::read_to_string(scope.path().join(file))
                 .unwrap_or_else(|error| panic!("{file} unreadable in the scope: {error}"));
             assert!(!contents.trim().is_empty(), "{file} was left unset");
             assert_ne!(contents.trim(), "max", "{file} carries no ceiling");
+        }
+
+        // Whatever the host did with `io.max`, the scope says which of the two it was, and never
+        // `NotProbed`: a scope that exists has had the write attempted against it.
+        assert!(
+            matches!(
+                io_max.status,
+                IoMaxStatus::Enforced | IoMaxStatus::Unavailable
+            ),
+            "a created scope must report a performed io.max write, got {io_max:?}"
+        );
+        assert_eq!(
+            io_max.declared_bytes_per_sec,
+            HostResourceLimits::default().cgroup_io_bytes_per_sec
+        );
+        if io_max.status == IoMaxStatus::Unavailable {
+            assert!(io_max.reason.is_some(), "unavailable must carry a reason");
+            assert!(io_max_warning(&io_max).is_some());
+        } else {
+            assert_eq!(io_max.reason, None);
+            assert_eq!(io_max_warning(&io_max), None);
         }
     }
 

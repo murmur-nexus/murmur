@@ -3497,6 +3497,7 @@ forgery: {prompt}"
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Content,
             None,

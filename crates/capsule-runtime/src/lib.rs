@@ -84,13 +84,19 @@ pub use network_policy::preopen_reports;
 // invoked-binary report already resolve one, rather than open-coding the `PATH` walk again.
 pub use sandbox::{find_on_path, HostProbe};
 pub use sealed::{
-    classify_installed_profile, inspect_installed_profile, InstalledProfileState, SealedBlocker,
-    UsernsGrant, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    classify_installed_profile, classify_profile_attachment, inspect_installed_profile,
+    inspect_profile_attachment, InstalledProfileState, ProfileAttachment, SealedBlocker,
+    UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH,
+    SEALED_APPARMOR_PROFILE_SHA256,
 };
-// `cgroup` is a private module, but the two test-support entry points below are consumed from
-// `murmur-cli`'s integration tests as well as from this crate's own, so they are re-exported here
-// rather than duplicating the delegation probe once per crate that has to skip on it.
-pub use cgroup::{cgroup_delegation_available, skip_without_host_support};
+// `cgroup` is a private module, but the entry points below are consumed from `murmur-cli` — the
+// two test-support probes from its integration tests, and the `io.max` reporting from
+// `mur run --explain-scope`, which has to answer the same question a launch does without staging
+// a session. Re-exported here rather than duplicating either probe once per crate that needs it.
+pub use cgroup::{
+    cgroup_delegation_available, probe_io_max, requires_process_bounding,
+    skip_without_host_support, IoMaxReport, IoMaxStatus,
+};
 pub use child_launch::{
     child_workdir_for, launch_child_capsule, ChildLaunchRequest, LaunchedChild, MUR_BINARY_ENV,
 };

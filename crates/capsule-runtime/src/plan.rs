@@ -263,7 +263,12 @@ fn execute_inner(
         &plan.id,
         &ctx.workdir,
     ) {
-        Ok(scope) => scope,
+        // The plan's own `io.max` outcome is dropped here rather than reported: this scope is a
+        // second one, created for the plan's shell steps inside a session whose `session_start`
+        // already carries the launch scope's `io_max` and whose launch already fired `W-SEC-021`
+        // if the ceiling did not apply. Both scopes sit on the same delegated base over the same
+        // workdir device, so a per-plan repetition would say nothing new.
+        Ok(prepared) => prepared.scope,
         Err(reason) => {
             let error =
                 crate::errors::RuntimeError::CgroupDelegationUnavailable { reason }.to_string();

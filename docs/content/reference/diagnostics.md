@@ -100,6 +100,7 @@ section that explains it.
 | `W-SEC-018` | An installed tool's `input_schema` says nothing about its destinations, so its calls are judged by key name | [W-SEC-018](#w-sec-018) |
 | `W-SEC-019` | A key in `murmur.yaml` this build does not recognize was parsed and ignored | [W-SEC-019](#w-sec-019) |
 | `W-SEC-020` | The capsule can delegate, and its `lifecycle` block cannot receive a delegation's outcome | [W-SEC-020](#w-sec-020) |
+| `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
 
 ---
 
@@ -849,7 +850,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
@@ -1533,3 +1534,29 @@ lifecycle:
 a slot. A capsule that delegates and deliberately does not wait — one that hands work off and exits
 — is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
 declaring `capabilities.spawn.allow` on a capsule that does not delegate.
+
+### W-SEC-021 — a declared I/O ceiling did not apply { #w-sec-021 }
+
+**Fires when:** the session was given a cgroup scope and the `io.max` write for
+[`capabilities.resources.cgroup_io_bytes_per_sec`](manifest.md#field-capabilities) against that
+scope did not succeed. Once per launch, on stderr and in the session's `logs/bootstrap.log`.
+
+```text
+[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): writing `0:30 rbps=104857600 wbps=104857600` to the scope's io.max: No such device (os error 19) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-021)
+```
+
+**Why it matters:** `io.max` names a block device by `MAJ:MIN`, and the backing device of a path
+cannot always be resolved to one the block layer accepts — tmpfs, overlayfs, btrfs subvolumes and
+device-mapper stacks all break the assumption. Because a default ceiling is always applied, every
+capsule that gets a cgroup scope has a declared I/O ceiling, so without this warning the manifest
+and the scope report both go on implying a bound the kernel refused.
+
+**What the runtime does about it:** nothing is refused and no exit code changes. `io.max` is the
+one cgroup limit this runtime treats as non-fatal; `memory.max`, `pids.max` and `cpu.max` stay
+enforced on the scope and stay fatal on failure. See
+[Whether the I/O ceiling applied](resource-limits.md#io-max-report).
+
+**What to do:** the same reason this warning carries is in `io_max.reason`, in
+`mur run --explain-scope --json` and in `session_start.effective_grants` in `trace.jsonl`. Move the
+project onto a block-device-backed filesystem if an I/O bound matters for this capsule; otherwise
+the warning is a report and the session is bounded by memory, pids and CPU as declared.
