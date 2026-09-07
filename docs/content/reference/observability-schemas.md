@@ -30,7 +30,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 |---|---|
 | `session_start` | Nothing — its `event_id` is the session node |
 | `task_start` | The session node. Its `event_id` is the task node |
-| `task_end`, `task_reopened`, `context_seed` | The task node |
+| `task_end`, `task_reopened`, `task_canceled`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied` | The turn node, falling back to the task node and then the session node |
@@ -339,7 +339,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` — the last task's own terminal outcome |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"canceled"` — the last task's own terminal outcome |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -387,7 +387,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -395,6 +395,24 @@ for every task, on every exit path
 | `tool_calls` | u32 | Tool calls for this task only |
 | `shell_calls` | u32 | Shell calls for this task only |
 | `reopen_count` | u32 | Times an `on-task-end` hook reopened this task before it ended. `0` for a task that ran once (the common case). A reader that finds no `reopen_count` field should default it to `0` |
+
+**`task_canceled`**{ #task-canceled } — written where the agent loop stopped because a person
+called [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task)
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | string | The task that was stopped |
+| `turn` | u32 | The turn that was in flight, 0-based. Absent for a task cancelled before it ran |
+| `phase` | string | `"queued"` \| `"turn"` \| `"inference"` \| `"input"` \| `"delegation"` — which wait the cancel interrupted |
+| `detached_work_ids` | array of string | Demoted shell commands still running when the loop stopped |
+| `delegation_ids` | array of string | Delegations still in flight when the loop stopped |
+
+Appears at most once per task, before that task's terminal `task_end`. A task cancelled at
+`"queued"` never started, so it has no `task_start` and no `task_end` — this is its only record.
+Nothing named in `detached_work_ids` or `delegation_ids` was stopped: both are reported so an
+operator knows what is still running, and both keep the lifecycle they already had. The arrays are
+a snapshot taken where the loop stopped, so they may differ from the `residue` artifact the
+`tasks/cancel` response carried, which was taken when that response was sent.
 
 **`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task,
 when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and

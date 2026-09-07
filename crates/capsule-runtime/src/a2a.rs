@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
-use crate::{lanes::TaskLane, origin::TaskProvenance};
+use crate::{cancel::CancelSignal, lanes::TaskLane, origin::TaskProvenance};
 
 // ── JSON-RPC 2.0 envelope types ───────────────────────────────────────────────
 
@@ -134,6 +134,38 @@ pub(crate) enum TaskState {
     Completed,
     Failed,
     Rejected,
+    /// A person stopped this task. Terminal, and distinct from `Failed`: nothing went wrong, the
+    /// work was called off. Spelled `"canceled"` on the wire, which is the A2A protocol's own
+    /// spelling.
+    Canceled,
+}
+
+impl TaskState {
+    /// Whether no further work will be done on a task in this state.
+    ///
+    /// The one rule a cancel reads: a terminal task is left exactly as it is, and only a live one
+    /// can be stopped.
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            Self::Submitted | Self::Working | Self::InputRequired => false,
+            Self::Completed | Self::Failed | Self::Rejected | Self::Canceled => true,
+        }
+    }
+}
+
+/// What [`TaskRegistry::request_cancel`] did.
+///
+/// Three outcomes and only one of them is an error at the door: cancelling a task that has
+/// already ended is a clean no-op, because the caller's intent — "do no more work on this" — is
+/// already true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelOutcome {
+    /// The task was live and is now `Canceled`. Its [`CancelSignal`] has been raised.
+    Accepted,
+    /// The task had already reached a terminal state, which is left untouched.
+    AlreadyTerminal,
+    /// No task with this id was ever enqueued here.
+    Unknown,
 }
 
 // ── Task slot state machine ───────────────────────────────────────────────────
@@ -166,6 +198,12 @@ pub(crate) struct TaskRegistry {
     pub(crate) task_acceptance: TaskAcceptance,
     /// Pending input waiters: task_id → (prompt, oneshot sender)
     input_waiters: HashMap<String, (String, oneshot::Sender<String>)>,
+    /// One signal per task anybody has asked about, whether or not it has been cancelled.
+    ///
+    /// Minted on demand rather than at enqueue, because both ends need one before the task is
+    /// running: the task loop watches a task it is about to activate, and the door cancels one
+    /// that is still queued.
+    cancels: HashMap<String, CancelSignal>,
     /// Which completed turn the capsule's exported files are as of, shared with the resource
     /// plane. Lives here because every terminal state passes through this registry, so a third
     /// [`Self::finish_task`] call site cannot appear with no matching increment beside it.
@@ -181,6 +219,7 @@ impl TaskRegistry {
             queue_depth,
             task_acceptance,
             input_waiters: HashMap::new(),
+            cancels: HashMap::new(),
             resource_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -256,6 +295,14 @@ impl TaskRegistry {
         {
             let (tid, cid) = (task_id.clone(), context_id.clone());
             self.input_waiters.remove(&tid);
+            self.cancels.remove(&tid);
+            // An accepted cancel is final. A turn a person stopped must never later read as one
+            // that ran to completion, so the outcome the loop reports loses to the one already
+            // recorded.
+            let final_state = match self.history.get(&tid) {
+                Some((TaskState::Canceled, _)) => TaskState::Canceled,
+                _ => final_state,
+            };
             self.history.insert(tid.clone(), (final_state, cid));
             self.active_slot = TaskSlotState::Done { task_id: tid };
         }
@@ -318,6 +365,48 @@ impl TaskRegistry {
             }
         }
         None
+    }
+
+    /// The cancel signal for `task_id`, minting one if nobody has asked yet.
+    ///
+    /// Handed to whatever has to race against a cancel — the driver call, the input wait, the
+    /// delegation wait — and to the door, which raises it. A signal for a task that never runs
+    /// costs one entry and is dropped with the task's terminal state.
+    pub(crate) fn cancel_watch(&mut self, task_id: &str) -> CancelSignal {
+        self.cancels.entry(task_id.to_string()).or_default().clone()
+    }
+
+    /// Whether this task's recorded state is `Canceled`.
+    ///
+    /// Read at the task loop's activation step, which is what keeps a task cancelled while it was
+    /// still `submitted` from ever starting.
+    pub(crate) fn is_canceled(&self, task_id: &str) -> bool {
+        matches!(self.history.get(task_id), Some((TaskState::Canceled, _)))
+    }
+
+    /// Stop one task: record `Canceled` and raise its signal.
+    ///
+    /// Called on the door's connection task and never waits for the agent loop to acknowledge —
+    /// the state is written here, so a `tasks/get` that lands next already reads `canceled`
+    /// whatever the loop is in the middle of.
+    ///
+    /// A cancelled task that was still `submitted` gives its queue slot back immediately: it will
+    /// be skipped when the loop reaches it, so holding capacity for it would refuse work the
+    /// capsule can do.
+    pub(crate) fn request_cancel(&mut self, task_id: &str) -> CancelOutcome {
+        let Some((state, context_id)) = self.history.get(task_id).cloned() else {
+            return CancelOutcome::Unknown;
+        };
+        if state.is_terminal() {
+            return CancelOutcome::AlreadyTerminal;
+        }
+        if matches!(state, TaskState::Submitted) {
+            self.pending_count = self.pending_count.saturating_sub(1);
+        }
+        self.history
+            .insert(task_id.to_string(), (TaskState::Canceled, context_id));
+        self.cancel_watch(task_id).cancel();
+        CancelOutcome::Accepted
     }
 
     /// Return the prompt stored for an input-required task.
@@ -479,6 +568,76 @@ mod tests {
         let artifacts = task.artifacts.unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].parts[0].text, "my prompt");
+    }
+
+    #[test]
+    fn request_cancel_on_a_running_task_records_canceled() {
+        let mut r = running_registry("tsk_001");
+        let signal = r.cancel_watch("tsk_001");
+        assert_eq!(r.request_cancel("tsk_001"), CancelOutcome::Accepted);
+        assert!(signal.is_canceled());
+        assert!(r.is_canceled("tsk_001"));
+        let task = r.get_task("tsk_001").unwrap();
+        assert_eq!(task.status.state, TaskState::Canceled);
+    }
+
+    #[test]
+    fn request_cancel_on_a_completed_task_leaves_it_alone() {
+        let mut r = running_registry("tsk_001");
+        r.finish_task(TaskState::Completed);
+        assert_eq!(r.request_cancel("tsk_001"), CancelOutcome::AlreadyTerminal);
+        assert_eq!(
+            r.get_task("tsk_001").unwrap().status.state,
+            TaskState::Completed
+        );
+        // And a second cancel of an already-cancelled task says the same thing.
+        let mut r = running_registry("tsk_002");
+        assert_eq!(r.request_cancel("tsk_002"), CancelOutcome::Accepted);
+        assert_eq!(r.request_cancel("tsk_002"), CancelOutcome::AlreadyTerminal);
+    }
+
+    #[test]
+    fn request_cancel_on_an_unknown_id_is_unknown() {
+        let mut r = make_registry();
+        assert_eq!(r.request_cancel("tsk_doesnotexist"), CancelOutcome::Unknown);
+        assert!(!r.is_canceled("tsk_doesnotexist"));
+    }
+
+    #[test]
+    fn finish_task_does_not_overwrite_an_accepted_cancel() {
+        let mut r = running_registry("tsk_001");
+        assert_eq!(r.request_cancel("tsk_001"), CancelOutcome::Accepted);
+        r.finish_task(TaskState::Completed);
+        assert_eq!(
+            r.get_task("tsk_001").unwrap().status.state,
+            TaskState::Canceled
+        );
+        r.finish_task(TaskState::Failed);
+        assert_eq!(
+            r.get_task("tsk_001").unwrap().status.state,
+            TaskState::Canceled
+        );
+    }
+
+    #[test]
+    fn cancelling_a_queued_task_frees_its_queue_slot() {
+        let mut r = TaskRegistry::new(2, TaskAcceptance::Queue);
+        r.enqueue("tsk_a", "ctx_001");
+        r.enqueue("tsk_b", "ctx_001");
+        assert!(!r.can_accept(), "the queue is full");
+        assert_eq!(r.request_cancel("tsk_b"), CancelOutcome::Accepted);
+        assert!(r.can_accept(), "a cancelled task holds no slot");
+    }
+
+    #[test]
+    fn canceled_serializes_with_the_protocol_spelling() {
+        let json = serde_json::to_string(&TaskState::Canceled).unwrap();
+        assert_eq!(json, "\"canceled\"");
+        // Every existing spelling is unchanged by the new variant.
+        assert_eq!(
+            serde_json::to_string(&TaskState::InputRequired).unwrap(),
+            "\"input-required\""
+        );
     }
 
     #[test]

@@ -164,6 +164,8 @@ async fn run_task_with_reopens(
     context_id: Option<String>,
     trace_task_id: &str,
     seed: Option<HookSeed>,
+    // This task's cancel flag, or `None` on the `task.md` paths, which run no A2A task.
+    cancel: Option<crate::cancel::CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     let task_md_path = accessible_workdir.join("task.md");
     // Original task content, captured once before any feedback is appended, so repeated
@@ -213,6 +215,7 @@ async fn run_task_with_reopens(
             // the same task, so every attempt must start from the same context the hook
             // proposed. The hook is dispatched once, at task start, and is not asked again.
             seed.clone(),
+            cancel.clone(),
         )
         .await;
 
@@ -229,7 +232,11 @@ async fn run_task_with_reopens(
             .dispatch_task_end(trace_task_id.to_string(), exit_str.to_string())
             .await;
 
-        match reopen {
+        // A cancelled attempt is not reopened. The hook still saw it — `on-task-end` is
+        // dispatched above with exit status `canceled` — but re-running work a person just
+        // stopped is the defect this refusal exists to prevent.
+        let canceled = matches!(result, Ok(AgentLoopExit::Canceled));
+        match reopen.filter(|_| !canceled) {
             Some(TaskReopen { hook_name, reason }) => {
                 // A hook wants more. Honor it only if a reopen remains in the budget AND
                 // turns remain under the ceiling; otherwise the request is exhausted and
@@ -1284,6 +1291,10 @@ pub fn launch_session(
         // the OS thread running a detached command never blocks handing its result over.
         let (detached, mut completion_rx) = DetachedRegistry::new();
 
+        // Delegations in flight. Built here rather than with the store state because the A2A door
+        // reads it too: a cancel names every child still running, and the door is spawned first.
+        let live_delegations = Arc::new(crate::cancel::LiveDelegations::new());
+
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // SSE broadcast channel and replay buffer for SSE clients
@@ -1519,6 +1530,8 @@ pub fn launch_session(
                             std::sync::Arc::clone(&resource_plane),
                             std::sync::Arc::clone(&peer_plane),
                             session_id.clone(),
+                            Some(Arc::clone(&detached)),
+                            Arc::clone(&live_delegations),
                         ));
 
                     // Read before `capability_policy` moves into the store state below. Hooks
@@ -1578,7 +1591,7 @@ pub fn launch_session(
                         current_traceparent: None,
                         current_task_provenance: None,
                         current_context_id: None,
-                        delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
+                        live_delegations: Arc::clone(&live_delegations),
                         detached: Some(Arc::clone(&detached)),
                         shell_grace_secs: effective_lifecycle.shell_grace_secs,
                         a2a_task_registry: Some(Arc::clone(&task_registry)),
@@ -1674,6 +1687,11 @@ pub fn launch_session(
                     // because a task drained while another was running has to still be here when
                     // that one finishes.
                     let mut lanes = LaneQueue::new();
+
+                    // Event ids for the final status a task cancelled before it started emits.
+                    // High, like `request-input`'s, so they never collide with the agent loop's
+                    // own per-attempt counter, which restarts at 0 for every task.
+                    let mut queued_cancel_event_id: u64 = u64::MAX / 8;
 
                     // Demoted commands the resumed-from session never accounted for. Only a
                     // resume does this, and it costs one read of a file `--resume` has already
@@ -1785,6 +1803,9 @@ pub fn launch_session(
                                             Some(context_id.clone()),
                                             &task_id,
                                             seed,
+                                            // No A2A task, so nothing a person can address a
+                                            // `tasks/cancel` to.
+                                            None,
                                         )
                                         .await;
                                         let failed = result.is_err();
@@ -1862,6 +1883,7 @@ pub fn launch_session(
                                             Some(context_id.clone()),
                                             &task_id,
                                             seed,
+                                            None,
                                         )
                                         .await;
                                         let _ = trace.flush().await;
@@ -2006,6 +2028,8 @@ pub fn launch_session(
                                                         // path, so `on-task-start` never fired and
                                                         // there is no seed to apply.
                                                         None,
+                                                        // Nor is there a task to cancel.
+                                                        None,
                                                     )
                                                     .await;
                                                     break 'task_loop;
@@ -2021,14 +2045,58 @@ pub fn launch_session(
                         };
 
                         // ── ACTIVATE TASK ──
-                        {
+                        // A task cancelled while it was still `submitted` never starts: no
+                        // `task_start`, no `on-task-start`, no request to the provider. The
+                        // registry already holds `Canceled` and has given the queue slot back,
+                        // so all that is left is to say so and take the next task.
+                        let cancel_signal = {
                             let mut reg = task_registry.lock().unwrap();
-                            reg.start_task(
-                                incoming.task_id.clone(),
-                                incoming.context_id.clone(),
-                                incoming_lane,
+                            if reg.is_canceled(&incoming.task_id) {
+                                None
+                            } else {
+                                reg.start_task(
+                                    incoming.task_id.clone(),
+                                    incoming.context_id.clone(),
+                                    incoming_lane,
+                                );
+                                Some(reg.cancel_watch(&incoming.task_id))
+                            }
+                        };
+                        let Some(cancel_signal) = cancel_signal else {
+                            let residue = crate::cancel::Residue::snapshot(
+                                Some(&detached),
+                                &live_delegations,
                             );
-                        }
+                            let _ = trace
+                                .write_task_canceled(
+                                    &incoming.task_id,
+                                    None,
+                                    crate::cancel::PHASE_QUEUED,
+                                    residue.detached_work_ids(),
+                                    residue.delegation_ids(),
+                                )
+                                .await;
+                            let _ = trace.flush().await;
+                            // The only thing that closes a `message/stream` connection on this
+                            // task: it never reaches an agent loop, so nothing else would.
+                            emit_sse(
+                                &Some((sse_tx.clone(), Arc::clone(&sse_buffer))),
+                                &mut queued_cancel_event_id,
+                                "status",
+                                &crate::streaming::TaskStatusUpdateEvent {
+                                    id: incoming.task_id.clone(),
+                                    context_id: Some(incoming.context_id.clone()),
+                                    status: crate::streaming::StreamStatus {
+                                        state: "canceled".into(),
+                                        message: "task canceled before it started".into(),
+                                        response: None,
+                                    },
+                                    r#final: true,
+                                },
+                            )
+                            .await;
+                            continue 'task_loop;
+                        };
                         if let Err(e) =
                             tokio::fs::write(&workdir_task_md, &incoming.message_text).await
                         {
@@ -2107,6 +2175,7 @@ pub fn launch_session(
                             Some(incoming.context_id.clone()),
                             &incoming.task_id,
                             seed,
+                            Some(cancel_signal),
                         )
                         .await;
 
@@ -2114,10 +2183,13 @@ pub fn launch_session(
                         // task_end (with reopen_count) and the terminal on-task-end dispatch
                         // already happened inside run_task_with_reopens; an exhausted reopen
                         // budget surfaces here as loop_result.is_err(), i.e. a failed task.
-                        let exit_state = if loop_result.is_ok() {
-                            TaskState::Completed
-                        } else {
-                            TaskState::Failed
+                        // `finish_task` refuses to overwrite an accepted cancel whatever is
+                        // passed, so this is the loop's own reading rather than the authority:
+                        // an attempt that reported `canceled` says so here too.
+                        let exit_state = match &loop_result {
+                            Ok(AgentLoopExit::Canceled) => TaskState::Canceled,
+                            Ok(_) => TaskState::Completed,
+                            Err(_) => TaskState::Failed,
                         };
                         let _ = trace.flush().await;
                         {
@@ -2360,7 +2432,7 @@ pub fn launch_session(
         current_traceparent: None,
         current_task_provenance: None,
         current_context_id: None,
-        delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
+        live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
         // The script-capsule path runs no task loop, so a demoted command's completion would
         // have nowhere to be delivered: every command it dispatches runs to completion in the
         // foreground.
@@ -3360,11 +3432,12 @@ pub(crate) async fn request_input_impl(
     use tokio::sync::oneshot;
 
     let (tx, rx) = oneshot::channel::<String>();
-    {
+    let cancel = {
         let mut reg = task_registry.lock().unwrap();
         reg.set_input_required(&task_id, prompt.clone(), tx)
             .map_err(|e| wasmtime::Error::msg(format!("request-input: {e}")))?;
-    }
+        reg.cancel_watch(&task_id)
+    };
 
     // Use high IDs to avoid overlapping with agent-loop SSE event IDs (which start at 0).
     let mut sse_event_id: u64 = u64::MAX / 2;
@@ -3385,12 +3458,25 @@ pub(crate) async fn request_input_impl(
     )
     .await;
 
-    let result = match input_timeout_secs {
-        Some(secs) => tokio::time::timeout(Duration::from_secs(secs), rx)
-            .await
-            .map_err(|_| ())
-            .and_then(|r| r.map_err(|_| ())),
-        None => rx.await.map_err(|_| ()),
+    // `input-required` is a wait like any other, so a cancel ends it rather than leaving the task
+    // parked until the input timeout. The guest is unwound by the error either way; what differs
+    // is which terminal state the task is left in, and who writes it.
+    let waited = async {
+        match input_timeout_secs {
+            Some(secs) => tokio::time::timeout(Duration::from_secs(secs), rx)
+                .await
+                .map_err(|_| ())
+                .and_then(|r| r.map_err(|_| ())),
+            None => rx.await.map_err(|_| ()),
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        () = cancel.canceled() => {
+            cancel.note_phase(crate::cancel::PHASE_INPUT);
+            Err(InputWaitEnd::Canceled)
+        }
+        waited = waited => waited.map_err(|()| InputWaitEnd::TimedOut),
     };
 
     match result {
@@ -3413,7 +3499,11 @@ pub(crate) async fn request_input_impl(
             .await;
             Ok(text)
         }
-        Err(()) => {
+        // The state and the final status event are the agent loop's to write on this path: it
+        // takes the cancel at its next boundary and ends the attempt there, with the record, the
+        // trace and the residue that go with it.
+        Err(InputWaitEnd::Canceled) => Err(wasmtime::Error::msg("task-canceled")),
+        Err(InputWaitEnd::TimedOut) => {
             {
                 let mut reg = task_registry.lock().unwrap();
                 reg.finish_task(TaskState::Failed);
@@ -3438,6 +3528,15 @@ pub(crate) async fn request_input_impl(
             Err(wasmtime::Error::msg("input-timeout"))
         }
     }
+}
+
+/// Why a `request-input` wait ended without an answer.
+///
+/// The two are not interchangeable: a timeout is this task failing, and a cancel is a person
+/// stopping it — so only one of them writes a terminal state here.
+enum InputWaitEnd {
+    Canceled,
+    TimedOut,
 }
 
 pub(crate) struct NetworkPolicyHooks {
@@ -3469,21 +3568,6 @@ impl WasiHttpHooks for NetworkPolicyHooks {
             request, config,
         ))
     }
-}
-
-/// One delegation this session started and is still waiting on the outcome of.
-///
-/// Kept because the terminal `delegation` trace line names the capsule and the version, and a
-/// completion arriving later carries neither: it names the delegation, and the runtime remembers
-/// what that delegation was for.
-pub(crate) struct StartedDelegation {
-    /// The child's directory, absolute — where its `completion.json` is read from.
-    pub(crate) workdir: PathBuf,
-    pub(crate) capsule: String,
-    pub(crate) version: String,
-    /// When the launch was recorded, so an unreadable completion still closes the row with a
-    /// duration rather than a zero.
-    pub(crate) started: std::time::Instant,
 }
 
 pub(crate) struct CapsuleStoreState {
@@ -3567,12 +3651,11 @@ pub(crate) struct CapsuleStoreState {
     pub(crate) current_context_id: Option<String>,
     /// Every delegation this session started and has not yet closed, by `dlg_` id.
     ///
-    /// Filled from the launch notice, read when that delegation's completion arrives as a task:
-    /// the terminal `delegation` trace line is written then, out of the child's own
-    /// `completion.json`, because a delegation that returns on start has not ended when the tool
-    /// call returns. Session-scoped, and behind a lock because the dispatch that fills it and the
-    /// task loop that reads it both hold this state shared.
-    pub(crate) delegation_workdirs: Arc<Mutex<HashMap<String, StartedDelegation>>>,
+    /// Filled from the launch notice, read from three places: the completion that arrives as a
+    /// task closes its row from the child's own `completion.json`, a cancel names whatever is
+    /// still in flight, and the plane's own failure path releases a launch that will never
+    /// report. Shared with the A2A door, which snapshots it without taking any other lock.
+    pub(crate) live_delegations: Arc<crate::cancel::LiveDelegations>,
     // ── Detached shell ───────────────────────────────────────────────────────────
     /// Where a demoted command registers itself and delivers its completion. `None` is what
     /// keeps a call site foreground-only: the script-capsule path and every test construction
@@ -3618,6 +3701,16 @@ pub(crate) struct CapsuleStoreState {
 }
 
 impl CapsuleStoreState {
+    /// This session's cancel flag for the task now in scope, or `None` outside an A2A task.
+    ///
+    /// Both halves are needed: the registry mints the signal and the task id names which task's.
+    /// The script-capsule path has neither and can cancel nothing.
+    pub(crate) fn task_cancel_signal(&self) -> Option<crate::cancel::CancelSignal> {
+        let registry = self.a2a_task_registry.as_ref()?;
+        let task_id = self.a2a_task_id.as_deref()?;
+        Some(registry.lock().unwrap().cancel_watch(task_id))
+    }
+
     /// Returns the held continuation `(id, acked_len)` iff a continuation is currently held
     /// **and** was established under `context_id`. The context-id guard is required for
     /// correctness: without it, an incremental send against a driver-side continuation from
@@ -3757,6 +3850,7 @@ impl send::Host for CapsuleStoreState {
                 crate::a2a::TaskState::Completed => "completed".to_string(),
                 crate::a2a::TaskState::Failed => "failed".to_string(),
                 crate::a2a::TaskState::Rejected => "rejected".to_string(),
+                crate::a2a::TaskState::Canceled => "canceled".to_string(),
             },
         })
     }
@@ -4595,22 +4689,13 @@ impl CapsuleStoreState {
         }
     }
 
-    /// Records one launched child in this session's trace, before its delegation has ended, and
-    /// remembers where that child's directory is.
+    /// Records one launched child in this session's trace, before its delegation has ended.
     ///
-    /// The directory is what [`Self::close_started_delegation`] later reads the child's own
-    /// `completion.json` out of, so the pair is filled here rather than recomposed from the
-    /// delegation id, which names no path.
+    /// The registration into [`Self::live_delegations`] happens on the launching thread, in the
+    /// plane's own launch callback, rather than here: this write is `async` and its wait can be
+    /// cancelled, and a delegation that is up must be nameable whether or not the call that
+    /// started it ever returned.
     async fn write_delegation_start(&self, notice: &crate::delegation_plane::DelegationLaunch) {
-        self.delegation_workdirs.lock().unwrap().insert(
-            notice.delegation_id.clone(),
-            StartedDelegation {
-                workdir: self.accessible_workdir.join(&notice.child_workdir),
-                capsule: notice.capsule.clone(),
-                version: notice.version.clone(),
-                started: std::time::Instant::now(),
-            },
-        );
         if let Some(trace) = &self.peer_trace {
             trace
                 .write_delegation_start(
@@ -4637,12 +4722,7 @@ impl CapsuleStoreState {
     /// closes the row — a delegation left permanently in flight in the trace is a worse record
     /// than one whose outcome is stated as unknown.
     async fn close_started_delegation(&self, delegation_id: &str) {
-        let Some(started) = self
-            .delegation_workdirs
-            .lock()
-            .unwrap()
-            .remove(delegation_id)
-        else {
+        let Some(started) = self.live_delegations.finish(delegation_id) else {
             // A completion for a delegation this session did not start: another session's, or one
             // whose start was never recorded. `mur trace show` renders the terminal line on its
             // own row, which is the honest reading of it.
@@ -4737,20 +4817,62 @@ impl CapsuleStoreState {
         // is a channel because the write is `async`: the notice has to cross back to the task
         // loop below to be written at all.
         let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
+        let live = Arc::clone(&self.live_delegations);
+        let child_root = self.accessible_workdir.clone();
         let origin = crate::delegation_plane::DelegationOrigin {
             context_id: self.current_context_id.clone().unwrap_or_default(),
-            launched: Some(Arc::new(move |notice| {
-                let _ = launch_tx.send(notice);
-            })),
+            launched: Some(Arc::new(
+                move |notice: crate::delegation_plane::DelegationLaunch| {
+                    // Registered here, synchronously on the launching thread, so a child that is up is
+                    // in the live set before anything can wait on it — including when the wait below
+                    // is cancelled and the trace write never happens.
+                    live.register(
+                        notice.delegation_id.clone(),
+                        crate::cancel::LiveDelegation {
+                            workdir: child_root.join(&notice.child_workdir),
+                            capsule: notice.capsule.clone(),
+                            version: notice.version.clone(),
+                            child_session_id: notice.child_session_id.clone(),
+                            child_workdir: notice.child_workdir.clone(),
+                            started: std::time::Instant::now(),
+                        },
+                    );
+                    let _ = launch_tx.send(notice);
+                },
+            )),
             // The completion this delegation posts inherits the delegating task's class, the same
             // derivation a demoted shell command's completion uses. `None` — the script-capsule
             // path — is read as untrusted by the plane.
             trust: self.current_task_provenance.map(|task| task.trust()),
         };
+        // A cancel that lands mid-launch must not queue behind it: the child is already the live
+        // set's problem, and the person who stopped the task is waiting on an answer.
+        let cancel = self.task_cancel_signal();
         let mut starting = tokio::task::spawn_blocking(move || plane.start(&request, &origin));
         let mut notices_open = true;
         let joined = loop {
             tokio::select! {
+                biased;
+                () = async {
+                    match &cancel {
+                        Some(signal) => signal.canceled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(signal) = &cancel {
+                        signal.note_phase(crate::cancel::PHASE_DELEGATION);
+                    }
+                    // Whatever the launch is doing continues on its own thread; nothing here kills
+                    // it. A child that came up is in the live set and is named as residue.
+                    while let Ok(notice) = launch_rx.try_recv() {
+                        self.write_delegation_start(&notice).await;
+                    }
+                    return Err(format!(
+                        "'{DELEGATE_TASK_TOOL}' was canceled while the sub-capsule was starting; \
+                         any child that came up is still running and is named in the cancel's \
+                         residue"
+                    ));
+                }
                 notice = launch_rx.recv(), if notices_open => match notice {
                     Some(notice) => self.write_delegation_start(&notice).await,
                     // The sender lives in the blocking closure, so this is that closure ending.
@@ -4759,8 +4881,8 @@ impl CapsuleStoreState {
                 joined = &mut starting => break joined,
             }
         };
-        // A launch that finished between the two arms being polled leaves its notice behind, and
-        // it still has to be recorded.
+        // A launch that finished between the arms being polled leaves its notice behind, and it
+        // still has to be recorded.
         while let Ok(notice) = launch_rx.try_recv() {
             self.write_delegation_start(&notice).await;
         }
@@ -4776,10 +4898,7 @@ impl CapsuleStoreState {
             // A launch that got far enough to be announced but not far enough to be started is
             // closed here, so the row it opened is not also waiting for a completion that will
             // never come.
-            self.delegation_workdirs
-                .lock()
-                .unwrap()
-                .remove(&result.delegation_id);
+            self.live_delegations.release(&result.delegation_id);
             if let Some(trace) = &self.peer_trace {
                 trace
                     .write_delegation(
@@ -8020,7 +8139,7 @@ inference:
             current_traceparent: None,
             current_task_provenance: None,
             current_context_id: None,
-            delegation_workdirs: Arc::new(Mutex::new(HashMap::new())),
+            live_delegations: Arc::new(crate::cancel::LiveDelegations::new()),
             detached: None,
             shell_grace_secs: 0,
             a2a_task_registry: None,
@@ -9847,6 +9966,7 @@ inference:
             Some("ctx_1".to_string()),
             "tsk_1",
             None,
+            None,
         )
         .await;
 
@@ -10067,6 +10187,7 @@ inference:
             ConversationMode::Stateless,
             Some("ctx_1".to_string()),
             "tsk_1",
+            None,
             None,
         )
         .await;

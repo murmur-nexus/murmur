@@ -562,8 +562,11 @@ impl ScriptedServer {
                     body
                 );
 
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.flush().unwrap();
+                // A client that disconnected during the delay — a cancelled inference call drops
+                // the whole connection — must not take this thread down with it: the case is
+                // about what the agent did next, and a panicked server thread answers nothing.
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             }
         });
 

@@ -328,6 +328,20 @@ struct TaskEndEvent {
     reopen_count: u32,
 }
 
+/// A person stopped this task, and what the runtime left running when it stopped.
+///
+/// `task_id` is not captured: `mur trace show` renders these in file order alongside the task
+/// they belong to, and serde ignores unknown JSON fields, so omitting it is not a parse risk.
+#[derive(Debug, Deserialize)]
+struct TaskCanceledEvent {
+    /// `"queued"`, `"turn"`, `"inference"`, `"input"` or `"delegation"`.
+    phase: String,
+    #[serde(default)]
+    detached_work_ids: Vec<String>,
+    #[serde(default)]
+    delegation_ids: Vec<String>,
+}
+
 /// One `on-task-end` hook reopened the task. New event type; older `mur` binaries
 /// route it through the `Unknown` catch-all, this one surfaces it.
 ///
@@ -550,6 +564,7 @@ enum TraceEvent {
     TaskStart(TaskStartEvent),
     TaskEnd(TaskEndEvent),
     TaskReopened(TaskReopenedEvent),
+    TaskCanceled(TaskCanceledEvent),
     CallDenied(CallDeniedEvent),
     ProtectedPathDenied(ProtectedPathDeniedEvent),
     HookDispatchError(HookDispatchErrorEvent),
@@ -771,6 +786,8 @@ struct TraceMetrics {
     /// Every `compaction_declined` record, in file order. A decline leaves the session running
     /// over budget, so all of them are kept rather than just the last.
     compactions_declined: Vec<CompactionDeclinedRecord>,
+    /// Every `task_canceled` record, in file order — one per task a person stopped.
+    cancels: Vec<CancelRecord>,
     /// Every `task_reopened` record, in file order — one per `on-task-end` reopen.
     reopens: Vec<ReopenRecord>,
     /// Every `context_seed` record, in file order — one per seeded task.
@@ -830,6 +847,13 @@ struct RetentionRecord {
     removed: u32,
     targets: Vec<String>,
     messages_dropped: Option<u64>,
+}
+
+/// One `task_canceled` trace record, surfaced in `mur trace show`.
+struct CancelRecord {
+    phase: String,
+    /// Every id the runtime left running: detached work first, then delegations.
+    still_running: Vec<String>,
 }
 
 /// One `task_reopened` trace record, surfaced in `mur trace show`.
@@ -1170,6 +1194,7 @@ fn compute_metrics(
     // than counted as a task.
     let mut task_starts: HashSet<String> = HashSet::new();
     let mut task_metrics: Vec<TaskMetrics> = Vec::new();
+    let mut cancels: Vec<CancelRecord> = Vec::new();
     let mut reopens: Vec<ReopenRecord> = Vec::new();
     let mut context_seeds: Vec<ContextSeedRecord> = Vec::new();
     let mut denials: Vec<DenialRecord> = Vec::new();
@@ -1314,6 +1339,16 @@ fn compute_metrics(
                         reopen_count: e.reopen_count,
                     });
                 }
+            }
+            TraceEvent::TaskCanceled(e) => {
+                cancels.push(CancelRecord {
+                    phase: e.phase,
+                    still_running: e
+                        .detached_work_ids
+                        .into_iter()
+                        .chain(e.delegation_ids)
+                        .collect(),
+                });
             }
             TraceEvent::TaskReopened(e) => {
                 reopens.push(ReopenRecord {
@@ -1532,6 +1567,7 @@ fn compute_metrics(
             skill_call_records,
             compaction,
             compactions_declined,
+            cancels,
             reopens,
             context_seeds,
             denials,
@@ -2040,6 +2076,19 @@ fn print_show(m: &TraceMetrics) {
             fmt_thousands(d.tokens),
             d.reason
         );
+    }
+
+    if !m.cancels.is_empty() {
+        println!();
+        println!("── Cancelled ────────────────────────────────────");
+        for c in &m.cancels {
+            let still_running = if c.still_running.is_empty() {
+                "nothing left running".to_string()
+            } else {
+                format!("still running: {}", c.still_running.join(", "))
+            };
+            println!("task_canceled  at {}  {still_running}", c.phase);
+        }
     }
 
     if !m.reopens.is_empty() {
@@ -2756,6 +2805,23 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.hook_name,
             e.reopen_number
         ),
+        TraceEvent::TaskCanceled(e) => {
+            let still_running = e.detached_work_ids.len() + e.delegation_ids.len();
+            let residue = if still_running == 0 {
+                "no residue".to_string()
+            } else {
+                format!(
+                    "{still_running} still running: {}",
+                    e.detached_work_ids
+                        .iter()
+                        .chain(e.delegation_ids.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!("{}{}  {residue}", kind("task_canceled"), e.phase)
+        }
         TraceEvent::CallDenied(e) => format!(
             "{}{}  {}  denied by {}",
             kind("call_denied"),
