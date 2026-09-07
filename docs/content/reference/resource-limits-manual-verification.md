@@ -108,7 +108,9 @@ runtime:
    — moving *itself* into `<base>/murmur-supervisor` first if the base still holds processes,
    which cgroup v2's "no internal processes" rule requires;
 4. creates `<base>/murmur-<session_id>` and writes `memory.max`, `pids.max`, `cpu.max` (fatal on
-   failure) and `io.max` (best-effort, logged on failure);
+   failure) and `io.max` (non-fatal, reported in
+   [`io_max`](resource-limits.md#io-max-report) and by
+   [`W-SEC-021`](diagnostics.md#w-sec-021));
 5. opens that scope's `cgroup.procs` write-only, and every subprocess writes its own pid there
    from inside its `pre_exec`, before `execve`.
 

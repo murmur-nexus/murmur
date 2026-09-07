@@ -25,6 +25,23 @@ use zip::{
     CompressionMethod, ZipWriter,
 };
 
+/// The first file named `name` anywhere beneath `root`, for tests that have to find a session's
+/// `trace.jsonl` without knowing the session id the run chose.
+pub fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|file| file == name) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 pub fn publish_local(home: &TempDir, artifact_path: &Path) -> Assert {
     let mut cmd = Command::cargo_bin("mur").unwrap();
     cmd.env("HOME", home.path())

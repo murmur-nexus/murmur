@@ -7,9 +7,9 @@ use std::{
 
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, configured_artifact_names, explain_scope,
-    launch_session, preopen_reports, stage_session, state_store_reports, AfterTask,
-    ArtifactRequest, LifecycleOverride, LockExpectation, ResumeMode, ResumeRequest, RuntimeError,
-    StageRequest, TaskAcceptance,
+    launch_session, preopen_reports, probe_io_max, requires_process_bounding, stage_session,
+    state_store_reports, AfterTask, ArtifactRequest, IoMaxReport, LifecycleOverride,
+    LockExpectation, ResumeMode, ResumeRequest, RuntimeError, StageRequest, TaskAcceptance,
 };
 use murmur_artifact::warn_on_unknown_manifest_keys;
 use murmur_artifact::{
@@ -398,6 +398,32 @@ pub(crate) fn run_run(
             )
         }))
         .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+        // Answered by performing the write, not by inferring it from a delegated controller list:
+        // `probe_io_max` creates a throwaway cgroup, writes the same `io.max` line a launch
+        // writes, and removes the directory again. The would-be workdir does not exist yet — this
+        // block runs ahead of every side effect — so the probe resolves the backing device from
+        // its nearest existing ancestor.
+        //
+        // A capsule that can reach no native subprocess is given no scope at launch, so the
+        // diagnostic reports `not-required` for it rather than exercising a write the launch would
+        // never perform.
+        //
+        // `has_native_artifact` is `false` here and not read from the manifest: an entry's
+        // implementation is a property of the *installed* artifact, which only a registry read
+        // resolves, and this block is placed ahead of every side effect including that one. The
+        // condition evaluated is therefore `shell.allow` or `spawn.allow` alone, so a capsule that
+        // declares neither and installs a native tool reports `not-required` here while its launch
+        // does create a scope and does report the real status in `session_start`.
+        //
+        // The `not-required` report is built by `IoMaxReport::no_scope_required` rather than
+        // spelled out here, because `session_start.effective_grants` must be the byte-for-byte
+        // object this prints — `trace.rs`'s
+        // `session_start_effective_grants_match_explain_scope_json` asserts exactly that.
+        let io_max = if requires_process_bounding(&capability_policy, false) {
+            probe_io_max(&capability_policy.resources, &workdir)
+        } else {
+            IoMaxReport::no_scope_required(capability_policy.resources.cgroup_io_bytes_per_sec)
+        };
         let report = explain_scope(
             &capability_policy,
             declared_containment_floor,
@@ -405,6 +431,7 @@ pub(crate) fn run_run(
             state_stores,
             configured_artifacts,
             preopens,
+            io_max,
         );
         if json {
             let line = serde_json::to_string(&report).map_err(|source| {

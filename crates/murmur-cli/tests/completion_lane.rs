@@ -435,11 +435,12 @@ fn a_capsule_that_never_delegates_is_unaffected() {
         "a capsule that declares no spawn capability opens no connection to the daemon"
     );
     assert!(
-        find_file(project.path(), "completion.json").is_none(),
+        common::find_file(project.path(), "completion.json").is_none(),
         "a capsule nobody delegated writes no completion"
     );
 
-    let trace_path = find_file(project.path(), "trace.jsonl").expect("the session wrote a trace");
+    let trace_path =
+        common::find_file(project.path(), "trace.jsonl").expect("the session wrote a trace");
     let trace = fs::read_to_string(&trace_path).unwrap();
     let starts: Vec<Value> = trace
         .lines()
@@ -453,22 +454,6 @@ fn a_capsule_that_never_delegates_is_unaffected() {
             "the field is omitted from the line, not written as null: {start}"
         );
     }
-}
-
-/// The first file named `name` anywhere beneath `root`.
-fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|file| file == name) {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 // ── 9. A malformed spawner handle refuses the launch ──────────────────────────
@@ -513,7 +498,7 @@ fn a_malformed_spawner_handle_refuses_the_launch() {
 
     // Nothing was staged and nothing was written: no session directory, no trace.
     assert!(
-        find_file(project.path(), "trace.jsonl").is_none(),
+        common::find_file(project.path(), "trace.jsonl").is_none(),
         "a refused launch writes no trace"
     );
     assert!(

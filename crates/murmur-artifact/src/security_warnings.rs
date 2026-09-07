@@ -193,6 +193,19 @@ pub const W_SEC_019: &str = "W-SEC-019";
 /// not wait is legitimate, and the warning is what makes that a choice rather than an accident.
 pub const W_SEC_020: &str = "W-SEC-020";
 
+/// The capsule was given a cgroup scope and the declared
+/// `capabilities.resources.cgroup_io_bytes_per_sec` ceiling did not apply to it, so the capsule's
+/// native subprocess tree runs with no I/O bandwidth bound.
+///
+/// `io.max` is the one cgroup limit this runtime treats as non-fatal: the backing device of a path
+/// cannot always be resolved to a `MAJ:MIN` the block layer accepts (tmpfs, overlayfs, btrfs
+/// subvolumes and device-mapper stacks all break the assumption), and a capsule that saturates
+/// disk bandwidth is slow where one that exhausts memory or pids is fatal. `memory.max`,
+/// `pids.max` and `cpu.max` stay enforced on the scope and stay fatal on failure. Fires once per
+/// launch, and carries the same reason `--explain-scope`'s and `session_start`'s `io_max.reason`
+/// carry.
+pub const W_SEC_021: &str = "W-SEC-021";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -212,7 +225,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020,
+            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

@@ -2780,6 +2780,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::cgroup::IoMaxReport::default(),
         )
     }
 
@@ -3122,6 +3123,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                crate::cgroup::IoMaxReport::default(),
             );
             let dir = tempfile::tempdir().unwrap();
             let mut w = TraceWriter::open(
@@ -3176,6 +3178,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            crate::cgroup::IoMaxReport::default(),
         );
         assert!(
             serde_json::to_value(&unprobed).unwrap()["userns_grant"].is_null(),
@@ -3230,6 +3233,7 @@ mod tests {
                 scope: None,
                 surface: crate::containment::PreopenSurface::WholeWorkdir,
             }],
+            crate::cgroup::IoMaxReport::default(),
         );
 
         let dir = tempfile::tempdir().unwrap();
