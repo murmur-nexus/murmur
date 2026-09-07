@@ -532,8 +532,8 @@ pub(crate) enum NamespaceProbe {
     MountDenied,
     /// Every mount succeeded and the `pivot_root(2)` sequence did not. Kept apart from
     /// [`MountDenied`](Self::MountDenied) because a host can permit `mount(2)` and refuse
-    /// `pivot_root(2)`, and before this variant existed such a host passed the launch probe and
-    /// failed at the first subprocess with `E-RUN-014`.
+    /// `pivot_root(2)`. Folding the two together lets such a host clear the launch probe and
+    /// fail at the first subprocess with `E-RUN-014`.
     PivotRootDenied,
     /// The kernel does not implement it (`ENOSYS`/`EINVAL`), or the probe could not run at all.
     #[default]
@@ -1657,8 +1657,10 @@ mod linux {
 
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child below calls `unshare`,
-        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps, and
-        // `_exit` — every one of them async-signal-safe, and no allocation, no locks, no stdio.
+        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps,
+        // `chdir`, `mkdir`, `pivot_root` via `syscall`, `umount2`, and `_exit` — every one of them
+        // async-signal-safe, and no allocation, no locks, no stdio. Anything added to the child
+        // must hold to the same list.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return NamespaceProbe::Unsupported;
@@ -1708,9 +1710,9 @@ mod linux {
                 }
 
                 // Steps 4, 6 and 7 of `construct_composed_root`, in the same order and with the
-                // same syscalls. Stopping at the mount above is what let a host that refuses
-                // `pivot_root(2)` pass the launch probe and then fail at the first subprocess,
-                // after an inference call had already been paid for.
+                // same syscalls. A probe that stops at the mount above clears a host that refuses
+                // `pivot_root(2)`, which then fails at the first subprocess after an inference
+                // call has already been paid for.
                 //
                 // Everything below happens inside this child's own mount namespace, whose
                 // propagation the mount above just made private, so the host's mount table is
@@ -3123,10 +3125,9 @@ mod tests {
         }
     }
 
-    /// A refused `pivot_root(2)` is its own finding, with its own remediation. Before this
-    /// variant existed, a host that permits `mount(2)` and refuses the pivot passed the launch
-    /// probe as `Ok` and failed at the first subprocess with `E-RUN-014`, after an inference call
-    /// had already been paid for.
+    /// A refused `pivot_root(2)` is its own finding, with its own remediation. Without this
+    /// variant a host that permits `mount(2)` and refuses the pivot probes as `Ok` and fails at
+    /// the first subprocess with `E-RUN-014`, after an inference call has already been paid for.
     #[test]
     fn a_refused_pivot_root_is_its_own_blocker() {
         let probe = SealedProbe {

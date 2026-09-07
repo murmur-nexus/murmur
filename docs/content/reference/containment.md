@@ -198,9 +198,9 @@ Nothing the child does touches the host: mount propagation is made private befor
 and the child exits a few syscalls after the pivot without unwinding any of it. The fork is what
 keeps the probe a probe — `unshare(CLONE_NEWUSER)` is irreversible for the task that calls it.
 
-The last row is why the rehearsal goes all the way through the pivot. A host that mounts and
-refuses `pivot_root(2)` used to pass the launch probe and fail at the first subprocess with
-`E-RUN-014` — after an inference call had already been paid for.
+The last row is why the rehearsal goes all the way through the pivot: a host that mounts and
+refuses `pivot_root(2)` is refused at launch, rather than at the first subprocess with
+`E-RUN-014` once an inference call has already been paid for.
 
 **Refusal.** A host whose achieved class is weaker than the effective declared floor refuses the
 launch with [`E-CAP-003`](diagnostics.md#e-cap-003), before any registry pull, artifact compile, or

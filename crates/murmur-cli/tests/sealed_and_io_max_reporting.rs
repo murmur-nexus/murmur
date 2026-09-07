@@ -1,8 +1,8 @@
 //! What a host claims about containment, measured against what it then does.
 //!
-//! Three properties the runtime used to assert without exercising: that `sealed` survives the
-//! first subprocess, that a declared `io.max` ceiling is actually on the session's cgroup scope,
-//! and that the two reports an operator reads — `--explain-scope --json` and
+//! Three properties, each exercised rather than inferred: that `sealed` survives the first
+//! subprocess, that a declared `io.max` ceiling is actually on the session's cgroup scope, and
+//! that the two reports an operator reads — `--explain-scope --json` and
 //! `session_start.effective_grants` — agree with the launch that produced them.
 //!
 //! Every assertion here asks the host first and asserts the branch that host is actually in,
@@ -139,8 +139,8 @@ fn session_start_grants(project_dir: &Path) -> Value {
 
 // ── Scenario A: a sealed verdict survives the first subprocess ────────────────
 
-/// The probe now rehearses the whole composed-root shape through `pivot_root(2)`, so the launch
-/// verdict and the first subprocess can no longer disagree.
+/// The probe rehearses the whole composed-root shape through `pivot_root(2)`, so the launch
+/// verdict and the first subprocess cannot disagree.
 ///
 /// On a host reporting `sealed`, the run reaches the agent loop, the `echo` call executes, and no
 /// `E-RUN-014` appears. On a host reporting anything below it, the refusal is `E-CAP-003`, it
@@ -322,17 +322,18 @@ fn a_failed_io_max_write_is_visible_wherever_the_ceiling_is_claimed() {
         "the diagnostic and the trace must carry the same reason, word for word"
     );
 
-    // `enforced` needs a filesystem the block layer will accept a `MAJ:MIN` for, which is not
-    // every filesystem: btrfs subvolumes, overlayfs and device-mapper stacks all report an
-    // anonymous device with major 0, and the kernel refuses `io.max` for it. Where the checkout
-    // sits on one of those there is no `enforced` to observe on this host, and the property above
-    // — the three surfaces agree, and W-SEC-021 fires exactly for `unavailable` — is what the run
-    // proves. `docs/content/reference/resource-limits-manual-verification.md` covers the rest.
-    if device_major(on_disk.path()) == 0 {
+    // `enforced` needs a filesystem with a block device behind it, which tmpfs, overlayfs and
+    // every FUSE mount lack — a checkout on one of those has no device for the block layer to
+    // bind a ceiling to, however well the host delegates cgroups. The gate asks the resolution a
+    // launch performs rather than re-deriving it here, so this stands down only where the launch
+    // would also find no device. The property above — the three surfaces agree, and W-SEC-021
+    // fires exactly for `unavailable` — is what the run proves in that case, and
+    // `docs/content/reference/resource-limits-manual-verification.md` covers the rest.
+    if !capsule_runtime::io_max_device_available(on_disk.path()) {
         eprintln!(
             "[SKIP-HOST] a_failed_io_max_write_is_visible_wherever_the_ceiling_is_claimed: the \
-             checkout sits on a filesystem with an anonymous backing device (major 0), so the \
-             `enforced` half of this scenario cannot be observed here"
+             checkout sits on a filesystem with no block device behind it, so the `enforced` half \
+             of this scenario cannot be observed here"
         );
         return;
     }
@@ -346,15 +347,6 @@ fn a_failed_io_max_write_is_visible_wherever_the_ceiling_is_claimed() {
         "an applied ceiling has nothing to explain: {:?}",
         disk.session_start
     );
-}
-
-/// The device major behind `path`, in glibc's wide (12+20 bit) encoding — the same decoding
-/// `cgroup::device_major_minor` performs before composing the `io.max` line.
-#[cfg(target_os = "linux")]
-fn device_major(path: &Path) -> u64 {
-    use std::os::linux::fs::MetadataExt;
-    let dev = path.metadata().unwrap().st_dev();
-    ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)
 }
 
 /// The key is always present, on the same terms `workdir_exec` is: an absent `io_max` identifies a

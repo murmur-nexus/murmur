@@ -499,8 +499,8 @@ pub struct ScopeReport {
     /// is written so `trace.jsonl` cannot claim a ceiling the kernel refused; under
     /// `--explain-scope` it carries the outcome of the same write against a throwaway cgroup that
     /// is created and removed. Declaring a ceiling that does not apply changes no class and refuses
-    /// no launch — `io.max` is the one non-fatal cgroup limit — so without this field the shortfall
-    /// had nowhere at all to appear.
+    /// no launch — `io.max` is the one non-fatal cgroup limit — so this field is the only place
+    /// the shortfall appears.
     pub io_max: IoMaxReport,
 }
 
@@ -1101,8 +1101,8 @@ mod tests {
         assert!(container.contains("outside the container"));
         assert!(!container.contains("apparmor_parser"));
 
-        // The probe now rehearses the pivot, so a host that mounts and will not pivot is refused
-        // at launch with its own text rather than at the first subprocess with `E-RUN-014`.
+        // A host that mounts and will not pivot is refused at launch with its own text, rather
+        // than at the first subprocess with `E-RUN-014`.
         let pivot = containment_shortfall_reason(
             ContainmentClass::Sealed,
             ContainmentClass::Advisory,
@@ -1333,7 +1333,8 @@ mod tests {
     }
 
     /// A ceiling that did not apply has to be visible in the rendering an operator reads, not
-    /// only in the JSON — this is the report that was implying an I/O bound it did not have.
+    /// only in the JSON: this report is where the claim of an I/O bound would otherwise stand
+    /// uncontradicted.
     #[test]
     fn the_rendered_resource_plane_states_what_became_of_the_io_ceiling() {
         let rendered = scope_report_for_tier(

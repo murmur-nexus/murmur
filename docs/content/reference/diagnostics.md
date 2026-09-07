@@ -1542,14 +1542,13 @@ declaring `capabilities.spawn.allow` on a capsule that does not delegate.
 scope did not succeed. Once per launch, on stderr and in the session's `logs/bootstrap.log`.
 
 ```text
-[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): writing `0:30 rbps=104857600 wbps=104857600` to the scope's io.max: No such device (os error 19) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-021)
+[capsule-runtime] warning[W-SEC-021]: the declared capabilities.resources.cgroup_io_bytes_per_sec ceiling did not apply to this session's cgroup scope, so this capsule's native subprocess tree has no I/O bandwidth bound; memory.max, pids.max and cpu.max are still enforced on the scope (declared 104857600 bytes/s): the filesystem mounted at /dev/shm is backed by `tmpfs`, which is not a block device, so no io.max ceiling can name one (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-021)
 ```
 
-**Why it matters:** `io.max` names a block device by `MAJ:MIN`, and the backing device of a path
-cannot always be resolved to one the block layer accepts — tmpfs, overlayfs, btrfs subvolumes and
-device-mapper stacks all break the assumption. Because a default ceiling is always applied, every
-capsule that gets a cgroup scope has a declared I/O ceiling, so without this warning the manifest
-and the scope report both go on implying a bound the kernel refused.
+**Why it matters:** `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block
+device behind it — tmpfs, overlayfs, FUSE and network mounts — has none to name. Because a default
+ceiling is always applied, every capsule that gets a cgroup scope has a declared I/O ceiling, and
+this warning is what says the ceiling is not on the scope.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. `io.max` is the
 one cgroup limit this runtime treats as non-fatal; `memory.max`, `pids.max` and `cpu.max` stay

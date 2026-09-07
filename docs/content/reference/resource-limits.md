@@ -99,14 +99,12 @@ not enforce `RLIMIT_DATA`.
 `cgroup_io_bytes_per_sec` is the one cgroup limit whose failure does not refuse a launch.
 `memory.max`, `pids.max` and `cpu.max` are settable on any cgroup v2 host once the controllers are
 delegated, so a failure there means the bound genuinely does not exist and the session must not
-start. `io.max` names a block device by `MAJ:MIN`, and the backing device of a path cannot always
-be resolved to one the block layer accepts — tmpfs, overlayfs, btrfs subvolumes and device-mapper
-stacks all break the assumption. A capsule that saturates disk bandwidth is slow; one that
-exhausts memory or pids is fatal.
+start. `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block device behind it
+— tmpfs, overlayfs, FUSE and network mounts — has none to name. A capsule that saturates disk
+bandwidth is slow; one that exhausts memory or pids is fatal.
 
-Non-fatal is not silent. Every session reports what became of the ceiling, in an `io_max` object
-carried by `mur run --explain-scope --json` and by `session_start.effective_grants` in
-`trace.jsonl`:
+Every session reports what became of the ceiling, in an `io_max` object carried by
+`mur run --explain-scope --json` and by `session_start.effective_grants` in `trace.jsonl`:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -119,13 +117,24 @@ carried by `mur run --explain-scope --json` and by `session_start.effective_gran
 | `enforced` | The `io.max` write succeeded against the device backing the workdir. The ceiling is on the scope |
 | `unavailable` | A scope exists and the write did not succeed. `memory.max`, `pids.max` and `cpu.max` are still enforced on it; I/O bandwidth is not bounded. [`W-SEC-021`](diagnostics.md#w-sec-021) reports it |
 | `not-required` | No scope was asked for: the capsule can reach no native subprocess, or this is not Linux |
-| `not-probed` | Nobody asked. A report constructed rather than measured claims nothing |
+| `not-probed` | The write was never attempted, so nothing is claimed either way |
 
 The value is established by performing the write, never by inferring it from the delegated
 controller list: `mur run --explain-scope` creates a throwaway cgroup, writes the same line a
 launch writes, and removes the directory again, so the diagnostic answers the question by
-exercising it. The would-be workdir does not exist at that point, so the device is resolved from
-its nearest existing ancestor.
+exercising it.
+
+The device that write names is resolved in three steps, because neither of the two numbers closest
+to hand is one the block layer accepts:
+
+| Step | Read from | Why |
+|---|---|---|
+| The filesystem behind the workdir | `st_dev` of the nearest existing ancestor of the path | Under `--explain-scope` the workdir does not exist yet, and a launch's workdir sits on the same filesystem as the project directory |
+| The device it was mounted from | `/proc/self/mountinfo` | btrfs, overlayfs, tmpfs and every FUSE mount are given an anonymous device number, which names no device |
+| The whole disk carrying that device | `/sys/dev/block/MAJ:MIN` | An `io.max` entry binds to a request queue and only a whole disk carries one, so the kernel refuses a partition such as `/dev/nvme0n1p7` |
+
+A filesystem that survives all three has a ceiling written against it; one that reaches the second
+step with a source such as `tmpfs` has no device, and that is what `unavailable` reports.
 
 To see both statuses on one host, run the same capsule from a project on a tmpfs and from one on a
 block-device-backed filesystem:

@@ -162,9 +162,9 @@ pub enum IoMaxStatus {
 /// The declared I/O ceiling and what became of it, carried into `--explain-scope`, into
 /// `session_start.effective_grants` and into `W-SEC-021`.
 ///
-/// A failed `io.max` write used to be one `eprintln!` note beside a scope report and a manifest
-/// that both went on implying an I/O ceiling. This is the value that makes the outcome travel with
-/// the claim.
+/// `io.max` is non-fatal, so a ceiling that did not apply refuses nothing. This value is what
+/// carries that outcome alongside the claim, so the manifest's declared ceiling and what the
+/// kernel accepted cannot disagree in silence.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct IoMaxReport {
     /// The effective `capabilities.resources.cgroup_io_bytes_per_sec`, after
@@ -202,8 +202,8 @@ impl IoMaxReport {
 
     /// No cgroup scope is required because this capsule can reach no native subprocess.
     ///
-    /// Public and reason-free by design: `mur run --explain-scope` has to produce the byte-for-byte
-    /// report a launch produces — `trace.rs`'s `session_start_effective_grants_match_explain_scope_json`
+    /// Public, and takes no reason argument: `mur run --explain-scope` has to produce the
+    /// byte-for-byte report a launch produces — `trace.rs`'s `session_start_effective_grants_match_explain_scope_json`
     /// asserts the two objects are equal — so the wording lives here rather than once per caller.
     #[must_use]
     pub fn no_scope_required(declared_bytes_per_sec: u64) -> Self {
@@ -268,8 +268,8 @@ pub(crate) fn warn_for_unenforced_io_max(workdir: &Path, report: &IoMaxReport) {
 
 /// What [`prepare_scope`] establishes: the scope, and what became of its I/O ceiling.
 ///
-/// A struct rather than a tuple so the two values cannot be swapped at a call site, and so the
-/// report is impossible to drop on the floor the way the `eprintln!` note it replaced was.
+/// A struct rather than a tuple so the two values cannot be swapped at a call site, and so a
+/// caller cannot take the scope without also being handed the ceiling's outcome.
 #[derive(Debug)]
 pub(crate) struct PreparedScope {
     /// The scope, or `None` where none was required or none can exist.
@@ -328,9 +328,9 @@ pub(crate) fn prepare_scope(
 ///
 /// The diagnostic half of [`prepare_scope`], for `mur run --explain-scope`, which runs before any
 /// workdir exists and before any session is staged. Inferring the answer from "is the `io`
-/// controller delegated" is exactly the mistake this card exists to remove: the write can fail for
-/// a device the block layer will not accept (tmpfs, overlayfs, a device-mapper stack) on a host
-/// whose `io` controller is delegated perfectly well.
+/// controller delegated" is wrong: the write can fail for a device the block layer will not
+/// accept (tmpfs, overlayfs, a device-mapper stack) on a host whose `io` controller is delegated
+/// perfectly well. Only performing the write answers it.
 ///
 /// `workdir` need not exist. The device is resolved from its nearest existing ancestor, so the
 /// probe names the device a launch would use without creating anything.
@@ -714,23 +714,15 @@ impl CgroupScope {
 /// and by [`probe_io_max`] under `--explain-scope`, so the diagnostic exercises the identical
 /// write the launch performs rather than a paraphrase of it.
 ///
-/// The device is resolved from the nearest *existing* ancestor of `workdir`: `--explain-scope`
-/// runs before the workdir is created, and a launch's workdir sits on the same filesystem as the
-/// project directory it is created under.
+/// The device comes from [`io_max_device`], which resolves it from the nearest *existing*
+/// ancestor of `workdir`: `--explain-scope` runs before the workdir is created, and a launch's
+/// workdir sits on the same filesystem as the project directory it is created under.
 #[cfg(target_os = "linux")]
 fn write_io_max(scope_path: &Path, bytes_per_sec: u64, workdir: &Path) -> IoMaxReport {
-    use std::os::linux::fs::MetadataExt;
-
-    let Some(metadata) = nearest_existing_ancestor_metadata(workdir) else {
-        return IoMaxReport::unavailable(
-            bytes_per_sec,
-            format!(
-                "could not stat {} or any ancestor of it to find its backing device",
-                workdir.display()
-            ),
-        );
+    let (major, minor) = match io_max_device(workdir) {
+        Ok(device) => device,
+        Err(reason) => return IoMaxReport::unavailable(bytes_per_sec, reason),
     };
-    let (major, minor) = device_major_minor(metadata.st_dev());
     let value = format!("{major}:{minor} rbps={bytes_per_sec} wbps={bytes_per_sec}");
     match std::fs::write(scope_path.join("io.max"), format!("{value}\n")) {
         Ok(()) => IoMaxReport::enforced(bytes_per_sec),
@@ -746,17 +738,196 @@ fn write_io_max(scope_path: &Path, bytes_per_sec: u64, workdir: &Path) -> IoMaxR
     }
 }
 
-/// `metadata()` of `path`, or of the closest ancestor of it that exists.
+/// The `MAJ:MIN` an `io.max` line has to name for the filesystem behind `path`, or why that
+/// filesystem has no device a ceiling can name.
 ///
-/// `st_dev` is a property of the filesystem, not of the leaf, so an ancestor's answer is the
-/// answer for a path that has not been created yet — which is the state `--explain-scope` finds
-/// the would-be workdir in.
+/// `st_dev` is not the answer on its own. Two things stand between a path and a device the block
+/// layer accepts:
+///
+/// * A filesystem the kernel gives an anonymous `dev_t` — btrfs, overlayfs, tmpfs, every FUSE
+///   mount — has major `0`, which names no device. `/proc/self/mountinfo` records what the
+///   covering mount was mounted from, and where that source is a block device node its `st_rdev`
+///   is the device the filesystem's I/O actually reaches.
+/// * `blkcg` binds a limit to a request queue and only a whole disk carries one, so the block
+///   layer answers `ENODEV` for a partition — which is what `st_dev` reports for the common case
+///   of a filesystem on `/dev/sda1` or `/dev/nvme0n1p7`. [`whole_disk_device`] takes the last hop.
+///
+/// A filesystem with no block device behind it at all carries no I/O ceiling, and the `Err` says
+/// which mount and what it is backed by. That is a measurement of the resolution, not a guess
+/// about the write: there is no device for a write to name.
 #[cfg(target_os = "linux")]
-fn nearest_existing_ancestor_metadata(path: &Path) -> Option<std::fs::Metadata> {
+fn io_max_device(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::linux::fs::MetadataExt;
+
+    let Some(existing) = nearest_existing_ancestor(path) else {
+        return Err(format!(
+            "could not stat {} or any ancestor of it to find its backing device",
+            path.display()
+        ));
+    };
+    let metadata = existing.metadata().map_err(|error| {
+        format!(
+            "could not stat {} to find its backing device: {error}",
+            existing.display()
+        )
+    })?;
+    let (major, minor) = device_major_minor(metadata.st_dev());
+    let (major, minor) = if major == 0 {
+        mount_source_device(existing)?
+    } else {
+        (major, minor)
+    };
+    Ok(whole_disk_device(major, minor))
+}
+
+/// The block device the mount covering `path` was mounted from.
+///
+/// Reached only for a filesystem whose `st_dev` is anonymous. `path` must exist, so that
+/// canonicalizing it yields the path the kernel's own mount lookup would take — a mount point
+/// reached through a symlink matches nothing in `mountinfo`.
+#[cfg(target_os = "linux")]
+fn mount_source_device(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").map_err(|error| {
+        format!(
+            "reading /proc/self/mountinfo to find the device behind {}: {error}",
+            resolved.display()
+        )
+    })?;
+    let Some(mount) = mount_covering(&mountinfo, &resolved) else {
+        return Err(format!(
+            "no mount in /proc/self/mountinfo covers {}, so its backing device is unknown",
+            resolved.display()
+        ));
+    };
+    match std::fs::metadata(&mount.source) {
+        Ok(metadata) if metadata.file_type().is_block_device() => {
+            Ok(device_major_minor(metadata.rdev()))
+        }
+        _ => Err(format!(
+            "the filesystem mounted at {} is backed by `{}`, which is not a block device, so no \
+             io.max ceiling can name one",
+            mount.mount_point.display(),
+            mount.source.display()
+        )),
+    }
+}
+
+/// `major:minor` of the whole disk carrying `major:minor`, which is itself where it is not a
+/// partition.
+///
+/// A partition has a `partition` attribute in sysfs and sits inside its disk's directory, so the
+/// parent's `dev` is the disk. Every failure to read sysfs answers with the device as given: the
+/// write that follows is what decides, and reporting a device the block layer then refuses is a
+/// better outcome than reporting a device nothing was tried against.
+#[cfg(target_os = "linux")]
+fn whole_disk_device(major: u64, minor: u64) -> (u64, u64) {
+    let device = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+    if !device.join("partition").exists() {
+        return (major, minor);
+    }
+    std::fs::read_to_string(device.join("../dev"))
+        .ok()
+        .and_then(|contents| parse_dev_line(&contents))
+        .unwrap_or((major, minor))
+}
+
+/// The `MAJ:MIN` on a sysfs `dev` attribute.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_dev_line(contents: &str) -> Option<(u64, u64)> {
+    let (major, minor) = contents.trim().split_once(':')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// One `/proc/self/mountinfo` line, reduced to the two fields that identify a filesystem's
+/// backing device.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct MountEntry {
+    /// Where the filesystem is mounted, as the kernel spells it.
+    mount_point: PathBuf,
+    /// What it was mounted from: a block device node for an ordinary disk filesystem, and a bare
+    /// name such as `tmpfs` for one with nothing behind it.
+    source: PathBuf,
+}
+
+/// The mount `path` lands in: the entry whose mount point is the longest prefix of it.
+///
+/// Later lines win a tie. `mountinfo` is in mount order, so a filesystem mounted over an earlier
+/// one at the same point is the one a lookup reaches.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mount_covering(mountinfo: &str, path: &Path) -> Option<MountEntry> {
+    let mut best: Option<(usize, MountEntry)> = None;
+    for line in mountinfo.lines() {
+        let Some(entry) = parse_mount_entry(line) else {
+            continue;
+        };
+        if !path.starts_with(&entry.mount_point) {
+            continue;
+        }
+        let depth = entry.mount_point.components().count();
+        if best.as_ref().is_none_or(|(best, _)| depth >= *best) {
+            best = Some((depth, entry));
+        }
+    }
+    best.map(|(_, entry)| entry)
+}
+
+/// Mount point and source out of one `mountinfo` line.
+///
+/// The optional-fields run is terminated by a lone `-`, which no field can contain: `mountinfo`
+/// escapes space, tab, newline and backslash as octal, so splitting on `" - "` is unambiguous.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_mount_entry(line: &str) -> Option<MountEntry> {
+    let (mounted, backing) = line.split_once(" - ")?;
+    let mount_point = mounted.split_whitespace().nth(4)?;
+    let source = backing.split_whitespace().nth(1)?;
+    Some(MountEntry {
+        mount_point: unescape_octal(mount_point),
+        source: unescape_octal(source),
+    })
+}
+
+/// Decode `mountinfo`'s `\NNN` octal escapes, byte-wise, so a mount point containing a space or a
+/// non-ASCII byte compares equal to the path the kernel reports for it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn unescape_octal(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = field.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..index + 4]
+                .iter()
+                .all(|byte| (b'0'..=b'7').contains(byte));
+        if escape {
+            let digits = &field[index + 1..index + 4];
+            out.push(u8::from_str_radix(digits, 8).expect("three octal digits"));
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// The closest ancestor of `path` that exists, which is `path` itself where it does.
+///
+/// The backing device is a property of the filesystem, not of the leaf, so an ancestor's answer
+/// is the answer for a path that has not been created yet — the state `--explain-scope` finds the
+/// would-be workdir in.
+#[cfg(target_os = "linux")]
+fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
     let mut candidate = Some(path);
     while let Some(current) = candidate {
-        if let Ok(metadata) = current.metadata() {
-            return Some(metadata);
+        if current.exists() {
+            return Some(current);
         }
         candidate = current.parent();
     }
@@ -1150,6 +1321,28 @@ pub fn cgroup_delegation_available() -> bool {
     }
 }
 
+/// Whether the filesystem behind `path` has a block device an `io.max` ceiling can name.
+///
+/// Test support beside [`cgroup_delegation_available`], for the half of the `io.max` scenario
+/// that needs a ceiling to actually apply: a checkout on tmpfs, on overlayfs or on a FUSE mount
+/// has no device for the block layer to bind a limit to, and `enforced` is unreachable there
+/// however well the host delegates cgroups. Answered through [`io_max_device`], the same
+/// resolution a launch performs, so a test cannot stand down on a host the launch would have
+/// satisfied. Off Linux there is no `io.max` at all.
+#[must_use]
+pub fn io_max_device_available(path: &Path) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        io_max_device(path).is_ok()
+    }
+}
+
 /// Whether a test that launches a subprocess-capable capsule must stand down on this host,
 /// printing the blocker when it must.
 ///
@@ -1262,8 +1455,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_device_is_resolved_from_the_nearest_existing_ancestor() {
-        use std::os::linux::fs::MetadataExt;
-
         let temp = tempfile::tempdir().unwrap();
         let missing = temp
             .path()
@@ -1271,10 +1462,106 @@ mod tests {
             .join("does")
             .join("not")
             .join("exist");
-        let resolved = nearest_existing_ancestor_metadata(&missing)
-            .expect("an ancestor of a tempdir always exists");
-        assert_eq!(resolved.st_dev(), temp.path().metadata().unwrap().st_dev());
+        assert_eq!(
+            nearest_existing_ancestor(&missing),
+            Some(temp.path()),
+            "an ancestor of a tempdir always exists"
+        );
+        assert_eq!(
+            io_max_device(&missing).ok(),
+            io_max_device(temp.path()).ok(),
+            "a path that does not exist yet must resolve to its filesystem's device"
+        );
         assert!(!missing.exists(), "resolving a device must create nothing");
+    }
+
+    /// The mount a path lands in is the deepest one covering it, not the first line that matches
+    /// — `/` covers every path, and a nested mount is what a lookup actually reaches.
+    #[test]
+    fn the_covering_mount_is_the_deepest_one() {
+        let mountinfo = "\
+25 30 0:29 / / rw,relatime shared:1 - btrfs /dev/nvme0n1p5 rw,subvol=/
+26 25 0:31 / /dev/shm rw,nosuid shared:2 - tmpfs tmpfs rw,inode64
+27 25 0:41 / /space rw,relatime shared:3 - btrfs /dev/nvme0n1p7 rw,subvol=/
+";
+        let covering = |path: &str| mount_covering(mountinfo, Path::new(path)).unwrap();
+
+        assert_eq!(
+            covering("/space/project/workdir").source,
+            PathBuf::from("/dev/nvme0n1p7")
+        );
+        assert_eq!(covering("/dev/shm/project").source, PathBuf::from("tmpfs"));
+        assert_eq!(
+            covering("/home/someone").source,
+            PathBuf::from("/dev/nvme0n1p5"),
+            "a path under no nested mount belongs to the root filesystem"
+        );
+        assert_eq!(
+            covering("/spaceship").source,
+            PathBuf::from("/dev/nvme0n1p5"),
+            "mount points match whole path components, not string prefixes"
+        );
+    }
+
+    /// A filesystem mounted over another at the same point is the one a lookup reaches, so the
+    /// later line wins.
+    #[test]
+    fn a_mount_over_another_at_the_same_point_wins() {
+        let mountinfo = "\
+25 30 0:29 / / rw shared:1 - ext4 /dev/sda1 rw
+26 25 0:31 / /mnt rw shared:2 - ext4 /dev/sdb1 rw
+27 25 0:32 / /mnt rw shared:3 - ext4 /dev/sdc1 rw
+";
+        assert_eq!(
+            mount_covering(mountinfo, Path::new("/mnt/data"))
+                .unwrap()
+                .source,
+            PathBuf::from("/dev/sdc1")
+        );
+    }
+
+    /// `mountinfo` escapes the four characters that would break its own field separation, and a
+    /// mount point that does not decode compares equal to nothing.
+    #[test]
+    fn mount_point_escapes_are_decoded() {
+        let mountinfo = "\
+25 30 0:29 / /media/a\\040disk rw shared:1 - ext4 /dev/sdb1 rw
+";
+        let entry = mount_covering(mountinfo, Path::new("/media/a disk/project")).unwrap();
+        assert_eq!(entry.mount_point, PathBuf::from("/media/a disk"));
+        assert_eq!(entry.source, PathBuf::from("/dev/sdb1"));
+        assert_eq!(unescape_octal("no\\134escape"), PathBuf::from("no\\escape"));
+        assert_eq!(
+            unescape_octal("\\04"),
+            PathBuf::from("\\04"),
+            "a truncated escape is not an escape"
+        );
+    }
+
+    /// A sysfs `dev` attribute is the only place the parent disk's number comes from.
+    #[test]
+    fn sysfs_dev_attributes_are_read_as_major_minor() {
+        assert_eq!(parse_dev_line("259:0\n"), Some((259, 0)));
+        assert_eq!(parse_dev_line(""), None);
+        assert_eq!(parse_dev_line("259"), None);
+    }
+
+    /// The block layer binds an `io.max` entry to a request queue, and only a whole disk carries
+    /// one — so whatever device this checkout sits on, the resolved one must not be a partition.
+    /// Naming a partition is the failure that makes `enforced` unreachable on an ordinary host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_resolved_device_is_never_a_partition() {
+        let Ok((major, minor)) = io_max_device(Path::new(".")) else {
+            // A checkout on a filesystem with no block device behind it has no device to check,
+            // and `write_io_max` reports that rather than naming one.
+            return;
+        };
+        let sysfs = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+        assert!(
+            !sysfs.join("partition").exists(),
+            "io.max was given the partition {major}:{minor}, which the block layer refuses"
+        );
     }
 
     /// The diagnostic answers the question by exercising it, and leaves nothing behind whichever

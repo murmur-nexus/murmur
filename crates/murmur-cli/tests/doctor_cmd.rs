@@ -1304,15 +1304,22 @@ fn doctor_names_the_running_binary_and_what_attaches_to_it() {
         .env_remove("NEXUS_API_KEY")
         .current_dir(project.path())
         .arg("doctor")
-        .assert();
+        // A project whose capabilities declare nothing reaches no `fixes` entry, and the
+        // attachment block adds none whichever profile the kernel reports — the one claim a
+        // regression in this block could break silently.
+        .assert()
+        .success();
     let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
 
     assert!(
         stdout.contains("AppArmor / user namespaces"),
         "stdout was:\n{stdout}"
     );
+    // Canonicalized, as doctor reports it: a `TMPDIR` with a symlink component would otherwise
+    // fail this on the spelling rather than on the behaviour.
+    let reported = fs::canonicalize(&unusual).unwrap_or_else(|_| unusual.clone());
     assert!(
-        stdout.contains(&format!("this binary:  {}", unusual.display())),
+        stdout.contains(&format!("this binary:  {}", reported.display())),
         "doctor must name the binary it is actually running as, stdout was:\n{stdout}"
     );
     assert!(

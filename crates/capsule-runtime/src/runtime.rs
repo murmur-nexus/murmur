@@ -1113,9 +1113,8 @@ pub fn launch_session(
     // and the script path both clone it later in this function. `stage_session` could not fill it:
     // the answer does not exist until the scope has been created.
     staged.scope_report.io_max = prepared_scope.io_max.clone();
-    // Non-fatal and therefore silent until now: `io.max` is the one cgroup limit a host is not
-    // refused for, so a declared ceiling that did not apply has to be *said* or the manifest and
-    // the scope report both go on implying it.
+    // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
+    // not apply has to be *said* here or the manifest and the scope report both go on implying it.
     cgroup::warn_for_unenforced_io_max(&staged.workdir, &prepared_scope.io_max);
     let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
