@@ -379,6 +379,84 @@ fn asking_for_sealed_adds_only_paths_under_the_session_directory() {
     }
 }
 
+/// The `Not protected here` block, read off the real binary on whatever host runs the suite.
+///
+/// Asserted as a biconditional rather than as one branch: `achieved_containment == "sealed"` iff
+/// the block is empty. A test that assumed either branch would pass on CI and fail on the machine
+/// the sealed tier was built for, which is the mistake the rest of this file exists to avoid.
+///
+/// The strings themselves are asserted in `capsule-runtime`'s own tests, against the function that
+/// derives them. What is asserted here is the part only the binary can show: that the JSON key
+/// reaches the report, that the human rendering carries the same statements in the same words, and
+/// that the block sits between `Containment` and `Effective grants`.
+#[test]
+fn explain_scope_discloses_what_this_host_does_not_protect() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - bash\n",
+    );
+
+    let report = explain_scope_report(&home, project.path(), &[]);
+    let boundary = &report["filesystem_boundary"];
+    let statements = boundary["not_protected"]
+        .as_array()
+        .expect("filesystem_boundary.not_protected is always an array");
+
+    let expected_restriction = match report["achieved_containment"].as_str().unwrap() {
+        "sealed" => "absent",
+        "scoped" => "enforced",
+        other => {
+            assert_eq!(other, "advisory", "{report}");
+            "advisory"
+        }
+    };
+    assert_eq!(boundary["restriction"], expected_restriction, "{report}");
+
+    let rendered = String::from_utf8(
+        mur_run(&home, project.path(), &["--explain-scope"])
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    let sealed = report["achieved_containment"] == "sealed";
+    assert_eq!(
+        sealed,
+        statements.is_empty(),
+        "not_protected is empty exactly at sealed: {report}"
+    );
+    assert_eq!(
+        sealed,
+        !rendered.contains("Not protected here"),
+        "the heading is printed exactly when there is something to disclaim:\n{rendered}"
+    );
+
+    if sealed {
+        return;
+    }
+
+    let heading = rendered.find("\nNot protected here\n").unwrap();
+    assert!(
+        heading > rendered.find("Containment\n").unwrap(),
+        "{rendered}"
+    );
+    assert!(
+        heading < rendered.find("\nEffective grants\n").unwrap(),
+        "{rendered}"
+    );
+    for statement in statements {
+        let statement = statement.as_str().unwrap();
+        assert!(
+            rendered.contains(statement),
+            "the human report must carry the JSON statement verbatim: {statement}\n{rendered}"
+        );
+    }
+}
+
 /// One `--explain-scope --json` report, parsed.
 fn explain_scope_report(home: &TempDir, project_dir: &Path, extra: &[&str]) -> serde_json::Value {
     let mut args = vec!["--explain-scope", "--json"];

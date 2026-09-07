@@ -375,6 +375,45 @@ the manifest declared. A `sealed` capsule allowing an interpreter and a shell ne
 descriptors to launch, and below that it is refused at startup rather than silently weakened. A
 manifest with a very tight `max_open_files` may need to raise it.
 
+## What the composed root contains { #composed-root-listability }
+
+A `sealed` capsule runs inside a fresh `tmpfs` the runtime populates and then `pivot_root`s onto. It
+holds exactly what the sections above put there, and every other path is absent:
+
+| Path | What it is | `ls` |
+|---|---|---|
+| `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32` | The [runtime-tree grant](#sealed-runtime-tree-grant), bind-mounted read-only from the host | lists |
+| The sixteen [`/etc` allowlist](#sealed-etc-grant) entries | Bind-mounted read-only, the account databases synthetic | lists, on the six directory entries |
+| `/dev` | A private tmpfs carrying the [OCI device set](#capsule-device-set) | `Permission denied` |
+| `/proc` | Masked with `hidepid` where the kernel allows it, bound from the host where it does not | `Permission denied` |
+| `/tmp` | A directory inside the session workdir, bound here so it stays inside the workdir's size budget | lists |
+| The workdir, at its own absolute host path | The capsule's accessible workdir, read-write, and the only writable path in the root | lists |
+| `/`, `/etc` as a directory, and each path component above the workdir | Scaffolding the runtime created so the mounts below have somewhere to land | `Permission denied` |
+
+**`cd` and `stat` succeed where `ls` fails, and that is the design.** With a workdir at
+`/home/you/project`, the composed root carries `/home` and `/home/you` as scaffolding holding
+nothing but the path down to that workdir:
+
+```console
+$ cd /home && stat -c '%F' /home
+directory
+$ ls /home
+ls: cannot open directory '/home': Permission denied
+```
+
+The reason is where the Landlock rules come from. A rule is attached to an **inode**, and the
+runtime opens each rule's file descriptor in the parent process, against a real host path, before
+the fork that builds the root. A bind-mounted subtree carries its host inode through the
+`pivot_root`, so its rule follows it — which is why `ls /usr` lists. The root `tmpfs` and the
+directories created inside it after the fork are new inodes that did not exist when those
+descriptors were opened, so no rule was ever taken on them and the capsule's own default-deny
+Landlock domain applies. That is also why `ls /` is refused, and why `/dev` and `/proc` hold nodes
+the capsule can open inside directories it cannot enumerate.
+
+A capsule has no business enumerating the root of the filesystem it runs in, so nothing here is
+planned to change. The [manual procedures](#verification) record live output from a real `sealed`
+host for each row above.
+
 ## Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
 Every mechanism above governs a specific syscall (`socket`, `mknod`) or a specific resource (the
@@ -526,6 +565,39 @@ which is exactly the case an operator is inspecting.
 Under a declared `sealed` floor, a `capabilities.shell.allow` grant that cannot function
 inside the composed root is decided at staging rather than deep into a run — see
 [`E-CAP-006`](diagnostics.md#e-cap-006) and [`W-SEC-012`](diagnostics.md#w-sec-012).
+
+## Testing containment honestly { #testing-containment }
+
+Probe with an **absolute path to a real file that exists outside the workdir**, and read the file
+rather than checking that it exists:
+
+```console
+$ cat /home/you/.ssh/id_rsa
+cat: /home/you/.ssh/id_rsa: Permission denied
+```
+
+| Class | What the probe above prints |
+|---|---|
+| `advisory` | The file's contents. Nothing on the host denies the read |
+| `scoped` | `Permission denied` — Landlock refuses the open, and `stat` on the same path still succeeds |
+| `sealed` | `No such file or directory` — the path is not in the composed root |
+
+**The `~` form returns a false pass.** `cat ~/.ssh/id_rsa` answers `No such file or directory` on
+every tier, including a host that denies nothing. The tilde resolves through `HOME`, which the
+runtime rewrites to `<workdir>/.capsule-home` before every subprocess spawns, so the shell looked
+inside the workdir and the host path was never opened. The answer reports where the path landed, not
+what was denied. This holds on macOS too, which reaches `advisory` — the same absolute path there
+reads the file.
+
+`mur run --explain-scope` says the same thing on any host below `sealed`, under `Not protected
+here`, and `--explain-scope --json` carries it as `filesystem_boundary`.
+
+**The rewrite is intended and is staying.** It exists so a capsule writing to `~` scribbles inside
+its own workdir instead of a real home directory, and it is unconditional so that one capsule
+behaves the same way on every tier — making it tier-dependent would change a capsule's behaviour
+for a reason that has nothing to do with containment. See
+[Lock down a capsule](../how-to/lock-down-capsule.md) for the environment the subprocess starts
+with.
 
 ## Verification — how the containment claims are checked { #verification }
 

@@ -335,6 +335,128 @@ impl PreopenReport {
     }
 }
 
+/// What the achieved containment class restricts on the filesystem, as a stable wire name.
+///
+/// Derived from [`ContainmentClass`] alone and never from the tier, so the
+/// `capabilities.filesystem.workdir_exec` cap that [`achieved_containment_class`] applies is
+/// honoured here without being restated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilesystemRestriction {
+    /// `advisory`: no kernel mechanism mediates the filesystem, so a path outside the workdir is
+    /// reachable.
+    Advisory,
+    /// `scoped`: Landlock refuses the open, and the path outside the granted set still exists.
+    Enforced,
+    /// `sealed`: a composed root, where the path outside the capsule is not there to open.
+    Absent,
+}
+
+impl FilesystemRestriction {
+    /// The wire name, identical to what [`Serialize`] emits.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::Enforced => "enforced",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// What the achieved containment class does *not* protect, in words an operator can act on.
+///
+/// The counterpart to every grant beside it in a [`ScopeReport`]: those say what the capsule may
+/// reach, and this says which of the restrictions an operator would read into the class are not
+/// there. A tier that protects nothing otherwise reads as protective, because `achieved: advisory`
+/// is a status word and the report carries no sentence saying what it costs.
+///
+/// [`Self::not_protected`] is empty at [`ContainmentClass::Sealed`] and non-empty below it. It is
+/// serialized either way — an absent key identifies a runtime that predates the field, never a
+/// capsule with nothing to disclaim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FilesystemBoundaryReport {
+    /// What the achieved class restricts on the filesystem.
+    pub restriction: FilesystemRestriction,
+    /// One statement per protection an operator would otherwise assume, empty at
+    /// [`ContainmentClass::Sealed`]. Rendered verbatim under `Not protected here`, so the JSON and
+    /// the human report cannot word the same disclaimer differently.
+    pub not_protected: Vec<String>,
+}
+
+/// What `advisory` leaves unrestricted on the filesystem.
+///
+/// Names the mechanism rather than the class, because "advisory" is the word an operator has
+/// already read on the `achieved:` line and taken for a protection.
+const ADVISORY_FILESYSTEM_NOT_PROTECTED: &str =
+    "Filesystem restriction is advisory on this host: no kernel mechanism denies a read or a write \
+     outside the session workdir, so capabilities.filesystem.scope bounds what the runtime hands a \
+     subprocess rather than what that subprocess can reach. A Linux host with a usable Landlock \
+     ABI achieves scoped, where the kernel refuses the open.";
+
+/// What `scoped` leaves unrestricted on the filesystem.
+///
+/// Deliberately not the `advisory` sentence: Landlock really does mediate the filesystem here, and
+/// an operator told otherwise goes and hardens something the kernel already holds. What `scoped`
+/// does not do is make a path absent — the property
+/// `docs/content/reference/containment.md` states as "Landlock mediates the operations that touch a
+/// file, not path resolution".
+const SCOPED_FILESYSTEM_NOT_PROTECTED: &str =
+    "A path outside the granted set is denied rather than absent: Landlock refuses the open, and \
+     stat, access and readlink on that path still succeed and still report the real file's \
+     metadata, because Landlock mediates the operations that touch a file and not path resolution. \
+     A probe that only asks whether a path exists therefore learns nothing about what was denied — \
+     read the file to see the refusal.";
+
+/// What no tier protects, and the reason `--explain-scope` carries this block at all.
+///
+/// Identical at every achieved class below `sealed`, because the rewrite it describes is identical:
+/// `HOME` is replaced with the session's synthetic home on every tier and every platform (see
+/// `crate::shell`), so the obvious `~`-based containment probe answers *no such file* on a host
+/// that denies nothing.
+const PATH_REWRITING_NOT_PROTECTED: &str =
+    "Path rewriting is a convenience, not a boundary: HOME is set to <workdir>/.capsule-home on \
+     every tier, so `cat ~/.ssh/id_rsa` answers \"No such file or directory\" whether or not \
+     anything was denied — the tilde resolved into the workdir and the host file was never looked \
+     for. A ~-based probe is therefore never evidence of containment; test with an absolute path \
+     to a real file outside the workdir instead.";
+
+/// The filesystem boundary an `achieved` class actually provides, and the protections it does not.
+///
+/// Pure and derived from the achieved class alone, so `--explain-scope` and
+/// `session_start.effective_grants` cannot word the same disclaimer differently: both go through
+/// [`scope_report_for_tier`], which calls this once with the class it has already computed.
+#[must_use]
+pub fn filesystem_boundary(achieved: ContainmentClass) -> FilesystemBoundaryReport {
+    // The path-rewriting statement rides along with the class-specific one rather than standing on
+    // its own, so `sealed` — where a composed root makes the paths outside it absent, and the `~`
+    // rewrite lands inside the only writable path in that root — discloses nothing at all.
+    let (restriction, filesystem) = match achieved {
+        ContainmentClass::Advisory => (
+            FilesystemRestriction::Advisory,
+            Some(ADVISORY_FILESYSTEM_NOT_PROTECTED),
+        ),
+        ContainmentClass::Scoped => (
+            FilesystemRestriction::Enforced,
+            Some(SCOPED_FILESYSTEM_NOT_PROTECTED),
+        ),
+        ContainmentClass::Sealed => (FilesystemRestriction::Absent, None),
+    };
+
+    let not_protected = match filesystem {
+        Some(filesystem) => vec![
+            filesystem.to_string(),
+            PATH_REWRITING_NOT_PROTECTED.to_string(),
+        ],
+        None => Vec::new(),
+    };
+
+    FilesystemBoundaryReport {
+        restriction,
+        not_protected,
+    }
+}
+
 /// Read-only answer to "what would this capsule actually be allowed to do on this host?".
 ///
 /// Built from the already-parsed [`CapabilityPolicy`] plus one host tier probe. Nothing here
@@ -520,6 +642,19 @@ pub struct ScopeReport {
     /// no launch — `io.max` is the one non-fatal cgroup limit — so this field is the only place
     /// the shortfall appears.
     pub io_max: IoMaxReport,
+    /// What the achieved containment class does not restrict on the filesystem — the block
+    /// `--explain-scope` prints as `Not protected here`, directly under `Containment`.
+    ///
+    /// Always serialized (never skipped), on the same terms as [`Self::state_stores`]: an absent
+    /// key identifies a runtime that predates the field, and an empty
+    /// [`FilesystemBoundaryReport::not_protected`] identifies a session with nothing to disclaim.
+    ///
+    /// Derived from [`Self::achieved_containment`] and from no [`CapabilityPolicy`] field, in
+    /// [`filesystem_boundary`], which is why it stands beside the grants rather than among them:
+    /// it qualifies every one of them at once, on the terms [`render_read_only`] sets one field
+    /// over — a protection stated without its qualification reads as a boundary the capsule does
+    /// not have.
+    pub filesystem_boundary: FilesystemBoundaryReport,
 }
 
 impl ScopeReport {
@@ -544,6 +679,8 @@ impl ScopeReport {
                 None => "n/a",
             }
         ));
+
+        out.push_str(&render_not_protected(&self.filesystem_boundary));
 
         out.push_str("\nEffective grants\n");
         out.push_str(&format!(
@@ -695,6 +832,24 @@ pub fn render_read_only(read_only_paths: &[String], advisory_for: &[String]) -> 
     out
 }
 
+/// The `Not protected here` block: one line per statement in
+/// [`FilesystemBoundaryReport::not_protected`], and nothing at all when that list is empty.
+///
+/// A heading with no entries under it would read as a disclaimer the reader had to interpret, so
+/// `sealed` prints no heading rather than an empty one. Every line is a statement from the report
+/// verbatim, so the human rendering and `--explain-scope --json` say the same thing in the same
+/// words.
+fn render_not_protected(boundary: &FilesystemBoundaryReport) -> String {
+    if boundary.not_protected.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nNot protected here\n");
+    for statement in &boundary.not_protected {
+        out.push_str(&format!("  - {statement}\n"));
+    }
+    out
+}
+
 fn push_list(out: &mut String, label: &str, values: &[String]) {
     if values.is_empty() {
         out.push_str(&format!("  {label}: <none>\n"));
@@ -839,6 +994,10 @@ pub(crate) fn scope_report_for_tier(
         // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.
         io_max,
+        // Derived here, from the `achieved` class already computed above, rather than filled by
+        // either caller: `--explain-scope --json` and `session_start.effective_grants` are the
+        // same object, and a field either of them worded for itself would make them differ.
+        filesystem_boundary: filesystem_boundary(achieved),
     }
 }
 
@@ -2397,6 +2556,202 @@ mod tests {
                 object.contains_key(*report_key),
                 "the table maps CapabilityPolicy::{policy_field} to a report key \
                  '{report_key}' that a serialized ScopeReport does not carry"
+            );
+        }
+    }
+
+    /// A report at `tier`, off [`sample_policy`] with `advisory` declared, so the achieved class
+    /// is the only thing that varies between the cases below.
+    fn boundary_report_for_tier(tier: EnforcementTier) -> ScopeReport {
+        scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Advisory,
+            tier,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport::default(),
+        )
+    }
+
+    /// A tier that mediates nothing says so, in the block an operator reads before the grants.
+    #[test]
+    fn an_advisory_class_reports_what_it_does_not_protect() {
+        let report = boundary_report_for_tier(EnforcementTier::EnvironmentOnly);
+
+        assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Advisory
+        );
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 2);
+
+        let filesystem = &report.filesystem_boundary.not_protected[0];
+        assert!(filesystem.contains("advisory"), "{filesystem}");
+        assert!(
+            filesystem.contains("denies a read or a write outside the session workdir"),
+            "{filesystem}"
+        );
+
+        let rewriting = &report.filesystem_boundary.not_protected[1];
+        assert!(rewriting.contains("not a boundary"), "{rewriting}");
+        assert!(rewriting.contains("HOME"), "{rewriting}");
+
+        let rendered = report.render();
+        let heading = rendered
+            .find("\nNot protected here\n")
+            .expect("a tier below sealed prints the block");
+        assert!(
+            heading > rendered.find("Containment\n").unwrap(),
+            "the block belongs under Containment:\n{rendered}"
+        );
+        assert!(
+            heading < rendered.find("\nEffective grants\n").unwrap(),
+            "the block belongs ahead of the grants an operator reads it against:\n{rendered}"
+        );
+        for statement in &report.filesystem_boundary.not_protected {
+            assert!(rendered.contains(statement.as_str()), "{rendered}");
+        }
+    }
+
+    /// `scoped` really does mediate the filesystem, so its statement says what `scoped` leaves
+    /// open rather than repeating `advisory`'s. Sending an operator to harden a boundary the
+    /// kernel already holds is the same class of untruth this block exists to remove.
+    #[test]
+    fn a_scoped_class_reports_denial_rather_than_absence() {
+        let report = boundary_report_for_tier(EnforcementTier::KernelFull);
+
+        assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Enforced
+        );
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 2);
+
+        let filesystem = &report.filesystem_boundary.not_protected[0];
+        assert!(
+            !filesystem.contains("advisory"),
+            "Landlock mediates the filesystem at scoped: {filesystem}"
+        );
+        assert!(
+            filesystem.contains("denied rather than absent"),
+            "{filesystem}"
+        );
+        for probe in ["stat", "access", "readlink"] {
+            assert!(filesystem.contains(probe), "{filesystem}");
+        }
+    }
+
+    /// The half of the block that is genuinely tier-independent: `HOME` is rewritten on every
+    /// tier, so the statement about it is one string, not one per class.
+    #[test]
+    fn the_path_rewriting_statement_is_identical_at_every_class_that_carries_it() {
+        let advisory = boundary_report_for_tier(EnforcementTier::EnvironmentOnly);
+        let scoped = boundary_report_for_tier(EnforcementTier::KernelFull);
+
+        assert_eq!(
+            advisory.filesystem_boundary.not_protected[1],
+            scoped.filesystem_boundary.not_protected[1]
+        );
+        assert!(
+            advisory.filesystem_boundary.not_protected[1]
+                .contains(crate::shell::SYNTHETIC_HOME_DIR_NAME),
+            "the statement must name the directory `shell::build_shell_env` really sets HOME to"
+        );
+    }
+
+    /// `sealed` prints no heading — not a heading with an empty list under it — and still carries
+    /// the key, because an absent key must identify a runtime that predates the field.
+    #[test]
+    fn a_sealed_class_carries_the_key_with_nothing_to_disclaim() {
+        let report = boundary_report_for_tier(EnforcementTier::KernelSealed);
+
+        assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Absent
+        );
+        assert!(report.filesystem_boundary.not_protected.is_empty());
+        assert!(
+            !report.render().contains("Not protected here"),
+            "{}",
+            report.render()
+        );
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["filesystem_boundary"]["restriction"], "absent");
+        assert_eq!(
+            json["filesystem_boundary"]["not_protected"],
+            serde_json::json!([]),
+            "the key is present and empty at sealed, never absent"
+        );
+    }
+
+    /// The block follows the achieved class rather than the tier, which is what makes the
+    /// `workdir_exec` cap apply to it without being restated: a capsule that declared an
+    /// executable workdir achieves `advisory` on a sealed-capable host, and gets the block there.
+    #[test]
+    fn workdir_exec_gets_the_block_on_a_sealed_capable_host() {
+        let policy = CapabilityPolicy {
+            workdir_exec_allowed: true,
+            ..CapabilityPolicy::default()
+        };
+
+        let report = scope_report_for_tier(
+            &policy,
+            ContainmentClass::Advisory,
+            EnforcementTier::KernelSealed,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport::default(),
+        );
+
+        assert_eq!(
+            report.enforcement_tier,
+            "mountns+pivot_root+landlock+seccomp"
+        );
+        assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Advisory
+        );
+        assert_eq!(report.filesystem_boundary.not_protected.len(), 2);
+        assert!(report.render().contains("Not protected here"));
+    }
+
+    /// Every class produces a `restriction` that agrees with the class itself, so a consumer can
+    /// read either field and reach the same conclusion.
+    #[test]
+    fn the_restriction_agrees_with_the_achieved_class_at_every_tier() {
+        for tier in ALL_TIERS {
+            let report = boundary_report_for_tier(*tier);
+            let expected = match report.achieved_containment {
+                ContainmentClass::Advisory => FilesystemRestriction::Advisory,
+                ContainmentClass::Scoped => FilesystemRestriction::Enforced,
+                ContainmentClass::Sealed => FilesystemRestriction::Absent,
+            };
+            assert_eq!(report.filesystem_boundary.restriction, expected, "{tier:?}");
+            assert_eq!(
+                report.filesystem_boundary.not_protected.is_empty(),
+                report.achieved_containment == ContainmentClass::Sealed,
+                "{tier:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(report.filesystem_boundary.restriction).unwrap(),
+                serde_json::Value::String(
+                    report
+                        .filesystem_boundary
+                        .restriction
+                        .wire_name()
+                        .to_string()
+                )
             );
         }
     }
