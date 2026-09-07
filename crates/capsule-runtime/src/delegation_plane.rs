@@ -417,6 +417,59 @@ impl DelegationPlane {
         Ok(SpawnApproval::new(approval.to_string()))
     }
 
+    /// Compose the one launch this plane makes, from the approval the daemon just gave and the
+    /// address — if any — the child's outcome is to be posted to.
+    ///
+    /// **The only place a [`ChildLaunchRequest`] is built.** Both methods reach a child through
+    /// here, so a field that is wrong is wrong on both paths at once rather than on whichever one
+    /// a later edit forgot; a source-sweep test in this file's `mod tests` holds that to one
+    /// construction site. Everything but `report_to` is the plane's own state and the caller's
+    /// three strings, which is why that is the single parameter: it is the whole of the
+    /// difference between a delegation whose answer arrives later as a task and one whose answer
+    /// arrives on the connection the caller is already holding.
+    ///
+    /// `completion_deadline` is derived from `report_to` rather than passed: the watcher this
+    /// plane's bound applies to only runs for a spawner naming an address, so two parameters
+    /// would be two ways of stating one decision and a way for them to disagree.
+    ///
+    /// `Err` when the child's own `capabilities.env.allow` cannot be read, which starts no
+    /// process on either path: a child launched without the variables its manifest names dies at
+    /// its own manifest load, inside a process nobody is reading. Called after the daemon has
+    /// approved the spawn, so a refusal is still reported as a refusal rather than as a local
+    /// read failure.
+    fn launch_request(
+        &self,
+        request: &DelegationRequest,
+        origin: &DelegationOrigin<'_>,
+        grant: SpawnApproval,
+        report_to: Option<CompletionAddress>,
+    ) -> Result<ChildLaunchRequest, RuntimeError> {
+        let completion_deadline = report_to.as_ref().map(|_| self.result_timeout);
+        Ok(ChildLaunchRequest {
+            parent_accessible_workdir: self.accessible_workdir.clone(),
+            capsule_name: request.capsule.clone(),
+            capsule_version: request.version.clone(),
+            grant,
+            // What both manifests declare and nothing else, read from the parent's own store
+            // rather than taken from the daemon's answer: the referee answers whether a spawn may
+            // happen, and this clamp has to hold whatever it answered.
+            child_env_allow: self.child_env_allow(&request.capsule, &request.version)?,
+            roost_url: self.roost_url.clone(),
+            // A caller that knows neither its session nor its conversation injects no handle at
+            // all, rather than one naming a lineage that does not exist. `start` holds both by
+            // the time it reaches here — it refuses outright when either is empty — so this is
+            // unconditional there in everything but form.
+            spawner: (!self.session_id.is_empty() && !origin.context_id.is_empty()).then(|| {
+                Spawner {
+                    session_id: self.session_id.clone(),
+                    context_id: origin.context_id.clone(),
+                    report_to,
+                }
+            }),
+            completion_deadline,
+        })
+    }
+
     /// Hand the launch back to the caller the moment the child is up and has reported its session
     /// id, so a child that then hangs, crashes or is ended is already attributable.
     ///
@@ -488,11 +541,19 @@ impl DelegationPlane {
             Err(reason) => return DelegationResult::refused(request, reason),
         };
 
-        // What both manifests declare and nothing else, on the same terms as every other launch
-        // from this plane: a child started without the variables its manifest names dies at its
-        // own manifest load, before it can report anything. A read that fails starts no child.
-        let child_env_allow = match self.child_env_allow(&request.capsule, &request.version) {
-            Ok(names) => names,
+        // The production caller of the completion path: naming this capsule's own address is what
+        // starts the watcher behind the child, and with it this plane's bound on the watch. The
+        // trust the delegating task ran under is the trust its child's completion arrives under.
+        let launch = match self.launch_request(
+            request,
+            origin,
+            grant,
+            Some(CompletionAddress {
+                url: self.own_url.clone(),
+                trust: origin.trust.unwrap_or(TrustClass::Untrusted),
+            }),
+        ) {
+            Ok(launch) => launch,
             Err(error) => {
                 return DelegationResult::unmade(
                     request,
@@ -502,26 +563,7 @@ impl DelegationPlane {
             }
         };
 
-        // The production caller of the completion path: this spawner names where the outcome goes
-        // and under which trust, which is what starts the watcher behind the child. The deadline
-        // is this plane's single bound, and here it bounds the watch rather than a poll.
-        let child = match launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_workdir: self.accessible_workdir.clone(),
-            capsule_name: request.capsule.clone(),
-            capsule_version: request.version.clone(),
-            grant,
-            child_env_allow,
-            roost_url: self.roost_url.clone(),
-            spawner: Some(Spawner {
-                session_id: self.session_id.clone(),
-                context_id: origin.context_id.clone(),
-                report_to: Some(CompletionAddress {
-                    url: self.own_url.clone(),
-                    trust: origin.trust.unwrap_or(TrustClass::Untrusted),
-                }),
-            }),
-            completion_deadline: Some(self.result_timeout),
-        }) {
+        let child = match launch_child_capsule(launch) {
             Ok(child) => child,
             Err(error) => {
                 return DelegationResult::unmade(
@@ -615,23 +657,16 @@ impl DelegationPlane {
         // process: dropping it — including on every early return below, and on the deadline in
         // step 4 — terminates and reaps the child rather than leaving it holding a port.
         //
-        // `child_env_allow` is what both manifests declare and nothing else, read here rather
-        // than taken from the daemon's answer: the referee answers whether a spawn may happen, and
-        // the clamp has to hold whatever it answered. A read that fails starts no child — one
-        // launched without the variables its manifest names dies at its own manifest load, inside
-        // a process nobody is reading.
+        // The spawner this composes is lineage and nothing else. The answer arrives on the
+        // connection this plane opened, so there is nothing for a completion to tell: naming no
+        // address means no watcher and no post — and no completion deadline, since the poll in
+        // step 4 is this method's bound — while the child still learns which session spawned it.
         //
-        // The spawner is lineage and nothing else. The answer arrives on the connection this
-        // plane opened, so there is nothing for a completion to tell it: no address means no
-        // watcher and no post, while the child still learns which session spawned it.
-        let spawner =
-            (!self.session_id.is_empty() && !origin.context_id.is_empty()).then(|| Spawner {
-                session_id: self.session_id.clone(),
-                context_id: origin.context_id.clone(),
-                report_to: None,
-            });
-        let child_env_allow = match self.child_env_allow(&request.capsule, &request.version) {
-            Ok(names) => names,
+        // A launch request that cannot be composed starts no child: a read of the child's own
+        // declaration that fails would otherwise launch a capsule without the variables its
+        // manifest names, which dies at its own manifest load inside a process nobody is reading.
+        let launch = match self.launch_request(request, origin, grant, None) {
+            Ok(launch) => launch,
             Err(error) => {
                 return DelegationResult::unmade(
                     request,
@@ -640,18 +675,7 @@ impl DelegationPlane {
                 )
             }
         };
-        let child = match launch_child_capsule(ChildLaunchRequest {
-            parent_accessible_workdir: self.accessible_workdir.clone(),
-            capsule_name: request.capsule.clone(),
-            capsule_version: request.version.clone(),
-            grant,
-            child_env_allow,
-            roost_url: self.roost_url.clone(),
-            spawner,
-            // No watcher runs for a spawner that names no address, so there is nothing here for a
-            // deadline to bound; the poll in step 4 is this method's bound.
-            completion_deadline: None,
-        }) {
+        let child = match launch_child_capsule(launch) {
             Ok(child) => child,
             // A child whose process never started named no delegation, the same as one the daemon
             // refused: the id is minted by the launcher, and this launch reached no launcher.
@@ -1151,6 +1175,253 @@ mod tests {
         assert!(message.contains("worker"), "{message}");
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("capabilities.env.allow"), "{message}");
+    }
+
+    /// A `worker@0.1.0` in a store of its own, declaring `capabilities.env.allow: [A, B, C]`.
+    ///
+    /// Packed the way `mur publish` packs one — a `murmur.yaml` entry in a `.mur.zip` — because
+    /// [`DelegationPlane::child_env_allow`] reads the child's declaration out of the archive
+    /// rather than out of a directory.
+    fn store_with_worker() -> tempfile::TempDir {
+        let store = tempfile::tempdir().unwrap();
+        let mut zipped = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut zipped);
+            zip.start_file(
+                "murmur.yaml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+            std::io::Write::write_all(
+                &mut zip,
+                b"name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [A, B, C]\n",
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        murmur_artifact::Registry::publish(
+            &murmur_artifact::LocalRegistry::new(store.path()),
+            murmur_artifact::ArtifactMeta {
+                name: "worker".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: murmur_artifact::RuntimeType::Wasm,
+                artifact_runtime: "capsule".to_string(),
+                platforms: Vec::new(),
+                description: None,
+                tags: Vec::new(),
+                wit_contracts: None,
+            },
+            &zipped.into_inner(),
+        )
+        .unwrap();
+        store
+    }
+
+    /// A plane over the given store, holding the given `capabilities.env.allow` of its own.
+    fn plane_over(store: &tempfile::TempDir, parent_env_allow: &[&str]) -> DelegationPlane {
+        DelegationPlane::new(
+            "http://127.0.0.1:1".to_string(),
+            SpawnCredential::new("msc1.test".to_string()),
+            PathBuf::from("/tmp"),
+            "ses_parent".to_string(),
+            DELEGATION_RESULT_TIMEOUT,
+            std::sync::Arc::new(murmur_artifact::LocalRegistry::new(store.path())),
+            parent_env_allow.iter().map(|n| n.to_string()).collect(),
+        )
+        .reporting_to("http://127.0.0.1:7000".to_string())
+    }
+
+    /// The conversation both paths delegate from.
+    fn origin() -> DelegationOrigin<'static> {
+        DelegationOrigin {
+            context_id: "ctx_parent".to_string(),
+            ..DelegationOrigin::default()
+        }
+    }
+
+    /// Where `start` tells a child to report, as it composes it.
+    fn completion_address() -> CompletionAddress {
+        CompletionAddress {
+            url: "http://127.0.0.1:7000".to_string(),
+            trust: TrustClass::Untrusted,
+        }
+    }
+
+    /// Every launch this crate makes is composed in one place, so a field can never be right on
+    /// one path and wrong on the other.
+    ///
+    /// Reads every `.rs` under `src/`, drops line comments and the trailing `mod tests`, and
+    /// counts the literal. `child_launch.rs` is excluded: it defines the type and builds one in
+    /// its own tests, where the launcher rather than a launch path is the unit under test.
+    #[test]
+    fn a_launch_request_is_built_in_exactly_one_place() {
+        let src = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut swept = 0_usize;
+        let mut found: Vec<(String, usize)> = Vec::new();
+
+        let mut pending = vec![src.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the crate's src directory is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !path.extension().is_some_and(|ext| ext == "rs") {
+                    continue;
+                }
+                swept += 1;
+                let name = path
+                    .strip_prefix(src)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if name == "child_launch.rs" {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                // Cut at the trailing test module rather than at the first `#[cfg(test)]`:
+                // files in this crate carry test-only items far above their `mod tests`.
+                let body = text
+                    .split("\n#[cfg(test)]\nmod tests")
+                    .next()
+                    .unwrap_or_default();
+                let count = body
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .map(|line| line.matches("ChildLaunchRequest {").count())
+                    .sum::<usize>();
+                if count > 0 {
+                    found.push((name, count));
+                }
+            }
+        }
+
+        found.sort();
+        assert!(
+            swept > 10,
+            "the source sweep found only {swept} files, so it is not sweeping the crate"
+        );
+        assert_eq!(
+            found,
+            vec![("delegation_plane.rs".to_string(), 1)],
+            "`ChildLaunchRequest` may be built in exactly one place: \
+`DelegationPlane::launch_request`, which every launch path in this crate goes through so that \
+what a child is handed cannot differ between them. Found: {found:?}. Route a new launch path \
+through that constructor rather than composing a second request literal."
+        );
+    }
+
+    /// A child whose declaration the parent cannot read starts no process, on the path that names
+    /// a completion address and on the path that does not.
+    #[test]
+    fn an_unreadable_child_declaration_composes_no_launch_on_either_path() {
+        let store = tempfile::tempdir().unwrap();
+        let plane = plane_over(&store, &["A"]);
+
+        for report_to in [Some(completion_address()), None] {
+            let named = if report_to.is_some() {
+                "the started path"
+            } else {
+                "the plan-step path"
+            };
+            let error = plane
+                .launch_request(
+                    &request(),
+                    &origin(),
+                    SpawnApproval::new("approved".to_string()),
+                    report_to,
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{named}: an empty store resolves nothing"));
+
+            let message = error.to_string();
+            assert!(message.contains("worker"), "{named}: {message}");
+            assert!(message.contains("0.1.0"), "{named}: {message}");
+            assert!(
+                message.contains("capabilities.env.allow"),
+                "{named}: {message}"
+            );
+        }
+    }
+
+    /// Every launch carries what both manifests declare, whichever path composed it. The two
+    /// helper tests above pin the intersection itself; this one pins that a launch is handed its
+    /// result.
+    #[test]
+    fn every_launch_carries_what_both_manifests_declare() {
+        let store = store_with_worker();
+        let plane = plane_over(&store, &["B", "C", "D"]);
+
+        for report_to in [Some(completion_address()), None] {
+            let named = if report_to.is_some() {
+                "the started path"
+            } else {
+                "the plan-step path"
+            };
+            let launch = plane
+                .launch_request(
+                    &request(),
+                    &origin(),
+                    SpawnApproval::new("approved".to_string()),
+                    report_to,
+                )
+                .unwrap_or_else(|error| panic!("{named}: {error}"));
+
+            assert_eq!(
+                launch.child_env_allow,
+                vec!["B".to_string(), "C".to_string()],
+                "{named} hands on what both manifests declare, in the child's order"
+            );
+        }
+    }
+
+    /// The two paths differ in where the outcome goes and in what bounds the wait for it. Every
+    /// other thing a child is launched with is the same, because it comes from the same plane.
+    #[test]
+    fn the_two_paths_differ_in_the_completion_target_and_its_deadline_alone() {
+        let store = store_with_worker();
+        let plane = plane_over(&store, &["B", "C", "D"]);
+        let compose = |report_to| {
+            plane
+                .launch_request(
+                    &request(),
+                    &origin(),
+                    SpawnApproval::new("approved".to_string()),
+                    report_to,
+                )
+                .expect("the store holds the child's declaration")
+        };
+
+        let started = compose(Some(completion_address()));
+        let stepped = compose(None);
+
+        let started_spawner = started
+            .spawner
+            .as_ref()
+            .expect("a named session and context");
+        assert_eq!(started_spawner.report_to, Some(completion_address()));
+        assert_eq!(started.completion_deadline, Some(plane.result_timeout()));
+
+        let stepped_spawner = stepped
+            .spawner
+            .as_ref()
+            .expect("a named session and context");
+        assert_eq!(stepped_spawner.report_to, None);
+        assert_eq!(stepped.completion_deadline, None);
+
+        assert_eq!(
+            started.parent_accessible_workdir,
+            stepped.parent_accessible_workdir
+        );
+        assert_eq!(started.capsule_name, stepped.capsule_name);
+        assert_eq!(started.capsule_version, stepped.capsule_version);
+        assert_eq!(started.grant.expose(), stepped.grant.expose());
+        assert_eq!(started.child_env_allow, stepped.child_env_allow);
+        assert_eq!(started.roost_url, stepped.roost_url);
+        assert_eq!(started_spawner.session_id, stepped_spawner.session_id);
+        assert_eq!(started_spawner.context_id, stepped_spawner.context_id);
     }
 
     /// The trailing slash is taken off once, so no request is built against `//spawn`.
