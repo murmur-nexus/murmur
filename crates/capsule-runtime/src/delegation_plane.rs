@@ -1158,15 +1158,7 @@ mod tests {
     #[test]
     fn a_capsule_the_store_cannot_resolve_fails_the_read_by_name() {
         let store = tempfile::tempdir().unwrap();
-        let plane = DelegationPlane::new(
-            "http://127.0.0.1:7700".to_string(),
-            SpawnCredential::new("msc1.test".to_string()),
-            PathBuf::from("/tmp"),
-            "ses_parent".to_string(),
-            DELEGATION_RESULT_TIMEOUT,
-            std::sync::Arc::new(murmur_artifact::LocalRegistry::new(store.path())),
-            vec!["MURMUR_TEST_PROVIDER_KEY".to_string()],
-        );
+        let plane = plane_over(&store, &["MURMUR_TEST_PROVIDER_KEY"]);
 
         let error = plane
             .child_env_allow("worker", "0.1.0")
