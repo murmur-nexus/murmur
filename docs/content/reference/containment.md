@@ -194,9 +194,8 @@ end to end, in its own throwaway namespace, and reports the stage that failed:
 | `mount(MS_REC \| MS_PRIVATE)` on `/`, then a `tmpfs` over a root base candidate | `mount(2)` inside the namespace was refused — what a confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN` looks like |
 | The parking directory, `chdir`, `pivot_root(2)`, `chdir("/")`, `umount2(MNT_DETACH)` | `pivot_root(2)` was refused. `mount(2)` working while the pivot does not is a policy that grants one and not the other: an AppArmor profile missing its `pivot_root,` rule, or a container runtime whose seccomp allowlist omits the syscall even where `CAP_SYS_ADMIN` is granted |
 
-Nothing the child does touches the host: mount propagation is made private before the first mount,
-and the child exits a few syscalls after the pivot without unwinding any of it. The fork is what
-keeps the probe a probe — `unshare(CLONE_NEWUSER)` is irreversible for the task that calls it.
+The rehearsal runs in the child's own namespace with mount propagation made private first, so
+nothing it does reaches the host's mount table.
 
 The last row is why the rehearsal goes all the way through the pivot: a host that mounts and
 refuses `pivot_root(2)` is refused at launch, rather than at the first subprocess with

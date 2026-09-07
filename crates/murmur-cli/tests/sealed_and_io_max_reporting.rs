@@ -55,7 +55,12 @@ fn publish_driver(home: &TempDir) {
     common::publish_local(home, &artifact).success();
 }
 
-/// One scripted `tool_use` calling `bash` with `command`, then a plain answer.
+/// One scripted `tool_use` calling the `echo` tool with `command`, then a plain answer.
+///
+/// The tool name has to be `echo`: a capsule declaring `shell.allow: [echo]` is offered exactly
+/// that tool, and any other name is refused by the dispatcher without a subprocess ever being
+/// spawned — which would leave the scenario below asserting nothing about the composed root.
+/// `command` is the argument list alone, without the binary name.
 fn echo_then_answer(command: &str) -> Vec<String> {
     vec![
         json!({
@@ -66,7 +71,7 @@ fn echo_then_answer(command: &str) -> Vec<String> {
             "content": [{
                 "type": "tool_use",
                 "id": "toolu_echo",
-                "name": "bash",
+                "name": "echo",
                 "input": {"command": command}
             }],
             "stop_reason": "tool_use",
@@ -108,26 +113,11 @@ fn mur_run(home: &TempDir, manifest: &Path, task: &str) -> assert_cmd::assert::A
         .assert()
 }
 
-#[cfg(target_os = "linux")]
-fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).ok()?.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.file_name().is_some_and(|file| file == name) {
-                return Some(path);
-            }
-        }
-    }
-    None
-}
-
 /// The `session_start` event's `effective_grants`, read out of the trace the run wrote.
 #[cfg(target_os = "linux")]
 fn session_start_grants(project_dir: &Path) -> Value {
-    let trace_path = find_file(project_dir, "trace.jsonl").expect("the session wrote a trace");
+    let trace_path =
+        common::find_file(project_dir, "trace.jsonl").expect("the session wrote a trace");
     let trace = fs::read_to_string(trace_path).unwrap();
     trace
         .lines()
@@ -151,7 +141,7 @@ fn a_sealed_verdict_survives_the_first_subprocess() {
     if common::skip_without_host_support("a_sealed_verdict_survives_the_first_subprocess") {
         return;
     }
-    let server = ScriptedServer::start(echo_then_answer("echo sealed-subprocess-ran"));
+    let server = ScriptedServer::start(echo_then_answer("sealed-subprocess-ran"));
     let home = TempDir::new().unwrap();
     publish_driver(&home);
 
@@ -168,10 +158,20 @@ fn a_sealed_verdict_survives_the_first_subprocess() {
             !stderr.contains("E-RUN-014"),
             "a host the probe passed must not fail composing the root:\n{stderr}"
         );
+        let requests = server.requests();
         assert_eq!(
-            server.requests().len(),
+            requests.len(),
             2,
             "the run reached the agent loop and answered the tool result"
+        );
+        // The subprocess itself, not just the turn around it: the echoed marker can only reach
+        // the provider by way of a process that ran inside the composed root. Asserting the turn
+        // count alone passes on a tool call the dispatcher refused before spawning anything.
+        let tool_result = requests[1].to_string();
+        assert!(
+            tool_result.contains("sealed-subprocess-ran") && tool_result.contains("Exit code: 0"),
+            "the echo subprocess must have run and its output reached the provider: {}",
+            requests[1]
         );
         return;
     }

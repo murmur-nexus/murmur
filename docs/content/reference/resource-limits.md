@@ -119,10 +119,8 @@ Every session reports what became of the ceiling, in an `io_max` object carried 
 | `not-required` | No scope was asked for: the capsule can reach no native subprocess, or this is not Linux |
 | `not-probed` | The write was never attempted, so nothing is claimed either way |
 
-The value is established by performing the write, never by inferring it from the delegated
-controller list: `mur run --explain-scope` creates a throwaway cgroup, writes the same line a
-launch writes, and removes the directory again, so the diagnostic answers the question by
-exercising it.
+`mur run --explain-scope` reports the status a launch would reach: it creates a throwaway cgroup,
+performs the same write, and removes the directory again.
 
 The device that write names is resolved in three steps, because neither of the two numbers closest
 to hand is one the block layer accepts:
