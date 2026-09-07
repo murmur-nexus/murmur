@@ -417,15 +417,22 @@ impl From<RuntimeError> for CliError {
             error @ RuntimeError::ShellBinaryPackageUnreachable { .. } => CliError::with_hint(
                 E_CAP_006,
                 error.to_string(),
-                "declare `capabilities.shell.interpreter_runtime` (or `staged_runtime`) for the \
-                 interpreter named above, listing the directories its import machinery actually \
-                 reads — measure them on this host with \
+                "if this command also has a module form, prefer it: allowlist the interpreter \
+                 and invoke the module through it — `python3 -m pytest` in place of `pytest` — \
+                 which runs the same code and needs no grant at all when the interpreter is the \
+                 distro's, because a `/usr/bin` interpreter already resolves under a fixed sealed \
+                 runtime path. `node`, `ruby` and `perl` all have the same form; murmur does not \
+                 check whether one exists here, so read the command's own docs. If it has none — \
+                 a wrapper script with no module entry point, or a case where that exact script \
+                 must run — declare `capabilities.shell.interpreter_runtime` (or \
+                 `staged_runtime`) for the interpreter named above, listing the directories its \
+                 import machinery actually reads: measure them on this host with \
                  `strace -f -e trace=openat,getdents64 <the command>` rather than guessing, since \
                  murmur deliberately does not try to derive an interpreted program's import \
-                 closure. Alternatively point `capabilities.shell.allow` at a copy that already \
-                 lives under a fixed sealed runtime path (a distro `/usr/bin` interpreter and its \
-                 system packages need no grant at all). See \
-                 docs/content/reference/containment.md",
+                 closure. Those directories are host-specific — \
+                 `/opt/venv/lib/python3.11/site-packages` on one image, a distro `dist-packages` \
+                 on the next — so declaring them ties the capsule to one image's layout. See \
+                 docs/content/reference/diagnostics.md",
             ),
             // Distinct from both E-CAP-003 and E-CAP-004, and none of the three remedies help
             // with another: this one is not about the containment ladder at all. A network
@@ -834,6 +841,55 @@ mod tests {
         assert!(
             hint.contains("interpreter_runtime") && hint.contains("strace"),
             "hint should name the grant to declare and how to measure its directories: {hint}"
+        );
+        assert!(
+            hint.contains("-m pytest"),
+            "hint should also name the module-invocation remedy: {hint}"
+        );
+        assert!(
+            hint.contains("no module entry point"),
+            "hint should say which situation the interpreter_runtime remedy belongs to: {hint}"
+        );
+        assert!(
+            hint.contains("host-specific") && hint.contains("one image's layout"),
+            "hint should say the enumerated directories pin the capsule to one image: {hint}"
+        );
+    }
+
+    /// The two remedies for `E-CAP-006` are not interchangeable and their order carries the
+    /// advice. Invoking the module through an already-granted interpreter is portable — it needs
+    /// no grant at all under a distro interpreter — while `interpreter_runtime` enumerates
+    /// directories that differ between base images and so pins the capsule to one of them. An
+    /// operator reads the rendered error top to bottom and acts on the first thing it offers, so
+    /// the portable answer has to be the first thing it offers.
+    #[test]
+    fn the_unreachable_entrypoint_hint_offers_the_portable_remedy_before_the_pinning_one() {
+        let rendered = CliError::from(RuntimeError::ShellBinaryPackageUnreachable {
+            entries: vec![capsule_runtime::UnreachableEntrypoint {
+                binary: "pytest".to_string(),
+                resolved_path: std::path::PathBuf::from("/opt/venv/bin/pytest"),
+                interpreter: "python3".to_string(),
+            }],
+        })
+        .to_string();
+
+        // Ordering is measured from the `hint:` marker on, not from the top of the rendered
+        // text: the refusal's own message names `capabilities.shell.interpreter_runtime` while
+        // stating the condition, and that message is fixed. The hint is the surface that offers
+        // remedies, and it is the one whose order is being asserted.
+        let hint = rendered
+            .split_once("\n  hint: ")
+            .unwrap_or_else(|| panic!("rendered error should carry a hint line: {rendered}"))
+            .1;
+        let module_form = hint
+            .find("python3 -m pytest")
+            .unwrap_or_else(|| panic!("hint should reach the module form: {hint}"));
+        let grant = hint
+            .find("interpreter_runtime")
+            .unwrap_or_else(|| panic!("hint should still name the grant: {hint}"));
+        assert!(
+            module_form < grant,
+            "the portable remedy must be stated before the pinning one: {hint}"
         );
     }
 }

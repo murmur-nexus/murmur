@@ -383,8 +383,15 @@ names the script or its shebang interpreter:
 
 ```text
 error[E-CAP-006]: capabilities.shell.allow grants 'pip' (/home/dev/.local/bin/pip, a script run by 'python3') under the 'sealed' containment floor, but nothing declared makes the interpreted entrypoint's own package tree reachable inside the composed root — ...
-  hint: declare `capabilities.shell.interpreter_runtime` (or `staged_runtime`) for the interpreter named above, listing the directories its import machinery actually reads — measure them on this host with `strace -f -e trace=openat,getdents64 <the command>` rather than guessing ...
+  hint: if this command also has a module form, prefer it: allowlist the interpreter and invoke the module through it — `python3 -m pytest` in place of `pytest` — which runs the same code and needs no grant at all when the interpreter is the distro's ...
 ```
+
+Two remedies answer this refusal, and which one you want depends on the command:
+
+| Situation | Remedy |
+|---|---|
+| The command has a module form — `python3 -m pytest` runs what `pytest` runs, and `node`, `ruby` and `perl` have the same form | Allowlist the interpreter and invoke the module through it. Under a distro interpreter this needs no grant at all, because `/usr/bin` is already a fixed sealed runtime path, and it stays correct across base images. murmur does not check whether a module form exists, so confirm one from the command's own documentation |
+| The command has no module form — a wrapper script with no module entry point, or a case where that exact script must run | Declare `capabilities.shell.interpreter_runtime` (or `staged_runtime`) for the interpreter, naming the directories its import machinery reads, measured with `strace -f -e trace=openat,getdents64 <the command>`. Those directories are host-specific — `/opt/venv/lib/python3.11/site-packages` on one image, a distro `dist-packages` on the next — so declaring them ties the capsule to one image's layout |
 
 The name match is deliberately loose, and the guarantee is correspondingly narrow: declaring
 `interpreter_runtime` for `python3` satisfies every `python3` script, whatever directories the
