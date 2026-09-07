@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use crate::{
     bindings::host::murmur::tool::run::{Status, ToolInput},
+    cancel::{CancelSignal, Residue, PHASE_INFERENCE},
     detached::DetachedDispatchInfo,
     errors::RuntimeError,
     hooks::{
@@ -126,6 +127,18 @@ fn with_new_id(mut message: Value) -> Value {
 /// never parsed by the runtime.
 const MESSAGE_SOURCE_ID_KEY: &str = "source_id";
 
+/// Message field marking the assistant turn a person stopped. Written to the conversation record
+/// so a cancelled turn is visible rather than silently missing, and never sent to a driver — see
+/// [`strip_message_identity`].
+const MESSAGE_CANCELED_KEY: &str = "canceled";
+
+/// The assistant message a cancelled turn leaves in the record.
+///
+/// The turn produced no reply, so the record says so in the model's own slot rather than ending
+/// the conversation on a user message nothing answered. A later task loads it as ordinary
+/// content: the marker key is the runtime's, and the driver never sees it.
+const CANCELED_TURN_TEXT: &str = "[the person cancelled this task before the model replied]";
+
 /// How one agent-loop attempt ended, for a caller that needs the outcome rather than just
 /// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
 /// share, so the same value reads the same wherever it lands in a trace.
@@ -139,6 +152,9 @@ pub(crate) enum AgentLoopExit {
     Ok,
     Failed,
     MaxTurnsReached,
+    /// A person stopped this task. Not a failure: the loop did exactly what it was asked to, and
+    /// the session it ran in is untouched.
+    Canceled,
 }
 
 impl AgentLoopExit {
@@ -147,6 +163,7 @@ impl AgentLoopExit {
             Self::Ok => "ok",
             Self::Failed => "failed",
             Self::MaxTurnsReached => "max_turns_reached",
+            Self::Canceled => "canceled",
         }
     }
 }
@@ -169,6 +186,10 @@ pub(crate) async fn run_agent_loop(
     mode: ConversationMode,
     context_id: Option<String>,
     seed: Option<HookSeed>,
+    // This task's cancel flag, or `None` where no task can be cancelled: the `task.md` paths,
+    // which run no A2A task, and the empty-task timeout path. The `process` transport ignores it
+    // — the CLI it drives owns its own turn, and this runtime has no wait of its own to drop.
+    cancel: Option<CancelSignal>,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // ── Process transport: spawn the CLI binary and communicate via JSON-lines ──
     if inference.transport == "process" {
@@ -367,6 +388,28 @@ pub(crate) async fn run_agent_loop(
     for turn in 0..max_turns as usize {
         let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
 
+        // The turn boundary. A cancel that landed while the previous turn's tools were running is
+        // honoured here rather than by another request to the provider: an ordinary tool call
+        // runs to its own bound, and this is the first place after it that can stop.
+        if let Some(signal) = cancel.as_ref().filter(|signal| signal.is_canceled()) {
+            return Ok(finish_canceled_turn(
+                store_state,
+                trace,
+                otel,
+                hooks,
+                record.as_mut(),
+                &sse,
+                &mut sse_event_id,
+                task_id.as_deref(),
+                &task_id_str,
+                context_id.clone(),
+                turn_u32,
+                // Whichever wait claimed the cancel, or `turn` when it landed between two.
+                signal.phase(),
+            )
+            .await);
+        }
+
         // Session-level half of the workdir bound. The subprocess spawn paths already refuse to
         // start another writer once the periodic check latches a breach; this is what actually
         // ends the session rather than letting it grind on against a full disk.
@@ -442,16 +485,58 @@ pub(crate) async fn run_agent_loop(
             .store(sse_event_id, Ordering::Relaxed);
 
         let inference_started = Instant::now();
-        let driver_result = match store_state
-            .dispatch_tool_async(
-                driver_name,
-                ToolInput {
-                    data: Some(payload_json),
-                    log_path: None,
-                },
+        // Raced rather than awaited: a cancel must stop the provider call in flight rather than
+        // wait it out. Losing the race drops the `call_async` future, which disposes the guest
+        // fiber and takes the pending outbound request down with it.
+        let dispatched = match cancel.as_ref() {
+            Some(signal) => {
+                tokio::select! {
+                    biased;
+                    () = signal.canceled() => {
+                        signal.note_phase(PHASE_INFERENCE);
+                        None
+                    }
+                    dispatched = store_state.dispatch_tool_async(
+                        driver_name,
+                        ToolInput {
+                            data: Some(payload_json),
+                            log_path: None,
+                        },
+                    ) => Some(dispatched),
+                }
+            }
+            None => Some(
+                store_state
+                    .dispatch_tool_async(
+                        driver_name,
+                        ToolInput {
+                            data: Some(payload_json),
+                            log_path: None,
+                        },
+                    )
+                    .await,
+            ),
+        };
+        let Some(dispatched) = dispatched else {
+            // Nothing from this turn is applied: no continuation id is adopted, no result file is
+            // written and no usage is recorded, because the call never returned one.
+            return Ok(finish_canceled_turn(
+                store_state,
+                trace,
+                otel,
+                hooks,
+                record.as_mut(),
+                &sse,
+                &mut sse_event_id,
+                task_id.as_deref(),
+                &task_id_str,
+                context_id.clone(),
+                turn_u32,
+                PHASE_INFERENCE,
             )
-            .await
-        {
+            .await);
+        };
+        let driver_result = match dispatched {
             Ok(r) => r,
             Err(e) => {
                 // Driver dispatch failed (e.g. WASM instantiation error, import mismatch).
@@ -1201,6 +1286,80 @@ pub(crate) async fn run_agent_loop(
         .await;
     }
     Ok(AgentLoopExit::MaxTurnsReached)
+}
+
+/// End one attempt because a person stopped the task.
+///
+/// Everything a cancelled turn leaves behind, in one place so the two sites that reach it — the
+/// turn boundary and the aborted driver call — cannot record it differently:
+///
+/// * the assistant turn goes into the conversation record marked cancelled, so a stopped turn is
+///   visible rather than silently missing;
+/// * a `task_canceled` trace record names the phase and everything still running;
+/// * a final `canceled` status event closes any `message/stream` connection on this task.
+///
+/// Nothing is killed and nothing is applied. The residue is what was running when the loop
+/// stopped, which is a second observation of the same registries the door read — the two may
+/// differ, and both are honest about their instant.
+#[allow(clippy::too_many_arguments)]
+async fn finish_canceled_turn(
+    store_state: &CapsuleStoreState,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    hooks: &mut HookRuntime,
+    record: Option<&mut crate::conversation::ConversationRecord>,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    sse_event_id: &mut u64,
+    task_id: Option<&str>,
+    task_id_str: &str,
+    context_id: Option<String>,
+    turn: u32,
+    phase: &str,
+) -> AgentLoopExit {
+    let mut canceled = with_new_id(json!({
+        "role": "assistant",
+        "content": [{"type": "text", "text": CANCELED_TURN_TEXT}],
+    }));
+    if let Some(fields) = canceled.as_object_mut() {
+        fields.insert(MESSAGE_CANCELED_KEY.to_string(), json!(true));
+    }
+    append_to_record(record, std::slice::from_ref(&canceled));
+
+    flush_hook_dispatch_faults(hooks, trace).await;
+
+    let residue = Residue::snapshot(store_state.detached.as_ref(), &store_state.live_delegations);
+    let _ = trace
+        .write_task_canceled(
+            task_id_str,
+            Some(turn),
+            phase,
+            residue.detached_work_ids(),
+            residue.delegation_ids(),
+        )
+        .await;
+    otel.emit_session_end(AgentLoopExit::Canceled.as_str())
+        .await;
+
+    if task_id.is_some() {
+        emit_sse(
+            sse,
+            sse_event_id,
+            "status",
+            &TaskStatusUpdateEvent {
+                id: task_id_str.to_string(),
+                context_id,
+                status: StreamStatus {
+                    state: AgentLoopExit::Canceled.as_str().into(),
+                    message: "task canceled".into(),
+                    response: None,
+                },
+                r#final: true,
+            },
+        )
+        .await;
+    }
+
+    AgentLoopExit::Canceled
 }
 
 /// Write every `run-inference` record a hook has buffered since the last flush
@@ -2543,11 +2702,13 @@ fn strip_message_identity(messages: &[Value]) -> Value {
             .map(|message| match message.as_object() {
                 Some(fields)
                     if fields.contains_key(MESSAGE_ID_KEY)
-                        || fields.contains_key(MESSAGE_SOURCE_ID_KEY) =>
+                        || fields.contains_key(MESSAGE_SOURCE_ID_KEY)
+                        || fields.contains_key(MESSAGE_CANCELED_KEY) =>
                 {
                     let mut stripped = fields.clone();
                     stripped.remove(MESSAGE_ID_KEY);
                     stripped.remove(MESSAGE_SOURCE_ID_KEY);
+                    stripped.remove(MESSAGE_CANCELED_KEY);
                     Value::Object(stripped)
                 }
                 _ => message.clone(),

@@ -311,7 +311,7 @@ curl -s -X POST http://localhost:$PORT \
   -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"id":"<your-task-id>"}}'
 ```
 
-`state` progresses through: `submitted` → `working` → `completed` | `failed`.
+`state` progresses through: `submitted` → `working` → `completed` | `failed` | `canceled`.
 
 ```json
 {
@@ -333,6 +333,76 @@ Poll until `state` is `completed` or `failed`. The task registry on the worker c
 
 !!! note "The HTTP server shuts down with the session"
     Once the worker capsule exits (idle timeout, or after the last queued task), its HTTP server is released. Final status is always available in `trace.jsonl` in the worker capsule's workdir.
+
+---
+
+## Cancelling a running task
+
+`tasks/cancel` stops one task. The worker capsule's session, its conversation and its queue keep
+going — queued tasks proceed and the capsule keeps answering — so this is not a way to shut a
+capsule down.
+
+```bash
+curl -s -X POST http://localhost:$PORT \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tasks/cancel","params":{"id":"<your-task-id>"}}'
+```
+
+The inference call in flight is dropped rather than waited out, and the task reaches the terminal
+state `canceled`:
+
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "result":
+    {
+        "contextId": "ctx-001",
+        "id": "tsk_019ed5211c827f63a8fe4be623277c55",
+        "status":
+        {
+            "state": "canceled"
+        }
+    }
+}
+```
+
+`mur cancel localhost:$PORT <your-task-id>` does the same thing from a terminal.
+
+Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` returns
+that state and changes nothing. A task id the capsule never held is the one error: JSON-RPC code
+`-32001`, `Task not found`.
+
+### What the cancel left running
+
+Nothing else is stopped. A detached shell command keeps its own lifecycle, and a delegated
+sub-capsule is left running exactly as a delegation deadline leaves it. When either was running at
+the moment the cancel was answered, the response carries an artifact named `residue` with one part
+per item, each part's `text` a JSON object:
+
+```json
+{
+    "artifacts":
+    [
+        {
+            "name": "residue",
+            "parts":
+            [
+                {"text": "{\"kind\":\"detached_shell\",\"work_id\":\"wrk_9f2a1c\",\"binary\":\"bash\",\"command\":\"sleep 30\",\"started_at_ms\":1757068800123}"},
+                {"text": "{\"kind\":\"delegation\",\"delegation_id\":\"dlg_7b31de\",\"capsule\":\"my-worker\",\"version\":\"0.1.0\",\"child_session_id\":\"ses_019ed…\",\"child_workdir\":\".murmur/children/my-worker-7b31de\"}"}
+            ]
+        }
+    ]
+}
+```
+
+A cancel with nothing left running omits the `artifacts` key entirely, so "nothing else is
+running" is distinguishable from "these things are" without parsing an empty list.
+
+The trace tells the same story from the loop's side: a
+[`task_canceled`](../reference/observability-schemas.md#task-canceled) event naming the wait that
+was interrupted and what was still running when the loop stopped, and a `task_end` carrying
+`exit_status: "canceled"`.
 
 ---
 
@@ -377,5 +447,6 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 | Fixed worker capsule port | `network.internal_port` in the worker capsule manifest; errors if port is already in use |
 | Orchestrator capsule can reach worker capsule | `capabilities.network.allow` must include the worker capsule's URL |
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
-| Task ID | Returned by the message call; use it with `tasks/get` to poll status |
+| Task ID | Returned by the message call; use it with `tasks/get` to poll status and `tasks/cancel` to stop it |
+| Stopping one task | `tasks/cancel`, or `mur cancel <url> <task-id>`; the session, its conversation and its queue keep running |
 | Trace | Both capsules write independent `trace.jsonl` files; `a2a_task_received` appears on the worker capsule side, `a2a_send` on the orchestrator capsule side |

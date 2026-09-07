@@ -783,6 +783,33 @@ struct TaskEndEvent {
     reopen_count: u32,
 }
 
+/// A person stopped this task. Written where the loop actually stopped, so the record names the
+/// wait that was interrupted and everything that was still running at that moment.
+///
+/// Distinct from the `task_end` that follows it: `task_end` says the task is over and with which
+/// `exit_status`, this says a person made that happen and what it left behind. A task cancelled
+/// while still queued has no `task_start` and gets no `task_end`, so this is its only record.
+#[derive(Serialize)]
+struct TaskCanceledEvent {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    task_id: String,
+    /// The turn that was in flight, 0-based. Absent for a task cancelled before it ever ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn: Option<u32>,
+    /// Where cancellation landed: `queued`, `turn`, `inference`, `input` or `delegation`.
+    phase: String,
+    /// Demoted shell commands still running when the loop stopped. They keep their own
+    /// lifecycle — nothing here was killed.
+    detached_work_ids: Vec<String>,
+    /// Delegations still in flight when the loop stopped, left running exactly as a delegation
+    /// deadline leaves them.
+    delegation_ids: Vec<String>,
+}
+
 /// One `on-task-end` hook reopened the task: its agent loop is about to re-run with
 /// the hook's feedback injected. Written between two agent-loop attempts for the same
 /// task, so `mur trace show` can show which hook drove each reopen and why.
@@ -1707,6 +1734,34 @@ impl TraceWriter {
         self.active_task_id = None;
         self.task_event_id = None;
         self.turn_event_id = None;
+        self.write_event(&event).await
+    }
+
+    /// Record that a person stopped this task, at the point the loop stopped.
+    ///
+    /// Leaves `active_task_id` and the task's parent id alone: for a running task the terminal
+    /// `task_end` still follows and closes the frame. A task cancelled while queued was never
+    /// started, so this record hangs off the session.
+    pub(crate) async fn write_task_canceled(
+        &mut self,
+        task_id: &str,
+        turn: Option<u32>,
+        phase: &str,
+        detached_work_ids: Vec<String>,
+        delegation_ids: Vec<String>,
+    ) -> std::io::Result<()> {
+        let event = TaskCanceledEvent {
+            event_type: "task_canceled",
+            event_id: new_event_id(),
+            parent_id: self.task_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            task_id: task_id.to_string(),
+            turn,
+            phase: phase.to_string(),
+            detached_work_ids,
+            delegation_ids,
+        };
         self.write_event(&event).await
     }
 

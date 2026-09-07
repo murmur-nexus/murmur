@@ -8,6 +8,7 @@ pub(crate) mod agent;
 pub mod artifact;
 pub mod artifact_config;
 pub mod bindings;
+pub(crate) mod cancel;
 pub(crate) mod cgroup;
 pub mod child_launch;
 pub mod containment;
