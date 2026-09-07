@@ -10,13 +10,16 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
-`mur run --explain-scope` enumerates every path the runtime itself writes inside the accessible
-workdir, as `runtime_writes` under `--json`. That enumeration is the authoritative one: the tables
-below describe what each path holds, and `trace.jsonl` carries the same array verbatim at
-`session_start.effective_grants.runtime_writes`. Paths there are relative to the accessible workdir
-and carry the literal segment `<session-id>`, which `session_start.session_id` supplies. A consumer
-diffing the accessible workdir to find what the capsule changed subtracts those paths; the single
-prefix `.murmur/` covers every one of them that belongs to the runtime rather than to the capsule.
+To find what the *capsule* changed, diff the accessible workdir and subtract what the runtime wrote
+there. `mur run --explain-scope` enumerates those paths, as `runtime_writes` under `--json`:
+
+- That enumeration is authoritative; the tables below describe what each path holds.
+- `trace.jsonl` carries the same array verbatim at `session_start.effective_grants.runtime_writes`,
+  so a run reports the paths to subtract from it.
+- Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which
+  `session_start.session_id` supplies.
+- Excluding the single prefix `.murmur/` covers every runtime-written path outside the accessible
+  workdir's own top level.
 
 Two more directories sit outside both and outlive every session: a
 [durable state store](#state-store), for artifacts that ask for one by name, and the
