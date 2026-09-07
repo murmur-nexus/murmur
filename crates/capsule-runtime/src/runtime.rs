@@ -498,6 +498,11 @@ pub fn stage_session(
         state_stores,
         configured_artifacts,
         preopens,
+        // Not established at stage time: whether the declared `io.max` ceiling applies is known
+        // only once the cgroup scope has been created, which `launch_session` does. Left at
+        // `NotProbed` here so the staged report claims nothing, and overwritten from
+        // `prepare_scope`'s real write outcome before `session_start` is written.
+        crate::cgroup::IoMaxReport::default(),
     );
     // Asked here, beside the containment floors and before any registry pull or workdir creation:
     // an ephemeral capsule's teardown is what bounds every handle it minted, and `after_task:
@@ -1096,13 +1101,22 @@ pub fn launch_session(
     });
     let requires_process_bounding =
         cgroup::requires_process_bounding(&staged.capability_policy, has_native_artifact);
-    let cgroup_scope = cgroup::prepare_scope(
+    let prepared_scope = cgroup::prepare_scope(
         requires_process_bounding,
         &staged.capability_policy.resources,
         &staged.session_id,
         &staged.workdir,
     )
     .map_err(|reason| RuntimeError::CgroupDelegationUnavailable { reason })?;
+    // Written into the staged report here, immediately after the write that decided it and ahead
+    // of every `staged.scope_report.clone()` that feeds a `session_start` event — the agent path
+    // and the script path both clone it later in this function. `stage_session` could not fill it:
+    // the answer does not exist until the scope has been created.
+    staged.scope_report.io_max = prepared_scope.io_max.clone();
+    // `io.max` is the one cgroup limit a host is not refused for, so a declared ceiling that did
+    // not apply has to be *said* here or the manifest and the scope report both go on implying it.
+    cgroup::warn_for_unenforced_io_max(&staged.workdir, &prepared_scope.io_max);
+    let cgroup_scope = prepared_scope.scope;
     let workdir_guard = Some(resources::WorkdirGuard::spawn(
         &staged.workdir,
         staged.capability_policy.resources.workdir_max_bytes,
@@ -8988,6 +9002,7 @@ inference:
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    crate::cgroup::IoMaxReport::default(),
                 ),
                 murmur_artifact::TraceCapture::Meta,
                 None,
@@ -9893,6 +9908,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
             None,
@@ -10109,6 +10125,7 @@ inference:
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                crate::cgroup::IoMaxReport::default(),
             ),
             murmur_artifact::TraceCapture::Meta,
             None,

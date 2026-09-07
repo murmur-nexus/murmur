@@ -162,6 +162,7 @@ fn the_trace_carries_the_same_declaration_explain_scope_prints() {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        capsule_runtime::IoMaxReport::default(),
     );
     assert_eq!(
         serde_json::to_value(&declared.runtime_writes).unwrap(),

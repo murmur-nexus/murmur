@@ -275,6 +275,96 @@ pub fn inspect_installed_profile() -> InstalledProfileState {
     classify_installed_profile(std::fs::read(SEALED_APPARMOR_PROFILE_PATH))
 }
 
+/// The paths the two shipped profiles in `packaging/apparmor/mur-sealed` attach to, as their
+/// AppArmor path globs.
+///
+/// **Remediation text only.** Nothing decides anything by matching the running binary's path
+/// against this list: matching a path is inference, while reading `/proc/self/attr/current` is
+/// what the kernel actually did, and [`classify_profile_attachment`] uses only the latter. This
+/// exists so `mur doctor` can tell an operator running a binary from an unusual location where the
+/// shipped profile *does* attach, without pretending to have measured anything.
+pub const SEALED_APPARMOR_ATTACHMENT_PATHS: &[&str] = &[
+    "/{usr/local/,usr/,opt/mur/}bin/mur",
+    "@{HOME}/{.local,.cargo}/bin/mur",
+];
+
+/// Which AppArmor profile, if any, the kernel reports as confining *this* process.
+///
+/// AppArmor attaches profiles by executable path, so a `mur` at a bind mount, a build output or a
+/// test fixture gets no profile however correctly the shipped one is installed. That is invisible
+/// in [`UsernsGrant`] alone — it reports [`UsernsGrant::Withheld`] identically for "the profile is
+/// not installed" and "the profile is installed and does not attach here" — which is why this is
+/// reported beside it rather than folded into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileAttachment {
+    /// A profile whose name begins with [`SEALED_APPARMOR_PROFILE_NAME`] confines this process —
+    /// the shipped profile, or the checkout profile `scripts/install-dev-apparmor.sh` generates.
+    /// The same condition [`UsernsGrant::ProfileConfining`] is decided on.
+    Sealed {
+        /// The profile name as the kernel reports it, without the trailing enforcement mode.
+        profile: String,
+    },
+    /// Some other profile confines this process. It grants nothing murmur asked for, and it may
+    /// be *narrower* than unconfined — a snap or a container runtime profile, for instance.
+    Other {
+        /// The profile name as the kernel reports it, without the trailing enforcement mode.
+        profile: String,
+    },
+    /// The kernel reports `unconfined`: AppArmor is present and no profile attaches to this
+    /// binary's path.
+    Unconfined,
+    /// `/proc/self/attr/current` is absent or unreadable — no AppArmor on this host, or not
+    /// Linux. Never collapsed into [`Self::Unconfined`], on the same terms
+    /// [`InstalledProfileState::Unreadable`] is kept apart from
+    /// [`InstalledProfileState::Absent`]: "nothing attaches" and "I could not look" are different
+    /// findings.
+    NotReported,
+}
+
+/// Classifies the contents of `/proc/self/attr/current` into a [`ProfileAttachment`].
+///
+/// Takes the already-performed read rather than the path, so all four outcomes are unit-testable
+/// on any OS — the same split [`classify_installed_profile`] uses.
+///
+/// The kernel writes the profile name followed by its enforcement mode in parentheses
+/// (`mur-sealed (unconfined)`, `unconfined`), so the mode is stripped before the name is compared.
+#[must_use]
+pub fn classify_profile_attachment(current_profile: Option<&str>) -> ProfileAttachment {
+    let Some(raw) = current_profile
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return ProfileAttachment::NotReported;
+    };
+    let name = raw
+        .split_once(" (")
+        .map_or(raw, |(name, _mode)| name)
+        .trim();
+    if name.is_empty() || name == "unconfined" {
+        return ProfileAttachment::Unconfined;
+    }
+    if name.starts_with(SEALED_APPARMOR_PROFILE_NAME) {
+        return ProfileAttachment::Sealed {
+            profile: name.to_string(),
+        };
+    }
+    ProfileAttachment::Other {
+        profile: name.to_string(),
+    }
+}
+
+/// [`classify_profile_attachment`] over the real `/proc/self/attr/current`. Holds no logic: the
+/// file is missing on every non-Linux host and on a Linux host without AppArmor, and both read as
+/// [`ProfileAttachment::NotReported`].
+#[must_use]
+pub fn inspect_profile_attachment() -> ProfileAttachment {
+    classify_profile_attachment(
+        std::fs::read_to_string("/proc/self/attr/current")
+            .ok()
+            .as_deref(),
+    )
+}
+
 // ---------------------------------------------------------------- blockers
 
 /// The one mechanism that stands between this host and `sealed`, named specifically enough that
@@ -301,6 +391,13 @@ pub enum SealedBlocker {
     /// The namespace was created, but `mount(2)` inside it was refused. The signature of a
     /// confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN`.
     MountDenied,
+    /// The namespace was created and `mount(2)` inside it worked, but the `pivot_root(2)`
+    /// sequence the composed root's step 6 performs did not. A separate finding from
+    /// [`Self::MountDenied`] because the two have separate remediations: `mount` is what an
+    /// AppArmor profile grants, while `pivot_root` is a distinct rule in that profile and a
+    /// distinct entry in a container runtime's seccomp allowlist, so a host can grant one and
+    /// refuse the other.
+    PivotRootDenied,
     /// The kernel has no unprivileged user namespace support at all (`CONFIG_USER_NS=n`, or
     /// `user.max_user_namespaces=0`).
     KernelUnsupported,
@@ -321,6 +418,7 @@ impl SealedBlocker {
         SealedBlocker::NamespaceCreationDenied,
         SealedBlocker::IdMapDenied,
         SealedBlocker::MountDenied,
+        SealedBlocker::PivotRootDenied,
         SealedBlocker::KernelUnsupported,
         SealedBlocker::LandlockUnavailable,
     ];
@@ -379,6 +477,17 @@ impl SealedBlocker {
                  invocation, or establish the mount namespace outside the container.",
                 path = SEALED_APPARMOR_PROFILE_PATH,
             ),
+            SealedBlocker::PivotRootDenied => format!(
+                "sealed created a user+mount namespace and mounted inside it, but pivot_root(2) \
+                 was refused, so the composed root cannot become this capsule's root. mount(2) \
+                 working while pivot_root(2) does not is what a policy that grants one and not \
+                 the other looks like: on an AppArmor host, check that the loaded profile carries \
+                 a `pivot_root,` rule and reload it with `sudo apparmor_parser -r {path}`; inside \
+                 a container, pivot_root(2) is commonly absent from the runtime's seccomp \
+                 allowlist even where CAP_SYS_ADMIN is granted, so establish the mount namespace \
+                 outside the container instead. The runtime will not fall back to a weaker class.",
+                path = SEALED_APPARMOR_PROFILE_PATH,
+            ),
             SealedBlocker::KernelUnsupported => {
                 "sealed requires unprivileged user namespaces, which this kernel does not provide \
                  (CONFIG_USER_NS=n, or user.max_user_namespaces=0). Raise \
@@ -398,14 +507,16 @@ impl SealedBlocker {
 
 // ---------------------------------------------------------------- host probe result
 
-/// Outcome of really trying to create a user+mount namespace in a forked child.
+/// Outcome of really rehearsing the composed root's construction in a forked child.
 ///
-/// The four states are not interchangeable: `Denied` and `MountDenied` both mean "no sealed here"
-/// but point at completely different remediations (container capability vs. AppArmor profile),
-/// which is the entire reason this is not a `bool`.
+/// The states are not interchangeable: `Denied`, `MountDenied` and `PivotRootDenied` all mean "no
+/// sealed here" but point at completely different remediations (container capability, AppArmor
+/// profile, seccomp allowlist), which is the entire reason this is not a `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum NamespaceProbe {
-    /// `unshare` succeeded and a `mount(2)` inside the new namespace succeeded.
+    /// The child completed the whole composed-root shape in its own throwaway namespace:
+    /// `unshare`, the identity maps, private propagation, a `tmpfs` over a root base candidate,
+    /// the parking directory, `pivot_root(2)` and `umount2(MNT_DETACH)`.
     Ok,
     /// `unshare` itself was refused (`EPERM`).
     Denied,
@@ -415,8 +526,15 @@ pub(crate) enum NamespaceProbe {
     /// points at id-mapping policy. Collapsing the two sent an operator hunting a container
     /// problem on a host that had created the namespace perfectly well.
     MapDenied,
-    /// `unshare` succeeded, `mount(2)` inside the namespace did not.
+    /// `unshare` succeeded, `mount(2)` inside the namespace did not — either the
+    /// `MS_REC | MS_PRIVATE` propagation change or the new root's `tmpfs`. The two fold together
+    /// because they are the same mechanism with the same remediation.
     MountDenied,
+    /// Every mount succeeded and the `pivot_root(2)` sequence did not. Kept apart from
+    /// [`MountDenied`](Self::MountDenied) because a host can permit `mount(2)` and refuse
+    /// `pivot_root(2)`. Folding the two together lets such a host clear the launch probe and
+    /// fail at the first subprocess with `E-RUN-014`.
+    PivotRootDenied,
     /// The kernel does not implement it (`ENOSYS`/`EINVAL`), or the probe could not run at all.
     #[default]
     Unsupported,
@@ -435,7 +553,8 @@ pub(crate) struct SealedProbe {
     /// [`UsernsGrant::permits_userns`]; the rest of the value is provenance, reported and never
     /// acted on.
     pub(crate) userns_grant: UsernsGrant,
-    /// What a real `unshare` + `mount` attempt in a forked child did.
+    /// What a real rehearsal of the composed root's construction — through `pivot_root(2)` and
+    /// `umount2(MNT_DETACH)` — did in a forked child.
     pub(crate) namespace: NamespaceProbe,
 }
 
@@ -468,6 +587,7 @@ pub(crate) fn sealed_blocker(
         NamespaceProbe::Denied => Some(SealedBlocker::NamespaceCreationDenied),
         NamespaceProbe::MapDenied => Some(SealedBlocker::IdMapDenied),
         NamespaceProbe::MountDenied => Some(SealedBlocker::MountDenied),
+        NamespaceProbe::PivotRootDenied => Some(SealedBlocker::PivotRootDenied),
         NamespaceProbe::Unsupported => Some(SealedBlocker::KernelUnsupported),
     }
 }
@@ -880,6 +1000,19 @@ pub(crate) fn synthetic_etc_source(session_workdir: &Path, file: SyntheticEtcFil
 /// Removed immediately afterwards, so it does not exist for any process the capsule can run.
 const OLD_ROOT_NAME: &str = ".mur-oldroot";
 
+/// [`OLD_ROOT_NAME`] relative, and rooted at `/` after the pivot, as NUL-terminated literals.
+///
+/// Same reason [`SEALED_ROOT_BASE_CANDIDATES_C`] exists: the probe child rehearses the pivot after
+/// `fork()`, where composing a `CString` is not allowed. `old_root_names_agree` keeps the three
+/// spellings in step.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const OLD_ROOT_NAME_C: &std::ffi::CStr = c".mur-oldroot";
+
+/// [`OLD_ROOT_NAME`] as it is named from inside the new root, once `pivot_root(2)` has parked the
+/// old one there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const OLD_ROOT_PIVOTED_C: &std::ffi::CStr = c"/.mur-oldroot";
+
 /// Base directories the new-root `tmpfs` may be mounted over, most preferred first.
 ///
 /// The base is overmounted inside the private namespace, so whatever the host has there becomes
@@ -887,6 +1020,17 @@ const OLD_ROOT_NAME: &str = ".mur-oldroot";
 /// the session workdir (a workdir under `/tmp` is entirely normal) and must not be one of the
 /// directories the composed root goes on to bind-mount from.
 pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "/mnt", "/media"];
+
+/// [`SEALED_ROOT_BASE_CANDIDATES`] as NUL-terminated literals, in the same order.
+///
+/// The host probe's child rehearses the composed root inside a `fork()`, where composing a
+/// `CString` would touch the allocator a sibling thread of the parent may have held frozen at fork
+/// time. Static literals are the only form usable there. `probe_root_base_candidates_match_the_str_list`
+/// keeps the two lists identical, so the probe can never rehearse a base the real construction
+/// would not choose.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const SEALED_ROOT_BASE_CANDIDATES_C: &[&std::ffi::CStr] =
+    &[c"/tmp", c"/run", c"/var/tmp", c"/mnt", c"/media"];
 
 /// `hidepid` spellings tried, in order, when mounting the composed root's `/proc` with
 /// `mount -t proc`. The numeric form is the legacy parser's; `invisible` is the Linux 5.8+
@@ -1386,7 +1530,8 @@ mod linux {
 
     use super::{
         ComposedRootPlan, NamespaceProbe, RootOp, RootStep, SealedProbe, UsernsGrant,
-        OLD_ROOT_NAME, PROC_HIDEPID_OPTIONS, SEALED_ROOT_FAILURE_PREFIX,
+        OLD_ROOT_NAME, OLD_ROOT_NAME_C, OLD_ROOT_PIVOTED_C, PROC_HIDEPID_OPTIONS,
+        SEALED_ROOT_BASE_CANDIDATES_C, SEALED_ROOT_FAILURE_PREFIX,
     };
 
     // ------------------------------------------------------------ probe
@@ -1497,6 +1642,16 @@ mod linux {
     const PROBE_UNSHARE_UNSUPPORTED: i32 = 2;
     const PROBE_MOUNT_DENIED: i32 = 3;
     const PROBE_MAP_DENIED: i32 = 4;
+    /// No candidate in [`SEALED_ROOT_BASE_CANDIDATES_C`] accepted a `tmpfs` mount. Same mechanism
+    /// and same remediation as [`PROBE_MOUNT_DENIED`], so it folds into `MountDenied`.
+    const PROBE_TMPFS_DENIED: i32 = 5;
+    /// The parking directory could not be made, or the child could not `chdir` into the new root —
+    /// composed-root step 6 before the syscall itself.
+    const PROBE_PIVOT_PREPARE_DENIED: i32 = 6;
+    /// `syscall(SYS_pivot_root, ".", ".mur-oldroot")` was refused.
+    const PROBE_PIVOT_ROOT_DENIED: i32 = 7;
+    /// `pivot_root` succeeded and detaching the parked old root did not — composed-root step 7.
+    const PROBE_OLD_ROOT_DETACH_DENIED: i32 = 8;
 
     fn probe_namespace() -> NamespaceProbe {
         // Read before the fork, and therefore before `unshare`: inside a fresh user namespace
@@ -1511,8 +1666,10 @@ mod linux {
 
         // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the child
         // touches nothing but async-signal-safe primitives. The child below calls `unshare`,
-        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps, and
-        // `_exit` — every one of them async-signal-safe, and no allocation, no locks, no stdio.
+        // `prctl`, `mount`, the `open`/`write`/`close` triples that write the identity maps,
+        // `chdir`, `mkdir`, `pivot_root` via `syscall`, `umount2`, and `_exit` — every one of them
+        // async-signal-safe, and no allocation, no locks, no stdio. Anything added to the child
+        // must hold to the same list.
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return NamespaceProbe::Unsupported;
@@ -1550,18 +1707,67 @@ mod linux {
                 // The first mount any composed root performs, and the one AppArmor's
                 // `unprivileged_userns` profile denies: if this works, `CAP_SYS_ADMIN` is real
                 // inside the new namespace.
-                let rc = libc::mount(
+                if libc::mount(
                     std::ptr::null(),
                     c"/".as_ptr(),
                     std::ptr::null(),
                     libc::MS_REC | libc::MS_PRIVATE,
                     std::ptr::null(),
-                );
-                libc::_exit(if rc == 0 {
-                    PROBE_OK
-                } else {
-                    PROBE_MOUNT_DENIED
-                });
+                ) != 0
+                {
+                    libc::_exit(PROBE_MOUNT_DENIED);
+                }
+
+                // Steps 4, 6 and 7 of `construct_composed_root`, in the same order and with the
+                // same syscalls. A probe that stops at the mount above clears a host that refuses
+                // `pivot_root(2)`, which then fails at the first subprocess after an inference
+                // call has already been paid for.
+                //
+                // Everything below happens inside this child's own mount namespace, whose
+                // propagation the mount above just made private, so the host's mount table is
+                // unchanged whatever the outcome — and the child `_exit`s a few syscalls later
+                // without ever unwinding any of it.
+                let mut based = false;
+                for base in SEALED_ROOT_BASE_CANDIDATES_C {
+                    if libc::mount(
+                        c"tmpfs".as_ptr(),
+                        base.as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        libc::MS_NOSUID | libc::MS_NODEV,
+                        c"mode=0755".as_ptr() as *const libc::c_void,
+                    ) == 0
+                    {
+                        // `chdir` first, so the parking directory and `pivot_root`'s two
+                        // arguments are all relative and no path has to be composed here.
+                        if libc::chdir(base.as_ptr()) != 0 {
+                            libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
+                        }
+                        based = true;
+                        break;
+                    }
+                }
+                if !based {
+                    libc::_exit(PROBE_TMPFS_DENIED);
+                }
+
+                if libc::mkdir(OLD_ROOT_NAME_C.as_ptr(), 0o700) != 0 {
+                    libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
+                }
+                if libc::syscall(
+                    libc::SYS_pivot_root,
+                    c".".as_ptr(),
+                    OLD_ROOT_NAME_C.as_ptr(),
+                ) != 0
+                {
+                    libc::_exit(PROBE_PIVOT_ROOT_DENIED);
+                }
+                if libc::chdir(c"/".as_ptr()) != 0 {
+                    libc::_exit(PROBE_PIVOT_PREPARE_DENIED);
+                }
+                if libc::umount2(OLD_ROOT_PIVOTED_C.as_ptr(), libc::MNT_DETACH) != 0 {
+                    libc::_exit(PROBE_OLD_ROOT_DETACH_DENIED);
+                }
+                libc::_exit(PROBE_OK);
             }
         }
 
@@ -1582,7 +1788,17 @@ mod linux {
             // the namespace outright — so the reported cause, and the remediation offered with
             // it, named the wrong thing entirely.
             PROBE_MAP_DENIED => NamespaceProbe::MapDenied,
-            PROBE_MOUNT_DENIED => NamespaceProbe::MountDenied,
+            // A tmpfs the kernel would not accept over any candidate base is the same mechanism
+            // and the same remediation as the propagation mount above, so the two report as one.
+            PROBE_MOUNT_DENIED | PROBE_TMPFS_DENIED => NamespaceProbe::MountDenied,
+            // The whole of composed-root steps 6 and 7. The parking `mkdir`, the two `chdir`s and
+            // the `umount2` are the sequence `pivot_root(2)` is performed with, and a host that
+            // refuses any of them refuses the pivot; the exit codes stay distinct so the *stage*
+            // is still recoverable from a core-less child, while the blocker names the mechanism
+            // an operator has to grant.
+            PROBE_PIVOT_PREPARE_DENIED | PROBE_PIVOT_ROOT_DENIED | PROBE_OLD_ROOT_DETACH_DENIED => {
+                NamespaceProbe::PivotRootDenied
+            }
             _ => NamespaceProbe::Unsupported,
         }
     }
@@ -2941,6 +3157,139 @@ mod tests {
         }
     }
 
+    /// A refused `pivot_root(2)` is its own finding, with its own remediation. Without this
+    /// variant a host that permits `mount(2)` and refuses the pivot probes as `Ok` and fails at
+    /// the first subprocess with `E-RUN-014`, after an inference call has already been paid for.
+    #[test]
+    fn a_refused_pivot_root_is_its_own_blocker() {
+        let probe = SealedProbe {
+            userns_grant: UsernsGrant::ProfileConfining,
+            namespace: NamespaceProbe::PivotRootDenied,
+        };
+        assert_eq!(
+            sealed_blocker(true, true, probe),
+            Some(SealedBlocker::PivotRootDenied)
+        );
+
+        let reason = SealedBlocker::PivotRootDenied.reason();
+        assert!(reason.contains("pivot_root(2)"), "reason was: {reason}");
+        // Distinguishable from `MountDenied`'s: an operator handed the mount remediation on a
+        // host whose mounts already work has been sent somewhere useless.
+        assert_ne!(reason, SealedBlocker::MountDenied.reason());
+        assert!(reason.contains("seccomp"), "reason was: {reason}");
+    }
+
+    /// Every [`NamespaceProbe`] variant reaches a blocker decision, so a variant added later
+    /// cannot fall through to "this host can back sealed".
+    #[test]
+    fn every_namespace_probe_outcome_is_attributed() {
+        const ALL: &[NamespaceProbe] = &[
+            NamespaceProbe::Ok,
+            NamespaceProbe::Denied,
+            NamespaceProbe::MapDenied,
+            NamespaceProbe::MountDenied,
+            NamespaceProbe::PivotRootDenied,
+            NamespaceProbe::Unsupported,
+        ];
+        for namespace in ALL {
+            let probe = SealedProbe {
+                userns_grant: UsernsGrant::ProfileConfining,
+                namespace: *namespace,
+            };
+            let blocker = sealed_blocker(true, true, probe);
+            if *namespace == NamespaceProbe::Ok {
+                assert_eq!(blocker, None, "a complete rehearsal must back sealed");
+            } else {
+                let blocker = blocker.unwrap_or_else(|| panic!("{namespace:?} named no blocker"));
+                assert!(
+                    SealedBlocker::ALL.contains(&blocker),
+                    "{blocker:?} is missing from SealedBlocker::ALL"
+                );
+            }
+        }
+    }
+
+    /// The probe child cannot compose a `CString`, so it carries its own NUL-terminated copies of
+    /// the base candidates. A copy that drifted would have the probe rehearse a base the real
+    /// construction would never choose.
+    #[test]
+    fn probe_root_base_candidates_match_the_str_list() {
+        let literals: Vec<&str> = SEALED_ROOT_BASE_CANDIDATES_C
+            .iter()
+            .map(|value| value.to_str().expect("ASCII path literal"))
+            .collect();
+        assert_eq!(literals, SEALED_ROOT_BASE_CANDIDATES);
+    }
+
+    /// Same reason, for the old-root parking directory: three spellings of one name.
+    #[test]
+    fn old_root_names_agree() {
+        assert_eq!(OLD_ROOT_NAME_C.to_str().unwrap(), OLD_ROOT_NAME);
+        assert_eq!(
+            OLD_ROOT_PIVOTED_C.to_str().unwrap(),
+            format!("/{OLD_ROOT_NAME}")
+        );
+    }
+
+    /// Four outcomes, none of them inferred from a path. `unconfined` and "I could not look" stay
+    /// apart for the same reason [`InstalledProfileState`]'s two absences do.
+    #[test]
+    fn profile_attachment_reports_only_what_the_kernel_said() {
+        assert_eq!(
+            classify_profile_attachment(Some("mur-sealed (unconfined)")),
+            ProfileAttachment::Sealed {
+                profile: "mur-sealed".to_string()
+            }
+        );
+        assert_eq!(
+            classify_profile_attachment(Some("mur-sealed-home")),
+            ProfileAttachment::Sealed {
+                profile: "mur-sealed-home".to_string()
+            }
+        );
+        assert_eq!(
+            classify_profile_attachment(Some("snap.chromium.chromium (enforce)")),
+            ProfileAttachment::Other {
+                profile: "snap.chromium.chromium".to_string()
+            }
+        );
+        assert_eq!(
+            classify_profile_attachment(Some("unconfined")),
+            ProfileAttachment::Unconfined
+        );
+        assert_eq!(
+            classify_profile_attachment(Some("unconfined\n")),
+            ProfileAttachment::Unconfined
+        );
+        assert_eq!(
+            classify_profile_attachment(None),
+            ProfileAttachment::NotReported
+        );
+        assert_eq!(
+            classify_profile_attachment(Some("   ")),
+            ProfileAttachment::NotReported
+        );
+    }
+
+    /// The attachment list is documentation of the shipped profile, never a verdict — nothing
+    /// decides anything by matching a path against it. This keeps it honest about what the file
+    /// actually declares.
+    #[test]
+    fn attachment_paths_are_the_ones_the_shipped_profile_declares() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packaging/apparmor/mur-sealed"
+        );
+        let profile =
+            std::fs::read_to_string(path).expect("the shipped profile is in the workspace");
+        for attachment in SEALED_APPARMOR_ATTACHMENT_PATHS {
+            assert!(
+                profile.contains(attachment),
+                "{attachment} is not an attachment in packaging/apparmor/mur-sealed"
+            );
+        }
+    }
+
     /// The digest constant is a literal because `capsule-runtime` is published to crates.io and
     /// `cargo package` would not carry a file from outside the crate directory. This test is what
     /// keeps the literal honest, and it does not run during `cargo package`.
@@ -3073,6 +3422,7 @@ mod tests {
                 | SealedBlocker::NamespaceCreationDenied
                 | SealedBlocker::IdMapDenied
                 | SealedBlocker::MountDenied
+                | SealedBlocker::PivotRootDenied
                 | SealedBlocker::KernelUnsupported
                 | SealedBlocker::LandlockUnavailable => *blocker,
             };

@@ -351,6 +351,9 @@ fn achieved_class_here() -> ContainmentClass {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        // Only `achieved_containment` is read here, and `io.max` reaches no class. `NotProbed` is
+        // the honest value for a report nobody asked the question of.
+        capsule_runtime::IoMaxReport::default(),
     )
     .achieved_containment
 }

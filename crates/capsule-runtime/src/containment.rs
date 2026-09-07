@@ -30,6 +30,7 @@ use murmur_artifact::{ContainmentClass, ExportMode, Exports, FileExport, PeerFil
 use serde::Serialize;
 
 use crate::{
+    cgroup::{IoMaxReport, IoMaxStatus},
     errors::RuntimeError,
     sandbox::{detect_enforcement_tier, EnforcementTier},
     sealed::{SealedBlocker, UsernsGrant},
@@ -503,6 +504,22 @@ pub struct ScopeReport {
     /// no `sealed` rows is that cap, not a disagreement — the host could seal and the capsule did
     /// not ask. See [`crate::workdir_writes`].
     pub runtime_writes: Vec<crate::workdir_writes::RuntimeWriteReport>,
+    /// The declared `capabilities.resources.cgroup_io_bytes_per_sec` ceiling, and whether it is
+    /// actually on this session's cgroup scope.
+    ///
+    /// Always serialized (never skipped), on the same terms as [`Self::workdir_exec`] and
+    /// [`Self::state_stores`]: an absent key identifies a runtime that predates the field, not a
+    /// host that was not asked. [`IoMaxStatus::NotProbed`] is what "not asked" looks like, and it
+    /// is a value in the report rather than a missing key.
+    ///
+    /// The one field here filled from a *performed* operation rather than from the policy: at
+    /// launch it carries the outcome of the real `io.max` write, established before `session_start`
+    /// is written so `trace.jsonl` cannot claim a ceiling the kernel refused; under
+    /// `--explain-scope` it carries the outcome of the same write against a throwaway cgroup that
+    /// is created and removed. Declaring a ceiling that does not apply changes no class and refuses
+    /// no launch — `io.max` is the one non-fatal cgroup limit — so this field is the only place
+    /// the shortfall appears.
+    pub io_max: IoMaxReport,
 }
 
 impl ScopeReport {
@@ -581,6 +598,20 @@ impl ScopeReport {
                     export.max_bytes
                 ));
             }
+        }
+
+        out.push_str(&format!(
+            "  io.max:        {} ({} bytes/s declared)\n",
+            match self.io_max.status {
+                IoMaxStatus::Enforced => "enforced",
+                IoMaxStatus::Unavailable => "unavailable",
+                IoMaxStatus::NotRequired => "not-required",
+                IoMaxStatus::NotProbed => "not-probed",
+            },
+            self.io_max.declared_bytes_per_sec
+        ));
+        if let Some(reason) = &self.io_max.reason {
+            out.push_str(&format!("    {reason}\n"));
         }
 
         out.push_str("\nPeer handoff\n");
@@ -692,6 +723,7 @@ pub fn explain_scope(
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
     preopens: Vec<PreopenReport>,
+    io_max: IoMaxReport,
 ) -> ScopeReport {
     let probe = crate::sandbox::HostProbe::probe();
     scope_report_for_tier(
@@ -704,6 +736,7 @@ pub fn explain_scope(
         state_stores,
         configured_artifacts,
         preopens,
+        io_max,
     )
 }
 
@@ -720,6 +753,7 @@ pub(crate) fn scope_report_for_tier(
     state_stores: Vec<StateStoreReport>,
     configured_artifacts: Vec<String>,
     preopens: Vec<PreopenReport>,
+    io_max: IoMaxReport,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
     let shortfall_reason = containment_shortfall_reason(
@@ -801,6 +835,10 @@ pub(crate) fn scope_report_for_tier(
         runtime_writes: crate::workdir_writes::runtime_writes(crate::sandbox::applied_tier(
             tier, declared,
         )),
+        // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
+        // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
+        // above it, it reaches no class and no floor.
+        io_max,
     }
 }
 
@@ -1097,12 +1135,34 @@ mod tests {
         assert!(container.contains("outside the container"));
         assert!(!container.contains("apparmor_parser"));
 
+        // A host that mounts and will not pivot is refused at launch with its own text, rather
+        // than at the first subprocess with `E-RUN-014`.
+        let pivot = containment_shortfall_reason(
+            ContainmentClass::Sealed,
+            ContainmentClass::Advisory,
+            Some(SealedBlocker::PivotRootDenied),
+            false,
+        )
+        .expect("refusal");
+        assert!(pivot.contains("pivot_root(2)"), "reason was: {pivot}");
+        assert_ne!(
+            pivot,
+            containment_shortfall_reason(
+                ContainmentClass::Sealed,
+                ContainmentClass::Advisory,
+                Some(SealedBlocker::MountDenied),
+                false,
+            )
+            .expect("refusal")
+        );
+
         // Never the pre-mechanism blanket text again, under any blocker.
         for blocker in [
             SealedBlocker::NotLinux,
             SealedBlocker::AppArmorProfileMissing,
             SealedBlocker::NamespaceCreationDenied,
             SealedBlocker::MountDenied,
+            SealedBlocker::PivotRootDenied,
             SealedBlocker::KernelUnsupported,
             SealedBlocker::LandlockUnavailable,
         ] {
@@ -1198,6 +1258,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Scoped);
@@ -1239,6 +1300,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
 
         assert!(report.workdir_exec);
@@ -1261,6 +1323,82 @@ mod tests {
         assert!(rendered.contains("achieved:  advisory"));
     }
 
+    /// The key is always written, on the same terms `workdir_exec` and `state_stores` are: an
+    /// absent `io_max` identifies a runtime that predates the field, not a host that was not
+    /// asked. "Not asked" is a value — `not-probed` — inside the object.
+    #[test]
+    fn scope_report_json_always_carries_io_max() {
+        let unprobed: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport::default(),
+        ))
+        .unwrap();
+        assert_eq!(unprobed["io_max"]["status"], "not-probed");
+        assert_eq!(unprobed["io_max"]["declared_bytes_per_sec"], 0);
+        assert!(unprobed["io_max"].get("reason").is_none());
+
+        let enforced: serde_json::Value = serde_json::to_value(scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport {
+                declared_bytes_per_sec: 52_428_800,
+                status: IoMaxStatus::Enforced,
+                reason: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(enforced["io_max"]["status"], "enforced");
+        assert_eq!(enforced["io_max"]["declared_bytes_per_sec"], 52_428_800);
+    }
+
+    /// A ceiling that did not apply has to be visible in the rendering an operator reads, not
+    /// only in the JSON: this report is where the claim of an I/O bound would otherwise stand
+    /// uncontradicted.
+    #[test]
+    fn the_rendered_resource_plane_states_what_became_of_the_io_ceiling() {
+        let rendered = scope_report_for_tier(
+            &sample_policy(),
+            ContainmentClass::Scoped,
+            EnforcementTier::KernelFull,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            IoMaxReport {
+                declared_bytes_per_sec: 52_428_800,
+                status: IoMaxStatus::Unavailable,
+                reason: Some("the io controller is not delegated".to_string()),
+            },
+        )
+        .render();
+
+        assert!(rendered.contains("Resource plane"), "{rendered}");
+        assert!(rendered.contains("io.max:"), "{rendered}");
+        assert!(rendered.contains("unavailable"), "{rendered}");
+        assert!(rendered.contains("52428800 bytes/s declared"), "{rendered}");
+        assert!(
+            rendered.contains("the io controller is not delegated"),
+            "{rendered}"
+        );
+    }
+
     /// The field is always written, including `false`, so a consumer can distinguish "this capsule
     /// declared nothing" from "this runtime does not know the key".
     #[test]
@@ -1275,6 +1413,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         assert_eq!(value["workdir_exec"], false);
@@ -1306,6 +1445,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                IoMaxReport::default(),
             );
             assert_eq!(
                 report.staged_runtime_grants,
@@ -1336,6 +1476,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         assert!(report.staged_runtime_grants.is_empty());
         assert!(report.render().contains("staged runtime: <none>"));
@@ -1356,6 +1497,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert!(!report.floor_met);
@@ -1373,6 +1515,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
 
         assert_eq!(report.declared_containment, ContainmentClass::Sealed);
@@ -1394,6 +1537,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert!(report.floor_met);
@@ -1415,6 +1559,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         let value: serde_json::Value = serde_json::to_value(&report).unwrap();
 
@@ -1440,6 +1585,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
 
         for grant in UsernsGrant::ALL {
@@ -1453,6 +1599,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                IoMaxReport::default(),
             );
             assert_eq!(report.achieved_containment, baseline.achieved_containment);
             assert_eq!(report.floor_met, baseline.floor_met);
@@ -1485,6 +1632,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
         .render();
 
@@ -1521,6 +1669,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
                     &policy,
@@ -1535,6 +1684,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    IoMaxReport::default(),
                 );
                 assert_eq!(
                     with.achieved_containment, without.achieved_containment,
@@ -1594,6 +1744,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    IoMaxReport::default(),
                 );
                 let with = scope_report_for_tier(
                     &with_policy,
@@ -1608,6 +1759,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    IoMaxReport::default(),
                 );
                 assert_eq!(
                     with.achieved_containment, without.achieved_containment,
@@ -1656,6 +1808,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         assert_eq!(undeclared["peer_files"], serde_json::Value::Null);
@@ -1681,6 +1834,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         assert_eq!(
@@ -1705,6 +1859,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
         .render();
         assert!(undeclared.contains("Peer handoff"));
@@ -1731,6 +1886,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
         .render();
         assert!(declared.contains("exports.peer_files root: out/"));
@@ -1761,6 +1917,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
             &policy,
@@ -1772,6 +1929,7 @@ mod tests {
             stores.clone(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
 
         assert_eq!(with.state_stores, stores);
@@ -1847,6 +2005,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         );
         let with = scope_report_for_tier(
             &policy,
@@ -1858,6 +2017,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             preopens.clone(),
+            IoMaxReport::default(),
         );
 
         assert_eq!(with.preopens, preopens);
@@ -1931,6 +2091,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         assert_eq!(undeclared["exports_files"], serde_json::Value::Null);
@@ -1952,6 +2113,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         assert_eq!(
@@ -1972,6 +2134,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
         .render();
         assert!(
@@ -1996,6 +2159,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
         .render();
         assert!(declared.contains("exports.files root: out/"), "{declared}");
@@ -2027,6 +2191,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         )
     }
 
@@ -2223,6 +2388,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            IoMaxReport::default(),
         ))
         .unwrap();
         let object = json.as_object().expect("a scope report is a JSON object");

@@ -4,10 +4,11 @@ use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
-    preopen_reports, read_only_advisory_for, render_read_only, warn_on_interpreter_runtime_grants,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, SEALED_APPARMOR_PROFILE_PATH,
-    SEALED_APPARMOR_PROFILE_SHA256,
+    inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
+    warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
+    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, load_runtime_manifest, native_binary_verdict,
@@ -149,6 +150,81 @@ fn check_lock_entry(
     LockVerdict::Ok
 }
 
+/// Prints where this `mur` is and which AppArmor profile, if any, the kernel reports confining it.
+///
+/// Two separate facts, printed together because neither is useful alone: a profile name with no
+/// path does not say what it attached *to*, and a path with no profile does not say whether
+/// anything reached it. The path is resolved through `std::env::current_exe()` and canonicalized
+/// where possible — a `mur` reached through a symlink is confined by whatever attaches to the
+/// resolved target, not to the link — and stated as unavailable rather than guessed when the
+/// platform will not report it.
+///
+/// Reaches no `fixes` entry and changes no exit code, exactly as the rest of this block does not.
+fn report_binary_attachment(grant: Option<UsernsGrant>) {
+    match std::env::current_exe() {
+        Ok(path) => {
+            let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+            println!("  this binary:  {}", resolved.display());
+        }
+        Err(error) => {
+            println!("  this binary:  <unavailable> ({error})");
+            println!(
+                "    Without the running binary's path there is nothing to say which profile \
+                 could attach to it. The `profile attached` line below is still what the kernel \
+                 reports."
+            );
+        }
+    }
+
+    match inspect_profile_attachment() {
+        ProfileAttachment::Sealed { profile } => {
+            println!("  profile attached: {profile}");
+            println!(
+                "    An AppArmor profile named for the one mur ships is confining this binary, so \
+                 the userns grant below covers mur alone."
+            );
+        }
+        ProfileAttachment::Other { profile } => {
+            println!("  profile attached: {profile}");
+            println!(
+                "    Some other profile confines this binary. It is not the profile mur ships and \
+                 grants nothing mur asked for; it may also be narrower than unconfined."
+            );
+        }
+        ProfileAttachment::Unconfined => {
+            println!("  profile attached: none (the kernel reports this binary as unconfined)");
+        }
+        ProfileAttachment::NotReported => {
+            println!("  profile attached: not reported (/proc/self/attr/current is unreadable)");
+            println!(
+                "    Expected where AppArmor is not enabled, and on every non-Linux host. Not the \
+                 same as `none`: nothing attaches and I could not look are different findings."
+            );
+        }
+    }
+
+    if grant == Some(UsernsGrant::Withheld) {
+        println!(
+            "    This path is why the grant below is withheld: AppArmor attaches profiles by \
+             executable path, and no mur-sealed profile attaches to this one."
+        );
+        println!("    The shipped profile attaches to:");
+        for attachment in SEALED_APPARMOR_ATTACHMENT_PATHS {
+            println!("      {attachment}");
+        }
+        println!(
+            "    Running from a checkout build: `scripts/install-dev-apparmor.sh` generates and \
+             loads the same grant for ./target/{{debug,release}}/mur. Running from anywhere else: \
+             install mur to one of the paths above."
+        );
+        println!(
+            "    Adding this path to the profile is not the fix. Path attachment is the \
+             mechanism's design — a profile that matched everything would grant userns to \
+             everything — so the next unusual location would fail exactly the same way."
+        );
+    }
+}
+
 /// Prints the AppArmor/user-namespace block, and emits `W-SEC-013` when this host's user
 /// namespaces are unrestricted host-wide rather than granted to `mur` by the shipped profile.
 ///
@@ -159,9 +235,18 @@ fn check_lock_entry(
 /// reloaded and a loaded profile can outlive the file it came from. So the file finding is
 /// reported after the grant and never contradicts it, changes no class, and changes no exit code —
 /// `run_doctor`'s exit status is driven by the `fixes` vector alone.
+///
+/// The **binary path and its attachment** are a third finding on the same terms. AppArmor attaches
+/// profiles by executable path, so a `mur` at a bind mount, a build output or a test fixture gets
+/// no profile however correctly the shipped one is installed — and the grant alone cannot say so,
+/// because it reports `withheld` identically for "no profile is installed" and "a profile is
+/// installed and does not attach here". The attachment is read from `/proc/self/attr/current`,
+/// never inferred by matching the running path against
+/// [`SEALED_APPARMOR_ATTACHMENT_PATHS`], which is remediation text only.
 fn report_userns_grant() {
     let grant = detect_userns_grant();
     println!("AppArmor / user namespaces");
+    report_binary_attachment(grant);
     match grant {
         Some(grant) => {
             println!("  userns grant: {}", grant.wire_name());

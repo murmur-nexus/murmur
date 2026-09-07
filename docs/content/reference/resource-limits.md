@@ -94,6 +94,57 @@ and [`W-SEC-010`](diagnostics.md#w-sec-010) names the residual gap: no aggregate
 tree, and no per-process memory bound either, because macOS has no `RLIMIT_AS` and its kernel does
 not enforce `RLIMIT_DATA`.
 
+### Whether the I/O ceiling applied { #io-max-report }
+
+`cgroup_io_bytes_per_sec` is the one cgroup limit whose failure does not refuse a launch.
+`memory.max`, `pids.max` and `cpu.max` are settable on any cgroup v2 host once the controllers are
+delegated, so a failure there means the bound genuinely does not exist and the session must not
+start. `io.max` names a block device by `MAJ:MIN`, and a filesystem with no block device behind it
+— tmpfs, overlayfs, FUSE and network mounts — has none to name. A capsule that saturates disk
+bandwidth is slow; one that exhausts memory or pids is fatal.
+
+Every session reports what became of the ceiling, in an `io_max` object carried by
+`mur run --explain-scope --json` and by `session_start.effective_grants` in `trace.jsonl`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `declared_bytes_per_sec` | integer | The effective `capabilities.resources.cgroup_io_bytes_per_sec`, after the default is applied. Present whatever the status |
+| `status` | string | One of the four below |
+| `reason` | string | Why, for every status but `enforced`. Absent when there is nothing to say |
+
+| `status` | Means |
+|---|---|
+| `enforced` | The `io.max` write succeeded against the device backing the workdir. The ceiling is on the scope |
+| `unavailable` | A scope exists and the write did not succeed. `memory.max`, `pids.max` and `cpu.max` are still enforced on it; I/O bandwidth is not bounded. [`W-SEC-021`](diagnostics.md#w-sec-021) reports it |
+| `not-required` | No scope was asked for: the capsule can reach no native subprocess, or this is not Linux |
+| `not-probed` | The write was never attempted, so nothing is claimed either way |
+
+`mur run --explain-scope` reports the status a launch would reach: it creates a throwaway cgroup,
+performs the same write, and removes the directory again.
+
+The device that write names is resolved in three steps, because neither of the two numbers closest
+to hand is one the block layer accepts:
+
+| Step | Read from | Why |
+|---|---|---|
+| The filesystem behind the workdir | `st_dev` of the nearest existing ancestor of the path | Under `--explain-scope` the workdir does not exist yet, and a launch's workdir sits on the same filesystem as the project directory |
+| The device it was mounted from | `/proc/self/mountinfo` | btrfs, overlayfs, tmpfs and every FUSE mount are given an anonymous device number, which names no device |
+| The whole disk carrying that device | `/sys/dev/block/MAJ:MIN` | An `io.max` entry binds to a request queue and only a whole disk carries one, so the kernel refuses a partition such as `/dev/nvme0n1p7` |
+
+A filesystem that survives all three has a ceiling written against it; one that reaches the second
+step with a source such as `tmpfs` has no device, and that is what `unavailable` reports.
+
+To see both statuses on one host, run the same capsule from a project on a tmpfs and from one on a
+block-device-backed filesystem:
+
+```console
+$ mkdir -p /dev/shm/io-demo && cp murmur.yaml /dev/shm/io-demo/
+$ mur run --manifest /dev/shm/io-demo/murmur.yaml --explain-scope --json | jq .io_max.status
+"unavailable"
+$ mur run --manifest ./murmur.yaml --explain-scope --json | jq .io_max.status
+"enforced"
+```
+
 ### Which limit a subprocess hit { #which-limit }
 
 When a subprocess dies or fails on a resource ceiling and the kernel's own evidence names exactly

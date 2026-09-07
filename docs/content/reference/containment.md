@@ -163,9 +163,9 @@ never lower it.
 **Achieved class.** `mur run` derives the class the host can *actually* provide by probing the
 kernel directly (never by trusting the manifest). The probe is a conjunction, and every element has
 to hold for the next class up: a Landlock-capable Linux 5.13+ host achieves `scoped`; a host that
-also creates an unprivileged user+mount namespace and mounts inside it — verified by really doing
-it in a forked child, not by reading a version string — achieves `sealed`; every other host (older
-Linux without Landlock, or macOS) achieves `advisory`. Granting a `scoped` capsule access to host
+also completes the whole composed-root construction — verified by really doing it in a forked
+child, not by reading a version string — achieves `sealed`; every other host (older Linux without
+Landlock, or macOS) achieves `advisory`. Granting a `scoped` capsule access to host
 paths outside the workdir via `capabilities.shell.interpreter_runtime` never changes the achieved
 class.
 
@@ -184,11 +184,28 @@ filesystem, no composed root. Installing one anyway would delete the host paths 
 The achieved class reported in the trace still says what the *host* can back; the mechanism
 installed follows what the capsule *asked for*.
 
+**What the `sealed` probe performs.** The probe child rehearses the composed root's construction
+end to end, in its own throwaway namespace, and reports the stage that failed:
+
+| Stage | A refusal reports |
+|---|---|
+| `unshare(CLONE_NEWUSER \| CLONE_NEWNS)` | The namespace could not be created — the container case: no `CAP_SYS_ADMIN`, or a seccomp filter blocking the syscall |
+| Identity `uid_map`/`gid_map` writes | The namespace exists and cannot be owned — an id-mapping policy problem, not a missing capability |
+| `mount(MS_REC \| MS_PRIVATE)` on `/`, then a `tmpfs` over a root base candidate | `mount(2)` inside the namespace was refused — what a confinement that permits `userns_create` and then denies `CAP_SYS_ADMIN` looks like |
+| The parking directory, `chdir`, `pivot_root(2)`, `chdir("/")`, `umount2(MNT_DETACH)` | `pivot_root(2)` was refused. `mount(2)` working while the pivot does not is a policy that grants one and not the other: an AppArmor profile missing its `pivot_root,` rule, or a container runtime whose seccomp allowlist omits the syscall even where `CAP_SYS_ADMIN` is granted |
+
+The rehearsal runs in the child's own namespace with mount propagation made private first, so
+nothing it does reaches the host's mount table.
+
+The last row is why the rehearsal goes all the way through the pivot: a host that mounts and
+refuses `pivot_root(2)` is refused at launch, rather than at the first subprocess with
+`E-RUN-014` once an inference call has already been paid for.
+
 **Refusal.** A host whose achieved class is weaker than the effective declared floor refuses the
 launch with [`E-CAP-003`](diagnostics.md#e-cap-003), before any registry pull, artifact compile, or
 workdir creation. The refusal names the specific missing mechanism — the AppArmor profile, a
-container's absent `CAP_SYS_ADMIN`, a kernel without user namespaces — and the command that fixes
-it.
+container's absent `CAP_SYS_ADMIN`, a refused `pivot_root(2)`, a kernel without user namespaces —
+and the command that fixes it.
 
 A manifest that never declares `capabilities.containment` is never gated by this check — the
 effective floor resolves to `advisory`, which every host satisfies.
