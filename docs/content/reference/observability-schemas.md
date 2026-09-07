@@ -412,7 +412,7 @@ Appears at most once per task, before that task's terminal `task_end`. A task ca
 Nothing named in `detached_work_ids` or `delegation_ids` was stopped: both are reported so an
 operator knows what is still running, and both keep the lifecycle they already had. The arrays are
 a snapshot taken where the loop stopped, so they may differ from the `residue` artifact the
-`tasks/cancel` response carried, which was taken at the door.
+`tasks/cancel` response carried, which was taken when that response was sent.
 
 **`task_reopened`** — written once per reopen, between two agent-loop attempts of the same task,
 when a blocking `on-task-end` hook (`commit_policy: reopen-task`) returns `reopen-task(reason)` and

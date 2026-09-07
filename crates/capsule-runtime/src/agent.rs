@@ -485,9 +485,9 @@ pub(crate) async fn run_agent_loop(
             .store(sse_event_id, Ordering::Relaxed);
 
         let inference_started = Instant::now();
-        // Raced rather than awaited: losing the race drops the `call_async` future, which disposes
-        // the guest fiber and takes the pending outbound request down with it. That is the whole
-        // point of the card — a cancel must stop the provider call in flight, not wait it out.
+        // Raced rather than awaited: a cancel must stop the provider call in flight rather than
+        // wait it out. Losing the race drops the `call_async` future, which disposes the guest
+        // fiber and takes the pending outbound request down with it.
         let dispatched = match cancel.as_ref() {
             Some(signal) => {
                 tokio::select! {
