@@ -30,8 +30,12 @@ const DEFAULT_ENV_BASELINE: &[&str] = &[
 ];
 
 /// Directory name for the per-session synthetic home, created under the capsule's
-/// session workdir. Planned /proc and subprocess key isolation work
-/// depend on this exact name/location convention.
+/// session workdir — `<accessible workdir>/.murmur/<session id>/` under `--workdir`, so it is
+/// under the one prefix a consumer diffing the accessible workdir excludes. Planned /proc and
+/// subprocess key isolation work depend on this exact name/location convention.
+///
+/// Nothing outside the runtime names this path: the capsule reaches it only through `$HOME`.
+/// Declared as a runtime write by [`crate::workdir_writes`].
 ///
 /// `pub(crate)` for one reader outside this file: `sandbox::ensure_sealed_identity_files`, which
 /// writes the `pw_dir` field of a sealed capsule's synthetic `/etc/passwd` entry. That field and
@@ -223,11 +227,13 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// Everything before the spawn is identical on both paths, including the whole spawn-failure
 /// arm: a spawn failure happens inside the grace window and stays a foreground error.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_shell(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
@@ -242,7 +248,7 @@ pub(crate) fn run_shell(
     // to stop it growing further is to not start the next process that would write to it.
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, env_overrides, workdir)?;
+    let env = build_shell_env(policy, env_overrides, session_workdir)?;
 
     // Resolve before spawning: this is the identity of the binary this call is about to
     // run, and it is the only point where the invoked name is still in hand.
@@ -252,7 +258,7 @@ pub(crate) fn run_shell(
     let mut command = Command::new(binary);
     command
         .args(args)
-        .current_dir(workdir)
+        .current_dir(accessible_workdir)
         .env_clear()
         .envs(env)
         .stdout(Stdio::piped())
@@ -262,7 +268,12 @@ pub(crate) fn run_shell(
     // never call `.spawn()` at all — no code path here lets a Linux host silently run this
     // subprocess with zero enforcement because setup failed. This also installs the hard
     // rlimits and (where a scope exists) cgroup membership for the child.
-    let supervisor = crate::sandbox::prepare_enforcement(&mut command, enforcement, workdir)?;
+    let supervisor = crate::sandbox::prepare_enforcement(
+        &mut command,
+        enforcement,
+        accessible_workdir,
+        session_workdir,
+    )?;
 
     // Snapshotted before the child runs so attribution keys on this call's delta rather than on
     // a session-cumulative total an earlier call could have moved.
@@ -320,7 +331,7 @@ pub(crate) fn run_shell(
                                 supervisor,
                                 DemotionContext {
                                     policy: detach.expect("the detach policy was matched above"),
-                                    workdir: workdir.to_path_buf(),
+                                    accessible_workdir: accessible_workdir.to_path_buf(),
                                     invoked_binary: binary.to_string(),
                                     resolved_binary,
                                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -365,7 +376,7 @@ pub(crate) fn run_shell(
             String::from_utf8_lossy(&stderr_bytes[..stderr_cut]).to_string(),
         );
         full_output_path = Some(write_shell_output_log(
-            workdir,
+            accessible_workdir,
             &format!("shell-{}", crate::trace::timestamp_ms()),
             binary,
             args,
@@ -395,7 +406,8 @@ pub(crate) fn execute_shell(
     binary: &str,
     args: &[&str],
     env_overrides: &[(String, String)],
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &crate::sandbox::ShellEnforcement,
 ) -> Result<ShellResult, ShellExecError> {
@@ -403,7 +415,8 @@ pub(crate) fn execute_shell(
         binary,
         args,
         env_overrides,
-        workdir,
+        accessible_workdir,
+        session_workdir,
         policy,
         enforcement,
         None,
@@ -466,7 +479,9 @@ impl OutputReaders {
 /// Everything the background thread needs to describe the command it is finishing.
 struct DemotionContext {
     policy: DetachPolicy,
-    workdir: PathBuf,
+    /// Where the command ran, and where its `logs/<work-id>.log` goes — the path the completion
+    /// reports back, workdir-relative.
+    accessible_workdir: PathBuf,
     /// The name as invoked, which is what the log header records.
     invoked_binary: String,
     /// The same name resolved to a path where the host `PATH` named one — what the trace and the
@@ -514,7 +529,7 @@ fn demote(
     let provenance = context.policy.completion_provenance();
     let DemotionContext {
         policy,
-        workdir,
+        accessible_workdir,
         invoked_binary,
         resolved_binary,
         args,
@@ -550,7 +565,7 @@ fn demote(
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output_path = crate::detached::output_path_for(&work_id);
         if let Err(failure) = write_shell_output_log(
-            &workdir,
+            &accessible_workdir,
             &work_id,
             &invoked_binary,
             &arg_refs,
@@ -563,7 +578,7 @@ fn demote(
                 None => failure,
             });
         }
-        let output_bytes = std::fs::metadata(workdir.join(&output_path))
+        let output_bytes = std::fs::metadata(accessible_workdir.join(&output_path))
             .map(|metadata| metadata.len())
             .unwrap_or(0);
 
@@ -647,7 +662,7 @@ fn classify_resource_limit(
 pub(crate) fn build_shell_env(
     policy: &CapabilityPolicy,
     env_overrides: &[(String, String)],
-    workdir: &Path,
+    session_workdir: &Path,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env = BTreeMap::new();
 
@@ -672,7 +687,7 @@ pub(crate) fn build_shell_env(
     // Inserted last so neither a guest-supplied `env_overrides` entry nor a
     // manifest-declared `shell_baseline_env` entry can resurrect the real host
     // HOME/USERPROFILE, and so no strip_env pattern can remove the synthetic one.
-    let synthetic_home = synthetic_home_dir(workdir)?;
+    let synthetic_home = synthetic_home_dir(session_workdir)?;
     let synthetic_home = synthetic_home.to_string_lossy().into_owned();
     env.insert("HOME".to_string(), synthetic_home.clone());
     env.insert("USERPROFILE".to_string(), synthetic_home);
@@ -725,8 +740,8 @@ pub(crate) fn build_wasi_env_allowlist(policy: &CapabilityPolicy) -> BTreeMap<St
     env
 }
 
-fn synthetic_home_dir(workdir: &Path) -> Result<std::path::PathBuf, String> {
-    let home = workdir.join(SYNTHETIC_HOME_DIR_NAME);
+fn synthetic_home_dir(session_workdir: &Path) -> Result<std::path::PathBuf, String> {
+    let home = session_workdir.join(SYNTHETIC_HOME_DIR_NAME);
     fs::create_dir_all(&home).map_err(|error| {
         format!(
             "failed to create synthetic home directory {}: {error}",
@@ -758,7 +773,7 @@ fn env_name_matches_pattern(pattern: &str, key: &str) -> bool {
 /// [`MAX_SHELL_OUTPUT_BYTES`] passes a `shell-<ms>` stem, and a demoted command passes its work
 /// id. A reader that finds either file reads the same header, `Stdout:` and `Stderr:` sections.
 fn write_shell_output_log(
-    workdir: &Path,
+    accessible_workdir: &Path,
     file_stem: &str,
     binary: &str,
     args: &[&str],
@@ -766,7 +781,7 @@ fn write_shell_output_log(
     stdout: &str,
     stderr: &str,
 ) -> Result<String, String> {
-    let logs_dir = workdir.join("logs");
+    let logs_dir = accessible_workdir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|error| format!("failed to create shell logs directory: {error}"))?;
 
@@ -821,6 +836,7 @@ mod tests {
             &["-c", "ulimit -Hn"],
             &[],
             temp.path(),
+            temp.path(),
             &policy,
             &enforcement,
         )
@@ -828,6 +844,57 @@ mod tests {
 
         assert_eq!(result.stdout.trim(), "64", "stderr was: {}", result.stderr);
         assert_eq!(result.resource_limit_hit, None);
+    }
+
+    /// Under `--workdir` the two workdirs are different directories, and each of the three things
+    /// `execute_shell` does with one has to pick the right one: the subprocess runs in the
+    /// accessible workdir, `$HOME` resolves into the session workdir, and the truncated-output log
+    /// stays where the tool result says it is.
+    ///
+    /// Asserted through a real subprocess rather than through `build_shell_env` alone, because
+    /// `$HOME` naming a directory that was never created is exactly the failure this split can
+    /// produce and a pure env check would not see.
+    #[test]
+    fn a_shell_command_runs_in_the_accessible_workdir_with_home_inside_the_session_one() {
+        let accessible = tempdir().unwrap();
+        let session = accessible.path().join(".murmur").join("ses_shell_test");
+        fs::create_dir_all(&session).unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let result = execute_shell(
+            "bash",
+            &[
+                "-c",
+                "echo marker > \"$HOME/probe\" && cat \"$HOME/probe\" && pwd",
+            ],
+            &[],
+            accessible.path(),
+            &session,
+            &policy,
+            &ShellEnforcement::environment_only(),
+        )
+        .expect("bash must run");
+
+        assert_eq!(result.exit_code, 0, "stderr was: {}", result.stderr);
+        let mut lines = result.stdout.lines();
+        assert_eq!(lines.next(), Some("marker"));
+        assert_eq!(
+            std::fs::canonicalize(lines.next().unwrap()).unwrap(),
+            std::fs::canonicalize(accessible.path()).unwrap(),
+            "the subprocess cwd is the directory the capsule was asked to produce"
+        );
+
+        assert_eq!(
+            fs::read_to_string(session.join(SYNTHETIC_HOME_DIR_NAME).join("probe")).unwrap(),
+            "marker\n"
+        );
+        assert!(
+            !accessible.path().join(SYNTHETIC_HOME_DIR_NAME).exists(),
+            "the synthetic home must add nothing to the top level of the accessible workdir"
+        );
     }
 
     /// A subprocess that exits normally must never be reported as limit-killed — the negative
@@ -845,6 +912,7 @@ mod tests {
             &["-c", "exit 3"],
             &[],
             temp.path(),
+            temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -861,6 +929,7 @@ mod tests {
             "bash",
             &["-c", "echo hi"],
             &[],
+            Path::new("."),
             Path::new("."),
             &policy,
             &ShellEnforcement::environment_only(),
@@ -882,6 +951,7 @@ mod tests {
             "bash",
             &["-c", "exit 42"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),
@@ -905,6 +975,7 @@ mod tests {
             "bash",
             &["-c", "exit 0"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),
@@ -946,6 +1017,7 @@ mod tests {
             "./local-tool",
             &[],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),
@@ -1008,6 +1080,7 @@ mod tests {
             &["-c", "echo should-not-run"],
             &[],
             &workdir,
+            &workdir,
             &policy,
             &ShellEnforcement::environment_only(),
         )
@@ -1028,6 +1101,7 @@ mod tests {
             "bash",
             &["-c", "echo -n $HOME"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),

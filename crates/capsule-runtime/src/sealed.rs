@@ -843,19 +843,26 @@ pub const SEALED_DEVICE_SYMLINKS: &[(&str, &str)] = &[
 ///
 /// `/tmp` has to exist — bash heredocs, `mktemp`, compilers and package managers all fail without
 /// it in ways that read as runtime bugs rather than as policy. Backing it with a directory *inside
-/// the workdir* is what keeps "the session workdir is the only writable path" literally true: the
-/// bytes written to `/tmp` land in the workdir, are counted by the existing workdir-size guard
+/// the workdir* is what keeps "the capsule's workdir is the only writable path" literally true:
+/// the bytes written to `/tmp` land in the workdir, are counted by the existing workdir-size guard
 /// (`capabilities.resources.workdir_max_bytes`), and are discarded with the session.
+///
+/// Under `--workdir` the session workdir is `<accessible workdir>/.murmur/<session id>/`, so this
+/// directory sits under the one prefix a consumer diffing the accessible workdir excludes, and
+/// inside the subtree `WorkdirGuard` measures. Declared as a runtime write by
+/// [`crate::workdir_writes`]. The capsule never names this path: it sees `/tmp`.
 pub const SEALED_TMP_DIR_NAME: &str = ".mur-tmp";
 
 /// Directory created inside the session workdir holding the synthetic `/etc` files, each of which
 /// the composed root binds read-only over its [`SEALED_ETC_PATHS`] target.
 ///
-/// Inside the workdir for the same reason as [`SEALED_TMP_DIR_NAME`]: it is the one host directory
-/// the parent already owns, already creates per session, and already discards with it. The capsule
-/// can read — and, since the workdir is its one writable path, rewrite — its own copy here; that
-/// buys it nothing, because the file is never read by anything outside the capsule and names no
-/// account the capsule is not already running as.
+/// Inside the session workdir for the same reason as [`SEALED_TMP_DIR_NAME`], and in the same
+/// place: it is the one host directory the parent already owns, already creates per session, and
+/// already discards with it, and under `--workdir` it is under `.murmur/<session id>/` rather than
+/// at the top level of what the capsule was asked to produce. The capsule can read — and, since
+/// the workdir is its one writable path, rewrite — its own copy here; that buys it nothing,
+/// because the file is never read by anything outside the capsule and names no account the capsule
+/// is not already running as. The capsule sees `/etc/passwd` and `/etc/group`, never this path.
 pub const SEALED_ETC_STAGING_DIR_NAME: &str = ".mur-etc";
 
 /// Host path of the staging file backing one synthetic `/etc` entry.
@@ -863,8 +870,8 @@ pub const SEALED_ETC_STAGING_DIR_NAME: &str = ".mur-etc";
 /// The single place this path is composed. Three callers need to agree on it byte for byte — the
 /// planner that binds it, the parent that writes it, and the Landlock fd that grants it — and two
 /// of them run in different phases of the launch.
-pub(crate) fn synthetic_etc_source(workdir: &Path, file: SyntheticEtcFile) -> PathBuf {
-    workdir
+pub(crate) fn synthetic_etc_source(session_workdir: &Path, file: SyntheticEtcFile) -> PathBuf {
+    session_workdir
         .join(SEALED_ETC_STAGING_DIR_NAME)
         .join(file.file_name())
 }
@@ -1036,7 +1043,8 @@ pub(crate) fn choose_root_base(
 /// rather than more entries in it, because the two have opposite failure semantics and the
 /// difference is the whole point of the capability. See [`PlanBuilder::require_bind`].
 pub(crate) fn plan_composed_root(
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     base: &Path,
     extra_read_only: &[PathBuf],
     staged_runtime_read_only: &[PathBuf],
@@ -1083,7 +1091,7 @@ pub(crate) fn plan_composed_root(
         match entry.synthetic {
             None => builder.mirror(path, host, /* required */ false),
             Some(file) => builder.bind_file(
-                synthetic_etc_source(workdir, file),
+                synthetic_etc_source(session_workdir, file),
                 rebase(base, path),
                 /* required */ true,
             ),
@@ -1138,8 +1146,8 @@ pub(crate) fn plan_composed_root(
     builder.push(RootOp::MkDir(proc.clone()), true);
     builder.push(RootOp::Proc { target: proc }, true);
 
-    // 5. /tmp, backed by a directory inside the workdir so it stays inside the one writable path
-    //    and inside the workdir size budget.
+    // 5. /tmp, backed by a directory inside the session workdir so it stays inside the one
+    //    writable path and inside the workdir size budget.
     //
     //    Before the workdir, not after, and the ordering is load-bearing rather than tidy. A
     //    session workdir under `/tmp` is not an edge case — it is `mur run`'s default, since
@@ -1152,20 +1160,21 @@ pub(crate) fn plan_composed_root(
     builder.push(RootOp::MkDir(tmp.clone()), true);
     builder.push(
         RootOp::Bind {
-            source: workdir.join(SEALED_TMP_DIR_NAME),
+            source: session_workdir.join(SEALED_TMP_DIR_NAME),
             target: tmp,
             read_only: false,
         },
         true,
     );
 
-    // 6. The session workdir, at its own absolute path, read-write — the only writable path in the
-    //    composed root, and the backing store for /tmp above.
-    let workdir_target = rebase(base, workdir);
+    // 6. The capsule's workdir — the accessible one, which is also the subprocess cwd — at its
+    //    own absolute path, read-write. The only writable path in the composed root, and the
+    //    subtree holding the session directory that backs /tmp above.
+    let workdir_target = rebase(base, accessible_workdir);
     builder.mkdir_p(&workdir_target);
     builder.push(
         RootOp::Bind {
-            source: workdir.to_path_buf(),
+            source: accessible_workdir.to_path_buf(),
             target: workdir_target,
             read_only: false,
         },
@@ -1175,7 +1184,7 @@ pub(crate) fn plan_composed_root(
     ComposedRootPlan {
         base: base.to_path_buf(),
         steps: builder.steps,
-        workdir_in_root: workdir.to_path_buf(),
+        workdir_in_root: accessible_workdir.to_path_buf(),
     }
 }
 
@@ -2217,9 +2226,21 @@ mod tests {
         }
     }
 
+    /// The session workdir a `--workdir` launch stages under `accessible`.
+    ///
+    /// Spelled out rather than reusing the accessible path, because that is the shape in which
+    /// the two are different directories — and the `/tmp` and `/etc` staging sources have to
+    /// resolve against this one, not against the directory the capsule was asked to produce.
+    fn session_of(accessible: impl AsRef<Path>) -> PathBuf {
+        accessible.as_ref().join(".murmur").join(TEST_SESSION_ID)
+    }
+
+    const TEST_SESSION_ID: &str = "ses_plan_tests";
+
     fn plan_for(workdir: &str) -> ComposedRootPlan {
         plan_composed_root(
             Path::new(workdir),
+            &session_of(workdir),
             Path::new("/tmp"),
             &[],
             &[],
@@ -2355,7 +2376,7 @@ mod tests {
         ] {
             let expected = RootStep {
                 op: RootOp::Bind {
-                    source: synthetic_etc_source(workdir, file),
+                    source: synthetic_etc_source(&session_of(workdir), file),
                     target: PathBuf::from(target),
                     read_only: true,
                 },
@@ -2476,9 +2497,16 @@ mod tests {
     }
 
     #[test]
-    fn tmp_is_backed_by_a_directory_inside_the_workdir() {
+    fn tmp_is_backed_by_a_directory_inside_the_session_workdir() {
         let plan = plan_for("/home/u/w");
         assert!(ops(&plan).contains(&RootOp::Bind {
+            source: session_of("/home/u/w").join(SEALED_TMP_DIR_NAME),
+            target: PathBuf::from("/tmp/tmp"),
+            read_only: false,
+        }));
+        // The accessible workdir's own top level gains nothing: `/tmp`'s backing store is under
+        // `.murmur/<session id>/`, the one prefix a consumer diffing that directory excludes.
+        assert!(!ops(&plan).contains(&RootOp::Bind {
             source: PathBuf::from("/home/u/w").join(SEALED_TMP_DIR_NAME),
             target: PathBuf::from("/tmp/tmp"),
             read_only: false,
@@ -2589,6 +2617,7 @@ mod tests {
             .insert(PathBuf::from("/opt/python3.12"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
+            &session_of("/home/u/w"),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/python3.12"), PathBuf::from("/usr")],
             &[],
@@ -2621,6 +2650,7 @@ mod tests {
         // Neither path is in `FakeHost::usrmerge()` — the host has neither.
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
+            &session_of("/home/u/w"),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/optional-tree")],
             &[PathBuf::from("/opt/staged-tree")],
@@ -2675,6 +2705,7 @@ mod tests {
             .insert(PathBuf::from("/opt/staged-tree"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
+            &session_of("/home/u/w"),
             Path::new("/tmp"),
             &[],
             &[PathBuf::from("/opt/staged-tree")],
@@ -2729,6 +2760,7 @@ mod tests {
         host.0.insert(PathBuf::from("/opt/shared"), PathKind::Dir);
         let plan = plan_composed_root(
             Path::new("/home/u/w"),
+            &session_of("/home/u/w"),
             Path::new("/tmp"),
             &[PathBuf::from("/opt/shared")],
             &[PathBuf::from("/opt/shared")],

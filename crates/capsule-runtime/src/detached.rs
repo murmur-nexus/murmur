@@ -379,6 +379,7 @@ mod tests {
             &["-c", script],
             &[],
             workdir,
+            workdir,
             &bash_policy(),
             &ShellEnforcement::environment_only(),
             Some(DetachPolicy {

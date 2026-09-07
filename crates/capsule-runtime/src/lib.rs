@@ -59,6 +59,7 @@ pub(crate) mod tool_annotations;
 pub(crate) mod trace;
 pub(crate) mod trace_blobs;
 pub mod types;
+pub mod workdir_writes;
 
 pub use artifact_config::{
     configured_artifact_names, lower_artifact_config, ARTIFACT_CONFIG_ENV,
@@ -158,4 +159,11 @@ pub use types::{
     capability_policy_from_runtime_manifest, ArtifactRequest, CapabilityPolicy,
     InstalledArtifactSummary, LaunchResult, LockExpectation, ResolvedLockArtifact, ResumeMode,
     ResumeRequest, StageRequest, StagedSession,
+};
+// The declaration `--explain-scope` prints and `trace.jsonl` carries as
+// `session_start.effective_grants.runtime_writes`. Flat, on the same terms as the other report
+// types: a consumer of a scope report reads these names off it.
+pub use workdir_writes::{
+    render_runtime_writes, RuntimeWriteCondition, RuntimeWriteKind, RuntimeWriteReport,
+    RuntimeWriteScope, SESSION_ID_PLACEHOLDER,
 };

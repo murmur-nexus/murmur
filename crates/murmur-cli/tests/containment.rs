@@ -258,3 +258,135 @@ fn an_unknown_manifest_containment_value_fails_at_parse_time() {
             "must be one of: advisory, scoped, sealed",
         ));
 }
+
+/// The `runtime_writes` declaration, read the way a consumer for whom the workdir is the
+/// deliverable reads it: before anything is staged, off a command that creates nothing.
+///
+/// The row set itself is asserted in `capsule-runtime`'s own tests, against the declaration
+/// function. What is asserted here is the part only the real binary can show — that the key
+/// reaches `--explain-scope --json` at all, that each row is the four-key object a consumer
+/// parses, and that asking the question leaves no directory behind.
+#[test]
+fn explain_scope_declares_what_the_runtime_writes_and_creates_nothing() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - bash\n",
+    );
+
+    let report = explain_scope_report(&home, project.path(), &[]);
+    let writes = report["runtime_writes"]
+        .as_array()
+        .expect("runtime_writes is an array");
+    assert!(!writes.is_empty(), "the runtime writes something");
+
+    for write in writes {
+        let object = write.as_object().expect("each row is an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["condition", "kind", "path", "scope"], "{write}");
+        assert!(
+            ["file", "directory"].contains(&object["kind"].as_str().unwrap()),
+            "{write}"
+        );
+        assert!(
+            ["accessible", "session"].contains(&object["scope"].as_str().unwrap()),
+            "{write}"
+        );
+        let condition = object["condition"].as_str().unwrap();
+        assert!(
+            condition
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-'),
+            "conditions are kebab-case wire names: {write}"
+        );
+    }
+
+    let declared: Vec<&str> = writes
+        .iter()
+        .map(|write| write["path"].as_str().unwrap())
+        .collect();
+    assert!(declared.contains(&".murmur/<session-id>"), "{declared:?}");
+    assert!(declared.contains(&"task.md"), "{declared:?}");
+
+    assert!(
+        !project.path().join(".murmur").exists(),
+        "--explain-scope answers before a session exists and must create nothing"
+    );
+    assert!(!project.path().join("workdir").exists());
+}
+
+/// Enabling `sealed` changes the set of paths the runtime writes, and the change is visible in
+/// the declaration rather than only on disk.
+///
+/// Host-independent in the same way the rest of this file is: on a host that can back `sealed`
+/// the two reports differ by exactly the sealed rows, and on a host that cannot they are equal,
+/// because the declaration is keyed on the tier that will actually be used rather than on the
+/// class the manifest asked for. Either way, no added row is a new top-level entry in the
+/// accessible workdir — which is the property a consumer diffing that directory depends on.
+#[test]
+fn asking_for_sealed_adds_only_paths_under_the_session_directory() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    write_project(
+        project.path(),
+        "capabilities:\n  shell:\n    allow:\n      - bash\n",
+    );
+
+    let scoped = explain_scope_report(&home, project.path(), &[]);
+    let sealed = explain_scope_report(&home, project.path(), &["--containment", "sealed"]);
+
+    let rows = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+        report["runtime_writes"].as_array().unwrap().clone()
+    };
+    let (scoped_rows, sealed_rows) = (rows(&scoped), rows(&sealed));
+    for row in &scoped_rows {
+        assert!(
+            sealed_rows.contains(row),
+            "the sealed declaration must keep every scoped row: {row}"
+        );
+    }
+
+    let added: Vec<&serde_json::Value> = sealed_rows
+        .iter()
+        .filter(|row| !scoped_rows.contains(row))
+        .collect();
+    if sealed["achieved_containment"] == "sealed" {
+        assert_eq!(sealed["floor_met"], true);
+        assert_eq!(
+            added.len(),
+            2,
+            "sealed adds /tmp and /etc staging: {added:?}"
+        );
+    } else {
+        assert!(
+            added.is_empty(),
+            "a host that cannot seal runs the non-sealed set, whatever the manifest declared: \
+             {added:?}"
+        );
+    }
+    for row in added {
+        assert_eq!(row["condition"], "sealed");
+        assert_eq!(row["scope"], "session");
+        assert!(
+            row["path"]
+                .as_str()
+                .unwrap()
+                .starts_with(".murmur/<session-id>/"),
+            "enabling sealed must add nothing to the top level of the accessible workdir: {row}"
+        );
+    }
+}
+
+/// One `--explain-scope --json` report, parsed.
+fn explain_scope_report(home: &TempDir, project_dir: &Path, extra: &[&str]) -> serde_json::Value {
+    let mut args = vec!["--explain-scope", "--json"];
+    args.extend_from_slice(extra);
+    let output = mur_run(home, project_dir, &args)
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_str(String::from_utf8(output).unwrap().trim()).unwrap()
+}
