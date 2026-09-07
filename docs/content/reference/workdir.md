@@ -10,6 +10,17 @@ keeps its bookkeeping in.
 
 Without `--workdir` the two are one directory and everything below lands in the same place.
 
+To find what the *capsule* changed, diff the accessible workdir and subtract what the runtime wrote
+there. `mur run --explain-scope` enumerates those paths, as `runtime_writes` under `--json`:
+
+- That enumeration is authoritative; the tables below describe what each path holds.
+- `trace.jsonl` carries the same array verbatim at `session_start.effective_grants.runtime_writes`,
+  so a run reports the paths to subtract from it.
+- Paths are relative to the accessible workdir and carry the literal segment `<session-id>`, which
+  `session_start.session_id` supplies.
+- Excluding the single prefix `.murmur/` covers every runtime-written path outside the accessible
+  workdir's own top level.
+
 Two more directories sit outside both and outlive every session: a
 [durable state store](#state-store), for artifacts that ask for one by name, and the
 [conversation record](#the-conversation-record), which every `http` capsule keeps by default.
@@ -54,17 +65,31 @@ task comes from the queue rather than from a stale file.
 | `tools/<name>/murmur.yaml` | A staged artifact's manifest |
 | `tools/<name>/<name>` | A staged native binary, marked executable |
 | `tools/<name>/skill.md` | A staged skill's text. The runtime returns this as the tool result when the skill is called |
+| `blobs/<sha256>` | Trace bodies too large to inline, addressed by their own digest. See [Observability schemas](observability-schemas.md) |
+| `plans/plan-<n>.json` | One submitted plan per file, numbered by this session's own counter |
+| `.capsule-home` | `$HOME` for every shell command and native tool. Created on the first such call. Reached only through the variable |
+| `.mur-tmp` | Backs `/tmp` inside a `sealed` capsule's composed root. The capsule sees `/tmp`. Counted against `capabilities.resources.workdir_max_bytes` like everything else in the workdir |
+| `.mur-etc` | Holds the `passwd` and `group` a `sealed` capsule's composed root binds at `/etc/passwd` and `/etc/group` |
 
 ## Accessible workdir files
 
 | Path | Notes |
 |---|---|
 | `task.md`, `input.txt` | The task, as above |
-| `.capsule-home` | `$HOME` for every shell command. Created on the first shell invocation |
+| `murmur.yaml` | A copy of the project manifest, so the agent can reference it by relative path. Only under `--workdir`, and never over a file already there |
+| `.murmur/<session-id>/` | The session workdir |
+| `.murmur/children/<capsule>-<suffix>/` | One directory per sub-capsule launch, each the child's own accessible workdir. Created mode `0700` |
 | `logs/shell-<timestamp>.log` | Full stdout and stderr of one shell command, written when either stream exceeds 16 KB. The tool result carries the path |
+| `logs/<work-id>.log` | The same, for a command demoted to the background. The completion carries the path |
+| `peer-in/<handle-id>-<name>` | Bytes fetched by redeeming a peer handle. See [Resource plane](resource-plane.md) |
+| `out/result.txt` | A script capsule's final output. An agent session writes it to the session workdir instead |
+| `completion.json` | How a delegated child ended, read by the launcher that started it |
 | `checkpoints/` | `summary.md`, `plan.json` and `decisions.json`. `MURMUR.md` directs the agent to write state here to survive compaction; the runtime neither reads nor writes them |
 
 Everything else in this directory belongs to the capsule.
+
+A `sealed` capsule adds nothing to this list: its `/tmp` store and its synthetic `/etc` staging are
+both in the session workdir.
 
 ---
 

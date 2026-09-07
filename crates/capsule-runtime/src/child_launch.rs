@@ -23,7 +23,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::delegation::{
@@ -59,6 +59,14 @@ const CHILD_DIR_MODE: u32 = 0o700;
 /// it arrives; this bound is only what a *failure* quotes back, so a child that logged for an hour
 /// before dying does not turn into an unbounded error string.
 const CHILD_STDERR_TAIL_LINES: usize = 20;
+
+/// How long a post-mortem read of the tail waits for the drain to reach the end of the pipe.
+///
+/// Bounds a thread being scheduled, not the child: by the time anything asks for a dead child's
+/// tail the exit has already closed the write end, so the drain is at most one wake-up away.
+/// A pipe some surviving grandchild still holds open would never reach EOF at all, and the bound
+/// is what stops that inheriting process from wedging the parent's launch or its watcher.
+const CHILD_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the completion watcher asks whether the child is still running.
 ///
@@ -198,7 +206,7 @@ pub struct LaunchedChild {
     pub delegation_id: Option<String>,
     process: Arc<Mutex<ChildProcess>>,
     /// The child's last [`CHILD_STDERR_TAIL_LINES`] lines, retained so a crash can say why.
-    stderr_tail: Arc<Mutex<Vec<String>>>,
+    stderr_tail: Arc<StderrTail>,
     /// When the child process was started, for the completion's `duration_ms`.
     started: Instant,
     /// Set by [`LaunchedChild::release`]. The one thing that stops [`Drop`] signalling the child:
@@ -233,7 +241,7 @@ impl LaunchedChild {
     /// The same lines a crash completion quotes back, exposed so a caller can read what the child
     /// said without scraping the stderr they were already echoed to.
     pub fn stderr_tail(&self) -> Vec<String> {
-        lock(&self.stderr_tail).clone()
+        self.stderr_tail.lines()
     }
 
     /// Terminate the child and reap it. Idempotent: a second call, or a call after `Drop` has
@@ -579,7 +587,7 @@ fn watch_for_completion(
                     Some(status) => status.to_string(),
                     None => "unknown exit status".to_string(),
                 };
-                let tail = lock(&stderr_tail).join("\n");
+                let tail = stderr_tail.lines_at_end().join("\n");
                 let detail = if tail.is_empty() {
                     format!(
                         "the child process ended without recording a completion ({status_text})"
@@ -669,26 +677,79 @@ fn create_child_dir(workdir: &Path) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Echo the child's stderr to this process's, keeping the last [`CHILD_STDERR_TAIL_LINES`] so a
-/// child that dies before reporting can say why.
+/// The child's stderr as the parent keeps it: every line echoed to this process's stderr as it
+/// arrives, with the last [`CHILD_STDERR_TAIL_LINES`] retained so a child that dies before
+/// reporting can say why.
+struct StderrTail {
+    state: Mutex<StderrState>,
+    /// Notified once [`StderrState::at_eof`] is set.
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct StderrState {
+    lines: Vec<String>,
+    /// Whether the pipe has been read to its end, which the child's exit is what causes.
+    at_eof: bool,
+}
+
+impl StderrTail {
+    /// What the child has said so far, without waiting for anything. For a child that is still
+    /// running, which is the only state in which "so far" is the question being asked.
+    fn lines(&self) -> Vec<String> {
+        lock(&self.state).lines.clone()
+    }
+
+    /// What a child that has ended left behind, read only once the pipe is at its end.
+    ///
+    /// The exit that closes the child's stdout closes its stderr in the same breath, so the thread
+    /// that notices the ending and the thread still draining stderr are racing, and the tail is
+    /// empty for as long as the drain has not caught up. Reading it unsynchronised turns "refused
+    /// because the declared floor is unmeetable here" into a refusal that names no reason —
+    /// the one case the tail is kept for. Bounded by [`CHILD_STDERR_DRAIN_TIMEOUT`].
+    fn lines_at_end(&self) -> Vec<String> {
+        let (state, _) = self
+            .drained
+            .wait_timeout_while(lock(&self.state), CHILD_STDERR_DRAIN_TIMEOUT, |state| {
+                !state.at_eof
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.lines.clone()
+    }
+
+    /// Mark the pipe finished and wake every post-mortem reader waiting on it.
+    fn finish(&self) {
+        lock(&self.state).at_eof = true;
+        self.drained.notify_all();
+    }
+}
+
+/// Start draining the child's stderr into a [`StderrTail`].
 ///
 /// The child's diagnostics belong to the operator running the parent, so nothing is swallowed —
 /// this only remembers, in addition to printing.
-fn drain_stderr(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
-    let tail = Arc::new(Mutex::new(Vec::new()));
+fn drain_stderr(child: &mut Child) -> Arc<StderrTail> {
+    let tail = Arc::new(StderrTail {
+        state: Mutex::new(StderrState::default()),
+        drained: Condvar::new(),
+    });
     let Some(stderr) = child.stderr.take() else {
+        // No pipe is an end already reached: a reader that waited here would wait out the whole
+        // bound for lines that can never arrive.
+        tail.finish();
         return tail;
     };
     let collector = Arc::clone(&tail);
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             eprintln!("{line}");
-            let mut tail = collector.lock().unwrap_or_else(|e| e.into_inner());
-            if tail.len() == CHILD_STDERR_TAIL_LINES {
-                tail.remove(0);
+            let mut state = lock(&collector.state);
+            if state.lines.len() == CHILD_STDERR_TAIL_LINES {
+                state.lines.remove(0);
             }
-            tail.push(line);
+            state.lines.push(line);
         }
+        collector.finish();
     });
     tail
 }
@@ -699,7 +760,7 @@ fn drain_stderr(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
 /// after its launch line would otherwise deadlock against a parent that had stopped reading.
 fn first_json_line(
     launched: &mut LaunchedChild,
-    stderr_tail: &Arc<Mutex<Vec<String>>>,
+    stderr_tail: &StderrTail,
 ) -> Result<String, RuntimeError> {
     let stdout = lock(&launched.process)
         .child
@@ -742,10 +803,7 @@ fn first_json_line(
             // The child's own refusal — an unmeetable containment floor, a registration the
             // daemon declined — is written to its stderr and is the only thing that explains this
             // failure, so it is quoted rather than replaced by a generic "did not start".
-            let reason = stderr_tail
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .join("\n");
+            let reason = stderr_tail.lines_at_end().join("\n");
             Err(RuntimeError::Runtime(format!(
                 "the child capsule '{}' exited without reporting a launch line ({status}): {reason}",
                 launched.workdir.display()
@@ -890,5 +948,49 @@ mod tests {
 
         assert!(!env.iter().any(|(key, _)| key == SPAWNER_ENV), "{env:?}");
         std::env::remove_var(SPAWNER_ENV);
+    }
+
+    /// A child's exit closes its stdout and its stderr together, so the reader that reports the
+    /// ending can reach the tail before the drain has appended to it. The post-mortem read is the
+    /// one that must not: an empty tail is a refusal that names no reason.
+    #[test]
+    fn a_tail_read_after_the_end_waits_for_the_drain_to_catch_up() {
+        let tail = Arc::new(StderrTail {
+            state: Mutex::new(StderrState::default()),
+            drained: Condvar::new(),
+        });
+
+        let writer = Arc::clone(&tail);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            lock(&writer.state)
+                .lines
+                .push("error[E-CAP-003]: not achievable on this host".to_string());
+            writer.finish();
+        });
+
+        assert!(tail.lines().is_empty());
+        assert_eq!(
+            tail.lines_at_end(),
+            vec!["error[E-CAP-003]: not achievable on this host".to_string()]
+        );
+    }
+
+    /// A child that exposed no stderr pipe has nothing to wait for, so the bound is never spent on
+    /// lines that cannot arrive.
+    #[test]
+    fn a_tail_with_no_pipe_behind_it_is_at_its_end_already() {
+        let tail = StderrTail {
+            state: Mutex::new(StderrState::default()),
+            drained: Condvar::new(),
+        };
+        tail.finish();
+
+        let started = Instant::now();
+        assert!(tail.lines_at_end().is_empty());
+        assert!(
+            started.elapsed() < CHILD_STDERR_DRAIN_TIMEOUT,
+            "{started:?}"
+        );
     }
 }

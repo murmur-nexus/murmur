@@ -486,6 +486,24 @@ pub struct ScopeReport {
     /// reach for `--explain-scope`, so hiding the grant behind a met floor would blank out the
     /// diagnostic in the one case it is for.
     pub staged_runtime_grants: Vec<String>,
+    /// Every path the runtime itself writes inside the capsule's workdir, so a consumer for whom
+    /// that workdir is the deliverable can subtract them and be left with what the *capsule*
+    /// changed. Always serialized as an array (never skipped), on the same terms as
+    /// [`Self::state_stores`]: an absent key identifies a runtime that predates the declaration,
+    /// not a runtime that writes nothing.
+    ///
+    /// The one field here that describes what the runtime does rather than what the capsule may
+    /// do. It is reported beside the grants because it answers the other half of "what is this
+    /// workdir", and because a consumer that has to maintain its own list of runtime entries
+    /// silently falls behind every time the set changes — enabling `sealed` being exactly that
+    /// case.
+    ///
+    /// Keyed on the tier this session would install: [`Self::enforcement_tier`] capped by
+    /// [`Self::declared_containment`], which is what decides whether a composed root is built at
+    /// all. Reading `enforcement_tier: mountns+pivot_root+landlock+seccomp` next to a report with
+    /// no `sealed` rows is that cap, not a disagreement — the host could seal and the capsule did
+    /// not ask. See [`crate::workdir_writes`].
+    pub runtime_writes: Vec<crate::workdir_writes::RuntimeWriteReport>,
     /// The declared `capabilities.resources.cgroup_io_bytes_per_sec` ceiling, and whether it is
     /// actually on this session's cgroup scope.
     ///
@@ -612,6 +630,11 @@ impl ScopeReport {
             }
         }
         push_list(&mut out, "peer_fetch allow", &self.peer_fetch_allow);
+
+        out.push_str("\nRuntime writes\n");
+        out.push_str(&crate::workdir_writes::render_runtime_writes(
+            &self.runtime_writes,
+        ));
 
         if !self.floor_met {
             out.push_str(
@@ -801,6 +824,17 @@ pub(crate) fn scope_report_for_tier(
                 )
             })
             .collect(),
+        // Keyed on the tier this session would actually install, which is the host reading
+        // `enforcement_tier` reports capped by the declared floor — the same
+        // `sandbox::applied_tier` `ShellEnforcement::resolve` runs. A capsule declaring `scoped`
+        // on a sealed-capable host composes no root and writes no `/tmp` store, so a declaration
+        // keyed on the bare host tier would name two directories that never appear. Nothing here
+        // touches the filesystem: `--explain-scope` returns before a workdir exists, and a
+        // diagnostic that created the directory it describes would be answering a question it had
+        // changed.
+        runtime_writes: crate::workdir_writes::runtime_writes(crate::sandbox::applied_tier(
+            tier, declared,
+        )),
         // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
         // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.

@@ -4536,6 +4536,7 @@ impl CapsuleStoreState {
                     input,
                     &native_bin,
                     &self.accessible_workdir,
+                    &self.workdir,
                     &self.capability_policy,
                     &self.shell_enforcement,
                 )
@@ -4552,7 +4553,8 @@ impl CapsuleStoreState {
             .any(|allowed| allowed == name)
         {
             let name = name.to_string();
-            let workdir = self.accessible_workdir.clone();
+            let accessible_workdir = self.accessible_workdir.clone();
+            let session_workdir = self.workdir.clone();
             let env_overrides = self.inference_env.clone();
             let policy = self.capability_policy.clone();
             let enforcement = self.shell_enforcement.clone();
@@ -4574,7 +4576,8 @@ impl CapsuleStoreState {
                 dispatch_shell_tool(
                     &name,
                     input,
-                    &workdir,
+                    &accessible_workdir,
+                    &session_workdir,
                     &env_overrides,
                     &policy,
                     &enforcement,
@@ -5039,6 +5042,7 @@ impl CapsuleStoreState {
 
         let capability_policy = self.capability_policy.clone();
         let scheduler_workdir = self.accessible_workdir.clone();
+        let scheduler_session_workdir = self.workdir.clone();
         let session_id = self.session_id.clone();
         // The conversation this plan was submitted from, named on the `MURMUR_SPAWNER` handle
         // every `capsule` step injects into its child — the same value `delegate-task` names.
@@ -5080,7 +5084,8 @@ impl CapsuleStoreState {
                     .map_err(|_| "the session stopped answering plan tool calls".to_string())?
             };
             let ctx = crate::plan::SchedulerContext {
-                workdir: scheduler_workdir,
+                accessible_workdir: scheduler_workdir,
+                session_workdir: scheduler_session_workdir,
                 capability_policy,
                 installed_tools,
                 // A `capsule` step's version is the daemon's question, not this session's: the
@@ -6142,7 +6147,8 @@ fn dispatch_native_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
     binary_path: &Path,
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
 ) -> Result<murmur::tool::run::ToolResult, String> {
@@ -6159,13 +6165,13 @@ fn dispatch_native_tool(
 
     enforcement.check_workdir_budget()?;
 
-    let env = build_shell_env(policy, &[], workdir)?;
+    let env = build_shell_env(policy, &[], session_workdir)?;
 
     // Bound to a local before spawning (rather than chained straight into `.spawn()`) so a
     // `pre_exec` step can be attached to it, mirroring `execute_shell`'s shape.
     let mut command = Command::new(binary_path);
     command
-        .current_dir(workdir)
+        .current_dir(accessible_workdir)
         .env_clear()
         .envs(env)
         .stdin(Stdio::piped())
@@ -6353,16 +6359,18 @@ fn resolve_shell_call_inner(
 /// `detach` is what decides whether a slow command can be demoted. `None` runs it to completion
 /// in the foreground — the only shape available to a caller with no task loop to deliver a
 /// completion to.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_shell_tool(
     name: &str,
     input: murmur::tool::run::ToolInput,
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     env_overrides: &[(String, String)],
     policy: &CapabilityPolicy,
     enforcement: &sandbox::ShellEnforcement,
     detach: Option<DetachPolicy>,
 ) -> DispatchOutcome {
-    let resolved = match resolve_shell_call_inner(name, &input, workdir, policy) {
+    let resolved = match resolve_shell_call_inner(name, &input, accessible_workdir, policy) {
         Ok(resolved) => resolved,
         Err(error) => {
             return DispatchOutcome::tool(murmur::tool::run::ToolResult {
@@ -6393,7 +6401,8 @@ fn dispatch_shell_tool(
         name,
         &args,
         env_overrides,
-        workdir,
+        accessible_workdir,
+        session_workdir,
         policy,
         enforcement,
         detach,
@@ -8600,6 +8609,7 @@ inference:
                 log_path: None,
             },
             tmp.path(),
+            tmp.path(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -8641,6 +8651,7 @@ inference:
         let outcome = dispatch_shell_tool(
             "bash",
             input,
+            tmp.path(),
             tmp.path(),
             &[],
             &policy,
@@ -8740,6 +8751,7 @@ inference:
             "just",
             input,
             tmp.path(),
+            tmp.path(),
             &[],
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -8795,6 +8807,7 @@ inference:
                 log_path: None,
             },
             tmp.path(),
+            tmp.path(),
             &[],
             &policy,
             &sandbox::sealed_test_enforcement(),
@@ -8830,6 +8843,7 @@ inference:
                 data: Some(r#"{"command":"echo hi"}"#.to_string()),
                 log_path: None,
             },
+            tmp.path(),
             tmp.path(),
             &[],
             // Empty allowlist: `execute_shell` refuses before spawning anything.
@@ -8963,6 +8977,7 @@ inference:
                     log_path: None,
                 },
                 &workdir,
+                &workdir,
                 &[],
                 &policy,
                 &sandbox::ShellEnforcement::environment_only(),
@@ -9050,6 +9065,7 @@ inference:
             },
             &binary,
             tmp.path(),
+            tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -9079,6 +9095,7 @@ inference:
             },
             &binary,
             tmp.path(),
+            tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -9107,6 +9124,7 @@ inference:
             },
             &binary,
             tmp.path(),
+            tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
         )
@@ -9134,6 +9152,7 @@ inference:
                 log_path: None,
             },
             &binary,
+            tmp.path(),
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),
@@ -9166,6 +9185,7 @@ inference:
                 log_path: None,
             },
             &binary,
+            tmp.path(),
             tmp.path(),
             &policy,
             &sandbox::ShellEnforcement::environment_only(),

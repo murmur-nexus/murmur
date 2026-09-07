@@ -53,7 +53,8 @@ fn ctx_gated<'a>(
     gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
 ) -> SchedulerContext<'a> {
     SchedulerContext {
-        workdir,
+        accessible_workdir: workdir.clone(),
+        session_workdir: workdir,
         capability_policy: CapabilityPolicy {
             shell_allow: vec!["bash".to_string(), "printf".to_string()],
             spawn_allow: vec!["worker".to_string()],

@@ -91,7 +91,13 @@ pub struct ExecutionReport {
 }
 
 pub struct SchedulerContext<'a> {
-    pub workdir: PathBuf,
+    /// The directory a `shell` step runs in and a `tool` step resolves a `data_path` against —
+    /// the capsule's own workdir, which under `--workdir` is the operator's directory.
+    pub accessible_workdir: PathBuf,
+    /// `<accessible_workdir>/.murmur/<session id>/` under `--workdir`, and the same path as
+    /// [`Self::accessible_workdir`] without it. Where a `shell` step's synthetic `$HOME` and, on
+    /// a sealed host, its `/tmp` and `/etc` staging live.
+    pub session_workdir: PathBuf,
     pub capability_policy: CapabilityPolicy,
     pub installed_tools: HashSet<String>,
     pub capsule_versions: HashMap<String, String>,
@@ -261,7 +267,7 @@ fn execute_inner(
         crate::cgroup::requires_process_bounding(&ctx.capability_policy, false),
         &ctx.capability_policy.resources,
         &plan.id,
-        &ctx.workdir,
+        &ctx.accessible_workdir,
     ) {
         // The plan's own `io.max` outcome is dropped here rather than reported: this scope is a
         // second one, created for the plan's shell steps inside a session whose `session_start`
@@ -282,7 +288,7 @@ fn execute_inner(
         }
     };
     let workdir_guard = Some(crate::resources::WorkdirGuard::spawn(
-        &ctx.workdir,
+        &ctx.accessible_workdir,
         ctx.capability_policy.resources.workdir_max_bytes,
     ));
 
@@ -922,8 +928,12 @@ fn dispatch_tool_step(
             let state_effect = crate::agent::extract_state_effect(&result.metadata);
             let resource_id = crate::agent::extract_resource_id(&result.metadata);
             let verdict = if matches!(result.status, ToolStatus::Passed) {
-                match tool_step_output(name, &ctx.workdir, result.data, result.data_path.as_deref())
-                {
+                match tool_step_output(
+                    name,
+                    &ctx.accessible_workdir,
+                    result.data,
+                    result.data_path.as_deref(),
+                ) {
                     Ok(output) => StepResult {
                         step_id: step.id.clone(),
                         status: StepStatus::Success,
@@ -969,7 +979,8 @@ fn dispatch_shell_step(
         &binary,
         &arg_refs,
         &[],
-        &ctx.workdir,
+        &ctx.accessible_workdir,
+        &ctx.session_workdir,
         &ctx.capability_policy,
         enforcement,
     ) {
@@ -1048,7 +1059,7 @@ fn dispatch_capsule_step(step: &StepDef, ctx: &SchedulerContext<'_>, input: Valu
     let plane = DelegationPlane::new(
         roost_url,
         credential.clone(),
-        ctx.workdir.clone(),
+        ctx.accessible_workdir.clone(),
         ctx.current_session_id.clone().unwrap_or_default(),
         crate::delegation_plane::DELEGATION_RESULT_TIMEOUT,
         std::sync::Arc::clone(&ctx.registry),
@@ -1326,7 +1337,8 @@ mod tests {
         gate_step: &'a (dyn Fn(&PlannedCall<'_>) -> Option<String> + Sync),
     ) -> SchedulerContext<'a> {
         SchedulerContext {
-            workdir,
+            accessible_workdir: workdir.clone(),
+            session_workdir: workdir,
             capability_policy: CapabilityPolicy {
                 shell_allow: vec!["bash".to_string()],
                 spawn_allow: vec!["worker".to_string()],

@@ -2396,7 +2396,8 @@ pub(crate) fn apply_fd_hygiene(command: &mut std::process::Command) {
 pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
-    _workdir: &Path,
+    _accessible_workdir: &Path,
+    _session_workdir: &Path,
 ) -> Result<SupervisorHandle, String> {
     #[cfg(test)]
     forced_prepare_failure()?;
@@ -2418,7 +2419,8 @@ pub(crate) fn prepare_enforcement(
 pub(crate) fn prepare_enforcement(
     command: &mut std::process::Command,
     enforcement: &ShellEnforcement,
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
 ) -> Result<SupervisorHandle, String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -2444,7 +2446,8 @@ pub(crate) fn prepare_enforcement(
         EnforcementTier::KernelFull | EnforcementTier::KernelSealed
     ) {
         Some(linux_enforce::open_landlock_fds(
-            workdir,
+            accessible_workdir,
+            session_workdir,
             &enforcement.landlock_grants,
             &landlock_device_grants(enforcement.tier),
             enforcement.workdir_exec,
@@ -2461,7 +2464,8 @@ pub(crate) fn prepare_enforcement(
     // itself. See `crate::sealed` for the plan/execute split.
     let sealed_spec = if enforcement.tier == EnforcementTier::KernelSealed {
         Some(build_sealed_root(
-            workdir,
+            accessible_workdir,
+            session_workdir,
             &enforcement.sealed_bind_dirs,
             &enforcement.staged_runtime_dirs,
         )?)
@@ -2634,8 +2638,8 @@ fn landlock_device_grants(tier: EnforcementTier) -> Vec<CapsuleDeviceGrant> {
 /// See [`crate::sealed::SEALED_TMP_DIR_NAME`] for why `/tmp` is workdir-backed rather than a second
 /// tmpfs.
 #[cfg(target_os = "linux")]
-fn ensure_sealed_tmp_store(workdir: &Path) -> Result<PathBuf, String> {
-    let tmp_store = workdir.join(crate::sealed::SEALED_TMP_DIR_NAME);
+fn ensure_sealed_tmp_store(session_workdir: &Path) -> Result<PathBuf, String> {
+    let tmp_store = session_workdir.join(crate::sealed::SEALED_TMP_DIR_NAME);
     std::fs::create_dir_all(&tmp_store).map_err(|error| {
         format!(
             "sealed: failed to create the workdir-backed /tmp store at {}: {error}",
@@ -2662,10 +2666,10 @@ fn ensure_sealed_tmp_store(workdir: &Path) -> Result<PathBuf, String> {
 /// would leave that rule pointing at an inode the composed root no longer binds — `/etc/passwd`
 /// mounted and `EACCES`.
 #[cfg(target_os = "linux")]
-fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> {
+fn ensure_sealed_identity_files(session_workdir: &Path) -> Result<Vec<PathBuf>, String> {
     use std::os::unix::fs::MetadataExt;
 
-    let staging = workdir.join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME);
+    let staging = session_workdir.join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME);
     std::fs::create_dir_all(&staging).map_err(|error| {
         format!(
             "sealed: failed to create the synthetic /etc staging directory at {}: {error}",
@@ -2675,14 +2679,16 @@ fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> 
 
     // The workdir was created by this process, so its owner is the identity the capsule's
     // subprocesses run as — no `getuid(2)` FFI needed under `#![deny(unsafe_code)]`.
-    let owner = std::fs::metadata(workdir).map_err(|error| {
+    let owner = std::fs::metadata(session_workdir).map_err(|error| {
         format!(
             "sealed: failed to stat the session workdir {} for the capsule's uid/gid: {error}",
-            workdir.display()
+            session_workdir.display()
         )
     })?;
-    // The same string `build_shell_env` puts in `$HOME`, from the same constant.
-    let home = workdir.join(crate::shell::SYNTHETIC_HOME_DIR_NAME);
+    // The same string `build_shell_env` puts in `$HOME`, from the same constant, resolved against
+    // the same directory: the synthetic home lives in the session workdir, so a `pw_dir` composed
+    // against the accessible one would name a directory that does not exist.
+    let home = session_workdir.join(crate::shell::SYNTHETIC_HOME_DIR_NAME);
     let home = home.to_string_lossy().into_owned();
     let identity = crate::sealed::SealedAccountIdentity {
         uid: owner.uid(),
@@ -2695,7 +2701,7 @@ fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> 
         let Some(file) = entry.synthetic else {
             continue;
         };
-        let path = crate::sealed::synthetic_etc_source(workdir, file);
+        let path = crate::sealed::synthetic_etc_source(session_workdir, file);
         std::fs::write(&path, file.render(&identity)?).map_err(|error| {
             format!(
                 "sealed: failed to write the synthetic {} at {}: {error}",
@@ -2726,7 +2732,8 @@ fn ensure_sealed_identity_files(workdir: &Path) -> Result<Vec<PathBuf>, String> 
 /// classification for a capsule that did not get a runtime tree it declared.
 #[cfg(target_os = "linux")]
 fn build_sealed_root(
-    workdir: &Path,
+    accessible_workdir: &Path,
+    session_workdir: &Path,
     extra_read_only: &[PathBuf],
     staged_runtime_read_only: &[PathBuf],
 ) -> Result<crate::sealed::SealedRootSpec, String> {
@@ -2735,17 +2742,19 @@ fn build_sealed_root(
     // The workdir must be absolute for its path to mean the same thing inside the composed root,
     // and `launch_session` always creates it as one — but the composed root's whole design rests
     // on it, so it is checked rather than assumed.
-    if !workdir.is_absolute() {
+    if !accessible_workdir.is_absolute() {
         return Err(format!(
-            "sealed: session workdir {} is not absolute; a composed root reproduces the workdir at \
+            "sealed: capsule workdir {} is not absolute; a composed root reproduces the workdir at \
              its own absolute path",
-            workdir.display()
+            accessible_workdir.display()
         ));
     }
 
-    let base = sealed::choose_root_base(workdir, sealed::SEALED_ROOT_BASE_CANDIDATES, |path| {
-        path.is_dir()
-    })
+    let base = sealed::choose_root_base(
+        accessible_workdir,
+        sealed::SEALED_ROOT_BASE_CANDIDATES,
+        |path| path.is_dir(),
+    )
     .ok_or_else(|| {
         format!(
             "sealed: no usable base directory for the composed root; none of {:?} exists outside \
@@ -2757,15 +2766,16 @@ fn build_sealed_root(
     // `/tmp` inside the composed root is backed by this directory, so it is created here rather
     // than from inside `pre_exec`. `open_landlock_fds` — which runs earlier and must open the same
     // directory to grant it — creates it through the same idempotent helper.
-    ensure_sealed_tmp_store(workdir)?;
+    ensure_sealed_tmp_store(session_workdir)?;
 
     // `/etc/passwd` and `/etc/group` inside the composed root are binds of these files, so they
     // exist on disk before the plan that names them is built — and long before the child executes
     // it. Same idempotent helper `open_landlock_fds` called earlier to grant them.
-    ensure_sealed_identity_files(workdir)?;
+    ensure_sealed_identity_files(session_workdir)?;
 
     let plan = sealed::plan_composed_root(
-        workdir,
+        accessible_workdir,
+        session_workdir,
         &base,
         extra_read_only,
         staged_runtime_read_only,
@@ -3755,24 +3765,27 @@ mod linux_enforce {
     /// shrink-not-fail `continue`. That bind is not manifest-optional, and silently dropping its fd
     /// would leave `/tmp` mounted-but-denied, which is precisely the defect the rule exists to fix.
     pub(super) fn open_landlock_fds(
-        workdir: &Path,
+        accessible_workdir: &Path,
+        session_workdir: &Path,
         landlock_grants: &[LandlockGrant],
         device_grants: &[super::CapsuleDeviceGrant],
         workdir_exec: bool,
         tier: EnforcementTier,
     ) -> Result<LandlockChildFds, String> {
-        let workdir_fd = open_o_path(workdir).map(OwnedFd::from).map_err(|error| {
-            format!(
-                "sandbox: failed to open workdir {} for Landlock scoping: {error}",
-                workdir.display()
-            )
-        })?;
+        let workdir_fd = open_o_path(accessible_workdir)
+            .map(OwnedFd::from)
+            .map_err(|error| {
+                format!(
+                    "sandbox: failed to open workdir {} for Landlock scoping: {error}",
+                    accessible_workdir.display()
+                )
+            })?;
 
         // `prepare_enforcement` calls this function *before* `build_sealed_root`, so `.mur-tmp`
         // need not exist yet; the shared helper creates it (idempotently — `build_sealed_root`
         // calls the same one) so there is something here to open.
         let sealed_tmp_fd = if tier == EnforcementTier::KernelSealed {
-            let tmp_store = super::ensure_sealed_tmp_store(workdir)?;
+            let tmp_store = super::ensure_sealed_tmp_store(session_workdir)?;
             let tmp_store_file = open_o_path(&tmp_store).map_err(|error| {
                 format!(
                     "sandbox: failed to open the workdir-backed /tmp store {} for Landlock \
@@ -3790,7 +3803,7 @@ mod linux_enforce {
         // those names, whose inodes the capsule never sees. See `LandlockChildFds`.
         let sealed_identity_fds = if tier == EnforcementTier::KernelSealed {
             let mut fds = Vec::new();
-            for path in super::ensure_sealed_identity_files(workdir)? {
+            for path in super::ensure_sealed_identity_files(session_workdir)? {
                 let file = open_o_path(&path).map_err(|error| {
                     format!(
                         "sandbox: failed to open the synthetic /etc file {} for Landlock scoping: \
@@ -5661,6 +5674,7 @@ mod tests {
                 &["-c", &script],
                 &[],
                 temp.path(),
+                temp.path(),
                 &policy,
                 &ShellEnforcement::environment_only(),
             )
@@ -5681,6 +5695,7 @@ mod tests {
             "bash",
             &["-c", &script],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &ShellEnforcement::environment_only(),
@@ -5739,6 +5754,15 @@ mod linux_integration_tests {
     /// it; only the host-bounding tail is ever consumed from here.
     fn host_bounding_base() -> ShellEnforcement {
         ShellEnforcement::environment_only()
+    }
+
+    /// `<accessible>/.murmur/<session id>/`, the session workdir a `--workdir` launch stages
+    /// into — the shape that makes the two workdirs different paths, which is the only shape in
+    /// which putting a staging directory in the wrong one is visible.
+    fn session_workdir_under(accessible: &Path) -> PathBuf {
+        let session = accessible.join(".murmur").join("ses_sandbox_tests");
+        std::fs::create_dir_all(&session).unwrap();
+        session
     }
 
     /// Pure content check on the workdir access-right set: no kernel call, no fork, no spawn.
@@ -5829,9 +5853,11 @@ mod linux_integration_tests {
     /// binds it.
     #[test]
     fn the_workdir_backed_tmp_store_is_opened_for_landlock_on_the_sealed_tier_only() {
-        let sealed_workdir = tempfile::tempdir().unwrap();
+        let accessible = tempfile::tempdir().unwrap();
+        let session = session_workdir_under(accessible.path());
         let fds = linux_enforce::open_landlock_fds(
-            sealed_workdir.path(),
+            accessible.path(),
+            &session,
             &[],
             &[],
             false,
@@ -5846,12 +5872,17 @@ mod linux_integration_tests {
             crate::sealed::SEALED_TMP_DIR_NAME,
         );
         assert!(
-            sealed_workdir
-                .path()
-                .join(crate::sealed::SEALED_TMP_DIR_NAME)
-                .is_dir(),
+            session.join(crate::sealed::SEALED_TMP_DIR_NAME).is_dir(),
             "the /tmp store must be created here: open_landlock_fds runs before build_sealed_root, \
              so nothing else has made this directory yet",
+        );
+        assert!(
+            !accessible
+                .path()
+                .join(crate::sealed::SEALED_TMP_DIR_NAME)
+                .exists(),
+            "enabling sealed must add nothing to the top level of the accessible workdir — that \
+             directory is the capsule's deliverable",
         );
 
         for tier in [
@@ -5859,9 +5890,17 @@ mod linux_integration_tests {
             EnforcementTier::KernelSeccompOnly,
             EnforcementTier::EnvironmentOnly,
         ] {
-            let workdir = tempfile::tempdir().unwrap();
-            let fds = linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
-                .expect("a real, writable workdir must yield Landlock fds on any tier");
+            let accessible = tempfile::tempdir().unwrap();
+            let session = session_workdir_under(accessible.path());
+            let fds = linux_enforce::open_landlock_fds(
+                accessible.path(),
+                &session,
+                &[],
+                &[],
+                false,
+                tier,
+            )
+            .expect("a real, writable workdir must yield Landlock fds on any tier");
 
             assert!(
                 fds.sealed_tmp_fd().is_none(),
@@ -5869,10 +5908,7 @@ mod linux_integration_tests {
                  /tmp would grant a path this tier's capsule never sees",
             );
             assert!(
-                !workdir
-                    .path()
-                    .join(crate::sealed::SEALED_TMP_DIR_NAME)
-                    .exists(),
+                !session.join(crate::sealed::SEALED_TMP_DIR_NAME).exists(),
                 "{tier:?} must not even create the store — an unbound directory in the session \
                  workdir is litter the capsule can see",
             );
@@ -5890,9 +5926,11 @@ mod linux_integration_tests {
     /// composes no root.
     #[test]
     fn the_synthetic_etc_files_are_written_and_opened_on_the_sealed_tier_only() {
-        let sealed_workdir = tempfile::tempdir().unwrap();
+        let accessible = tempfile::tempdir().unwrap();
+        let session = session_workdir_under(accessible.path());
         let fds = linux_enforce::open_landlock_fds(
-            sealed_workdir.path(),
+            accessible.path(),
+            &session,
             &[],
             &[],
             false,
@@ -5910,10 +5948,7 @@ mod linux_integration_tests {
             "every synthetic /etc entry the composed root binds needs a rule of its own: {synthetic:?}",
         );
         for entry in &synthetic {
-            let path = crate::sealed::synthetic_etc_source(
-                sealed_workdir.path(),
-                entry.synthetic.unwrap(),
-            );
+            let path = crate::sealed::synthetic_etc_source(&session, entry.synthetic.unwrap());
             assert!(
                 path.is_file(),
                 "{} must be written here: open_landlock_fds runs before build_sealed_root, so \
@@ -5921,15 +5956,30 @@ mod linux_integration_tests {
                 entry.path,
             );
         }
+        assert!(
+            !accessible
+                .path()
+                .join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME)
+                .exists(),
+            "the staging directory belongs to the session, not to the capsule's deliverable",
+        );
 
         for tier in [
             EnforcementTier::KernelFull,
             EnforcementTier::KernelSeccompOnly,
             EnforcementTier::EnvironmentOnly,
         ] {
-            let workdir = tempfile::tempdir().unwrap();
-            let fds = linux_enforce::open_landlock_fds(workdir.path(), &[], &[], false, tier)
-                .expect("a real, writable workdir must yield Landlock fds on any tier");
+            let accessible = tempfile::tempdir().unwrap();
+            let session = session_workdir_under(accessible.path());
+            let fds = linux_enforce::open_landlock_fds(
+                accessible.path(),
+                &session,
+                &[],
+                &[],
+                false,
+                tier,
+            )
+            .expect("a real, writable workdir must yield Landlock fds on any tier");
 
             assert_eq!(
                 fds.sealed_identity_fd_count(),
@@ -5938,8 +5988,7 @@ mod linux_integration_tests {
                  these files stand in for nothing",
             );
             assert!(
-                !workdir
-                    .path()
+                !session
                     .join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME)
                     .exists(),
                 "{tier:?} must not even create the staging directory — same reason as .mur-tmp",
@@ -5958,17 +6007,18 @@ mod linux_integration_tests {
     fn the_synthetic_passwd_entry_carries_exactly_the_home_the_subprocess_env_gets() {
         use std::os::unix::fs::MetadataExt;
 
-        let workdir = tempfile::tempdir().unwrap();
-        let written = ensure_sealed_identity_files(workdir.path()).unwrap();
+        let accessible = tempfile::tempdir().unwrap();
+        let session = session_workdir_under(accessible.path());
+        let written = ensure_sealed_identity_files(&session).unwrap();
         let env = crate::shell::build_shell_env(
             &crate::types::CapabilityPolicy::default(),
             &[],
-            workdir.path(),
+            &session,
         )
         .unwrap();
 
         let passwd = std::fs::read_to_string(&written[0]).unwrap();
-        let owner = std::fs::metadata(workdir.path()).unwrap();
+        let owner = std::fs::metadata(&session).unwrap();
         let entry: Vec<&str> = passwd
             .lines()
             .last()
@@ -6048,8 +6098,13 @@ mod linux_integration_tests {
     fn prepare_enforcement_is_noop_for_environment_only_tier_even_on_linux() {
         let mut command = std::process::Command::new("true");
         let enforcement = ShellEnforcement::environment_only();
-        let supervisor = prepare_enforcement(&mut command, &enforcement, Path::new("/tmp"))
-            .expect("environment_only must never fail");
+        let supervisor = prepare_enforcement(
+            &mut command,
+            &enforcement,
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+        )
+        .expect("environment_only must never fail");
         supervisor.join_best_effort();
     }
 
@@ -6093,6 +6148,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", "exit 7"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &enforcement,
@@ -6144,6 +6200,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", "ls"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &enforcement,
@@ -6205,6 +6262,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", &script],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &enforcement,
@@ -6288,6 +6346,7 @@ mod linux_integration_tests {
             &["-c", &script],
             &[],
             temp.path(),
+            temp.path(),
             &policy,
             &enforcement,
         )
@@ -6346,6 +6405,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", "cat /etc/hostname"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &enforcement,
@@ -6408,6 +6468,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", "echo landlock-grant-ok | cat"],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             &enforcement,
@@ -6476,6 +6537,7 @@ mod linux_integration_tests {
             &["-c", &script],
             &[],
             workdir.path(),
+            workdir.path(),
             &policy,
             &enforcement,
         )
@@ -6510,6 +6572,101 @@ mod linux_integration_tests {
             unix_sockets_allowed: policy.unix_sockets_allowed,
             landlock_grants,
             ..host_bounding_base()
+        }
+    }
+
+    /// A real sealed run against two different workdirs: the composed root's `/tmp` and its
+    /// synthetic `/etc/passwd` both have to resolve from the session workdir, and the capsule's
+    /// own directory has to gain nothing from either.
+    ///
+    /// This is the one test that drives a composed root end to end, so it needs a host that can
+    /// actually reach `KernelSealed` and skips loudly on one that cannot; the parent-side halves
+    /// are covered unconditionally by the `open_landlock_fds` tests above. `mur doctor` reports
+    /// the same host answer this checks.
+    #[test]
+    fn a_sealed_command_finds_tmp_and_etc_after_they_moved_into_the_session_workdir() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "a_sealed_command_finds_tmp_and_etc_after_they_moved_into_the_session_workdir",
+        ) {
+            return;
+        }
+        let probe = HostProbe::probe();
+        if probe.tier() != EnforcementTier::KernelSealed {
+            eprintln!(
+                "SKIP — PROVES NOTHING ABOUT THE SEALED ROOT ON THIS HOST: \
+                 a_sealed_command_finds_tmp_and_etc_... needs a host that reaches KernelSealed \
+                 (unprivileged user namespaces plus a usable Landlock ABI); detected {:?}. No \
+                 composed root is built in this run.",
+                probe.tier()
+            );
+            return;
+        }
+
+        let accessible = tempfile::tempdir().unwrap();
+        let session = accessible.path().join(".murmur").join("ses_sealed_e2e");
+        std::fs::create_dir_all(&session).unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string(), "cat".to_string(), "id".to_string()],
+            ..CapabilityPolicy::default()
+        };
+        let enforcement =
+            ShellEnforcement::resolve(&policy, murmur_artifact::ContainmentClass::Sealed, probe)
+                .expect("a sealed-capable host resolves sealed enforcement");
+        assert_eq!(enforcement.tier, EnforcementTier::KernelSealed);
+
+        let result = crate::shell::execute_shell(
+            "bash",
+            &["-c", "echo t > /tmp/probe && cat /tmp/probe && id -un"],
+            &[],
+            accessible.path(),
+            &session,
+            &policy,
+            &enforcement,
+        )
+        .expect("execute_shell returns Ok even when the command itself fails");
+
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {} stderr: {}",
+            result.stdout, result.stderr
+        );
+        let mut lines = result.stdout.lines();
+        assert_eq!(
+            lines.next(),
+            Some("t"),
+            "the capsule's /tmp must be writable"
+        );
+        assert!(
+            lines.next().is_some_and(|name| !name.is_empty()),
+            "`id -un` resolves only through the synthetic /etc/passwd the composed root binds: \
+             {}",
+            result.stdout
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(
+                session
+                    .join(crate::sealed::SEALED_TMP_DIR_NAME)
+                    .join("probe")
+            )
+            .unwrap(),
+            "t\n",
+            "the bytes written to /tmp land in the session workdir's own store"
+        );
+        assert!(session
+            .join(crate::sealed::SEALED_ETC_STAGING_DIR_NAME)
+            .join("passwd")
+            .is_file());
+        for name in [
+            crate::sealed::SEALED_TMP_DIR_NAME,
+            crate::sealed::SEALED_ETC_STAGING_DIR_NAME,
+            crate::shell::SYNTHETIC_HOME_DIR_NAME,
+        ] {
+            assert!(
+                !accessible.path().join(name).exists(),
+                "enabling sealed must add nothing to the top level of the accessible workdir, \
+                 and it added {name}"
+            );
         }
     }
 
@@ -6562,6 +6719,7 @@ mod linux_integration_tests {
             &["-c", &format!("cat '{}'", module.display())],
             &[],
             workdir.path(),
+            workdir.path(),
             &policy,
             &enforcement,
         )
@@ -6578,6 +6736,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", &format!("ls '{}'", stdlib.path().display())],
             &[],
+            workdir.path(),
             workdir.path(),
             &policy,
             &enforcement,
@@ -6635,6 +6794,7 @@ mod linux_integration_tests {
             &["-c", &format!("ls '{}'", stdlib.display())],
             &[],
             workdir.path(),
+            workdir.path(),
             &policy,
             &enforcement,
         )
@@ -6652,6 +6812,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", &format!("ls '{}'", parent.path().display())],
             &[],
+            workdir.path(),
             workdir.path(),
             &policy,
             &enforcement,
@@ -6719,6 +6880,7 @@ mod linux_integration_tests {
                 "bash",
                 &["-c", &command],
                 &[],
+                workdir.path(),
                 workdir.path(),
                 &policy,
                 enforcement,
@@ -6824,6 +6986,7 @@ mod linux_integration_tests {
                 &["-c", &format!("cat '{}'", bundle.display())],
                 &[],
                 workdir.path(),
+                workdir.path(),
                 &policy,
                 enforcement,
             )
@@ -6921,8 +7084,13 @@ mod linux_integration_tests {
             .arg("-c")
             .arg(format!("echo ran > '{}'", marker.display()));
 
-        let error = prepare_enforcement(&mut command, &kernel_full_empty_grants(), &missing)
-            .expect_err("an unresolvable workdir must fail before fork()");
+        let error = prepare_enforcement(
+            &mut command,
+            &kernel_full_empty_grants(),
+            &missing,
+            &missing,
+        )
+        .expect_err("an unresolvable workdir must fail before fork()");
         assert!(
             !marker.exists(),
             "prepare_enforcement must never spawn a subprocess: {error}"
@@ -6958,6 +7126,7 @@ mod linux_integration_tests {
             "bash",
             &["-c", &script],
             &[],
+            temp.path(),
             temp.path(),
             &policy,
             enforcement,
