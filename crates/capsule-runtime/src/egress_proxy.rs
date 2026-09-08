@@ -11,12 +11,17 @@
 //! ## The two halves, and why they are two
 //!
 //! **DNS (UDP 53).** Every name a capsule looks up arrives here. A name in the allowlist is
-//! resolved for real, upstream, and the answer is returned *and remembered* — the address→name
-//! binding recorded in [`ResolvedNames`] is what lets the TCP half know which host a later
-//! connection is for. A name that is not in the allowlist is answered `REFUSED`: a real reply,
-//! immediately, not a dropped packet. That is the whole of "decide DNS deliberately" — and a
-//! DNS-shaped exfiltration attempt (`nc -u <resolver> 53` with data in the QNAME) terminates in
-//! this process, its payload never leaving the host.
+//! resolved for real, by [`crate::dns_resolver`], and the answer is returned *and remembered* —
+//! the address→name binding recorded in [`ResolvedNames`] is what lets the TCP half know which
+//! host a later connection is for. A name that is not in the allowlist is answered `REFUSED`: a
+//! real reply, immediately, not a dropped packet. That is the whole of "decide DNS deliberately"
+//! — and a DNS-shaped exfiltration attempt (`nc -u <resolver> 53` with data in the QNAME)
+//! terminates in this process, its payload never leaving the host.
+//!
+//! Every query gets one of four answers and never silence: `REFUSED` for a name the allowlist does
+//! not carry, then `NOERROR`, `NXDOMAIN` or `SERVFAIL` for the resolver's three outcomes. A slow
+//! or unreachable upstream is `SERVFAIL`, which a client reads as "ask again", and not `NXDOMAIN`,
+//! which would tell it the name does not exist.
 //!
 //! **TCP.** A connection to any address on an allowlisted port is looped back by the namespace's
 //! local route and accepted here, with the original destination recovered from `getsockname(2)`
@@ -63,6 +68,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::dns_resolver::Resolution;
 use crate::network_policy::{NetworkAllowRule, RequestTarget};
 
 /// The DNS port. Fixed by the protocol, not a choice.
@@ -78,8 +84,10 @@ pub(crate) const MAX_EGRESS_TCP_PORTS: usize = 16;
 
 /// TTL, in seconds, on every record this resolver synthesises.
 ///
-/// Short on purpose: each answer comes from a live upstream lookup made for one query, and a
-/// capsule caching them for long would paper over an allowlist change taking effect.
+/// Short on purpose: the answer a capsule is given is the runtime's own view of the name, and a
+/// capsule caching it for long would paper over both an allowlist change taking effect and the
+/// upstream record moving. It is not the upstream record's own TTL — `crate::dns_resolver` caches
+/// on its own terms behind this.
 const DNS_TTL_SECONDS: u32 = 60;
 
 /// How long an address→name binding stays usable.
@@ -92,16 +100,6 @@ const NAME_BINDING_LIFETIME: Duration = Duration::from_secs(300);
 /// Largest DNS message this resolver will read or produce. 4096 is the EDNS0 buffer size every
 /// modern resolver advertises; anything larger is malformed for our purposes.
 const MAX_DNS_MESSAGE_BYTES: usize = 4096;
-
-/// Ceiling on how long `resolve_upstream`'s real lookup may run before it is treated as having
-/// found nothing.
-///
-/// `to_socket_addrs` (`getaddrinfo(3)`) has no timeout of its own, and a session's DNS queries are
-/// served by one thread processing them one at a time — an unbounded lookup here would stall every
-/// other query behind it, and would make `EgressProxyHandle::shutdown`'s join of that same thread
-/// wait on however long a slow or unreachable upstream resolver takes. This is the DNS-side
-/// counterpart of `CONNECT_TIMEOUT`, the equivalent bound already in place on the TCP half.
-const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------- listen ports
 
@@ -307,6 +305,10 @@ pub(crate) const DNS_TYPE_A: u16 = 1;
 pub(crate) const DNS_TYPE_AAAA: u16 = 28;
 pub(crate) const DNS_RCODE_NOERROR: u8 = 0;
 pub(crate) const DNS_RCODE_FORMERR: u8 = 1;
+/// What a capsule is told when nothing answered the runtime's own lookup. A resolver client reads
+/// it as "ask again" — `getaddrinfo` turns it into `EAI_AGAIN`, "Temporary failure in name
+/// resolution" — where `NXDOMAIN` would tell it not to bother.
+pub(crate) const DNS_RCODE_SERVFAIL: u8 = 2;
 pub(crate) const DNS_RCODE_NXDOMAIN: u8 = 3;
 pub(crate) const DNS_RCODE_REFUSED: u8 = 5;
 
@@ -395,16 +397,20 @@ pub(crate) fn build_dns_response(query: &DnsQuery, rcode: u8, answers: &[IpAddr]
     message
 }
 
-/// The whole resolver decision, with the upstream lookup injected so it is testable without DNS.
+/// The whole resolver decision, with the lookup's outcome injected so it is testable without DNS.
 ///
 /// Records the address→name binding for every address it resolves — that binding is what the TCP
 /// half later uses to know which host a connection is for, so it is produced here, at the one
-/// moment the runtime knows both halves of the pair.
+/// moment the runtime knows both halves of the pair. No other outcome records anything: a name the
+/// allowlist refuses and a name nothing answered for both leave the TCP half knowing nothing.
+///
+/// `resolve` is [`FnOnce`] because the caller that matters has already awaited the lookup and has
+/// one [`Resolution`] to hand over; the tests pass a closure returning a constant.
 pub(crate) fn answer_dns_query(
     policy: &EgressPolicy,
     resolved: &ResolvedNames,
     query: &DnsQuery,
-    resolve: impl Fn(&str) -> Vec<IpAddr>,
+    resolve: impl FnOnce(&str) -> Resolution,
 ) -> Vec<u8> {
     if !policy.allows_name(&query.name) {
         return build_dns_response(query, DNS_RCODE_REFUSED, &[]);
@@ -417,10 +423,14 @@ pub(crate) fn answer_dns_query(
         return build_dns_response(query, DNS_RCODE_NOERROR, &[]);
     }
 
-    let all = resolve(&query.name);
-    if all.is_empty() {
-        return build_dns_response(query, DNS_RCODE_NXDOMAIN, &[]);
-    }
+    let all = match resolve(&query.name) {
+        Resolution::Resolved(addresses) => addresses,
+        // The upstream settled it: there is no such name.
+        Resolution::DoesNotExist => return build_dns_response(query, DNS_RCODE_NXDOMAIN, &[]),
+        // Nothing answered. `SERVFAIL` is the reply that leaves the capsule free to ask again;
+        // `NXDOMAIN` would tell it the name is gone, which nobody established.
+        Resolution::DidNotAnswer(_) => return build_dns_response(query, DNS_RCODE_SERVFAIL, &[]),
+    };
     // Bind every address of the name, not just the family asked about: a client that queries AAAA
     // first and then connects over IPv4 must not be refused for a name it was legitimately told
     // about.
@@ -437,42 +447,6 @@ pub(crate) fn answer_dns_query(
     // tells a dual-stack client to try the other one, which for `AAAA` is exactly what this
     // IPv4-routed namespace needs it to do.
     build_dns_response(query, DNS_RCODE_NOERROR, &addresses)
-}
-
-/// The real upstream lookup, performed in the *host's* network namespace by the runtime process.
-///
-/// Run on a short-lived helper thread with a bounded wait rather than called inline: the
-/// `to_socket_addrs` call below has no timeout of its own, and the caller here is the single
-/// thread that serves every DNS query for this session and that `EgressProxyHandle::shutdown`
-/// joins — so an unbounded lookup would be both a head-of-line block on every other query and a
-/// stalled teardown. A lookup that does not answer within `DNS_UPSTREAM_TIMEOUT` is treated the
-/// same as one that resolved to nothing (`NXDOMAIN`, exactly as for a name that genuinely does not
-/// exist); the helper thread is simply left to finish on its own, since dropping an unjoined
-/// `JoinHandle` is not a leak.
-pub(crate) fn resolve_upstream(name: &str) -> Vec<IpAddr> {
-    use std::net::ToSocketAddrs;
-    let name = name.to_string();
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let looked_up = (name.as_str(), 0u16)
-            .to_socket_addrs()
-            .map(|addresses| {
-                let mut ips: Vec<IpAddr> = Vec::new();
-                for address in addresses {
-                    if !ips.contains(&address.ip()) {
-                        ips.push(address.ip());
-                    }
-                }
-                ips
-            })
-            .unwrap_or_default();
-        // The receiver may already be gone (timed out and returned) — that is not an error here,
-        // just this thread finishing after nobody is left waiting.
-        let _ = result_tx.send(looked_up);
-    });
-    result_rx
-        .recv_timeout(DNS_UPSTREAM_TIMEOUT)
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------- the running proxy
@@ -501,9 +475,10 @@ mod linux {
     use std::time::Duration;
 
     use super::{
-        answer_dns_query, parse_dns_query, resolve_upstream, EgressPolicy, ResolvedNames,
-        DNS_RCODE_FORMERR, MAX_DNS_MESSAGE_BYTES,
+        answer_dns_query, parse_dns_query, EgressPolicy, ResolvedNames, DNS_RCODE_FORMERR,
+        MAX_DNS_MESSAGE_BYTES,
     };
+    use crate::dns_resolver::{DnsResolver, NoAnswer, Resolution};
 
     /// Read/write timeout on a relayed connection, and how long an upstream connect may take.
     /// Both bound a capsule's ability to pin a proxy thread indefinitely.
@@ -582,8 +557,9 @@ mod linux {
             let policy = policy.clone();
             let resolved = Arc::clone(&resolved);
             let stop = Arc::clone(&stop);
+            let names = crate::dns_resolver::shared().cloned();
             threads.push(std::thread::spawn(move || {
-                serve_dns(resolver, policy, resolved, stop);
+                serve_dns(resolver, policy, resolved, stop, names);
             }));
         }
 
@@ -717,12 +693,26 @@ mod linux {
     #[repr(C, align(8))]
     struct CmsgBuffer([u8; 64]);
 
-    fn serve_dns(
+    /// Receives queries and hands each one to `names`; nothing on this path performs a lookup.
+    ///
+    /// One query's lookup is a task on `crate::dns_resolver`'s runtime, which replies on the same
+    /// socket when it finishes. That is what keeps a slow name off the critical path of every
+    /// other one, and what lets `EgressProxyHandle::shutdown` join this thread inside one poll
+    /// interval no matter how many lookups are still in flight — a task outliving the session it
+    /// was started for writes its reply into a namespace that is already gone, which is a datagram
+    /// nobody receives rather than a wait anybody pays for.
+    ///
+    /// The socket is shared with those tasks rather than lent as a raw descriptor, so the last
+    /// task to finish is what closes it. A descriptor number outliving its socket is a write into
+    /// whatever the process opened next.
+    pub(crate) fn serve_dns(
         socket: UdpSocket,
         policy: EgressPolicy,
         resolved: Arc<ResolvedNames>,
         stop: Arc<AtomicBool>,
+        names: Option<DnsResolver>,
     ) {
+        let socket = Arc::new(socket);
         let fd = socket.as_raw_fd();
         let mut buffer = vec![0u8; MAX_DNS_MESSAGE_BYTES];
         while !stop.load(Ordering::SeqCst) {
@@ -732,21 +722,40 @@ mod linux {
             let Some((len, peer, local)) = recv_query(fd, &mut buffer) else {
                 continue;
             };
-            let reply = match parse_dns_query(&buffer[..len]) {
-                Some(query) => answer_dns_query(&policy, &resolved, &query, resolve_upstream),
-                None => {
-                    // Not a query this resolver understands. A `FORMERR` needs the message id,
-                    // which is the first field of every DNS message; without at least a header
-                    // there is nothing to reply to.
-                    if len < 12 {
-                        continue;
-                    }
-                    let mut header = [0u8; 12];
-                    header.copy_from_slice(&buffer[..12]);
-                    formerr_reply(&header)
+            let Some(query) = parse_dns_query(&buffer[..len]) else {
+                // Not a query this resolver understands. A `FORMERR` needs the message id, which
+                // is the first field of every DNS message; without at least a header there is
+                // nothing to reply to.
+                if len < 12 {
+                    continue;
                 }
+                let mut header = [0u8; 12];
+                header.copy_from_slice(&buffer[..12]);
+                send_reply(fd, &formerr_reply(&header), peer, local);
+                continue;
             };
-            send_reply(fd, &reply, peer, local);
+
+            match (names.as_ref(), crate::dns_resolver::runtime_handle()) {
+                (Some(names), Some(runtime)) => {
+                    let names = names.clone();
+                    let policy = policy.clone();
+                    let resolved = Arc::clone(&resolved);
+                    let socket = Arc::clone(&socket);
+                    runtime.spawn(async move {
+                        let resolution = names.lookup(&query.name).await;
+                        let reply = answer_dns_query(&policy, &resolved, &query, |_| resolution);
+                        send_reply(socket.as_raw_fd(), &reply, peer, local);
+                    });
+                }
+                // No resolver at all: every name is one nothing answered for, which is a reply the
+                // capsule can act on rather than a query that disappears.
+                _ => {
+                    let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+                        Resolution::DidNotAnswer(NoAnswer::ResolverUnavailable)
+                    });
+                    send_reply(fd, &reply, peer, local);
+                }
+            }
         }
     }
 
@@ -852,7 +861,11 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::dns_resolver::scripted::{Behaviour, ScriptedResolver};
+    use crate::dns_resolver::{DnsResolver, NoAnswer};
     use crate::network_policy::parse_network_allow_rules;
 
     fn rules(entries: &[&str]) -> Vec<NetworkAllowRule> {
@@ -1115,7 +1128,9 @@ mod tests {
         let policy = policy(&["https://api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("evil.example.com", DNS_TYPE_A)).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert_eq!(
             u16::from_be_bytes([reply[0], reply[1]]),
             0x1234,
@@ -1133,7 +1148,9 @@ mod tests {
         let policy = policy(&["https://api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("evil.example.com", DNS_TYPE_A)).unwrap();
-        answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert!(resolved.names_for(ADDRESS).is_empty());
     }
 
@@ -1142,7 +1159,9 @@ mod tests {
         let policy = policy(&["https://api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_A)).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert_eq!(reply[3] & 0x0f, DNS_RCODE_NOERROR);
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 1);
         assert_eq!(&reply[reply.len() - 4..], &[203, 0, 113, 7]);
@@ -1154,8 +1173,40 @@ mod tests {
         let policy = policy(&["https://api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_A)).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| Vec::new());
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| Resolution::DoesNotExist);
         assert_eq!(reply[3] & 0x0f, DNS_RCODE_NXDOMAIN);
+    }
+
+    #[test]
+    fn a_listed_name_nothing_answered_for_is_servfail_and_leaves_no_binding() {
+        // The distinction the whole module turns on: a capsule told SERVFAIL retries, a capsule
+        // told NXDOMAIN does not. Nothing was learned about the name, so nothing is bound.
+        let policy = policy(&["https://api.example.com"], &[]);
+        let resolved = ResolvedNames::default();
+        let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_A)).unwrap();
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::DidNotAnswer(NoAnswer::DeadlineElapsed)
+        });
+        assert_eq!(reply[3] & 0x0f, DNS_RCODE_SERVFAIL);
+        assert_eq!(DNS_RCODE_SERVFAIL, 2);
+        assert_ne!(DNS_RCODE_SERVFAIL, DNS_RCODE_NXDOMAIN);
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0, "no answers");
+        assert!(resolved.names_for(ADDRESS).is_empty());
+    }
+
+    #[test]
+    fn a_listed_name_with_no_address_record_is_noerror_not_nxdomain() {
+        // The name exists and carries something other than an address. `NXDOMAIN` would be a
+        // claim the upstream never made.
+        let policy = policy(&["https://api.example.com"], &[]);
+        let resolved = ResolvedNames::default();
+        let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_A)).unwrap();
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(Vec::new())
+        });
+        assert_eq!(reply[3] & 0x0f, DNS_RCODE_NOERROR);
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0);
+        assert!(resolved.names_for(ADDRESS).is_empty());
     }
 
     #[test]
@@ -1165,7 +1216,9 @@ mod tests {
         let policy = policy(&["https://api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("api.example.com", 16)).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert_eq!(reply[3] & 0x0f, DNS_RCODE_NOERROR);
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0);
     }
@@ -1175,7 +1228,9 @@ mod tests {
         let policy = policy(&["api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_AAAA)).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 0);
         assert_eq!(
             reply[3] & 0x0f,
@@ -1191,7 +1246,9 @@ mod tests {
         let policy = policy(&["api.example.com"], &[]);
         let resolved = ResolvedNames::default();
         let query = parse_dns_query(&query_bytes("api.example.com", DNS_TYPE_AAAA)).unwrap();
-        answer_dns_query(&policy, &resolved, &query, |_| vec![ADDRESS]);
+        answer_dns_query(&policy, &resolved, &query, |_| {
+            Resolution::Resolved(vec![ADDRESS])
+        });
         assert_eq!(resolved.names_for(ADDRESS), vec!["api.example.com"]);
     }
 
@@ -1201,7 +1258,170 @@ mod tests {
         let resolved = ResolvedNames::default();
         let raw = query_bytes("api.example.com", DNS_TYPE_A);
         let query = parse_dns_query(&raw).unwrap();
-        let reply = answer_dns_query(&policy, &resolved, &query, |_| Vec::new());
+        let reply = answer_dns_query(&policy, &resolved, &query, |_| Resolution::DoesNotExist);
         assert_eq!(&reply[12..12 + query.question.len()], &raw[12..]);
+    }
+
+    // ---- the three outcomes, over a scripted upstream ----
+
+    /// The acceptance criterion this module's resolver exists for: a resolver that receives a
+    /// query and never replies must be distinguishable, inside the deadline, from one that says
+    /// the name does not exist.
+    #[test]
+    fn a_blackholed_name_is_servfail_and_a_missing_one_is_nxdomain() {
+        let blackhole = ScriptedResolver::start(&[], Behaviour::Blackhole).unwrap();
+        let missing = ScriptedResolver::start(&[], Behaviour::DoesNotExist).unwrap();
+        let slow = DnsResolver::from_config(blackhole.config()).unwrap();
+        let absent = DnsResolver::from_config(missing.config()).unwrap();
+
+        let policy = policy(&["slow.example.test", "gone.example.test"], &[]);
+        let resolved = ResolvedNames::default();
+
+        let query = parse_dns_query(&query_bytes("slow.example.test", DNS_TYPE_A)).unwrap();
+        let started = Instant::now();
+        let blackholed = answer_dns_query(&policy, &resolved, &query, |name| slow.resolve(name));
+        let waited = started.elapsed();
+
+        assert_eq!(blackholed[3] & 0x0f, DNS_RCODE_SERVFAIL);
+        assert!(
+            waited > Duration::from_secs(4) && waited < Duration::from_secs(8),
+            "the blackholed lookup must be given its whole deadline and no more, waited {waited:?}"
+        );
+
+        let query = parse_dns_query(&query_bytes("gone.example.test", DNS_TYPE_A)).unwrap();
+        let started = Instant::now();
+        let gone = answer_dns_query(&policy, &resolved, &query, |name| absent.resolve(name));
+        let waited = started.elapsed();
+
+        assert_eq!(gone[3] & 0x0f, DNS_RCODE_NXDOMAIN);
+        assert!(
+            waited < Duration::from_secs(1),
+            "an answered lookup must not wait on a deadline, waited {waited:?}"
+        );
+        assert_ne!(blackholed[3] & 0x0f, gone[3] & 0x0f);
+        assert!(
+            blackholed.len() >= 12 && gone.len() >= 12,
+            "neither is silence"
+        );
+    }
+
+    // ---- the running DNS server ----
+
+    /// Binds a loopback socket, runs [`linux::serve_dns`] over it against `upstream`, and returns
+    /// the address to send queries to, the stop flag and the server thread.
+    ///
+    /// A plain loopback socket carries no `IP_PKTINFO`, so `recv_query` reports no local address
+    /// and `send_reply` sends without one — the path a namespace socket does not take, kept
+    /// working because this harness is the only way to drive the receive loop without root.
+    #[cfg(target_os = "linux")]
+    fn serve_dns_on_loopback(
+        upstream: &ScriptedResolver,
+        entries: &[&str],
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::net::{Ipv4Addr, UdpSocket};
+        use std::sync::atomic::AtomicBool;
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = socket.local_addr().unwrap();
+        let policy = policy(entries, &[]);
+        let names = DnsResolver::from_config(upstream.config()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                linux::serve_dns(
+                    socket,
+                    policy,
+                    Arc::new(ResolvedNames::default()),
+                    stop,
+                    Some(names),
+                );
+            })
+        };
+        (address, stop, thread)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_slow_name_does_not_hold_up_the_one_asked_after_it() {
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let upstream = ScriptedResolver::start(
+            &[
+                ("slow.example.test.", Behaviour::Blackhole),
+                ("fast.example.test.", Behaviour::Answer(vec![ADDRESS])),
+            ],
+            Behaviour::DoesNotExist,
+        )
+        .unwrap();
+        let (server, stop, thread) =
+            serve_dns_on_loopback(&upstream, &["slow.example.test", "fast.example.test"]);
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let started = Instant::now();
+        client
+            .send_to(&query_bytes("slow.example.test", DNS_TYPE_A), server)
+            .unwrap();
+        client
+            .send_to(&query_bytes("fast.example.test", DNS_TYPE_A), server)
+            .unwrap();
+
+        let mut buffer = [0u8; 512];
+        let (len, _) = client.recv_from(&mut buffer).unwrap();
+        let first = started.elapsed();
+        assert_eq!(
+            buffer[3] & 0x0f,
+            DNS_RCODE_NOERROR,
+            "the first reply back must be the name that resolved"
+        );
+        assert_eq!(u16::from_be_bytes([buffer[6], buffer[7]]), 1);
+        assert_eq!(&buffer[len - 4..len], &[203, 0, 113, 7]);
+        assert!(
+            first < Duration::from_secs(1),
+            "the fast name waited on the slow one, {first:?}"
+        );
+
+        let (_, _) = client.recv_from(&mut buffer).unwrap();
+        let second = started.elapsed();
+        assert_eq!(buffer[3] & 0x0f, DNS_RCODE_SERVFAIL);
+        assert!(
+            second > Duration::from_secs(4) && second < Duration::from_secs(8),
+            "the blackholed name must answer at its deadline, {second:?}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_does_not_wait_on_a_lookup_in_flight() {
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        let upstream = ScriptedResolver::start(&[], Behaviour::Blackhole).unwrap();
+        let (server, stop, thread) = serve_dns_on_loopback(&upstream, &["slow.example.test"]);
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .send_to(&query_bytes("slow.example.test", DNS_TYPE_A), server)
+            .unwrap();
+        // Long enough for the receive loop to have taken the query and spawned its lookup.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread.join().unwrap();
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "teardown is bounded by the poll interval, not by the lookup deadline, {waited:?}"
+        );
     }
 }

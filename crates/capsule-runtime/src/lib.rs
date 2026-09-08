@@ -18,6 +18,7 @@ pub mod delegation;
 pub mod delegation_plane;
 pub mod detached;
 pub(crate) mod detached_reconcile;
+pub(crate) mod dns_resolver;
 pub(crate) mod egress_proxy;
 pub mod errors;
 pub(crate) mod fence;
