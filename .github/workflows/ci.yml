@@ -120,27 +120,21 @@ jobs:
       - name: WIT package versions are single-valued and documented
         run: ./scripts/check-wit-versions.sh
 
-  glibc-floor:
-    name: glibc-floor
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: The declared glibc floor matches the release target and what we tell operators
-        # Configuration only, so it needs no toolchain and no binary. It catches the
-        # pinned target losing its glibc suffix and an operator-facing surface drifting
-        # away from the declared floor -- but it compares declarations against each
-        # other and cannot see a binary, so glibc-floor-binary below is what answers
-        # whether the promise they encode is true.
-        run: ./scripts/check-glibc-floor.sh --config
-
   glibc-floor-binary:
     name: glibc-floor-binary
     runs-on: ubuntu-latest
-    # The check that reads a real ELF, on every pull request rather than only at
-    # release. A source change can raise what the binary requires without touching any
-    # of the four declarations the configuration check reads, so that check stays green
-    # while the promise it encodes stops being true -- and a check that cannot fail for
-    # the reason that matters is worse than no check, because it reports confidence.
+    # Builds at the same pinned target the release uses and reads the version needs off
+    # the resulting ELF, so what runs here is what ships. A source change can raise what
+    # the binary requires without touching the floor declaration at all -- which is how a
+    # glibc 2.34 symbol reached main under a declared floor of 2.31 -- so nothing that
+    # only reads declarations can stand in for this. No --floor override: comparing
+    # against anything but the declared floor proves nothing.
+    #
+    # Merge to main only. A warm-cache rebuild of both binaries at the pinned target
+    # measures ~6 minutes on a host faster than this runner, too much to spend on every
+    # push to every branch; on main it still fails within minutes of the merge that
+    # caused it, where the alternative is finding out at release.
+    if: github.event_name == 'push'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

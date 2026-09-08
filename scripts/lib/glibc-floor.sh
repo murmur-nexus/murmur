@@ -21,15 +21,13 @@
 # Moving the floor is a deliberate act with five edits: both variables here, the
 # `### Install` section of README.md, the header of scripts/install.sh, and
 # docs/content/reference/roost-api.md — the three surfaces that state the floor to
-# the person installing. Those three are machine-checked against this file by
-# `scripts/check-glibc-floor.sh --config`, so a floor that moves in one place and
-# not the others fails CI rather than reaching an operator as a wrong promise.
+# the person installing. Those three are prose and nothing checks them, so move
+# them in the same commit: a stale number there misleads an operator, where a
+# stale number here ships a binary that will not start.
 #
 # Contract for a sourcer:
 #
 #   * Have `set -eu` already in force.
-#   * The path variables below are repo-relative; a caller that reads them out of
-#     somewhere other than the repository root prefixes them itself.
 #   * `glibc_reader` must be called before any function that reads an ELF.
 
 # The floor itself. RHEL 9 ships glibc 2.34, Ubuntu 22.04 ships 2.35 and Debian 12
@@ -58,20 +56,13 @@ GLIBC_FLOOR_TARGET="x86_64-unknown-linux-gnu.2.34"
 # surfaces describe the same promise.
 GLIBC_FLOOR_DISTROS="Debian 12+, Ubuntu 22.04+, RHEL 9+"
 
-# The four files whose statement of the floor must agree with the two declarations
-# above; see `scripts/check-glibc-floor.sh --config`. Repo-relative.
-GLIBC_FLOOR_WORKFLOW=".github/workflows/release.yml"
-GLIBC_FLOOR_README="README.md"
-GLIBC_FLOOR_INSTALLER="scripts/install.sh"
-GLIBC_FLOOR_DOCS="docs/content/reference/roost-api.md"
-
 # This file, for a message that has to say where the floor is changed.
 GLIBC_FLOOR_LIB="scripts/lib/glibc-floor.sh"
 
 # The reader for every ELF question below, resolved once into GLIBC_READELF.
 # Exits 2 with the shared message when the host has none; it is a guard, not a
-# predicate. binutils is not installed by default in a minimal build container,
-# so the release job installs it alongside the compiler.
+# predicate. binutils carries readelf, so both workflows that run the gate install
+# it alongside the compiler.
 glibc_reader() {
     for _candidate in readelf llvm-readelf eu-readelf; do
         if command -v "$_candidate" >/dev/null 2>&1; then

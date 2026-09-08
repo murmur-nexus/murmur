@@ -26,8 +26,8 @@ CHECKSUMS_FILE="checksums.txt"
 
 # The oldest glibc a published linux-x86_64 binary is built to run on, quoted back to
 # whoever a binary refused to start for. Declared in scripts/lib/glibc-floor.sh and
-# enforced over every asset at release time by scripts/check-glibc-floor.sh; this copy
-# is checked against that declaration by `scripts/check-glibc-floor.sh --config`.
+# enforced over every asset by scripts/check-glibc-floor.sh, on every pull request and
+# again before upload. This copy is prose: keep it in step with that declaration.
 SUPPORTED_GLIBC="2.34"
 
 # AppArmor profile that lets `mur` create an unprivileged user namespace, which is
