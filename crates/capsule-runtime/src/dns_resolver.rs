@@ -11,8 +11,8 @@
 //! `getaddrinfo(3)` has no deadline and no cancellation. The only way to bound it is to abandon
 //! the thread running it, which throws away the one fact that matters: *why* there was no answer.
 //! A name that does not exist and a resolver that did not reply are different situations with
-//! different remedies, and collapsing them told every capsule "that name does not exist" whenever
-//! the upstream was merely slow — a claim a resolver client has no reason to retry.
+//! different remedies, and collapsing them tells a capsule "that name does not exist" whenever the
+//! upstream is merely slow — a claim a resolver client has no reason to retry.
 //!
 //! A lookup here is an ordinary cancellable future under [`LOOKUP_DEADLINE`]. Its expiry is a
 //! named outcome, [`NoAnswer::DeadlineElapsed`], not the absence of one.
@@ -601,8 +601,8 @@ mod tests {
         );
     }
 
-    /// The configuration scenario 5 pins: one search domain, `ndots` at the `resolv.conf(5)`
-    /// default of 1.
+    /// The configuration the search and `ndots` tests share: one search domain, `ndots` at the
+    /// `resolv.conf(5)` default of 1.
     fn with_search(upstream: &ScriptedResolver) -> DnsResolver {
         let mut config = upstream.config();
         config.add_search(Name::from_str("example.test.").unwrap());

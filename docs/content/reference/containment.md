@@ -483,8 +483,8 @@ consulted **first**, so a name pinned there is answered without a query leaving 
 files are read **once**, when the first lookup in a process happens, and are not re-read when they
 change: a host that rewrites either mid-run needs `mur` restarted for the change to take effect.
 
-**What the runtime does not read.** This is a DNS client with a hosts file, not a reimplementation
-of glibc's name-service switch. The differences are fixed, and are not configurable:
+**What the runtime does not read.** The runtime is a DNS client with a hosts file. Everything
+glibc's name-service switch layers on top of that is absent, and none of it is configurable:
 
 | Not honoured | Consequence |
 |---|---|

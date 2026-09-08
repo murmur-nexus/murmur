@@ -397,6 +397,27 @@ pub(crate) fn build_dns_response(query: &DnsQuery, rcode: u8, answers: &[IpAddr]
     message
 }
 
+/// The reply a query gets from policy alone, or `None` when only a lookup can settle it.
+///
+/// **Every caller must consult this before it resolves anything.** Both decisions here are made
+/// from the query on its own, and both must be made *before* a lookup leaves the process: a QNAME
+/// carried to an upstream on behalf of a name the allowlist does not list is the DNS-shaped
+/// exfiltration this proxy exists to terminate, and it is exfiltration whatever rcode comes back
+/// afterwards.
+pub(crate) fn reply_without_lookup(policy: &EgressPolicy, query: &DnsQuery) -> Option<Vec<u8>> {
+    if !policy.allows_name(&query.name) {
+        return Some(build_dns_response(query, DNS_RCODE_REFUSED, &[]));
+    }
+    if query.qtype != DNS_TYPE_A && query.qtype != DNS_TYPE_AAAA {
+        // A listed name asked about through a record type this resolver does not synthesise (MX,
+        // TXT, SRV…). `NOERROR` with no answers is the accurate reply — the name exists, this
+        // resolver has nothing of that type — and TXT in particular is the classic DNS
+        // exfiltration and ingest carrier, which this refuses to relay by construction.
+        return Some(build_dns_response(query, DNS_RCODE_NOERROR, &[]));
+    }
+    None
+}
+
 /// The whole resolver decision, with the lookup's outcome injected so it is testable without DNS.
 ///
 /// Records the address→name binding for every address it resolves — that binding is what the TCP
@@ -405,22 +426,17 @@ pub(crate) fn build_dns_response(query: &DnsQuery, rcode: u8, answers: &[IpAddr]
 /// allowlist refuses and a name nothing answered for both leave the TCP half knowing nothing.
 ///
 /// `resolve` is [`FnOnce`] because the caller that matters has already awaited the lookup and has
-/// one [`Resolution`] to hand over; the tests pass a closure returning a constant.
+/// one [`Resolution`] to hand over; the tests pass a closure returning a constant. It is called
+/// only for a query [`reply_without_lookup`] leaves unanswered, so passing a closure that performs
+/// the lookup is safe here even though the running proxy cannot use that shape.
 pub(crate) fn answer_dns_query(
     policy: &EgressPolicy,
     resolved: &ResolvedNames,
     query: &DnsQuery,
     resolve: impl FnOnce(&str) -> Resolution,
 ) -> Vec<u8> {
-    if !policy.allows_name(&query.name) {
-        return build_dns_response(query, DNS_RCODE_REFUSED, &[]);
-    }
-    if query.qtype != DNS_TYPE_A && query.qtype != DNS_TYPE_AAAA {
-        // A listed name asked about through a record type this resolver does not synthesise (MX,
-        // TXT, SRV…). `NOERROR` with no answers is the accurate reply — the name exists, this
-        // resolver has nothing of that type — and TXT in particular is the classic DNS
-        // exfiltration and ingest carrier, which this refuses to relay by construction.
-        return build_dns_response(query, DNS_RCODE_NOERROR, &[]);
+    if let Some(reply) = reply_without_lookup(policy, query) {
+        return reply;
     }
 
     let all = match resolve(&query.name) {
@@ -475,8 +491,8 @@ mod linux {
     use std::time::Duration;
 
     use super::{
-        answer_dns_query, parse_dns_query, EgressPolicy, ResolvedNames, DNS_RCODE_FORMERR,
-        MAX_DNS_MESSAGE_BYTES,
+        answer_dns_query, parse_dns_query, reply_without_lookup, EgressPolicy, ResolvedNames,
+        DNS_RCODE_FORMERR, MAX_DNS_MESSAGE_BYTES,
     };
     use crate::dns_resolver::{DnsResolver, NoAnswer, Resolution};
 
@@ -693,7 +709,12 @@ mod linux {
     #[repr(C, align(8))]
     struct CmsgBuffer([u8; 64]);
 
-    /// Receives queries and hands each one to `names`; nothing on this path performs a lookup.
+    /// Receives queries, decides each one against the allowlist, and hands only the survivors to
+    /// `names`; nothing on this path performs a lookup.
+    ///
+    /// The allowlist decision is made here rather than after the lookup, because a name the
+    /// allowlist does not carry must not be looked up at all — the QNAME would reach an upstream
+    /// nameserver, which is the exfiltration channel this half exists to terminate.
     ///
     /// One query's lookup is a task on `crate::dns_resolver`'s runtime, which replies on the same
     /// socket when it finishes. That is what keeps a slow name off the critical path of every
@@ -734,6 +755,13 @@ mod linux {
                 send_reply(fd, &formerr_reply(&header), peer, local);
                 continue;
             };
+
+            // Policy first, and on this thread: a query the allowlist refuses must never become a
+            // lookup, or its QNAME leaves the host on the way to being refused.
+            if let Some(reply) = reply_without_lookup(&policy, &query) {
+                send_reply(fd, &reply, peer, local);
+                continue;
+            }
 
             match (names.as_ref(), crate::dns_resolver::runtime_handle()) {
                 (Some(names), Some(runtime)) => {
@@ -1264,9 +1292,8 @@ mod tests {
 
     // ---- the three outcomes, over a scripted upstream ----
 
-    /// The acceptance criterion this module's resolver exists for: a resolver that receives a
-    /// query and never replies must be distinguishable, inside the deadline, from one that says
-    /// the name does not exist.
+    /// A resolver that receives a query and never replies must be distinguishable, inside the
+    /// deadline, from one that says the name does not exist.
     #[test]
     fn a_blackholed_name_is_servfail_and_a_missing_one_is_nxdomain() {
         let blackhole = ScriptedResolver::start(&[], Behaviour::Blackhole).unwrap();
@@ -1394,6 +1421,53 @@ mod tests {
         assert!(
             second > Duration::from_secs(4) && second < Duration::from_secs(8),
             "the blackholed name must answer at its deadline, {second:?}"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        thread.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unlisted_name_is_refused_without_its_qname_reaching_an_upstream() {
+        use std::net::{Ipv4Addr, UdpSocket};
+
+        // The exfiltration case, stated as a measurement: the payload is in the QNAME, so a
+        // refusal that arrives only after the upstream was asked has already leaked it.
+        let upstream = ScriptedResolver::start(&[], Behaviour::Blackhole).unwrap();
+        let (server, stop, thread) = serve_dns_on_loopback(&upstream, &["listed.example.test"]);
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let started = Instant::now();
+        client
+            .send_to(
+                &query_bytes("secret-payload.evil.example", DNS_TYPE_A),
+                server,
+            )
+            .unwrap();
+        // A record type this resolver does not synthesise, for a name that *is* listed: also
+        // answerable from the query alone, and also not a reason to ask anyone anything.
+        client
+            .send_to(&query_bytes("listed.example.test", 16), server)
+            .unwrap();
+
+        let mut buffer = [0u8; 512];
+        let (_, _) = client.recv_from(&mut buffer).unwrap();
+        assert_eq!(buffer[3] & 0x0f, DNS_RCODE_REFUSED);
+        let (_, _) = client.recv_from(&mut buffer).unwrap();
+        assert_eq!(buffer[3] & 0x0f, DNS_RCODE_NOERROR);
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a query answered from policy alone must not wait on a lookup deadline, {waited:?}"
+        );
+        assert_eq!(
+            upstream.asked(),
+            Vec::new(),
+            "no query the allowlist refuses may reach an upstream nameserver"
         );
 
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
