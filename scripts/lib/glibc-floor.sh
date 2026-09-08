@@ -34,11 +34,10 @@
 
 # The floor itself. RHEL 9 ships glibc 2.34, Ubuntu 22.04 ships 2.35 and Debian 12
 # ships 2.36, so this one number covers every distribution named in
-# GLIBC_FLOOR_DISTROS. It is not a policy choice about how far back to reach: the
-# binary has required 2.34 since `mark_inherited_fds_cloexec` in
-# crates/capsule-runtime/src/sandbox.rs started calling `libc::close_range`, whose
-# glibc wrapper landed in 2.34. Anything below this number cannot link that call.
-# `cargo install murmur-cli` is the path on an older host.
+# GLIBC_FLOOR_DISTROS. It is not a policy choice about how far back to reach:
+# `mark_inherited_fds_cloexec` in crates/capsule-runtime/src/sandbox.rs calls
+# `libc::close_range`, whose glibc wrapper exists only from 2.34, so a build below
+# this number cannot link. `cargo install murmur-cli` is the path on an older host.
 GLIBC_FLOOR="2.34"
 
 # The build target that produces exactly that floor. The `.2.34` suffix is a
