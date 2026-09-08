@@ -68,7 +68,7 @@ const NOT_A_PROGRAM: &[u8] = b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00not a prog
 
 /// A binary this host's loader refuses, standing in for one built above the glibc floor: it writes
 /// the line the dynamic loader writes and exits 127, exactly as `mur` built against glibc 2.39
-/// does on Debian 11.
+/// does on Debian 12.
 const REFUSED_BY_LOADER: &str = r#"#!/bin/sh
 echo "$0: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.39' not found" >&2
 exit 127
@@ -384,7 +384,7 @@ fn a_mur_asset_that_cannot_exec_installs_nothing() {
         "the kernel's own refusal must reach the operator: {stderr}"
     );
     assert!(
-        stderr.contains("glibc 2.31"),
+        stderr.contains("glibc 2.34"),
         "the supported floor must be stated: {stderr}"
     );
     assert_eq!(
@@ -417,7 +417,7 @@ fn a_mur_asset_the_loader_refuses_installs_nothing_and_quotes_the_loader() {
         "the loader's own line must appear verbatim: {stderr}"
     );
     assert!(
-        stderr.contains("glibc 2.31"),
+        stderr.contains("glibc 2.34"),
         "the supported floor must be stated: {stderr}"
     );
     assert_eq!(

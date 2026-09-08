@@ -120,17 +120,66 @@ jobs:
       - name: WIT package versions are single-valued and documented
         run: ./scripts/check-wit-versions.sh
 
-  glibc-floor:
-    name: glibc-floor
+  glibc-floor-binary:
+    name: glibc-floor-binary
     runs-on: ubuntu-latest
+    # Builds at the same pinned target the release uses and reads the version needs off
+    # the resulting ELF, so what runs here is what ships. A source change can raise what
+    # the binary requires without touching the floor declaration at all -- which is how a
+    # glibc 2.34 symbol reached main under a declared floor of 2.31 -- so nothing that
+    # only reads declarations can stand in for this. No --floor override: comparing
+    # against anything but the declared floor proves nothing.
+    #
+    # Merge to main only. A warm-cache rebuild of both binaries at the pinned target
+    # measures ~6 minutes on a host faster than this runner, too much to spend on every
+    # push to every branch; on main it still fails within minutes of the merge that
+    # caused it, where the alternative is finding out at release.
+    if: github.event_name == 'push'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: The declared glibc floor matches the release image and what we tell operators
-        # Configuration only, so it needs no toolchain and no binary. The release
-        # runner's image changing under the build raises the glibc floor silently; this
-        # makes that arrive as a failing diff rather than as a published binary half the
-        # target distributions cannot exec.
-        run: ./scripts/check-glibc-floor.sh --config
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libseccomp
+        # Bounded separately from the job: a runner whose Azure mirror is unreachable leaves
+        # `apt-get update` failing over for tens of minutes, which reads as a cancelled job with
+        # no failing step rather than as the infrastructure hiccup it is.
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp-dev
+      - name: Install zig and cargo-zigbuild
+        # Pinned by hand rather than through a marketplace action: these two decide the
+        # glibc this build links against, so what runs here has to be readable in this
+        # file. Keep both versions in step with .github/workflows/release.yml, which
+        # builds the published assets the same way.
+        env:
+          ZIG_VERSION: 0.14.1
+          CARGO_ZIGBUILD_VERSION: 0.23.4
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o zig.tar.xz
+          mkdir -p "$HOME/.zig"
+          tar -xJf zig.tar.xz -C "$HOME/.zig" --strip-components=1
+          echo "$HOME/.zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
+      - name: Build both published binaries at the pinned target
+        # zig links against its own bundled glibc headers and stubs, which is what pins the
+        # floor -- but it also means its linker does not search the host's multiarch
+        # directory, and `-lseccomp` (from capsule-runtime, in both binaries) resolves
+        # nowhere without being told where to look. Naming the directory does not let the
+        # host's glibc back in: zig resolves libc from its own sysroot, and the version
+        # needs the gate reads two steps later are what proves it.
+        env:
+          RUSTFLAGS: "-L native=/usr/lib/x86_64-linux-gnu"
+        run: cargo zigbuild -p murmur-cli -p mur-roost --release --target x86_64-unknown-linux-gnu.2.34
+      - name: The built binaries require nothing above the floor
+        # cargo-zigbuild strips the glibc suffix before handing the target to cargo, so
+        # the binaries land under the unsuffixed triple's directory.
+        run: |
+          ./scripts/check-glibc-floor.sh \
+            target/x86_64-unknown-linux-gnu/release/mur \
+            target/x86_64-unknown-linux-gnu/release/mur-roost
 
   release-notes-cli:
     name: release-notes-cli

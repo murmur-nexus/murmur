@@ -23,7 +23,7 @@ The installer ships `mur-roost` beside `mur`, in the same directory and at the s
 curl -fsSL https://install.murmur.rs | sh
 ```
 
-The published Linux x86_64 binaries need glibc 2.31 or newer — Debian 11+, Ubuntu 20.04+, RHEL 9+.
+The published Linux x86_64 binaries need glibc 2.34 or newer — Debian 12+, Ubuntu 22.04+, RHEL 9+.
 The installer runs each binary once before putting it on your `PATH`, so a host that cannot start
 them is told so and left with whatever it already had. On an older distribution, build from source
 with `cargo install murmur-cli`.
