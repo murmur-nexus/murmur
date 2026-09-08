@@ -411,9 +411,8 @@ descriptors were opened, so no rule was ever taken on them and the capsule's own
 Landlock domain applies. That is also why `ls /` is refused, and why `/dev` and `/proc` hold nodes
 the capsule can open inside directories it cannot enumerate.
 
-A capsule has no business enumerating the root of the filesystem it runs in, so nothing here is
-planned to change. The [manual procedures](#verification) record live output from a real `sealed`
-host for each row above.
+Enumerating the root is refused; opening a path inside it is not. Read a file under `/usr` or
+`/etc` directly rather than listing the directory that holds it.
 
 ## Default-deny syscall allowlist { #default-deny-syscall-allowlist }
 
@@ -603,12 +602,9 @@ reads the file.
 `mur run --explain-scope` says the same thing under `Not protected here` on every session that
 composes no root, and `--explain-scope --json` carries it as `filesystem_boundary.not_protected`.
 
-**The rewrite is intended and is staying.** It exists so a capsule writing to `~` scribbles inside
-its own workdir instead of a real home directory, and it is unconditional so that one capsule
-behaves the same way on every tier — making it tier-dependent would change a capsule's behaviour
-for a reason that has nothing to do with containment. See
-[Lock down a capsule](../how-to/lock-down-capsule.md) for the environment the subprocess starts
-with.
+The rewrite is unconditional, so a capsule that writes to `~` writes inside its own workdir on
+every tier and every platform. See [Lock down a capsule](../how-to/lock-down-capsule.md) for the
+environment the subprocess starts with.
 
 ## Verification — how the containment claims are checked { #verification }
 

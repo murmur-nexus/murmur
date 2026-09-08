@@ -2795,9 +2795,22 @@ mod tests {
     /// rather than against a tier it assumes. `bash` reads the file with a redirect and tests its
     /// existence with `[[ -e ]]` — both are syscalls the shell makes itself, so nothing here needs
     /// a second binary on the exec allowlist.
+    ///
+    /// Driving `execute_shell` needs an egress network namespace, so it stands down where the host
+    /// withholds one rather than failing: a host that restricts unprivileged user namespaces
+    /// refuses the uid_map write every spawn goes through, whatever the filesystem tier.
     #[test]
     fn the_reported_restriction_matches_what_a_subprocess_actually_reaches() {
+        if crate::network_namespace::skip_without_egress_namespace(
+            "the_reported_restriction_matches_what_a_subprocess_actually_reaches",
+        ) {
+            return;
+        }
         if crate::sandbox::find_on_path("bash").is_none() {
+            eprintln!(
+                "[SKIP-HOST] the_reported_restriction_matches_what_a_subprocess_actually_reaches: \
+                 no bash on PATH"
+            );
             return;
         }
         let outside = tempfile::tempdir().expect("a temp directory outside the workdir");
