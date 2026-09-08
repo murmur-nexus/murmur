@@ -335,56 +335,44 @@ impl PreopenReport {
     }
 }
 
-/// What the achieved containment class restricts on the filesystem, as a stable wire name.
+/// What the filesystem mechanism this session installs restricts, as a stable wire name.
 ///
-/// Derived from [`ContainmentClass`] alone and never from the tier, so the
-/// `capabilities.filesystem.workdir_exec` cap that [`achieved_containment_class`] applies is
-/// honoured here without being restated.
+/// Keyed on [`crate::sandbox::applied_tier`] — the host tier capped by the declared containment
+/// floor, which is the same value [`crate::sandbox::ShellEnforcement::resolve`] installs the
+/// session's mechanisms from. The achieved containment class answers a different question ("what
+/// can this host back"), and a capsule declaring less than `sealed` on a sealed-capable host is
+/// where the two part company: it is reported `achieved: sealed` and runs Landlock-scoped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilesystemRestriction {
-    /// `advisory`: no kernel mechanism mediates the filesystem, so a path outside the workdir is
-    /// reachable.
+    /// No kernel mechanism mediates the filesystem, so a path outside the workdir is reachable.
     Advisory,
-    /// `scoped`: Landlock refuses the open, and the path outside the granted set still exists.
+    /// Landlock refuses the open, and the path outside the granted set still exists.
     Enforced,
-    /// `sealed`: a composed root, where the path outside the capsule is not there to open.
+    /// A composed root, where the path outside the capsule is not there to open.
     Absent,
 }
 
-impl FilesystemRestriction {
-    /// The wire name, identical to what [`Serialize`] emits.
-    #[must_use]
-    pub fn wire_name(self) -> &'static str {
-        match self {
-            Self::Advisory => "advisory",
-            Self::Enforced => "enforced",
-            Self::Absent => "absent",
-        }
-    }
-}
-
-/// What the achieved containment class does *not* protect, in words an operator can act on.
+/// What the filesystem mechanism this session installs does *not* protect, in words an operator
+/// can act on.
 ///
 /// The counterpart to every grant beside it in a [`ScopeReport`]: those say what the capsule may
-/// reach, and this says which of the restrictions an operator would read into the class are not
-/// there. A tier that protects nothing otherwise reads as protective, because `achieved: advisory`
-/// is a status word and the report carries no sentence saying what it costs.
+/// reach, and this says which of the restrictions an operator would read into them are not there.
 ///
-/// [`Self::not_protected`] is empty at [`ContainmentClass::Sealed`] and non-empty below it. It is
-/// serialized either way — an absent key identifies a runtime that predates the field, never a
+/// [`Self::not_protected`] is empty at [`FilesystemRestriction::Absent`] and non-empty below it. It
+/// is serialized either way — an absent key identifies a runtime that predates the field, never a
 /// capsule with nothing to disclaim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilesystemBoundaryReport {
-    /// What the achieved class restricts on the filesystem.
+    /// What the session's filesystem mechanism restricts.
     pub restriction: FilesystemRestriction,
     /// One statement per protection an operator would otherwise assume, empty at
-    /// [`ContainmentClass::Sealed`]. Rendered verbatim under `Not protected here`, so the JSON and
-    /// the human report cannot word the same disclaimer differently.
+    /// [`FilesystemRestriction::Absent`]. Rendered verbatim under `Not protected here`, so the JSON
+    /// and the human report cannot word the same disclaimer differently.
     pub not_protected: Vec<String>,
 }
 
-/// What `advisory` leaves unrestricted on the filesystem.
+/// What a session with no kernel filesystem mechanism leaves unrestricted.
 ///
 /// Names the mechanism rather than the class, because "advisory" is the word an operator has
 /// already read on the `achieved:` line and taken for a protection.
@@ -392,28 +380,26 @@ const ADVISORY_FILESYSTEM_NOT_PROTECTED: &str =
     "Filesystem restriction is advisory on this host: no kernel mechanism denies a read or a write \
      outside the session workdir, so capabilities.filesystem.scope bounds what the runtime hands a \
      subprocess rather than what that subprocess can reach. A Linux host with a usable Landlock \
-     ABI achieves scoped, where the kernel refuses the open.";
+     ABI installs a Landlock domain instead, where the kernel refuses the open.";
 
-/// What `scoped` leaves unrestricted on the filesystem.
+/// What a Landlock-scoped session leaves unrestricted.
 ///
-/// Deliberately not the `advisory` sentence: Landlock really does mediate the filesystem here, and
-/// an operator told otherwise goes and hardens something the kernel already holds. What `scoped`
-/// does not do is make a path absent — the property
-/// `docs/content/reference/containment.md` states as "Landlock mediates the operations that touch a
-/// file, not path resolution".
-const SCOPED_FILESYSTEM_NOT_PROTECTED: &str =
+/// Not the `advisory` sentence: Landlock really does mediate the filesystem here, and an operator
+/// told otherwise goes and hardens something the kernel already holds. What Landlock does not do is
+/// make a path absent — it mediates the operations that touch a file, not path resolution.
+const ENFORCED_FILESYSTEM_NOT_PROTECTED: &str =
     "A path outside the granted set is denied rather than absent: Landlock refuses the open, and \
      stat, access and readlink on that path still succeed and still report the real file's \
      metadata, because Landlock mediates the operations that touch a file and not path resolution. \
      A probe that only asks whether a path exists therefore learns nothing about what was denied — \
-     read the file to see the refusal.";
+     read the file to see the refusal. Declaring capabilities.containment: sealed on a host that \
+     reaches the sealed tier composes a root the path is not in at all.";
 
-/// What no tier protects, and the reason `--explain-scope` carries this block at all.
+/// What no mechanism protects, and the reason `--explain-scope` carries this block at all.
 ///
-/// Identical at every achieved class below `sealed`, because the rewrite it describes is identical:
-/// `HOME` is replaced with the session's synthetic home on every tier and every platform (see
-/// `crate::shell`), so the obvious `~`-based containment probe answers *no such file* on a host
-/// that denies nothing.
+/// Identical wherever it prints, because the rewrite it describes is identical: `HOME` is replaced
+/// with the session's synthetic home on every tier and every platform (see `crate::shell`), so the
+/// obvious `~`-based containment probe answers *no such file* on a host that denies nothing.
 const PATH_REWRITING_NOT_PROTECTED: &str =
     "Path rewriting is a convenience, not a boundary: HOME is set to <workdir>/.capsule-home on \
      every tier, so `cat ~/.ssh/id_rsa` answers \"No such file or directory\" whether or not \
@@ -421,26 +407,32 @@ const PATH_REWRITING_NOT_PROTECTED: &str =
      for. A ~-based probe is therefore never evidence of containment; test with an absolute path \
      to a real file outside the workdir instead.";
 
-/// The filesystem boundary an `achieved` class actually provides, and the protections it does not.
+/// The filesystem boundary the tier a session applies actually provides, and the protections it
+/// does not.
 ///
-/// Pure and derived from the achieved class alone, so `--explain-scope` and
+/// Pure and derived from the applied tier alone, so `--explain-scope` and
 /// `session_start.effective_grants` cannot word the same disclaimer differently: both go through
-/// [`scope_report_for_tier`], which calls this once with the class it has already computed.
-#[must_use]
-pub fn filesystem_boundary(achieved: ContainmentClass) -> FilesystemBoundaryReport {
-    // The path-rewriting statement rides along with the class-specific one rather than standing on
-    // its own, so `sealed` — where a composed root makes the paths outside it absent, and the `~`
-    // rewrite lands inside the only writable path in that root — discloses nothing at all.
-    let (restriction, filesystem) = match achieved {
-        ContainmentClass::Advisory => (
+/// [`scope_report_for_tier`], which calls this once with the tier it has already resolved.
+///
+/// The argument is the *applied* tier, never the host tier and never the achieved class. A composed
+/// root is what makes a host path absent, and a session composes one only when the host reaches
+/// `KernelSealed` **and** the capsule declared a `sealed` floor; a Landlock domain is installed
+/// whenever the applied tier is `KernelFull` or `KernelSealed`, including for a capsule whose
+/// `capabilities.filesystem.workdir_exec` caps its achieved class at `advisory`.
+pub(crate) fn filesystem_boundary(applied: EnforcementTier) -> FilesystemBoundaryReport {
+    // The path-rewriting statement rides along with the mechanism-specific one rather than standing
+    // on its own, so a composed root — where the paths outside it are absent, and the `~` rewrite
+    // lands inside the only writable path in that root — discloses nothing at all.
+    let (restriction, filesystem) = match applied {
+        EnforcementTier::KernelSealed => (FilesystemRestriction::Absent, None),
+        EnforcementTier::KernelFull => (
+            FilesystemRestriction::Enforced,
+            Some(ENFORCED_FILESYSTEM_NOT_PROTECTED),
+        ),
+        EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => (
             FilesystemRestriction::Advisory,
             Some(ADVISORY_FILESYSTEM_NOT_PROTECTED),
         ),
-        ContainmentClass::Scoped => (
-            FilesystemRestriction::Enforced,
-            Some(SCOPED_FILESYSTEM_NOT_PROTECTED),
-        ),
-        ContainmentClass::Sealed => (FilesystemRestriction::Absent, None),
     };
 
     let not_protected = match filesystem {
@@ -642,18 +634,19 @@ pub struct ScopeReport {
     /// no launch — `io.max` is the one non-fatal cgroup limit — so this field is the only place
     /// the shortfall appears.
     pub io_max: IoMaxReport,
-    /// What the achieved containment class does not restrict on the filesystem — the block
-    /// `--explain-scope` prints as `Not protected here`, directly under `Containment`.
+    /// What this session's filesystem mechanism does not restrict — the block `--explain-scope`
+    /// prints as `Not protected here`, directly under `Containment`.
     ///
     /// Always serialized (never skipped), on the same terms as [`Self::state_stores`]: an absent
     /// key identifies a runtime that predates the field, and an empty
     /// [`FilesystemBoundaryReport::not_protected`] identifies a session with nothing to disclaim.
     ///
-    /// Derived from [`Self::achieved_containment`] and from no [`CapabilityPolicy`] field, in
-    /// [`filesystem_boundary`], which is why it stands beside the grants rather than among them:
-    /// it qualifies every one of them at once, on the terms [`render_read_only`] sets one field
-    /// over — a protection stated without its qualification reads as a boundary the capsule does
-    /// not have.
+    /// Derived in [`filesystem_boundary`] from [`crate::sandbox::applied_tier`] — the same value
+    /// [`Self::runtime_writes`] is keyed on — and from no [`CapabilityPolicy`] field. Not from
+    /// [`Self::achieved_containment`], which reports the class this *host* can back: a capsule
+    /// declaring less than `sealed` on a sealed-capable host reads `achieved: sealed` and composes
+    /// no root, so a boundary keyed on the class would report an absence the capsule does not have.
+    /// It stands beside the grants rather than among them because it qualifies every one at once.
     pub filesystem_boundary: FilesystemBoundaryReport,
 }
 
@@ -835,8 +828,8 @@ pub fn render_read_only(read_only_paths: &[String], advisory_for: &[String]) -> 
 /// The `Not protected here` block: one line per statement in
 /// [`FilesystemBoundaryReport::not_protected`], and nothing at all when that list is empty.
 ///
-/// A heading with no entries under it would read as a disclaimer the reader had to interpret, so
-/// `sealed` prints no heading rather than an empty one. Every line is a statement from the report
+/// A heading with no entries under it would read as a disclaimer the reader had to interpret, so a
+/// composed root prints no heading rather than an empty one. Every line is a statement from the report
 /// verbatim, so the human rendering and `--explain-scope --json` say the same thing in the same
 /// words.
 fn render_not_protected(boundary: &FilesystemBoundaryReport) -> String {
@@ -911,6 +904,11 @@ pub(crate) fn scope_report_for_tier(
     io_max: IoMaxReport,
 ) -> ScopeReport {
     let achieved = achieved_containment_class(tier, policy.workdir_exec_allowed);
+    // The tier this session would actually install: the host reading `enforcement_tier`
+    // reports, capped by the declared floor, which is the same `sandbox::applied_tier`
+    // `ShellEnforcement::resolve` runs. Two fields below are keyed on it rather than on
+    // `achieved`, because both describe mechanisms rather than the class this host can back.
+    let applied = crate::sandbox::applied_tier(tier, declared);
     let shortfall_reason = containment_shortfall_reason(
         declared,
         achieved,
@@ -979,25 +977,20 @@ pub(crate) fn scope_report_for_tier(
                 )
             })
             .collect(),
-        // Keyed on the tier this session would actually install, which is the host reading
-        // `enforcement_tier` reports capped by the declared floor — the same
-        // `sandbox::applied_tier` `ShellEnforcement::resolve` runs. A capsule declaring `scoped`
-        // on a sealed-capable host composes no root and writes no `/tmp` store, so a declaration
-        // keyed on the bare host tier would name two directories that never appear. Nothing here
-        // touches the filesystem: `--explain-scope` returns before a workdir exists, and a
-        // diagnostic that created the directory it describes would be answering a question it had
-        // changed.
-        runtime_writes: crate::workdir_writes::runtime_writes(crate::sandbox::applied_tier(
-            tier, declared,
-        )),
+        // A capsule declaring `scoped` on a sealed-capable host composes no root and writes no
+        // `/tmp` store, so a declaration keyed on the bare host tier would name two directories
+        // that never appear. Nothing here touches the filesystem: `--explain-scope` returns before
+        // a workdir exists, and a diagnostic that created the directory it describes would be
+        // answering a question it had changed.
+        runtime_writes: crate::workdir_writes::runtime_writes(applied),
         // Established by performing the `io.max` write, never inferred: `prepare_scope` fills it
         // at launch and `cgroup::probe_io_max` fills it under `--explain-scope`. Like every field
         // above it, it reaches no class and no floor.
         io_max,
-        // Derived here, from the `achieved` class already computed above, rather than filled by
+        // Derived here, from the `applied` tier already resolved above, rather than filled by
         // either caller: `--explain-scope --json` and `session_start.effective_grants` are the
         // same object, and a field either of them worded for itself would make them differ.
-        filesystem_boundary: filesystem_boundary(achieved),
+        filesystem_boundary: filesystem_boundary(applied),
     }
 }
 
@@ -2560,12 +2553,12 @@ mod tests {
         }
     }
 
-    /// A report at `tier`, off [`sample_policy`] with `advisory` declared, so the achieved class
-    /// is the only thing that varies between the cases below.
-    fn boundary_report_for_tier(tier: EnforcementTier) -> ScopeReport {
+    /// A report off [`sample_policy`] at a chosen host tier and declared floor, so the mechanism
+    /// this session would install is the only thing that varies between the cases below.
+    fn boundary_report(declared: ContainmentClass, tier: EnforcementTier) -> ScopeReport {
         scope_report_for_tier(
             &sample_policy(),
-            ContainmentClass::Advisory,
+            declared,
             tier,
             None,
             None,
@@ -2577,10 +2570,10 @@ mod tests {
         )
     }
 
-    /// A tier that mediates nothing says so, in the block an operator reads before the grants.
+    /// A host that mediates nothing says so, in the block an operator reads before the grants.
     #[test]
-    fn an_advisory_class_reports_what_it_does_not_protect() {
-        let report = boundary_report_for_tier(EnforcementTier::EnvironmentOnly);
+    fn a_session_with_no_kernel_mechanism_reports_what_it_does_not_protect() {
+        let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::EnvironmentOnly);
 
         assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
         assert_eq!(
@@ -2603,7 +2596,7 @@ mod tests {
         let rendered = report.render();
         let heading = rendered
             .find("\nNot protected here\n")
-            .expect("a tier below sealed prints the block");
+            .expect("a session that composes no root prints the block");
         assert!(
             heading > rendered.find("Containment\n").unwrap(),
             "the block belongs under Containment:\n{rendered}"
@@ -2617,12 +2610,11 @@ mod tests {
         }
     }
 
-    /// `scoped` really does mediate the filesystem, so its statement says what `scoped` leaves
-    /// open rather than repeating `advisory`'s. Sending an operator to harden a boundary the
-    /// kernel already holds is the same class of untruth this block exists to remove.
+    /// A Landlock domain really does mediate the filesystem, so its statement says what Landlock
+    /// leaves open rather than repeating the advisory one.
     #[test]
-    fn a_scoped_class_reports_denial_rather_than_absence() {
-        let report = boundary_report_for_tier(EnforcementTier::KernelFull);
+    fn a_landlock_session_reports_denial_rather_than_absence() {
+        let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelFull);
 
         assert_eq!(report.achieved_containment, ContainmentClass::Scoped);
         assert_eq!(
@@ -2634,7 +2626,7 @@ mod tests {
         let filesystem = &report.filesystem_boundary.not_protected[0];
         assert!(
             !filesystem.contains("advisory"),
-            "Landlock mediates the filesystem at scoped: {filesystem}"
+            "Landlock mediates the filesystem here: {filesystem}"
         );
         assert!(
             filesystem.contains("denied rather than absent"),
@@ -2645,16 +2637,45 @@ mod tests {
         }
     }
 
-    /// The half of the block that is genuinely tier-independent: `HOME` is rewritten on every
-    /// tier, so the statement about it is one string, not one per class.
+    /// A capsule that declares less than `sealed` composes no root on a sealed-capable host: it
+    /// runs Landlock-scoped, and the block must say so rather than claim the paths outside its
+    /// grants are absent. This is the configuration `achieved_containment` cannot distinguish —
+    /// it reads `sealed` on both sides of this test.
     #[test]
-    fn the_path_rewriting_statement_is_identical_at_every_class_that_carries_it() {
-        let advisory = boundary_report_for_tier(EnforcementTier::EnvironmentOnly);
-        let scoped = boundary_report_for_tier(EnforcementTier::KernelFull);
+    fn a_sealed_capable_host_still_discloses_landlock_for_a_capsule_that_declared_less() {
+        let report = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelSealed);
+
+        assert_eq!(
+            report.achieved_containment,
+            ContainmentClass::Sealed,
+            "the host can back sealed, which is what `achieved` answers"
+        );
+        assert_eq!(
+            report.filesystem_boundary.restriction,
+            FilesystemRestriction::Enforced,
+            "no composed root is installed for a capsule that did not declare one"
+        );
+        assert_eq!(
+            report.filesystem_boundary.not_protected,
+            boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelFull)
+                .filesystem_boundary
+                .not_protected,
+            "the same mechanism gets the same statements on either host"
+        );
+        assert!(report.render().contains("Not protected here"));
+    }
+
+    /// The half of the block that is genuinely mechanism-independent: `HOME` is rewritten on every
+    /// tier, so the statement about it is one string, not one per mechanism.
+    #[test]
+    fn the_path_rewriting_statement_is_identical_wherever_it_is_carried() {
+        let advisory =
+            boundary_report(ContainmentClass::Advisory, EnforcementTier::EnvironmentOnly);
+        let enforced = boundary_report(ContainmentClass::Advisory, EnforcementTier::KernelFull);
 
         assert_eq!(
             advisory.filesystem_boundary.not_protected[1],
-            scoped.filesystem_boundary.not_protected[1]
+            enforced.filesystem_boundary.not_protected[1]
         );
         assert!(
             advisory.filesystem_boundary.not_protected[1]
@@ -2663,11 +2684,11 @@ mod tests {
         );
     }
 
-    /// `sealed` prints no heading — not a heading with an empty list under it — and still carries
-    /// the key, because an absent key must identify a runtime that predates the field.
+    /// A composed root prints no heading — not a heading with an empty list under it — and still
+    /// carries the key, because an absent key must identify a runtime that predates the field.
     #[test]
-    fn a_sealed_class_carries_the_key_with_nothing_to_disclaim() {
-        let report = boundary_report_for_tier(EnforcementTier::KernelSealed);
+    fn a_composed_root_carries_the_key_with_nothing_to_disclaim() {
+        let report = boundary_report(ContainmentClass::Sealed, EnforcementTier::KernelSealed);
 
         assert_eq!(report.achieved_containment, ContainmentClass::Sealed);
         assert_eq!(
@@ -2686,15 +2707,15 @@ mod tests {
         assert_eq!(
             json["filesystem_boundary"]["not_protected"],
             serde_json::json!([]),
-            "the key is present and empty at sealed, never absent"
+            "the key is present and empty at absent, never missing"
         );
     }
 
-    /// The block follows the achieved class rather than the tier, which is what makes the
-    /// `workdir_exec` cap apply to it without being restated: a capsule that declared an
-    /// executable workdir achieves `advisory` on a sealed-capable host, and gets the block there.
+    /// `capabilities.filesystem.workdir_exec` caps the achieved *class* at `advisory` and leaves
+    /// the *mechanism* alone: Landlock is still installed, so the block prints the Landlock
+    /// statement rather than claiming the host denies nothing.
     #[test]
-    fn workdir_exec_gets_the_block_on_a_sealed_capable_host() {
+    fn workdir_exec_caps_the_class_without_changing_the_mechanism() {
         let policy = CapabilityPolicy {
             workdir_exec_allowed: true,
             ..CapabilityPolicy::default()
@@ -2720,39 +2741,123 @@ mod tests {
         assert_eq!(report.achieved_containment, ContainmentClass::Advisory);
         assert_eq!(
             report.filesystem_boundary.restriction,
-            FilesystemRestriction::Advisory
+            FilesystemRestriction::Enforced
         );
         assert_eq!(report.filesystem_boundary.not_protected.len(), 2);
         assert!(report.render().contains("Not protected here"));
     }
 
-    /// Every class produces a `restriction` that agrees with the class itself, so a consumer can
-    /// read either field and reach the same conclusion.
+    /// The restriction follows the tier the session applies, at every combination of host tier and
+    /// declared floor — which is what `runtime_writes` beside it is already keyed on.
     #[test]
-    fn the_restriction_agrees_with_the_achieved_class_at_every_tier() {
+    fn the_restriction_follows_the_tier_the_session_would_install() {
         for tier in ALL_TIERS {
-            let report = boundary_report_for_tier(*tier);
-            let expected = match report.achieved_containment {
-                ContainmentClass::Advisory => FilesystemRestriction::Advisory,
-                ContainmentClass::Scoped => FilesystemRestriction::Enforced,
-                ContainmentClass::Sealed => FilesystemRestriction::Absent,
+            for declared in [
+                ContainmentClass::Advisory,
+                ContainmentClass::Scoped,
+                ContainmentClass::Sealed,
+            ] {
+                let report = boundary_report(declared, *tier);
+                let expected = match crate::sandbox::applied_tier(*tier, declared) {
+                    EnforcementTier::KernelSealed => FilesystemRestriction::Absent,
+                    EnforcementTier::KernelFull => FilesystemRestriction::Enforced,
+                    EnforcementTier::KernelSeccompOnly | EnforcementTier::EnvironmentOnly => {
+                        FilesystemRestriction::Advisory
+                    }
+                };
+                assert_eq!(
+                    report.filesystem_boundary.restriction, expected,
+                    "{tier:?} / {declared:?}"
+                );
+                assert_eq!(
+                    report.filesystem_boundary.not_protected.is_empty(),
+                    expected == FilesystemRestriction::Absent,
+                    "{tier:?} / {declared:?}"
+                );
+                let wire = match expected {
+                    FilesystemRestriction::Advisory => "advisory",
+                    FilesystemRestriction::Enforced => "enforced",
+                    FilesystemRestriction::Absent => "absent",
+                };
+                assert_eq!(
+                    serde_json::to_value(report.filesystem_boundary.restriction).unwrap(),
+                    serde_json::Value::String(wire.to_string())
+                );
+            }
+        }
+    }
+
+    /// The one assertion the report cannot satisfy by agreeing with itself: what a subprocess in a
+    /// real session actually gets back when it probes a host file outside its workdir, compared
+    /// against the `restriction` the report prints for that same session.
+    ///
+    /// Runs on whatever tier this host reaches, and asserts against the restriction it observes
+    /// rather than against a tier it assumes. `bash` reads the file with a redirect and tests its
+    /// existence with `[[ -e ]]` — both are syscalls the shell makes itself, so nothing here needs
+    /// a second binary on the exec allowlist.
+    #[test]
+    fn the_reported_restriction_matches_what_a_subprocess_actually_reaches() {
+        if crate::sandbox::find_on_path("bash").is_none() {
+            return;
+        }
+        let outside = tempfile::tempdir().expect("a temp directory outside the workdir");
+        let secret = outside.path().join("host-file");
+        std::fs::write(&secret, "PROBE-CONTENTS\n").unwrap();
+        let secret = secret.to_str().unwrap().to_string();
+
+        for declared in [ContainmentClass::Advisory, ContainmentClass::Sealed] {
+            let workdir = tempfile::tempdir().unwrap();
+            let policy = CapabilityPolicy {
+                shell_allow: vec!["bash".to_string()],
+                ..CapabilityPolicy::default()
             };
-            assert_eq!(report.filesystem_boundary.restriction, expected, "{tier:?}");
-            assert_eq!(
-                report.filesystem_boundary.not_protected.is_empty(),
-                report.achieved_containment == ContainmentClass::Sealed,
-                "{tier:?}"
+            let probe = crate::sandbox::HostProbe::probe();
+            let enforcement =
+                crate::sandbox::ShellEnforcement::resolve(&policy, declared, probe).unwrap();
+            let report = scope_report_for_tier(
+                &policy,
+                declared,
+                probe.tier(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                IoMaxReport::default(),
             );
-            assert_eq!(
-                serde_json::to_value(report.filesystem_boundary.restriction).unwrap(),
-                serde_json::Value::String(
-                    report
-                        .filesystem_boundary
-                        .restriction
-                        .wire_name()
-                        .to_string()
-                )
+
+            let command = format!(
+                "if read -r line < '{secret}' 2>/dev/null; then echo \"read=$line\"; \
+                 else echo read=refused; fi; \
+                 if [[ -e '{secret}' ]]; then echo exists=yes; else echo exists=no; fi"
             );
+            let result = crate::shell::execute_shell(
+                "bash",
+                &["-c", &command],
+                &[],
+                workdir.path(),
+                workdir.path(),
+                &policy,
+                &enforcement,
+            )
+            .unwrap_or_else(|error| panic!("declared {declared:?}: {error}"));
+            let seen = result.stdout;
+
+            match report.filesystem_boundary.restriction {
+                FilesystemRestriction::Advisory => assert!(
+                    seen.contains("read=PROBE-CONTENTS"),
+                    "reported advisory, so nothing denies the read: {seen}"
+                ),
+                FilesystemRestriction::Enforced => assert!(
+                    seen.contains("read=refused") && seen.contains("exists=yes"),
+                    "reported enforced, so the read is denied and the path still exists: {seen}"
+                ),
+                FilesystemRestriction::Absent => assert!(
+                    seen.contains("read=refused") && seen.contains("exists=no"),
+                    "reported absent, so the path is not in the composed root: {seen}"
+                ),
+            }
         }
     }
 

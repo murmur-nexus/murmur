@@ -377,8 +377,9 @@ manifest with a very tight `max_open_files` may need to raise it.
 
 ## What the composed root contains { #composed-root-listability }
 
-A `sealed` capsule runs inside a fresh `tmpfs` the runtime populates and then `pivot_root`s onto. It
-holds exactly what the sections above put there, and every other path is absent:
+A capsule that declares [`capabilities.containment: sealed`](#field-containment) on a host that
+reaches the Sealed tier runs inside a fresh `tmpfs` the runtime populates and then `pivot_root`s
+onto. It holds exactly what the sections above put there, and every other path is absent:
 
 | Path | What it is | `ls` |
 |---|---|---|
@@ -576,11 +577,21 @@ $ cat /home/you/.ssh/id_rsa
 cat: /home/you/.ssh/id_rsa: Permission denied
 ```
 
-| Class | What the probe above prints |
+`mur run --explain-scope --json` names the answer to expect, as `filesystem_boundary.restriction`:
+
+| `filesystem_boundary.restriction` | What the probe above prints |
 |---|---|
-| `advisory` | The file's contents. Nothing on the host denies the read |
-| `scoped` | `Permission denied` — Landlock refuses the open, and `stat` on the same path still succeeds |
-| `sealed` | `No such file or directory` — the path is not in the composed root |
+| `advisory` | The file's contents. No kernel mechanism mediates the filesystem |
+| `enforced` | `Permission denied` — Landlock refuses the open, and `stat` on the same path still succeeds |
+| `absent` | `No such file or directory` — the path is not in the composed root |
+
+Read `filesystem_boundary.restriction` rather than `achieved_containment`. The achieved class is
+what this **host** can back; the restriction is the mechanism this **session** installs, and the two
+part company on a sealed-capable host running a capsule that declared less than `sealed`. A composed
+root is built only for a session that asked for one — through
+[`capabilities.containment: sealed`](#field-containment) or `mur run --containment sealed` — so a
+capsule that declares nothing reads `achieved: sealed` and `restriction: enforced`, and its probe
+gets `Permission denied` rather than `No such file or directory`.
 
 **The `~` form returns a false pass.** `cat ~/.ssh/id_rsa` answers `No such file or directory` on
 every tier, including a host that denies nothing. The tilde resolves through `HOME`, which the
@@ -589,8 +600,8 @@ inside the workdir and the host path was never opened. The answer reports where 
 what was denied. This holds on macOS too, which reaches `advisory` — the same absolute path there
 reads the file.
 
-`mur run --explain-scope` says the same thing on any host below `sealed`, under `Not protected
-here`, and `--explain-scope --json` carries it as `filesystem_boundary`.
+`mur run --explain-scope` says the same thing under `Not protected here` on every session that
+composes no root, and `--explain-scope --json` carries it as `filesystem_boundary.not_protected`.
 
 **The rewrite is intended and is staying.** It exists so a capsule writing to `~` scribbles inside
 its own workdir instead of a real home directory, and it is unconditional so that one capsule
