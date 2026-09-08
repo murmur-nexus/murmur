@@ -8,8 +8,8 @@
 # the release's checksums.txt, runs each binary once, and installs `mur` and `mur-roost`
 # onto PATH.
 #
-# The published linux-x86_64 binaries require glibc 2.31 or newer: Debian 11+, Ubuntu
-# 20.04+, RHEL 9+. On an older host, build from source with `cargo install murmur-cli`.
+# The published linux-x86_64 binaries require glibc 2.34 or newer: Debian 12+, Ubuntu
+# 22.04+, RHEL 9+. On an older host, build from source with `cargo install murmur-cli`.
 # Nothing is installed unless it runs here — a binary this host's loader refuses leaves
 # no `mur` on PATH and no previous install disturbed.
 #
@@ -28,7 +28,7 @@ CHECKSUMS_FILE="checksums.txt"
 # whoever a binary refused to start for. Declared in scripts/lib/glibc-floor.sh and
 # enforced over every asset at release time by scripts/check-glibc-floor.sh; this copy
 # is checked against that declaration by `scripts/check-glibc-floor.sh --config`.
-SUPPORTED_GLIBC="2.31"
+SUPPORTED_GLIBC="2.34"
 
 # AppArmor profile that lets `mur` create an unprivileged user namespace, which is
 # what `capabilities.containment: sealed` and every capsule's own network namespace
@@ -305,7 +305,7 @@ verify_runs() {
 
 $(cat "$_stderr_file" 2>/dev/null)
 
-The published linux-x86_64 binaries require glibc ${SUPPORTED_GLIBC} or newer (Debian 11+, Ubuntu 20.04+, RHEL 9+), the shared libraries mur links (libseccomp.so.2), and a matching CPU architecture. Nothing was installed and no existing install was changed. On a host older than that, build from source with \`cargo install murmur-cli\`."
+The published linux-x86_64 binaries require glibc ${SUPPORTED_GLIBC} or newer (Debian 12+, Ubuntu 22.04+, RHEL 9+), the shared libraries mur links (libseccomp.so.2), and a matching CPU architecture. Nothing was installed and no existing install was changed. On a host older than that, build from source with \`cargo install murmur-cli\`."
 }
 
 # ---------------------------------------------------------------- apparmor

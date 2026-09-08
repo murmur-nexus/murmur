@@ -9,21 +9,21 @@
 # The floor is a release promise: a published `linux-x86_64` binary must start on
 # every host whose glibc is at least GLIBC_FLOOR. Nothing in the toolchain holds
 # that promise on its own. A dynamically linked binary requires whatever versioned
-# symbols the glibc that built it offered, so without a pinned build image the
-# floor is silently whatever the release runner ships, and a runner image moving
-# raises it with no build failure anywhere.
+# symbols the glibc that built it offered, so without a pinned build the floor is
+# silently whatever the release runner ships, and a runner image moving raises it
+# with no build failure anywhere.
 #
 # Two declarations hold the promise, and they only mean anything together:
 #
-#   GLIBC_FLOOR        the highest GLIBC_x.y a published binary may require
-#   GLIBC_FLOOR_IMAGE  the build image whose glibc *is* that floor
+#   GLIBC_FLOOR         the highest GLIBC_x.y a published binary may require
+#   GLIBC_FLOOR_TARGET  the build target whose pinned glibc *is* that floor
 #
-# Moving the floor is a deliberate act with four edits: both variables here, the
-# `### Install` section of README.md, and the header of scripts/install.sh — the
-# two surfaces that state the floor to the person installing. Those two are
-# machine-checked against this file by `scripts/check-glibc-floor.sh --config`,
-# so a floor that moves in one place and not the others fails CI rather than
-# reaching an operator as a wrong promise.
+# Moving the floor is a deliberate act with five edits: both variables here, the
+# `### Install` section of README.md, the header of scripts/install.sh, and
+# docs/content/reference/roost-api.md — the three surfaces that state the floor to
+# the person installing. Those three are machine-checked against this file by
+# `scripts/check-glibc-floor.sh --config`, so a floor that moves in one place and
+# not the others fails CI rather than reaching an operator as a wrong promise.
 #
 # Contract for a sourcer:
 #
@@ -32,29 +32,39 @@
 #     somewhere other than the repository root prefixes them itself.
 #   * `glibc_reader` must be called before any function that reads an ELF.
 
-# The floor itself. Debian 11 (bullseye) and Ubuntu 20.04 both ship glibc 2.31,
-# and RHEL 9 ships 2.34 — so this one number covers every distribution named in
-# GLIBC_FLOOR_DISTROS. Ubuntu 18.04 (2.27) and Debian 10 (2.28) are below it and
-# are deliberately not covered: `cargo install murmur-cli` is the path there.
-GLIBC_FLOOR="2.31"
+# The floor itself. RHEL 9 ships glibc 2.34, Ubuntu 22.04 ships 2.35 and Debian 12
+# ships 2.36, so this one number covers every distribution named in
+# GLIBC_FLOOR_DISTROS. It is not a policy choice about how far back to reach: the
+# binary has required 2.34 since `mark_inherited_fds_cloexec` in
+# crates/capsule-runtime/src/sandbox.rs started calling `libc::close_range`, whose
+# glibc wrapper landed in 2.34. Anything below this number cannot link that call.
+# `cargo install murmur-cli` is the path on an older host.
+GLIBC_FLOOR="2.34"
 
-# The image that produces exactly that floor. Bullseye's glibc *is* 2.31, so a
-# binary built in it cannot require anything above the floor by construction —
-# the gate is then a check on the build staying where it is, not a check the
-# build could otherwise fail. Its libseccomp is 2.5.1, which clears the
-# `libseccomp` crate's documented 2.5.0 minimum.
-GLIBC_FLOOR_IMAGE="debian:bullseye"
+# The build target that produces exactly that floor. The `.2.34` suffix is a
+# cargo-zigbuild glibc pin: zig's linker emits version needs against that glibc
+# and no higher, so a binary built at this target cannot exceed the floor by
+# construction, and the gate is then a check on the pin staying in place rather
+# than a check the build could otherwise fail.
+#
+# A target rather than a container image, deliberately. An image states the floor
+# only for as long as its distribution is supported: once the archive stops
+# serving a fresh Release file, the build's own dependency install fails before a
+# compiler exists, and the floor expires with the image. A pinned target states
+# the floor as a fact about the artifact and depends on no support calendar.
+GLIBC_FLOOR_TARGET="x86_64-unknown-linux-gnu.2.34"
 
-# The distributions the floor covers, in the words the README and the installer
-# use. Stated here so the gate's failure message and the operator-facing surfaces
-# describe the same promise.
-GLIBC_FLOOR_DISTROS="Debian 11+, Ubuntu 20.04+, RHEL 9+"
+# The distributions the floor covers, in the words the README, the docs and the
+# installer use. Stated here so the gate's failure message and the operator-facing
+# surfaces describe the same promise.
+GLIBC_FLOOR_DISTROS="Debian 12+, Ubuntu 22.04+, RHEL 9+"
 
-# The three files whose statement of the floor must agree with the two
-# declarations above; see `scripts/check-glibc-floor.sh --config`. Repo-relative.
+# The four files whose statement of the floor must agree with the two declarations
+# above; see `scripts/check-glibc-floor.sh --config`. Repo-relative.
 GLIBC_FLOOR_WORKFLOW=".github/workflows/release.yml"
 GLIBC_FLOOR_README="README.md"
 GLIBC_FLOOR_INSTALLER="scripts/install.sh"
+GLIBC_FLOOR_DOCS="docs/content/reference/roost-api.md"
 
 # This file, for a message that has to say where the floor is changed.
 GLIBC_FLOOR_LIB="scripts/lib/glibc-floor.sh"
@@ -127,7 +137,7 @@ glibc_symbols_requiring() {
 #
 # True when version `a` is strictly above version `b`. `sort -V` is the
 # comparator because these are dotted versions, not numbers and not strings: it
-# is the only ordering that puts 2.4 below 2.10 and 2.10 below 2.31.
+# is the only ordering that puts 2.4 below 2.10 and 2.10 below 2.34.
 glibc_version_gt() {
     [ "$1" != "$2" ] || return 1
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
