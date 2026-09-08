@@ -4050,17 +4050,16 @@ mod tests {
         );
     }
 
-    /// `mark_inherited_fds_cloexec` reaches `close_range` through `libc::syscall` rather than the
-    /// gnu-only libc wrapper of the same name, so its failure convention is the raw one: `-1` with
-    /// `errno` set. That convention is what turns a kernel that rejects the call into a failed
-    /// `Command::spawn()` rather than a spawn that silently runs without fd hygiene.
+    /// `mark_inherited_fds_cloexec` reaches `close_range` through `libc::syscall`, so its failure
+    /// convention is the raw one: `-1` with `errno` set. That convention is what turns a kernel
+    /// that rejects the call into a failed `Command::spawn()` rather than a spawn that silently
+    /// runs without fd hygiene.
     ///
     /// The rejection is provoked with an all-bits-set flag word, which the kernel refuses during
     /// argument validation before it touches any descriptor — so this exercises the errno path
-    /// without closing or flagging a single fd of the test process. It stands in for the
-    /// pre-5.11-kernel case that cannot be run here — see the **Kernel range narrowing**
-    /// paragraph on `mark_inherited_fds_cloexec` — where the kernel picks a different errno but
-    /// the identical `-1`-and-`errno` convention.
+    /// without closing or flagging a single fd of the test process. A kernel older than 5.11
+    /// rejects the production call with a different errno and the identical convention — see the
+    /// **Kernel range narrowing** paragraph on `mark_inherited_fds_cloexec`.
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
     #[test]
