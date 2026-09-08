@@ -1,3 +1,4 @@
+mod allocator;
 mod beta;
 mod commands;
 mod config;

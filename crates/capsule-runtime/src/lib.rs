@@ -5,6 +5,8 @@
 
 pub(crate) mod a2a;
 pub(crate) mod agent;
+#[cfg(feature = "alloc-bench")]
+pub mod alloc_bench;
 pub mod artifact;
 pub mod artifact_config;
 pub mod bindings;
