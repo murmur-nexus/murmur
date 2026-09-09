@@ -21,8 +21,8 @@
 #
 #   scripts/alloc-bench.sh [--cpu <n>] [--rounds <n>] [--compiles <n>] [--stores <n>]
 #
-# Takes roughly ten minutes with the defaults. Output is a markdown table plus the host facts
-# the decision record has to carry.
+# Takes roughly ten minutes with the defaults on a warm target tree. Output is a markdown
+# table plus the host facts a comparison has to be read against.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -38,7 +38,9 @@ while [ $# -gt 0 ]; do
     --rounds) ROUNDS="$2"; shift 2 ;;
     --compiles) COMPILES="$2"; shift 2 ;;
     --stores) STORES="$2"; shift 2 ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    # Everything between the shebang and the first line of code, so the header stays the
+    # single copy of the usage text however far it grows.
+    -h|--help) awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

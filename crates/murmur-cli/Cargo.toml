@@ -42,8 +42,9 @@ log = { version = "0.4", default-features = false, features = ["release_max_leve
 serde_json = "1"
 serde_yaml = "0.9"
 # Candidate global allocators, one selected by the `jemalloc`/`mimalloc` features below and
-# declared in `src/allocator.rs`. Both build C sources, so a host compiling `mur` with either
-# feature on needs `cc`, `make` and `ar` on PATH.
+# declared in `src/allocator.rs`. Both build C sources; `cc` and `ar` are already needed by
+# `ring` and `wasmtime` in every build, but jemalloc runs its own `configure` and `make`, so
+# the `jemalloc` feature additionally needs `make` on PATH.
 # `default-features = false` drops `background_threads_runtime_support`, which builds jemalloc
 # with background threads compiled out rather than merely defaulted off. A background thread
 # would be counted by `resources::uid_task_count()` against the `RLIMIT_NPROC` baseline and
@@ -66,7 +67,7 @@ beta-mur-topology = ["beta"]
 # beta-dag-topology = ["beta"]
 # Mutually exclusive in effect, not in Cargo: `--all-features` turns both on, and
 # `src/allocator.rs` resolves the pair in favour of `jemalloc`. Neither is in `default`:
-# measured on glibc, neither beat the system allocator by enough to ship.
+# on glibc neither is faster than the system allocator by enough to ship.
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Builds the `mur-alloc-bench` measurement binary and the runtime module it times.

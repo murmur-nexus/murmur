@@ -1,4 +1,4 @@
-//! `mur-alloc-bench` — the harness that chose `mur`'s global allocator.
+//! `mur-alloc-bench` — the harness that compares candidate global allocators for `mur`.
 //!
 //! Built once per candidate allocator and run round-robin by `scripts/alloc-bench.sh`, which
 //! is where medians, deltas and the per-round sign count are computed. This binary parses no

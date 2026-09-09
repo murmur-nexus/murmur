@@ -1,5 +1,5 @@
 //! Timings for the two allocation bursts a session actually pays for, exposed for the
-//! `mur-alloc-bench` harness that chose `mur`'s global allocator.
+//! `mur-alloc-bench` harness that compares global allocators.
 //!
 //! Both functions build their engine through [`crate::runtime::build_engine`], the single
 //! `Engine` every session runs every guest on. A hand-rolled second `Config` here would be
