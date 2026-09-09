@@ -389,6 +389,11 @@ could not be launched, one that bound no address, and one that did not accept it
 delivery bound. A child that fails at any of those points is stopped and reaped rather than left
 running.
 
+This `status` is the call's own word for how far the call got, not for how the sub-capsule ended.
+How it ended is the completion's `status`. The `delegation` line in `trace.jsonl` carries one or
+the other, depending on which of the two it is recording — see
+[Which outcome vocabulary applies](observability-schemas.md#delegation-outcome).
+
 A refusal comes back instead as a plain sentence naming the manifest key and the entry that failed,
 with no JSON around it. The delegating capsule's own run carries on: a refused delegation is a
 failed tool call, and the session continues.
@@ -474,7 +479,7 @@ that wants it reads the file deliberately through an ordinary tool call.
 | `delegation_id` | The id the parent's launcher minted, echoed back |
 | `capsule_name`, `capsule_version` | Which capsule ran |
 | `session_id` | The child's own session, so its trace is findable |
-| `status` | `ok`, `error`, `crashed` or `terminated` |
+| `status` | `ok`, `error`, `crashed` or `terminated`. These are the words the `delegation` trace line carries for a delegation closed from a completion — see [Which outcome vocabulary applies](observability-schemas.md#delegation-outcome) |
 | `result_path` | Workdir-relative path to the result, absent when the child wrote none |
 | `workdir` | The child's directory, absolute — the root `result_path` is relative to |
 | `duration_ms` | How long the child ran |
