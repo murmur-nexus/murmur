@@ -11,11 +11,11 @@ use capsule_runtime::{
     SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
-    current_platform, effective_containment_floor, load_runtime_manifest, native_binary_verdict,
-    parse_tool_implementation_from_yaml, read_lockfile, registry_warning_link,
-    resolve_manifest_path, sha256_hex, warn_on_unknown_manifest_keys, ArtifactImplementation,
-    ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock, NativeBinaryVerdict, PlatformMatch,
-    W_REG_001, W_REG_002,
+    current_platform, effective_containment_floor, native_binary_verdict,
+    parse_tool_implementation_from_yaml, read_lockfile, read_runtime_manifest_text,
+    registry_warning_link, resolve_manifest_path, sha256_hex, warn_on_unknown_manifest_keys,
+    ArtifactImplementation, ArtifactRuntime, LocalRegistry, LockfileError, MurmurLock,
+    NativeBinaryVerdict, PlatformMatch, RuntimeManifest, W_REG_001, W_REG_002,
 };
 
 use crate::commands::install::find_project_root;
@@ -26,7 +26,8 @@ use crate::error::{
     CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_RUN_019,
 };
 use crate::formation::{
-    walk_formation_env, EnvironmentNames, FormationEnvReport, UninspectableReason,
+    formation_env_report, EnvironmentNames, FormationEnvReport, RequiredVariable,
+    UninspectableReason,
 };
 
 /// Whether an installed artifact's payload can run on the host doctor is checking for.
@@ -419,8 +420,9 @@ struct FormationFindings {
 }
 
 /// Print the `Formation environment` block: every variable the `capabilities.spawn.allow` closure
-/// declares, every declaration `mur-roost` will refuse, every capsule the walk could not read, and
-/// every edge that closes a cycle.
+/// declares, every variable the project manifest references and this workspace does not hold,
+/// every declaration `mur-roost` will refuse, every capsule the walk could not read, and every
+/// edge that closes a cycle.
 ///
 /// Names only. No value is read into the report or printed, and nothing is launched.
 ///
@@ -428,8 +430,12 @@ struct FormationFindings {
 /// environment `mur run` starts a session with. An unparseable `.env` is reported and the walk
 /// still runs against the process environment: an operator asking what a formation needs should
 /// get the list even when one line of one file is malformed.
+///
+/// Prints nothing, and finds nothing, for a capsule that delegates to nobody and holds every
+/// variable it references — [`formation_env_report`] is what decides there is nothing to say.
 fn report_formation_env(
-    runtime_manifest: &murmur_artifact::RuntimeManifest,
+    runtime_manifest: &RuntimeManifest,
+    root_manifest_yaml: &str,
     project_root: &Path,
     lock: Option<&MurmurLock>,
 ) -> FormationFindings {
@@ -441,7 +447,15 @@ fn report_formation_env(
     // The project root is the workspace root here: `find_project_root` returns the nearest
     // ancestor holding a `murmur.yaml`, which is the same directory a run reads its `.env` from.
     let (environment, dotenv_error) = EnvironmentNames::for_workspace(project_root);
-    let report = walk_formation_env(runtime_manifest, project_root, lock, &environment);
+    let Some(report) = formation_env_report(
+        runtime_manifest,
+        root_manifest_yaml,
+        project_root,
+        lock,
+        &environment,
+    ) else {
+        return findings;
+    };
 
     println!("Formation environment");
     println!(
@@ -479,6 +493,26 @@ fn report_formation_env(
     findings
 }
 
+/// Who needs a variable, as one line of attribution.
+///
+/// A `capabilities.env.allow` source is rendered bare, because that key is what the whole block is
+/// about and naming it on every line would say nothing. Any other key is named, so an operator
+/// reading `root@0.0.1 (inference.api_key)` knows which declaration to look at.
+fn render_sources(variable: &RequiredVariable) -> String {
+    variable
+        .sources
+        .iter()
+        .map(|source| {
+            if source.manifest_key == capsule_runtime::EnvelopeAxis::EnvAllow.manifest_key() {
+                source.capsule.clone()
+            } else {
+                format!("{} ({})", source.capsule, source.manifest_key)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn print_variables(report: &FormationEnvReport, findings: &mut FormationFindings) {
     if report.variables.is_empty() {
         return;
@@ -501,11 +535,11 @@ fn print_variables(report: &FormationEnvReport, findings: &mut FormationFindings
         println!(
             "    {mark}  {name:<col_width$}   {status:<5}   \u{2014} {declared_by}",
             name = variable.name,
-            declared_by = variable.declared_by.join(", ")
+            declared_by = render_sources(variable)
         );
     }
 
-    let unset: Vec<&crate::formation::RequiredVariable> = report
+    let unset: Vec<&RequiredVariable> = report
         .variables
         .iter()
         .filter(|variable| !variable.set)
@@ -518,11 +552,11 @@ fn print_variables(report: &FormationEnvReport, findings: &mut FormationFindings
         findings.fixes.push(format!(
             "export {} — declared by {}",
             variable.name,
-            variable.declared_by.join(", ")
+            render_sources(variable)
         ));
     }
     eprintln!(
-        "[mur doctor] error[{E_CAP_014}]: this formation declares {count} variable{s} nothing in \
+        "[mur doctor] error[{E_CAP_014}]: this project needs {count} variable{s} nothing in \
          this environment sets: {names}\n  \
          Every name is copied from the launching shell at the moment of the spawn, so an unset \
          one reaches the capsule that declared it as absent — export it, or declare it in the \
@@ -643,8 +677,15 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         error
     })?;
     let manifest_path = resolve_manifest_path(&project_root);
-    let runtime_manifest =
-        load_runtime_manifest(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+    // Parsed without resolving any secret it references, and the text kept for the reference scan
+    // below, so the file is read once. Doctor reads no `inference.api_key` value, and a manifest
+    // referencing a variable this shell does not hold is exactly the manifest an operator runs
+    // `mur doctor` to diagnose — refusing to load it would withhold the report naming the
+    // variable. `mur run`, which does need the value, still resolves it and still refuses.
+    let manifest_yaml =
+        read_runtime_manifest_text(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
+    let runtime_manifest = RuntimeManifest::from_yaml_str_without_secrets(&manifest_yaml)
+        .map_err(runtime_manifest_error_to_cli)?;
 
     // Keys this build does not recognize, in the same words and from the same emitter `mur run`
     // uses — an operator reaching for `mur doctor` to find out why a declaration did nothing is
@@ -808,22 +849,21 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         Err(error) => return Err(lockfile_error_to_cli(error)),
     };
 
-    // What the whole delegation closure needs from the operator's environment, gated on the same
-    // `spawn_allows` as the roost report: a capsule that delegates to nobody has no formation.
+    // What the whole delegation closure needs from the operator's environment, and what the
+    // project manifest itself references and this workspace does not hold. Ungated: a capsule
+    // that delegates to nobody has no formation, but it can still reference a variable nothing
+    // sets, and that is the one thing this block has to say about it.
     //
     // Unlike the E-CAP-004/005/006 blocks above, this one fails rather than warns. Those predict
     // a refusal of the root capsule, which a run surfaces within seconds; these predict one at
     // depth, after the parent has already run. Where the walk knows the run cannot succeed it
     // fails; where it does not know — a capsule it could not read — it warns.
-    let formation_findings = if spawn_allows {
-        Some(report_formation_env(
-            &runtime_manifest,
-            &project_root,
-            lock.as_ref(),
-        ))
-    } else {
-        None
-    };
+    let formation_findings = report_formation_env(
+        &runtime_manifest,
+        &manifest_yaml,
+        &project_root,
+        lock.as_ref(),
+    );
 
     let project_registry = LocalRegistry::new(project_root.join(".murmur").join("artifacts"));
     let global_registry = LocalRegistry::from_default_home().map_err(CliError::from)?;
@@ -847,10 +887,8 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // worse outcome than the migration it announces.
     let mut warnings: Vec<String> = Vec::new();
 
-    if let Some(formation_findings) = formation_findings {
-        fixes.extend(formation_findings.fixes);
-        warnings.extend(formation_findings.warnings);
-    }
+    fixes.extend(formation_findings.fixes);
+    warnings.extend(formation_findings.warnings);
 
     for artifact in &runtime_manifest.artifacts {
         let request = ArtifactRequest {

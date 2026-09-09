@@ -428,13 +428,15 @@ Ahead of the checklist it prints three blocks, none of which affects the exit co
 
 For a capsule declaring [`capabilities.spawn.allow`](manifest.md#field-capabilities), `mur doctor` also reports whether `mur-roost` — the daemon that capsule registers with at launch — is installed and answering, naming [`E-RUN-019`](diagnostics.md#e-run-019) as the error a `mur run` would meet. It tells apart three states: the binary is not on `PATH`, `MURMUR_ROOST_URL` is not set, and nothing answers at the URL that variable names. A reachable daemon prints nothing, and a capsule declaring no `spawn.allow` gets no such line. Like the blocks above, this warning goes to stderr and never changes the exit code.
 
-For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched, no daemon is contacted, and a capsule declaring no `spawn.allow` gets no such block.
+For the same capsule, `mur doctor` also prints a `Formation environment` block: what the whole formation — that capsule and the transitive closure of its `capabilities.spawn.allow` — needs from the environment before its first token is spent. It resolves each named capsule to an exact version: `murmur.lock` pins it if the lockfile holds an entry for the name, otherwise the project store (`.murmur/artifacts/`) decides alone if it holds the name at all, otherwise the global store (`~/.murmur/artifacts/`). No version is guessed — a name that no single source settles is listed as one the walk could not inspect. Nothing is launched and no daemon is contacted.
+
+The block also reports every variable the project manifest itself references through an `${VAR}` — today [`inference.api_key`](manifest.md#field-inference) — that neither this shell nor the workspace `.env` sets. A capsule declaring no `spawn.allow` has no formation to walk, so it gets a block only when it has such a reference to report. `mur doctor` parses the project manifest without resolving what it references, so a reference this shell cannot satisfy is named in the block below; `mur run` needs the value and refuses the same manifest with [`E-MAN-003`](diagnostics.md#index).
 
 Four findings, of which two change the exit code:
 
 | Finding | Line | Exit code |
 |---|---|---|
-| A name in the closure's `capabilities.env.allow` that neither this shell nor the workspace `.env` sets | `✗ NAME   unset   — <capsule>` | non-zero, [`E-CAP-014`](diagnostics.md#e-cap-014) on stderr |
+| A name that neither this shell nor the workspace `.env` sets: an entry in the closure's `capabilities.env.allow`, or a variable the project manifest references | `✗ NAME   unset   — <capsule>` | non-zero, [`E-CAP-014`](diagnostics.md#e-cap-014) on stderr |
 | A capsule declaring a `capabilities.env.allow` entry the capsule that spawns it does not hold — the spawn `mur-roost` refuses | `declarations mur-roost will refuse:` | non-zero, [`E-CAP-015`](diagnostics.md#e-cap-015) on stderr |
 | A capsule the walk could not read: not installed, more than one version installed with nothing pinning which, or an unreadable archive | `could not inspect N of M capsules in this formation:` | `0`, [`W-REG-002`](diagnostics.md#w-reg-002) on stderr |
 | A `spawn.allow` edge pointing back at a capsule already on the walk | `spawn.allow cycle: a@1 → b@2` | `0` |
@@ -442,6 +444,8 @@ Four findings, of which two change the exit code:
 This block is stricter than the manifest blocks above, which report a refusal of the root capsule as a warning: a formation failure lands at depth, after the parent has already spent tokens reaching the point of delegating.
 
 Only names are printed. No variable's value is read into the report or written anywhere, and set/unset is decided by presence alone, so a name set to the empty string counts as set. The workspace `.env` counts because `mur run` loads it; a `.env` that cannot be parsed is reported by file and line, adds a `Fix:` entry, and leaves the variable list computed from this shell's environment alone.
+
+A variable line names every capsule that needs the name. A `capabilities.env.allow` entry is named by the capsule alone; a name any other manifest key asked for carries that key.
 
 **Output — a formation with one unset variable:**
 
@@ -451,6 +455,15 @@ Formation environment
   variables:
     ✓  ANTHROPIC_API_KEY   set     — root-capsule@0.0.1, worker@0.1.0
     ✗  WORKER_TOKEN        unset   — worker@0.1.0
+```
+
+**Output — a capsule that delegates to nobody, with one unset reference:**
+
+```text
+Formation environment
+  capsules: solo@0.0.1
+  variables:
+    ✗  SOLO_PROVIDER_KEY   unset   — solo@0.0.1 (inference.api_key)
 ```
 
 **Output — happy path:**

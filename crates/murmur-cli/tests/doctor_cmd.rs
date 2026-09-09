@@ -258,6 +258,31 @@ fn create_three_level_formation(home: &TempDir, project_dir: &Path) {
     .unwrap();
 }
 
+/// A capsule that delegates to nobody, whose `inference.api_key` is `api_key` verbatim.
+///
+/// `endpoint` and `driver` are declared because the `http` transport requires them: `mur doctor`
+/// validates this manifest exactly as `mur run` does, resolving the secret aside.
+fn create_referencing_project(project_dir: &Path, api_key: &str) {
+    fs::write(
+        project_dir.join("murmur.yaml"),
+        format!(
+            "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
+             endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
+             artifact: murmur-driver-anthropic\n  api_key: {api_key}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Both streams of one invocation, for the substring checks that must hold across the pair.
+fn streams(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -939,7 +964,9 @@ fn formation_env_reports_the_whole_closure_three_levels_deep() {
     .stdout(predicate::str::contains("\u{2713}  DEEP_KEY"))
     .stdout(predicate::str::contains("unset").not())
     .stdout(predicate::str::contains("could not inspect").not())
-    .stdout(predicate::str::contains("mur-roost will refuse").not());
+    .stdout(predicate::str::contains("mur-roost will refuse").not())
+    // Every name here is a `capabilities.env.allow` entry, and those render bare.
+    .stdout(predicate::str::contains("(inference.api_key)").not());
 }
 
 #[test]
@@ -1277,6 +1304,238 @@ fn a_child_manifest_with_an_unresolvable_env_reference_is_still_read() {
     .stdout(predicate::str::contains("\u{2717}  PROVIDER_KEY"))
     .stdout(predicate::str::contains("worker@0.1.0"))
     .stderr(predicate::str::contains("E-CAP-014"));
+}
+
+/// The preflight that names a missing variable must not need that variable to run. `mur doctor`
+/// parses the project manifest without resolving what it references, so a reference nothing sets
+/// is a finding in the report rather than a refusal before it.
+#[test]
+fn an_unresolvable_reference_in_the_project_manifest_is_reported_not_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
+
+    let output = mur_doctor_with_env(&home, project.path(), &[("SOLO_PROVIDER_KEY", None)])
+        .failure()
+        .stdout(predicate::str::contains("Formation environment"))
+        .stdout(predicate::str::contains("capsules: solo@0.0.1"))
+        .stdout(predicate::str::contains("\u{2717}  SOLO_PROVIDER_KEY"))
+        .stdout(predicate::str::contains("unset"))
+        .stdout(predicate::str::contains("solo@0.0.1 (inference.api_key)"))
+        .stdout(predicate::str::contains("Fix: export SOLO_PROVIDER_KEY"))
+        .stdout(predicate::str::contains(format!(
+            "murmur.yaml for {}...",
+            platform()
+        )))
+        .stderr(predicate::str::contains("E-CAP-014"))
+        .get_output()
+        .clone();
+
+    assert!(
+        !streams(&output).contains("E-MAN-003"),
+        "{}",
+        streams(&output)
+    );
+}
+
+/// The walk collects; it does not stop at the first thing it cannot find. Three unset names reach
+/// three lines and one aggregated error, whichever manifest key named each of them.
+#[test]
+fn every_unset_variable_is_reported_not_only_the_first() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    install_capsule(
+        &global_store(&home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [SECOND_KEY, THIRD_KEY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
+         endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
+         artifact: murmur-driver-anthropic\n  api_key: ${SOLO_PROVIDER_KEY}\ncapabilities:\n  \
+         env:\n    allow: [SOLO_PROVIDER_KEY, SECOND_KEY, THIRD_KEY]\n  spawn:\n    \
+         allow: [worker]\n",
+    )
+    .unwrap();
+
+    let output = mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[
+            ("SOLO_PROVIDER_KEY", None),
+            ("SECOND_KEY", None),
+            ("THIRD_KEY", None),
+        ],
+    )
+    .failure()
+    .stdout(predicate::str::contains("\u{2717}  SOLO_PROVIDER_KEY"))
+    .stdout(predicate::str::contains("\u{2717}  SECOND_KEY"))
+    .stdout(predicate::str::contains("\u{2717}  THIRD_KEY"))
+    .get_output()
+    .clone();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let aggregated: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("error[E-CAP-014]"))
+        .collect();
+    assert_eq!(aggregated.len(), 1, "one aggregated line, got:\n{stderr}");
+    for name in ["SOLO_PROVIDER_KEY", "SECOND_KEY", "THIRD_KEY"] {
+        assert!(aggregated[0].contains(name), "{name} in:\n{stderr}");
+    }
+}
+
+/// The reported case: a directory where `mur run` works because the workspace `.env` declares the
+/// provider key, and `mur doctor` used to refuse it because the shell does not.
+#[test]
+fn a_reference_the_workspace_dotenv_declares_is_not_a_finding() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
+    fs::write(
+        project.path().join(".env"),
+        "SOLO_PROVIDER_KEY=from-dotenv\n",
+    )
+    .unwrap();
+
+    let output = mur_doctor_with_env(&home, project.path(), &[("SOLO_PROVIDER_KEY", None)])
+        .success()
+        .stdout(predicate::str::contains("All checks passed."))
+        .get_output()
+        .clone();
+
+    let streams = streams(&output);
+    for absent in ["E-MAN-003", "E-CAP-014", "SOLO_PROVIDER_KEY", "from-dotenv"] {
+        assert!(!streams.contains(absent), "{absent} in:\n{streams}");
+    }
+}
+
+/// Names only. A reference the shell does hold is read for its presence and never for its value.
+#[test]
+fn a_referenced_variables_value_is_never_printed() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
+
+    let output = mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("SOLO_PROVIDER_KEY", Some("sk-do-not-print-me-f5081b3c"))],
+    )
+    .success()
+    .get_output()
+    .clone();
+
+    let streams = streams(&output);
+    assert!(
+        !streams.contains("sk-do-not-print-me-f5081b3c"),
+        "{streams}"
+    );
+}
+
+/// One list, one heading, one error, however many manifest keys named the variables in it.
+#[test]
+fn the_roots_own_reference_joins_the_formations_variable_list() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    install_capsule(
+        &global_store(&home),
+        "worker",
+        "0.1.0",
+        "name: worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [WORKER_KEY]\n",
+    );
+    fs::write(
+        project.path().join("murmur.yaml"),
+        "name: root-capsule\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  \
+         endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    \
+         artifact: murmur-driver-anthropic\n  api_key: ${ROOT_PROVIDER_KEY}\ncapabilities:\n  \
+         env:\n    allow: [WORKER_KEY]\n  spawn:\n    allow: [worker]\n",
+    )
+    .unwrap();
+
+    let output = mur_doctor_with_env(
+        &home,
+        project.path(),
+        &[("ROOT_PROVIDER_KEY", None), ("WORKER_KEY", None)],
+    )
+    .failure()
+    .stdout(predicate::str::contains(
+        "capsules: root-capsule@0.0.1, worker@0.1.0",
+    ))
+    .stdout(predicate::str::contains(
+        "\u{2717}  ROOT_PROVIDER_KEY   unset   \u{2014} root-capsule@0.0.1 (inference.api_key)",
+    ))
+    .stdout(predicate::str::contains(
+        "\u{2717}  WORKER_KEY          unset   \u{2014} root-capsule@0.0.1, worker@0.1.0",
+    ))
+    .get_output()
+    .clone();
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert_eq!(
+        stdout.matches("Formation environment").count(),
+        1,
+        "one heading, got:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("variables:").count(),
+        1,
+        "one list, got:\n{stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let aggregated: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("error[E-CAP-014]"))
+        .collect();
+    assert_eq!(aggregated.len(), 1, "one aggregated line, got:\n{stderr}");
+    assert!(aggregated[0].contains("ROOT_PROVIDER_KEY"), "{stderr}");
+    assert!(aggregated[0].contains("WORKER_KEY"), "{stderr}");
+}
+
+/// A literal key is a value, not a reference. Nothing is looked up for it and nothing is reported
+/// about it — and the value itself never reaches either stream.
+#[test]
+fn a_literal_api_key_is_not_mistaken_for_a_reference() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_referencing_project(project.path(), "not-a-reference");
+
+    let output = mur_doctor(&home, project.path())
+        .success()
+        .stdout(predicate::str::contains("All checks passed."))
+        .get_output()
+        .clone();
+
+    let streams = streams(&output);
+    for absent in ["Formation environment", "E-CAP-014", "not-a-reference"] {
+        assert!(!streams.contains(absent), "{absent} in:\n{streams}");
+    }
+}
+
+/// `mur run` needs the key's value, so it still refuses the manifest `mur doctor` now reports on,
+/// in the same words and at the same moment. The two commands ask different questions of one
+/// reference.
+#[test]
+fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_referencing_project(project.path(), "${SOLO_PROVIDER_KEY}");
+
+    Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .env_remove("SOLO_PROVIDER_KEY")
+        .current_dir(project.path())
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("E-MAN-003"))
+        .stderr(predicate::str::contains("inference.api_key"))
+        .stderr(predicate::str::contains("${SOLO_PROVIDER_KEY}"));
 }
 
 /// AppArmor attaches profiles by executable path, so a `mur` at a bind mount, a build output or a
