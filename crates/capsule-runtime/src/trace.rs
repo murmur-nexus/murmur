@@ -4657,6 +4657,37 @@ mod tests {
         assert_eq!(matching, 1, "exactly one file bears that name");
     }
 
+    /// A record written for a completion the runtime parsed no driver response for names no stop
+    /// reason: the key is absent, never an empty string. Absence means "no driver response was
+    /// parsed here", so a reader can tell it apart from a driver that reported nothing — which is
+    /// recorded as `""`.
+    #[tokio::test]
+    async fn stop_reason_is_absent_when_no_driver_response_was_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = make_writer(dir.path()).await;
+        w.write_inference(
+            0,
+            10,
+            5,
+            "end_turn".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        let event = read_events(dir.path()).remove(0);
+        assert!(
+            event.get("stop_reason").is_none(),
+            "stop_reason must be absent, got {event}"
+        );
+    }
+
     /// A hook's `run-inference` sends a payload the runtime never built, so its record names no
     /// hashes — absent from the JSON, not empty strings.
     #[tokio::test]

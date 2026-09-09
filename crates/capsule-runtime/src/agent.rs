@@ -641,9 +641,9 @@ pub(crate) async fn run_agent_loop(
             .get("stop_reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        // A capped turn reports `"text"` here, exactly as it always has: `decision` names what
-        // the loop does next, and a capped turn ends the task the same way an `end_turn` does.
-        // `stop_reason`, recorded verbatim beside it, is the field that says it was cut off.
+        // A capped turn reports `"text"` here: `decision` names what the loop does next, and a
+        // capped turn ends the task the same way an `end_turn` does. `stop_reason`, recorded
+        // verbatim beside it, is the field that says it was cut off.
         let decision = if stop_reason == "tool_call" {
             "tool_call"
         } else if stop_reason == "end_turn" {
