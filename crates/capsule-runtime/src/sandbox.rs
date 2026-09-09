@@ -3172,15 +3172,17 @@ mod linux_enforce {
     /// error rather than degrade), but it is a real, user-visible narrowing of the supported
     /// kernel range for kernel-enforcement tiers.
     pub(super) fn mark_inherited_fds_cloexec() -> io::Result<()> {
-        // SAFETY: `close_range` takes three scalar arguments and dereferences nothing. It is a
-        // single syscall, so it is safe to call in the post-fork/pre-exec window. `c_uint::MAX`
-        // as the `last` argument is the documented "to the end of the table" spelling from
-        // `close_range(2)`.
+        // SAFETY: this issues the `close_range` syscall directly through `libc::syscall`. The
+        // three variadic arguments are all `c_uint` scalars and the kernel dereferences none of
+        // them. It is a single syscall, so it is safe to make in the post-fork/pre-exec window.
+        // `c_uint::MAX` as the `last` argument is the documented "to the end of the table"
+        // spelling from `close_range(2)`.
         let rc = unsafe {
-            libc::close_range(
+            libc::syscall(
+                libc::SYS_close_range,
                 super::FD_HYGIENE_FIRST_FD,
                 libc::c_uint::MAX,
-                libc::CLOSE_RANGE_CLOEXEC as libc::c_int,
+                libc::CLOSE_RANGE_CLOEXEC,
             )
         };
         if rc != 0 {
@@ -4051,6 +4053,40 @@ mod tests {
             FD_HYGIENE_FIRST_FD, 3,
             "fd hygiene must start at 3 — 0/1/2 are the stdio pipes both spawn paths need to \
              survive execve"
+        );
+    }
+
+    /// `mark_inherited_fds_cloexec` reaches `close_range` through `libc::syscall`, so its failure
+    /// convention is the raw one: `-1` with `errno` set. That convention is what turns a kernel
+    /// that rejects the call into a failed `Command::spawn()` rather than a spawn that silently
+    /// runs without fd hygiene.
+    ///
+    /// The rejection is provoked with an all-bits-set flag word, which the kernel refuses during
+    /// argument validation before it touches any descriptor — so this exercises the errno path
+    /// without closing or flagging a single fd of the test process. A kernel older than 5.11
+    /// rejects the production call with a different errno and the identical convention — see the
+    /// **Kernel range narrowing** paragraph on `mark_inherited_fds_cloexec`.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    #[test]
+    fn close_range_syscall_reports_failure_as_minus_one_and_errno() {
+        // SAFETY: `close_range` takes three scalar arguments and dereferences nothing. Every flag
+        // bit is set here, so the kernel rejects the call on argument validation and no descriptor
+        // of this process is closed or marked close-on-exec.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                FD_HYGIENE_FIRST_FD,
+                libc::c_uint::MAX,
+                libc::c_uint::MAX,
+            )
+        };
+
+        assert_eq!(rc, -1, "an invalid flag word must not be accepted");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL),
+            "the two statements the production path runs on failure must carry the kernel's errno"
         );
     }
 
