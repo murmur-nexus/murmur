@@ -4284,8 +4284,10 @@ mod linux_enforce {
         fn load_in_child(filter: &libseccomp::ScmpFilterContext) -> Result<(), i32> {
             // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the
             // child confines itself to work that does not depend on another thread's state. This
-            // child calls `load()` — whose allocation happened in the parent when the filter was
-            // built — and then `_exit`.
+            // child calls `load()` and then `_exit`. `load()` allocates — libseccomp generates
+            // the BPF program on every load and does not cache the one `export_bpf` produced —
+            // so this probe is not async-signal-safe in the strict sense; it is bounded to a
+            // child that touches nothing else and dies immediately.
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
 
@@ -4352,8 +4354,8 @@ mod linux_enforce {
             false
         }
 
-        /// The card's headline number: what the real filter compiles to, against the budget this
-        /// project holds itself to and the ceiling the kernel holds it to.
+        /// What the real filter compiles to, against the budget this project holds itself to and
+        /// the ceiling the kernel holds it to.
         ///
         /// Both `unix_sockets_allowed` settings, because they build different rule sets — one
         /// moves `AF_UNIX` from the denied domains to the allowed ones — and the budget has to
@@ -4482,8 +4484,8 @@ mod linux_enforce {
         /// two filters that straddle it and observing that the kernel takes one and refuses the
         /// other with `EINVAL`.
         ///
-        /// `EINVAL`, not `ENOMEM`: this ceiling is not the one the musl observation could have
-        /// come from, and that is the point of measuring it.
+        /// `EINVAL`, not `ENOMEM`: an `ENOMEM` out of a seccomp attach never came from this
+        /// ceiling, whatever the filter's length.
         #[test]
         fn seccomp_per_filter_ceiling() {
             if skip_without_seccomp("the kernel's per-filter instruction ceiling") {
@@ -4533,10 +4535,10 @@ mod linux_enforce {
         /// Measures `MAX_INSNS_PER_PATH`, the kernel's limit on the *whole chain* of filters one
         /// task carries, by stacking filters in a forked child until the kernel refuses.
         ///
-        /// This is the rule-out the card exists for. `ENOMEM` is what this ceiling returns, and
-        /// it is the only seccomp attach path in the kernel that returns it — so an `ENOMEM` from
-        /// a runtime that installs exactly one filter of a few hundred instructions, and that had
-        /// not yet reached `load()` when it failed, did not come from the kernel's seccomp code.
+        /// `ENOMEM` is what this ceiling returns, and it is the only seccomp attach path in the
+        /// kernel that returns it — so an `ENOMEM` from a runtime that installs exactly one
+        /// filter of a few hundred instructions, and that had not yet reached `load()` when it
+        /// failed, did not come from the kernel's seccomp code.
         #[test]
         fn seccomp_cumulative_ceiling() {
             if skip_without_seccomp("the kernel's cumulative filter-chain ceiling") {
