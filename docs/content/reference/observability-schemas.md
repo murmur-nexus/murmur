@@ -78,7 +78,8 @@ before the first task begins
 | `task_id` | string \| null | The task this turn belongs to. `null` when no task is in scope |
 | `input_tokens` | u64 | The runtime's own tiktoken (`cl100k_base`) estimate of the request, counted before the request was sent. This is the number the compaction threshold and the session totals run on |
 | `output_tokens` | u64 | The runtime's own tiktoken estimate of the driver response |
-| `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` |
+| `decision` | string | `"tool_call"` \| `"end_turn"` \| `"text"` — what the loop does next. A turn the provider cut off at the output cap reads `"text"`; `stop_reason` beside it is the field that says it was cut off |
+| `stop_reason` | string | The provider's own stop reason, verbatim as the loop dispatched on it — `"max_tokens"` for a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens). Written on every agent-loop turn, and as `""` when the driver reported none. Absent on a record no driver response was parsed for: a hook's `run-inference` and the `process` transport |
 | `tool_name` | string \| null | The tool the response asked for; `null` when it asked for none |
 | `input_tokens_actual` | u64 | The provider's own count of the request, from the driver's [`usage`](wit-interfaces.md#driver-usage) block |
 | `output_tokens_actual` | u64 | The provider's own count of the completion |
@@ -812,7 +813,7 @@ Neither path can suppress or corrupt the other, and a failure on either is non-f
 | Span name | Source event | Attributes |
 |---|---|---|
 | `capsule.session` | One per task | `exit_status` |
-| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens` and `cache_write_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
+| `capsule.inference` | `inference` | `turn`, `input_tokens`, `output_tokens`, `decision`, `stop_reason` (the provider's own reason, on every agent-loop turn), `tool_name` (when the response asked for one), `input_tokens_actual`, `output_tokens_actual`, `cached_tokens` and `cache_write_tokens` (each when the driver reported it), plus `origin` and `model` for a hook-run completion |
 | `capsule.tool_call` | `tool_call` | `tool_name`, `input_bytes`, `output_bytes`, `duration_ms`, `status` |
 | `capsule.shell` | `shell` | `command` (first 200 characters), `exit_code`, `duration_ms` |
 | `capsule.compaction` | `compaction` | `tokens_before`, `tokens_after` |

@@ -15,6 +15,13 @@ use crate::session_address::{self, ses_entries, SessionQuery};
 const E_TRC_001: &str = "E-TRC-001";
 const E_TRC_002: &str = "E-TRC-002";
 
+/// The `inference.stop_reason` value a provider reports for a turn it cut off at the output cap.
+const MAX_TOKENS_STOP_REASON: &str = "max_tokens";
+
+/// What a capped turn's rendered line ends on, so a fragment is visible without reading the raw
+/// event. Names the manifest field that decided the cap.
+const TRUNCATED_TURN_MARKER: &str = "  [truncated at inference.max_tokens]";
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Subcommand)]
@@ -153,6 +160,10 @@ struct SessionStartEvent {
 struct InferenceEvent {
     turn: u32,
     decision: String,
+    /// The provider's own stop reason for this turn. Absent on a record no driver response was
+    /// parsed for — a hook's `run-inference` and the `process` transport.
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     tool_name: Option<String>,
     /// `hook:<name>` when a hook produced this completion through `run-inference`. Absent on
@@ -2707,10 +2718,18 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             // A hook's completion is not a turn of the agent loop; it hangs off the turn it
             // ran inside.
             Some(origin) => format!("{}{}  {}", kind("inference"), origin, e.decision),
-            None => match &e.tool_name {
-                Some(tool) => format!("turn {}  {}  {}", e.turn, e.decision, tool),
-                None => format!("turn {}  {}", e.turn, e.decision),
-            },
+            None => {
+                // A turn the provider cut off at the output cap, named on the line rather than
+                // left to be read out of the raw event.
+                let capped = match e.stop_reason.as_deref() {
+                    Some(MAX_TOKENS_STOP_REASON) => TRUNCATED_TURN_MARKER,
+                    _ => "",
+                };
+                match &e.tool_name {
+                    Some(tool) => format!("turn {}  {}  {}{}", e.turn, e.decision, tool, capped),
+                    None => format!("turn {}  {}{}", e.turn, e.decision, capped),
+                }
+            }
         },
         TraceEvent::ToolCall(e) => format!(
             "{}{}  {}  {}{}",

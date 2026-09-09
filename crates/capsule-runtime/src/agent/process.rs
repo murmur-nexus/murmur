@@ -620,6 +620,10 @@ async fn read_process_output(
                         0,
                         0,
                         decision.to_string(),
+                        // The process transport reads no driver JSON response and names its own
+                        // `decision` from the CLI's stream, so there is no provider stop reason
+                        // to record.
+                        None,
                         None,
                         None,
                         None,
@@ -631,7 +635,7 @@ async fn read_process_output(
                     )
                     .await;
 
-                otel.emit_inference(turn_idx, 0, 0, decision, None, 0, None, None)
+                otel.emit_inference(turn_idx, 0, 0, decision, None, None, 0, None, None)
                     .await;
 
                 hooks
@@ -867,11 +871,12 @@ async fn read_codex_output(
                                 None,
                                 None,
                                 None,
+                                None,
                                 Vec::new(),
                                 None,
                             )
                             .await;
-                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, 0, None, None)
+                        otel.emit_inference(turns - 1, 0, 0, "end_turn", None, None, 0, None, None)
                             .await;
                     }
                     "mcp_tool_call" => {
@@ -898,6 +903,7 @@ async fn read_codex_output(
                                 0,
                                 0,
                                 "tool_call".into(),
+                                None,
                                 Some(tool_name.clone()),
                                 None,
                                 None,
@@ -910,6 +916,7 @@ async fn read_codex_output(
                             0,
                             0,
                             "tool_call",
+                            None,
                             Some(tool_name.as_str()),
                             0,
                             None,

@@ -13,6 +13,7 @@ pub mod platform;
 pub mod registry;
 pub mod registry_warnings;
 pub mod runtime_manifest;
+pub mod runtime_warnings;
 pub mod secrets;
 pub mod security_warnings;
 pub mod trace_capture;
@@ -71,6 +72,7 @@ pub use runtime_manifest::{
     DURATION_ACCEPTED_FORM, PEER_FETCH_ALLOW_ACCEPTED_FORM,
     PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
+pub use runtime_warnings::{runtime_warning_link, W_RUN_001};
 pub use secrets::{scan_yaml_secrets, SecretWarning};
 pub use security_warnings::{
     security_warning_link, W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006,
