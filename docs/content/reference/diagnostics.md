@@ -80,6 +80,7 @@ section that explains it.
 | `W-BLD-003` | A compiled artifact packages build inputs | [W-BLD-003](#w-bld-003) |
 | `W-REG-001` | An installed native artifact has no recorded platform | [W-REG-001](#w-reg-001) |
 | `W-REG-002` | A capsule in a formation could not be inspected | [W-REG-002](#w-reg-002) |
+| `W-RUN-001` | A turn stopped at the `inference.max_tokens` output cap | [W-RUN-001](#w-run-001) |
 | `W-SEC-001` | No kernel-level subprocess sandbox on this platform | [W-SEC-001](#w-sec-001) |
 | `W-SEC-002` | Linux host without Landlock — filesystem scope and exec unenforced | [W-SEC-002](#w-sec-002) |
 | `W-SEC-003` | `network.allow` doesn't constrain bash's own outbound connections | [W-SEC-003](#w-sec-003) |
@@ -837,6 +838,41 @@ Three reasons:
 Install the capsule, or pin its version in `murmur.lock`, and `mur doctor` folds its declarations
 into the report. The exit code is unchanged either way: the walk not being able to read a capsule
 is not evidence that a run fails.
+
+---
+
+## Runtime warnings
+
+A session prints non-fatal warnings about what a turn did while the loop was running. Each one
+carries a `W-RUN-NNN` code and a link back to its section on this page. The session still produces
+a result, still ends `ok`, and `mur run` still exits `0`.
+
+These are decided mid-session, so they go to stderr alone. `logs/bootstrap.log` covers the launch,
+which is over by the time a turn happens.
+
+### W-RUN-001 — a turn stopped at the output cap { #w-run-001 }
+
+```text
+[capsule-runtime] warning[W-RUN-001]: this turn stopped at the inference.max_tokens output cap of 256 tokens, so out/result.txt holds a fragment rather than a finished answer
+  (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-run-001)
+```
+
+The provider reported `stop_reason: "max_tokens"`: it generated the whole budget
+[`inference.max_tokens`](manifest.md#inference-max-tokens) allowed and stopped mid-reply. The cap
+named in the warning is the value that was in force — the manifest's, or the `8192` default.
+
+What the turn leaves behind:
+
+| Surface | What it holds |
+|---|---|
+| `out/result.txt`, and `out/result_<task-id>.txt` under `mode: threaded` | The model's partial text, then a marker naming `inference.max_tokens` and the cap |
+| The terminal A2A `status` event's `response`, and the task output an `on-task-end` hook reads | The same marked text |
+| The [conversation record](workdir.md#the-conversation-record)'s assistant message | The model's own bytes, with `"truncated": true` on the message envelope |
+| The trace's [`inference`](observability-schemas.md#session-trace-tracejsonl) event | `"stop_reason": "max_tokens"`, beside a `decision` of `"text"` |
+
+The turn is a result, not a failure: the session ends `ok`, the A2A task reaches `completed`, and
+the runtime attempts no continuation turn. Raising `inference.max_tokens` gives the next run room to
+finish; a task whose answer is genuinely long is better split across turns the agent drives itself.
 
 ---
 
