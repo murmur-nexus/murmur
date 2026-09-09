@@ -10,9 +10,9 @@ exclude_docs: |
   # Snippet partials pulled in via --8<--; not standalone pages.
   # pymdownx.snippets still resolves them from disk via base_path.
   includes/
-  # Hand-run acceptance procedures addressed to the team, not to users. They stay in
-  # the repo at these paths (code comments cite them by path) but are not published.
-  # reference/containment.md links to them on GitHub.
+  # Acceptance procedures and measurement records addressed to the team, not to users.
+  # They stay in the repo at these paths (code comments cite them by path) but are not
+  # published. reference/containment.md links to the hand-run procedures on GitHub.
   # Note: links *inside* these are no longer checked by `mkdocs build --strict`.
   reference/sealed-containment-manual-verification.md
   reference/resource-limits-manual-verification.md
@@ -21,6 +21,7 @@ exclude_docs: |
   reference/network-namespace-egress-proxy-manual-verification.md
   reference/workdir-exec-landlock-manual-verification.md
   reference/shell-binary-reachability-manual-verification.md
+  reference/seccomp-filter-instruction-budget.md
   reference/workdir-device-node-manual-verification.md
   reference/af-unix-sockets-manual-verification.md
   reference/capsule-device-set-manual-verification.md

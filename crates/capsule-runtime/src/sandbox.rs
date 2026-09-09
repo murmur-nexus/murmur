@@ -1719,6 +1719,34 @@ pub(crate) const SECCOMP_MUST_STAY_DENIED: &[&str] = &[
     "kcmp",
 ];
 
+/// The largest BPF program `linux_enforce::build_seccomp_filter` may compile to before this
+/// project treats the filter as having outgrown its headroom. Held against the *measured* export
+/// of the real filter by a test, not against an estimate: growing
+/// [`SECCOMP_SYSCALL_ALLOWLIST`] past this fails `cargo test` with the measured count in the
+/// message, instead of surfacing as a spawn that dies inside `pre_exec` on some host.
+///
+/// Set well below [`BPF_MAXINSNS_CEILING`] on purpose. It is a project budget, not a kernel one:
+/// crossing it is a prompt to re-measure and decide, not evidence that the kernel would refuse.
+/// `docs/content/reference/seccomp-filter-instruction-budget.md` records the measurement this
+/// number was chosen against.
+#[allow(dead_code)]
+pub(crate) const SECCOMP_FILTER_INSTRUCTION_BUDGET: usize = 512;
+
+/// The kernel's `BPF_MAXINSNS` — the most instructions a *single* seccomp filter may contain.
+/// A longer program is refused by `seccomp(SECCOMP_SET_MODE_FILTER)` with `EINVAL`, before the
+/// filter is attached to anything. Measured rather than quoted: a test brackets it by loading
+/// two filters that straddle it in forked children.
+#[allow(dead_code)]
+pub(crate) const BPF_MAXINSNS_CEILING: usize = 4096;
+
+/// The kernel's `MAX_INSNS_PER_PATH` — the most instructions the *whole chain* of filters
+/// attached to one task may total, counting every filter it already carries plus a small
+/// per-filter accounting overhead. An attach that would cross it is refused with `ENOMEM`,
+/// which is the only seccomp path in the kernel that returns that errno. Measured rather than
+/// quoted: a test stacks filters in a forked child until the refusal arrives.
+#[allow(dead_code)]
+pub(crate) const SECCOMP_MAX_INSNS_PER_PATH: usize = 32768;
+
 /// Bundles the resolved, host-independent enforcement inputs for one capsule session.
 #[derive(Debug, Clone)]
 pub(crate) struct ShellEnforcement {
@@ -3423,7 +3451,11 @@ mod linux_enforce {
         ("landlock_restrict_self", 446),
     ];
 
-    /// Builds and loads the child's seccomp filter.
+    /// Builds the child's seccomp filter and returns it unloaded, so that the same construction
+    /// the spawn path uses can also be measured. [`install_seccomp_filter`] is the only caller
+    /// that loads it; the measurement of what it compiles to, the kernel ceilings that number is
+    /// held against and the headroom between them are recorded in
+    /// `docs/content/reference/seccomp-filter-instruction-budget.md`.
     ///
     /// **This filter raises no notifications and needs no supervisor.** Network enforcement lives
     /// in [`crate::network_namespace`] plus [`crate::egress_proxy`], and exec enforcement in the
@@ -3442,7 +3474,9 @@ mod linux_enforce {
     ///     argument being inspected. That is what makes `io_uring_setup`, `bpf`, `userfaultfd`,
     ///     `perf_event_open`, `ptrace` and the rest of [`super::SECCOMP_MUST_STAY_DENIED`]
     ///     unreachable — they are simply absent, not argument-matched.
-    fn install_seccomp_filter(unix_sockets_allowed: bool) -> io::Result<()> {
+    fn build_seccomp_filter(
+        unix_sockets_allowed: bool,
+    ) -> io::Result<libseccomp::ScmpFilterContext> {
         // Default-deny. `EPERM` matches what the OCI/Docker default profile returns for a syscall
         // outside its allowlist, and is deliberately a *different* errno from the `EACCES` that the
         // `socket()` domain rules (and Landlock) return: `EACCES` means "the sandbox looked at this
@@ -3572,14 +3606,93 @@ mod linux_enforce {
                 .map_err(to_io_err)?;
         }
 
-        // Dropping `filter` after `load()` is safe: libseccomp's `seccomp_release()` (invoked on
-        // Drop) only frees the userspace filter-building context, while the filter itself is
+        Ok(filter)
+    }
+
+    /// Loads the filter [`build_seccomp_filter`] produces into the calling task. Irreversible:
+    /// the filter stays in force for the rest of this task's life and is inherited across the
+    /// `execve` that follows, which is why nothing outside a forked child ever calls this.
+    fn install_seccomp_filter(unix_sockets_allowed: bool) -> io::Result<()> {
+        // Dropping the context after `load()` is safe: libseccomp's `seccomp_release()` (invoked
+        // on Drop) only frees the userspace filter-building context, while the filter itself is
         // already installed in the kernel and is inherited across the `execve` that follows.
-        filter.load().map_err(to_io_err)
+        build_seccomp_filter(unix_sockets_allowed)?
+            .load()
+            .map_err(to_io_err)
     }
 
     fn to_io_err<E: std::fmt::Display>(error: E) -> io::Error {
         io::Error::other(error.to_string())
+    }
+
+    /// Size of one `struct sock_filter`, the record `seccomp_export_bpf` writes per BPF
+    /// instruction. Dividing an export's length by it is what turns bytes into an instruction
+    /// count.
+    #[cfg(test)]
+    const SOCK_FILTER_BYTES: usize = 8;
+
+    /// Writes `export` — one of libseccomp's two exporters — into an anonymous in-memory file and
+    /// returns what it wrote.
+    ///
+    /// Both exporters take a descriptor and nothing else, so the buffer has to come from
+    /// somewhere. A `memfd` rather than a temporary file because it touches no filesystem the
+    /// sandbox might already have scoped away, and because `tempfile` is a dev-dependency of this
+    /// crate and so is unavailable to anything outside a test build.
+    #[cfg(test)]
+    fn export_to_memfd<F>(export: F) -> io::Result<Vec<u8>>
+    where
+        F: FnOnce(&OwnedFd) -> Result<(), libseccomp::error::SeccompError>,
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::FromRawFd;
+
+        // SAFETY: `memfd_create` reads a NUL-terminated name (a `c"..."` literal, static
+        // lifetime) and returns a fresh descriptor or -1. No flags, so no cloexec and no sealing:
+        // the descriptor lives and dies inside this function.
+        let raw = unsafe { libc::memfd_create(c"murmur-seccomp-export".as_ptr(), 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a descriptor `memfd_create` just returned and nothing else owns, which
+        // is exactly the precondition for handing it to `OwnedFd`.
+        let memfd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        export(&memfd).map_err(to_io_err)?;
+
+        let mut file = std::fs::File::from(memfd);
+        file.seek(SeekFrom::Start(0))?;
+        let mut exported = Vec::new();
+        file.read_to_end(&mut exported)?;
+        Ok(exported)
+    }
+
+    /// The number of BPF instructions the filter [`build_seccomp_filter`] produces compiles to on
+    /// this host, for the given `unix_sockets_allowed`.
+    ///
+    /// Measured, never assumed: `seccomp_export_bpf` writes the generated program as a sequence of
+    /// 8-byte `struct sock_filter` records, so the instruction count is the exported length
+    /// divided by that record size. The number depends on the host — how many
+    /// [`super::SECCOMP_SYSCALL_ALLOWLIST`] names this architecture and this libseccomp resolve —
+    /// which is why it is measured here rather than written down.
+    ///
+    /// `export_bpf` and not `export_bpf_mem`: the latter binds `seccomp_export_bpf_mem`, which
+    /// first appeared in libseccomp 2.6.0, and a host on 2.5.x would fail to resolve the symbol.
+    #[cfg(test)]
+    fn seccomp_filter_instruction_count(unix_sockets_allowed: bool) -> io::Result<usize> {
+        let filter = build_seccomp_filter(unix_sockets_allowed)?;
+        let exported = export_to_memfd(|fd| filter.export_bpf(fd))?;
+        Ok(exported.len() / SOCK_FILTER_BYTES)
+    }
+
+    /// The filter [`build_seccomp_filter`] produces, rendered as libseccomp's pseudo filter code:
+    /// one block per syscall carrying a rule, each block naming the argument comparisons and the
+    /// action. It is the only view of a built context that shows the rule *shape* rather than the
+    /// compiled program's size, which is what a test pinning the rule sequence needs.
+    #[cfg(test)]
+    fn seccomp_filter_pfc(unix_sockets_allowed: bool) -> io::Result<String> {
+        let filter = build_seccomp_filter(unix_sockets_allowed)?;
+        let exported = export_to_memfd(|fd| filter.export_pfc(fd))?;
+        String::from_utf8(exported).map_err(to_io_err)
     }
 
     /// Scopes the shell subprocess tree's filesystem access with Landlock. Four kinds of rule:
@@ -4032,6 +4145,520 @@ mod linux_enforce {
                 );
                 None
             }
+        }
+    }
+
+    /// What the child's seccomp filter costs, and the two kernel ceilings that cost is held
+    /// against — all four numbers produced by running code on the host under test, never quoted.
+    ///
+    /// The written record these tests feed is
+    /// `docs/content/reference/seccomp-filter-instruction-budget.md`.
+    ///
+    /// Nothing here ever loads a filter into the test process. A loaded seccomp filter is
+    /// irreversible for the life of the task, so an in-process load would silently apply to the
+    /// rest of the test binary and to everything it spawns. Every load happens in a forked child
+    /// that does nothing else and then `_exit`s.
+    #[cfg(test)]
+    mod seccomp_budget {
+        use std::io;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // `seccomp_filter_instruction_count` is absent from this list because the test that
+        // reports it carries the same name; it is called as `super::` throughout.
+        use super::{
+            build_seccomp_filter, export_to_memfd, seccomp_filter_pfc, to_io_err,
+            LANDLOCK_SYSCALLS, SOCK_FILTER_BYTES,
+        };
+        use crate::sandbox::{
+            allowed_socket_domains, denied_socket_domains, detect_enforcement_tier,
+            EnforcementTier, BPF_MAXINSNS_CEILING, SECCOMP_FILTER_INSTRUCTION_BUDGET,
+            SECCOMP_MAX_INSNS_PER_PATH, SECCOMP_SYSCALL_ALLOWLIST,
+        };
+
+        /// The kernel charges each filter already attached to a task four instructions on top of
+        /// its own length when it decides whether the next attach fits under
+        /// [`SECCOMP_MAX_INSNS_PER_PATH`].
+        ///
+        /// It is only part of the arithmetic. The length the kernel adds up is that of the
+        /// *converted* program — `seccomp_prepare_filter` translates the classic BPF that
+        /// `export_bpf` writes into eBPF before the chain is measured, and the translation comes
+        /// out slightly longer. So a load count predicted from the exported classic length is an
+        /// upper bound on the load count the kernel actually allows, never an equality, which is
+        /// why the cumulative probe brackets it rather than pinning it.
+        const KERNEL_PER_FILTER_OVERHEAD_INSNS: usize = 4;
+
+        /// The exit code a load probe's child reports on a refusal libseccomp gave no errno for.
+        /// Every real errno is a small positive number, and 0 is reserved for a load that
+        /// succeeded, so this cannot collide with either.
+        const PROBE_ERRNO_UNKNOWN: i32 = 254;
+
+        /// A filter built only to be measured or refused: default `Allow`, and `rules`
+        /// argument-conditional `Errno` rules on a syscall no probe child ever makes.
+        ///
+        /// Default `Allow` rather than the real filter's default deny, for two reasons that both
+        /// matter. A child has to survive its own load long enough to `_exit` and, in the
+        /// cumulative probe, to call `seccomp(2)` again — the real filter denies `seccomp` on
+        /// purpose, so it cannot be stacked on itself. And libseccomp drops a rule whose action
+        /// equals the default action, so the rules have to carry an action the default does not:
+        /// `Errno` against a default of `Allow` is the inverse of the shipped filter and keeps
+        /// every rule in the program.
+        ///
+        /// `set_api_sysrawrc` is what makes the errno observable at all: without it libseccomp
+        /// collapses every `seccomp(2)` attach failure to `ECANCELED`, which would hide the very
+        /// `EINVAL`/`ENOMEM` distinction these probes exist to establish.
+        fn probe_filter(rules: usize) -> io::Result<(libseccomp::ScmpFilterContext, usize)> {
+            let mut filter = libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Allow)
+                .map_err(to_io_err)?;
+            filter.set_api_sysrawrc(true).map_err(to_io_err)?;
+
+            let syscall = libseccomp::ScmpSyscall::from_name("ptrace").map_err(to_io_err)?;
+            for value in 0..rules {
+                filter
+                    .add_rule_conditional(
+                        libseccomp::ScmpAction::Errno(libc::EPERM),
+                        syscall,
+                        &[libseccomp::ScmpArgCompare::new(
+                            0,
+                            libseccomp::ScmpCompareOp::Equal,
+                            value as u64,
+                        )],
+                    )
+                    .map_err(to_io_err)?;
+            }
+
+            let exported = export_to_memfd(|fd| filter.export_bpf(fd))?;
+            Ok((filter, exported.len() / SOCK_FILTER_BYTES))
+        }
+
+        /// The smallest probe-filter rule count whose compiled program is longer than
+        /// `instructions`. Doubling to bracket, then bisecting: the instruction count grows
+        /// monotonically with the rule count, so both halves are sound and the whole search
+        /// costs a couple of dozen exports rather than thousands.
+        fn first_rule_count_above(instructions: usize) -> io::Result<usize> {
+            let mut under = 1;
+            let mut over = 8;
+            while probe_filter(over)?.1 <= instructions {
+                under = over;
+                over *= 2;
+                assert!(
+                    over <= 1 << 20,
+                    "no probe filter of up to {over} rules exceeded {instructions} instructions — \
+                     the probe is not growing the program the way this search assumes"
+                );
+            }
+            while over - under > 1 {
+                let mid = under + (over - under) / 2;
+                if probe_filter(mid)?.1 <= instructions {
+                    under = mid;
+                } else {
+                    over = mid;
+                }
+            }
+            Ok(over)
+        }
+
+        /// The raw errno behind a libseccomp failure, for a context built by [`probe_filter`] and
+        /// therefore carrying `SCMP_FLTATR_API_SYSRAWRC`. Known errnos come back as
+        /// `ErrorKind::Errno`, anything else as the raw code; both are mapped here so the caller
+        /// only ever sees a plain `libc` value.
+        fn refusal_errno(error: &libseccomp::error::SeccompError) -> i32 {
+            use libseccomp::error::SeccompErrno;
+
+            if let Some(raw) = error.sysrawrc() {
+                return -raw;
+            }
+            match error.errno() {
+                Some(SeccompErrno::EACCES) => libc::EACCES,
+                Some(SeccompErrno::ECANCELED) => libc::ECANCELED,
+                Some(SeccompErrno::EINVAL) => libc::EINVAL,
+                Some(SeccompErrno::ENOMEM) => libc::ENOMEM,
+                _ => PROBE_ERRNO_UNKNOWN,
+            }
+        }
+
+        /// Loads `filter` in a forked child and reports what the kernel said: `Ok(())` for a load
+        /// that took, `Err(errno)` for one the kernel refused.
+        ///
+        /// The filter is built by the caller, before the fork, so the child's whole post-fork
+        /// window is `load()` and `_exit`.
+        fn load_in_child(filter: &libseccomp::ScmpFilterContext) -> Result<(), i32> {
+            // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the
+            // child confines itself to work that does not depend on another thread's state. This
+            // child calls `load()` and then `_exit`. `load()` allocates — libseccomp generates
+            // the BPF program on every load and does not cache the one `export_bpf` produced —
+            // so this probe is not async-signal-safe in the strict sense; it is bounded to a
+            // child that touches nothing else and dies immediately.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+
+            if pid == 0 {
+                let code = match filter.load() {
+                    Ok(()) => 0,
+                    Err(error) => refusal_errno(&error),
+                };
+                // SAFETY: forked-child context; `_exit` skips every destructor and atexit hook,
+                // which is what keeps libtest's state in the parent untouched.
+                unsafe { libc::_exit(code) }
+            }
+
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` is the child just forked; `status` is a live local.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(waited == pid, "waitpid: {}", io::Error::last_os_error());
+            assert!(
+                libc::WIFEXITED(status),
+                "the load probe child did not exit normally (status {status})"
+            );
+            match libc::WEXITSTATUS(status) {
+                0 => Ok(()),
+                errno => Err(errno),
+            }
+        }
+
+        /// The number of distinct syscalls the allowlist actually contributes a rule for on this
+        /// host, counted the way `build_seccomp_filter` contributes them — resolve the name, try
+        /// the rule, keep what libseccomp accepted — but against a scratch context, so the count
+        /// is an independent measurement rather than a restatement of the filter under test.
+        fn resolvable_allowlist_syscalls() -> io::Result<usize> {
+            use std::collections::HashSet;
+
+            let mut scratch =
+                libseccomp::ScmpFilterContext::new(libseccomp::ScmpAction::Errno(libc::EPERM))
+                    .map_err(to_io_err)?;
+            let mut accepted = HashSet::new();
+            for name in SECCOMP_SYSCALL_ALLOWLIST {
+                if let Ok(syscall) = libseccomp::ScmpSyscall::from_name(name) {
+                    if scratch
+                        .add_rule(libseccomp::ScmpAction::Allow, syscall)
+                        .is_ok()
+                    {
+                        accepted.insert(i32::from(syscall));
+                    }
+                }
+            }
+            Ok(accepted.len())
+        }
+
+        /// The line both ceiling probes print instead of running, on a host where no seccomp
+        /// filter can be loaded at all.
+        fn skip_without_seccomp(what: &str) -> bool {
+            let tier = detect_enforcement_tier();
+            if tier == EnforcementTier::EnvironmentOnly {
+                eprintln!(
+                    "SKIP — PROVES NOTHING ON THIS HOST: measuring {what} requires a host that \
+                     can load a seccomp filter at all, which is every tier above \
+                     EnforcementTier::EnvironmentOnly; detected {tier:?}"
+                );
+                return true;
+            }
+            false
+        }
+
+        /// What the real filter compiles to, against the budget this project holds itself to and
+        /// the ceiling the kernel holds it to.
+        ///
+        /// Both `unix_sockets_allowed` settings, because they build different rule sets — one
+        /// moves `AF_UNIX` from the denied domains to the allowed ones — and the budget has to
+        /// cover the larger of the two.
+        #[test]
+        fn seccomp_filter_instruction_count() {
+            for unix_sockets_allowed in [false, true] {
+                let count = super::seccomp_filter_instruction_count(unix_sockets_allowed)
+                    .expect("export the built seccomp filter");
+
+                eprintln!(
+                    "seccomp filter instruction count: unix_sockets_allowed={unix_sockets_allowed} \
+                     -> {count} instructions; budget {SECCOMP_FILTER_INSTRUCTION_BUDGET}; kernel \
+                     per-filter ceiling {BPF_MAXINSNS_CEILING} ({:.1}x headroom); kernel \
+                     cumulative ceiling {SECCOMP_MAX_INSNS_PER_PATH} ({:.1}x headroom)",
+                    BPF_MAXINSNS_CEILING as f64 / count as f64,
+                    SECCOMP_MAX_INSNS_PER_PATH as f64 / count as f64,
+                );
+
+                assert!(
+                    count > 0,
+                    "the exported filter is empty, so nothing was measured — \
+                     `export_bpf` wrote no `struct sock_filter` records at all"
+                );
+                assert!(
+                    count <= SECCOMP_FILTER_INSTRUCTION_BUDGET,
+                    "the child's seccomp filter compiles to {count} instructions with \
+                     unix_sockets_allowed={unix_sockets_allowed}, over this project's budget of \
+                     {SECCOMP_FILTER_INSTRUCTION_BUDGET} (the kernel refuses a single filter over \
+                     {BPF_MAXINSNS_CEILING} with EINVAL). Re-measure, decide whether the rule set \
+                     still earns its size, and raise SECCOMP_FILTER_INSTRUCTION_BUDGET \
+                     deliberately — updating \
+                     docs/content/reference/seccomp-filter-instruction-budget.md with the new \
+                     numbers — rather than letting the filter grow into a spawn failure"
+                );
+            }
+        }
+
+        /// The rule sequence `build_seccomp_filter` lays down, pinned against the filter's own
+        /// pseudo-filter-code export so a change to the shape is a test failure rather than a
+        /// silent change of policy.
+        ///
+        /// The `EACCES` count is the load-bearing one. An unconditional `Allow` on `socket`
+        /// anywhere in this function would make libseccomp discard every argument-conditional
+        /// chain already recorded for that syscall — reopening `AF_UNIX`, `AF_NETLINK` and
+        /// `AF_PACKET` — and it would show up here as zero `EACCES` actions.
+        #[test]
+        fn seccomp_filter_rule_shape() {
+            let allowlist_syscalls =
+                resolvable_allowlist_syscalls().expect("count the resolvable allowlist syscalls");
+            assert!(
+                allowlist_syscalls > 0,
+                "no SECCOMP_SYSCALL_ALLOWLIST name resolved on this host, so this test would pass \
+                 for the wrong reason"
+            );
+
+            for unix_sockets_allowed in [false, true] {
+                let filter =
+                    build_seccomp_filter(unix_sockets_allowed).expect("build the seccomp filter");
+                assert_eq!(
+                    filter.get_act_default().expect("read the default action"),
+                    libseccomp::ScmpAction::Errno(libc::EPERM),
+                    "the filter's default action is no longer a deny with EPERM, which is what \
+                     makes every syscall outside the allowlist unreachable"
+                );
+
+                let pfc =
+                    seccomp_filter_pfc(unix_sockets_allowed).expect("export the filter's pfc");
+                let denied = denied_socket_domains(unix_sockets_allowed);
+                let allowed = allowed_socket_domains(unix_sockets_allowed);
+
+                // One block per syscall carrying at least one rule: `socket`, every allowlist
+                // name libseccomp accepted, and the three Landlock syscalls.
+                let syscall_blocks = pfc.matches("# filter for syscall ").count();
+                assert_eq!(
+                    syscall_blocks,
+                    1 + allowlist_syscalls + LANDLOCK_SYSCALLS.len(),
+                    "the built filter carries rules for {syscall_blocks} syscalls, not the \
+                     socket rule plus {allowlist_syscalls} allowlist syscalls plus {} Landlock \
+                     syscalls this code adds",
+                    LANDLOCK_SYSCALLS.len()
+                );
+
+                let deny_actions = pfc
+                    .matches(&format!("action ERRNO({});", libc::EACCES))
+                    .count();
+                assert_eq!(
+                    deny_actions,
+                    denied.len(),
+                    "the built filter carries {deny_actions} EACCES rules, not one per denied \
+                     socket domain ({denied:?}) — an unconditional Allow on `socket` would look \
+                     exactly like this, and would have discarded every domain denial with it"
+                );
+
+                // Every non-`socket` block contributes exactly one `Allow`; the `socket` block
+                // contributes one per allowed domain.
+                let allow_actions = pfc.matches("action ALLOW;").count();
+                assert_eq!(
+                    allow_actions,
+                    allowed.len() + allowlist_syscalls + LANDLOCK_SYSCALLS.len(),
+                    "the built filter carries {allow_actions} Allow rules, not one per allowed \
+                     socket domain ({allowed:?}) plus one per allowlist syscall plus one per \
+                     Landlock syscall"
+                );
+
+                for (name, _) in LANDLOCK_SYSCALLS {
+                    assert!(
+                        pfc.contains(&format!("\"{name}\"")),
+                        "{name} has no rule in the built filter, so `apply_landlock_scope` would \
+                         be refused by the filter installed just before it"
+                    );
+                }
+
+                eprintln!(
+                    "seccomp filter rule shape: unix_sockets_allowed={unix_sockets_allowed} -> \
+                     default ERRNO(EPERM); {} socket EACCES rules; {} socket ALLOW rules; \
+                     {allowlist_syscalls} allowlist syscalls; {} Landlock syscalls",
+                    denied.len(),
+                    allowed.len(),
+                    LANDLOCK_SYSCALLS.len(),
+                );
+            }
+        }
+
+        /// Brackets `BPF_MAXINSNS`, the kernel's limit on a *single* filter's length, by loading
+        /// two filters that straddle it and observing that the kernel takes one and refuses the
+        /// other with `EINVAL`.
+        ///
+        /// `EINVAL`, not `ENOMEM`: an `ENOMEM` out of a seccomp attach never came from this
+        /// ceiling, whatever the filter's length.
+        #[test]
+        fn seccomp_per_filter_ceiling() {
+            if skip_without_seccomp("the kernel's per-filter instruction ceiling") {
+                return;
+            }
+
+            let over_rules = first_rule_count_above(BPF_MAXINSNS_CEILING)
+                .expect("bracket the per-filter ceiling");
+            let (under_filter, under_count) =
+                probe_filter(over_rules - 1).expect("build the under-ceiling probe filter");
+            let (over_filter, over_count) =
+                probe_filter(over_rules).expect("build the over-ceiling probe filter");
+
+            assert!(
+                under_count <= BPF_MAXINSNS_CEILING && over_count > BPF_MAXINSNS_CEILING,
+                "the two probe filters ({under_count} and {over_count} instructions) do not \
+                 straddle BPF_MAXINSNS_CEILING ({BPF_MAXINSNS_CEILING}), so this test would prove \
+                 nothing about where the ceiling is"
+            );
+
+            let under_outcome = load_in_child(&under_filter);
+            let over_outcome = load_in_child(&over_filter);
+
+            eprintln!(
+                "seccomp per-filter ceiling: largest filter that loaded = {under_count} \
+                 instructions; smallest that did not = {over_count} instructions, refused with \
+                 errno {} (EINVAL is {}); recorded BPF_MAXINSNS_CEILING = {BPF_MAXINSNS_CEILING}",
+                over_outcome.err().unwrap_or(0),
+                libc::EINVAL,
+            );
+
+            assert_eq!(
+                under_outcome,
+                Ok(()),
+                "a {under_count}-instruction filter was refused, below the \
+                 {BPF_MAXINSNS_CEILING}-instruction ceiling this test expects the kernel to hold"
+            );
+            assert_eq!(
+                over_outcome,
+                Err(libc::EINVAL),
+                "a {over_count}-instruction filter was not refused with EINVAL, so \
+                 BPF_MAXINSNS_CEILING ({BPF_MAXINSNS_CEILING}) is not where this kernel puts its \
+                 per-filter limit"
+            );
+        }
+
+        /// Measures `MAX_INSNS_PER_PATH`, the kernel's limit on the *whole chain* of filters one
+        /// task carries, by stacking filters in a forked child until the kernel refuses.
+        ///
+        /// `ENOMEM` is what this ceiling returns, and it is the only seccomp attach path in the
+        /// kernel that returns it — so an `ENOMEM` from a runtime that installs exactly one
+        /// filter of a few hundred instructions, and that had not yet reached `load()` when it
+        /// failed, did not come from the kernel's seccomp code.
+        #[test]
+        fn seccomp_cumulative_ceiling() {
+            if skip_without_seccomp("the kernel's cumulative filter-chain ceiling") {
+                return;
+            }
+
+            // A probe of roughly the shipped filter's size, so the number of stacked loads reads
+            // directly as "how many filters like ours one task could carry".
+            let (filter, count) = probe_filter(120).expect("build the cumulative probe filter");
+            let per_filter_cost = count + KERNEL_PER_FILTER_OVERHEAD_INSNS;
+            // Enough headroom past the ceiling that a kernel which never refuses is caught by the
+            // cap rather than by the test hanging.
+            let max_loads = SECCOMP_MAX_INSNS_PER_PATH / per_filter_cost + 16;
+
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a live two-element array, which is what `pipe2` writes into.
+            let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+            assert!(rc == 0, "pipe2: {}", io::Error::last_os_error());
+            // SAFETY: both descriptors are fresh out of `pipe2` and owned by nothing else.
+            let (read_fd, write_fd) =
+                unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+
+            // SAFETY: `fork()` from a possibly-multithreaded process is sound as long as the
+            // child confines itself to work that does not depend on another thread's state. This
+            // child calls `load()` in a loop, writes eight bytes and `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+
+            if pid == 0 {
+                let mut loads: u32 = 0;
+                let mut refusal: i32 = 0;
+                while loads < max_loads as u32 {
+                    match filter.load() {
+                        Ok(()) => loads += 1,
+                        Err(error) => {
+                            refusal = refusal_errno(&error);
+                            break;
+                        }
+                    }
+                }
+
+                let mut report = [0u8; 8];
+                report[..4].copy_from_slice(&loads.to_ne_bytes());
+                report[4..].copy_from_slice(&refusal.to_ne_bytes());
+                // SAFETY: forked-child context; `write` is async-signal-safe, `report` is a live
+                // local of exactly the length passed, and the descriptor is the pipe's write end.
+                unsafe { libc::write(write_fd.as_raw_fd(), report.as_ptr().cast(), report.len()) };
+                // SAFETY: forked-child context; `_exit` skips every destructor and atexit hook.
+                unsafe { libc::_exit(0) }
+            }
+
+            drop(write_fd);
+            let mut report = [0u8; 8];
+            std::io::Read::read_exact(&mut std::fs::File::from(read_fd), &mut report)
+                .expect("read the cumulative probe child's report");
+            let loads = u32::from_ne_bytes(report[..4].try_into().unwrap()) as usize;
+            let refusal = i32::from_ne_bytes(report[4..].try_into().unwrap());
+
+            let mut status: libc::c_int = 0;
+            // SAFETY: `pid` is the child just forked; `status` is a live local.
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            assert!(waited == pid, "waitpid: {}", io::Error::last_os_error());
+
+            let stacked = loads * count;
+            let cumulative_at_refusal = count + loads * per_filter_cost;
+            let loads_if_counted_classic = SECCOMP_MAX_INSNS_PER_PATH / per_filter_cost;
+            let shipped = super::seccomp_filter_instruction_count(false)
+                .expect("measure the shipped filter for comparison");
+
+            eprintln!(
+                "seccomp cumulative ceiling: {loads} loads of a {count}-instruction filter \
+                 succeeded ({stacked} instructions stacked, {cumulative_at_refusal} counted the \
+                 way the kernel counts once the {KERNEL_PER_FILTER_OVERHEAD_INSNS}-instruction \
+                 per-filter overhead is added); load {} was refused with errno {refusal} (ENOMEM \
+                 is {}), against the recorded SECCOMP_MAX_INSNS_PER_PATH of \
+                 {SECCOMP_MAX_INSNS_PER_PATH} — which the exported classic length puts at at most \
+                 {loads_if_counted_classic} loads. The runtime installs ONE filter of {shipped} \
+                 instructions, so reaching this ceiling would take {} of them in a single task.",
+                loads + 1,
+                libc::ENOMEM,
+                SECCOMP_MAX_INSNS_PER_PATH / shipped,
+            );
+
+            assert!(
+                loads >= 2,
+                "the kernel refused the filter chain after only {loads} load(s), so this is not \
+                 a cumulative limit and the ENOMEM it returns is not the one being ruled out"
+            );
+            assert_eq!(
+                refusal,
+                libc::ENOMEM,
+                "stacking filters past SECCOMP_MAX_INSNS_PER_PATH was refused with errno \
+                 {refusal}, not ENOMEM ({}) — the rule-out in \
+                 docs/content/reference/seccomp-filter-instruction-budget.md rests on ENOMEM \
+                 being what this ceiling returns",
+                libc::ENOMEM
+            );
+            assert!(
+                loads <= loads_if_counted_classic,
+                "the kernel took {loads} loads of a {count}-instruction filter — more than the \
+                 {loads_if_counted_classic} that fit under SECCOMP_MAX_INSNS_PER_PATH \
+                 ({SECCOMP_MAX_INSNS_PER_PATH}) even before the conversion to eBPF lengthens \
+                 each one, so this kernel's ceiling is higher than the recorded value"
+            );
+            // Loose on purpose: the exported classic length under-counts what the kernel adds
+            // up, so the bound below tolerates any plausible conversion expansion while still
+            // refusing a ceiling of a different order of magnitude — a kernel that stopped at,
+            // say, BPF_MAXINSNS would fail here.
+            assert!(
+                loads * 2 > loads_if_counted_classic,
+                "the kernel refused after {loads} loads of a {count}-instruction filter, far \
+                 short of the {loads_if_counted_classic} that SECCOMP_MAX_INSNS_PER_PATH \
+                 ({SECCOMP_MAX_INSNS_PER_PATH}) implies — the ceiling being measured is not the \
+                 one recorded"
+            );
+            assert!(
+                shipped * 2 < SECCOMP_MAX_INSNS_PER_PATH,
+                "the shipped filter ({shipped} instructions) is within a factor of two of the \
+                 cumulative ceiling, which would make the rule-out this test supports untrue"
+            );
         }
     }
 }
