@@ -195,8 +195,33 @@ dig +tries=1 +time=2 evil.example.com | grep -E 'status:|ANSWER:'
 ```
 
 **Expect:** `status: REFUSED` for the unlisted name, with `ANSWER: 0` — a reply, arriving at once.
-`status: NXDOMAIN` appears only for an *allowlisted* name that genuinely does not resolve; that is
-the truth about the name, not a policy signal.
+An allowlisted name gets one of the [three resolution outcomes](containment.md#capsule-name-resolution)
+instead, never `REFUSED`.
+
+To see the third one, point the runtime's own `/etc/resolv.conf` at an address nothing answers on
+(`nameserver 203.0.113.1`, an address reserved for documentation) and start a new `mur run`. Two
+things are observable. On the runtime's stderr, before the capsule starts:
+
+```
+[capsule-runtime] warning: the network allowlist host 'example.com' could not be resolved at
+launch: the resolver did not answer within 5s (a subprocess reaching it by literal address is
+denied for this run)
+```
+
+And inside the capsule, for an allowlisted name:
+
+```bash
+time getent hosts example.com ; echo "exit=$?"
+```
+
+**Expect:** no address and a non-zero exit, arriving on the lookup deadline — around five seconds
+per address family asked — rather than at once. That slowness *is* the signal: the capsule was told
+`SERVFAIL`, and a resolver client treats `SERVFAIL` as "ask again". `NXDOMAIN` would come back at
+once and tell it not to bother. Put `/etc/resolv.conf` back afterwards; the runtime reads it once
+per process, so the change takes effect on the next `mur run` and not before.
+
+`NXDOMAIN` appears only for an allowlisted name that an upstream answered for, saying it does not
+exist; that is the truth about the name, not a policy signal.
 
 The DNS-shaped exfiltration attempt the roadmap named, run directly:
 

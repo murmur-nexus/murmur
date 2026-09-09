@@ -559,8 +559,20 @@ no longer in the system prompt, so there is nothing to double-inject.
 A `capabilities.network.allow` host that fails DNS resolution at launch is skipped rather than
 treated as an error: the run proceeds with that host contributing no addresses to the launch-time
 IP allowlist a shell subprocess falls back to when it reaches a destination by address rather than
-by name. This only ever shrinks what a shell binary can reach. Malformed host *syntax*, as opposed
-to a resolution failure, is still rejected outright with
+by name. This only ever shrinks what a shell binary can reach. When the failure was a resolver that
+did not answer within five seconds — as opposed to a name that does not exist — the runtime says so
+on stderr and carries on:
+
+```
+[capsule-runtime] warning: the network allowlist host 'api.example.com' could not be resolved at
+launch: the resolver did not answer within 5s (a subprocess reaching it by literal address is
+denied for this run)
+```
+
+Each unresolvable host costs up to that five seconds at launch. Names are still resolved for the
+capsule while it runs, so a host named here stays reachable *by name* whatever happened at launch;
+see [Capsule name resolution](containment.md#capsule-name-resolution). Malformed host *syntax*, as
+opposed to a resolution failure, is still rejected outright with
 [`E-CAP-001`](diagnostics.md#e-cap-001).
 
 A WASM guest never inherits the host process's environment. `capabilities.env.allow` is the only

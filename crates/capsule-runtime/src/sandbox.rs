@@ -87,7 +87,7 @@
 //! There is no code path where a Linux host silently runs a shell subprocess with zero
 //! enforcement because setup failed.
 
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -330,11 +330,17 @@ pub(crate) fn resolve_network_allowlist_ips(
     let mut ips = std::collections::BTreeSet::new();
     for rule in &rules {
         let host = rule.host.as_str();
-        let Ok(resolved) = (host, 0u16).to_socket_addrs() else {
-            continue;
-        };
-        for addr in resolved {
-            ips.insert(addr.ip());
+        match crate::dns_resolver::resolve(host) {
+            crate::dns_resolver::Resolution::Resolved(addresses) => ips.extend(addresses),
+            crate::dns_resolver::Resolution::DoesNotExist => {}
+            // Skipped like any other host that contributed no address, but said out loud: a
+            // resolver that did not answer is a transient condition an operator can act on,
+            // where a name that does not exist is a manifest to correct.
+            crate::dns_resolver::Resolution::DidNotAnswer(reason) => eprintln!(
+                "[capsule-runtime] warning: the network allowlist host '{host}' could not be \
+                 resolved at launch: {reason} (a subprocess reaching it by literal address is \
+                 denied for this run)"
+            ),
         }
     }
 

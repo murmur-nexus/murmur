@@ -456,6 +456,49 @@ there apply alongside it.
 
 ---
 
+## Capsule name resolution { #capsule-name-resolution }
+
+Every name a capsule looks up is resolved by the runtime process itself, not by the C library. The
+capsule's namespace has one resolver — the runtime's, on UDP 53 — and the runtime answers it from
+an in-process DNS client of its own. A name outside `capabilities.network.allow` never gets
+resolved at all: it is answered `REFUSED` before any lookup starts.
+
+One lookup for an allowlisted name has three outcomes, and each carries a different rcode.
+
+| Outcome | What it means | What the capsule sees |
+|---|---|---|
+| Resolved | The name has addresses | `NOERROR` with the `A`/`AAAA` records for the family asked about |
+| Does not exist | An upstream answered authoritatively that there is no such name | `NXDOMAIN` (rcode 3) |
+| Did not answer | The deadline elapsed, no nameserver was reachable, or every one failed the query | `SERVFAIL` (rcode 2) |
+
+`SERVFAIL` is what a resolver client reads as "ask again": `getaddrinfo` inside the capsule reports
+it as `EAI_AGAIN`, "Temporary failure in name resolution". `NXDOMAIN` is the claim that the name is
+gone, which a client has no reason to retry — so a slow or unreachable upstream must not produce
+it. One name's whole budget, across every search suffix tried and every nameserver asked, is five
+seconds; a name that exceeds it is `SERVFAIL`.
+
+**What the runtime reads.** `/etc/resolv.conf` supplies the nameservers, the search list and
+`ndots`, applied as `resolv.conf(5)` states them. `/etc/hosts` supplies static names and is
+consulted **first**, so a name pinned there is answered without a query leaving the host. Both
+files are read **once**, when the first lookup in a process happens, and are not re-read when they
+change: a host that rewrites either mid-run needs `mur` restarted for the change to take effect.
+
+**What the runtime does not read.** The runtime is a DNS client with a hosts file. Everything
+glibc's name-service switch layers on top of that is absent, and none of it is configurable:
+
+| Not honoured | Consequence |
+|---|---|
+| `/etc/nsswitch.conf` ordering | The order is always the hosts file, then DNS, whatever the file says |
+| mDNS (`.local` names, `mdns4_minimal`) | A `.local` name resolves only if an ordinary nameserver answers for it |
+| `myhostname` | The host's own name resolves only from `/etc/hosts` or DNS |
+| `nis`, and systemd-resolved's `resolve` NSS module | A name that exists only in one of these does not resolve |
+
+systemd-resolved's *stub listener* is unaffected: on a host whose `/etc/resolv.conf` names
+`127.0.0.53`, the runtime speaks ordinary DNS to it like any other nameserver. It is the NSS module
+that is bypassed, not the daemon.
+
+---
+
 ## Executable workdirs { #field-workdir-exec }
 
 `capabilities.filesystem.workdir_exec` decides one Landlock bit: whether the session workdir's own
