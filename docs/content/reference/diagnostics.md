@@ -596,8 +596,8 @@ manifest references. What `mur run` does with the same name depends on the key: 
 
 Names only: no value is read into the report or printed. A name set to the empty string counts as
 set, because the runtime copies it through as-is. The matching stdout line is
-`✗ NAME   unset   — <capsule>@<version>`, naming every capsule that needs the name; a name a key
-other than `capabilities.env.allow` asked for carries that key, as
+`✗ NAME   unset   — <capsule>@<version>`, naming every capsule that needs the name. A name reached
+through a field other than `capabilities.env.allow` carries that field in brackets, as
 `✗ NAME   unset   — solo@0.0.1 (inference.api_key)`. This is one of the two formation findings
 that make `mur doctor` exit non-zero.
 

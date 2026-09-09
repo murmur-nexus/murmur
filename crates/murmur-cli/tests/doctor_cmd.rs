@@ -1387,8 +1387,8 @@ fn every_unset_variable_is_reported_not_only_the_first() {
     }
 }
 
-/// The reported case: a directory where `mur run` works because the workspace `.env` declares the
-/// provider key, and `mur doctor` used to refuse it because the shell does not.
+/// A directory where `mur run` works because the workspace `.env` declares the provider key: the
+/// `.env` counts for doctor too, so a shell that does not set the name is not a finding.
 #[test]
 fn a_reference_the_workspace_dotenv_declares_is_not_a_finding() {
     let home = tempfile::tempdir().unwrap();
@@ -1515,9 +1515,8 @@ fn a_literal_api_key_is_not_mistaken_for_a_reference() {
     }
 }
 
-/// `mur run` needs the key's value, so it still refuses the manifest `mur doctor` now reports on,
-/// in the same words and at the same moment. The two commands ask different questions of one
-/// reference.
+/// `mur run` needs the key's value, so it refuses at manifest load the same manifest `mur doctor`
+/// reports on. The two commands ask different questions of one reference.
 #[test]
 fn mur_run_still_refuses_the_reference_mur_doctor_reports() {
     let home = tempfile::tempdir().unwrap();

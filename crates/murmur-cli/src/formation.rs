@@ -189,8 +189,7 @@ pub(crate) fn formation_env_report(
     environment: &EnvironmentNames,
 ) -> Option<FormationEnvReport> {
     // A set reference is already satisfied, so it contributes no line and no finding — which is
-    // what keeps a fully-provisioned capsule's output identical to what it was before references
-    // were reported at all.
+    // what keeps a fully-provisioned capsule's report to what the walk alone found.
     let unset_references: Vec<ReferencedEnvVariable> = referenced_env_variables(root_manifest_yaml)
         .into_iter()
         .filter(|reference| !environment.contains(&reference.variable))
