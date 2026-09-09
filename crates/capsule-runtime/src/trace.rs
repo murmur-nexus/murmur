@@ -527,8 +527,14 @@ struct ShellCompletedEvent {
     completion_task_id: String,
 }
 
-/// A detached command still running when its session ended. Its result is lost; this record and
-/// the stderr line beside it are what keep the loss visible.
+/// A detached command the session ended without carrying its result back. No task will ever report
+/// it; this record and the operator report beside it are what keep the loss visible.
+///
+/// The command was either still running at the sweep or finished during teardown, and the second
+/// case knows more: [`Self::exit_code`], [`Self::output_path`] and [`Self::output_bytes`] are
+/// written together for it and omitted together for the first. A command still running therefore
+/// produces a line byte-identical in shape to one written before those fields existed — omitted,
+/// never `null`, because `null` would read as a known-absent exit code rather than an unknown one.
 #[derive(Serialize)]
 struct ShellAbandonedEvent {
     event_type: &'static str,
@@ -539,8 +545,21 @@ struct ShellAbandonedEvent {
     work_id: String,
     binary: String,
     command: String,
-    /// How long the command had been running when the session gave up on it.
+    /// How long the command had been running when the session gave up on it. For a command that
+    /// finished during teardown, its full duration from spawn to exit.
     running_ms: u64,
+    /// `128 + signal` for a signal kill, as on `shell_completed`. Absent for a command still
+    /// running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    /// Workdir-relative path of the file holding the command's full stdout and stderr, always
+    /// `logs/<work_id>.log`. Absent for a command still running, for which that file was never
+    /// written and never will be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    /// Size of that file. Present exactly when [`Self::output_path`] is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_bytes: Option<u64>,
 }
 
 /// A demoted command a later launch found unaccounted for, appended to the `trace.jsonl` of the
@@ -1578,12 +1597,18 @@ impl TraceWriter {
     }
 
     /// A detached command the session ended without waiting for.
+    ///
+    /// `recovered` carries the exit code, the output path and that file's byte count for a command
+    /// that finished during teardown, and is `None` for one still running. The three travel as one
+    /// argument because they exist together: a command with an exit code has a written log, and
+    /// one without has neither.
     pub(crate) async fn write_shell_abandoned(
         &mut self,
         work_id: &str,
         binary: &str,
         command: &str,
         running_ms: u64,
+        recovered: Option<(i32, &str, u64)>,
     ) -> std::io::Result<()> {
         let event = ShellAbandonedEvent {
             event_type: "shell_abandoned",
@@ -1595,6 +1620,9 @@ impl TraceWriter {
             binary: binary.to_string(),
             command: command.to_string(),
             running_ms,
+            exit_code: recovered.map(|(exit_code, _, _)| exit_code),
+            output_path: recovered.map(|(_, path, _)| path.to_string()),
+            output_bytes: recovered.map(|(_, _, bytes)| bytes),
         };
         self.write_event(&event).await
     }
@@ -2853,6 +2881,66 @@ mod tests {
         assert_eq!(events[0]["work_id"], "wrk_0a1b");
         assert_eq!(events[0]["binary"], "/usr/bin/bash");
         assert_eq!(events[0]["reason"], "No space left");
+    }
+
+    /// A command still running when the session ended has no exit code, no output file and no
+    /// byte count, and its line carries none of the three — omitted rather than `null`, so the
+    /// shape is identical to a line written before those fields existed.
+    #[tokio::test]
+    async fn an_abandoned_command_still_running_omits_the_fields_it_cannot_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        writer
+            .write_shell_abandoned(
+                "wrk_0a1b2c3d4e5f6a7b",
+                "/usr/bin/bash",
+                "sleep 45; echo done",
+                45_012,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let events = read_events(dir.path());
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["event_type"], "shell_abandoned");
+        assert_eq!(event["work_id"], "wrk_0a1b2c3d4e5f6a7b");
+        assert_eq!(event["binary"], "/usr/bin/bash");
+        assert_eq!(event["command"], "sleep 45; echo done");
+        assert_eq!(event["running_ms"], 45_012);
+        for absent in ["exit_code", "output_path", "output_bytes"] {
+            assert!(
+                event.get(absent).is_none(),
+                "{absent} must be omitted, not written as null: {event}"
+            );
+        }
+    }
+
+    /// A command that finished during teardown carries the exit code, the output path and the
+    /// byte count that do exist for it, so a trace reader can tell it from one still running
+    /// without reading anything else.
+    #[tokio::test]
+    async fn an_abandoned_command_that_finished_carries_its_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = make_writer(dir.path()).await;
+        writer
+            .write_shell_abandoned(
+                "wrk_0a1b2c3d4e5f6a7b",
+                "/usr/bin/bash",
+                "sleep 2; echo done",
+                2_014,
+                Some((0, "logs/wrk_0a1b2c3d4e5f6a7b.log", 91)),
+            )
+            .await
+            .unwrap();
+
+        let event = &read_events(dir.path())[0];
+        assert_eq!(event["event_type"], "shell_abandoned");
+        assert_eq!(event["running_ms"], 2_014);
+        assert_eq!(event["exit_code"], 0);
+        assert_eq!(event["output_path"], "logs/wrk_0a1b2c3d4e5f6a7b.log");
+        assert_eq!(event["output_bytes"], 91);
     }
 
     async fn make_writer(dir: &std::path::Path) -> TraceWriter {

@@ -704,6 +704,15 @@ fn shell_work_lost_to_a_killed_runtime_is_reported_once_on_resume() {
     killed.kill().expect("SIGKILL reaches the run");
     killed.wait().expect("the killed run is reaped");
 
+    // The teardown sweep never ran, so the operator surface it writes to holds nothing about this
+    // command. Reconciliation on the next resume is the whole report for a killed runtime.
+    let killed_bootstrap =
+        fs::read_to_string(killed_dir.join("logs").join("bootstrap.log")).unwrap_or_default();
+    assert!(
+        !killed_bootstrap.contains("discarded at session end"),
+        "a killed runtime writes no abandonment report:\n{killed_bootstrap}"
+    );
+
     let killed_events = trace_events(&killed_dir);
     let detached = events_of_type(&killed_events, "shell_detached");
     assert_eq!(detached.len(), 1, "exactly one command was demoted");

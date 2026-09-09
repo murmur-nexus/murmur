@@ -17,7 +17,7 @@ use murmur_artifact::{
     LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
     RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -46,7 +46,10 @@ use crate::{
     cgroup,
     containment::{achieved_containment_class, check_containment_floor},
     delegation::SpawnerHandle,
-    detached::{demotion_tool_result, DetachPolicy, DetachedRegistry, DetachedReport},
+    detached::{
+        self, demotion_tool_result, AbandonedDisposition, AbandonedWork, DetachPolicy,
+        DetachedRegistry, DetachedReport,
+    },
     errors::RuntimeError,
     hooks::{
         dispatch_stage, HookEnvVars, HookEvent, HookRuntime, HookSeed, ResolvedCall,
@@ -1252,6 +1255,11 @@ pub fn launch_session(
             !staged.capability_policy.spawn_allow.is_empty(),
             &staged.lifecycle,
         );
+        warn_for_unreachable_shell_completions(
+            &workdir,
+            !staged.capability_policy.shell_allow.is_empty(),
+            &staged.lifecycle,
+        );
 
         let agent_card = identity::build_agent_card(
             &capsule_identity,
@@ -1924,8 +1932,7 @@ pub fn launch_session(
                                     // timeout. The host (mur-roost) is responsible for shutdown.
                                     // All other modes apply MURMUR_A2A_TIMEOUT_SECS (default 30 s).
                                     let is_queue_sleep =
-                                        matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Queue)
-                                        && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
+                                        effective_lifecycle.can_receive_background_tasks();
 
                                     loop {
                                         // Detached shell commands that finished are turned into
@@ -2283,46 +2290,67 @@ pub fn launch_session(
                     // neither place; reading `outstanding` first and draining second means it is
                     // seen in one or the other rather than falling between them. A command
                     // caught in both is recorded once.
-                    let mut recorded: Vec<String> = Vec::new();
+                    let mut abandoned: Vec<AbandonedWork> = Vec::new();
                     for work in detached.outstanding() {
-                        eprintln!(
-                            "[capsule-runtime] detached shell command {} ({}) is still running at session end; its result is lost",
-                            work.work_id, work.binary
-                        );
-                        let _ = trace
-                            .write_shell_abandoned(
-                                &work.work_id,
-                                &work.binary,
-                                &work.command,
-                                abandoned_at_ms.saturating_sub(work.started_at_ms),
-                            )
-                            .await;
-                        recorded.push(work.work_id);
+                        abandoned.push(AbandonedWork {
+                            work_id: work.work_id,
+                            binary: work.binary,
+                            command: work.command,
+                            disposition: AbandonedDisposition::StillRunning {
+                                running_ms: abandoned_at_ms.saturating_sub(work.started_at_ms),
+                            },
+                        });
                     }
-                    // Work that reported after the task loop stopped reading. The result exists,
-                    // but no task will ever carry it, so it is lost on the same terms as work still
-                    // running and is recorded the same way.
+                    // Work that reported after the task loop stopped reading. No task will carry
+                    // the result, so it is discarded on the same terms as work still running — but
+                    // the exit code, the duration and the written output log all exist, and the
+                    // record and the report both name them rather than flattening this case into
+                    // the other one.
                     while let Ok(report) = completion_rx.try_recv() {
                         match report {
                             DetachedReport::Completed(completion) => {
-                                if recorded.contains(&completion.work_id) {
+                                if abandoned
+                                    .iter()
+                                    .any(|work| work.work_id == completion.work_id)
+                                {
                                     continue;
                                 }
-                                eprintln!(
-                                    "[capsule-runtime] detached shell command {} ({}) finished after the session stopped accepting work; its result is lost",
-                                    completion.work_id, completion.binary
-                                );
-                                let _ = trace
-                                    .write_shell_abandoned(
-                                        &completion.work_id,
-                                        &completion.binary,
-                                        &completion.command,
-                                        completion.duration_ms,
-                                    )
-                                    .await;
-                                recorded.push(completion.work_id);
+                                let status = completion.status();
+                                abandoned.push(AbandonedWork {
+                                    work_id: completion.work_id,
+                                    binary: completion.binary,
+                                    command: completion.command,
+                                    disposition: AbandonedDisposition::FinishedTooLate {
+                                        exit_code: completion.exit_code,
+                                        duration_ms: completion.duration_ms,
+                                        output_path: completion.output_path,
+                                        output_bytes: completion.output_bytes,
+                                        resource_limit: completion.resource_limit,
+                                        wait_error: completion.error,
+                                        status,
+                                    },
+                                });
                             }
                             DetachedReport::Lost(_) => {}
+                        }
+                    }
+                    // The discard is stated to the operator in full, on the two surfaces that are
+                    // not `trace.jsonl`: there is no turn left to tell the agent in, so every
+                    // remaining surface is the operator's.
+                    if !abandoned.is_empty() {
+                        let report = detached::abandonment_report_text(&session_id, &abandoned);
+                        eprintln!("{report}");
+                        agent::append_bootstrap_log(&workdir, &report);
+                        for work in &abandoned {
+                            let _ = trace
+                                .write_shell_abandoned(
+                                    &work.work_id,
+                                    &work.binary,
+                                    &work.command,
+                                    work.running_ms(),
+                                    work.recovered(),
+                                )
+                                .await;
                         }
                     }
 
@@ -2883,9 +2911,8 @@ pub(crate) fn unreachable_delegation_outcomes_warning(
     can_delegate: bool,
     lifecycle: &LifecycleConfig,
 ) -> Option<(&'static str, &'static str)> {
-    let can_receive = lifecycle.task_acceptance == TaskAcceptance::Queue
-        && lifecycle.after_task == AfterTask::Sleep;
-    (can_delegate && !can_receive).then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
+    (can_delegate && !lifecycle.can_receive_background_tasks())
+        .then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
 }
 
 /// Fires at every launch, not just once.
@@ -2896,6 +2923,45 @@ pub(crate) fn warn_for_unreachable_delegation_outcomes(
 ) {
     if let Some((code, message)) = unreachable_delegation_outcomes_warning(can_delegate, lifecycle)
     {
+        let link = security_warning_link(code);
+        eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
+        agent::append_bootstrap_log(
+            workdir,
+            &format!("[capability-policy] warning[{code}]: {message} ({link})"),
+        );
+    }
+}
+
+const NO_SHELL_COMPLETION_LANE_WARNING: &str = "this capsule declares \
+capabilities.shell.allow, but its lifecycle block cannot receive a background command's \
+completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, \
+and its exit code and output path arrive afterwards as a background task. Declare \
+lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule \
+demotes will be discarded at session end and reported to the operator instead of to the agent.";
+
+/// Pure decision for the shell-lifecycle warning, split out of
+/// [`warn_for_unreachable_shell_completions`] on the same terms as
+/// [`unreachable_delegation_outcomes_warning`], so a test can assert it without capturing stderr.
+///
+/// Fires exactly where a completion has nowhere to land: a capsule that can run shell commands and
+/// either exits after its task or accepts no second one. Deliberately not conditioned on
+/// `lifecycle.shell_grace_secs` — `0` demotes on the first check after the spawn, so a low grace
+/// makes the discard more likely rather than less, and no value of it turns demotion off.
+pub(crate) fn unreachable_shell_completions_warning(
+    can_run_shell: bool,
+    lifecycle: &LifecycleConfig,
+) -> Option<(&'static str, &'static str)> {
+    (can_run_shell && !lifecycle.can_receive_background_tasks())
+        .then_some((W_SEC_022, NO_SHELL_COMPLETION_LANE_WARNING))
+}
+
+/// Fires at every launch, not just once.
+pub(crate) fn warn_for_unreachable_shell_completions(
+    workdir: &Path,
+    can_run_shell: bool,
+    lifecycle: &LifecycleConfig,
+) {
+    if let Some((code, message)) = unreachable_shell_completions_warning(can_run_shell, lifecycle) {
         let link = security_warning_link(code);
         eprintln!("[capsule-runtime] warning[{code}]: {message} ({link})");
         agent::append_bootstrap_log(
@@ -7184,6 +7250,78 @@ inference:
             assert!(
                 unreachable_delegation_outcomes_warning(false, &lifecycle).is_none(),
                 "a capsule that cannot delegate is not warned about delegating"
+            );
+        }
+    }
+
+    /// A capsule that can run shell commands and leaves `lifecycle` at its defaults is warned,
+    /// because `after_task: exit` ends the session before any demoted command's completion can
+    /// arrive.
+    #[test]
+    fn warn_for_unreachable_shell_completions_writes_the_code_and_link_to_bootstrap_log() {
+        let temp = TempDir::new().unwrap();
+        warn_for_unreachable_shell_completions(temp.path(), true, &LifecycleConfig::default());
+        let log = bootstrap_log_contents(temp.path());
+
+        assert!(log.contains(W_SEC_022), "log was: {log}");
+        assert!(
+            log.contains(&security_warning_link(W_SEC_022)),
+            "log was: {log}"
+        );
+        assert!(log.contains("lifecycle.shell_grace_secs"), "log was: {log}");
+        assert!(log.contains("lifecycle.task_acceptance"), "log was: {log}");
+        assert!(log.contains("lifecycle.after_task"), "log was: {log}");
+    }
+
+    /// The only lifecycle a completion can reach is `queue` + `sleep`; a capsule that declares no
+    /// `capabilities.shell.allow` is never warned whatever it declares.
+    #[test]
+    fn only_a_shell_running_capsule_that_cannot_be_told_is_warned() {
+        assert!(unreachable_shell_completions_warning(
+            true,
+            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep)
+        )
+        .is_none());
+        for lifecycle in [
+            lifecycle(TaskAcceptance::Queue, AfterTask::Exit),
+            lifecycle(TaskAcceptance::Single, AfterTask::Sleep),
+            lifecycle(TaskAcceptance::None, AfterTask::Sleep),
+        ] {
+            assert_eq!(
+                unreachable_shell_completions_warning(true, &lifecycle).map(|(code, _)| code),
+                Some(W_SEC_022),
+                "{lifecycle:?} cannot receive a completion"
+            );
+            assert!(
+                unreachable_shell_completions_warning(false, &lifecycle).is_none(),
+                "a capsule that cannot run shell commands is not warned about them"
+            );
+        }
+    }
+
+    /// `lifecycle.shell_grace_secs` is not part of the decision. `0` demotes on the first check
+    /// after the spawn, so a low grace makes the discard more likely rather than less, and no
+    /// value of it turns demotion off.
+    #[test]
+    fn the_shell_completion_warning_ignores_the_grace_period() {
+        for shell_grace_secs in [0, 1, 10, 3_600] {
+            let receiving = LifecycleConfig {
+                task_acceptance: TaskAcceptance::Queue,
+                after_task: AfterTask::Sleep,
+                shell_grace_secs,
+                ..LifecycleConfig::default()
+            };
+            assert!(
+                unreachable_shell_completions_warning(true, &receiving).is_none(),
+                "queue+sleep is silent at every grace period, including {shell_grace_secs}"
+            );
+            let discarding = LifecycleConfig {
+                after_task: AfterTask::Exit,
+                ..receiving
+            };
+            assert!(
+                unreachable_shell_completions_warning(true, &discarding).is_some(),
+                "exit warns at every grace period, including {shell_grace_secs}"
             );
         }
     }
