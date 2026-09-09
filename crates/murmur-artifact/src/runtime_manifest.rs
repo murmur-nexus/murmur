@@ -9256,8 +9256,8 @@ capabilities:
         .is_empty());
     }
 
-    /// The fix narrows the warning rather than disabling it: a key no command reads still reports,
-    /// and reports alone.
+    /// `W-SEC-019` still covers every key no command reads: one sitting beside the four
+    /// build-side keys reports, and reports alone.
     #[test]
     fn a_genuinely_unknown_key_beside_the_build_side_keys_still_reports() {
         assert_eq!(
@@ -9287,6 +9287,13 @@ capabilities:
         .expect("a build-side key of any shape never refuses a manifest");
 
         assert!(with_build_keys.unknown_keys.is_empty());
+        assert!(
+            !plain.artifacts.is_empty()
+                && plain.capabilities.is_some()
+                && plain.inference.is_some(),
+            "the fixture must populate the blocks the comparison below rests on, or it \
+             compares absence against absence"
+        );
         assert_eq!(with_build_keys.name, plain.name);
         assert_eq!(with_build_keys.version, plain.version);
         assert_eq!(with_build_keys.artifacts, plain.artifacts);

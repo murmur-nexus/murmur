@@ -37,6 +37,12 @@ requires_files:
 
 The manifest `mur run` reads.
 
+One `murmur.yaml` can be both manifests at once: a capsule you also publish carries the
+[artifact manifest](#artifact-manifest) fields beside the capsule fields below. `mur run` and
+`mur doctor` accept `runtime`, `implementation`, `execution` and `requires_files`, take no
+run-time meaning from them, and do not report them as unrecognized keys
+([`W-SEC-019`](diagnostics.md#w-sec-019)).
+
 ### Supported shape
 
 ```yaml

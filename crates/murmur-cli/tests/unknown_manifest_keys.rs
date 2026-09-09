@@ -229,8 +229,8 @@ fn every_build_side_key_warns_on_neither_surface() {
     assert!(warning_lines(&doctor_stderr(&home, dir.path())).is_empty());
 }
 
-/// The warning is narrowed, not switched off: a key no command reads still reports, alone, and
-/// both surfaces still print the same bytes for it.
+/// `W-SEC-019` still covers every key no command reads: one sitting beside the four build-side
+/// keys reports alone, and both surfaces print the same bytes for it.
 #[test]
 fn a_genuinely_unknown_key_survives_beside_the_build_side_keys() {
     let home = TempDir::new().unwrap();
