@@ -220,7 +220,8 @@ result as a task
 | `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it |
 
 **`shell_abandoned`** — written once per demoted command the session ended without carrying its
-result back, whether it was still running at the sweep or finished during teardown
+result back, whether it was still running when the session ended or finished while it was shutting
+down
 
 | Field | Type | Notes |
 |---|---|---|

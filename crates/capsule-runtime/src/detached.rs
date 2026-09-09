@@ -51,6 +51,8 @@ pub(crate) struct DetachedWork {
     pub binary: String,
     /// The command text the model supplied, without the binary name.
     pub command: String,
+    /// When the command was spawned, not when it was demoted — the foreground grace period counts
+    /// as running time, so this lines up with the `duration_ms` a completion carries.
     pub started_at_ms: u64,
 }
 
@@ -283,6 +285,9 @@ pub(crate) enum AbandonedDisposition {
         output_path: String,
         output_bytes: u64,
         resource_limit: Option<String>,
+        /// Set only when the wait itself failed, as on [`DetachedCompletion::error`]. Without it a
+        /// report can read `status: error` with an exit code of `0` and no reason for either.
+        wait_error: Option<String>,
         /// [`DetachedCompletion::status`] of the completion this was built from.
         status: &'static str,
     },
@@ -365,6 +370,7 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
                 output_path,
                 output_bytes,
                 resource_limit,
+                wait_error,
                 status,
             } => {
                 text.push_str(&format!(
@@ -374,6 +380,9 @@ pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWo
                 ));
                 if let Some(limit) = resource_limit {
                     text.push_str(&format!("resource_limit: {limit}\n"));
+                }
+                if let Some(error) = wait_error {
+                    text.push_str(&format!("wait_error: {error}\n"));
                 }
                 text.push_str(&format!(
                     "output: {output_path} ({output_bytes} bytes, in the capsule workdir)\n\
@@ -888,6 +897,7 @@ mod tests {
                 output_path: output_path_for(work_id),
                 output_bytes: 91,
                 resource_limit: None,
+                wait_error: None,
                 status: "ok",
             },
         }
@@ -996,6 +1006,25 @@ mod tests {
             Some((0, "logs/wrk_0c2d.log", 91)),
             "the exit code, the output path and its byte count travel together"
         );
+    }
+
+    /// A wait that itself failed is named. It is what turns `status` to `"error"` on a command
+    /// that exited zero, so a report carrying the status without the reason states a failure and
+    /// withholds the only thing that explains it.
+    #[test]
+    fn a_failed_wait_is_named_beside_the_status_it_explains() {
+        let mut work = finished_too_late("wrk_0c2d");
+        if let AbandonedDisposition::FinishedTooLate {
+            wait_error, status, ..
+        } = &mut work.disposition
+        {
+            *wait_error = Some("no child processes".to_string());
+            *status = "error";
+        }
+        let text = abandonment_report_text("ses_abc", &[work]);
+
+        assert!(text.contains("status: error"), "{text}");
+        assert!(text.contains("wait_error: no child processes"), "{text}");
     }
 
     /// The clean-exit report must not read like [`LostReport::message_text`]: that text asserts

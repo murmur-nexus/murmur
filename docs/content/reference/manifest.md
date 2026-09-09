@@ -1425,8 +1425,8 @@ lifecycle:
 #### When a session ends with a command still running
 
 The session does not wait and does not kill: the command keeps running, detached, and the runtime
-stops owning its result. What changes is that the discard is stated. One report goes to stderr and
-to `logs/bootstrap.log` under the [capsule workdir](workdir.md), naming every discarded command's
+stops owning its result. The discard is stated rather than left silent. One report goes to stderr
+and to `logs/bootstrap.log` under the [capsule workdir](workdir.md), naming every discarded command's
 work id, binary, command text and how long it had been running, and each command also gets a
 [`shell_abandoned`](observability-schemas.md#session-trace-tracejsonl) line in `trace.jsonl`.
 
@@ -1455,6 +1455,11 @@ exit_code: 0
 output: logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log (91 bytes, in the capsule workdir)
 result: on disk — it finished too late for any task to carry it back to the agent.
 ```
+
+`status` is `ok` only for a clean, zero exit with nothing attributed against it. A `resource_limit`
+line names the ceiling a command was stopped against, and a `wait_error` line names a failure in
+waiting for the command rather than in the command itself; either explains a `status: error` that
+the exit code alone does not.
 
 #### What a backgrounded command costs when the host dies
 

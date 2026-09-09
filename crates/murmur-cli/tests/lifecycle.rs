@@ -1030,8 +1030,8 @@ fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
 }
 
 /// A command that finishes inside the grace period is untouched on every surface: no
-/// `shell_detached`, no `shell_abandoned`, and no abandonment report block. The regression guard
-/// on the whole change.
+/// `shell_detached`, no `shell_abandoned`, and no abandonment report block. Demotion is what the
+/// abandonment machinery hangs off, so a command that never demotes must reach none of it.
 #[test]
 fn lifecycle_a_command_inside_the_grace_period_is_reported_nowhere() {
     if capsule_runtime::skip_without_host_support(

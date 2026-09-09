@@ -77,6 +77,19 @@ pub struct LifecycleConfig {
     pub delegation_deadline_secs: u64,
 }
 
+impl LifecycleConfig {
+    /// Whether a session under this lifecycle is still there to receive work that arrives after
+    /// the task which started it ended — a demoted shell command's completion, a delegation's
+    /// outcome.
+    ///
+    /// `queue` + `sleep` is the only combination that qualifies, and the delegation lane and the
+    /// shell lane must agree on it: a capsule warned about one and not the other would be told its
+    /// lifecycle is both adequate and inadequate for the same reason.
+    pub fn can_receive_background_tasks(&self) -> bool {
+        self.task_acceptance == TaskAcceptance::Queue && self.after_task == AfterTask::Sleep
+    }
+}
+
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {

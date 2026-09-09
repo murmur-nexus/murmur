@@ -1932,8 +1932,7 @@ pub fn launch_session(
                                     // timeout. The host (mur-roost) is responsible for shutdown.
                                     // All other modes apply MURMUR_A2A_TIMEOUT_SECS (default 30 s).
                                     let is_queue_sleep =
-                                        matches!(effective_lifecycle.task_acceptance, TaskAcceptance::Queue)
-                                        && matches!(effective_lifecycle.after_task, AfterTask::Sleep);
+                                        effective_lifecycle.can_receive_background_tasks();
 
                                     loop {
                                         // Detached shell commands that finished are turned into
@@ -2327,6 +2326,7 @@ pub fn launch_session(
                                         output_path: completion.output_path,
                                         output_bytes: completion.output_bytes,
                                         resource_limit: completion.resource_limit,
+                                        wait_error: completion.error,
                                         status,
                                     },
                                 });
@@ -2911,9 +2911,8 @@ pub(crate) fn unreachable_delegation_outcomes_warning(
     can_delegate: bool,
     lifecycle: &LifecycleConfig,
 ) -> Option<(&'static str, &'static str)> {
-    let can_receive = lifecycle.task_acceptance == TaskAcceptance::Queue
-        && lifecycle.after_task == AfterTask::Sleep;
-    (can_delegate && !can_receive).then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
+    (can_delegate && !lifecycle.can_receive_background_tasks())
+        .then_some((W_SEC_020, NO_COMPLETION_LANE_WARNING))
 }
 
 /// Fires at every launch, not just once.
@@ -2952,9 +2951,8 @@ pub(crate) fn unreachable_shell_completions_warning(
     can_run_shell: bool,
     lifecycle: &LifecycleConfig,
 ) -> Option<(&'static str, &'static str)> {
-    let can_receive = lifecycle.task_acceptance == TaskAcceptance::Queue
-        && lifecycle.after_task == AfterTask::Sleep;
-    (can_run_shell && !can_receive).then_some((W_SEC_022, NO_SHELL_COMPLETION_LANE_WARNING))
+    (can_run_shell && !lifecycle.can_receive_background_tasks())
+        .then_some((W_SEC_022, NO_SHELL_COMPLETION_LANE_WARNING))
 }
 
 /// Fires at every launch, not just once.

@@ -523,7 +523,19 @@ fn demote(
             work_id: work_id.clone(),
             binary: context.resolved_binary.clone(),
             command: context.policy.command.clone(),
-            started_at_ms: crate::trace::timestamp_ms(),
+            // The spawn instant, not this one. Demotion happens a whole grace period after the
+            // command started, and every reader of this field — the cancel residue, the
+            // session-end sweep's `running_ms` — reports it as how long the command has been
+            // running, which must include the foreground portion to match the `duration_ms` a
+            // completion carries.
+            started_at_ms: crate::trace::timestamp_ms().saturating_sub(
+                context
+                    .started
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
         });
 
     let provenance = context.policy.completion_provenance();
