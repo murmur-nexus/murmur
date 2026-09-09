@@ -49,6 +49,12 @@ libseccomp = "0.4"
 # depends on running inside a tokio runtime.
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
+[features]
+# Exposes `alloc_bench`, the timing harness `mur-alloc-bench` runs to compare global
+# allocators. Off by default: a normal build compiles neither the module nor the second
+# binary in `murmur-cli` that calls it.
+alloc-bench = []
+
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 tempfile = "3"

@@ -11,6 +11,13 @@ readme.workspace = true
 name = "mur"
 path = "src/main.rs"
 
+# Hand-run only. `required-features` keeps it out of `cargo build --release` and out of every
+# release artifact; `scripts/alloc-bench.sh` is the thing that asks for it.
+[[bin]]
+name = "mur-alloc-bench"
+path = "src/bin/alloc_bench.rs"
+required-features = ["alloc-bench"]
+
 [dependencies]
 bytes = "1"
 console = "0.16"
@@ -34,6 +41,18 @@ tracing = { version = "0.1", default-features = false, features = ["release_max_
 log = { version = "0.4", default-features = false, features = ["release_max_level_off"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Candidate global allocators, one selected by the `jemalloc`/`mimalloc` features below and
+# declared in `src/allocator.rs`. Both build C sources; `cc` and `ar` are already needed by
+# `ring` and `wasmtime` in every build, but jemalloc runs its own `configure` and `make`, so
+# the `jemalloc` feature additionally needs `make` on PATH.
+# `default-features = false` drops `background_threads_runtime_support`, which builds jemalloc
+# with background threads compiled out rather than merely defaulted off. A background thread
+# would be counted by `resources::uid_task_count()` against the `RLIMIT_NPROC` baseline and
+# could hold a malloc lock across the forks in `sandbox.rs` and `staged_runtime.rs`.
+tikv-jemallocator = { version = "0.7", default-features = false, optional = true }
+# `default-features = false` for the same reason: an explicit, empty feature list rather than
+# whatever the crate defaults to.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
@@ -46,6 +65,13 @@ beta-mur-deploy = ["beta"]
 beta-mur-topology = ["beta"]
 # beta-blueprint = ["beta"]
 # beta-dag-topology = ["beta"]
+# Mutually exclusive in effect, not in Cargo: `--all-features` turns both on, and
+# `src/allocator.rs` resolves the pair in favour of `jemalloc`. Neither is in `default`:
+# on glibc neither is faster than the system allocator by enough to ship.
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
+# Builds the `mur-alloc-bench` measurement binary and the runtime module it times.
+alloc-bench = ["capsule-runtime/alloc-bench"]
 
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }

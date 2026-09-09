@@ -3296,7 +3296,7 @@ fn warn_on_inert_native_config(artifact_name: &str, config: Option<&serde_yaml::
 /// entries. It only arms the mechanism: a deadline fires solely when some store has called
 /// `set_epoch_deadline` *and* an [`EpochTicker`] is advancing this engine's epoch, both of
 /// which `stage_session` sets up.
-fn build_engine() -> Result<Engine, RuntimeError> {
+pub(crate) fn build_engine() -> Result<Engine, RuntimeError> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.epoch_interruption(true);

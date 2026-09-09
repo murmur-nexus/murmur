@@ -102,6 +102,35 @@ since a CI runner provides neither; the job's step summary reports how many test
 that reason and points at
 `docs/content/reference/resource-limits-manual-verification.md`, which covers them by hand.
 
+## Optional allocator features
+
+A default build of `mur` uses the system allocator. Two optional features on `murmur-cli` swap in
+a different one, and a third builds the tool that compares them:
+
+| Feature | Effect |
+|---|---|
+| `jemalloc` | `mur` allocates through jemalloc |
+| `mimalloc` | `mur` allocates through mimalloc, unless `jemalloc` is also on, which wins |
+| `alloc-bench` | Builds the `mur-alloc-bench` binary, which times component compilation and the runtime's per-session allocation churn |
+
+Every build of `mur` already needs a C compiler, because some of its dependencies ship C and
+assembly. `jemalloc` adds one more tool: it configures and builds jemalloc from source, so
+`--features jemalloc` and any `--all-features` build also need `make` on `PATH`.
+
+To compare the three allocators on your own machine:
+
+```bash
+scripts/alloc-bench.sh                      # 15 rounds, ~10 minutes with a warm target directory
+scripts/alloc-bench.sh --cpu 3 --rounds 21  # different core, more rounds
+```
+
+The script builds all three configurations into separate target directories, runs them one round
+each per pass pinned to a single core with `taskset`, and prints a table of median component
+compile time and median per-session allocation time with the per-round spread. Raw per-round
+figures are left at `target/alloc-bench/rounds.tsv`. The measurement resolves differences of a few
+percent, so run it on an otherwise idle machine: when the system row's own min/max spans more than
+about 10%, the run is measuring the scheduler rather than the allocator.
+
 ## Formatting and lints
 
 CI also runs a `lint` job on every push and pull request:
@@ -113,6 +142,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Run both locally before submitting a PR. `--all-features` includes the beta CLI surfaces
 (`topology_cmd`, `deploy_cmd`) in the clippy pass, so a change gated behind a beta feature is
-still checked. An `#[allow(...)]` is acceptable when the lint's default judgment is wrong at that
-specific site, but it needs a comment saying why — a bare `#[allow(...)]` with no justification,
-or a crate-level `#![allow(...)]`, will not pass review.
+still checked; it also turns on the allocator features above. An `#[allow(...)]` is acceptable
+when the lint's default judgment is wrong at that specific site, but it needs a comment saying why
+— a bare `#[allow(...)]` with no justification, or a crate-level `#![allow(...)]`, will not pass
+review.
