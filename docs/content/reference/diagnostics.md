@@ -102,6 +102,7 @@ section that explains it.
 | `W-SEC-019` | A key in `murmur.yaml` this build does not recognize was parsed and ignored | [W-SEC-019](#w-sec-019) |
 | `W-SEC-020` | The capsule can delegate, and its `lifecycle` block cannot receive a delegation's outcome | [W-SEC-020](#w-sec-020) |
 | `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
+| `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 
 ---
 
@@ -904,7 +905,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
@@ -1613,3 +1614,42 @@ enforced on the scope and stay fatal on failure. See
 `mur run --explain-scope --json` and in `session_start.effective_grants` in `trace.jsonl`. Move the
 project onto a block-device-backed filesystem if an I/O bound matters for this capsule; otherwise
 the warning is a report and the session is bounded by memory, pids and CPU as declared.
+
+### W-SEC-022 — a shell-running capsule cannot receive a completion { #w-sec-022 }
+
+**Fires when:** `capabilities.shell.allow` is non-empty and the resolved `lifecycle` block cannot
+take an inbound completion — [`lifecycle.after_task`](manifest.md#lifecycle-after-task) is `exit`,
+or [`lifecycle.task_acceptance`](manifest.md#lifecycle-task-acceptance) is anything but `queue`.
+Once per launch, on stderr and in the session's `logs/bootstrap.log`.
+
+```text
+[capsule-runtime] warning[W-SEC-022]: this capsule declares capabilities.shell.allow, but its lifecycle block cannot receive a background command's completion: a shell command that outruns lifecycle.shell_grace_secs is demoted to the background, and its exit code and output path arrive afterwards as a background task. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep, or every command this capsule demotes will be discarded at session end and reported to the operator instead of to the agent. (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-022)
+```
+
+**Why it matters:** every shell command starts in the foreground, and one that outruns
+[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs) is demoted: the turn gets a
+`wrk_` handle, and the exit code and output path arrive afterwards as a `completion`-origin task in
+the `bg` lane. Under the default lifecycle the session ends with the task that started the command,
+so the command keeps running with nothing reading its result. The compute is spent and the agent
+never learns the answer.
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The command still
+runs and still writes its output; only the completion has nowhere to land. At session end the
+discard is stated to the operator — see
+[When a session ends with a command still running](manifest.md#lifecycle-shell-grace-secs).
+
+**What to do:** declare a lifecycle that outlives the task which started the command.
+
+```yaml
+lifecycle:
+  task_acceptance: queue
+  queue_depth: 4
+  after_task: sleep
+```
+
+The warning does not read `lifecycle.shell_grace_secs`, and no value of it silences the warning:
+`0` demotes on the first check after the spawn, so a low grace makes the discard more likely rather
+than less. A capsule that fires a command and deliberately does not wait — one that starts work and
+exits — is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
+declaring `capabilities.shell.allow` on a capsule that runs no commands.
+

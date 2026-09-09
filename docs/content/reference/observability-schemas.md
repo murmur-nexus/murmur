@@ -219,17 +219,31 @@ result as a task
 | `status` | string | `"ok"` \| `"error"`. `"error"` for a non-zero exit, a signal kill, an attributed `resource_limit`, or a wait that itself failed |
 | `completion_task_id` | string | The `task_id` of the `completion`-origin task this result was enqueued as, so a reader can join a command to the task that reported it |
 
-**`shell_abandoned`** — written once per demoted command still running when the session ends
+**`shell_abandoned`** — written once per demoted command the session ended without carrying its
+result back, whether it was still running at the sweep or finished during teardown
 
 | Field | Type | Notes |
 |---|---|---|
 | `work_id` | string | The `shell_detached` line's `work_id` |
 | `binary` | string | As on `shell` |
 | `command` | string | As on `shell` |
-| `running_ms` | u64 | How long the command had been running when the session gave up on it |
+| `running_ms` | u64 | How long the command had been running when the session gave up on it. For one that finished during teardown, its full duration from spawn to exit |
+| `exit_code` | i32 | As on `shell_completed`. Written only for a command that finished during teardown; absent for one still running |
+| `output_path` | string | As on `shell_completed`. Present exactly when `exit_code` is |
+| `output_bytes` | u64 | As on `shell_completed`. Present exactly when `output_path` is |
 
-The command's result is lost. The session does not wait for it, and the same line is announced on
-the process's stderr.
+The last three are omitted rather than written as `null`, so a command still running produces a
+line carrying only the first four fields — `null` would read as a known-absent exit code rather
+than an unknown one. Their absence means no exit code exists and no `logs/<work_id>.log` was
+written or ever will be: that file is written from the command's own runtime thread after the
+command exits, and that thread ends with the session.
+
+No task carries the result either way. The session does not wait for the command and does not kill
+it, and one grouped report naming every discarded command is written to stderr and to
+`logs/bootstrap.log` under the [capsule workdir](workdir.md) — see
+[`lifecycle.shell_grace_secs`](manifest.md#lifecycle-shell-grace-secs). A capsule whose `lifecycle`
+block cannot receive a completion at all is warned before the run with
+[`W-SEC-022`](diagnostics.md#w-sec-022).
 
 **`shell_lost`** — written once per demoted command a later `mur run --resume` found with no
 `shell_completed` and no `shell_abandoned`, and appended to the `trace.jsonl` of the session that

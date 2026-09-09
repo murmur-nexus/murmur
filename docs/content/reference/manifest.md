@@ -1410,15 +1410,50 @@ lane, carrying the exit code and the output path. A non-zero exit, a signal kill
 [`shell_completed`](observability-schemas.md#session-trace-tracejsonl) record.
 
 That completion reaches only a capsule that outlives the task which started the command. Under
-the default `after_task: exit` the session ends when the task does, and a command still running
-is recorded as `shell_abandoned` and its result is lost. A capsule that means to receive
-completions declares `task_acceptance: queue` and `after_task: sleep`:
+the default `after_task: exit` the session ends when the task does, and nothing arrives; a capsule
+that runs shell commands and leaves its `lifecycle` block that way is warned at launch with
+[`W-SEC-022`](diagnostics.md#w-sec-022). A capsule that means to receive completions declares
+`task_acceptance: queue` and `after_task: sleep`:
 
 ```yaml
 lifecycle:
   task_acceptance: queue
   after_task: sleep
   shell_grace_secs: 2
+```
+
+#### When a session ends with a command still running
+
+The session does not wait and does not kill: the command keeps running, detached, and the runtime
+stops owning its result. What changes is that the discard is stated. One report goes to stderr and
+to `logs/bootstrap.log` under the [capsule workdir](workdir.md), naming every discarded command's
+work id, binary, command text and how long it had been running, and each command also gets a
+[`shell_abandoned`](observability-schemas.md#session-trace-tracejsonl) line in `trace.jsonl`.
+
+```text
+[capsule-runtime] 1 background shell command discarded at session end.
+
+Session ses_01k4m2y7xq8f9v3n5r7t9w1c2e ended while 1 demoted shell command was unaccounted for. Nothing was waited for and nothing was killed; what is known about each is below.
+
+work_id: wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2
+binary: /usr/bin/bash
+command: sleep 45; echo done
+state: still running after 45012 ms
+result: none — no exit code, and no logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log will be written, because the thread that writes it ended with this session.
+
+A command still running keeps running, detached from this session, with nothing reading its output. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: sleep for a session that outlives its task and can be told the result instead.
+```
+
+A command that finishes during teardown — too late for any task to carry its result, but with its
+exit code and `logs/<work_id>.log` already written — is reported with that better information
+instead:
+
+```text
+state: finished during teardown after 2014 ms
+status: ok
+exit_code: 0
+output: logs/wrk_0199a3f1c2d47e8ab5c6d7e8f9a0b1c2.log (91 bytes, in the capsule workdir)
+result: on disk — it finished too late for any task to carry it back to the agent.
 ```
 
 #### What a backgrounded command costs when the host dies

@@ -206,6 +206,22 @@ pub const W_SEC_020: &str = "W-SEC-020";
 /// carry.
 pub const W_SEC_021: &str = "W-SEC-021";
 
+/// `capabilities.shell.allow` is non-empty and the declared `lifecycle` block cannot receive a
+/// background command's completion, so every command this capsule demotes is discarded when the
+/// session ends.
+///
+/// A shell command that outruns `lifecycle.shell_grace_secs` is demoted: the turn gets a handle
+/// and the exit code, duration and output path arrive afterwards as a `completion`-origin task in
+/// the background lane. A capsule that leaves `lifecycle.after_task` at `exit`, or sets
+/// `lifecycle.task_acceptance` to anything but `queue`, has no session left by then, so the
+/// teardown sweep reports the discard to the operator instead of to the agent. Silenced by
+/// declaring `lifecycle.task_acceptance: queue` with `lifecycle.after_task: sleep`. Not
+/// conditioned on `lifecycle.shell_grace_secs`: `0` demotes on the first check after the spawn, so
+/// no value of it turns demotion off. Never a refusal: a capsule that fires a command and
+/// deliberately does not wait is legitimate, and the warning is what makes that a choice rather
+/// than an accident.
+pub const W_SEC_022: &str = "W-SEC-022";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -225,7 +241,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021,
+            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

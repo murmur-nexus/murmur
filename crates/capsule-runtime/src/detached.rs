@@ -254,6 +254,143 @@ impl DetachPolicy {
     }
 }
 
+// -- Work a clean exit discarded ---------------------------------------------
+
+/// What the teardown sweep knows about one discarded command.
+///
+/// The two arms are the two places a command can be caught by the sweep, and they are told apart
+/// because what is known differs: a command still running has nothing on disk and never will,
+/// while one that finished between the task loop's last read and the sweep has an exit code and a
+/// written output log that no task will ever carry back.
+#[derive(Debug, Clone)]
+pub(crate) enum AbandonedDisposition {
+    /// Running when the session ended. No exit code exists, and no `logs/<work_id>.log` will be
+    /// written: [`crate::shell`] writes that file from the command's own runtime thread after
+    /// `child.wait()` returns, and that thread ends with the process.
+    StillRunning {
+        /// From spawn to the sweep, foreground portion included.
+        running_ms: u64,
+    },
+    /// Finished during teardown, after the task loop stopped reading completions. Everything a
+    /// `shell_completed` would have carried exists; only the task that would have carried it does
+    /// not.
+    FinishedTooLate {
+        exit_code: i32,
+        /// From spawn to exit, foreground portion included.
+        duration_ms: u64,
+        /// Workdir-relative, always `logs/<work_id>.log`, and on disk by the time this arm is
+        /// built.
+        output_path: String,
+        output_bytes: u64,
+        resource_limit: Option<String>,
+        /// [`DetachedCompletion::status`] of the completion this was built from.
+        status: &'static str,
+    },
+}
+
+/// One discarded command, as the operator report and the `shell_abandoned` record both read it.
+#[derive(Debug, Clone)]
+pub(crate) struct AbandonedWork {
+    pub work_id: String,
+    /// As [`DetachedWork::binary`].
+    pub binary: String,
+    /// As [`DetachedWork::command`] — the text the model wrote, which the operator needs to know
+    /// what was actually left running.
+    pub command: String,
+    pub disposition: AbandonedDisposition,
+}
+
+impl AbandonedWork {
+    /// How long the command ran, whichever arm it was caught in — the `running_ms` of its
+    /// `shell_abandoned` line.
+    pub(crate) fn running_ms(&self) -> u64 {
+        match &self.disposition {
+            AbandonedDisposition::StillRunning { running_ms } => *running_ms,
+            AbandonedDisposition::FinishedTooLate { duration_ms, .. } => *duration_ms,
+        }
+    }
+
+    /// The exit code, output path and byte count, or `None` for a command still running.
+    ///
+    /// The three travel together because they exist together: a command with an exit code has a
+    /// written log, and one without has neither.
+    pub(crate) fn recovered(&self) -> Option<(i32, &str, u64)> {
+        match &self.disposition {
+            AbandonedDisposition::StillRunning { .. } => None,
+            AbandonedDisposition::FinishedTooLate {
+                exit_code,
+                output_path,
+                output_bytes,
+                ..
+            } => Some((*exit_code, output_path.as_str(), *output_bytes)),
+        }
+    }
+}
+
+/// The grouped operator report for every command one session discarded, as it lands on stderr and
+/// in `logs/bootstrap.log`.
+///
+/// One block for the whole session rather than a line per command: a session that discarded ten
+/// commands must state the condition once and then enumerate, or the condition is lost in the
+/// enumeration. Deliberately **not** [`LostReport::message_text`] — that text asserts nothing was
+/// recovered and nothing can be, which is false here: this session's registry was alive, so the
+/// running time is known, and a command that finished during teardown has its exit code and its
+/// output log on disk.
+pub(crate) fn abandonment_report_text(session_id: &str, abandoned: &[AbandonedWork]) -> String {
+    let count = abandoned.len();
+    let plural = if count == 1 { "command" } else { "commands" };
+    let mut text = format!(
+        "[capsule-runtime] {count} background shell {plural} discarded at session end.\n\n\
+         Session {session_id} ended while {count} demoted shell {plural} {} unaccounted for. \
+         Nothing was waited for and nothing was killed; what is known about each is below.\n",
+        if count == 1 { "was" } else { "were" }
+    );
+    for work in abandoned {
+        text.push_str(&format!(
+            "\nwork_id: {}\nbinary: {}\ncommand: {}\n",
+            work.work_id, work.binary, work.command
+        ));
+        match &work.disposition {
+            AbandonedDisposition::StillRunning { running_ms } => {
+                text.push_str(&format!(
+                    "state: still running after {running_ms} ms\n\
+                     result: none — no exit code, and no {} will be written, because the thread \
+                     that writes it ended with this session.\n",
+                    output_path_for(&work.work_id)
+                ));
+            }
+            AbandonedDisposition::FinishedTooLate {
+                exit_code,
+                duration_ms,
+                output_path,
+                output_bytes,
+                resource_limit,
+                status,
+            } => {
+                text.push_str(&format!(
+                    "state: finished during teardown after {duration_ms} ms\n\
+                     status: {status}\n\
+                     exit_code: {exit_code}\n"
+                ));
+                if let Some(limit) = resource_limit {
+                    text.push_str(&format!("resource_limit: {limit}\n"));
+                }
+                text.push_str(&format!(
+                    "output: {output_path} ({output_bytes} bytes, in the capsule workdir)\n\
+                     result: on disk — it finished too late for any task to carry it back to the \
+                     agent.\n"
+                ));
+            }
+        }
+    }
+    text.push_str(
+        "\nA command still running keeps running, detached from this session, with nothing \
+         reading its output. Declare lifecycle.task_acceptance: queue with lifecycle.after_task: \
+         sleep for a session that outlives its task and can be told the result instead.",
+    );
+    text
+}
+
 // -- Work a dead session left unaccounted ------------------------------------
 
 /// A demoted command whose session died before anything could be recorded about it.
@@ -727,5 +864,148 @@ mod tests {
             sources.len()
         );
         sources
+    }
+
+    // ── The operator's abandonment report ────────────────────────────────────
+
+    fn still_running(work_id: &str, running_ms: u64) -> AbandonedWork {
+        AbandonedWork {
+            work_id: work_id.to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "sleep 45; echo done".to_string(),
+            disposition: AbandonedDisposition::StillRunning { running_ms },
+        }
+    }
+
+    fn finished_too_late(work_id: &str) -> AbandonedWork {
+        AbandonedWork {
+            work_id: work_id.to_string(),
+            binary: "/usr/bin/bash".to_string(),
+            command: "sleep 2; echo done".to_string(),
+            disposition: AbandonedDisposition::FinishedTooLate {
+                exit_code: 0,
+                duration_ms: 2_014,
+                output_path: output_path_for(work_id),
+                output_bytes: 91,
+                resource_limit: None,
+                status: "ok",
+            },
+        }
+    }
+
+    /// A command still running is reported with the four things that are known about it, and is
+    /// told plainly that its output file will never exist — the runtime thread that writes it dies
+    /// with the process, so a report promising the file would send an operator looking for
+    /// something that never appears.
+    #[test]
+    fn a_still_running_command_is_reported_with_what_is_known_and_promises_no_file() {
+        let text = abandonment_report_text("ses_abc", &[still_running("wrk_0a1b", 45_012)]);
+
+        assert!(
+            text.contains("1 background shell command discarded"),
+            "{text}"
+        );
+        assert!(text.contains("Session ses_abc"), "{text}");
+        assert!(text.contains("work_id: wrk_0a1b"), "{text}");
+        assert!(text.contains("binary: /usr/bin/bash"), "{text}");
+        assert!(text.contains("command: sleep 45; echo done"), "{text}");
+        assert!(
+            text.contains("state: still running after 45012 ms"),
+            "{text}"
+        );
+        assert!(
+            text.contains("no logs/wrk_0a1b.log will be written"),
+            "{text}"
+        );
+        assert!(!text.contains("exit_code:"), "no exit code exists: {text}");
+    }
+
+    /// The `FinishedTooLate` arm names the exit code, the status, the duration and the real
+    /// output file, rather than being flattened into "still running, result lost". This is the
+    /// fidelity a clean exit has and a killed runtime does not.
+    #[test]
+    fn a_command_that_finished_during_teardown_is_reported_with_its_result() {
+        let text = abandonment_report_text("ses_abc", &[finished_too_late("wrk_0c2d")]);
+
+        assert!(
+            text.contains("state: finished during teardown after 2014 ms"),
+            "{text}"
+        );
+        assert!(text.contains("status: ok"), "{text}");
+        assert!(text.contains("exit_code: 0"), "{text}");
+        assert!(
+            text.contains("output: logs/wrk_0c2d.log (91 bytes, in the capsule workdir)"),
+            "{text}"
+        );
+        assert!(!text.contains("still running after"), "{text}");
+    }
+
+    /// One block for the session, then one entry per command: a session that discarded several
+    /// states the condition once and enumerates below it.
+    #[test]
+    fn the_report_states_the_condition_once_and_enumerates_every_command() {
+        let text = abandonment_report_text(
+            "ses_abc",
+            &[still_running("wrk_0a1b", 12), finished_too_late("wrk_0c2d")],
+        );
+
+        assert_eq!(
+            text.matches("2 background shell commands discarded")
+                .count(),
+            1
+        );
+        assert_eq!(text.matches("work_id: ").count(), 2);
+        assert!(text.contains("wrk_0a1b"), "{text}");
+        assert!(text.contains("wrk_0c2d"), "{text}");
+    }
+
+    /// An attributed resource limit rides along, on the same terms
+    /// [`DetachedCompletion::message_text`] carries it.
+    #[test]
+    fn an_attributed_resource_limit_is_named_in_the_report() {
+        let mut work = finished_too_late("wrk_0c2d");
+        if let AbandonedDisposition::FinishedTooLate {
+            resource_limit,
+            exit_code,
+            status,
+            ..
+        } = &mut work.disposition
+        {
+            *resource_limit = Some("memory".to_string());
+            *exit_code = 137;
+            *status = "error";
+        }
+        let text = abandonment_report_text("ses_abc", &[work]);
+
+        assert!(text.contains("resource_limit: memory"), "{text}");
+        assert!(text.contains("status: error"), "{text}");
+        assert!(text.contains("exit_code: 137"), "{text}");
+    }
+
+    /// `running_ms` and `recovered` are what the `shell_abandoned` line is written from, so the
+    /// two arms must disagree on `recovered` and agree on carrying a duration.
+    #[test]
+    fn only_a_command_that_finished_carries_a_recovered_result() {
+        assert_eq!(still_running("wrk_0a1b", 45_012).running_ms(), 45_012);
+        assert!(still_running("wrk_0a1b", 45_012).recovered().is_none());
+
+        let finished = finished_too_late("wrk_0c2d");
+        assert_eq!(finished.running_ms(), 2_014);
+        assert_eq!(
+            finished.recovered(),
+            Some((0, "logs/wrk_0c2d.log", 91)),
+            "the exit code, the output path and its byte count travel together"
+        );
+    }
+
+    /// The clean-exit report must not read like [`LostReport::message_text`]: that text asserts
+    /// nothing was recovered and nothing can be, which is false here.
+    #[test]
+    fn the_report_does_not_claim_nothing_is_recoverable() {
+        let text = abandonment_report_text("ses_abc", &[still_running("wrk_0a1b", 12)]);
+        assert!(
+            !text.contains("Nothing about them was recovered"),
+            "the clean-exit report is not the crash report: {text}"
+        );
     }
 }

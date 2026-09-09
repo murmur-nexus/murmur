@@ -930,3 +930,257 @@ fn lifecycle_a_completion_waits_behind_a_peer_request() {
     );
     assert_eq!(starts[2]["lane"], "bg");
 }
+
+/// The abandonment report block in `logs/bootstrap.log`, or `None` if the sweep wrote none.
+///
+/// Read from `bootstrap.log` rather than `trace.jsonl` on purpose: under `after_task: exit` there
+/// is no turn left to tell the agent in, so the operator's surfaces are the whole delivery.
+fn abandonment_report(workdir: &Path) -> Option<String> {
+    let log = fs::read_to_string(workdir.join("logs").join("bootstrap.log")).ok()?;
+    let start = log.find("background shell command")?;
+    Some(log[start..].to_string())
+}
+
+/// Block until `logs/bootstrap.log` holds an abandonment report, or fail naming what it does hold.
+fn wait_for_abandonment_report(workdir: &Path, seconds: u64) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        if let Some(report) = abandonment_report(workdir) {
+            return report;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for an abandonment report; logs/bootstrap.log holds: {}",
+            fs::read_to_string(workdir.join("logs").join("bootstrap.log")).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Under `after_task: exit` a command still running at session end is stated to the operator in
+/// full — the work id, the binary, the command text as the model wrote it, and how long it had
+/// been running — on a surface that is not `trace.jsonl`.
+#[test]
+fn lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_a_command_still_running_at_exit_is_reported_to_the_operator",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        bash_call_response("msg_1", "toolu_build", "sleep 45; echo done"),
+        end_turn_response("msg_2", "build started"),
+    ]);
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Exit,
+            queue_depth: 4,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    let workdir = staged.workdir.clone();
+    let trace_path = workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    http_post_json(
+        &capsule_url,
+        "/",
+        &message_send_body("task-build", "run the build"),
+    );
+
+    let events = wait_for_trace(&trace_path, 120, "the command to be demoted", |events| {
+        !events_named(events, "shell_detached").is_empty()
+    });
+    let work_id = events_named(&events, "shell_detached")[0]["work_id"]
+        .as_str()
+        .expect("a demoted command carries its work id")
+        .to_string();
+
+    let report = wait_for_abandonment_report(&workdir, 120);
+    assert!(report.contains(&work_id), "report was: {report}");
+    assert!(report.contains("bash"), "report was: {report}");
+    assert!(
+        report.contains("command: sleep 45; echo done"),
+        "the report names the command as the model wrote it; report was: {report}"
+    );
+    assert!(
+        report.contains("state: still running after"),
+        "the report says how long it had been running; report was: {report}"
+    );
+    assert!(
+        report.contains(&format!("no logs/{work_id}.log will be written")),
+        "the report must not promise a file that never appears; report was: {report}"
+    );
+}
+
+/// A command that finishes inside the grace period is untouched on every surface: no
+/// `shell_detached`, no `shell_abandoned`, and no abandonment report block. The regression guard
+/// on the whole change.
+#[test]
+fn lifecycle_a_command_inside_the_grace_period_is_reported_nowhere() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_a_command_inside_the_grace_period_is_reported_nowhere",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start(vec![
+        bash_call_response("msg_1", "toolu_quick", "echo quick"),
+        end_turn_response("msg_2", "ran it"),
+    ]);
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Exit,
+            queue_depth: 4,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    let workdir = staged.workdir.clone();
+    let trace_path = workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    http_post_json(
+        &capsule_url,
+        "/",
+        &message_send_body("task-quick", "run the quick one"),
+    );
+
+    let events = wait_for_trace(&trace_path, 120, "the session to end", |events| {
+        !events_named(events, "session_end").is_empty()
+    });
+
+    assert_eq!(
+        events_named(&events, "shell").len(),
+        1,
+        "the command ran in the foreground and its output went to the turn"
+    );
+    assert!(events_named(&events, "shell_detached").is_empty());
+    assert!(events_named(&events, "shell_abandoned").is_empty());
+    assert_eq!(
+        abandonment_report(&workdir),
+        None,
+        "nothing was discarded, so nothing is reported"
+    );
+}
+
+/// A command that finishes during teardown — after the task loop stopped reading completions and
+/// before the sweep drains the channel — is reported with what is known about it, not flattened
+/// into "still running, result lost".
+///
+/// The window is opened by holding every scripted response: the command is demoted a second after
+/// it spawns, finishes a second after that, and the end-turn response that breaks the task loop is
+/// still in flight for a second more. The sweep therefore finds nothing outstanding and one
+/// completion waiting on the channel.
+#[test]
+fn lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result() {
+    if capsule_runtime::skip_without_host_support(
+        "lifecycle_a_command_that_finished_during_teardown_is_reported_with_its_result",
+    ) {
+        return;
+    }
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            bash_call_response("msg_1", "toolu_build", "sleep 2; echo done"),
+            end_turn_response("msg_2", "build started"),
+        ],
+        std::time::Duration::from_secs(3),
+    );
+    let (home, manifest_path) = setup_shell_agent_project(&server.endpoint);
+
+    let staged = stage_agent(
+        &home,
+        &manifest_path,
+        Some(LifecycleConfig {
+            task_acceptance: TaskAcceptance::Queue,
+            after_task: AfterTask::Exit,
+            queue_depth: 4,
+            shell_grace_secs: 1,
+            ..Default::default()
+        }),
+        None,
+    );
+    let workdir = staged.workdir.clone();
+    let trace_path = workdir.join("trace.jsonl");
+
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let _ = launch_session(staged, move |url| {
+            let _ = url_tx.send(url.to_string());
+        });
+    });
+    let capsule_url = url_rx
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("timed out waiting for capsule_url");
+
+    http_post_json(
+        &capsule_url,
+        "/",
+        &message_send_body("task-build", "run the build"),
+    );
+
+    let report = wait_for_abandonment_report(&workdir, 180);
+    assert!(
+        report.contains("state: finished during teardown after"),
+        "report was: {report}"
+    );
+    assert!(report.contains("status: ok"), "report was: {report}");
+    assert!(report.contains("exit_code: 0"), "report was: {report}");
+
+    let events = wait_for_trace(&trace_path, 60, "the abandonment record", |events| {
+        !events_named(events, "shell_abandoned").is_empty()
+    });
+    let detached = events_named(&events, "shell_detached");
+    let abandoned = events_named(&events, "shell_abandoned");
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["work_id"], detached[0]["work_id"]);
+    assert_eq!(abandoned[0]["exit_code"], 0);
+    let work_id = detached[0]["work_id"].as_str().unwrap();
+    assert_eq!(
+        abandoned[0]["output_path"],
+        Value::String(format!("logs/{work_id}.log"))
+    );
+    assert!(
+        abandoned[0]["output_bytes"].as_u64().unwrap() > 0,
+        "the output log was written before the sweep ran: {}",
+        abandoned[0]
+    );
+    assert!(
+        workdir.join("logs").join(format!("{work_id}.log")).exists(),
+        "the report names a file that is on disk"
+    );
+    assert!(
+        events_named(&events, "shell_completed").is_empty(),
+        "no task carried the result, so nothing wrote shell_completed"
+    );
+}
