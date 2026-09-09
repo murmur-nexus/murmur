@@ -519,6 +519,7 @@ other path.
 | The child's session ended | The child, at the end of its own session | `ok` or `error` |
 | The child's process ended without recording a completion | The parent's launcher | `crashed` |
 | The parent ended the delegation itself | The parent's launcher, recorded and posted to nobody | `terminated` |
+| The child was still running at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) | The parent's launcher | `terminated` |
 
 Both reporters write the outcome to `completion.json` before posting it, and rewrite the file with
 what the posting did. Between those two writes the record reads `delivered: false` with no

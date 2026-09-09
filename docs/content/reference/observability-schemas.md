@@ -613,7 +613,7 @@ The sub-capsule's vocabulary, read out of the child's own
 | `"ok"` | The child's session finished, and reported so itself |
 | `"error"` | The child's session ran and failed, and reported so itself |
 | `"crashed"` | The child's process ended without recording a completion |
-| `"terminated"` | The parent ended the delegation itself |
+| `"terminated"` | The parent ended the delegation — by hand, or at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) |
 | `"unknown"` | A completion arrived, and the parent found no readable `completion.json` behind it. The parent's own word, and reachable on no other path |
 
 The delegating call's vocabulary, read out of the call's result:
@@ -621,8 +621,8 @@ The delegating call's vocabulary, read out of the call's result:
 | Value | Surface | Means |
 |---|---|---|
 | `"completed"` | `capsule` step only | The child answered the caller that was waiting for it |
-| `"timed_out"` | `capsule` step only | The child was still running at the delegation deadline and was stopped |
-| `"failed"` | either | The child was approved but never got far enough to answer |
+| `"timed_out"` | `capsule` step only | The child had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) and was stopped |
+| `"failed"` | either | The spawn was approved and no answer came back — a child that could not be launched or handed its task, or one whose own task failed |
 | `"refused"` | either | `mur-roost` refused the spawn, so no child was launched |
 
 **`ok` and `completed` are the only two values that say the sub-capsule did the work** — `ok` from
