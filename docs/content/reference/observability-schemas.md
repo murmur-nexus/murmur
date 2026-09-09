@@ -591,24 +591,53 @@ from the parent's side whatever happens next. A delegation the daemon refused wr
 | `delegation_id` | string \| null | `dlg_…`, the id the delegation is named by. `null` whenever no child was launched: a delegation the daemon refused, or one that was never started, was never made |
 | `child_session_id` | string \| null | `ses_…`, the child's own session, so its trace is findable. `null` when no child ran |
 | `duration_ms` | u64 | How long the child ran, on an outcome; how long the call took, on one that never started |
-| `outcome` | string | One of the values in the table below |
-| `reason` | string \| null | `null` on `"ok"` and `"completed"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
+| `outcome` | string | How the delegation ended, in one of two vocabularies — see [Which outcome vocabulary applies](#delegation-outcome) |
+| `reason` | string \| null | `null` on `"ok"`, `"error"` and `"completed"`; otherwise one sentence — the sub-capsule's `detail`, or the sentence the model was given |
 
-`outcome` values:
+### Which outcome vocabulary applies { #delegation-outcome }
+
+`outcome` is drawn from the sub-capsule's own vocabulary exactly when a
+[`delegate-task`](runtime-provided-tools.md) call started a child and that child's outcome came
+back as a completion. In every other case — a plan [`capsule` step](plans.md), or a `delegate-task`
+call whose child never started — it is drawn from the delegating call's vocabulary.
+
+The two vocabularies name different subjects: one names what a child that ran did, the other names
+how far the delegating call got. A delegation that was `refused` never existed; one that `crashed`
+did. A single merged list would lose that, so the two are kept apart.
+
+The sub-capsule's vocabulary, read out of the child's own
+[`completion.json`](roost-api.md#the-completion-path):
 
 | Value | Means |
 |---|---|
-| `"ok"`, `"error"`, `"crashed"`, `"terminated"` | The child ran and reported its own outcome in a [`completion.json`](roost-api.md#the-completion-path) |
-| `"unknown"` | The child ran and left no readable `completion.json` |
-| `"completed"` | The child answered the caller that was waiting for it |
-| `"timed_out"` | The child was still running at the delegation deadline and was stopped |
-| `"failed"` | The child was approved but never got far enough to answer |
-| `"refused"` | `mur-roost` refused the spawn, so no child was launched |
+| `"ok"` | The child's session finished, and reported so itself |
+| `"error"` | The child's session ran and failed, and reported so itself |
+| `"crashed"` | The child's process ended without recording a completion |
+| `"terminated"` | The parent ended the delegation — by hand, or at [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) |
+| `"unknown"` | A completion arrived, and the parent found no readable `completion.json` behind it. The parent's own word, and reachable on no other path |
+
+The delegating call's vocabulary, read out of the call's result:
+
+| Value | Surface | Means |
+|---|---|---|
+| `"completed"` | `capsule` step only | The child answered the caller that was waiting for it |
+| `"timed_out"` | `capsule` step only | The child had not answered within [`lifecycle.delegation_deadline_secs`](manifest.md#lifecycle-delegation-deadline-secs) and was stopped |
+| `"failed"` | either | The spawn was approved and no answer came back — a child that could not be launched or handed its task, or one whose own task failed |
+| `"refused"` | either | `mur-roost` refused the spawn, so no child was launched |
+
+**`ok` and `completed` are the only two values that say the sub-capsule did the work** — `ok` from
+a `delegate-task` delegation, `completed` from a plan `capsule` step. A `delegate-task` delegation
+reaches `ok`, never `completed`.
+
+**`started` is never an `outcome`.** It is the
+[`delegate-task` result's `status`](roost-api.md#the-delegation-tool), naming a delegation still in
+flight, and a delegation in flight has written no `delegation` line at all: its terminal line
+arrives when its outcome does.
 
 **Two surfaces launch children**: the [`delegate-task`](runtime-provided-tools.md) tool an agent
 calls, and a plan's [`capsule` step](plans.md). Both write both lines under the session node, and
-neither line names the surface — a reader can tell that a delegation happened, but not which
-surface made it.
+neither line carries a field naming the surface — where the `outcome` value does not settle it, a
+reader can tell that a delegation happened but not which surface made it.
 
 They differ only in when the terminal line lands, because `delegate-task` returns as soon as the
 child is up while a `capsule` step waits for the answer:
