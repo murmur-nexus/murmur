@@ -56,7 +56,7 @@ task comes from the queue rather than from a stale file.
 | `MURMUR.md` | The capsule's generated inventory: identity, directory layout, installed tools and skills, shell access. Agent sessions only. Written at staging and rewritten once the capsule's port is bound |
 | `trace.jsonl` | One JSON object per session event. See [Observability schemas](observability-schemas.md) |
 | `eval.jsonl` | Scorer output for the session. `mur eval` reads it after each case. See [Observability schemas](observability-schemas.md) |
-| `out/result.txt` | The agent's final output. Written on every terminal outcome; a failure writes `error: <message>` |
+| `out/result.txt` | The agent's final output. Written on every terminal outcome; a failure writes `error: <message>`, and a turn stopped at [`inference.max_tokens`](manifest.md#inference-max-tokens) writes the model's partial text followed by a truncation marker naming that field and the cap |
 | `out/result_<task-id>.txt` | Per-task copy of the final output, so one task does not overwrite another's. Only under `lifecycle.conversation: threaded` |
 | `out/compaction-summaries.jsonl` | The text each committed compaction replaced the context with. See [below](#compaction-summaries) |
 | `logs/bootstrap.log` | Staging and agent-loop diagnostics: the installed tool inventory, compaction decisions, and non-fatal write failures |

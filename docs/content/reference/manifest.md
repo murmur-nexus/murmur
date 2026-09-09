@@ -911,6 +911,15 @@ Two interactions worth knowing:
   built-in `8192` default. This field caps the agent's own responses, not the runtime's internal
   calls.
 
+##### When a turn hits the cap { #inference-max-tokens-reached }
+
+A turn the provider stopped at the cap still produces a result: the session ends `ok`, the runtime
+attempts no continuation turn, and every surface carrying the reply marks it as a fragment.
+[`W-RUN-001`](diagnostics.md#w-run-001) lists what the turn leaves behind.
+
+A driver reaches this path by reporting `stop_reason: "max_tokens"` in its response. A driver whose
+provider names the same condition differently normalizes it to that value.
+
 #### Endpoint scheme and host validation { #endpoint-validation }
 
 `inference.endpoint` is validated when the manifest is parsed, before any capsule launches or any
