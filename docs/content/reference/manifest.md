@@ -911,6 +911,19 @@ Two interactions worth knowing:
   built-in `8192` default. This field caps the agent's own responses, not the runtime's internal
   calls.
 
+##### When a turn hits the cap { #inference-max-tokens-reached }
+
+A turn the provider stopped at the cap is a result, not a failure: the session ends `ok`, the A2A
+task reaches `completed`, and the runtime attempts no continuation turn. What it leaves behind names
+the truncation on every surface — [`out/result.txt`](workdir.md#session-workdir) ends on a marker
+carrying this field's name and the value in force, the assistant message in the
+[conversation record](workdir.md#the-conversation-record) carries `"truncated": true` on its
+envelope, the trace's `inference` event carries `"stop_reason": "max_tokens"`, and stderr carries one
+[`W-RUN-001`](diagnostics.md#w-run-001) line.
+
+A driver reaches this path by reporting `stop_reason: "max_tokens"` in its response. A driver whose
+provider names the same condition differently normalizes it to that value.
+
 #### Endpoint scheme and host validation { #endpoint-validation }
 
 `inference.endpoint` is validated when the manifest is parsed, before any capsule launches or any

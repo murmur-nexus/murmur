@@ -11,7 +11,7 @@ use std::{
     time::Instant,
 };
 
-use murmur_artifact::{ConversationMode, InferenceConfig};
+use murmur_artifact::{runtime_warning_link, ConversationMode, InferenceConfig, W_RUN_001};
 use serde_json::{json, Value};
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
     detached::DetachedDispatchInfo,
     errors::RuntimeError,
     hooks::{
-        CallDecision, DispatchFault, HookEvent, HookRuntime, HookSeed, ResolvedCall,
+        CallDecision, DispatchFault, HookArtifact, HookEvent, HookRuntime, HookSeed, ResolvedCall,
         FAULT_ARM_SEED_REJECTED,
     },
     murmur_md::MURMUR_MD_TRUST_NOTICE,
@@ -138,6 +138,15 @@ const MESSAGE_CANCELED_KEY: &str = "canceled";
 /// the conversation on a user message nothing answered. A later task loads it as ordinary
 /// content: the marker key is the runtime's, and the driver never sees it.
 const CANCELED_TURN_TEXT: &str = "[the person cancelled this task before the model replied]";
+
+/// Message field marking the assistant turn the provider cut off at the `inference.max_tokens`
+/// output cap. Written to the conversation record so a fragment is visible as one, and never sent
+/// to a driver — see [`strip_message_identity`].
+///
+/// The mark is an envelope key rather than text inside the content, because the content is
+/// replayed to the provider on the next resume: a marker written into it would come back as
+/// something the model said about itself.
+const MESSAGE_TRUNCATED_KEY: &str = "truncated";
 
 /// How one agent-loop attempt ended, for a caller that needs the outcome rather than just
 /// "did it error". The strings are the `exit_status` vocabulary `session_end` and `task_end`
@@ -632,6 +641,9 @@ pub(crate) async fn run_agent_loop(
             .get("stop_reason")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // A capped turn reports `"text"` here, exactly as it always has: `decision` names what
+        // the loop does next, and a capped turn ends the task the same way an `end_turn` does.
+        // `stop_reason`, recorded verbatim beside it, is the field that says it was cut off.
         let decision = if stop_reason == "tool_call" {
             "tool_call"
         } else if stop_reason == "end_turn" {
@@ -690,6 +702,7 @@ pub(crate) async fn run_agent_loop(
                 u64::from(input_tokens),
                 u64::from(output_tokens),
                 decision.to_string(),
+                Some(stop_reason),
                 hook_tool_name.clone(),
                 None,
                 driver_usage.as_ref(),
@@ -703,6 +716,7 @@ pub(crate) async fn run_agent_loop(
             u64::from(input_tokens),
             u64::from(output_tokens),
             decision,
+            Some(stop_reason),
             hook_tool_name.as_deref(),
             inference_duration_ms,
             None,
@@ -1148,87 +1162,56 @@ pub(crate) async fn run_agent_loop(
                 // assistant message that asked for the tools, then each tool result.
                 append_to_record(record.as_mut(), &messages[turn_start..]);
             }
-            "end_turn" | "max_tokens" => {
-                let final_text = extract_text_content(&content);
-                record_result(hooks, workdir, &final_text)
-                    .map_err(RuntimeError::AgentLoopFailed)?;
-
-                // In threaded mode: write per-task result file so earlier turns aren't overwritten.
-                if matches!(mode, ConversationMode::Threaded) {
-                    if let Some(ref tid) = task_id {
-                        write_result_for_task(workdir, tid, &final_text)
-                            .map_err(RuntimeError::AgentLoopFailed)?;
-                    }
-                }
-
-                // The message the model just produced is part of the conversation whatever the
-                // capsule's mode: `stateless` decides what a later task *loads*, not what the
-                // record holds.
-                let assistant = with_new_id(json!({
-                    "role": "assistant",
-                    "content": content,
-                }));
-                append_to_record(record.as_mut(), std::slice::from_ref(&assistant));
-                messages.push(assistant);
-                // The assistant just recorded is known to the driver (it generated it), so
-                // advance the acked length past it: the next same-context Task then wires only
-                // its new user message, not this assistant again.
-                if matches!(mode, ConversationMode::Threaded) && context_id.is_some() {
-                    store_state
-                        .advance_continuation_acked_len(context_id.as_deref(), messages.len());
-                }
-
-                flush_hook_dispatch_faults(hooks, trace).await;
-                otel.emit_session_end("ok").await;
-                if let (Some(ref tid), Some((ref tx, ref buf))) = (&task_id, &sse) {
-                    // Forward every hook artifact to the SSE stream before the completed event.
-                    for ha in &hook_artifact {
-                        emit_sse(
-                            &sse,
-                            &mut sse_event_id,
-                            "artifact",
-                            &TaskArtifactUpdateEvent {
-                                id: task_id_str.clone(),
-                                artifact: StreamArtifact {
-                                    tool_name: ha.hook_name.clone(),
-                                    content: ha.payload.clone(),
-                                },
-                            },
-                        )
-                        .await;
-                    }
-                    // Non-streaming driver fallback: emit full turn text as a single text event.
-                    // Streaming drivers already emitted cursor-removal above (final:true, empty).
-                    if !store_state.a2a_chunks_emitted.load(Ordering::Relaxed)
-                        && !final_text.is_empty()
-                    {
-                        emit_chunk_sse_final(
-                            tx,
-                            buf,
-                            &store_state.a2a_chunk_event_id,
-                            tid,
-                            &final_text,
-                        );
-                        sse_event_id = store_state.a2a_chunk_event_id.load(Ordering::Relaxed);
-                    }
-                    emit_sse(
-                        &sse,
-                        &mut sse_event_id,
-                        "status",
-                        &TaskStatusUpdateEvent {
-                            id: task_id_str.clone(),
-                            context_id: context_id.clone(),
-                            status: StreamStatus {
-                                state: "completed".into(),
-                                message: "session ended".into(),
-                                response: Some(final_text),
-                            },
-                            r#final: true,
-                        },
-                    )
-                    .await;
-                }
-                return Ok(AgentLoopExit::Ok);
+            "end_turn" => {
+                return finish_completed_turn(
+                    store_state,
+                    trace,
+                    otel,
+                    hooks,
+                    record.as_mut(),
+                    &mut messages,
+                    content,
+                    workdir,
+                    mode,
+                    &sse,
+                    &mut sse_event_id,
+                    task_id.as_deref(),
+                    &task_id_str,
+                    context_id.clone(),
+                    &hook_artifact,
+                    None,
+                )
+                .await;
+            }
+            "max_tokens" => {
+                // The provider honoured the cap the capsule asked for, so nothing failed and
+                // nothing is retried. What the turn leaves behind is a fragment, and every
+                // surface that carries the result says so.
+                let cap = run_config.max_output_tokens;
+                eprintln!(
+                    "[capsule-runtime] warning[{W_RUN_001}]: {} ({})",
+                    truncation_warning_message(cap),
+                    runtime_warning_link(W_RUN_001)
+                );
+                return finish_completed_turn(
+                    store_state,
+                    trace,
+                    otel,
+                    hooks,
+                    record.as_mut(),
+                    &mut messages,
+                    content,
+                    workdir,
+                    mode,
+                    &sse,
+                    &mut sse_event_id,
+                    task_id.as_deref(),
+                    &task_id_str,
+                    context_id.clone(),
+                    &hook_artifact,
+                    Some(cap),
+                )
+                .await;
             }
             other => {
                 let error = format!("error: unsupported stop_reason '{other}'");
@@ -1362,6 +1345,159 @@ async fn finish_canceled_turn(
     AgentLoopExit::Canceled
 }
 
+/// How the output cap in force is named wherever a capped turn is reported: the manifest field a
+/// person edits, and the value that field resolved to.
+fn output_cap_phrase(cap: u32) -> String {
+    format!("the inference.max_tokens output cap of {cap} tokens")
+}
+
+/// The marker a capped turn's result text ends on.
+///
+/// One definition, read by every consumer of the result — `out/result.txt`,
+/// `out/result_<task-id>.txt`, the terminal A2A `status` response and the task output an
+/// `on-task-end` hook or a delegating parent reads — so nothing downstream has to infer
+/// "fragment" from length.
+fn truncation_marker(cap: u32) -> String {
+    format!(
+        "[truncated at {} — this is a fragment of the reply, not a finished answer]",
+        output_cap_phrase(cap)
+    )
+}
+
+/// A capped turn's result text: the model's partial reply, then [`truncation_marker`].
+///
+/// A turn whose content carried no text writes the marker alone. Leading blank lines would claim
+/// the model produced something it did not.
+fn truncated_result_text(partial: &str, cap: u32) -> String {
+    let marker = truncation_marker(cap);
+    if partial.is_empty() {
+        marker
+    } else {
+        format!("{partial}\n\n{marker}")
+    }
+}
+
+/// The [`W_RUN_001`] warning body, printed to stderr once per capped turn.
+fn truncation_warning_message(cap: u32) -> String {
+    format!(
+        "this turn stopped at {}, so out/result.txt holds a fragment rather than a finished answer",
+        output_cap_phrase(cap)
+    )
+}
+
+/// End one attempt because the model's turn ended the task.
+///
+/// Everything a completed turn leaves behind, in one place so the two stop reasons that reach it
+/// cannot record it differently. `truncated_at` is the whole difference between them: `None` for a
+/// turn that finished saying what it meant to, `Some(cap)` for one the provider cut off at that
+/// output cap.
+///
+/// A capped turn is a result, not a failure — the session ends `ok` and the A2A task reaches
+/// `completed` either way, and no continuation turn is attempted. What changes is that every
+/// surface carrying the *result* names the truncation, while the conversation record keeps the
+/// model's own bytes and carries the mark as [`MESSAGE_TRUNCATED_KEY`].
+#[allow(clippy::too_many_arguments)]
+async fn finish_completed_turn(
+    store_state: &mut CapsuleStoreState,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    hooks: &mut HookRuntime,
+    record: Option<&mut crate::conversation::ConversationRecord>,
+    messages: &mut Vec<Value>,
+    content: Vec<Value>,
+    workdir: &Path,
+    mode: ConversationMode,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    sse_event_id: &mut u64,
+    task_id: Option<&str>,
+    task_id_str: &str,
+    context_id: Option<String>,
+    hook_artifact: &[HookArtifact],
+    truncated_at: Option<u32>,
+) -> Result<AgentLoopExit, RuntimeError> {
+    let turn_text = extract_text_content(&content);
+    let final_text = match truncated_at {
+        Some(cap) => truncated_result_text(&turn_text, cap),
+        None => turn_text,
+    };
+    record_result(hooks, workdir, &final_text).map_err(RuntimeError::AgentLoopFailed)?;
+
+    // In threaded mode: write per-task result file so earlier turns aren't overwritten.
+    if matches!(mode, ConversationMode::Threaded) {
+        if let Some(tid) = task_id {
+            write_result_for_task(workdir, tid, &final_text)
+                .map_err(RuntimeError::AgentLoopFailed)?;
+        }
+    }
+
+    // The message the model just produced is part of the conversation whatever the capsule's
+    // mode: `stateless` decides what a later task *loads*, not what the record holds. The
+    // content is the model's own, marker-free: a marker written into it would be replayed to the
+    // provider on the next resume as if the model had said it.
+    let mut assistant = with_new_id(json!({
+        "role": "assistant",
+        "content": content,
+    }));
+    if truncated_at.is_some() {
+        if let Some(fields) = assistant.as_object_mut() {
+            fields.insert(MESSAGE_TRUNCATED_KEY.to_string(), json!(true));
+        }
+    }
+    append_to_record(record, std::slice::from_ref(&assistant));
+    messages.push(assistant);
+    // The assistant just recorded is known to the driver (it generated it), so advance the acked
+    // length past it: the next same-context Task then wires only its new user message, not this
+    // assistant again.
+    if matches!(mode, ConversationMode::Threaded) && context_id.is_some() {
+        store_state.advance_continuation_acked_len(context_id.as_deref(), messages.len());
+    }
+
+    flush_hook_dispatch_faults(hooks, trace).await;
+    otel.emit_session_end("ok").await;
+    if let (Some(tid), Some((tx, buf))) = (task_id, sse) {
+        // Forward every hook artifact to the SSE stream before the completed event.
+        for ha in hook_artifact {
+            emit_sse(
+                sse,
+                sse_event_id,
+                "artifact",
+                &TaskArtifactUpdateEvent {
+                    id: task_id_str.to_string(),
+                    artifact: StreamArtifact {
+                        tool_name: ha.hook_name.clone(),
+                        content: ha.payload.clone(),
+                    },
+                },
+            )
+            .await;
+        }
+        // Non-streaming driver fallback: emit full turn text as a single text event. Streaming
+        // drivers already emitted cursor-removal above (final:true, empty).
+        if !store_state.a2a_chunks_emitted.load(Ordering::Relaxed) && !final_text.is_empty() {
+            emit_chunk_sse_final(tx, buf, &store_state.a2a_chunk_event_id, tid, &final_text);
+            *sse_event_id = store_state.a2a_chunk_event_id.load(Ordering::Relaxed);
+        }
+        emit_sse(
+            sse,
+            sse_event_id,
+            "status",
+            &TaskStatusUpdateEvent {
+                id: task_id_str.to_string(),
+                context_id,
+                status: StreamStatus {
+                    state: "completed".into(),
+                    message: "session ended".into(),
+                    response: Some(final_text),
+                },
+                r#final: true,
+            },
+        )
+        .await;
+    }
+
+    Ok(AgentLoopExit::Ok)
+}
+
 /// Write every `run-inference` record a hook has buffered since the last flush
 /// through the session's real `TraceWriter`/`OtelEmitter`. Called after any
 /// point a hook may have run — `hooks.rs` can't write these itself, since it
@@ -1379,6 +1515,9 @@ async fn flush_hook_inference_records(
                 record.input_tokens,
                 record.output_tokens,
                 record.decision.clone(),
+                // A hook names its own `decision` from its own completion and never saw a
+                // provider stop reason, so there is none to record.
+                None,
                 None,
                 Some(&record.origin),
                 record.usage.as_ref(),
@@ -1394,6 +1533,7 @@ async fn flush_hook_inference_records(
             record.input_tokens,
             record.output_tokens,
             &record.decision,
+            None,
             None,
             record.duration_ms,
             Some(&record.origin),
@@ -2687,13 +2827,14 @@ fn wire_messages<'a>(messages: &'a [Value], continuation: Option<(&str, usize)>)
         .unwrap_or(messages)
 }
 
-/// The `messages` array as it goes on the wire: every message minus [`MESSAGE_ID_KEY`] and
-/// [`MESSAGE_SOURCE_ID_KEY`].
+/// The `messages` array as it goes on the wire: every message minus the runtime's own envelope
+/// keys — [`MESSAGE_ID_KEY`], [`MESSAGE_SOURCE_ID_KEY`], [`MESSAGE_CANCELED_KEY`] and
+/// [`MESSAGE_TRUNCATED_KEY`].
 ///
-/// Both are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
+/// All four are runtime bookkeeping the provider must never see. An id is a fresh uuid every time
 /// one is minted, so a seed message carrying its id at the head of the prompt is volatile
 /// content in the exact position a provider matches its cached prefix from — it would turn
-/// every request into a cache miss. A message carrying neither key is cloned through
+/// every request into a cache miss. A message carrying none of them is cloned through
 /// untouched, so a list that never met a hook serializes unchanged.
 fn strip_message_identity(messages: &[Value]) -> Value {
     Value::Array(
@@ -2703,12 +2844,14 @@ fn strip_message_identity(messages: &[Value]) -> Value {
                 Some(fields)
                     if fields.contains_key(MESSAGE_ID_KEY)
                         || fields.contains_key(MESSAGE_SOURCE_ID_KEY)
-                        || fields.contains_key(MESSAGE_CANCELED_KEY) =>
+                        || fields.contains_key(MESSAGE_CANCELED_KEY)
+                        || fields.contains_key(MESSAGE_TRUNCATED_KEY) =>
                 {
                     let mut stripped = fields.clone();
                     stripped.remove(MESSAGE_ID_KEY);
                     stripped.remove(MESSAGE_SOURCE_ID_KEY);
                     stripped.remove(MESSAGE_CANCELED_KEY);
+                    stripped.remove(MESSAGE_TRUNCATED_KEY);
                     Value::Object(stripped)
                 }
                 _ => message.clone(),
@@ -4203,6 +4346,7 @@ forgery: {prompt}"
                 1,
                 1,
                 "end_turn".to_string(),
+                Some("end_turn"),
                 None,
                 None,
                 None,
@@ -4271,6 +4415,7 @@ forgery: {prompt}"
                     1,
                     1,
                     "end_turn".to_string(),
+                    Some("end_turn"),
                     None,
                     None,
                     None,

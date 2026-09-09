@@ -119,6 +119,7 @@ impl OtelEmitter {
         input_tokens: u64,
         output_tokens: u64,
         decision: &str,
+        stop_reason: Option<&str>,
         tool_name: Option<&str>,
         duration_ms: u64,
         origin: Option<&crate::trace::InferenceOrigin>,
@@ -136,6 +137,12 @@ impl OtelEmitter {
             kv_int("output_tokens", output_tokens),
             kv_str("decision", decision),
         ];
+        // The provider's own stop reason, beside the `decision` the loop derived from it. Absent
+        // only where no driver response was parsed — a hook's `run-inference` and the `process`
+        // transport.
+        if let Some(sr) = stop_reason {
+            attrs.push(kv_str("stop_reason", sr));
+        }
         if let Some(tn) = tool_name {
             attrs.push(kv_str("tool_name", tn));
         }
