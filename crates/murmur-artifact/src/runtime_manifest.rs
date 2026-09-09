@@ -2453,9 +2453,14 @@ fn child_path(parent: &str, field: &str) -> String {
     format!("{parent}.{field}")
 }
 
-#[must_use = "validated runtime manifest is required before run"]
-pub fn load_runtime_manifest(path: &Path) -> Result<RuntimeManifest, RuntimeManifestError> {
-    let content = fs::read_to_string(path).map_err(|source| {
+/// Read a manifest file's text, mapping a missing file to
+/// [`RuntimeManifestError::NotFound`] and any other read failure to
+/// [`RuntimeManifestError::Io`].
+///
+/// For a caller that needs the manifest text as well as the parsed manifest — `mur doctor` reads
+/// the references a manifest makes out of the same bytes it parses, so the file is opened once.
+pub fn read_runtime_manifest_text(path: &Path) -> Result<String, RuntimeManifestError> {
+    fs::read_to_string(path).map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             return RuntimeManifestError::NotFound(path.display().to_string());
         }
@@ -2464,9 +2469,69 @@ pub fn load_runtime_manifest(path: &Path) -> Result<RuntimeManifest, RuntimeMani
             path: path.display().to_string(),
             source,
         }
-    })?;
+    })
+}
+
+#[must_use = "validated runtime manifest is required before run"]
+pub fn load_runtime_manifest(path: &Path) -> Result<RuntimeManifest, RuntimeManifestError> {
+    let content = read_runtime_manifest_text(path)?;
 
     RuntimeManifest::from_yaml_str(&content)
+}
+
+/// One `${VAR}` reference a manifest makes, and the field that makes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferencedEnvVariable {
+    /// The manifest field holding the reference, e.g. `inference.api_key`.
+    pub field: &'static str,
+    /// The variable the reference names.
+    pub variable: String,
+}
+
+/// The narrow view of a manifest this scan needs: the fields whose value may be an `${ENV_REF}`,
+/// and nothing else. Every other key is ignored, so a manifest this build would refuse for an
+/// unrelated reason still yields its references.
+///
+/// Deliberately not one of the `Raw*` structs: those carry the unknown-key overflow map that
+/// makes `warn_on_unknown_manifest_keys` complete, and this one is a second, partial reader of a
+/// document that reader has already covered.
+#[derive(Deserialize)]
+struct ReferencedManifestFields {
+    #[serde(default)]
+    inference: Option<ReferencedInferenceFields>,
+}
+
+#[derive(Deserialize)]
+struct ReferencedInferenceFields {
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+/// Every environment variable `manifest_yaml` references through an `${ENV_REF}`, sorted by
+/// variable name and deduplicated.
+///
+/// Never fails and never reads the environment: unparseable YAML, an absent field and a literal
+/// (non-reference) value all yield an empty list. What counts as a reference is decided by the
+/// same `parse_env_reference` the resolving parse applies, so a name reported here is exactly a
+/// name [`RuntimeManifest::from_yaml_str`] would have looked up.
+pub fn referenced_env_variables(manifest_yaml: &str) -> Vec<ReferencedEnvVariable> {
+    let Ok(raw) = serde_yaml::from_str::<ReferencedManifestFields>(manifest_yaml) else {
+        return Vec::new();
+    };
+
+    let mut referenced: Vec<ReferencedEnvVariable> = Vec::new();
+    if let Some(api_key) = raw.inference.and_then(|inference| inference.api_key) {
+        if let Some(variable) = parse_env_reference(api_key.trim()) {
+            referenced.push(ReferencedEnvVariable {
+                field: "inference.api_key",
+                variable: variable.to_string(),
+            });
+        }
+    }
+
+    referenced.sort_by(|a, b| a.variable.cmp(&b.variable).then(a.field.cmp(b.field)));
+    referenced.dedup();
+    referenced
 }
 
 /// Whether a parse is allowed to reach outside the manifest text for a secret it references.
@@ -6428,6 +6493,27 @@ inference:
                 .to_string();
             assert_eq!(resolving, without_secrets);
         }
+    }
+
+    /// The reference scan answers from the manifest text alone: it reports a reference, ignores
+    /// a literal, and has nothing to say about a manifest that carries no `inference` block or
+    /// does not parse at all.
+    #[test]
+    fn referenced_env_variables_reports_a_reference_and_nothing_else() {
+        let referencing = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${MURMUR_TEST_REFERENCED_KEY}\n";
+        let referenced = referenced_env_variables(referencing);
+        assert_eq!(referenced.len(), 1);
+        assert_eq!(referenced[0].field, "inference.api_key");
+        assert_eq!(referenced[0].variable, "MURMUR_TEST_REFERENCED_KEY");
+
+        let literal = "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: not-a-reference\n";
+        assert!(referenced_env_variables(literal).is_empty());
+
+        let no_inference = "name: cap\nversion: 0.0.1\nartifacts: []\n";
+        assert!(referenced_env_variables(no_inference).is_empty());
+
+        let unparseable = "name: broken\nversion: [\n";
+        assert!(referenced_env_variables(unparseable).is_empty());
     }
 
     #[test]

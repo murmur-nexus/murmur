@@ -11,8 +11,8 @@ use std::path::Path;
 
 use capsule_runtime::EnvelopeAxis;
 use murmur_artifact::{
-    current_platform, dotenv_variable_names, DotenvError, LocalRegistry, MurmurLock, Registry,
-    RuntimeManifest,
+    current_platform, dotenv_variable_names, referenced_env_variables, DotenvError, LocalRegistry,
+    MurmurLock, ReferencedEnvVariable, Registry, RuntimeManifest,
 };
 
 use crate::registry_client::FallbackRegistry;
@@ -21,7 +21,8 @@ use crate::registry_client::FallbackRegistry;
 pub(crate) struct FormationEnvReport {
     /// Every capsule whose declarations were read, root first, in first-visit order.
     pub(crate) inspected: Vec<CapsuleCoordinate>,
-    /// Every variable the closure declares, sorted by name, one entry per name.
+    /// Every variable this report names, sorted by name, one entry per name: what the closure
+    /// declares, plus every unset variable the root manifest references.
     pub(crate) variables: Vec<RequiredVariable>,
     /// Every declaration `mur-roost` would refuse at the moment of the spawn.
     pub(crate) refusals: Vec<DeclarationRefusal>,
@@ -53,12 +54,21 @@ impl CapsuleCoordinate {
     }
 }
 
-/// One variable name the formation declares, and whether a run from this workspace would find it.
+/// One variable name the formation needs, and whether a run from this workspace would find it.
 pub(crate) struct RequiredVariable {
     pub(crate) name: String,
-    /// Every capsule in the closure declaring it, rendered `name@version`, first-visit order.
-    pub(crate) declared_by: Vec<String>,
+    /// Every capsule that needs this name and the manifest key that names it, first-visit order,
+    /// deduplicated by the pair.
+    pub(crate) sources: Vec<VariableSource>,
     pub(crate) set: bool,
+}
+
+/// One capsule's reason for needing a variable.
+pub(crate) struct VariableSource {
+    /// The capsule, `name@version`.
+    pub(crate) capsule: String,
+    /// The manifest key naming the variable: `capabilities.env.allow` or `inference.api_key`.
+    pub(crate) manifest_key: &'static str,
 }
 
 /// A child declaring an `env.allow` entry the capsule that spawns it does not hold — the spawn
@@ -157,6 +167,96 @@ impl EnvironmentNames {
         }
         self.declared.contains(name)
     }
+}
+
+/// The report `mur doctor` renders: the `spawn.allow` closure when the root declares one, plus —
+/// in either case — every variable the root's own manifest references that this workspace does not
+/// hold.
+///
+/// `None` when there is nothing to print: the root declares no `capabilities.spawn.allow` and
+/// every variable it references is already set. A root that delegates to nobody and references
+/// nothing gets no block at all, so its `capabilities.env.allow` names are never reported — the
+/// walk is what reports those, and a capsule with no formation has no walk.
+///
+/// `root_manifest_yaml` is the text `root` was parsed from. References are read from the text
+/// rather than the parsed manifest because a parse that does not resolve secrets keeps no record
+/// of what was referenced.
+pub(crate) fn formation_env_report(
+    root: &RuntimeManifest,
+    root_manifest_yaml: &str,
+    project_dir: &Path,
+    lock: Option<&MurmurLock>,
+    environment: &EnvironmentNames,
+) -> Option<FormationEnvReport> {
+    // A set reference is already satisfied, so it contributes no line and no finding — which is
+    // what keeps a fully-provisioned capsule's report to what the walk alone found.
+    let unset_references: Vec<ReferencedEnvVariable> = referenced_env_variables(root_manifest_yaml)
+        .into_iter()
+        .filter(|reference| !environment.contains(&reference.variable))
+        .collect();
+    let root_ref = format!("{}@{}", root.name, root.version);
+
+    if declared_spawn_allow(root).is_empty() {
+        if unset_references.is_empty() {
+            return None;
+        }
+
+        let mut variables = Vec::new();
+        merge_references(&mut variables, &unset_references, &root_ref);
+        return Some(FormationEnvReport {
+            inspected: vec![CapsuleCoordinate {
+                name: root.name.clone(),
+                version: root.version.clone(),
+            }],
+            variables,
+            refusals: Vec::new(),
+            uninspectable: Vec::new(),
+            cycles: Vec::new(),
+        });
+    }
+
+    let mut report = walk_formation_env(root, project_dir, lock, environment);
+    merge_references(&mut report.variables, &unset_references, &root_ref);
+    Some(report)
+}
+
+/// Fold `references` into `variables`, keyed by variable name: a name already present gains the
+/// reference as another source and keeps the `set` value the walk gave it, a name not present is
+/// appended unset. The result is sorted by name, the order the walk itself finishes in.
+fn merge_references(
+    variables: &mut Vec<RequiredVariable>,
+    references: &[ReferencedEnvVariable],
+    capsule: &str,
+) {
+    for reference in references {
+        match variables
+            .iter_mut()
+            .find(|variable| variable.name == reference.variable)
+        {
+            Some(existing) => {
+                if !existing
+                    .sources
+                    .iter()
+                    .any(|had| had.capsule == capsule && had.manifest_key == reference.field)
+                {
+                    existing.sources.push(VariableSource {
+                        capsule: capsule.to_string(),
+                        manifest_key: reference.field,
+                    });
+                }
+            }
+            None => variables.push(RequiredVariable {
+                name: reference.variable.clone(),
+                sources: vec![VariableSource {
+                    capsule: capsule.to_string(),
+                    manifest_key: reference.field,
+                }],
+                set: false,
+            }),
+        }
+    }
+
+    variables.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// Walk the `spawn.allow` closure from `root` and report what the whole formation declares.
@@ -406,12 +506,19 @@ impl Walk<'_> {
     }
 
     fn record_variables(&mut self, env_allow: &[String], declaring_ref: &str) {
+        let manifest_key = EnvelopeAxis::EnvAllow.manifest_key();
         for variable in env_allow {
             match self.variable_index.get(variable) {
                 Some(&index) => {
-                    let declared_by = &mut self.variables[index].declared_by;
-                    if !declared_by.iter().any(|had| had == declaring_ref) {
-                        declared_by.push(declaring_ref.to_string());
+                    let sources = &mut self.variables[index].sources;
+                    if !sources
+                        .iter()
+                        .any(|had| had.capsule == declaring_ref && had.manifest_key == manifest_key)
+                    {
+                        sources.push(VariableSource {
+                            capsule: declaring_ref.to_string(),
+                            manifest_key,
+                        });
                     }
                 }
                 None => {
@@ -419,7 +526,10 @@ impl Walk<'_> {
                         .insert(variable.clone(), self.variables.len());
                     self.variables.push(RequiredVariable {
                         name: variable.clone(),
-                        declared_by: vec![declaring_ref.to_string()],
+                        sources: vec![VariableSource {
+                            capsule: declaring_ref.to_string(),
+                            manifest_key,
+                        }],
                         set: self.environment.contains(variable),
                     });
                 }
@@ -512,6 +622,15 @@ mod tests {
         RuntimeManifest::from_yaml_str(yaml).unwrap()
     }
 
+    /// The capsules attributed to one variable, in the order the report holds them.
+    fn source_refs(variable: &RequiredVariable) -> Vec<&str> {
+        variable
+            .sources
+            .iter()
+            .map(|source| source.capsule.as_str())
+            .collect()
+    }
+
     #[test]
     fn walks_three_levels_and_attributes_every_variable() {
         let project = TempDir::new().unwrap();
@@ -552,9 +671,13 @@ mod tests {
             ["A_KEY", "B_KEY"]
         );
         assert_eq!(
-            report.variables[1].declared_by,
+            source_refs(&report.variables[1]),
             ["fmt-root@0.0.1", "fmt-worker@0.1.0", "fmt-deep@0.2.0"]
         );
+        assert!(report.variables[1]
+            .sources
+            .iter()
+            .all(|source| source.manifest_key == EnvelopeAxis::EnvAllow.manifest_key()));
         assert!(report.variables.iter().all(|variable| variable.set));
         assert!(report.refusals.is_empty());
         assert!(report.uninspectable.is_empty());
@@ -758,9 +881,97 @@ mod tests {
         assert_eq!(variable.name, "PROVIDER_KEY_4C7E05B1");
         assert!(!variable.set);
         assert_eq!(
-            variable.declared_by,
+            source_refs(variable),
             ["infer-root@0.0.1", "infer-worker@0.1.0"]
         );
+    }
+
+    /// A capsule that delegates to nobody has no formation to walk, so the only thing this
+    /// report can say about it is which of its own references this workspace does not hold.
+    #[test]
+    fn a_solo_capsule_reports_its_unset_reference_and_nothing_else() {
+        let project = TempDir::new().unwrap();
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
+
+        let report = formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(Vec::<String>::new()),
+        )
+        .expect("an unset reference is something to report");
+
+        assert_eq!(
+            report
+                .inspected
+                .iter()
+                .map(CapsuleCoordinate::reference)
+                .collect::<Vec<_>>(),
+            ["solo@0.0.1"]
+        );
+        assert_eq!(report.variables.len(), 1);
+        assert_eq!(report.variables[0].name, "SOLO_REFERENCE_4C7E05B1");
+        assert!(!report.variables[0].set);
+        assert_eq!(
+            report.variables[0].sources[0].manifest_key,
+            "inference.api_key"
+        );
+        assert!(report.refusals.is_empty());
+        assert!(report.uninspectable.is_empty());
+        assert!(report.cycles.is_empty());
+    }
+
+    /// The same capsule with the reference satisfied has nothing to print at all — not its own
+    /// `env.allow` names, and not an empty block.
+    #[test]
+    fn a_solo_capsule_holding_every_reference_reports_nothing() {
+        let project = TempDir::new().unwrap();
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SOLO_ENV_ALLOW]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
+
+        assert!(formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(["SOLO_REFERENCE_4C7E05B1"]),
+        )
+        .is_none());
+    }
+
+    /// One list, whatever named the variable: a reference to a name the closure also declares
+    /// joins that name's entry rather than opening a second one.
+    #[test]
+    fn a_reference_to_a_declared_name_joins_the_entry_the_walk_made() {
+        let project = TempDir::new().unwrap();
+        install_capsule(
+            project.path(),
+            "src-worker",
+            "0.1.0",
+            "name: src-worker\nversion: 0.1.0\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n",
+        );
+        let yaml = "name: src-root\nversion: 0.0.1\nartifacts: []\ncapabilities:\n  env:\n    allow: [SHARED_KEY_4C7E05B1]\n  spawn:\n    allow: [src-worker]\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SHARED_KEY_4C7E05B1}\n";
+        let root = RuntimeManifest::from_yaml_str_without_secrets(yaml).unwrap();
+
+        let report = formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(Vec::<String>::new()),
+        )
+        .unwrap();
+
+        assert_eq!(report.variables.len(), 1);
+        let variable = &report.variables[0];
+        assert_eq!(variable.name, "SHARED_KEY_4C7E05B1");
+        assert_eq!(
+            source_refs(variable),
+            ["src-root@0.0.1", "src-worker@0.1.0", "src-root@0.0.1"]
+        );
+        assert_eq!(variable.sources[2].manifest_key, "inference.api_key");
     }
 
     #[test]
