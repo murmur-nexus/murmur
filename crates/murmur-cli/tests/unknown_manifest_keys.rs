@@ -191,6 +191,68 @@ fn a_higher_pin_adds_a_line_naming_both_versions_and_the_count() {
     );
 }
 
+/// The least a delegated sub-capsule needs to be publishable — `runtime:` plus `execution:` —
+/// is silent on both surfaces. `POST /register` derives each registrant's ceiling from the
+/// registry manifest, so every sub-capsule of a delegating formation carries these keys.
+#[test]
+fn a_publishable_capsule_warns_on_neither_surface() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "name: probe\nversion: 0.1.0\nruntime: capsule\nexecution: static\n",
+    );
+
+    assert_eq!(
+        warning_lines(&explain_scope_stderr(&home, dir.path())),
+        Vec::<&str>::new()
+    );
+    assert!(warning_lines(&doctor_stderr(&home, dir.path())).is_empty());
+}
+
+/// All four keys `mur build` and `mur publish` read beyond `name:` and `version:`, not just the
+/// two a publishable agent capsule cannot omit.
+#[test]
+fn every_build_side_key_warns_on_neither_surface() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "name: probe\nversion: 0.1.0\nruntime: capsule\nimplementation: wasm\nexecution: \
+         static\nrequires_files:\n  - capsule.wasm\n  - assets/logo.png\n",
+    );
+
+    assert_eq!(
+        warning_lines(&explain_scope_stderr(&home, dir.path())),
+        Vec::<&str>::new()
+    );
+    assert!(warning_lines(&doctor_stderr(&home, dir.path())).is_empty());
+}
+
+/// The warning is narrowed, not switched off: a key no command reads still reports, alone, and
+/// both surfaces still print the same bytes for it.
+#[test]
+fn a_genuinely_unknown_key_survives_beside_the_build_side_keys() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
+        dir.path(),
+        "name: probe\nversion: 0.1.0\nruntime: capsule\nimplementation: wasm\nexecution: \
+         static\nrequires_files:\n  - capsule.wasm\nquantum_teleport: true\n",
+    );
+
+    let stderr = explain_scope_stderr(&home, dir.path());
+    let lines = warning_lines(&stderr);
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(lines[0].contains("unrecognized key 'quantum_teleport' at the top level"));
+    assert!(lines[0].contains("may come from a newer mur"));
+    for key in ["runtime", "implementation", "execution", "requires_files"] {
+        assert!(!lines[0].contains(&format!("'{key}'")), "{stderr}");
+    }
+
+    assert_eq!(lines, warning_lines(&doctor_stderr(&home, dir.path())));
+}
+
 // ── A full launch, not just the diagnostic ────────────────────────────────────
 
 const TOOL_NAME: &str = "echo-tool";

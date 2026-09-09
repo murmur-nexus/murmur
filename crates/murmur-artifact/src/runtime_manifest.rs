@@ -1455,6 +1455,30 @@ struct RawRuntimeManifest {
     /// the unrecognized top-level keys this manifest silently ignores.
     #[serde(default, deserialize_with = "deserialize_present")]
     config: Option<serde_yaml::Value>,
+    /// Read by `mur build` and `mur publish` off this same file to select the packaging type.
+    /// Declared here so a manifest that is both runnable and publishable does not report its own
+    /// build-side keys as unrecognized; the run path takes no meaning from it and never inspects
+    /// the value, so any shape parses.
+    #[serde(default)]
+    #[allow(dead_code)]
+    runtime: Option<serde_yaml::Value>,
+    /// Read by `mur build` and `mur publish`: it separates a native tool from a wasm one, both in
+    /// the derived packaging type and in `mur publish`'s platform tagging. Ignored on the run
+    /// path, and untyped for the same reason as `runtime:` above.
+    #[serde(default)]
+    #[allow(dead_code)]
+    implementation: Option<serde_yaml::Value>,
+    /// Read by `mur build` and `mur publish` as the declared packaging type, which overrides the
+    /// one derived from `runtime:` and `implementation:`. Ignored on the run path, and untyped for
+    /// the same reason as `runtime:` above.
+    #[serde(default)]
+    #[allow(dead_code)]
+    execution: Option<serde_yaml::Value>,
+    /// Read by `mur build` as the list of companion files to pack beside the manifest. Ignored on
+    /// the run path, and untyped for the same reason as `runtime:` above.
+    #[serde(default)]
+    #[allow(dead_code)]
+    requires_files: Option<serde_yaml::Value>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -1957,6 +1981,10 @@ impl RawBlock for RawRuntimeManifest {
         "exports",
         "mur_version",
         "config",
+        "runtime",
+        "implementation",
+        "execution",
+        "requires_files",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -9204,6 +9232,66 @@ capabilities:
             unknown_keys_of("name: cap\nversion: 0.1.0\nquantum_teleport: true\n"),
             vec![("quantum_teleport".to_string(), String::new(), None)]
         );
+    }
+
+    /// The minimum publishable delegated sub-capsule — `runtime:` plus `execution:` — reports
+    /// nothing. Every registrant of a delegating capsule must be published, so every one of them
+    /// carries these keys; warning on them would make the diagnostic unreadable exactly where it
+    /// is needed most.
+    #[test]
+    fn the_build_side_keys_of_a_publishable_capsule_report_nothing() {
+        assert!(unknown_keys_of(
+            "name: cap\nversion: 0.1.0\nruntime: capsule\nexecution: static\n"
+        )
+        .is_empty());
+    }
+
+    /// All four keys `mur build` and `mur publish` read beyond `name:` and `version:`, together.
+    #[test]
+    fn every_build_side_key_is_recognized() {
+        assert!(unknown_keys_of(
+            "name: cap\nversion: 0.1.0\nruntime: tool\nimplementation: wasm\nexecution: \
+             wasm\nrequires_files:\n  - tool.wasm\n  - assets/logo.png\n"
+        )
+        .is_empty());
+    }
+
+    /// The fix narrows the warning rather than disabling it: a key no command reads still reports,
+    /// and reports alone.
+    #[test]
+    fn a_genuinely_unknown_key_beside_the_build_side_keys_still_reports() {
+        assert_eq!(
+            unknown_keys_of(
+                "name: cap\nversion: 0.1.0\nruntime: capsule\nimplementation: wasm\nexecution: \
+                 static\nrequires_files:\n  - capsule.wasm\nquantum_teleport: true\n"
+            ),
+            vec![("quantum_teleport".to_string(), String::new(), None)]
+        );
+    }
+
+    /// The four keys are recognized and then dropped: they add no refusal and no run-time meaning,
+    /// so a manifest carrying them parses to what it parses to without them. A wrong-shaped value
+    /// is build's business to reject, not the run path's.
+    #[test]
+    fn the_build_side_keys_change_nothing_the_run_path_reads() {
+        let body = "artifacts:\n  - name: notes-tool\n    version: 0.1.0\n    runtime: tool\n\
+                    capabilities:\n  filesystem:\n    read_only:\n      - tests\n\
+                    inference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: \
+                    test-model\n  driver:\n    artifact: murmur-driver-anthropic\n";
+        let plain = RuntimeManifest::from_yaml_str(&format!("name: cap\nversion: 0.1.0\n{body}"))
+            .expect("fixture must parse");
+        let with_build_keys = RuntimeManifest::from_yaml_str(&format!(
+            "name: cap\nversion: 0.1.0\nruntime: capsule\nimplementation: 42\nexecution:\n  \
+             any: shape\nrequires_files: not-a-list\n{body}"
+        ))
+        .expect("a build-side key of any shape never refuses a manifest");
+
+        assert!(with_build_keys.unknown_keys.is_empty());
+        assert_eq!(with_build_keys.name, plain.name);
+        assert_eq!(with_build_keys.version, plain.version);
+        assert_eq!(with_build_keys.artifacts, plain.artifacts);
+        assert_eq!(with_build_keys.capabilities, plain.capabilities);
+        assert_eq!(with_build_keys.inference, plain.inference);
     }
 
     /// The overflow map captures the key without consuming the block: the rest of it still parses
