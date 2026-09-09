@@ -21,6 +21,7 @@ exclude_docs: |
   reference/network-namespace-egress-proxy-manual-verification.md
   reference/workdir-exec-landlock-manual-verification.md
   reference/shell-binary-reachability-manual-verification.md
+  reference/seccomp-filter-instruction-budget.md
   reference/workdir-device-node-manual-verification.md
   reference/af-unix-sockets-manual-verification.md
   reference/capsule-device-set-manual-verification.md
