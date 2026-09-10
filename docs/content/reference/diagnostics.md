@@ -1524,8 +1524,10 @@ more than one of these:
 | `"murmur-destinations": []` at the schema root | The tool writes nothing named by or derived from its input |
 
 A property that is a destination under some input values and a read source under others — a `repo`
-written under `checkout` and read under `log` — cannot be declared either way, and keeps firing
-this warning.
+written under `checkout` and read under `log` — cannot be declared either way. It falls back on its
+name: if the name is in one of the tables above it keeps the key-name rules and keeps firing this
+warning; `repo` is in neither, so a tool with that shape is contained there only by
+`capabilities.filesystem.scope`.
 
 The warning is the tool author's to answer, not the operator's: a capsule cannot annotate a tool it
 installs, and there is no way to suppress it for one. The entry grammar is in

@@ -60,11 +60,13 @@
 //! A destination whose write-ness depends on another input's value. A `git` tool's `repo` is
 //! written by `checkout`, `reset --hard`, `stash pop`, `pull`, `merge` and `cherry_pick`, and read
 //! by `log`, `diff`, `show` and `status` — one property, decided by the `operation` value beside
-//! it. No annotation here takes a condition, so such a property stays unannotated and
-//! [`unannotated_path_properties`] keeps naming it in `W-SEC-018`, permanently. That is the
-//! decision rather than an omission: a conditional destination language would be a second
-//! evaluator over model-chosen values inside the containment check, and a loudly unjudged property
-//! is the better failure.
+//! it. No annotation here takes a condition, so such a property stays unannotated and falls back
+//! on its name: where the name is in [`TOOL_PATH_KEYS`] or [`TOOL_DESTINATION_KEYS`] it is judged
+//! by key name and [`unannotated_path_properties`] keeps naming it in `W-SEC-018`, permanently;
+//! where it is not — `repo` is in neither — it is neither judged nor named, and the tool's
+//! containment there rests on `capabilities.filesystem.scope` alone. That is the decision rather
+//! than an omission: a conditional destination language would be a second evaluator over
+//! model-chosen values inside the containment check.
 
 use std::collections::BTreeMap;
 use std::path::Path;
