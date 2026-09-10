@@ -1192,6 +1192,77 @@ fn staging_warns_that_an_unannotated_tool_schema_is_judged_by_key_name() {
         .stderr(predicate::str::contains("W-SEC-018").not());
 }
 
+/// The warning is per property: annotating one destination leaves every other path-shaped
+/// property still guessed at, and staging names each of those and none of the annotated ones.
+#[test]
+fn staging_warns_about_a_path_shaped_property_beside_an_annotated_one() {
+    if common::skip_without_host_support(
+        "staging_warns_about_a_path_shaped_property_beside_an_annotated_one",
+    ) {
+        return;
+    }
+    let partly_annotated = r#"{"type":"object","properties":{"dest":{"type":"string","format":"murmur-destination"},"path":{"type":"string"},"repo":{"type":"string"}}}"#;
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = staging_project_with_tool(
+        &home,
+        artifact_dir.path(),
+        &["tests"],
+        "half-declared-tool",
+        Some(partly_annotated),
+    );
+    mur()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            project.path().join("murmur.yaml").to_str().unwrap(),
+        ])
+        .assert()
+        .stderr(predicate::str::contains("warning[W-SEC-018]"))
+        .stderr(predicate::str::contains("'half-declared-tool'"))
+        .stderr(predicate::str::contains("'path'"))
+        .stderr(predicate::str::contains("'dest'").not());
+}
+
+/// A schema-root `murmur-destinations` list answers for the whole tool, so staging says nothing
+/// about it — including the empty list, which declares that the tool writes nothing named by or
+/// derived from its input.
+#[test]
+fn a_declared_destination_list_silences_the_schema_warning() {
+    if common::skip_without_host_support("a_declared_destination_list_silences_the_schema_warning")
+    {
+        return;
+    }
+    for (tool, schema) in [
+        (
+            "derived-tool",
+            r#"{"type":"object","properties":{"repo_path":{"type":"string"},"file":{"type":"string"},"path":{"type":"string"}},"murmur-destinations":["{repo_path}/.murmur"]}"#,
+        ),
+        (
+            "reader-tool",
+            r#"{"type":"object","properties":{"file":{"type":"string"}},"murmur-destinations":[]}"#,
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let project =
+            staging_project_with_tool(&home, artifact_dir.path(), &["tests"], tool, Some(schema));
+        mur()
+            .env("HOME", home.path())
+            .env_remove("NEXUS_API_KEY")
+            .args([
+                "run",
+                "--manifest",
+                project.path().join("murmur.yaml").to_str().unwrap(),
+            ])
+            .assert()
+            .stderr(predicate::str::contains("W-SEC-018").not());
+    }
+}
+
 /// A capsule that declares nothing read-only reads no tool schema, so it warns about nothing.
 #[test]
 fn a_capsule_without_read_only_gets_no_schema_warning() {

@@ -3059,14 +3059,20 @@ fn warn_on_advisory_read_only(read_only: &[String], shell_allow: &[String]) {
 }
 
 /// Warns (non-fatal, once per installed tool) when a capsule that declares
-/// `capabilities.filesystem.read_only` installs a tool whose `input_schema` names a path-shaped or
-/// destination-shaped property and annotates nothing.
+/// `capabilities.filesystem.read_only` installs a tool whose `input_schema` leaves a path-shaped
+/// or destination-shaped property unannotated.
 ///
-/// Such a tool's calls are judged by key name — the analyser guesses which of its inputs are
-/// filesystem destinations from [`crate::protected_paths::TOOL_PATH_KEYS`] and
+/// Such a property is judged by key name — the analyser guesses whether it is a filesystem
+/// destination from [`crate::protected_paths::TOOL_PATH_KEYS`] and
 /// [`crate::protected_paths::TOOL_DESTINATION_KEYS`] — and a guess is wrong in both directions: a
 /// stored payload carrying a `{file, text}` pair is refused as a write, and a destination under an
 /// unrecognized name is not checked. The tool's own schema can say which it is.
+///
+/// The decision is [`crate::tool_annotations::unannotated_path_properties`], which is per property
+/// rather than per tool: annotating one property leaves every other one still guessed at, so the
+/// warning names each of them. A schema-root
+/// [`crate::tool_annotations::KEYWORD_DESTINATIONS`] list answers for the whole tool and silences
+/// it; nothing on the capsule's side can.
 ///
 /// Only the capsule's own installed artifacts are considered. The synthetic manifests the runtime
 /// writes (the shell binaries, the peer-handoff tools, `delegate-task`) are not an operator's to
@@ -3076,18 +3082,31 @@ fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
         let Some(schema) = crate::tool_annotations::schema_from_manifest_yaml(manifest_yaml) else {
             continue;
         };
-        let Some(property) = crate::tool_annotations::unannotated_path_property(&schema) else {
+        let properties = crate::tool_annotations::unannotated_path_properties(&schema);
+        if properties.is_empty() {
             continue;
+        }
+        let named = properties
+            .iter()
+            .map(|property| format!("'{property}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (noun, pronoun) = if properties.len() == 1 {
+            ("property", "it")
+        } else {
+            ("properties", "them")
         };
         let link = security_warning_link(W_SEC_018);
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_018}]: capabilities.filesystem.read_only is \
-             declared and the tool '{tool}' declares the property '{property}' with no murmur \
-             format annotation — its calls are judged by key name. Annotate a destination \
-             property with \"format\": \"{destination}\", and any object the tool only stores \
-             with \"format\": \"{opaque}\" ({link})",
+             declared and the tool '{tool}' declares the {noun} {named} with no murmur \
+             annotation — calls naming {pronoun} are judged by key name. Annotate a destination \
+             property with \"format\": \"{destination}\", any object the tool only stores with \
+             \"format\": \"{opaque}\", and a destination derived from another property — or the \
+             absence of any — with the schema-root \"{keyword}\" list ({link})",
             destination = crate::tool_annotations::FORMAT_DESTINATION,
             opaque = crate::tool_annotations::FORMAT_OPAQUE,
+            keyword = crate::tool_annotations::KEYWORD_DESTINATIONS,
         );
     }
 }

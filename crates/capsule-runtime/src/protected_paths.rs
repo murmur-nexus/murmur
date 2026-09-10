@@ -20,6 +20,7 @@
 //! | A tool input carrying no [`TOOL_DESTINATION_KEYS`] key and no [`TOOL_PATH_KEYS`]/[`TOOL_CONTENT_KEYS`] pairing | A path alone is a read. |
 //! | A malicious artifact writing wherever its preopen allows | Dispatch sees innocuous input. Only a narrow `capabilities.filesystem.scope` on that artifact's entry stops it. |
 //! | A path inside a subtree a tool's own schema declared [`crate::tool_annotations::FORMAT_OPAQUE`] | The key-name heuristic does not descend there, so a destination the tool did not also declare is not seen. The tool author's declaration is taken at its word; the tool author is not this layer's adversary. |
+//! | A destination whose write-ness depends on another input's value — a `repo` a `git` tool writes under `checkout` and reads under `log` | Neither a `format` value nor [`crate::tool_annotations::KEYWORD_DESTINATIONS`] takes a condition, so such a property stays unannotated and keeps firing `W-SEC-018`. Judging it by key name in both directions is the deliberate outcome. |
 //! | A destination whose declaration the lowering could not read — behind a `$ref`, past [`crate::tool_annotations`]'s depth bound, in an unparsable schema, or in an artifact `manage.pull()` fetched after staging | The tool keeps the key-name heuristic, which is the conservative direction: it can only miss a declared destination, never permit one it looked at. |
 //!
 //! This layer is the only one that covers the tool path, which is where the threat lives, and the
@@ -87,9 +88,11 @@ pub(crate) enum WriteSignal {
         path_key: String,
         content_key: String,
     },
-    /// A location the tool's own `input_schema` declared to be a filesystem destination with
-    /// [`crate::tool_annotations::FORMAT_DESTINATION`], named as
-    /// [`crate::tool_annotations::InputLocation::render`] writes it.
+    /// A location the tool's own `input_schema` declared to be a filesystem destination: a
+    /// property carrying [`crate::tool_annotations::FORMAT_DESTINATION`], named as
+    /// [`crate::tool_annotations::InputLocation::render`] writes it, or a schema-root
+    /// [`crate::tool_annotations::KEYWORD_DESTINATIONS`] entry, named as the tool declared it —
+    /// `edits[].path` against `{repo_path}/.murmur`, so the braces say which of the two it was.
     ToolDeclaredDestination { location: String },
 }
 
@@ -371,12 +374,16 @@ impl ProtectedPaths {
         None
     }
 
-    /// The tool arm: the locations the tool declared as destinations first, then the key-name
-    /// heuristic over the input JSON, evaluating the pairing rule per object so a nested edit list
-    /// is read the same way a flat input is.
+    /// The tool arm: the locations the tool declared as destinations first, then the destinations
+    /// it derives from an input location, then the key-name heuristic over the input JSON,
+    /// evaluating the pairing rule per object so a nested edit list is read the same way a flat
+    /// input is.
     ///
     /// A declared destination is asked first for the same reason a destination *key* is: it is a
-    /// write target on its own, and it is the more precise thing to name in the refusal.
+    /// write target on its own, and it is the more precise thing to name in the refusal. The order
+    /// decides which signal a refusal carries and nothing else — every declared location is
+    /// checked in addition to the heuristic, never instead of it, so a schema can only move a
+    /// verdict from permitted to refused.
     fn check_tool(
         &self,
         workdir: &Path,
@@ -385,6 +392,9 @@ impl ProtectedPaths {
     ) -> Option<ProtectedPathRefusal> {
         let value: serde_json::Value = serde_json::from_str(input).ok()?;
         if let Some(refusal) = self.check_declared_destinations(workdir, &value, annotations) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = self.check_derived_destinations(workdir, &value, annotations) {
             return Some(refusal);
         }
         self.walk_json(workdir, &value, &mut Vec::new(), annotations)
@@ -408,6 +418,34 @@ impl ProtectedPaths {
                         path,
                         signal: WriteSignal::ToolDeclaredDestination {
                             location: location.render(),
+                        },
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Every destination the schema derives from an input location: each string the location
+    /// resolves to, with the entry's suffix joined onto it.
+    ///
+    /// The refusal names the entry as the tool declared it — `{repo_path}/.murmur` — so the trace
+    /// vocabulary does not grow and the braces distinguish a derived destination from a property
+    /// that carried the `format` value.
+    fn check_derived_destinations(
+        &self,
+        workdir: &Path,
+        value: &serde_json::Value,
+        annotations: &ToolAnnotations,
+    ) -> Option<ProtectedPathRefusal> {
+        for derived in annotations.derived() {
+            for candidate in derived.candidates(value) {
+                if let Some((rule, path)) = self.covering_rule(workdir, &candidate) {
+                    return Some(ProtectedPathRefusal {
+                        rule: rule.declared().to_string(),
+                        path,
+                        signal: WriteSignal::ToolDeclaredDestination {
+                            location: derived.declared().to_string(),
                         },
                     });
                 }
@@ -1523,6 +1561,92 @@ mod tests {
                 .is_some(),
             "a tool absent from the map keeps the heuristic"
         );
+    }
+
+    /// A destination the tool derives from a read input is checked where the input points, and
+    /// the refusal names the entry as the schema declared it.
+    #[test]
+    fn a_derived_destination_is_checked_under_the_location_it_names() {
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "grapher",
+            r#"{"type":"object","properties":{"repo_path":{"type":"string"}},"murmur-destinations":["{repo_path}/.murmur"]}"#,
+        )]);
+        let call = named_tool("grapher", serde_json::json!({"repo_path": "repo"}));
+
+        let refusal = paths(&["repo"])
+            .check_call(workdir, &call, &annotations)
+            .expect("the derived destination falls under the rule");
+        assert_eq!(refusal.rule, "repo");
+        assert_eq!(refusal.path, "repo/.murmur");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolDeclaredDestination {
+                location: "{repo_path}/.murmur".to_string()
+            }
+        );
+        assert_eq!(
+            refusal.signal.describe(),
+            "destination '{repo_path}/.murmur' declared by the tool's input schema"
+        );
+
+        assert!(
+            paths(&["tests"])
+                .check_call(workdir, &call, &annotations)
+                .is_none(),
+            "a derived destination outside every rule is not a refusal"
+        );
+    }
+
+    /// A declaration is not an exemption: the empty list adds no location to check and removes
+    /// none, so the same input is refused with the same signal it would have been without it.
+    #[test]
+    fn a_complete_declaration_judges_the_input_exactly_as_no_declaration_does() {
+        let protected = paths(&["tests"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "reader",
+            r#"{"type":"object","properties":{"file":{"type":"string"},"content":{"type":"string"}},"murmur-destinations":[]}"#,
+        )]);
+        let call = named_tool(
+            "reader",
+            serde_json::json!({"file": "tests/a.py", "content": "x"}),
+        );
+
+        let refusal = protected
+            .check_call(workdir, &call, &annotations)
+            .expect("declaring no destination permits nothing");
+        assert_eq!(
+            refusal.signal,
+            WriteSignal::ToolPathWithContent {
+                path_key: "file".to_string(),
+                content_key: "content".to_string()
+            }
+        );
+        assert_eq!(
+            protected.check_unannotated(workdir, &call),
+            Some(refusal),
+            "the same call without the declaration reaches the same verdict"
+        );
+    }
+
+    /// A malformed entry invalidates the whole list, so nothing is derived from it and the tool
+    /// keeps the key-name heuristic alone.
+    #[test]
+    fn a_malformed_declaration_derives_nothing() {
+        let protected = paths(&["repo"]);
+        let workdir = Path::new("/nowhere/work");
+        let annotations = ToolAnnotationMap::from_schemas(&[(
+            "grapher",
+            r#"{"type":"object","properties":{"repo_path":{"type":"string"}},"murmur-destinations":["{repo_path}/.murmur","{repo_path}/../out"]}"#,
+        )]);
+        assert!(protected
+            .check_call(
+                workdir,
+                &named_tool("grapher", serde_json::json!({"repo_path": "repo"})),
+                &annotations,
+            )
+            .is_none());
     }
 
     /// A shell call consults no annotation, whatever any tool declared.
