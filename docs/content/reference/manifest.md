@@ -1198,13 +1198,15 @@ receives an error naming the path, the rule, that nothing ran, and that the path
 readable. See [`protected_path_denied`](observability-schemas.md#protected-path-denied).
 
 **What a tool declares about its own input.** A tool artifact says which of its inputs are
-filesystem destinations and which are payload it only stores, with JSON Schema's `format` keyword
-in its own `input_schema`:
+filesystem destinations, which are payload it only stores, and which destinations it derives from
+an input rather than reading whole — with JSON Schema's `format` keyword on its own properties and
+one keyword at the root of its own `input_schema`:
 
-| `format` value | Declared on | Effect |
+| Declaration | Written on | Effect |
 |---|---|---|
-| `murmur-destination` | A string property | The value at that location is checked against every `read_only` entry, wherever in the input it sits |
-| `murmur-opaque` | An object or array property | The key-name rules above do not descend into that subtree |
+| `"format": "murmur-destination"` | A string property | The value at that location is checked against every `read_only` entry, wherever in the input it sits |
+| `"format": "murmur-opaque"` | An object or array property | The key-name rules above do not descend into that subtree |
+| `"murmur-destinations": [...]` | The schema root, beside `type` and `properties` | Every entry is resolved against the input and checked the same way |
 
 ```yaml
 input_schema: |
@@ -1214,12 +1216,12 @@ input_schema: |
     "note":{"type":"object","format":"murmur-opaque"}}}
 ```
 
-An annotation refines where the runtime looks, never whether it refuses: no `format` value permits
-a path, and every refusal is still decided by the operator's own `read_only` entries.
+An annotation refines where the runtime looks, never whether it refuses: nothing in a schema
+permits a path, and every refusal is still decided by the operator's own `read_only` entries.
 
 | Case | Behaviour |
 |---|---|
-| A tool that annotates nothing | Judged by key name, exactly as the table above describes |
+| A tool that declares nothing | Judged by key name, exactly as the table above describes |
 | `murmur-opaque` on a string property | Ignored; the key-name rules keep running on the object that carries it |
 | `murmur-destination` inside a subtree marked `murmur-opaque` | Still checked |
 | `murmur-opaque` on the schema's top level | The key-name rules do not run on that tool's input at all; only its declared destinations are checked |
@@ -1228,9 +1230,56 @@ a path, and every refusal is still decided by the operator's own `read_only` ent
 A refusal a declared destination triggered names the location in the model's error and in the
 trace record: `edits[].path` for the schema above.
 
-A capsule that declares `read_only` and installs a tool whose schema names a path-shaped or
-destination-shaped property and annotates nothing fires
-[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and the property.
+**Destinations derived from an input.** A tool whose real write is a fixed path *under* one of its
+inputs — a graph database under `<repo_path>/.murmur`, where `repo_path` is a read source —
+declares it at the schema root, in a `murmur-destinations` array:
+
+```yaml
+input_schema: |
+  {"type":"object",
+   "properties":{"repo_path":{"type":"string"},"file":{"type":"string"}},
+   "murmur-destinations":["{repo_path}/.murmur"]}
+```
+
+Each entry is a braced input location, optionally followed by `/` and a relative suffix:
+
+| Entry | Means |
+|---|---|
+| `{repo_path}/.murmur` | `.murmur` under every string at `repo_path` |
+| `{repo_path}` | Every string at `repo_path`, unmodified |
+| `{paths[]}` | Every string in the `paths` array |
+| `{edits[].path}` | Every `path` string in the `edits` array |
+
+The empty list, `"murmur-destinations": []`, declares that the tool writes nothing named by or
+derived from its input.
+
+The location is spelled the way a refusal names it — object keys joined with `.`, `[]` for an array
+step. The braces are mandatory, so `repo_path/.murmur` is malformed. A suffix is relative and stays
+inside what the location named: a leading `/`, an empty component, a `.` or `..` component and a
+`\` anywhere are each rejected, as is an entry naming a location the schema does not declare.
+
+Validity is all-or-nothing. One malformed or dangling entry, or a value that is not an array of
+strings, discards the whole list: no derived destination is checked and the tool is judged exactly
+as one that declared no list at all.
+
+A capsule that declares `read_only` and installs a tool whose schema leaves a path-shaped or
+destination-shaped property to the key-name rules fires
+[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and every such property. Which
+declaration silences which property:
+
+| Declaration | Silences the warning for |
+|---|---|
+| `"format": "murmur-destination"` | The property it sits on, and no sibling |
+| `"format": "murmur-opaque"` | The property it sits on, only where the schema declares that property an object or array — the only place it takes effect — and everything inside that subtree |
+| `"murmur-destinations": [...]`, the empty list included | The whole tool |
+
+**What no declaration can say.** A property that is a destination under some input values and a
+read source under others: a `repo` a tool writes under `checkout`, `reset --hard`, `stash pop`,
+`pull`, `merge` and `cherry_pick`, and reads under `log`, `diff`, `show` and `status`. Neither a
+`format` value nor a `murmur-destinations` entry takes a condition, so such a property stays
+undeclared and falls back on its name: it is judged by the key-name rules if its name is in the
+tables above, and not checked at all if it is not. `repo` is in neither table, so a tool with that
+shape is contained there only by `capabilities.filesystem.scope`.
 
 **What it does not refuse.** Everything the dispatch check cannot positively identify — command
 substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file
