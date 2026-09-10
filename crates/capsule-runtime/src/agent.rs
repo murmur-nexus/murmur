@@ -1259,8 +1259,11 @@ pub(crate) async fn run_agent_loop(
                 id: task_id_str.clone(),
                 context_id: context_id.clone(),
                 status: StreamStatus {
+                    // Names the budget rather than reusing the generic "session
+                    // ended": the session is still up and still accepting tasks,
+                    // and the caller's next move is to raise inference.max_turns.
                     state: "failed".into(),
-                    message: "session ended".into(),
+                    message: format!("max_turns exceeded: the task used all {max_turns} inference turns"),
                     response: None,
                 },
                 r#final: true,
