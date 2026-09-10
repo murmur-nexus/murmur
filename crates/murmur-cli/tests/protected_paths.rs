@@ -519,6 +519,9 @@ const SNEAKY_SCHEMA: &str = r#"{"type":"object","properties":{"path":{"type":"st
 const MISLABELED_SCHEMA: &str =
     r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-opaque"}}}"#;
 
+/// A grapher whose only write is derived: a fixed directory under a property it reads.
+const GRAPHER_SCHEMA: &str = r#"{"type":"object","properties":{"repo_path":{"type":"string"}},"murmur-destinations":["{repo_path}/.murmur"]}"#;
+
 /// A `{file, text}` pair inside a subtree the tool declared opaque is stored data, and the call
 /// is dispatched.
 #[test]
@@ -685,6 +688,54 @@ fn a_declared_destination_adds_coverage_the_key_names_do_not_have() {
         undeclared.trace_raw
     );
     assert!(undeclared.marker_exists(), "the tool ran");
+}
+
+/// A destination the tool derives from an input is checked where the derivation lands: an input
+/// naming a read-only directory is refused for the suffix under it, and the refusal names the
+/// entry the tool declared.
+#[test]
+fn a_derived_destination_is_refused_under_the_location_it_names() {
+    if common::skip_without_host_support(
+        "a_derived_destination_is_refused_under_the_location_it_names",
+    ) {
+        return;
+    }
+    let inside = run_session(
+        one_tool_call("grapher", json!({"repo_path": "tests"})),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("grapher", Some(GRAPHER_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(!inside.marker_exists(), "the tool must never be invoked");
+    let refusal = inside.refusal();
+    assert_eq!(refusal["path"], json!("tests/.murmur"));
+    assert_eq!(refusal["rule"], json!("tests"));
+    assert_eq!(
+        refusal["signal"],
+        json!("destination '{repo_path}/.murmur' declared by the tool's input schema"),
+        "the refusal names the entry as the tool wrote it"
+    );
+
+    let outside = run_session(
+        one_tool_call("grapher", json!({"repo_path": "src"})),
+        &Capsule {
+            read_only: &["tests"],
+            shell_allow: &["bash"],
+            tools: &[("grapher", Some(GRAPHER_SCHEMA))],
+        },
+        |_| {},
+    );
+
+    assert!(
+        outside.events("protected_path_denied").is_empty(),
+        "a derivation landing outside every rule is not a write to refuse:\n{}",
+        outside.trace_raw
+    );
+    assert!(outside.marker_exists(), "the tool ran");
 }
 
 /// No annotation, at any location, suppresses a refusal: an opaque sibling does not shelter a
@@ -1225,6 +1276,40 @@ fn staging_warns_about_a_path_shaped_property_beside_an_annotated_one() {
         .stderr(predicate::str::contains("'half-declared-tool'"))
         .stderr(predicate::str::contains("'path'"))
         .stderr(predicate::str::contains("'dest'").not());
+}
+
+/// `murmur-opaque` takes effect only on a container, so on a string property it answers nothing:
+/// the dispatch check still judges that property by key name and staging still names it. A
+/// path-shaped property inside an opaque subtree is not named.
+#[test]
+fn staging_warns_about_an_opaque_string_property() {
+    if common::skip_without_host_support("staging_warns_about_an_opaque_string_property") {
+        return;
+    }
+    let mislabeled = r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-opaque"},"note":{"type":"object","format":"murmur-opaque","properties":{"file":{"type":"string"}}}}}"#;
+
+    let home = tempfile::tempdir().unwrap();
+    let artifact_dir = tempfile::tempdir().unwrap();
+    let project = staging_project_with_tool(
+        &home,
+        artifact_dir.path(),
+        &["tests"],
+        "mislabeled-tool",
+        Some(mislabeled),
+    );
+    mur()
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .args([
+            "run",
+            "--manifest",
+            project.path().join("murmur.yaml").to_str().unwrap(),
+        ])
+        .assert()
+        .stderr(predicate::str::contains("warning[W-SEC-018]"))
+        .stderr(predicate::str::contains("'mislabeled-tool'"))
+        .stderr(predicate::str::contains("'path'"))
+        .stderr(predicate::str::contains("'file'").not());
 }
 
 /// A schema-root `murmur-destinations` list answers for the whole tool, so staging says nothing

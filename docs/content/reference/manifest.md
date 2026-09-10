@@ -1260,17 +1260,19 @@ Validity is all-or-nothing. One malformed or dangling entry, or a value that is 
 strings, lowers the whole list to nothing: no derived destination is checked and the tool is judged
 exactly as one that declared no list at all.
 
-A capsule that declares `read_only` and installs a tool whose schema names a path-shaped or
-destination-shaped property that carries no annotation of its own fires
-[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and every such property. A
-`format` value answers for the property it sits on and for no sibling; a valid `murmur-destinations`
-list — the empty one included — answers for the whole tool and silences the warning for it.
+A capsule that declares `read_only` and installs a tool whose schema leaves a path-shaped or
+destination-shaped property to the key-name rules fires
+[`W-SEC-018`](diagnostics.md#w-sec-018) at staging, naming the tool and every such property.
+`murmur-destination` answers for the property it sits on and for no sibling; `murmur-opaque` answers
+only where the schema declares that property an object or array, which is the only place it takes
+effect; a valid `murmur-destinations` list — the empty one included — answers for the whole tool and
+silences the warning for it.
 
-**What no declaration can say.** A destination whose write-ness depends on another input's value: a
-`repo` a tool writes under `checkout`, `reset --hard`, `stash pop`, `pull`, `merge` and
-`cherry_pick`, and reads under `log`, `diff`, `show` and `status`. Neither a `format` value nor a
-`murmur-destinations` entry takes a condition, so such a property stays undeclared and keeps firing
-`W-SEC-018` — loudly unjudged rather than silently so.
+**What no declaration can say.** A property that is a destination under some input values and a
+read source under others: a `repo` a tool writes under `checkout`, `reset --hard`, `stash pop`,
+`pull`, `merge` and `cherry_pick`, and reads under `log`, `diff`, `show` and `status`. Neither a
+`format` value nor a `murmur-destinations` entry takes a condition, so such a property stays
+undeclared, keeps the key-name rules, and keeps firing [`W-SEC-018`](diagnostics.md#w-sec-018).
 
 **What it does not refuse.** Everything the dispatch check cannot positively identify — command
 substitution, `eval`, a binary outside the table above, and an allowlisted interpreter's own file

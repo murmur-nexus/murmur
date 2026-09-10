@@ -1485,15 +1485,18 @@ gap; keeping it does not weaken any other part of the declaration. See
 **Fires when:** `capabilities.filesystem.read_only` is non-empty and an installed tool's
 `input_schema` declares a path-shaped property (`path`, `file_path`, `filepath`, `filename`,
 `file`) or a destination-shaped one (`dest`, `dest_path`, `destination`, `destination_path`,
-`target_path`, `output_path`, `out_path`, `new_path`, `to`) that carries no `murmur-destination` or
-`murmur-opaque` value of its own. Once per such tool, at staging, on stderr, naming every one of
-those properties.
+`target_path`, `output_path`, `out_path`, `new_path`, `to`) that the key-name rules still judge.
+Once per such tool, at staging, on stderr, naming every one of those properties.
 
 The decision is per property. Annotating one property answers for that property alone, so a tool
-that has declared some of its destinations keeps being asked about the rest. Two things silence the
-whole tool: a schema-root `murmur-destinations` list, including the empty one, and a subtree
-declared `murmur-opaque` — the key-name rules do not descend there, so nothing inside it is judged
-by key name.
+that has declared some of its destinations keeps being asked about the rest. A schema-root
+`murmur-destinations` list, including the empty one, answers for the whole tool. A property inside
+a subtree declared `murmur-opaque` is never named, because the key-name rules do not descend there
+either.
+
+`murmur-opaque` answers for a property only where the schema declares that property an object or an
+array. On a string property the dispatch check ignores it and keeps judging the value by key name,
+so that property is still named here.
 
 **Why it matters:** with nothing declared, the dispatch-time check guesses which of a tool's inputs
 are filesystem destinations from those property names. The guess is wrong in both directions: a
@@ -1501,17 +1504,17 @@ note the tool merely stores, carrying a `{file, text}` pair, is refused as a wri
 destination under a name no table carries is never checked.
 
 ```text
-[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur annotation — calls naming it are judged by key name. Annotate a destination property with "format": "murmur-destination", any object the tool only stores with "format": "murmur-opaque", and a destination derived from another property — or the absence of any — with the schema-root "murmur-destinations" list (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-018)
+[capsule-runtime] warning[W-SEC-018]: capabilities.filesystem.read_only is declared and the tool 'guessed-tool' declares the property 'file_path' with no murmur annotation in effect — calls naming it are judged by key name. Annotate a destination property with "format": "murmur-destination", any object the tool only stores with "format": "murmur-opaque", and a destination derived from another property — or the absence of any — with the schema-root "murmur-destinations" list (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-018)
 ```
 
 With more than one such property the line names them all: `declares the properties 'file', 'path'
-with no murmur annotation — calls naming them are judged by key name`.
+with no murmur annotation in effect — calls naming them are judged by key name`.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The named
 properties keep the key-name rules.
 
-**What to do:** say in the tool's `input_schema` what each named property is. There are three ways
-to say it, and a tool usually needs more than one:
+**What to do:** say in the tool's `input_schema` what each named property is. A tool usually needs
+more than one of these:
 
 | Declaration | Says |
 |---|---|
@@ -1520,11 +1523,12 @@ to say it, and a tool usually needs more than one:
 | `"murmur-destinations": ["{repo_path}/.murmur"]` at the schema root | The tool writes a fixed path under another input's value |
 | `"murmur-destinations": []` at the schema root | The tool writes nothing named by or derived from its input |
 
-A destination whose write-ness depends on another input's value — a `repo` written under `checkout`
-and read under `log` — cannot be declared, and such a property keeps firing this warning.
+A property that is a destination under some input values and a read source under others — a `repo`
+written under `checkout` and read under `log` — cannot be declared either way, and keeps firing
+this warning.
 
 The warning is the tool author's to answer, not the operator's: a capsule cannot annotate a tool it
-installs, and there is no way to suppress it for one. See
+installs, and there is no way to suppress it for one. The entry grammar is in
 [Read-only paths](manifest.md#read-only-paths).
 
 ### W-SEC-019 — an unrecognized key in `murmur.yaml` { #w-sec-019 }

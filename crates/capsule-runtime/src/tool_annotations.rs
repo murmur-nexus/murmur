@@ -33,6 +33,11 @@
 //! tool author is not this layer's adversary — see the "what it cannot see" table in
 //! [`crate::protected_paths`].
 //!
+//! An opaque declaration therefore answers `W-SEC-018` only where the schema declares the node an
+//! object or an array. On a string property dispatch ignores it and keeps judging that property by
+//! key name, so the warning saying so is true and stays: no annotation buys silence about a check
+//! it does not remove.
+//!
 //! # Why the third word sits at the schema root
 //!
 //! A derived destination is not a property's value. A tool that reads Rust sources under
@@ -269,13 +274,19 @@ impl DerivedDestination {
 
     /// Every path this entry names in one concrete input: each string the location resolves to,
     /// with the suffix joined onto it.
+    ///
+    /// A location resolving to the empty string names the workdir root, so the suffix stands
+    /// alone there: joining it onto the empty string would name an absolute path outside the
+    /// workdir, which `ProtectedPaths::covering_rule` declines and the tool would never write.
     pub(crate) fn candidates(&self, input: &Value) -> Vec<String> {
         self.base
             .resolve(input)
             .into_iter()
-            .map(|base| match &self.suffix {
-                Some(suffix) => format!("{base}/{suffix}"),
-                None => base.to_string(),
+            .filter_map(|base| match (&self.suffix, base) {
+                (Some(suffix), "") => Some(suffix.clone()),
+                (Some(suffix), base) => Some(format!("{base}/{suffix}")),
+                (None, "") => None,
+                (None, base) => Some(base.to_string()),
             })
             .collect()
     }
@@ -321,6 +332,16 @@ impl ToolAnnotations {
     }
 }
 
+/// One property whose name alone would put a call naming it on the key-name heuristic.
+struct PathShapedProperty {
+    name: String,
+    at: InputLocation,
+    /// Whether the schema declares this node an object or an array. [`FORMAT_OPAQUE`] is honoured
+    /// at dispatch only on a container value, so anywhere else it answers nothing about this
+    /// property.
+    container: bool,
+}
+
 /// One tool's `input_schema` read for everything this module decides from it.
 struct LoweredSchema {
     annotations: ToolAnnotations,
@@ -330,9 +351,9 @@ struct LoweredSchema {
     /// Every location the walk reached, which is what a [`KEYWORD_DESTINATIONS`] entry's location
     /// is checked against.
     visited: Vec<InputLocation>,
-    /// Every path-shaped or destination-shaped property the walk saw outside an opaque subtree,
-    /// with the location it sits at — the input to [`unannotated_path_properties`].
-    path_shaped: Vec<(String, InputLocation)>,
+    /// Every path-shaped or destination-shaped property the walk saw outside an opaque subtree —
+    /// the input to [`unannotated_path_properties`].
+    path_shaped: Vec<PathShapedProperty>,
 }
 
 impl LoweredSchema {
@@ -382,7 +403,11 @@ impl LoweredSchema {
                 if !in_opaque
                     && (matches_key(TOOL_PATH_KEYS, key) || matches_key(TOOL_DESTINATION_KEYS, key))
                 {
-                    self.path_shaped.push((key.clone(), location.clone()));
+                    self.path_shaped.push(PathShapedProperty {
+                        name: key.clone(),
+                        at: location.clone(),
+                        container: declares_container(child),
+                    });
                 }
                 self.walk(child, &location, depth + 1, in_opaque);
             }
@@ -450,6 +475,17 @@ fn murmur_format(node: &Value) -> Option<&str> {
     match node.get("format").and_then(Value::as_str) {
         Some(value @ (FORMAT_DESTINATION | FORMAT_OPAQUE)) => Some(value),
         _ => None,
+    }
+}
+
+/// Whether one schema node declares its value an object or an array, under either the single-type
+/// or the type-list spelling. A node declaring no `type` at all declares no container.
+fn declares_container(node: &Value) -> bool {
+    let container = |name: &Value| matches!(name.as_str(), Some("object" | "array"));
+    match node.get("type") {
+        Some(Value::Array(names)) => names.iter().any(container),
+        Some(name) => container(name),
+        None => false,
     }
 }
 
@@ -556,8 +592,13 @@ fn read_staged_schema(manifest_path: &Path) -> Option<String> {
 /// Empty when the schema carries a valid [`KEYWORD_DESTINATIONS`] list, the empty list included:
 /// the tool has answered the question the warning asks, for the whole tool. Otherwise every
 /// property whose name is path-shaped or destination-shaped, whose own location carries no murmur
-/// annotation, and which does not sit inside a subtree declared [`FORMAT_OPAQUE`] — in walk order,
-/// deduplicated by name.
+/// annotation that dispatch honours there, and which does not sit inside a subtree declared
+/// [`FORMAT_OPAQUE`] — in walk order, deduplicated by name.
+///
+/// [`FORMAT_OPAQUE`] answers for a property only where the schema declares that node an object or
+/// an array, because that is the only place `ProtectedPaths::walk_json` honours it. On a string
+/// property the heuristic keeps judging the value by key name, and a property still judged by key
+/// name is what this warning is about.
 ///
 /// The decision is per property rather than per tool: annotating one property answers for that
 /// property and for no other, so a tool that has declared some of its destinations keeps being
@@ -568,11 +609,11 @@ pub(crate) fn unannotated_path_properties(schema: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut names: Vec<String> = Vec::new();
-    for (name, location) in lowered.path_shaped {
-        let annotated = lowered.annotations.destinations.contains(&location)
-            || lowered.annotations.opaque.contains(&location);
-        if !annotated && !names.contains(&name) {
-            names.push(name);
+    for property in lowered.path_shaped {
+        let answered = lowered.annotations.destinations.contains(&property.at)
+            || (property.container && lowered.annotations.opaque.contains(&property.at));
+        if !answered && !names.contains(&property.name) {
+            names.push(property.name);
         }
     }
     names
@@ -783,6 +824,11 @@ mod tests {
             "{repo_path}/.murmur",
             "a refusal names the entry as the tool wrote it"
         );
+        assert_eq!(
+            annotations.derived()[0].candidates(&serde_json::json!({"repo_path": ""})),
+            vec![".murmur"],
+            "a location resolving to the empty string names the workdir root"
+        );
     }
 
     /// Validity is all-or-nothing: one bad entry, or a value that is not an array of strings,
@@ -869,6 +915,40 @@ mod tests {
             r#"{"type":"object","properties":{"note":{"type":"object","format":"murmur-opaque","properties":{"file":{"type":"string"}}}}}"#
         )
         .is_empty());
+    }
+
+    /// An opaque declaration answers for a property only where the schema declares that node a
+    /// container, because that is the only place dispatch honours it.
+    #[test]
+    fn an_opaque_declaration_on_a_non_container_property_keeps_warning() {
+        assert_eq!(
+            unannotated_path_properties(
+                r#"{"type":"object","properties":{"path":{"type":"string","format":"murmur-opaque"}}}"#
+            ),
+            vec!["path".to_string()],
+            "a string property is still judged by key name, whatever it declares"
+        );
+        assert_eq!(
+            unannotated_path_properties(
+                r#"{"type":"object","properties":{"file":{"format":"murmur-opaque"}}}"#
+            ),
+            vec!["file".to_string()],
+            "a node declaring no type declares no container"
+        );
+        assert!(
+            unannotated_path_properties(
+                r#"{"type":"object","properties":{"file":{"type":"object","format":"murmur-opaque","properties":{"body":{"type":"string"}}}}}"#
+            )
+            .is_empty(),
+            "on a container the declaration is what stops the heuristic descending"
+        );
+        assert!(
+            unannotated_path_properties(
+                r#"{"type":"object","properties":{"file":{"type":["object","null"],"format":"murmur-opaque"}}}"#
+            )
+            .is_empty(),
+            "the type-list spelling declares the same container"
+        );
     }
 
     /// A valid list answers for the whole tool, the empty list included.

@@ -3100,10 +3100,10 @@ fn warn_on_unannotated_tool_schemas(installed_manifests: &[(String, String)]) {
         eprintln!(
             "[capsule-runtime] warning[{W_SEC_018}]: capabilities.filesystem.read_only is \
              declared and the tool '{tool}' declares the {noun} {named} with no murmur \
-             annotation — calls naming {pronoun} are judged by key name. Annotate a destination \
-             property with \"format\": \"{destination}\", any object the tool only stores with \
-             \"format\": \"{opaque}\", and a destination derived from another property — or the \
-             absence of any — with the schema-root \"{keyword}\" list ({link})",
+             annotation in effect — calls naming {pronoun} are judged by key name. Annotate a \
+             destination property with \"format\": \"{destination}\", any object the tool only \
+             stores with \"format\": \"{opaque}\", and a destination derived from another \
+             property — or the absence of any — with the schema-root \"{keyword}\" list ({link})",
             destination = crate::tool_annotations::FORMAT_DESTINATION,
             opaque = crate::tool_annotations::FORMAT_OPAQUE,
             keyword = crate::tool_annotations::KEYWORD_DESTINATIONS,
