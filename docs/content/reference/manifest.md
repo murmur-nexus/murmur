@@ -1335,6 +1335,23 @@ the same terms. Omit the key to deliver no variable.
 - A `capabilities.shell` block present with an empty `allow` list is rejected at parse time.
 - A synthetic tool manifest is written to `workdir/tools/<binary>/murmur.yaml` at session start for
   each listed binary; the agent discovers these alongside artifact-backed tools.
+- The tool's `command` argument carries the arguments alone — the runtime supplies the binary. A
+  shell interpreter (`bash`, `sh`, `zsh`, `fish`, `dash`, `ksh`) is the exception: its `command` is
+  a whole shell line, run as the interpreter's `-c` argument.
+- The result the agent reads back opens with the command line that ran, then the exit code and the
+  two output streams:
+
+  ```text
+  $ ls -d .
+  Exit code: 0
+  Stdout:
+  .
+
+  Stderr:
+  ```
+
+  The name on the `$` line is the allowlist entry, so an interpreter's line shows the shell line
+  on its own (`$ echo hi`).
 
 ---
 

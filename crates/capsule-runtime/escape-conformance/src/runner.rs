@@ -770,10 +770,13 @@ mod tests {
     #[test]
     fn shell_exit_code_is_read_out_of_the_tool_result_text() {
         assert_eq!(
-            shell_exit_code("case=x tool=python3 isError=false :: $ ec-probe.py Exit code: 137 Stdout:  Stderr:"),
+            shell_exit_code("case=x tool=python3 isError=false :: $ python3 ec-probe.py Exit code: 137 Stdout:  Stderr:"),
             Some(137)
         );
-        assert_eq!(shell_exit_code("$ ec-probe.py Exit code: 0 Stdout: hi"), Some(0));
+        assert_eq!(
+            shell_exit_code("$ python3 ec-probe.py Exit code: 0 Stdout: hi"),
+            Some(0)
+        );
         assert_eq!(shell_exit_code("no exit code here"), None);
     }
 
