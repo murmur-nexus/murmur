@@ -1263,7 +1263,9 @@ pub(crate) async fn run_agent_loop(
                     // ended": the session is still up and still accepting tasks,
                     // and the caller's next move is to raise inference.max_turns.
                     state: "failed".into(),
-                    message: format!("max_turns exceeded: the task used all {max_turns} inference turns"),
+                    message: format!(
+                        "max_turns exceeded: the task used all {max_turns} inference turns"
+                    ),
                     response: None,
                 },
                 r#final: true,
