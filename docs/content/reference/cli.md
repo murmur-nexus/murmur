@@ -646,7 +646,12 @@ Output format:
 
 ```text
 [working]  inference turn 1
-[artifact] tool: bash | "Exit code: 0\nStdout:\nhello\n"
+[artifact] tool: bash | $ echo hello
+  Exit code: 0
+  Stdout:
+  hello
+
+  Stderr:
 [working]  inference turn 2
 [completed]
 ```

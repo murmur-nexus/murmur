@@ -6510,7 +6510,7 @@ fn dispatch_shell_tool(
                 resource_limit: result.resource_limit_hit.clone(),
             };
             DispatchOutcome {
-                result: shell_result_to_tool_result(&command, result),
+                result: shell_result_to_tool_result(name, &command, result),
                 shell: Some(shell),
                 detached: None,
                 is_skill: false,
@@ -6566,13 +6566,35 @@ fn extract_shell_command(input: &murmur::tool::run::ToolInput) -> Result<String,
     Ok(command.to_string())
 }
 
+/// The command line a person would type at a shell prompt to run this call.
+///
+/// An interpreter's `command` is already a whole shell line — it becomes the `-c` body — so it
+/// stands alone. Every other allowlisted binary receives the argument list alone, because
+/// `shell_tool_manifest_yaml` tells the model to omit the binary name, so the name goes back in
+/// front of it here.
+///
+/// `name` is the declared short name, the `capabilities.shell.allow` entry, not
+/// `ShellResult::binary`: that field is the resolved absolute path and would render
+/// `$ /usr/bin/ls .`.
+fn shell_command_line(name: &str, command: &str) -> String {
+    if is_shell_interpreter(name) {
+        format!("$ {command}")
+    } else {
+        format!("$ {name} {command}")
+    }
+}
+
 fn shell_result_to_tool_result(
+    name: &str,
     command: &str,
     result: ShellResult,
 ) -> murmur::tool::run::ToolResult {
     let mut data = format!(
-        "$ {}\nExit code: {}\nStdout:\n{}\nStderr:\n{}",
-        command, result.exit_code, result.stdout, result.stderr
+        "{}\nExit code: {}\nStdout:\n{}\nStderr:\n{}",
+        shell_command_line(name, command),
+        result.exit_code,
+        result.stdout,
+        result.stderr
     );
 
     let mut metadata = Vec::new();
@@ -8786,6 +8808,78 @@ inference:
             "command must still carry only the argument list"
         );
         assert_eq!(shell.exit_code, 0);
+    }
+
+    /// The `$ ` line is a command line, so for a non-interpreter it carries the binary the
+    /// model was told to omit from `command`. The name printed is the declared short name and
+    /// not `ShellResult::binary`, which is the resolved path.
+    #[test]
+    fn shell_tool_result_names_the_binary_a_non_interpreter_call_ran() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["ls".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let outcome = dispatch_shell_tool(
+            "ls",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"-d ."}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+
+        let data = outcome.result.data.expect("a finished call renders text");
+        let first = data.lines().next().expect("the text opens with the $ line");
+        assert_eq!(first, "$ ls -d .");
+        assert!(
+            !first.starts_with("$ /"),
+            "the resolved path must not reach the $ line, got {first:?}"
+        );
+        let printed_binary = first
+            .strip_prefix("$ ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the $ line names a binary");
+        assert!(
+            !printed_binary.contains('/'),
+            "the $ line names the declared short name, got {printed_binary:?}"
+        );
+    }
+
+    /// An interpreter's `command` is a whole shell line already, so it stands alone: `$ bash
+    /// echo hi` would read as bash invoked with `echo` as its script argument, which is not
+    /// what ran.
+    #[test]
+    fn shell_tool_result_leaves_an_interpreter_command_line_alone() {
+        let tmp = TempDir::new().unwrap();
+        let policy = CapabilityPolicy {
+            shell_allow: vec!["bash".to_string()],
+            ..CapabilityPolicy::default()
+        };
+
+        let outcome = dispatch_shell_tool(
+            "bash",
+            murmur::tool::run::ToolInput {
+                data: Some(r#"{"command":"echo hi"}"#.to_string()),
+                log_path: None,
+            },
+            tmp.path(),
+            tmp.path(),
+            &[],
+            &policy,
+            &sandbox::ShellEnforcement::environment_only(),
+            None,
+        );
+
+        let data = outcome.result.data.expect("a finished call renders text");
+        let first = data.lines().next().expect("the text opens with the $ line");
+        assert_eq!(first, "$ echo hi");
     }
 
     /// The argv a policy hook decides on and the argv the spawn receives come from one
