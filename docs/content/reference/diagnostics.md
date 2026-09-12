@@ -106,6 +106,7 @@ section that explains it.
 | `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
 | `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
+| `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker, or delivers nothing | [W-SEC-024](#w-sec-024) |
 
 ---
 
@@ -961,7 +962,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1758,3 +1759,58 @@ its port, serves its door and runs its tasks exactly as it would have.
 **What to do:** the message carries the reason the write failed, usually a `~/.murmur` that is not
 writable or a home directory the host would not resolve. Restore write access to `~/.murmur`, or
 set `HOME` to a directory this user owns, and the next launch records itself.
+
+### W-SEC-024 — `capabilities.env.allow` names a credential-shaped variable { #w-sec-024 }
+
+**Fires when:** an entry in [`capabilities.env.allow`](manifest.md#field-capabilities) is
+credential-shaped — its name contains `api_key`, `token`, `secret` or `password`, in any case. Once
+per distinct entry, in declaration order, on stderr, from `mur run` (including
+`mur run --explain-scope`) and from `mur doctor` in identical words.
+
+Which of the two lines you get depends on whether the credential backstop drops the name:
+
+| The backstop | What the capsule gets | Names it applies to |
+|---|---|---|
+| keeps the name | Every WASM guest the capsule runs observes the host's value | Credential-shaped names the backstop's patterns do not cover: `DATABASE_PASSWORD`, `SLACK_BOT_TOKEN`, `JWT_SECRET` |
+| drops the name | Nothing — the entry is inert and no guest sees a value | Names matching [the backstop's patterns](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) — `GITHUB_TOKEN`, `AWS_*`, `*_API_KEY` among them — or a [`capabilities.shell.strip_env`](manifest.md#field-capabilities) pattern the manifest declared |
+
+A name the backstop keeps:
+
+```text
+[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it: for as long as the capsule runs, the capsule holds it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
+```
+
+A kept name on a capsule whose resolved [`lifecycle.after_task`](manifest.md#lifecycle-after-task)
+is `sleep` gets one further sentence, because the capsule holds the value after the task that
+launched it is gone:
+
+```text
+[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: sleep keeps this capsule alive past the task that launched it, so it holds that value with nothing left waiting on it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
+```
+
+A name the backstop drops:
+
+```text
+[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'GITHUB_TOKEN', a credential-shaped variable the credential backstop drops before any guest is built — the grant delivers nothing and no guest observes the host's value. Remove the entry, or rename the host variable if the capsule is meant to receive it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
+```
+
+**Why it matters:** `capabilities.env.allow` is the one grant whose value murmur never issues, sees
+or revokes — an operator names a host variable, and the runtime passes it through. The line is how
+you tell which of your capsules holds which secret, and a working grant from an inert one; without
+it both outcomes look the same from the outside.
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The grant is as
+effective as it would be unwarned. The judgment is made from the variable's name alone: the line
+reads the same on a host that has the variable set and one that does not, and no value ever appears
+in it.
+
+**What to do:** when the backstop keeps the name, decide whether this capsule should hold that
+secret for its whole life, and point the variable at the narrowest credential that does the job —
+murmur cannot rotate or withdraw it for you. When the backstop drops the name the entry is dead
+weight: remove it, or rename the host variable out of the backstop's patterns if the capsule is
+meant to receive it.
+
+A capsule that holds an operator-granted secret for its whole life is a legitimate shape, which is
+why this is a warning and not a refusal — including with `after_task: sleep`.
+[`lifecycle.after_task`](manifest.md#lifecycle-after-task) is not a trigger on its own: with no
+credential-shaped name declared there is nothing being held.

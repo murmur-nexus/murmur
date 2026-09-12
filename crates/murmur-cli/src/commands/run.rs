@@ -332,6 +332,28 @@ pub(crate) fn run_run(
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    // Parsed ahead of the `--explain-scope` return because the warning below reads the resolved
+    // lifecycle, and a diagnostic that describes a launch must describe the flags it was given.
+    // A malformed value therefore refuses `--explain-scope` as it refuses a real run — the same
+    // reason `check_no_reserved_tool_names` is placed ahead of it.
+    let lifecycle_override = parse_lifecycle_override(
+        lifecycle_task_acceptance,
+        lifecycle_after_task,
+        &session_id,
+        &workdir,
+        json,
+    )?;
+
+    // The one grant whose value murmur never sees: `capabilities.env.allow` hands a capsule a host
+    // secret nothing here brokers. Emitted at this seam for the same reasons as the ignored-key
+    // warning above — `--explain-scope` reports it without staging anything, `StageRequest` gains
+    // no field, and `mur doctor` calls the same emitter. Never a refusal.
+    capsule_runtime::warn_on_secret_shaped_env_grants(
+        &capability_policy,
+        runtime_manifest.lifecycle.as_ref(),
+        lifecycle_override.as_ref(),
+    );
+
     // The same set, and the same checker, `stage_session` consults — called here only because the
     // installed-artifact pre-flight below would otherwise report a colliding name as a missing
     // artifact, sending the operator to `mur install` for something no registry may serve. Placed
@@ -613,15 +635,6 @@ pub(crate) fn run_run(
             )
         })?
     };
-
-    // Parse lifecycle override from CLI flags
-    let lifecycle_override = parse_lifecycle_override(
-        lifecycle_task_acceptance,
-        lifecycle_after_task,
-        &session_id,
-        &workdir,
-        json,
-    )?;
 
     let stage_request = StageRequest {
         manifest_dir: project_dir.clone(),
