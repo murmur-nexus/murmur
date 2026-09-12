@@ -105,6 +105,38 @@ echo "$RESULT" | grep -q '"uri":"/concepts/hooks.md"' || {
 }
 echo "    rewrote /concepts/hooks/ -> /concepts/hooks.md"
 
+# The trailing-slash redirect is the other production-critical rule: without it
+# every page has a second URL whose relative nav links 404.
+echo "==> Testing the uploaded function against a slashless page request"
+cat >/tmp/cf-event-slashless.json <<'JSON'
+{
+  "version": "1.0",
+  "context": { "eventType": "viewer-request" },
+  "viewer": { "ip": "1.2.3.4" },
+  "request": {
+    "method": "GET",
+    "uri": "/concepts/hooks",
+    "querystring": {},
+    "headers": { "host": { "value": "docs.murmur.nexus" } },
+    "cookies": {}
+  }
+}
+JSON
+
+RESULT=$(aws cloudfront test-function \
+    --name "$NAME" \
+    --if-match "$ETAG" \
+    --stage DEVELOPMENT \
+    --event-object "fileb:///tmp/cf-event-slashless.json" \
+    --query 'TestResult.FunctionOutput' --output text)
+
+echo "$RESULT" | grep -q '"statusCode":301' || {
+    echo "error: uploaded function did not redirect the slashless page URL." >&2
+    echo "$RESULT" >&2
+    exit 1
+}
+echo "    redirected /concepts/hooks -> https://docs.murmur.nexus/concepts/hooks/"
+
 if [[ "$DRY_RUN" == true ]]; then
     echo "==> --dry-run: stopping before publish. DEVELOPMENT stage is updated."
     exit 0

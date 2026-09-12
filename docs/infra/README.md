@@ -16,16 +16,40 @@ below changes on a normal docs deploy.
 ## The CloudFront Function (one-time setup)
 
 `cloudfront-agent-negotiation.js` implements two of the three markdown
-discovery paths:
+discovery paths, and canonicalises every other request onto one URL per page:
 
 | Request | Serves |
 | --- | --- |
 | `curl -H "Accept: text/markdown" .../concepts/hooks` | `/concepts/hooks.md` |
 | `curl ".../concepts/hooks?mode=agent"` | `/concepts/hooks.md` |
-| a browser | the HTML page, untouched |
+| a browser asking for `/concepts/hooks/` | `/concepts/hooks/index.html` |
+| a browser asking for `/concepts/hooks` | `301` to `/concepts/hooks/` |
 
-The third path — `<link rel="alternate" type="text/markdown">` in every page
-head — is built into the HTML and needs nothing here.
+The third markdown path — `<link rel="alternate" type="text/markdown">` in
+every page head — is built into the HTML and needs nothing here.
+
+### Why the slashless form redirects instead of being served
+
+MkDocs builds directory URLs and links between pages relatively, as
+`href="../artifacts/"`. A browser resolves that against the URL it is on: from
+`/concepts/access-control/` it reaches `/concepts/artifacts/`, but from
+`/concepts/access-control` it reaches `/artifacts/`, which does not exist.
+Serving the slashless form gives the page a second address on which every link
+in its own nav is a 404, and a crawler that lands there indexes both the
+duplicate and the dead siblings. The 301 leaves one URL per page, agreeing with
+the `<link rel="canonical">` in the page and the `<loc>` in `sitemap.xml`.
+
+Markdown negotiation runs first, so `/concepts/hooks?mode=agent` and an
+`Accept: text/markdown` on the slashless form still answer with the twin
+directly rather than costing a redirect hop.
+
+### This function serves both sites
+
+`murmur-index-rewrite` is associated with the landing distribution
+(`E8I1RI0YU23W1`) as well as the docs one, so publishing it changes
+`murmur.nexus` at the same time — that site's markdown twins and its own
+trailing-slash canonicalisation both come from here. Verify both after a
+publish.
 
 The function source lives in this repo, but CloudFront runs its own uploaded
 copy. **Editing the `.js` file changes nothing in production.**
@@ -108,9 +132,11 @@ minutes. To roll back, re-run with the `viewer-request` entry removed.
 ### 3. Verify
 
 ```bash
-curl -sI https://docs.murmur.nexus/concepts/hooks | grep -i content-type      # text/html
+curl -sI https://docs.murmur.nexus/concepts/hooks/ | grep -i content-type     # text/html
+curl -sI https://docs.murmur.nexus/concepts/hooks  | grep -iE '^(HTTP|location)'  # 301 -> /concepts/hooks/
 curl -s  https://docs.murmur.nexus/concepts/hooks?mode=agent | head -3        # frontmatter
 curl -s -H "Accept: text/markdown" https://docs.murmur.nexus/concepts/hooks | head -3
+curl -sI https://murmur.nexus/blog | grep -iE '^(HTTP|location)'              # same function, other site
 ```
 
 ## Shared agent-discovery response headers (one-time setup)

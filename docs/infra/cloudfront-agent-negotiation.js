@@ -21,25 +21,41 @@
  * hooks/agent_head.py and needs nothing here.
  *
  * ---------------------------------------------------------------------------
- * Ordering: markdown negotiation MUST run before the index.html rewrite.
+ * Rule order: markdown negotiation, then the trailing-slash redirect, then the
+ * index.html rewrite.
  *
- * The index.html rule appends "index.html" to any extensionless/directory
- * URI. If it ran first, "/concepts/hooks" would become
- * "/concepts/hooks/index.html" before the markdown check ever saw it — which
- * now has a "." in it, so the markdown rule would skip it and an agent asking
- * for text/markdown would get an HTML page instead of its twin.
+ * Markdown negotiation MUST run first. The rules below both put "index.html"
+ * or "/" on the end of an extensionless URI, so either one running first would
+ * hand "/concepts/hooks" on to a path the markdown rule no longer recognises,
+ * and an agent asking for text/markdown would get an HTML page instead of its
+ * twin.
  *
- * The index.html rule itself is unchanged from the original function and
- * still runs unconditionally on every request markdown negotiation doesn't
- * claim — including ones with a dot elsewhere in the path — to avoid
- * changing behavior for the plain-browser traffic it already served.
+ * The trailing-slash redirect must then run before the index.html rewrite,
+ * because the rewrite is what would otherwise serve the slashless URI a page
+ * of its own.
+ * ---------------------------------------------------------------------------
+ * Why the slashless URI is redirected rather than served.
+ *
+ * MkDocs builds directory URLs, so every page lives at /concepts/hooks/ and
+ * links to its siblings relatively, as href="../artifacts/". A browser
+ * resolves that against the *served* URL: from /concepts/hooks/ it gives
+ * /concepts/artifacts/, but from /concepts/hooks it gives /artifacts/, which
+ * does not exist. Rewriting the slashless form to .../index.html serves the
+ * page but leaves the address bar one segment short, so every in-page link
+ * points into a 404 — and a crawler that reached the slashless form indexes
+ * both the duplicate and the dead siblings it found there.
+ *
+ * A 301 to the trailing-slash form leaves one URL per page, matching the
+ * <link rel="canonical"> the page itself declares and the loc entries in
+ * sitemap.xml.
  * ---------------------------------------------------------------------------
  * No cache policy changes are needed, and adding them would hurt.
  *
  * A viewer-request function runs *before* the cache lookup, and the default
  * cache key is the distribution domain plus the URL path. Because this function
  * rewrites the path, `/concepts/hooks/` and `/concepts/hooks.md` are already
- * two different cache keys — the variants cannot collide.
+ * two different cache keys — the variants cannot collide. The redirect is
+ * generated at the edge and never reaches the cache at all.
  *
  * Do NOT add `Accept` to the cache key to "make this safe". Accept strings vary
  * enormously between browsers, versions, and bots, so including one would
@@ -65,12 +81,21 @@ function handler(event) {
     return request;
   }
 
+  var endsInSlash = uri.charAt(uri.length - 1) === "/";
+
+  // One URL per page. Guarded on "no dot anywhere in the path", the same test
+  // the index.html rewrite used for this branch, so the set of URIs claimed
+  // here is unchanged — /.well-known/api-catalog and /release-1.0 still pass
+  // through to the origin untouched.
+  if (!endsInSlash && uri.indexOf(".") === -1) {
+    return redirect(uri + "/", request);
+  }
+
   // Pre-existing rule (murmur-index-rewrite): rewrite directory requests to
-  // index.html.
-  if (uri.charAt(uri.length - 1) === "/") {
+  // index.html. Unconditional on extension, so a directory path with a dot
+  // elsewhere in it is served too.
+  if (endsInSlash) {
     request.uri = uri + "index.html";
-  } else if (uri.indexOf(".") === -1) {
-    request.uri = uri + "/index.html";
   }
 
   return request;
@@ -103,4 +128,42 @@ function markdownTwin(uri) {
     return "/index.md";
   }
   return trimmed + ".md";
+}
+
+function redirect(path, request) {
+  var headers = request.headers || {};
+  var host = headers.host ? headers.host.value : "";
+  var target = (host ? "https://" + host : "") + path + queryString(request.querystring);
+
+  return {
+    statusCode: 301,
+    statusDescription: "Moved Permanently",
+    headers: {
+      location: { value: target },
+      // A viewer-request response never enters the CloudFront cache, so this
+      // is the only thing keeping a client from asking the edge again on every
+      // navigation.
+      "cache-control": { value: "public, max-age=86400" }
+    }
+  };
+}
+
+function queryString(querystring) {
+  var names = Object.keys(querystring || {});
+  var parts = [];
+
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var param = querystring[name];
+    // CloudFront splits a repeated parameter into multiValue; dropping it
+    // would silently change the request the client made.
+    var values = param.multiValue || [{ value: param.value }];
+
+    for (var j = 0; j < values.length; j++) {
+      var value = values[j].value;
+      parts.push(value === "" ? name : name + "=" + value);
+    }
+  }
+
+  return parts.length ? "?" + parts.join("&") : "";
 }
