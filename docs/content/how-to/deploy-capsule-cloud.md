@@ -229,7 +229,7 @@ mur deploy ls
 ```text
 DEPLOYMENT_ID                           PROVIDER      REGION        STATUS      URL
 ----------------------------------------------------------------------------------------------------
-dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c  manual                      running     http://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual                      running     http://1.2.3.4:9000
 ```
 
 All active deployments are stored in `~/.murmur/deployments.json`. Each row maps to one entry.
@@ -241,7 +241,7 @@ All active deployments are stored in `~/.murmur/deployments.json`. Each row maps
 When you no longer need a deployment, remove it from the tracking list:
 
 ```bash
-mur destroy dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c
+mur destroy dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b
 ```
 
 This removes the entry from `~/.murmur/deployments.json`. It does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.

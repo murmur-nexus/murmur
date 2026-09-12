@@ -725,7 +725,7 @@ progress and the final box both go to stderr.
   ┌────────────────────────────────┐
   │  ∞  my-agent                   │
   │                                │
-  │  url   https://1.2.3.4:9000    │
+  │  url   http://1.2.3.4:9000     │
   │  dep   dep_01954a3b            │
   │  time  42s                     │
   └────────────────────────────────┘
@@ -733,7 +733,7 @@ progress and the final box both go to stderr.
 
 | Row | Description |
 |---|---|
-| `url` | Public A2A endpoint — `https://<VM_PUBLIC_IP>:<PORT>`. Use for `message/send`, `tasks/get`, and `/.well-known/agent-card.json`. |
+| `url` | Public A2A endpoint — `http://<VM_PUBLIC_IP>:<PORT>`. Use for `message/send`, `tasks/get`, and `/.well-known/agent-card.json`. |
 | `dep` | The deployment ID, abbreviated to its `dep_` prefix and first 8 hex characters. The full `dep_` + UUID v7 is stored in `~/.murmur/deployments.json` and listed by [`mur deploy ls`](#mur-deploy-ls); `mur destroy` accepts any unambiguous prefix. |
 | `time` | Elapsed wall-clock seconds |
 
@@ -762,7 +762,7 @@ mur deploy run \
   --manifest ./my-agent/murmur.yaml \
   --mur-binary ./target/x86_64-unknown-linux-musl/release/mur \
   --env ANTHROPIC_API_KEY=sk-ant-...
-# summary box on stderr: url https://1.2.3.4:9000 / dep dep_01954a3b / time 42s
+# summary box on stderr: url http://1.2.3.4:9000 / dep dep_01954a3b / time 42s
 ```
 
 **Error codes:**
@@ -793,7 +793,7 @@ Output columns:
 | `PROVIDER` | Always `manual` — VMs are created by the user, not by `mur deploy run` |
 | `REGION` | Empty for every record `mur deploy run` writes; the VM is one you created, and its region is never queried |
 | `STATUS` | Always `running` for present entries (`mur destroy` removes the entry) |
-| `URL` | Public A2A endpoint (`https://IP:PORT`) |
+| `URL` | Public A2A endpoint (`http://IP:PORT`) |
 
 Prints `no deployments` when `~/.murmur/deployments.json` is absent or empty.
 
@@ -802,7 +802,7 @@ Prints `no deployments` when `~/.murmur/deployments.json` is absent or empty.
 ```text
 DEPLOYMENT_ID                           PROVIDER      REGION        STATUS      URL
 ----------------------------------------------------------------------------------------------------
-dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual                      running     https://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual                      running     http://1.2.3.4:9000
 ```
 
 ---
@@ -831,7 +831,7 @@ mur destroy dep_01954a3b
 
 Location: `~/.murmur/deployments.json`
 
-A JSON array that tracks all active deployments. Written on `mur deploy`; entries removed on `mur destroy`. Schema per entry:
+A JSON array that tracks all active deployments. Written on `mur deploy run`; entries removed on `mur destroy`. Schema per entry:
 
 ```json
 {
@@ -841,7 +841,7 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
   "provider_key_id": "",
   "region":         "",
   "ip":             "1.2.3.4",
-  "url":            "https://1.2.3.4:9000",
+  "url":            "http://1.2.3.4:9000",
   "manifest_path":  "/Users/you/my-agent/murmur.yaml",
   "started_at":     "2026-06-03T12:00:00+00:00",
   "status":         "running"
@@ -856,7 +856,7 @@ A JSON array that tracks all active deployments. Written on `mur deploy`; entrie
 | `provider_key_id` | Always empty — reserved for future provider integrations |
 | `region` | Always empty — reserved for future provider integrations |
 | `ip` | Public IPv4 of the VM (the value passed to `--host`) |
-| `url` | `https://IP:PORT` — the public A2A endpoint |
+| `url` | `http://IP:PORT` — the public A2A endpoint |
 | `manifest_path` | Absolute local path to the manifest used at deploy time |
 | `started_at` | RFC 3339 timestamp of when the deployment was created |
 | `status` | Always `"running"` — entries are removed on destroy, not updated |

@@ -92,8 +92,8 @@ fn read_deployments(home: &std::path::Path) -> Vec<Value> {
     serde_json::from_str(&raw).unwrap()
 }
 
-/// Write ~/.murmur/config.yaml with `mur-deploy` enabled so the binary accepts
-/// deploy/destroy/ps commands during integration tests.
+/// Write ~/.murmur/config.yaml with `mur-deploy` enabled so the binary accepts the
+/// `deploy` and `destroy` commands during integration tests.
 fn enable_deploy_beta(home: &std::path::Path) {
     let config_dir = home.join(".murmur");
     fs::create_dir_all(&config_dir).unwrap();
@@ -168,7 +168,7 @@ fn deploy_ls_multiple_deployments_shows_all() {
     assert!(stdout.contains(OTHER_DEPLOYMENT_ID), "got: {stdout}");
 }
 
-// ─── retired command surface ──────────────────────────────────────────────────
+// ─── invocations the parser must reject ───────────────────────────────────────
 
 /// The `ps` name is deliberately unclaimed, reserved for a listing of local capsule processes. It
 /// carries no alias to `mur deploy ls`, so the parser must reject it outright rather than print
@@ -199,8 +199,8 @@ fn ps_is_not_a_subcommand_even_with_beta_enabled() {
     );
 }
 
-/// The flags moved one level down into `mur deploy run`; the old flat form is removed outright,
-/// so `--host` on the group itself is an argument error and never reaches the deploy path.
+/// `--host` belongs to `mur deploy run`, not to the `deploy` group, so passing it to the group
+/// is an argument error that never reaches the deploy path.
 #[test]
 fn flat_deploy_form_is_rejected_by_the_parser() {
     let dir = tempdir().unwrap();
@@ -313,6 +313,76 @@ fn destroy_by_ambiguous_prefix_removes_nothing() {
         2,
         "a record was dropped"
     );
+}
+
+/// An id matching no record is a user error, and the message has to name a command that exists
+/// so the user can go look the id up.
+#[test]
+fn destroy_unknown_id_points_at_deploy_ls() {
+    let dir = tempdir().unwrap();
+    enable_deploy_beta(dir.path());
+    write_deployment(dir.path(), DEPLOYMENT_ID, "1.2.3.4");
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["destroy", "dep_doesnotexist"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mur deploy ls"),
+        "error must send the user to a command that exists, got: {stderr}"
+    );
+}
+
+// ─── beta gating ──────────────────────────────────────────────────────────────
+
+/// The runtime opt-in is checked on the `deploy` group, not on its members, so every subcommand
+/// under it is refused together and `mur --help` advertises none of them.
+#[test]
+fn deploy_group_is_hidden_until_the_beta_is_enabled() {
+    let dir = tempdir().unwrap();
+
+    for args in [
+        vec!["deploy", "ls"],
+        vec!["deploy", "run", "--host", "1.2.3.4"],
+        vec!["destroy", "dep_01954a3b"],
+    ] {
+        let out = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert!(!out.status.success(), "{args:?} was accepted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "{args:?} got: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).is_empty(),
+            "{args:?} wrote to stdout"
+        );
+    }
+
+    let help = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .arg("--help")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    for hidden in ["deploy", "destroy"] {
+        assert!(
+            !stdout.lines().any(|l| l.trim_start().starts_with(hidden)),
+            "--help lists {hidden}: {stdout}"
+        );
+    }
 }
 
 // ─── argument validation ──────────────────────────────────────────────────────

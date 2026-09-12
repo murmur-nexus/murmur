@@ -237,7 +237,7 @@ inference:
     system_prompt_file: compaction-instructions.md
 ```
 
-Setting both `system_prompt` and `system_prompt_file` on the same `compaction:` block is a manifest error — pick one. `mur deploy` uploads the referenced file alongside the manifest, so a remote run resolves it the same way.
+Setting both `system_prompt` and `system_prompt_file` on the same `compaction:` block is a manifest error — pick one. `mur deploy run` uploads the referenced file alongside the manifest, so a remote run resolves it the same way.
 
 If left unset, `compaction-event.system-prompt` arrives at the hook as `none`, and the hook falls back to its own built-in default prompt. `model` and the two prompt-source fields are independent — setting one does not require or affect the other.
 

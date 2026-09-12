@@ -191,7 +191,7 @@ mur_version: "1.0.0"
 
 | Command | Behaviour |
 |---|---|
-| `mur deploy` | Downloads `mur-{version}-{platform}` from GitHub releases and installs it on the target VM, regardless of which `mur` version is running locally. The binary is cached at `~/.murmur/bin/mur-{version}-{platform}` and reused on subsequent deploys. Omitted, the running `mur` binary's version is used. |
+| `mur deploy run` | Downloads `mur-{version}-{platform}` from GitHub releases and installs it on the target VM, regardless of which `mur` version is running locally. The binary is cached at `~/.murmur/bin/mur-{version}-{platform}` and reused on subsequent deploys. Omitted, the running `mur` binary's version is used. |
 | `mur run` | Prints a warning to stderr when the running `mur` version does not match. The run continues. |
 
 #### `artifacts` { #field-artifacts }
