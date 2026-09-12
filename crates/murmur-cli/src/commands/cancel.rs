@@ -4,6 +4,7 @@ use std::net::TcpStream;
 use serde_json::Value;
 
 use crate::error::{CliError, E_IO_003};
+use crate::live_address::Target;
 
 /// Stop one running task on a capsule without ending its session.
 ///
@@ -14,8 +15,9 @@ use crate::error::{CliError, E_IO_003};
 /// Exits 0 for every task the capsule holds, including one that had already ended: "do no more
 /// work on this" is already true of a completed task, so there is nothing to report as a failure.
 /// A task id the capsule never held is the one error.
-pub(crate) fn run_cancel(capsule_url: &str, task_id: &str) -> Result<(), CliError> {
-    let addr = capsule_url
+pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError> {
+    let addr = target
+        .url()
         .trim_start_matches("http://")
         .trim_start_matches("https://");
 

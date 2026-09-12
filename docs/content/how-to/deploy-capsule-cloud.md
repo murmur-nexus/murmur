@@ -182,6 +182,7 @@ A 200 response confirms the capsule is running:
   "name": "my-agent",
   "version": "0.1.0",
   "url": "1.2.3.4:9000",
+  "session_id": "ses_019f01a940ce7761854e768ecbe3d399",
   "capabilities": {
     "tools": ["bash"],
     "shell": true,

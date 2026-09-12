@@ -397,7 +397,18 @@ pub(crate) struct StagedRewrite {
 
 impl StagedRewrite {
     pub(crate) fn stage(target: &Path, contents: &[u8]) -> Result<Self, String> {
+        Self::stage_with_mode(target, contents, None)
+    }
+
+    /// [`Self::stage`] with the staged file's mode set explicitly, for a target whose permissions
+    /// are part of its contract. `None` leaves the mode to the process umask.
+    pub(crate) fn stage_with_mode(
+        target: &Path,
+        contents: &[u8],
+        mode: Option<u32>,
+    ) -> Result<Self, String> {
         use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let dir = target
             .parent()
@@ -411,13 +422,26 @@ impl StagedRewrite {
             std::process::id(),
             uuid::Uuid::now_v7().simple()
         ));
-        let mut file =
-            std::fs::File::create(&temp).map_err(|err| format!("{}: {err}", temp.display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|err| format!("{}: {err}", temp.display()))?;
         // The fsync is the point: a rename is only atomic with respect to a file whose bytes are
         // already durable. Without it a crash can leave the new name pointing at a short file.
         file.write_all(contents)
             .and_then(|()| file.sync_all())
             .map_err(|err| format!("{}: {err}", temp.display()))?;
+        // Re-asserted after the write: `mode` on the open only applies when this call created the
+        // file, and a mode that is part of the target's contract must hold for a staged file an
+        // earlier run left behind too.
+        if let Some(mode) = mode {
+            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))
+                .map_err(|err| format!("{}: {err}", temp.display()))?;
+        }
         Ok(Self {
             target: target.to_path_buf(),
             temp,

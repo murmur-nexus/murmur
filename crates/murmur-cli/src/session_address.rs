@@ -3,9 +3,14 @@
 //! `mur trace show`, `mur trace steps`, `mur trace diff`, `mur trace report`, `mur eval show`,
 //! `mur eval diff` and `mur run --resume` all name a session the same four ways, and all read
 //! the same way when an address names nothing. That holds because [`resolve`] is the only body
-//! in the crate that parses an ordinal, matches a suffix, recognises a full `ses_` id or passes
-//! a literal path through; every command reaches it through a [`SessionQuery`] carrying the
-//! three things the vocabulary itself cannot know.
+//! any of them reaches to parse an ordinal, match a suffix, recognise a full `ses_` id or pass a
+//! literal path through; every command reaches it through a [`SessionQuery`] carrying the three
+//! things the vocabulary itself cannot know.
+//!
+//! The commands that need a capsule running right now — `mur watch`, `mur cancel` — spell an
+//! address the same way but resolve it against a different candidate set, and go through
+//! [`crate::live_address`] instead. A literal path is a spelling only this module accepts: it
+//! names a recorded session directory, which says nothing about whether a process is running.
 
 use std::{
     fs,

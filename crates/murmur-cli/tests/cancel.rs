@@ -745,7 +745,7 @@ fn mur_cancel_reports_the_state_and_the_residue() {
     let (_server, _home, capsule, task_id) = detached_scenario("cancel-cli-residue");
 
     let output = mur()
-        .args(["cancel", &capsule.url, &task_id])
+        .args(["cancel", "--url", &capsule.url, &task_id])
         .assert()
         .success()
         .get_output()
@@ -926,7 +926,7 @@ fn mur_cancel_reports_unknown_and_completed_tasks() {
     poll_until_state(&capsule.url, &task_id, "completed", Duration::from_secs(60));
 
     let stdout = mur()
-        .args(["cancel", &capsule.url, &task_id])
+        .args(["cancel", "--url", &capsule.url, &task_id])
         .assert()
         .success()
         .get_output()
@@ -937,7 +937,7 @@ fn mur_cancel_reports_unknown_and_completed_tasks() {
     assert!(stdout.contains("completed"), "{stdout}");
 
     let failure = mur()
-        .args(["cancel", &capsule.url, "tsk_doesnotexist"])
+        .args(["cancel", "--url", &capsule.url, "tsk_doesnotexist"])
         .assert()
         .failure()
         .get_output()

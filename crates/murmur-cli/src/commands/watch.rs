@@ -5,14 +5,20 @@ use std::net::TcpStream;
 use serde_json::Value;
 
 use crate::error::{CliError, E_IO_003};
+use crate::live_address::Target;
 
 /// Connect to a capsule's SSE observer endpoint (`stream/watch`) and print events to stdout.
 ///
 /// Unlike `message/stream`, this does not submit a task. It passively observes the capsule's
 /// SSE stream, including any events buffered since the capsule started. The process stays
 /// connected across task turns and exits only when the capsule closes or Ctrl+C is pressed.
-pub(crate) fn run_watch(capsule_url: &str) -> Result<(), CliError> {
-    let addr = capsule_url
+///
+/// The capsule is already resolved: a session address was verified against the running record
+/// before this ran, so an unreachable capsule is reported as such rather than as a refused
+/// connection.
+pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
+    let addr = target
+        .url()
         .trim_start_matches("http://")
         .trim_start_matches("https://");
 

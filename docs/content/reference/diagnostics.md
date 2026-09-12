@@ -70,6 +70,8 @@ section that explains it.
 | `E-RUN-019` | A session that can delegate could not register with `mur-roost` | [E-RUN-019](#e-run-019) |
 | `E-RUN-020` | `MURMUR_SPAWNER` is set to something that is not a spawner handle | [E-RUN-020](#e-run-020) |
 | `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
+| `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
+| `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -103,6 +105,7 @@ section that explains it.
 | `W-SEC-020` | The capsule can delegate, and its `lifecycle` block cannot receive a delegation's outcome | [W-SEC-020](#w-sec-020) |
 | `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
 | `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
+| `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 
 ---
 
@@ -319,6 +322,58 @@ session leaves no tool binaries in its workdir.
 
 [`mur doctor`](cli.md#mur-doctor) reads the same header of the same installed bytes and fails that
 artifact's line, so the mismatch is reportable without launching a session.
+
+### E-RUN-022 — the address names no running capsule { #e-run-022 }
+
+[`mur watch`](cli.md#mur-watch) and [`mur cancel`](cli.md#mur-cancel) resolve a
+[session address](cli.md#session-addresses) against the
+[running-capsule records](cli.md#running-capsule-records) on this machine. This is the refusal when
+none of them names a capsule that is still there.
+
+```text
+error[E-RUN-022]: ses_019f01a940ce7761854e768ecbe3d399 is not running: no process holds pid 48213
+  hint: its record has been removed; start the capsule again to make the address resolve
+```
+
+The record naming a session whose process is gone is removed by the read that reported this, so a
+second attempt reports that nothing is running rather than naming the same session twice:
+
+```text
+error[E-RUN-022]: no capsule is running on this machine
+  hint: start a capsule with `mur run`; it is addressable for as long as it serves
+```
+
+The reason names which of the two local checks the record failed.
+
+| Reason | Means |
+|---|---|
+| `no process holds pid N` | Nothing is running under that process id |
+| `pid N is held by a process that started at another time` | The process id was handed out again to something unrelated |
+| `pid N's start time could not be read` | The host would not say when the process started, so the record cannot be verified |
+
+The same code covers an address that is not a session address at all — a path, a `host:port`, or
+fewer than four characters:
+
+```text
+error[E-RUN-022]: 'localhost:41235' is not a session address
+  hint: name a running session with @1, a ses_ id, or a 4-character suffix of one
+```
+
+To reach a capsule by address rather than by name, pass `--url <host:port>`.
+
+### E-RUN-023 — the capsule did not answer { #e-run-023 }
+
+The address named a capsule whose process is alive, and the capsule's agent card did not come back:
+
+```text
+error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsule did not answer at localhost:41235: failed to connect to localhost:41235: Connection refused (os error 111)
+  hint: the process holding the door is alive — it may be mid-turn; its record is kept
+```
+
+`E-RUN-022` removes the record; this one keeps it. The process is genuinely running, so the record
+still names something real, and a capsule that was slow to answer must not lose the only handle
+anyone has on it. Try again, or read what the session is doing with
+[`mur trace show`](cli.md#mur-trace-show) in its workdir.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -905,7 +960,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 
 | Warning | Written to |
 |---|---|
-| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
+| `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
 | `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
@@ -1681,3 +1736,25 @@ than less. A capsule that fires a command and deliberately does not wait — one
 exits — is a legitimate shape, which is why this is a warning and not a refusal; silence it by not
 declaring `capabilities.shell.allow` on a capsule that runs no commands.
 
+
+### W-SEC-023 — the session is not addressable { #w-sec-023 }
+
+**Fires when:** a session opened its A2A door and its
+[running-capsule record](cli.md#running-capsule-records) could not be written. Once per launch, on
+stderr and in the session's `logs/bootstrap.log`.
+
+```text
+[capsule-runtime] warning[W-SEC-023]: this session's record under ~/.murmur/running/ could not be written, so `mur watch` and `mur cancel` cannot reach it by session address — only by the URL printed above: failed to create the directory: Permission denied (os error 13) (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-023)
+```
+
+**Why it matters:** the record is what lets [`mur watch`](cli.md#mur-watch) and
+[`mur cancel`](cli.md#mur-cancel) name this session from a terminal that never saw its URL. Without
+one, the address `mur run` printed is the only way back to the capsule, and it is gone as soon as
+that terminal is.
+
+**What the runtime does about it:** nothing is refused and no exit code changes. The capsule binds
+its port, serves its door and runs its tasks exactly as it would have.
+
+**What to do:** the message carries the reason the write failed, usually a `~/.murmur` that is not
+writable or a home directory the host would not resolve. Restore write access to `~/.murmur`, or
+set `HOME` to a directory this user owns, and the next launch records itself.

@@ -62,6 +62,11 @@ pub(crate) async fn bind_local_port(
 }
 
 /// Build the Agent Card JSON derived from capsule identity and capability policy.
+///
+/// `session_id` is served alongside the rest because the card is how a caller confirms that the
+/// capsule answering an address is the session it went looking for. A session id is already
+/// non-secret here — the door names the addressed session when it refuses a completion meant for
+/// another one.
 pub(crate) fn build_agent_card(
     identity: &CapsuleIdentity,
     installed_artifacts: &[InstalledArtifactSummary],
@@ -77,6 +82,7 @@ pub(crate) fn build_agent_card(
         "name": identity.capsule_name,
         "version": identity.capsule_version,
         "url": identity.capsule_url,
+        "session_id": identity.session_id,
         "capabilities": {
             "tools": tools,
             "shell": !capability_policy.shell_allow.is_empty(),

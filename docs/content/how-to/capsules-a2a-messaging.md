@@ -293,11 +293,15 @@ When the orchestrator capsule is itself a WASM capsule component, it sends messa
 
 ## Alternative: stream events instead of polling
 
-Use `mur watch localhost:$PORT` from a second terminal to observe live progress — inference heartbeats, tool results, and completion state — as the agent loop runs.
+Use `mur watch` from a second terminal to observe live progress — inference heartbeats, tool results, and completion state — as the agent loop runs. It takes a [session address](../reference/cli.md#session-addresses), so the second terminal needs nothing the first one printed:
 
 ```bash
-mur watch localhost:$PORT
+mur watch @1
 ```
+
+`@1` is the most recent capsule running on this machine, resolved against the
+[running-capsule records](../reference/cli.md#running-capsule-records). Name an older one by the
+last four characters of its session id, or reach a capsule directly with `mur watch --url localhost:$PORT`.
 
 ---
 
@@ -367,7 +371,8 @@ state `canceled`:
 }
 ```
 
-`mur cancel localhost:$PORT <your-task-id>` does the same thing from a terminal.
+`mur cancel @1 <your-task-id>` does the same thing from a terminal, naming the capsule by
+[session address](../reference/cli.md#session-addresses) rather than by URL.
 
 Cancelling a task that has already reached `completed`, `failed`, `rejected` or `canceled` returns
 that state and changes nothing. A task id the capsule never held is the one error: JSON-RPC code
@@ -448,5 +453,5 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 | Orchestrator capsule can reach worker capsule | `capabilities.network.allow` must include the worker capsule's URL |
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
 | Task ID | Returned by the message call; use it with `tasks/get` to poll status and `tasks/cancel` to stop it |
-| Stopping one task | `tasks/cancel`, or `mur cancel <url> <task-id>`; the session, its conversation and its queue keep running |
+| Stopping one task | `tasks/cancel`, or `mur cancel <session> <task-id>`; the session, its conversation and its queue keep running |
 | Trace | Both capsules write independent `trace.jsonl` files; `a2a_task_received` appears on the worker capsule side, `a2a_send` on the orchestrator capsule side |

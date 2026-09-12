@@ -17,7 +17,7 @@ use murmur_artifact::{
     LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
     RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -70,7 +70,7 @@ use crate::{
     outgoing,
     protected_paths::{ProtectedPathRefusal, ProtectedPaths},
     registration::SessionOutcome,
-    resources, sandbox,
+    resources, running, sandbox,
     sealed::UsernsGrant,
     shell::{
         build_shell_env, build_wasi_env_allowlist, is_shell_interpreter, run_shell,
@@ -1210,6 +1210,15 @@ pub fn launch_session(
         let capsule_url = format!("localhost:{external_port}");
         staged.capsule_url = capsule_url.clone();
         on_url(&capsule_url);
+
+        // The one place in the runtime that knows where this session's door is, so the one place
+        // the record can be written. A guard rather than a line at each return: `loop_result?`
+        // and both success returns below end the session, and a record that outlived its session
+        // would resolve an address onto a port nothing holds.
+        //
+        // Only the agent path reaches here. A script capsule binds nothing and is never
+        // addressable, so it records nothing.
+        let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
 
         let capsule_identity = CapsuleIdentity {
             capsule_name: staged.capsule_name.clone(),
@@ -2588,6 +2597,55 @@ pub fn launch_session(
         session_id: staged.session_id,
         workdir: staged.workdir,
     })
+}
+
+/// Writes this session's entry in `~/.murmur/running/` and returns the guard that removes it.
+///
+/// `None` when the record could not be written, which warns `W-SEC-023` and changes nothing else:
+/// the session runs and serves exactly as it would have, reachable by the URL `mur run` printed
+/// rather than by session address.
+///
+/// `outlives_launcher` is derived from whether the launching process has a controlling terminal.
+/// A capsule started in a terminal dies with that window; one started without a terminal —
+/// `nohup … </dev/null &`, a `setsid`, a service manager — survives whoever started it.
+fn open_running_record(
+    staged: &StagedSession,
+    session_id: &str,
+    capsule_url: &str,
+    workdir: &Path,
+) -> Option<running::RunningGuard> {
+    let pid = std::process::id();
+    let record = running::RunningRecord {
+        session_id: session_id.to_string(),
+        url: capsule_url.to_string(),
+        pid,
+        // An unreadable start time is recorded as the empty string, which no freshly read token
+        // equals, so the record fails layer 2 on the first read instead of resolving unverified.
+        process_start: running::process_start_token(pid).unwrap_or_default(),
+        capsule_name: staged.capsule_name.clone(),
+        capsule_version: staged.capsule_version.clone(),
+        workdir: staged.workdir.clone(),
+        outlives_launcher: !running::has_controlling_terminal(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    match running::RunningGuard::write(&record) {
+        Ok(guard) => Some(guard),
+        Err(reason) => {
+            let link = security_warning_link(W_SEC_023);
+            let message = format!(
+                "this session's record under ~/.murmur/running/ could not be written, so \
+                 `mur watch` and `mur cancel` cannot reach it by session address — only by the \
+                 URL printed above: {reason}"
+            );
+            eprintln!("[capsule-runtime] warning[{W_SEC_023}]: {message} ({link})");
+            agent::append_bootstrap_log(
+                workdir,
+                &format!("[running-record] warning[{W_SEC_023}]: {message} ({link})"),
+            );
+            None
+        }
+    }
 }
 
 /// This session's registration with `mur-roost`, for exactly as long as the session runs.
