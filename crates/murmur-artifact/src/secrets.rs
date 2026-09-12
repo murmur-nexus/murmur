@@ -59,7 +59,7 @@ fn visit_value(
                 let key_name = yaml_key_to_string(key);
                 path.push(key_name.clone());
 
-                if is_sensitive_key(&key_name) {
+                if is_secret_shaped_name(&key_name) {
                     if let Some(str_value) = child.as_str() {
                         if should_warn_secret_value(str_value) {
                             warnings.push(SecretWarning {
@@ -96,8 +96,16 @@ fn yaml_key_to_string(key: &Value) -> String {
     }
 }
 
-fn is_sensitive_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase();
+/// Whether a name is credential-shaped: it contains one of [`SENSITIVE_KEYS`], case-insensitively.
+///
+/// Judges a name and never a value, which is what lets it serve both callers: the manifest scan
+/// here, which asks it about a YAML key before looking at what that key holds, and
+/// `capsule_runtime::secret_shaped_env_grants`, which asks it about a `capabilities.env.allow`
+/// entry and must reach the same verdict on a host that has the variable set and one that does not.
+/// Substring matching is deliberate — `DATABASE_PASSWORD` and `db_api_key_id` both match — because
+/// a name this misses is a grant nothing warns about.
+pub fn is_secret_shaped_name(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
     SENSITIVE_KEYS.iter().any(|s| normalized.contains(s))
 }
 

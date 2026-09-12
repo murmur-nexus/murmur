@@ -5,10 +5,10 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
-    warn_on_interpreter_runtime_grants, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    warn_on_interpreter_runtime_grants, warn_on_secret_shaped_env_grants,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
@@ -716,6 +716,16 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
             .as_ref()
             .and_then(|caps| caps.filesystem.as_ref())
             .is_some_and(|filesystem| filesystem.workdir_exec),
+    );
+
+    // Same reasoning for `capabilities.env.allow`: a credential-shaped entry hands the capsule a
+    // host secret murmur does not broker, and an operator asking which capsule holds what should
+    // get the answer from `mur doctor` too. Same `W-SEC-024`, same emitter, same wording as a
+    // `mur run` — `None` for the override because doctor has no lifecycle flag to apply.
+    warn_on_secret_shaped_env_grants(
+        &capability_policy_from_runtime_manifest(&runtime_manifest),
+        runtime_manifest.lifecycle.as_ref(),
+        None,
     );
 
     // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a

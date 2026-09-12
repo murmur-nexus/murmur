@@ -587,6 +587,11 @@ way to expose a host variable, and even a name declared there is dropped if it i
 for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
 is omitted rather than reported.
 
+A credential-shaped entry — one whose name contains `api_key`, `token`, `secret` or `password` — is
+reported once by [`W-SEC-024`](diagnostics.md#w-sec-024), which says which of the two things
+happened to it: the name reached every guest, or the backstop dropped it and the grant delivered
+nothing.
+
 The field governs WASM guests and capsules delegated to through
 [`capabilities.spawn.allow`](#field-capabilities) — never the capsule process itself, which is
 started by the operator's own shell and inherits that shell wholesale. So a root capsule needs no

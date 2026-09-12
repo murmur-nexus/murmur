@@ -718,13 +718,24 @@ pub(crate) fn strip_credential_shaped_vars(
     env: &mut BTreeMap<String, String>,
     extra_patterns: &[String],
 ) {
-    env.retain(|key, _| {
-        !CREDENTIAL_ENV_PATTERNS
-            .iter()
-            .copied()
-            .chain(extra_patterns.iter().map(String::as_str))
-            .any(|pattern| env_name_matches_pattern(pattern, key))
-    });
+    env.retain(|key, _| !credential_backstop_drops(key, extra_patterns));
+}
+
+/// Whether the credential backstop would drop a variable of this name — the same question
+/// [`strip_credential_shaped_vars`] answers per entry, asked of a name alone.
+///
+/// Exists so a diagnostic can predict the backstop rather than re-implement it: the
+/// `capabilities.env.allow` judgment behind `W-SEC-024` has to say whether a declared name reaches
+/// a guest at all, and a second copy of [`CREDENTIAL_ENV_PATTERNS`] plus the glob rules would
+/// agree today and drift the first time either changes. `extra_patterns` is a policy's
+/// `shell_strip_env`, so a manifest that strips a name of its own is predicted as accurately as
+/// the fixed list.
+pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool {
+    CREDENTIAL_ENV_PATTERNS
+        .iter()
+        .copied()
+        .chain(extra_patterns.iter().map(String::as_str))
+        .any(|pattern| env_name_matches_pattern(pattern, name))
 }
 
 /// Resolve the host variables a WASM guest may observe: only names the manifest declared in
@@ -1242,6 +1253,42 @@ mod tests {
         let env = build_shell_env(&policy, &overrides, temp.path()).unwrap();
 
         assert!(!env.contains_key("MYCOMPANY_SECRET"));
+    }
+
+    /// The prediction and the strip are one decision procedure, asserted over names that exercise
+    /// every arm of the pattern grammar plus a manifest-supplied pattern. A disagreement here is a
+    /// `W-SEC-024` line that tells an operator the opposite of what the guest env will hold.
+    #[test]
+    fn credential_backstop_drops_agrees_with_the_strip_it_predicts() {
+        let extra = vec!["*_SERVICE_SECRET".to_string()];
+        let names = [
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "GITHUB_TOKEN_2",
+            "AWS_ACCESS_KEY_ID",
+            "MY_AWS_KEY",
+            "STRIPE_API_KEY",
+            "KUBECONFIG",
+            "MY_SERVICE_SECRET",
+            "DATABASE_PASSWORD",
+            "SLACK_BOT_TOKEN",
+            "HOME",
+            "TZ",
+        ];
+
+        let mut env: BTreeMap<String, String> = names
+            .iter()
+            .map(|name| ((*name).to_string(), "value".to_string()))
+            .collect();
+        strip_credential_shaped_vars(&mut env, &extra);
+
+        for name in names {
+            assert_eq!(
+                credential_backstop_drops(name, &extra),
+                !env.contains_key(name),
+                "prediction and strip disagree about {name}"
+            );
+        }
     }
 
     #[test]

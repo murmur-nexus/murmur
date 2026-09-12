@@ -10,14 +10,14 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, native_binary_verdict, parse_hook_config_from_yaml,
+    current_platform, is_secret_shaped_name, native_binary_verdict, parse_hook_config_from_yaml,
     parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
     write_lockfile_atomic, AfterTask, ArtifactImplementation, ArtifactRuntime, ContextConfig,
     ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
     LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
     RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -3086,6 +3086,127 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
          there can run regardless of capabilities.shell.allow; this capsule reports containment \
          class 'advisory' on every host, including a Landlock-capable one ({link})"
     );
+}
+
+/// One credential-shaped entry of `capabilities.env.allow`, judged.
+///
+/// The judgment is made from the name alone: nothing here reads the host environment, so the
+/// warning an operator sees reads identically on a machine that has the variable set and one that
+/// does not. A capsule's own value is never a diagnostic's business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretShapedEnvGrant {
+    /// The declared variable name, verbatim. Never its value.
+    pub name: String,
+    /// `false` when the credential backstop would drop this name before any guest is built.
+    pub reaches_guest: bool,
+    /// `true` only when `reaches_guest` is also true and the resolved `lifecycle.after_task`
+    /// is `Sleep`.
+    pub outlives_launcher: bool,
+}
+
+/// Pure decision for the `capabilities.env.allow` secret warning, split out of
+/// [`warn_on_secret_shaped_env_grants`] on the same terms as
+/// [`unreachable_delegation_outcomes_warning`], so a test can assert it without capturing stderr.
+///
+/// One entry per distinct credential-shaped name, in declaration order — a name repeated in
+/// `env.allow` is judged once, because the grant it describes is one grant.
+///
+/// `reaches_guest` is [`crate::credential_backstop_drops`] inverted rather than a second reading of
+/// the pattern list: the diagnostic has to agree with what
+/// [`crate::shell::build_wasi_env_allowlist`] will actually pass through, and `GITHUB_TOKEN` is the
+/// case that makes the distinction load-bearing — it is credential-shaped *and* on the backstop's
+/// list, so the grant delivers nothing.
+///
+/// `outlives_launcher` reads `lifecycle.after_task` directly instead of
+/// [`LifecycleConfig::can_receive_background_tasks`]: that predicate also requires
+/// `task_acceptance: queue`, and a `single` + `sleep` capsule still outlives the task that launched
+/// it while holding the value.
+pub fn secret_shaped_env_grants(
+    policy: &CapabilityPolicy,
+    lifecycle: &LifecycleConfig,
+) -> Vec<SecretShapedEnvGrant> {
+    let mut grants: Vec<SecretShapedEnvGrant> = Vec::new();
+
+    for name in &policy.env_allow {
+        if !is_secret_shaped_name(name) {
+            continue;
+        }
+        if grants.iter().any(|grant| &grant.name == name) {
+            continue;
+        }
+        let reaches_guest = !crate::shell::credential_backstop_drops(name, &policy.shell_strip_env);
+        grants.push(SecretShapedEnvGrant {
+            name: name.clone(),
+            reaches_guest,
+            outlives_launcher: reaches_guest && lifecycle.after_task == AfterTask::Sleep,
+        });
+    }
+
+    grants
+}
+
+/// The line body for one judged grant, so the two arms exist once rather than once per call site.
+fn secret_shaped_env_grant_message(grant: &SecretShapedEnvGrant) -> String {
+    let name = &grant.name;
+    if !grant.reaches_guest {
+        return format!(
+            "capabilities.env.allow names '{name}', a credential-shaped variable the credential \
+             backstop drops before any guest is built — the grant delivers nothing and no guest \
+             observes the host's value. Remove the entry, or rename the host variable if the \
+             capsule is meant to receive it"
+        );
+    }
+
+    let held = if grant.outlives_launcher {
+        "murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: \
+         sleep keeps this capsule alive past the task that launched it, so it holds that value \
+         with nothing left waiting on it"
+    } else {
+        "murmur does not broker this secret and cannot withdraw it: for as long as the capsule \
+         runs, the capsule holds it"
+    };
+
+    format!(
+        "capabilities.env.allow names '{name}', a credential-shaped variable the credential \
+         backstop does not drop — every WASM guest this capsule runs observes the host's value. \
+         {held}"
+    )
+}
+
+/// Warns (non-fatal, once per distinct credential-shaped `capabilities.env.allow` entry) that the
+/// capsule was handed a host secret murmur does not broker.
+///
+/// `capabilities.env.allow` is the one grant whose value murmur never sees, issues or revokes: an
+/// operator names a host variable and the runtime passes it through. Nothing said so in either
+/// direction — a name that survives the credential backstop reached every WASM guest silently, and
+/// a name the backstop dropped delivered nothing just as silently — so an operator with a thousand
+/// capsules had no way to ask which of them holds what.
+///
+/// Never a refusal, including for the `after_task: sleep` combination: a long-lived worker holding
+/// an operator-granted database password is an ordinary shape, and refusing it would make that
+/// shape unbuildable. The combination gets its own sentence instead.
+///
+/// Shared verbatim between `mur run` and `mur doctor`, on the same terms as
+/// [`warn_on_interpreter_runtime_grants`] — one emitter, two call sites, so the two surfaces cannot
+/// word one grant differently. Resolves the lifecycle itself, from the manifest block and the CLI
+/// override, so the `sleep` sentence follows `--lifecycle-after-task` as well as the manifest.
+/// `lifecycle: None` means the manifest declared no block (`after_task` defaults to `exit`), and
+/// `lifecycle_override: None` means the surface has no lifecycle flag to apply — which is `mur
+/// doctor` always. Decided before any session workdir exists, so it goes to stderr only, not
+/// `logs/bootstrap.log`.
+pub fn warn_on_secret_shaped_env_grants(
+    policy: &CapabilityPolicy,
+    lifecycle: Option<&LifecycleConfig>,
+    lifecycle_override: Option<&murmur_artifact::LifecycleOverride>,
+) {
+    let resolved = resolve_lifecycle(lifecycle.cloned(), lifecycle_override);
+    for grant in secret_shaped_env_grants(policy, &resolved) {
+        let link = security_warning_link(W_SEC_024);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_024}]: {} ({link})",
+            secret_shaped_env_grant_message(&grant)
+        );
+    }
 }
 
 /// Warns (non-fatal, once per allowlisted interpreter) when `capabilities.filesystem.read_only`
@@ -7423,6 +7544,145 @@ inference:
                 "exit warns at every grace period, including {shell_grace_secs}"
             );
         }
+    }
+
+    // ── capabilities.env.allow secret grants ─────────────────────────────────
+
+    fn env_allow_policy(names: &[&str], strip: &[&str]) -> CapabilityPolicy {
+        CapabilityPolicy {
+            env_allow: names.iter().map(|name| (*name).to_string()).collect(),
+            shell_strip_env: strip.iter().map(|name| (*name).to_string()).collect(),
+            ..CapabilityPolicy::default()
+        }
+    }
+
+    /// The held arm: a credential-shaped name the backstop's fixed list does not cover reaches
+    /// every guest, and the default lifecycle does not keep the capsule past its task.
+    #[test]
+    fn a_credential_shaped_name_the_backstop_keeps_is_reported_as_reaching_the_guest() {
+        let grants = secret_shaped_env_grants(
+            &env_allow_policy(&["DATABASE_PASSWORD"], &[]),
+            &LifecycleConfig::default(),
+        );
+
+        assert_eq!(
+            grants,
+            vec![SecretShapedEnvGrant {
+                name: "DATABASE_PASSWORD".to_string(),
+                reaches_guest: true,
+                outlives_launcher: false,
+            }]
+        );
+        let message = secret_shaped_env_grant_message(&grants[0]);
+        assert!(message.contains("the capsule holds it"), "{message}");
+        assert!(!message.contains("lifecycle.after_task"), "{message}");
+    }
+
+    /// The escalated arm: `after_task: sleep` alone, without `task_acceptance: queue`, still keeps
+    /// the capsule alive past the task that launched it, so the sentence is added. Read directly
+    /// off `after_task` rather than through `can_receive_background_tasks`, which would stay
+    /// silent here.
+    #[test]
+    fn sleep_escalates_a_held_grant_even_without_a_queue() {
+        for acceptance in [
+            TaskAcceptance::Single,
+            TaskAcceptance::Queue,
+            TaskAcceptance::None,
+        ] {
+            let grants = secret_shaped_env_grants(
+                &env_allow_policy(&["DATABASE_PASSWORD"], &[]),
+                &lifecycle(acceptance.clone(), AfterTask::Sleep),
+            );
+            assert!(
+                grants[0].outlives_launcher,
+                "{acceptance:?} + sleep outlives the launching task"
+            );
+            let message = secret_shaped_env_grant_message(&grants[0]);
+            assert!(message.contains("lifecycle.after_task: sleep"), "{message}");
+            assert!(
+                message.contains("with nothing left waiting on it"),
+                "{message}"
+            );
+        }
+    }
+
+    /// The dropped arm, and the case that makes two arms necessary: `GITHUB_TOKEN` is
+    /// credential-shaped *and* on the backstop's list, so the grant delivers nothing — and a name
+    /// that never reaches a guest outlives nothing, whatever the lifecycle says.
+    #[test]
+    fn a_name_the_backstop_drops_is_never_reported_as_held_or_outliving() {
+        let grants = secret_shaped_env_grants(
+            &env_allow_policy(&["GITHUB_TOKEN"], &[]),
+            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
+        );
+
+        assert_eq!(
+            grants,
+            vec![SecretShapedEnvGrant {
+                name: "GITHUB_TOKEN".to_string(),
+                reaches_guest: false,
+                outlives_launcher: false,
+            }]
+        );
+        let message = secret_shaped_env_grant_message(&grants[0]);
+        assert!(message.contains("the grant delivers nothing"), "{message}");
+        assert!(!message.contains("the capsule holds it"), "{message}");
+        assert!(!message.contains("lifecycle.after_task"), "{message}");
+    }
+
+    /// A manifest's own `capabilities.shell.strip_env` pattern moves a name into the dropped arm,
+    /// because the backstop it predicts consults that list too.
+    #[test]
+    fn a_manifest_strip_pattern_moves_a_name_into_the_dropped_arm() {
+        let grants = secret_shaped_env_grants(
+            &env_allow_policy(&["MY_SERVICE_SECRET"], &["*_SERVICE_SECRET"]),
+            &LifecycleConfig::default(),
+        );
+
+        assert_eq!(grants.len(), 1);
+        assert!(!grants[0].reaches_guest);
+    }
+
+    /// `after_task: sleep` is not itself a trigger: with no credential-shaped name declared there
+    /// is nothing to hold, and a name that is not credential-shaped is not judged.
+    #[test]
+    fn sleep_without_a_credential_shaped_name_decides_nothing() {
+        assert!(secret_shaped_env_grants(
+            &env_allow_policy(&["HOME", "TZ", "LANG", "BUILD_NUMBER"], &[]),
+            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
+        )
+        .is_empty());
+        assert!(secret_shaped_env_grants(
+            &CapabilityPolicy::default(),
+            &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
+        )
+        .is_empty());
+    }
+
+    /// One judgment per distinct name, in declaration order, with non-credential names passed over
+    /// rather than counted.
+    #[test]
+    fn every_distinct_credential_shaped_name_is_judged_once_in_declaration_order() {
+        let grants = secret_shaped_env_grants(
+            &env_allow_policy(
+                &[
+                    "DATABASE_PASSWORD",
+                    "HOME",
+                    "GITHUB_TOKEN",
+                    "DATABASE_PASSWORD",
+                ],
+                &[],
+            ),
+            &LifecycleConfig::default(),
+        );
+
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| (grant.name.as_str(), grant.reaches_guest))
+                .collect::<Vec<_>>(),
+            vec![("DATABASE_PASSWORD", true), ("GITHUB_TOKEN", false)]
+        );
     }
 
     /// An `InferenceConfig` with every system-prompt field empty, for the prompt-resolution

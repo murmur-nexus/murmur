@@ -233,6 +233,23 @@ pub const W_SEC_022: &str = "W-SEC-022";
 /// binds a door.
 pub const W_SEC_023: &str = "W-SEC-023";
 
+/// A `capabilities.env.allow` entry is credential-shaped by name (`api_key`, `token`, `secret`,
+/// `password`), so the grant hands a capsule a host secret murmur does not broker.
+///
+/// Two arms, chosen by asking the credential backstop whether it would drop the name. A name the
+/// backstop keeps reaches every WASM guest the capsule runs, and murmur has no way to withdraw it
+/// once granted; a name the backstop drops delivers nothing, so the entry is inert and the capsule
+/// never sees the value. A kept name on a capsule whose resolved `lifecycle.after_task` is `sleep`
+/// gets a further sentence: the capsule outlives the task that launched it while still holding the
+/// value.
+///
+/// Never a refusal, and `sleep` does not escalate it into one: `capabilities.env.allow` exists
+/// precisely because capsules need secrets murmur knows nothing about, and a long-lived worker
+/// holding an operator-granted database password is an ordinary shape. What the warning removes is
+/// the silence — without it nothing tells an operator which of their capsules holds what. Fires
+/// once per distinct credential-shaped entry, in declaration order.
+pub const W_SEC_024: &str = "W-SEC-024";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -252,7 +269,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023,
+            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");
