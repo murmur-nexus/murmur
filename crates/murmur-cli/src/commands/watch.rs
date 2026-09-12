@@ -73,6 +73,15 @@ pub(crate) fn run_watch(target: &Target) -> Result<(), CliError> {
         }
     }
 
+    // Which tool the operator is looking at, said once, on stderr so piping stdout is unaffected.
+    // The same keystroke means opposite things in the two places a capsule is watched from: here
+    // it ends the watch, in the nexus CLI it ends the capsule.
+    eprintln!(
+        "[murmur] watching {} — Ctrl-C ends the watch, not the capsule; use `mur stop` to end \
+         the capsule",
+        target.label()
+    );
+
     // SSE stream state
     let mut conversation_mode = String::from("stateless");
     let mut task_context_map: HashMap<String, String> = HashMap::new();

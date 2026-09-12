@@ -154,7 +154,7 @@ pub use retention::{
 // The running-capsule vocabulary a reader of a record needs. The verbs stay module-qualified —
 // `running::list`, `running::verify`, `running::prune`, `running::running_dir` — on the same terms
 // as `origin::from_wire`: their bare names say nothing about capsules.
-pub use running::{Liveness, ProcessState, RunningGuard, RunningRecord};
+pub use running::{Liveness, ProcessState, RunningGuard, RunningRecord, SignalOutcome};
 pub use runtime::{
     check_no_reserved_tool_names, launch_session, stage_session,
     warn_on_interpreter_runtime_grants, warn_on_userns_restriction_disabled_host_wide,

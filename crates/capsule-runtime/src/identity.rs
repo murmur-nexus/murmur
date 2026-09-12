@@ -349,6 +349,7 @@ async fn handle_connection(
             delegation_id,
             detached.as_ref(),
             &live_delegations,
+            &session_id,
         );
         let _ = writer_half.write_all(response.as_bytes()).await;
         return;
@@ -622,6 +623,7 @@ fn handle_jsonrpc(
     delegation_id: Option<String>,
     detached: Option<&Arc<DetachedRegistry>>,
     live_delegations: &LiveDelegations,
+    session_id: &str,
 ) -> String {
     let req: JsonRpcRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -645,6 +647,9 @@ fn handle_jsonrpc(
         "tasks/get" => handle_tasks_get(id, &req.params, task_registry),
         "tasks/cancel" => {
             handle_tasks_cancel(id, &req.params, task_registry, detached, live_delegations)
+        }
+        "session/stop" => {
+            handle_session_stop(id, task_registry, detached, live_delegations, session_id)
         }
         _ => JsonRpcResponse::err(id, -32601, "Method not found").into_http_response(),
     }
@@ -818,6 +823,60 @@ fn handle_tasks_cancel(
             JsonRpcResponse::ok(id, task).into_http_response()
         }
     }
+}
+
+/// `session/stop`: cancel everything this session still holds and report what it leaves running.
+///
+/// The one moment anything can ask a capsule for that account. A detached shell command keeps its
+/// own lifecycle and a delegated child is still going, and once the process is gone so is the
+/// registry that knew about either — so the question is asked while the door is still up, and
+/// ending the process is left to the signal that follows.
+///
+/// Nothing here shuts the door down. A method that killed its own process would be racing its
+/// response out of it.
+///
+/// Three keys, all three always present. `canceled` lists only the tasks this call moved to
+/// `canceled`, so a second stop answers `[]` rather than an error. `residue` is `[]` when nothing
+/// is running — unlike `tasks/cancel`, which omits the key: a session stop has to be able to say
+/// "nothing" as a positive fact, because that is the whole answer the operator asked for.
+fn handle_session_stop(
+    id: Value,
+    task_registry: &Arc<Mutex<TaskRegistry>>,
+    detached: Option<&Arc<DetachedRegistry>>,
+    live_delegations: &LiveDelegations,
+    session_id: &str,
+) -> String {
+    let canceled = {
+        let mut registry = task_registry.lock().unwrap();
+        let live: Vec<String> = registry
+            .history
+            .iter()
+            .filter(|(_, (state, _))| !state.is_terminal())
+            .map(|(task_id, _)| task_id.clone())
+            .collect();
+        let mut canceled: Vec<String> = live
+            .into_iter()
+            .filter(|task_id| matches!(registry.request_cancel(task_id), CancelOutcome::Accepted))
+            .collect();
+        // `history` is a `HashMap`, so without this the same two tasks come back in a different
+        // order on every call and nothing can diff two stops.
+        canceled.sort();
+        canceled
+    };
+
+    // Read after every cancellation is recorded, so nothing this snapshot names can have been
+    // started by a task afterwards.
+    let residue = Residue::snapshot(detached, live_delegations).into_json_items();
+
+    JsonRpcResponse::ok(
+        id,
+        serde_json::json!({
+            "session_id": session_id,
+            "canceled": canceled,
+            "residue": residue,
+        }),
+    )
+    .into_http_response()
 }
 
 #[cfg(test)]

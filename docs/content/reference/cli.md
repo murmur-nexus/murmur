@@ -13,8 +13,10 @@ Every `mur` command, its flags, and what each one does.
 | `mur list` | List installed artifacts in the project or global store |
 | `mur doctor` | Check every artifact declared in `murmur.yaml` against the project and global stores |
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
+| `mur ps` | List the capsules running on this machine |
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
+| `mur stop` | End one running capsule, and report what it left behind |
 | `mur deploy run` | Upload a capsule to an existing VM and return its public URL |
 | `mur deploy ls` | List all deployed capsules |
 | `mur destroy` | Remove a deployment record from the local tracking list |
@@ -49,14 +51,14 @@ What an address is resolved against depends on what the command needs.
 | Command | Candidate set | `@1` means |
 |---|---|---|
 | [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` session directories in one workdir, whether or not the session is still running | The most recent recorded session |
-| [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
+| [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel), [`mur stop`](#mur-stop) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
 
 The recorded set is the `ses_*` directories in `./workdir` for the `mur trace` and `mur eval`
 commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
 `--workdir` names. See [Session workdir](workdir.md).
 
-`mur watch` and `mur cancel` have to connect, so they take the three forms that name a session and
-refuse the path form: a path names a directory on disk, which says nothing about whether a process
+`mur watch`, `mur cancel` and `mur stop` have to reach a process, so they take the three forms that
+name a session and refuse the path form: a path names a directory on disk, which says nothing about whether a process
 is running. An address naming a session that has stopped reports
 [`E-RUN-022`](diagnostics.md#e-run-022) rather than resolving to a different capsule.
 
@@ -80,7 +82,7 @@ take two addresses or none; one address is refused.
 An address matching no session, or several, is refused with
 [`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`,
 [`E-EVAL-002`](diagnostics.md) under `mur eval`, and
-[`E-RUN-022`](diagnostics.md#e-run-022) under `mur watch` and `mur cancel`.
+[`E-RUN-022`](diagnostics.md#e-run-022) under `mur watch`, `mur cancel` and `mur stop`.
 
 ---
 
@@ -695,6 +697,130 @@ Current runtime constraints:
 
 ---
 
+## `mur ps`
+
+List the capsules running on this machine, with the address each one answers on.
+
+```bash
+mur ps
+```
+
+`mur ps` takes no arguments. It is host-scoped, exactly like `docker ps`: a capsule deployed onto
+another machine writes its [record](#running-capsule-records) on *that* machine, so it is that
+machine's `mur ps` that lists it.
+
+| Column | Width | Carries |
+|---|---|---|
+| `SESSION` | 36 | The full session id, never abbreviated, so it can be copied into the next command |
+| `CAPSULE` | 24 | `name@version` from the manifest the session was launched from |
+| `STATUS` | 12 | `running` or `unreachable` |
+| `DETACHED` | 8 | `yes` when the capsule outlives the window that launched it, `no` when it dies with it |
+| `UPTIME` | 9 | `HH:MM:SS` since the session started, prefixed `Nd ` past a day |
+| `URL` | — | The `host:port` the capsule's A2A door is bound to |
+
+```text
+SESSION                               CAPSULE                   STATUS        DETACHED  UPTIME     URL
+ses_019f01a940ce7761854e768ecbe3d399  my-worker@0.1.0           running       yes       00:14:02   localhost:41235
+ses_019f0193c7d871a5b2e30ff41a7c0ce2  my-agent@0.2.0            unreachable   no        01:03:55   localhost:41102
+```
+
+A machine running nothing prints one line and exits 0:
+
+```text
+no running capsules
+```
+
+An absent `~/.murmur/running/` and an empty one are the same fact about the machine, and read the
+same way.
+
+### What each row was verified against { #mur-ps-verification }
+
+Every record is put through all three layers described under
+[A record is a hint](#running-record-is-a-hint) before its row is printed, and what the layers say
+decides both the `STATUS` column and whether the record survives the read.
+
+| Layers | `STATUS` | The record |
+|---|---|---|
+| All three pass | `running` | Kept |
+| The process is the one that wrote the record; the door did not answer | `unreachable` | Kept |
+| The process that wrote the record is gone | No row | Unlinked |
+
+A quiet door is not evidence that the process is gone. An `unreachable` capsule may be mid-turn,
+and unlinking its record would throw away the only handle anyone has on something still running.
+Rows are sorted by session id descending — the same order [`@N` counts in](#session-addresses) —
+so the first row is what `@1` names.
+
+---
+
+## `mur stop`
+
+End one running capsule, and report what it left behind.
+
+```bash
+mur stop <SESSION> [--timeout <SECONDS>]
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | — | A [session address](#session-addresses) naming a running capsule |
+| `--timeout` | `10` | Seconds to wait after `SIGTERM` before escalating to `SIGKILL`. `0` escalates immediately, with no grace period |
+
+Three steps, in this order:
+
+| Step | What it does |
+|---|---|
+| 1. [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) through the A2A door | Cancels every task the session still holds and reads what it leaves running |
+| 2. `SIGTERM` to the recorded process | Ends the capsule |
+| 3. `SIGKILL` after `--timeout` seconds | Only if the process is still there |
+
+The door step is not politeness. It is the only moment anything can ask the capsule what it leaves
+running — a detached shell command keeps its own lifecycle and a delegated sub-capsule is still
+going, and the registries that know about either die with the process. A stop that signalled first
+would have nothing left to ask.
+
+```text
+stopped: ses_019f01a940ce7761854e768ecbe3d399
+capsule: my-worker@0.1.0
+signal:  SIGTERM
+canceled: tsk_019ed5211c827f63a8fe4be623277c55
+running: wrk_9f2a1c  detached shell  sleep 30
+running: dlg_7b31de  delegation  worker@0.1.0
+```
+
+The `running:` lines are the ones [`mur cancel`](#mur-cancel) prints for the same items. Nothing on
+them was stopped.
+
+### What it left behind is three answers, not two { #mur-stop-residue }
+
+| Line | Means |
+|---|---|
+| `running: …`, one per item | The capsule answered and named these |
+| `residue: nothing else was left running` | The capsule answered and had nothing to name |
+| `residue: unknown — the capsule could not be asked: …` | The door did not answer, and the reason says why |
+
+A capsule that answered with nothing and a capsule that could not be asked are different facts
+about the machine, so they are different lines. Both exit 0: the session was ended either way, and
+only the accounting is incomplete.
+
+### There is no `--url` { #mur-stop-no-url }
+
+Two of the three steps signal a local process id, so a URL-addressed stop could only ever perform
+the first one. `mur stop --url` is refused by the argument parser rather than silently doing a
+third of the job. A capsule on another machine records on *that* machine, so it is that machine's
+`mur stop` that ends it.
+
+Exit codes:
+
+- `0` — the session was ended, whether or not its door answered
+- `1` — the address named no running session ([`E-RUN-022`](diagnostics.md#e-run-022)), or the
+  session could not be ended and is still running ([`E-RUN-024`](diagnostics.md#e-run-024))
+
+`mur stop` refuses to signal a process id it cannot confirm. A record whose recorded start time no
+longer matches the host's names a process that inherited the number, and the refusal is
+`E-RUN-022`: the record is unlinked and no signal of any kind is sent.
+
+---
+
 ## `mur watch`
 
 Stream live SSE events from a running capsule's output to stdout. The command opens a
@@ -713,6 +839,11 @@ mur watch --url <host:port>
 
 The session is resolved against the [running-capsule record](#running-capsule-records) and verified
 before the connection is opened.
+
+**Ctrl-C ends the watch, not the capsule.** The capsule keeps running and keeps answering; only
+this connection to it closes. On connect, `mur watch` prints one line to stderr naming the session
+it is watching and saying so, which keeps stdout to SSE events alone for piping. To end the capsule
+itself, use [`mur stop`](#mur-stop).
 
 Output format:
 

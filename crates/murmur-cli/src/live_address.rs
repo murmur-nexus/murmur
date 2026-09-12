@@ -41,6 +41,15 @@ impl Target {
             Target::Url(url) => url,
         }
     }
+
+    /// What to call this capsule when telling a person which one they are looking at: the session
+    /// it turned out to be, or the address they typed when that is all that was given.
+    pub(crate) fn label(&self) -> &str {
+        match self {
+            Target::Session(record) => &record.session_id,
+            Target::Url(url) => url,
+        }
+    }
 }
 
 /// The capsule a session address or a `--url` names.
@@ -67,7 +76,7 @@ pub(crate) fn target(session: Option<&str>, url: Option<&str>) -> Result<Target,
 /// session: the process is gone and its record has been unlinked. `E-RUN-023` is the capsule not
 /// answering: the process is alive, so the record stands.
 pub(crate) fn resolve_live(address: &str) -> Result<RunningRecord, CliError> {
-    let record = candidate(address)?;
+    let record = resolve_live_process(address)?;
     match running::verify(&record) {
         Liveness::Live => Ok(record),
         Liveness::Unreachable(reason) => Err(CliError::with_hint(
@@ -84,6 +93,19 @@ pub(crate) fn resolve_live(address: &str) -> Result<RunningRecord, CliError> {
             Err(not_running(&record, &reason))
         }
     }
+}
+
+/// The running session `address` names, verified only as far as its process.
+///
+/// The same three forms and the same candidate set as [`resolve_live`], stopping one layer
+/// earlier: the pid is alive and is still the process that wrote the record, and the door has not
+/// been asked anything. `E-RUN-022` is the only way this fails.
+///
+/// What `mur stop` resolves with. A stop is three steps, and only the first goes through the
+/// door; refusing the whole command because the door is quiet — which is what `E-RUN-023` would
+/// do — would abandon a stop that still has two steps left and a process still running.
+pub(crate) fn resolve_live_process(address: &str) -> Result<RunningRecord, CliError> {
+    candidate(address)
 }
 
 /// Every record on this machine, split by what layers 1 and 2 say about the process it names.

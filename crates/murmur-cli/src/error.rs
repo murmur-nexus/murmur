@@ -39,6 +39,7 @@ pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something t
 pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built for another platform
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
+pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

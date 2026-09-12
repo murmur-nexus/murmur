@@ -72,6 +72,7 @@ section that explains it.
 | `E-RUN-021` | A staged native tool's binary is built for another operating system or CPU architecture | [E-RUN-021](#e-run-021) |
 | `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
+| `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -374,6 +375,29 @@ error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsul
 still names something real, and a capsule that was slow to answer must not lose the only handle
 anyone has on it. Try again, or read what the session is doing with
 [`mur trace show`](cli.md#mur-trace-show) in its workdir.
+
+### E-RUN-024 — the session could not be ended { #e-run-024 }
+
+[`mur stop`](cli.md#mur-stop) signalled the process a [running-capsule
+record](cli.md#running-capsule-records) names, and the process is still there afterwards.
+
+```text
+error[E-RUN-024]: ses_019f01a940ce7761854e768ecbe3d399 could not be ended: the kernel refused SIGTERM to pid 48213: Operation not permitted (os error 1)
+  hint: the capsule is still running and its record is kept; the process may belong to another user
+```
+
+The message names which signal was refused and what the kernel said about it.
+
+| Reason | Means |
+|---|---|
+| `the kernel refused SIGTERM to pid N: …` | The process is there and this user may not signal it — usually another user's capsule |
+| `the kernel refused SIGKILL to pid N: …` | The same, at the escalation step |
+| `pid N was still running 5 seconds after SIGKILL` | The kernel accepted the signal and the process has not gone, which an uninterruptible wait can cause |
+
+The record is **not** removed. Unlike [`E-RUN-022`](#e-run-022), the capsule it names is still
+running, so unlinking the record would remove the only handle anyone has on it. Every task the
+session held was cancelled before the signalling started, so the capsule is idle even though it is
+still there.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
