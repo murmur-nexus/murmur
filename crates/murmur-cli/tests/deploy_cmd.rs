@@ -168,13 +168,11 @@ fn deploy_ls_multiple_deployments_shows_all() {
     assert!(stdout.contains(OTHER_DEPLOYMENT_ID), "got: {stdout}");
 }
 
-// ─── invocations the parser must reject ───────────────────────────────────────
-
-/// The `ps` name is deliberately unclaimed, reserved for a listing of local capsule processes. It
-/// carries no alias to `mur deploy ls`, so the parser must reject it outright rather than print
-/// the deployment table.
+/// `mur ps` lists the capsules running on this machine. It carries no alias to `mur deploy ls`,
+/// so a deployment on record must not reach its output even with the deploy beta enabled: the two
+/// commands answer different questions, one about this host and one about rented machines.
 #[test]
-fn ps_is_not_a_subcommand_even_with_beta_enabled() {
+fn ps_lists_local_capsules_and_never_deployments() {
     let dir = tempdir().unwrap();
     enable_deploy_beta(dir.path());
     write_deployment(dir.path(), DEPLOYMENT_ID, "1.2.3.4");
@@ -186,18 +184,18 @@ fn ps_is_not_a_subcommand_even_with_beta_enabled() {
         .output()
         .unwrap();
 
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("ps"),
-        "error must name the rejected subcommand, got: {stderr}"
-    );
+    assert!(out.status.success());
+    // Nothing is running in this scratch home, and a deployment on record is not a capsule
+    // running on this machine.
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.trim(), "no running capsules", "got: {stdout}");
     assert!(
-        !stdout.contains("DEPLOYMENT_ID"),
-        "no deployment table may reach stdout, got: {stdout}"
+        !stdout.contains(DEPLOYMENT_ID) && !stdout.contains("1.2.3.4"),
+        "no deployment may reach `mur ps` output, got: {stdout}"
     );
 }
+
+// ─── invocations the parser must reject ───────────────────────────────────────
 
 /// `--host` belongs to `mur deploy run`, not to the `deploy` group, so passing it to the group
 /// is an argument error that never reaches the deploy path.
