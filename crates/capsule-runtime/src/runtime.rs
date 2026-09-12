@@ -10009,7 +10009,7 @@ inference:
     fn gateway_is_driver_only() {
         use http_body_util::{BodyExt, Empty};
 
-        const KEY: &str = "sk-s8-6e08b3d7";
+        const KEY: &str = "sk-driver-only-marker";
         let gateway = Arc::new(
             InferenceGateway::new(
                 "the-driver",
@@ -10071,7 +10071,7 @@ inference:
 
     #[test]
     fn inference_env_pairs_never_carries_the_api_key() {
-        const KEY: &str = "sk-s7-6e08b3d7";
+        const KEY: &str = "sk-env-pairs-marker";
         let inference = http_inference("https://api.moonshot.ai/v1", Some(KEY));
         let gateway = InferenceGateway::new(
             "the-driver",

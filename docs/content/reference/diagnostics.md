@@ -426,8 +426,7 @@ A block that is present and malformed adds the reason in parentheses:
 | `must contain {key} exactly once` | `value` has no `{key}`, or more than one |
 | `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
 
-The block's shape and the values the shipped drivers declare are in
-[Driver `inference_auth:` block](default-artifacts.md#inference-auth).
+The block's shape is in [Driver `inference_auth:` block](default-artifacts.md#inference-auth).
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 

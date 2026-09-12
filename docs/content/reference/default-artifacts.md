@@ -230,10 +230,3 @@ inference_auth:
 |---|---|---:|---|
 | `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the driver sets, in any case, is replaced |
 | `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by `inference.api_key`. With no `api_key`, no header is sent |
-
-| Driver | `header` | `value` |
-|---|---|---|
-| `murmur-driver-anthropic` | `x-api-key` | `"{key}"` |
-| `murmur-driver-openai` | `Authorization` | `"Bearer {key}"` |
-| `murmur-driver-deepseek` | `Authorization` | `"Bearer {key}"` |
-| `murmur-driver-moonshotai` | `Authorization` | `"Bearer {key}"` |

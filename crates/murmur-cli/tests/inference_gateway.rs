@@ -226,24 +226,6 @@ fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
     stream.write_all(b"\r\n")
 }
 
-/// Pack a driver whose bundled `murmur.yaml` carries `auth_block` verbatim (empty for none).
-fn pack_driver(dir: &Path, name: &str, wasm: &Path, auth_block: &str) -> PathBuf {
-    use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
-    let path = dir.join(format!("{name}-{DRIVER_VERSION}.mur.zip"));
-    let mut zip = ZipWriter::new(fs::File::create(&path).unwrap());
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("murmur.yaml", options).unwrap();
-    write!(
-        zip,
-        "name: {name}\nversion: {DRIVER_VERSION}\nruntime: driver\n{auth_block}"
-    )
-    .unwrap();
-    zip.start_file("tool.wasm", options).unwrap();
-    zip.write_all(&fs::read(wasm).unwrap()).unwrap();
-    zip.finish().unwrap();
-    path
-}
-
 struct Capsule {
     home: TempDir,
     project: TempDir,
@@ -256,7 +238,13 @@ impl Capsule {
         let home = TempDir::new().unwrap();
         let artifacts = TempDir::new().unwrap();
         let project = TempDir::new().unwrap();
-        let artifact = pack_driver(artifacts.path(), driver, wasm, auth_block);
+        let artifact = common::create_driver_artifact_with_auth(
+            artifacts.path(),
+            driver,
+            DRIVER_VERSION,
+            wasm,
+            auth_block,
+        );
         common::publish_local(&home, &artifact).success();
         let manifest = project.path().join("murmur.yaml");
         fs::write(
@@ -305,15 +293,15 @@ fn golden_path() -> PathBuf {
     common::fixture_path("inference-gateway/anthropic-request.txt")
 }
 
-const GOLDEN_KEY: &str = "sk-ant-golden-6e08b3d7";
+const GOLDEN_KEY: &str = "sk-ant-golden-marker";
 
-/// S2: the real anthropic driver's request, as the provider receives it, is byte-for-byte the
-/// request recorded before the gateway existed — same method, target, headers (with `host`
-/// naming the upstream) and body, and exactly one `x-api-key`.
+/// The real anthropic driver's request, as the provider receives it, is byte-for-byte the
+/// recording — same method, target, headers (with `host` naming the upstream) and body, and
+/// exactly one `x-api-key`.
 ///
 /// `MURMUR_RECORD_GOLDEN=1` rewrites the recording instead of comparing against it.
 #[test]
-fn the_upstream_request_is_unchanged_by_the_gateway() {
+fn upstream_request_matches_recording() {
     let upstream = RecordingUpstream::start(Reply::Json(
         r#"{"id":"msg_1","type":"message","role":"assistant","model":"test-model","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":1,"output_tokens":1}}"#
             .to_string(),
@@ -362,7 +350,7 @@ fn the_upstream_request_is_unchanged_by_the_gateway() {
 }
 
 const ENV_REPORT_DRIVER: &str = "env-report-driver";
-const MARKER: &str = "sk-marker-6e08b3d7-gateway";
+const MARKER: &str = "sk-gateway-test-marker";
 const W_SEC_025_LINK: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025";
 
@@ -458,11 +446,11 @@ fn env_report_capsule(upstream: &RecordingUpstream, extra: &str) -> Capsule {
     )
 }
 
-/// S1: a driver that sends no auth header and holds no key reaches its provider through the
+/// A driver that sends no auth header and holds no key reaches its provider through the
 /// gateway. The provider sees exactly one `x-api-key`, the operator's, and the streamed body
 /// arrives at the driver byte for byte and still in pieces, the pause between them intact.
 #[test]
-fn a_driver_without_the_key_reaches_its_provider_and_reads_the_stream_as_sent() {
+fn gateway_happy_path() {
     let upstream = streamed_upstream();
     let capsule = env_report_capsule(&upstream, "");
     let run = Run::of(capsule.run(MARKER, &[]));
@@ -513,10 +501,10 @@ fn a_driver_without_the_key_reaches_its_provider_and_reads_the_stream_as_sent() 
     assert!(run.warning_lines("W-SEC-025").is_empty(), "{}", run.stderr);
 }
 
-/// S4: a driver that declares no usable `inference_auth:` refuses to start, by name and version,
+/// A driver that declares no usable `inference_auth:` refuses to start, by name and version,
 /// before anything reaches the provider.
 #[test]
-fn a_driver_without_a_usable_inference_auth_block_refuses_to_start() {
+fn driver_without_inference_auth_refuses() {
     for (auth_block, reason) in [
         ("", None),
         (
@@ -549,10 +537,10 @@ fn a_driver_without_a_usable_inference_auth_block_refuses_to_start() {
     }
 }
 
-/// S5: naming the provider in `network.allow` is accepted and warned about once, on a real run and
+/// Naming the provider in `network.allow` is accepted and warned about once, on a real run and
 /// under `--explain-scope`.
 #[test]
-fn an_allow_entry_naming_the_endpoint_is_accepted_with_one_warning() {
+fn provider_in_network_allow_warns() {
     let upstream = streamed_upstream();
     let allow = format!(
         "capabilities:\n  network:\n    allow:\n      - {}\n",
@@ -597,11 +585,11 @@ fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
     found
 }
 
-/// S6: at every `trace.capture` setting the key is nowhere the session writes — its workdir with
+/// At every `trace.capture` setting the key is nowhere the session writes — its workdir with
 /// `trace.jsonl`, blobs, logs and `out/`, the conversation records under `HOME` — nor on stdout or
 /// stderr.
 #[test]
-fn the_key_is_in_no_trace_blob_log_or_output_at_any_capture_setting() {
+fn key_never_recorded() {
     for capture in ["none", "meta", "content"] {
         let upstream = streamed_upstream();
         let capsule = env_report_capsule(&upstream, &format!("trace:\n  capture: {capture}\n"));
@@ -626,11 +614,11 @@ fn the_key_is_in_no_trace_blob_log_or_output_at_any_capture_setting() {
     }
 }
 
-/// S7: a shell subprocess's environment carries no key either — the only place it could have come
-/// from, the session's inference environment, no longer holds one.
+/// A shell subprocess's environment carries no key either: the session's inference environment,
+/// the only place it could come from, holds none.
 #[test]
-fn a_shell_command_sees_no_key() {
-    if common::skip_without_host_support("a_shell_command_sees_no_key") {
+fn no_guest_observes_the_key() {
+    if common::skip_without_host_support("no_guest_observes_the_key") {
         return;
     }
     let upstream = RecordingUpstream::start(Reply::Sequence(vec![

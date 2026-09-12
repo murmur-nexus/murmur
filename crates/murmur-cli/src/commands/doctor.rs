@@ -730,7 +730,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     );
 
     // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming the
-    // inference endpoint grants direct reach without the key and no longer serves inference.
+    // inference endpoint grants direct reach without the key and does not serve inference.
     warn_on_inference_endpoint_in_network_allow(
         &capability_policy_from_runtime_manifest(&runtime_manifest),
         runtime_manifest.inference.as_ref(),

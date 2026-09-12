@@ -355,8 +355,8 @@ pub(crate) fn run_run(
     );
 
     // Same seam, same reasons: the runtime reaches the provider itself, so an allow-list entry
-    // naming the inference endpoint no longer serves inference, and what it does still grant
-    // should be said before `--explain-scope` returns. Never a refusal.
+    // naming the inference endpoint does not serve inference, and what it does grant should be
+    // said before `--explain-scope` returns. Never a refusal.
     capsule_runtime::warn_on_inference_endpoint_in_network_allow(
         &capability_policy,
         runtime_manifest.inference.as_ref(),

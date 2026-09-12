@@ -158,7 +158,7 @@ mod tests {
 
     use super::*;
 
-    const KEY: &str = "sk-unit-6e08b3d7";
+    const KEY: &str = "sk-unit-gateway-marker";
 
     fn auth(header: &str, value: &str) -> InferenceAuth {
         InferenceAuth {
