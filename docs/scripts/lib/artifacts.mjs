@@ -26,7 +26,7 @@ export async function writeLlmsFullTxt({ outDir, baseUrl, product, pages }) {
   const ordered = [...pages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
   const sections = ordered.map((page) => {
-    const canonical = new URL(page.urlPath, `${baseUrl}/`).toString();
+    const canonical = new URL(canonicalPageUrl(page.urlPath), `${baseUrl}/`).toString();
     const heading = [`# ${page.title}`, "", `Source: ${canonical}`];
     if (page.description) heading.push("", `> ${page.description}`);
 
@@ -148,6 +148,41 @@ export function fixApiCatalogLinkset(apiCatalog) {
     }
   }
   return apiCatalog;
+}
+
+/**
+ * The canonical form of a page URL: its trailing-slash directory form.
+ *
+ * leadtype's urlPath is slashless (`/concepts/hooks`) because the markdown
+ * twins are named from it, but MkDocs serves the page at `/concepts/hooks/`
+ * and the edge 301s the slashless form there (infra/cloudfront-agent-
+ * negotiation.js). Paths that already end in a slash and paths naming a file
+ * are returned unchanged. Accepts a site-absolute path or an absolute URL.
+ */
+export function canonicalPageUrl(pathOrUrl) {
+  const pathname = pathOrUrl.replace(/^https?:\/\/[^/]+/, "");
+  if (pathname.endsWith("/") || /\.[a-zA-Z0-9]+$/.test(pathname)) return pathOrUrl;
+  return `${pathOrUrl}/`;
+}
+
+/**
+ * leadtype writes every sitemap.xml <loc> as baseUrl + urlPath, so each entry
+ * names the slashless form, which is a redirect rather than the page. Search
+ * Console reports redirecting sitemap entries as errors and treats them as a
+ * weaker signal than the canonical, and generateAgentArtifacts has no option
+ * to change the URL it writes, so this rewrites the entries post-generation.
+ */
+export function fixSitemapXml(xml) {
+  return xml.replace(/<loc>([^<]*)<\/loc>/g, (_, loc) => `<loc>${canonicalPageUrl(loc)}</loc>`);
+}
+
+/**
+ * Same leadtype behavior as fixSitemapXml, in sitemap.md: every page link is
+ * written as the slashless urlPath. Only site-absolute link targets are
+ * touched; a link to a file such as /llms.txt keeps its name.
+ */
+export function fixSitemapMarkdown(markdown) {
+  return markdown.replace(/\]\((\/[^)\s#?]*)\)/g, (_, target) => `](${canonicalPageUrl(target)})`);
 }
 
 export async function applyCuratedLlmsTxt({ outDir, sourceFile }) {

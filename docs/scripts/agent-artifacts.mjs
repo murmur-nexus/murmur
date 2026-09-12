@@ -32,6 +32,8 @@ import {
 import {
   applyCuratedLlmsTxt,
   fixApiCatalogLinkset,
+  fixSitemapMarkdown,
+  fixSitemapXml,
   seedCuratedLlmsTxt,
   writeLlmsFullTxt,
   writeSearchIndex,
@@ -256,6 +258,14 @@ async function main() {
   if (result.files.apiCatalog) {
     const apiCatalog = fixApiCatalogLinkset(JSON.parse(await readFile(result.files.apiCatalog, "utf8")));
     await writeFile(result.files.apiCatalog, `${JSON.stringify(apiCatalog, null, 2)}\n`);
+  }
+
+  // See fixSitemapXml's own comment for why both sitemaps are rewritten.
+  if (result.files.sitemapXml) {
+    await writeFile(result.files.sitemapXml, fixSitemapXml(await readFile(result.files.sitemapXml, "utf8")));
+  }
+  if (result.files.sitemapMd) {
+    await writeFile(result.files.sitemapMd, fixSitemapMarkdown(await readFile(result.files.sitemapMd, "utf8")));
   }
 
   const rel = (file) => path.relative(DOCS_DIR, file);
