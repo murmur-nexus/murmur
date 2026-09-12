@@ -7,6 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use clap::Subcommand;
 use console::{measure_text_width, style};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use murmur_artifact::{load_runtime_manifest, LocalRegistry, RuntimeManifest, MANIFEST_FILENAME};
@@ -26,6 +27,62 @@ use super::deploy_state::{append_deployment, DeploymentRecord};
 const E_DEPLOY_003: &str = "E-DEPLOY-003";
 const E_DEPLOY_004: &str = "E-DEPLOY-004";
 const E_DEPLOY_006: &str = "E-DEPLOY-006";
+
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
+// `Run` carries the whole flag set while `Ls` takes no arguments, so the enum is as wide as `Run`.
+// One of these is built per process, straight out of the argument parser, so boxing the fields
+// would trade a clearer command definition for an allocation that saves nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Subcommand)]
+pub(crate) enum DeployCommand {
+    /// Upload a capsule to an existing VM and start it
+    Run {
+        /// IP address or hostname of the target VM (must already exist)
+        #[arg(long)]
+        host: String,
+
+        /// SSH user on the target VM (default: root)
+        #[arg(long, default_value = "root")]
+        ssh_user: String,
+
+        /// Path to SSH private key; uses SSH agent / default keys if omitted
+        #[arg(long)]
+        ssh_key: Option<std::path::PathBuf>,
+
+        /// Path to murmur.yaml
+        #[arg(long, default_value = "./murmur.yaml")]
+        manifest: std::path::PathBuf,
+
+        /// Local workdir to upload into the capsule's working directory
+        #[arg(long)]
+        workdir: Option<std::path::PathBuf>,
+
+        /// Path to a pre-built mur binary for the target platform. If omitted, the version
+        /// from manifest.mur_version (or the running mur version) is downloaded from GitHub
+        /// releases and cached at ~/.murmur/bin/mur-{version}-{platform}.
+        #[arg(long)]
+        mur_binary: Option<std::path::PathBuf>,
+
+        /// Environment variables for mur run on the remote VM: --env KEY=VALUE (repeatable).
+        /// If neither --env nor --env-file is passed, .env in the manifest directory is
+        /// loaded automatically when it exists.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env_vars: Vec<String>,
+
+        /// Path to a .env file with KEY=VALUE entries (one per line, # comments ignored).
+        /// Takes precedence over auto-detection of .env in the manifest directory.
+        #[arg(long, value_name = "PATH")]
+        env_file: Option<std::path::PathBuf>,
+
+        /// Target platform for artifact resolution (default: linux-x86_64).
+        /// Artifacts are pulled and staged for this platform before deploying.
+        #[arg(long, default_value = "linux-x86_64")]
+        deploy_platform: String,
+    },
+    /// List all deployed capsules
+    Ls,
+}
 
 // ─── artifact staging for deploy ─────────────────────────────────────────────
 

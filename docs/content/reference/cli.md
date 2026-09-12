@@ -15,9 +15,9 @@ Every `mur` command, its flags, and what each one does.
 | `mur run` | Run a capsule with lockfile-aware artifact resolution |
 | `mur watch` | Stream live events from a running capsule's output to stdout |
 | `mur cancel` | Stop one running task on a capsule, leaving the session running |
-| `mur deploy` | Upload a capsule to an existing VM and return its public URL |
+| `mur deploy run` | Upload a capsule to an existing VM and return its public URL |
+| `mur deploy ls` | List all deployed capsules |
 | `mur destroy` | Remove a deployment record from the local tracking list |
-| `mur ps` | List all deployed capsules |
 | `mur conversation ls` | List the durable conversation records, or place one message id in them |
 | `mur conversation rm` | Remove one context's record directory, whole |
 | `mur conversation truncate` | Drop the oldest messages from a record, keeping the newest N |
@@ -696,14 +696,14 @@ Exit codes:
 
 ---
 
-## `mur deploy`
+## `mur deploy run`
 
-Upload the `mur` binary and capsule files to an existing VM via SSH, start the capsule, and print the public A2A endpoint. The VM must already exist and be reachable via SSH — `mur deploy` never provisions or terminates VMs on your behalf.
+Upload the `mur` binary and capsule files to an existing VM via SSH, start the capsule, and print the public A2A endpoint. The VM must already exist and be reachable via SSH — `mur deploy run` never provisions or terminates VMs on your behalf.
 
 ```bash
-mur deploy --host <ip> [--ssh-user <user>] [--ssh-key <path>]
-           [--manifest <path>] [--workdir <path>] [--mur-binary <path>]
-           [--env KEY=VALUE] ...
+mur deploy run --host <ip> [--ssh-user <user>] [--ssh-key <path>]
+               [--manifest <path>] [--workdir <path>] [--mur-binary <path>]
+               [--env KEY=VALUE] [--env-file <path>] [--deploy-platform <platform>]
 ```
 
 | Flag | Default | Description |
@@ -713,10 +713,12 @@ mur deploy --host <ip> [--ssh-user <user>] [--ssh-key <path>]
 | `--ssh-key` | — | Path to SSH private key; uses SSH agent if omitted |
 | `--manifest` | `./murmur.yaml` | Path to the capsule manifest to deploy |
 | `--workdir` | — | Local directory to upload as the capsule's working directory |
-| `--mur-binary` | current executable | Path to a Linux x86_64 `mur` binary to upload. Defaults to `std::env::current_exe()`. Always specify this flag when deploying from macOS. |
+| `--mur-binary` | — | Path to a `mur` binary for `--deploy-platform` to upload. When omitted, the release named by `mur_version` in the manifest (or the running `mur` version) is downloaded from GitHub and cached at `~/.murmur/bin/mur-{version}-{platform}` |
 | `--env` | — | Environment variable in `KEY=VALUE` format; repeat for multiple vars |
+| `--env-file` | — | Path to a `.env` file of `KEY=VALUE` lines, `#` comments ignored. Takes precedence over the `.env` beside the manifest, which is loaded when neither `--env` nor `--env-file` is given |
+| `--deploy-platform` | `linux-x86_64` | Platform the uploaded artifacts and `mur` binary are resolved for |
 
-**Output — a summary box on stderr.** `mur deploy` emits no JSON and writes nothing to stdout;
+**Output — a summary box on stderr.** `mur deploy run` emits no JSON and writes nothing to stdout;
 progress and the final box both go to stderr.
 
 ```
@@ -732,10 +734,10 @@ progress and the final box both go to stderr.
 | Row | Description |
 |---|---|
 | `url` | Public A2A endpoint — `https://<VM_PUBLIC_IP>:<PORT>`. Use for `message/send`, `tasks/get`, and `/.well-known/agent-card.json`. |
-| `dep` | The deployment ID, abbreviated to its `dep_` prefix and first 8 hex characters. The full `dep_` + UUID v7 is stored in `~/.murmur/deployments.json` and listed by [`mur ps`](#mur-ps); `mur destroy` accepts any unambiguous prefix. |
+| `dep` | The deployment ID, abbreviated to its `dep_` prefix and first 8 hex characters. The full `dep_` + UUID v7 is stored in `~/.murmur/deployments.json` and listed by [`mur deploy ls`](#mur-deploy-ls); `mur destroy` accepts any unambiguous prefix. |
 | `time` | Elapsed wall-clock seconds |
 
-To script against a deployment, read `~/.murmur/deployments.json` or parse `mur ps` — the box is
+To script against a deployment, read `~/.murmur/deployments.json` or parse `mur deploy ls` — the box is
 for humans and its layout is not a stable interface.
 
 **Deployment flow:**
@@ -755,7 +757,7 @@ The flow depends on `mur run --json` — see [`mur run`](#mur-run) for the `--js
 **Example:**
 
 ```bash
-mur deploy \
+mur deploy run \
   --host 1.2.3.4 \
   --manifest ./my-agent/murmur.yaml \
   --mur-binary ./target/x86_64-unknown-linux-musl/release/mur \
@@ -775,32 +777,12 @@ mur deploy \
 
 ---
 
-## `mur destroy`
-
-Remove a deployment entry from `~/.murmur/deployments.json`. Does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.
-
-```bash
-mur destroy <deployment_id>
-```
-
-- `deployment_id` — the id returned by `mur deploy` (also listed by `mur ps`); a unique prefix is enough
-- Exits non-zero with a clear error if the id is not found in `~/.murmur/deployments.json`
-
-**Example:**
-
-```bash
-mur destroy dep_01954a3b
-# destroyed dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b (1.2.3.4)
-```
-
----
-
-## `mur ps`
+## `mur deploy ls`
 
 List all deployed capsules tracked in `~/.murmur/deployments.json`.
 
 ```bash
-mur ps
+mur deploy ls
 ```
 
 Output columns:
@@ -808,8 +790,8 @@ Output columns:
 | Column | Description |
 |---|---|
 | `DEPLOYMENT_ID` | Id assigned at deploy time (`dep_` + UUID v7) |
-| `PROVIDER` | Always `manual` — VMs are created by the user, not by `mur deploy` |
-| `IP` | Public IPv4 address of the VM |
+| `PROVIDER` | Always `manual` — VMs are created by the user, not by `mur deploy run` |
+| `REGION` | Empty for every record `mur deploy run` writes; the VM is one you created, and its region is never queried |
 | `STATUS` | Always `running` for present entries (`mur destroy` removes the entry) |
 | `URL` | Public A2A endpoint (`https://IP:PORT`) |
 
@@ -818,9 +800,29 @@ Prints `no deployments` when `~/.murmur/deployments.json` is absent or empty.
 **Example:**
 
 ```text
-DEPLOYMENT_ID                           PROVIDER    IP            STATUS      URL
+DEPLOYMENT_ID                           PROVIDER      REGION        STATUS      URL
 ----------------------------------------------------------------------------------------------------
-dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual      1.2.3.4       running     https://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual                      running     https://1.2.3.4:9000
+```
+
+---
+
+## `mur destroy`
+
+Remove a deployment entry from `~/.murmur/deployments.json`. Does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.
+
+```bash
+mur destroy <deployment_id>
+```
+
+- `deployment_id` — the id returned by `mur deploy run` (also listed by `mur deploy ls`); a unique prefix is enough
+- Exits non-zero with a clear error if the id is not found in `~/.murmur/deployments.json`
+
+**Example:**
+
+```bash
+mur destroy dep_01954a3b
+# destroyed dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b (1.2.3.4)
 ```
 
 ---

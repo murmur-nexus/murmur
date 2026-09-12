@@ -2,7 +2,7 @@ use crate::error::CliError;
 
 use super::deploy_state::load_deployments;
 
-pub(crate) fn run_ps() -> Result<(), CliError> {
+pub(crate) fn run_deploy_ls() -> Result<(), CliError> {
     let records = load_deployments()?;
 
     if records.is_empty() {
