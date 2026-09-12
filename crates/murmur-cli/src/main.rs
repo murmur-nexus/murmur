@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod error;
 mod formation;
+mod live_address;
 mod registry_client;
 mod session_address;
 mod source;
@@ -312,15 +313,25 @@ enum Commands {
     Topology(TopologyArgs),
     /// Watch a running capsule's output stream
     Watch {
-        /// Capsule URL (e.g. localhost:12345)
-        url: String,
+        /// Running session to watch: @1, a ses_ id, or a 4-character suffix of one
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Capsule address to reach directly, e.g. localhost:12345
+        #[arg(long, value_name = "HOST:PORT", conflicts_with = "session")]
+        url: Option<String>,
     },
     /// Stop one running task on a capsule, leaving the session running
     Cancel {
-        /// Capsule URL (e.g. localhost:12345)
-        url: String,
+        /// Running session holding the task: @1, a ses_ id, or a 4-character suffix of one.
+        /// With --url, give the task id alone.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
         /// Task to stop (e.g. tsk_0199...)
-        task_id: String,
+        #[arg(value_name = "TASK_ID")]
+        task_id: Option<String>,
+        /// Capsule address to reach directly, e.g. localhost:12345
+        #[arg(long, value_name = "HOST:PORT")]
+        url: Option<String>,
     },
     #[cfg(feature = "beta-mur-deploy")]
     /// Upload a capsule to an existing VM and start it
@@ -387,6 +398,37 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+}
+
+/// The capsule and the task `mur cancel` was given.
+///
+/// The positional list is `<SESSION> <TASK_ID>`, and `--url` stands in for the session address,
+/// leaving `<TASK_ID>` alone. Any other shape is a usage error, reported by clap in the same words
+/// as every other usage error.
+fn cancel_arguments(
+    session: Option<String>,
+    task_id: Option<String>,
+    url: Option<String>,
+) -> (Result<live_address::Target, error::CliError>, String) {
+    match (url, session, task_id) {
+        (Some(url), Some(task_id), None) => (Ok(live_address::Target::Url(url)), task_id),
+        (Some(_), _, _) => cancel_usage_error(
+            "--url names the capsule, so the task id is the only positional: \
+             mur cancel --url <HOST:PORT> <TASK_ID>",
+        ),
+        (None, Some(session), Some(task_id)) => {
+            (live_address::target(Some(&session), None), task_id)
+        }
+        (None, _, _) => cancel_usage_error(
+            "mur cancel names a running session and the task to stop: mur cancel <SESSION> <TASK_ID>",
+        ),
+    }
+}
+
+fn cancel_usage_error(message: &str) -> ! {
+    Cli::command()
+        .error(clap::error::ErrorKind::MissingRequiredArgument, message)
+        .exit()
 }
 
 fn main() {
@@ -588,8 +630,18 @@ fn main() {
             }
             run_topology(&args)
         }
-        Commands::Watch { url } => run_watch(&url),
-        Commands::Cancel { url, task_id } => run_cancel(&url, &task_id),
+        Commands::Watch { session, url } => {
+            live_address::target(session.as_deref(), url.as_deref())
+                .and_then(|target| run_watch(&target))
+        }
+        Commands::Cancel {
+            session,
+            task_id,
+            url,
+        } => {
+            let (target, task_id) = cancel_arguments(session, task_id, url);
+            target.and_then(|target| run_cancel(&target, &task_id))
+        }
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy {
             host,

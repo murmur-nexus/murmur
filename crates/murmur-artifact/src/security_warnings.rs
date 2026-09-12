@@ -222,6 +222,17 @@ pub const W_SEC_021: &str = "W-SEC-021";
 /// than an accident.
 pub const W_SEC_022: &str = "W-SEC-022";
 
+/// A session opened its A2A door and its record under `~/.murmur/running/` could not be written,
+/// so nothing on the machine can look the session's address up.
+///
+/// The record is what makes `mur watch` and `mur cancel` reachable by session address rather than
+/// by the URL one terminal printed once. A home directory that cannot be resolved or written
+/// leaves the session running and serving exactly as it would have, addressable only by that URL.
+/// Never a refusal: a capsule that serves is worth more than a capsule that refused to start
+/// because a convenience could not be recorded. Fires once per launch, only for a session that
+/// binds a door.
+pub const W_SEC_023: &str = "W-SEC-023";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -241,7 +252,7 @@ mod tests {
         let codes = [
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
-            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022,
+            W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

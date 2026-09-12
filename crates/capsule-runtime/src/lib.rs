@@ -46,6 +46,7 @@ pub mod registration;
 pub mod resource_plane;
 pub mod resources;
 pub mod retention;
+pub mod running;
 pub mod runtime;
 pub(crate) mod sandbox;
 pub mod sealed;
@@ -150,6 +151,10 @@ pub use retention::{
     MessageLocation, MessageStatus, PrunedRecord, PrunedSession, RecordHeader, RecordSummary,
     RemovedRecord, TruncationMarker, TruncationOutcome,
 };
+// The running-capsule vocabulary a reader of a record needs. The verbs stay module-qualified —
+// `running::list`, `running::verify`, `running::prune`, `running::running_dir` — on the same terms
+// as `origin::from_wire`: their bare names say nothing about capsules.
+pub use running::{Liveness, ProcessState, RunningGuard, RunningRecord};
 pub use runtime::{
     check_no_reserved_tool_names, launch_session, stage_session,
     warn_on_interpreter_runtime_grants, warn_on_userns_restriction_disabled_host_wide,

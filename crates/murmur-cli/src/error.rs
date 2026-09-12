@@ -37,6 +37,8 @@ pub const E_RUN_018: &str = "E-RUN-018"; // --resume-mode compact with no hook b
 pub const E_RUN_019: &str = "E-RUN-019"; // a session declaring capabilities.spawn.allow could not register with mur-roost
 pub const E_RUN_020: &str = "E-RUN-020"; // MURMUR_SPAWNER is set to something that is not a spawner handle
 pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built for another platform
+pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
+pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed

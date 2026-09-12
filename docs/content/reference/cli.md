@@ -35,13 +35,7 @@ Every `mur` command, its flags, and what each one does.
 
 ## Session addresses { #session-addresses }
 
-[`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show),
-[`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff),
-[`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show) and
-[`mur eval diff`](#mur-eval-diff) name a session the same four ways. Each is resolved against the
-`ses_*` session directories in the workdir: `./workdir` for the `mur trace` and `mur eval`
-commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
-`--workdir` names. See [Session workdir](workdir.md).
+Every command that names a session spells the address the same way.
 
 | Form | Example | Names |
 |---|---|---|
@@ -49,6 +43,22 @@ commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside 
 | Suffix | `d399` | The one session whose ID ends with those characters, matched case-insensitively. 4 characters or more. Two or more matches are refused, and the refusal lists them |
 | Ordinal | `@1`, `@2` | The most recent session, the second most recent, and so on. Session IDs sort in creation order, so `@N` counts back from the newest |
 | Path | `workdir/ses_019f…/trace.jsonl` | The record file at that literal path, taken verbatim. `mur run --resume` also accepts the session directory itself |
+
+What an address is resolved against depends on what the command needs.
+
+| Command | Candidate set | `@1` means |
+|---|---|---|
+| [`mur run --resume`](#mur-run), [`mur trace show`](#mur-trace-show), [`mur trace steps`](#mur-trace-steps), [`mur trace diff`](#mur-trace-diff), [`mur trace report`](#mur-trace-report), [`mur eval show`](#mur-eval-show), [`mur eval diff`](#mur-eval-diff) | The `ses_*` session directories in one workdir, whether or not the session is still running | The most recent recorded session |
+| [`mur watch`](#mur-watch), [`mur cancel`](#mur-cancel) | The [running-capsule records](#running-capsule-records) for this whole machine | The most recent running session |
+
+The recorded set is the `ses_*` directories in `./workdir` for the `mur trace` and `mur eval`
+commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside the directory
+`--workdir` names. See [Session workdir](workdir.md).
+
+`mur watch` and `mur cancel` have to connect, so they take the three forms that name a session and
+refuse the path form: a path names a directory on disk, which says nothing about whether a process
+is running. An address naming a session that has stopped reports
+[`E-RUN-022`](diagnostics.md#e-run-022) rather than resolving to a different capsule.
 
 Omitting the address selects a default:
 
@@ -61,14 +71,69 @@ Omitting the address selects a default:
 | `mur trace report` | every session in the workdir |
 | `mur eval show` | `@1` |
 | `mur eval diff` | `@2 @1` |
+| `mur watch` | `@1` |
 
 `mur trace diff` and `mur eval diff` take their arguments in *before, after* order, so the bare
 `@2 @1` puts the older run in the Run A column and the delta column reads forwards in time. Both
 take two addresses or none; one address is refused.
 
 An address matching no session, or several, is refused with
-[`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`, and
-[`E-EVAL-002`](diagnostics.md) under `mur eval`.
+[`E-TRC-002`](diagnostics.md) under `mur run` and `mur trace`,
+[`E-EVAL-002`](diagnostics.md) under `mur eval`, and
+[`E-RUN-022`](diagnostics.md#e-run-022) under `mur watch` and `mur cancel`.
+
+---
+
+## Running-capsule records { #running-capsule-records }
+
+A capsule that opens an [A2A door](../how-to/capsules-a2a-messaging.md) writes one record of where that door is, and
+removes it when the session ends.
+
+| Property | Value |
+|---|---|
+| Location | `~/.murmur/running/<session_id>.json` |
+| Directory mode | `0700` |
+| File mode | `0600` |
+| Written by | The runtime, at the moment it binds the port |
+| Removed by | The runtime, when the session ends |
+
+Each record carries the session id, the capsule address, the process id and its start time, the
+capsule name and version, the session workdir, whether the session outlives its launcher, and the
+time it started. It carries nothing from the environment: no API key, no granted variable, no
+token.
+
+Taken together the records are a map of every reachable capsule on the machine, readable by
+anything running as the same user. The `0700` directory and `0600` files are what keep that map
+owner-only, and both modes are reapplied on every write.
+
+### A record is a hint { #running-record-is-a-hint }
+
+Nothing can guarantee a record is removed — a capsule killed outright writes no farewell — so every
+read verifies it in three layers, and a session is reported as running only when all three hold.
+
+| Layer | Question | Alone it proves |
+|---|---|---|
+| 1 | Is a process holding that process id? | Little: process ids are handed out again |
+| 2 | Did that process start when the record says it did? | That the process id was not reused by something unrelated |
+| 3 | Does the capsule's agent card answer, naming that session? | That the capsule is the one being addressed and can still respond |
+
+Reading the records removes every one that fails layer 1 or 2 — that is the only sweep there is,
+and it is enough because a record is never treated as truth. A record that passes layers 1 and 2
+and fails layer 3 is kept: it names a process that is genuinely alive, possibly mid-turn, and the
+command reports [`E-RUN-023`](diagnostics.md#e-run-023) instead of throwing the address away.
+
+Ordinals count over records that pass layers 1 and 2, so a capsule that has stopped never shifts
+the numbering of the ones still running.
+
+### Whether a capsule outlives its launcher { #outlives-launcher }
+
+The `outlives_launcher` field is read from whether the launching process has a controlling
+terminal, which `/dev/tty` answers regardless of where the streams were redirected.
+
+| Launch | Controlling terminal | `outlives_launcher` |
+|---|---|---|
+| Started in a terminal window | Yes | `false` — the capsule ends with that window |
+| Started with no terminal attached — `nohup`, a service manager, a detached session | No | `true` |
 
 ---
 
@@ -637,10 +702,17 @@ Stream live SSE events from a running capsule's output to stdout. The command op
 format until the capsule closes or Ctrl+C is pressed.
 
 ```bash
-mur watch <capsule_url>
+mur watch [SESSION]
+mur watch --url <host:port>
 ```
 
-- `capsule_url` — the `localhost:<port>` URL printed by `mur run` (with or without `http://`)
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | `@1` | A [session address](#session-addresses) naming a running capsule |
+| `--url` | — | A capsule's address, reached without resolving anything. Conflicts with `SESSION` |
+
+The session is resolved against the [running-capsule record](#running-capsule-records) and verified
+before the connection is opened.
 
 Output format:
 
@@ -659,7 +731,8 @@ Output format:
 Exit codes:
 
 - `0` — terminal state event received (`completed` or `failed`)
-- `1` — connection error or non-200 response from the capsule
+- `1` — the session address named nothing running (`E-RUN-022`), the capsule did not answer
+  (`E-RUN-023`), or the connection failed
 
 ---
 
@@ -669,11 +742,15 @@ Stop one running task on a capsule. The capsule's session, its conversation and 
 untouched: queued tasks proceed, and the capsule keeps answering.
 
 ```bash
-mur cancel <capsule_url> <task_id>
+mur cancel <SESSION> <TASK_ID>
+mur cancel --url <host:port> <TASK_ID>
 ```
 
-- `capsule_url` — the `localhost:<port>` URL printed by `mur run` (with or without `http://`)
-- `task_id` — the `tsk_` id `message/send` returned, or the one `tasks/get` reports
+| Argument | Default | Description |
+|---|---|---|
+| `SESSION` | — | A [session address](#session-addresses) naming a running capsule |
+| `TASK_ID` | — | The `tsk_` id `message/send` returned, or the one `tasks/get` reports |
+| `--url` | — | A capsule's address, reached without resolving anything. Takes the place of `SESSION` |
 
 The in-flight inference call is dropped rather than waited out, and the task reaches the terminal
 state `canceled`. Nothing else is stopped: a detached shell command keeps its own lifecycle and a
@@ -692,7 +769,8 @@ that state and changes nothing.
 Exit codes:
 
 - `0` — the capsule holds this task; the line printed says what state it is in
-- `1` — the capsule does not hold this task id, or the connection failed
+- `1` — the capsule does not hold this task id, the session address named nothing running
+  (`E-RUN-022`), or the capsule did not answer (`E-RUN-023`)
 
 ---
 
