@@ -980,6 +980,15 @@ impl HookRuntime {
             .unwrap_or_default()
     }
 
+    /// Take every `run-inference` call a spend ceiling refused since the last drain. Drained by
+    /// the agent loop beside [`Self::drain_inference_records`].
+    pub(crate) fn drain_spend_refusals(&self) -> Vec<crate::inference_import::SpendRefusalRecord> {
+        self.inference
+            .as_ref()
+            .map(|ctx| ctx.drain_spend_refusals())
+            .unwrap_or_default()
+    }
+
     /// Put a task in scope for one attempt of the agent loop, with the two input forms the
     /// `murmur:task-io/read` import distinguishes: `original` is the task before any reopen
     /// feedback was appended, `as_given` is exactly what this attempt's loop is handed.
@@ -3420,7 +3429,9 @@ mod tests {
             network_allow_rules: Vec::new(),
             driver_grant: None,
             inference_gateway: None,
+            spend: Arc::new(crate::spend::SpendMeter::unlimited()),
             records: std::sync::Mutex::new(Vec::new()),
+            spend_refusals: std::sync::Mutex::new(Vec::new()),
         });
 
         let rt = tokio::runtime::Runtime::new().unwrap();

@@ -362,6 +362,7 @@ fn stage_agent_session_inner(
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap()

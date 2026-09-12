@@ -91,6 +91,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
                 system_prompt_artifact: None,
                 max_turns: 10,
                 max_tokens: None,
+                max_session_tokens: None,
             }),
             system_prompt_overridden: false,
             context: None,
@@ -109,6 +110,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .expect("stage_session should succeed");
@@ -193,6 +195,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
                 system_prompt_artifact: None,
                 max_turns: 10,
                 max_tokens: None,
+                max_session_tokens: None,
             }),
             system_prompt_overridden: false,
             context: None,
@@ -211,6 +214,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .expect("stage_session should succeed without shell-desc driver");
@@ -299,6 +303,7 @@ fn shell_desc_driver_respects_custom_manifest() {
                 system_prompt_artifact: None,
                 max_turns: 10,
                 max_tokens: None,
+                max_session_tokens: None,
             }),
             system_prompt_overridden: false,
             context: None,
@@ -317,6 +322,7 @@ fn shell_desc_driver_respects_custom_manifest() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .expect("stage_session should succeed");

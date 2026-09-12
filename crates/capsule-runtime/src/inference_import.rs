@@ -26,6 +26,7 @@ use crate::{
     },
     network_policy::{NetworkAllowRule, ToolCapabilityGrant},
     runtime::{invoke_tool_component, ToolA2aWiring, ToolInvokeEnv},
+    spend::{SpendMeter, SpendRefusal},
     trace::InferenceOrigin,
     types::CapabilityPolicy,
 };
@@ -58,6 +59,16 @@ pub(crate) struct HookInferenceRecord {
     pub(crate) usage: Option<DriverUsage>,
 }
 
+/// One `run-inference` call a spend ceiling refused before dispatch, buffered for the agent loop
+/// to write as a `spend_ceiling_reached` trace line. No [`HookInferenceRecord`] accompanies it:
+/// no call was made.
+#[derive(Debug, Clone)]
+pub(crate) struct SpendRefusalRecord {
+    /// `hook:<name>` of the hook whose call was refused.
+    pub(crate) origin: String,
+    pub(crate) refusal: SpendRefusal,
+}
+
 /// Everything the host needs to run one inference-driver call from inside a
 /// hook's wasm call.
 ///
@@ -83,8 +94,13 @@ pub(crate) struct HookInferenceCtx {
     /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
     /// as the agent loop's own turns do.
     pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
+    /// The session's spend account — the same one the agent loop admits its turns against — so a
+    /// hook's completion counts toward, and is refused by, the same ceilings.
+    pub(crate) spend: Arc<SpendMeter>,
     /// Buffered trace records, drained by the agent loop after hook dispatch.
     pub(crate) records: std::sync::Mutex<Vec<HookInferenceRecord>>,
+    /// Calls refused by a spend ceiling, drained beside [`Self::records`].
+    pub(crate) spend_refusals: std::sync::Mutex<Vec<SpendRefusalRecord>>,
 }
 
 impl HookInferenceCtx {
@@ -119,6 +135,25 @@ impl HookInferenceCtx {
             .map_err(|e| format!("failed to encode driver payload: {e}"))?;
         let input_tokens = u64::from(count_tokens(&payload_json));
 
+        // Refused before dispatch: the guest gets the refusal text as `err`, and the trace gets a
+        // refusal line rather than an `inference` record for a call that never happened.
+        let admission = match self
+            .spend
+            .admit(input_tokens, u64::from(DEFAULT_MAX_OUTPUT_TOKENS))
+        {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                let text = refusal.to_string();
+                if let Ok(mut refusals) = self.spend_refusals.lock() {
+                    refusals.push(SpendRefusalRecord {
+                        origin: origin.to_string(),
+                        refusal,
+                    });
+                }
+                return Err(text);
+            }
+        };
+
         let started = Instant::now();
         let outcome = self.dispatch(payload_json).await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -129,6 +164,7 @@ impl HookInferenceCtx {
                 // runtime's own tiktoken counts, so a driver-reported `usage` never lands
                 // there — it goes to the trace record below and nowhere else.
                 let output_tokens = u64::from(count_tokens(&raw));
+                admission.settle(input_tokens, output_tokens);
                 (
                     output_tokens,
                     usage,
@@ -142,7 +178,10 @@ impl HookInferenceCtx {
                     }),
                 )
             }
-            Err(err) => (0, None, Err(err)),
+            Err(err) => {
+                drop(admission);
+                (0, None, Err(err))
+            }
         };
 
         self.record(HookInferenceRecord {
@@ -222,6 +261,14 @@ impl HookInferenceCtx {
     /// Take every record buffered since the last drain.
     pub(crate) fn drain_records(&self) -> Vec<HookInferenceRecord> {
         self.records
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+
+    /// Take every spend refusal buffered since the last drain.
+    pub(crate) fn drain_spend_refusals(&self) -> Vec<SpendRefusalRecord> {
+        self.spend_refusals
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default()
@@ -402,6 +449,15 @@ mod tests {
     }
 
     fn ctx(engine: &Engine, workdir: &std::path::Path, driver: Component) -> HookInferenceCtx {
+        ctx_with_spend(engine, workdir, driver, Arc::new(SpendMeter::unlimited()))
+    }
+
+    fn ctx_with_spend(
+        engine: &Engine,
+        workdir: &std::path::Path,
+        driver: Component,
+        spend: Arc<SpendMeter>,
+    ) -> HookInferenceCtx {
         HookInferenceCtx {
             driver_name: "mock-driver".to_string(),
             driver_component: driver,
@@ -413,7 +469,9 @@ mod tests {
             network_allow_rules: Vec::new(),
             driver_grant: None,
             inference_gateway: None,
+            spend,
             records: std::sync::Mutex::new(Vec::new()),
+            spend_refusals: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -613,6 +671,57 @@ mod tests {
         assert!(!serialized.contains("corpus:abc"));
         assert!(!serialized.contains("source_id"));
         assert!(!serialized.contains("source-id"));
+    }
+
+    /// A spend ceiling refuses a hook's completion before dispatch — both a ceiling too small for
+    /// the call and a session already latched by an earlier refusal. The guest gets the refusal
+    /// text, no `inference` record is buffered, and one refusal record names the hook.
+    #[test]
+    fn run_inference_refused_by_spend_ceiling() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine();
+
+        let latched = Arc::new(SpendMeter::new(Some(1_000_000), None));
+        assert!(latched.admit(2_000_000, 0).is_err(), "latches the session");
+
+        for (case, meter) in [
+            ("too small", Arc::new(SpendMeter::new(Some(10), None))),
+            ("latched", latched),
+        ] {
+            // A driver double that, had it been invoked, would have buffered an `error` record:
+            // `run` records every dispatched call, success or failure.
+            let ctx = ctx_with_spend(
+                &engine,
+                dir.path(),
+                driver_double(&engine, 2, "the driver was invoked"),
+                Arc::clone(&meter),
+            );
+            let err = block_on(ctx.run("hook:compact", request(None)))
+                .expect_err("a refused call is an err");
+            assert!(
+                err.starts_with("spend ceiling reached: inference.max_session_tokens is"),
+                "{case}: {err}"
+            );
+            assert!(
+                err.contains("retrying will not get past it"),
+                "{case}: {err}"
+            );
+            assert!(!err.contains("the driver was invoked"), "{case}: {err}");
+            assert!(
+                ctx.drain_records().is_empty(),
+                "{case}: no inference record"
+            );
+            let refusals = ctx.drain_spend_refusals();
+            assert_eq!(refusals.len(), 1, "{case}");
+            assert_eq!(refusals[0].origin, "hook:compact", "{case}");
+            assert_eq!(
+                refusals[0].refusal.limit,
+                crate::spend::SpendLimit::Session,
+                "{case}"
+            );
+            assert_eq!(meter.used(), 0, "{case}: nothing was charged");
+            assert!(!meter.has_open_admission(), "{case}");
+        }
     }
 
     /// A non-`passed` tool status from the driver is also an `Err`.

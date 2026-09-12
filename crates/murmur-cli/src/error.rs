@@ -41,6 +41,7 @@ pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running s
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
 pub const E_RUN_025: &str = "E-RUN-025"; // the inference driver declares no usable inference_auth: block
+pub const E_RUN_026: &str = "E-RUN-026"; // spend.machine_tokens_per_day is set and the spend ledger cannot be used
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -479,6 +480,13 @@ impl From<RuntimeError> for CliError {
                 error.to_string(),
                 "the runtime presents the provider key itself and needs the driver to say how; \
                  update the driver to a version whose murmur.yaml declares inference_auth:",
+            ),
+            error @ RuntimeError::SpendLedgerUnavailable { .. } => CliError::with_hint(
+                E_RUN_026,
+                error.to_string(),
+                "spend.machine_tokens_per_day is set in config.yaml, and the machine spend ceiling \
+                 cannot be kept without its ledger; make ~/.murmur/spend a directory this user can \
+                 write, or remove spend.machine_tokens_per_day",
             ),
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,

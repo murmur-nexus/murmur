@@ -33,7 +33,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `task_end`, `task_reopened`, `task_canceled`, `context_seed` | The task node |
 | `inference` (agent loop's own) | The task node, or the session node between tasks. Its `event_id` is the turn node — a turn has no line of its own |
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
-| `call_denied`, `protected_path_denied` | The turn node, falling back to the task node and then the session node |
+| `call_denied`, `protected_path_denied`, `spend_ceiling_reached` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
@@ -55,6 +55,8 @@ before the first task begins
 | `capsule_version` | string | Manifest `version` |
 | `model` | string | `inference.model` |
 | `max_turns` | u32 | `inference.max_turns` — the turn ceiling each task of this launch runs under |
+| `max_session_tokens` | u64 \| null | [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens). Always present; `null` when no session ceiling applies |
+| `machine_tokens_per_day` | u64 \| null | [`spend.machine_tokens_per_day`](config.md#spend) when this session is counted against it. Always present; `null` when no machine ceiling was in effect, and under `transport: process` |
 | `capabilities` | string[] | The capability categories the manifest granted anything under: `"network"`, `"filesystem"`, `"shell"` |
 | `tools_declared` | string[] | Names of the tools offered to the model |
 | `containment_declared` | string | `"advisory"` \| `"scoped"` \| `"sealed"` — the strongest class the manifest, workspace config or `--containment` asked for. Always present; `"advisory"` when none of them declared one |
@@ -356,7 +358,7 @@ loop has exited, on every exit path
 | `total_tool_calls` | u32 | Equals the count of `tool_call` lines |
 | `total_shell_calls` | u32 | Equals the count of `shell` plus `shell_detached` lines |
 | `duration_ms` | u64 | Wall-clock time from session start |
-| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"canceled"` — the last task's own terminal outcome |
+| `exit_status` | string | `"ok"` \| `"failed"` \| `"max_turns_reached"` \| `"spend_ceiling_reached"` \| `"canceled"` — the last task's own terminal outcome |
 
 **`a2a_task_received`** — written when an incoming message reserves the task slot
 
@@ -404,7 +406,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |
@@ -481,6 +483,23 @@ hook](../concepts/hooks.md#policy-hooks), so a call refused here produces no `ca
 beside it. `mur trace show` reports the count as `protected-path refusals`.
 
 Distinct from `call_denied` above, which is a *hook's* refusal and names the hook.
+
+**`spend_ceiling_reached`**{ #spend-ceiling-reached } — written when a spend ceiling refuses a
+driver call before it is sent
+
+| Field | Type | Notes |
+|---|---|---|
+| `turn` | u32 | The turn the refused call belonged to |
+| `task_id` | string \| null | The task in scope, `null` between tasks |
+| `limit` | string | `"session"` — [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) \| `"machine"` — [`spend.machine_tokens_per_day`](config.md#spend) |
+| `ceiling` | u64 | The ceiling's value |
+| `used` | u64 | `"session"`: this session's settled tokens plus its calls in flight. `"machine"`: the day's ledger total plus this session's calls in flight |
+| `requested` | u64 | The refused call's `input_tokens` plus the most output it could request |
+| `origin` | string | `"hook:<hook name>"` for a hook's `run-inference` call. Absent for an agent turn |
+
+No `inference` line accompanies it: nothing was sent. A `"session"` refusal latches, so every later
+driver call in the session writes one of these too; a `"machine"` refusal is checked again on every
+call. `used + requested > ceiling` on every line.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 
@@ -781,8 +800,9 @@ stopped early.
 - When the launch fails before `session_start` is written (a missing driver artifact, for
   example), `trace.jsonl` is created but empty. No `session_end` is written, because no session
   started.
-- A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"` or
-  `"max_turns_reached"` on a task the runtime survived and reported on. The launch's own
+- A `task_end` carries the attempt's own terminal outcome, so it reads `"failed"`,
+  `"max_turns_reached"` or `"spend_ceiling_reached"` on a task the runtime survived and reported
+  on. The launch's own
   `session_end` carries the last task's outcome the same way.
 
 ---
