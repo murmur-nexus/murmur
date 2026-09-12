@@ -42,7 +42,6 @@ Six manifest fields work together to make the recursive pattern possible. Create
     capabilities:
       network:
         allow:
-          - https://api.anthropic.com
           - localhost:52222
       filesystem:
         allow:
@@ -90,7 +89,6 @@ Six manifest fields work together to make the recursive pattern possible. Create
     capabilities:
       network:
         allow:
-          - https://api.openai.com
           - localhost:52222
       filesystem:
         allow:
@@ -138,7 +136,6 @@ Six manifest fields work together to make the recursive pattern possible. Create
     capabilities:
       network:
         allow:
-          - https://api.deepseek.com
           - localhost:52222
       filesystem:
         allow:

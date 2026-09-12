@@ -40,6 +40,7 @@ pub const E_RUN_021: &str = "E-RUN-021"; // a staged native tool binary is built
 pub const E_RUN_022: &str = "E-RUN-022"; // a session address names no running session on this machine
 pub const E_RUN_023: &str = "E-RUN-023"; // the capsule a session address resolved to did not answer
 pub const E_RUN_024: &str = "E-RUN-024"; // a session could not be ended and is still running
+pub const E_RUN_025: &str = "E-RUN-025"; // the inference driver declares no usable inference_auth: block
 
 // Capability enforcement
 pub const E_CAP_001: &str = "E-CAP-001"; // capabilities.network.allow entry could not be parsed
@@ -473,6 +474,12 @@ impl From<RuntimeError> for CliError {
                 format!("inference driver '{name}' is not installed in the local tool registry"),
                 "declare the driver artifact in murmur.yaml artifacts: and run `mur run` to install it",
             ),
+            error @ RuntimeError::DriverDeclaresNoInferenceAuth { .. } => CliError::with_hint(
+                E_RUN_025,
+                error.to_string(),
+                "the runtime presents the provider key itself and needs the driver to say how; \
+                 update the driver to a version whose murmur.yaml declares inference_auth:",
+            ),
             RuntimeError::AgentLoopFailed(message) => CliError::new(
                 E_RUN_007,
                 format!("agent loop failed: {message}"),
@@ -571,6 +578,10 @@ impl From<ManifestError> for CliError {
                 format!(
                     "{MANIFEST_FILENAME}: field '{field}' has invalid type (expected {expected}, got {got})"
                 ),
+            ),
+            ManifestError::InvalidValue { field, message } => CliError::new(
+                E_MAN_003,
+                format!("{MANIFEST_FILENAME}: field '{field}' {message}"),
             ),
             ManifestError::NotFound(path) => {
                 CliError::new(E_IO_001, format!("{MANIFEST_FILENAME} not found at {path}"))

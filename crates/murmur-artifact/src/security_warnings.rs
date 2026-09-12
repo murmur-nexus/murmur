@@ -250,6 +250,15 @@ pub const W_SEC_023: &str = "W-SEC-023";
 /// once per distinct credential-shaped entry, in declaration order.
 pub const W_SEC_024: &str = "W-SEC-024";
 
+/// A `transport: http` capsule names its own inference endpoint in `capabilities.network.allow`.
+///
+/// The runtime reaches the provider itself, through the inference gateway, and attaches the key
+/// there; the driver's inference request never consults the allow-list. The entry is not inert —
+/// it still grants tools, subprocesses and the driver direct reach to that host, just without the
+/// key — so it is accepted rather than refused, and the warning says what it now grants. Fires
+/// once per matching entry, before any session workdir exists.
+pub const W_SEC_025: &str = "W-SEC-025";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -270,6 +279,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
+            W_SEC_025,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

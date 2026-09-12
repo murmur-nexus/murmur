@@ -500,9 +500,9 @@ fn agent_system_prompt_includes_capsule_context() {
         "expected at least one inference request"
     );
 
-    let system_field = requests[0]["system"]
-        .as_str()
+    let system_field = common::system_text(&requests[0]["system"])
         .expect("system field should be present in inference request");
+    let system_field = system_field.as_str();
 
     assert!(
         system_field.starts_with("[Capsule]\nName:"),
@@ -610,8 +610,9 @@ fn prompt_prefix_is_identical_across_two_launches() {
         "expected one inference request per launch"
     );
 
-    let first = requests[0]["system"].as_str().expect("system field");
-    let second = requests[1]["system"].as_str().expect("system field");
+    let first = common::system_text(&requests[0]["system"]).expect("system field");
+    let second = common::system_text(&requests[1]["system"]).expect("system field");
+    let (first, second) = (first.as_str(), second.as_str());
 
     assert_eq!(
         first, second,

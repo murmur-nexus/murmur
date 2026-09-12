@@ -1923,6 +1923,7 @@ name = "murmur-artifact"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "http",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1956,6 +1957,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "tikv-jemallocator",
  "tokio",

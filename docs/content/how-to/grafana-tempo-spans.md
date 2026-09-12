@@ -134,11 +134,6 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
             allow:
               - http://localhost:4318
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -169,11 +164,6 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
             allow:
               - http://localhost:4318
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -203,11 +193,6 @@ Create a `murmur.yaml` file with `observability.otel_endpoint` pointing to Tempo
           network:
             allow:
               - http://localhost:4318
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

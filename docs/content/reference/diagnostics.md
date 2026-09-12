@@ -73,6 +73,7 @@ section that explains it.
 | `E-RUN-022` | A session address names no capsule running on this machine | [E-RUN-022](#e-run-022) |
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
+| `E-RUN-025` | The `transport: http` inference driver declares no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -108,6 +109,7 @@ section that explains it.
 | `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker, or delivers nothing | [W-SEC-024](#w-sec-024) |
+| `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 
 ---
 
@@ -399,6 +401,32 @@ The record is **not** removed. Unlike [`E-RUN-022`](#e-run-022), the capsule it 
 running, so unlinking the record would remove the only handle anyone has on it. Every task the
 session held was cancelled before the signalling started, so the capsule is idle even though it is
 still there.
+
+### E-RUN-025 — the inference driver declares no usable `inference_auth:` block { #e-run-025 }
+
+A `transport: http` capsule names a driver whose own `murmur.yaml` does not say how its provider
+takes the API key. The runtime attaches the key to each driver request itself, so without that
+declaration it cannot authenticate the driver, and `mur run` refuses at staging, before any
+component runs or any request is sent. The refusal applies whether or not `inference.api_key` is
+set.
+
+```text
+error[E-RUN-025]: inference driver 'murmur-driver-anthropic@1.0.0' declares no usable inference_auth: block
+  hint: the runtime presents the provider key itself and needs the driver to say how; update the driver to a version whose murmur.yaml declares inference_auth:
+```
+
+A block that is present and malformed adds the reason in parentheses:
+
+| Reason names | Means |
+|---|---|
+| `'inference_auth' has invalid type` | The block is not a mapping |
+| `missing required field 'inference_auth.header'` or `'inference_auth.value'` | A child is absent |
+| `'inference_auth.header' has invalid type` or `'inference_auth.value' has invalid type` | A child is not a string |
+| `is not a valid HTTP header name` | `header` cannot be sent as a header |
+| `must contain {key} exactly once` | `value` has no `{key}`, or more than one |
+| `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
+
+The block's shape is in [Driver `inference_auth:` block](default-artifacts.md#inference-auth).
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -986,7 +1014,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1838,3 +1866,18 @@ A capsule that holds an operator-granted secret for its whole life is a legitima
 why this is a warning and not a refusal — including with `after_task: sleep`.
 [`lifecycle.after_task`](manifest.md#lifecycle-after-task) is not a trigger on its own: with no
 credential-shaped name declared there is nothing being held.
+
+### W-SEC-025 — `capabilities.network.allow` names the inference endpoint { #w-sec-025 }
+
+**Fires when:** a `transport: http` capsule's [`capabilities.network.allow`](manifest.md#field-capabilities)
+has an entry that matches its [`inference.endpoint`](manifest.md#transport-http). Once per matching
+entry, on stderr, from `mur run` (including `mur run --explain-scope`) and from `mur doctor`.
+
+```text
+[capsule-runtime] warning[W-SEC-025]: capabilities.network.allow entry 'https://api.anthropic.com' names the inference endpoint; inference no longer uses it — the runtime reaches the provider itself — so the entry now only grants tools, subprocesses and the driver direct reach to that host without the key (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-025)
+```
+
+The runtime reaches the provider for the driver and attaches the key there, so inference works with
+or without the entry. The entry still grants every tool, shell subprocess and the driver direct
+access to that host, without the key. Remove it unless something other than inference needs that
+host.

@@ -191,10 +191,9 @@ into every tool artifact.
 |---|---|---|
 | `MURMUR_INFERENCE_TRANSPORT` | `inference.transport` | `process` |
 | `MURMUR_INFERENCE_MODEL` | `inference.model` | The configured model, empty when `inference.model` is omitted |
-| `MURMUR_INFERENCE_ENDPOINT` | `inference.endpoint` | Empty |
+| `MURMUR_INFERENCE_ENDPOINT` | `http://127.0.0.1:9` followed by the path of `inference.endpoint` — `https://api.moonshot.ai/v1` gives `http://127.0.0.1:9/v1`. Nothing listens there: the runtime sends the driver's requests to this address on to `inference.endpoint` with the key attached | Empty |
 | `MURMUR_INFERENCE_DRIVER` | `inference.driver.artifact` | Empty |
 | `MURMUR_INFERENCE_DRIVER_CONFIG` | `inference.driver.config` as JSON. Not set when the field is absent | Not set |
-| `MURMUR_INFERENCE_API_KEY` | `inference.api_key`. Not set when the field is absent | Not set |
 | `MURMUR_CAPSULE_NAME` | `name` from the manifest | Same |
 | `MURMUR_CAPSULE_VERSION` | `version` from the manifest | Same |
 | `MURMUR_SESSION_ID` | The session ID | Same |
@@ -213,3 +212,21 @@ reported as [`W-SEC-015`](diagnostics.md#w-sec-015) and delivers nothing.
 `transport: process` loads no driver component: `inference.endpoint`, `inference.driver` and
 `inference.api_key` are rejected in the manifest, and the agent loop spawns `inference.command`
 instead. Tool artifacts still receive the whole table.
+
+### Driver `inference_auth:` block { #inference-auth }
+
+No component receives `inference.api_key`. A driver's own `murmur.yaml` declares how its provider
+takes the key, and the runtime attaches that header to each request the driver sends to
+`MURMUR_INFERENCE_ENDPOINT`. A `transport: http` driver without a usable block refuses to start with
+[`E-RUN-025`](diagnostics.md#e-run-025).
+
+```yaml
+inference_auth:
+  header: Authorization
+  value: "Bearer {key}"
+```
+
+| Field | Type | Required | Notes |
+|---|---|---:|---|
+| `inference_auth.header` | string | yes | A valid HTTP header name. Any header of the same name the driver sets, in any case, is replaced |
+| `inference_auth.value` | string | yes | The header value. Must contain `{key}` exactly once, which is replaced by `inference.api_key`. With no `api_key`, no header is sent |

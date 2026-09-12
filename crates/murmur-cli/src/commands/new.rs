@@ -375,10 +375,6 @@ artifacts:
   - name: murmur-skill-create-manifest
     version: "0.1.1"
     runtime: skill
-capabilities:
-  network:
-    allow:
-      - "{endpoint}"
 lifecycle:
   task_acceptance: single
   after_task: exit

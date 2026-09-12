@@ -36,11 +36,6 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -67,11 +62,6 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -97,11 +87,6 @@ Compaction requires two things: `context.max_tokens` set to match your model's a
       - name: murmur-hook-compact
         version: "{{ v.murmur_hook_compact }}"
         runtime: hook
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

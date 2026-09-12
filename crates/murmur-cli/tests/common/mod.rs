@@ -114,6 +114,21 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
     capsule_runtime::skip_without_host_support(test_name)
 }
 
+/// The provider-bound `system` text: a plain string, or the concatenated `text` of the block array
+/// the anthropic driver sends when it places cache breakpoints.
+pub fn system_text(system: &serde_json::Value) -> Option<String> {
+    if let Some(text) = system.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = system.as_array()?;
+    Some(
+        blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+    )
+}
+
 pub fn fixture_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -353,6 +368,25 @@ fn stage_agent_session_inner(
 }
 
 pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: &Path) -> PathBuf {
+    // A `transport: http` capsule refuses a driver that does not say how its provider takes the key.
+    create_driver_artifact_with_auth(
+        dir,
+        name,
+        version,
+        wasm_path,
+        "inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n",
+    )
+}
+
+/// [`create_driver_artifact`] with `auth_block` appended verbatim to the bundled `murmur.yaml`
+/// (empty for none).
+pub fn create_driver_artifact_with_auth(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    wasm_path: &Path,
+    auth_block: &str,
+) -> PathBuf {
     let artifact_path = dir.join(format!("{name}-{version}.mur.zip"));
     let file = fs::File::create(&artifact_path).unwrap();
     let mut zip = ZipWriter::new(file);
@@ -363,6 +397,7 @@ pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: 
     writeln!(zip, "name: {name}").unwrap();
     writeln!(zip, "version: {version}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
+    zip.write_all(auth_block.as_bytes()).unwrap();
 
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();

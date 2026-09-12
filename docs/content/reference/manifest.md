@@ -60,7 +60,7 @@ artifacts:
 capabilities:
   network:
     allow:
-      - https://api.anthropic.com
+      - https://api.github.com  # hosts tools and shell subprocesses may reach; not needed for inference
     unix_sockets: false  # optional, defaults to false: may shell subprocesses create AF_UNIX sockets?
   peer_fetch:            # optional: peers this capsule may redeem a peer-file handle against
     allow:
@@ -950,6 +950,7 @@ is the only transport that accepts `endpoint` at all.
 
 Murmur spawns `inference.command` as a subprocess and communicates over stdin/stdout. No
 `ANTHROPIC_API_KEY` is required — authentication uses whatever the CLI is already configured with.
+Credentials under this transport are the CLI's own, and murmur neither holds nor controls them.
 The base name of `command` selects the wire protocol: `codex` speaks the codex-exec dialect,
 anything else speaks the Claude Code dialect. No WASM driver artifact is needed or staged.
 
@@ -981,6 +982,16 @@ inference:
   the host environment. If the variable is not set, `mur run` exits with an error before launch.
 
 Only `${UPPER_SNAKE_CASE}` references are expanded. Anything else is treated as a literal value.
+
+The runtime keeps the resolved key, and the driver never receives it. On each request the driver
+sends, the runtime attaches the header the driver's own
+[`inference_auth:`](default-artifacts.md#inference-auth) block declares and sends the request to
+`inference.endpoint` itself. A driver without that block refuses to start with
+[`E-RUN-025`](diagnostics.md#e-run-025). Without `api_key`, requests go out with no credential
+header.
+
+The provider does not need to be in `capabilities.network.allow`. An entry naming it is accepted
+with [`W-SEC-025`](diagnostics.md#w-sec-025), and grants direct reach to that host without the key.
 
 ### `inference.system_prompt` / `system_prompt_file` { #inference-system-prompt }
 
@@ -1144,6 +1155,9 @@ Accepted forms:
 
 A URL entry must carry no path, query or fragment, and its scheme must be `http` or `https`.
 Anything else fails with [`E-CAP-001`](diagnostics.md#e-cap-001).
+
+A `transport: http` capsule's inference requests do not consult this list, so the provider need
+not appear in it; see [`inference.api_key` resolution](#inference-api-key).
 
 ### Filesystem scope
 

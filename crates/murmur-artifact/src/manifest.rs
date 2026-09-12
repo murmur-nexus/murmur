@@ -40,6 +40,8 @@ pub enum ManifestError {
         expected: String,
         got: String,
     },
+    #[error("{}: field '{field}' {message}", MANIFEST_FILENAME)]
+    InvalidValue { field: String, message: String },
     #[error("failed to read {} at {path}: {source}", MANIFEST_FILENAME)]
     Io {
         path: String,
@@ -224,6 +226,212 @@ fn yaml_type_name(value: &Value) -> String {
         Value::Sequence(_) => "sequence".into(),
         Value::Mapping(_) => "mapping".into(),
         Value::Tagged(_) => "tagged".into(),
+    }
+}
+
+/// The substitution point for the inference credential in [`InferenceAuth::value`].
+pub const INFERENCE_AUTH_KEY_PLACEHOLDER: &str = "{key}";
+
+/// How a driver's provider expects the inference credential to be presented, from the driver's
+/// own bundled `murmur.yaml`:
+///
+/// ```yaml
+/// inference_auth:
+///   header: Authorization
+///   value: "Bearer {key}"
+/// ```
+///
+/// The runtime attaches `header` to each request the driver sends through the inference gateway,
+/// with `{key}` replaced by `inference.api_key`. Holds the template only, never a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceAuth {
+    /// A valid HTTP header name, as written. Compared case-insensitively on the wire.
+    pub header: String,
+    /// The header value template. Contains [`INFERENCE_AUTH_KEY_PLACEHOLDER`] exactly once.
+    pub value: String,
+}
+
+impl InferenceAuth {
+    /// The header value for `key`.
+    #[must_use]
+    pub fn render(&self, key: &str) -> String {
+        self.value.replacen(INFERENCE_AUTH_KEY_PLACEHOLDER, key, 1)
+    }
+}
+
+/// Reads the top-level `inference_auth:` block from a driver's bundled manifest text.
+///
+/// `Ok(None)` means the manifest has no `inference_auth` key. `Err` means the block is present
+/// and unusable: not a mapping, `header` or `value` missing or not a string, `header` not a valid
+/// HTTP header name, or `value` not containing `{key}` exactly once or carrying characters no
+/// header value may hold.
+pub fn parse_inference_auth(manifest_yaml: &str) -> Result<Option<InferenceAuth>, ManifestError> {
+    const FIELD: &str = "inference_auth";
+    let value: Value = serde_yaml::from_str(manifest_yaml).map_err(|err| {
+        ManifestError::YamlSyntax(format!("{MANIFEST_FILENAME}: YAML syntax error: {err}"))
+    })?;
+    let Some(block) = value
+        .as_mapping()
+        .and_then(|root| root.get(Value::String(FIELD.to_string())))
+    else {
+        return Ok(None);
+    };
+    let block = block
+        .as_mapping()
+        .ok_or_else(|| ManifestError::InvalidType {
+            field: FIELD.to_string(),
+            expected: "mapping".to_string(),
+            got: yaml_type_name(block),
+        })?;
+
+    let header = required_string(block, "header").map_err(|err| prefix_field(err, FIELD))?;
+    let template = required_string(block, "value").map_err(|err| prefix_field(err, FIELD))?;
+
+    if http::HeaderName::from_bytes(header.as_bytes()).is_err() {
+        return Err(ManifestError::InvalidValue {
+            field: format!("{FIELD}.header"),
+            message: format!("'{header}' is not a valid HTTP header name"),
+        });
+    }
+    let placeholders = template.matches(INFERENCE_AUTH_KEY_PLACEHOLDER).count();
+    if placeholders != 1 {
+        return Err(ManifestError::InvalidValue {
+            field: format!("{FIELD}.value"),
+            message: format!(
+                "must contain {INFERENCE_AUTH_KEY_PLACEHOLDER} exactly once (found {placeholders})"
+            ),
+        });
+    }
+    if http::HeaderValue::from_str(&template.replace(INFERENCE_AUTH_KEY_PLACEHOLDER, "")).is_err() {
+        return Err(ManifestError::InvalidValue {
+            field: format!("{FIELD}.value"),
+            message: "contains characters an HTTP header value cannot hold".to_string(),
+        });
+    }
+
+    Ok(Some(InferenceAuth {
+        header,
+        value: template,
+    }))
+}
+
+/// Names a child of `block` by its full dotted path rather than its bare key.
+fn prefix_field(err: ManifestError, block: &str) -> ManifestError {
+    match err {
+        ManifestError::MissingField { field } => ManifestError::MissingField {
+            field: format!("{block}.{field}"),
+        },
+        ManifestError::InvalidType {
+            field,
+            expected,
+            got,
+        } => ManifestError::InvalidType {
+            field: format!("{block}.{field}"),
+            expected,
+            got,
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod inference_auth_tests {
+    use super::*;
+
+    /// Each block exactly as the four shipped drivers write it, comment line included.
+    const ANTHROPIC: &str = "name: murmur-driver-anthropic\nversion: 0.1.0\nruntime: driver\n\n\
+        # How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
+        inference_auth:\n  header: x-api-key\n  value: \"{key}\"\n";
+    const BEARER: &str = "\n# How this provider expects the inference credential to be presented; the runtime substitutes {key}.\n\
+        inference_auth:\n  header: Authorization\n  value: \"Bearer {key}\"\n";
+
+    fn bearer(name: &str) -> String {
+        format!("name: {name}\nversion: 0.1.0\nruntime: driver\n{BEARER}")
+    }
+
+    #[test]
+    fn inference_auth_parses_the_anthropic_block() {
+        let auth = parse_inference_auth(ANTHROPIC).unwrap().unwrap();
+        assert_eq!(auth.header, "x-api-key");
+        assert_eq!(auth.render("sk-1"), "sk-1");
+    }
+
+    #[test]
+    fn inference_auth_parses_the_three_bearer_blocks() {
+        for driver in [
+            "murmur-driver-openai",
+            "murmur-driver-deepseek",
+            "murmur-driver-moonshotai",
+        ] {
+            let auth = parse_inference_auth(&bearer(driver)).unwrap().unwrap();
+            assert_eq!(auth.header, "Authorization", "{driver}");
+            assert_eq!(auth.render("sk-2"), "Bearer sk-2", "{driver}");
+        }
+    }
+
+    #[test]
+    fn inference_auth_absent_is_none() {
+        let yaml = "name: d\nversion: 0.1.0\nruntime: driver\n";
+        assert_eq!(parse_inference_auth(yaml).unwrap(), None);
+    }
+
+    fn refused(block: &str) -> String {
+        let yaml = format!("name: d\nversion: 0.1.0\nruntime: driver\n{block}");
+        parse_inference_auth(&yaml).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn inference_auth_refuses_each_malformed_block() {
+        let cases = [
+            (
+                "inference_auth: x-api-key\n",
+                "'inference_auth' has invalid type",
+            ),
+            ("inference_auth:\n", "'inference_auth' has invalid type"),
+            (
+                "inference_auth:\n  value: \"{key}\"\n",
+                "'inference_auth.header'",
+            ),
+            (
+                "inference_auth:\n  header: x-api-key\n",
+                "'inference_auth.value'",
+            ),
+            (
+                "inference_auth:\n  header: [x]\n  value: \"{key}\"\n",
+                "'inference_auth.header' has invalid type",
+            ),
+            (
+                "inference_auth:\n  header: x-api-key\n  value: 42\n",
+                "'inference_auth.value' has invalid type",
+            ),
+            (
+                "inference_auth:\n  header: \"bad header\"\n  value: \"{key}\"\n",
+                "not a valid HTTP header name",
+            ),
+            (
+                "inference_auth:\n  header: \"\"\n  value: \"{key}\"\n",
+                "not a valid HTTP header name",
+            ),
+            (
+                "inference_auth:\n  header: Authorization\n  value: Bearer\n",
+                "exactly once (found 0)",
+            ),
+            (
+                "inference_auth:\n  header: Authorization\n  value: \"{key}{key}\"\n",
+                "exactly once (found 2)",
+            ),
+            (
+                "inference_auth:\n  header: Authorization\n  value: \"Bearer\\n{key}\"\n",
+                "cannot hold",
+            ),
+        ];
+        for (block, expected) in cases {
+            let message = refused(block);
+            assert!(
+                message.contains(expected),
+                "{block:?}: expected {expected:?} in {message:?}"
+            );
+        }
     }
 }
 

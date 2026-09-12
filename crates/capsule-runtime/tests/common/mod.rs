@@ -116,8 +116,14 @@ pub fn publish_driver(registry_root: &Path, name: &str, version: &str, wasm_path
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
-        zip.write_all(format!("name: {name}\nversion: {version}\nruntime: driver\n").as_bytes())
-            .unwrap();
+        zip.write_all(
+            format!(
+                "name: {name}\nversion: {version}\nruntime: driver\n\
+                 inference_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         zip.start_file("tool.wasm", options).unwrap();
         zip.write_all(&std::fs::read(wasm_path).unwrap()).unwrap();
         zip.finish().unwrap();

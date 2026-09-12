@@ -803,6 +803,7 @@ async fn call_stage_once(
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
+            inference_gateway: None,
         },
     };
     let mut store = Store::new(engine, state);
@@ -1577,6 +1578,7 @@ async fn instantiate_hook(
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: staged.grant.network_allow_rules.clone(),
+            inference_gateway: None,
         },
     };
     let mut store = Store::new(engine, state);
@@ -3417,6 +3419,7 @@ mod tests {
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
+            inference_gateway: None,
             records: std::sync::Mutex::new(Vec::new()),
         });
 
@@ -4358,6 +4361,7 @@ mod tests {
             http: WasiHttpCtx::new(),
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: grant.network_allow_rules.clone(),
+                inference_gateway: None,
             },
         }
     }

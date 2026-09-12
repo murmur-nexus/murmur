@@ -352,7 +352,11 @@ fn publish_driver(registry_root: &Path) {
             .compression_method(zip::CompressionMethod::Deflated);
         zip.start_file("murmur.yaml", options).unwrap();
         zip.write_all(
-            format!("name: {DRIVER}\nversion: {DRIVER_VERSION}\nruntime: driver\n").as_bytes(),
+            format!(
+                "name: {DRIVER}\nversion: {DRIVER_VERSION}\nruntime: driver\n\
+                 inference_auth:\n  header: x-api-key\n  value: \"{{key}}\"\n"
+            )
+            .as_bytes(),
         )
         .unwrap();
         zip.start_file("tool.wasm", options).unwrap();
