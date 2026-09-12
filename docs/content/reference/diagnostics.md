@@ -366,13 +366,13 @@ To reach a capsule by address rather than by name, pass `--url <host:port>`.
 The address named a capsule whose process is alive, and the capsule's agent card did not come back:
 
 ```text
-error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsule did not answer at localhost:41235: nothing answered at localhost:41235: Connection refused
+error[E-RUN-023]: ses_019f01a940ce7761854e768ecbe3d399 is running but its capsule did not answer at localhost:41235: failed to connect to localhost:41235: Connection refused (os error 111)
   hint: the process holding the door is alive — it may be mid-turn; its record is kept
 ```
 
-This is deliberately not `E-RUN-022`. The process is genuinely running, so the record still names
-something real and is kept: a capsule that was slow to answer must not lose the only handle anyone
-has on it. Try again, or read what the session is doing with
+`E-RUN-022` removes the record; this one keeps it. The process is genuinely running, so the record
+still names something real, and a capsule that was slow to answer must not lose the only handle
+anyone has on it. Try again, or read what the session is doing with
 [`mur trace show`](cli.md#mur-trace-show) in its workdir.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }

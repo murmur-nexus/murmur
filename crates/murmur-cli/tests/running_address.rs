@@ -2,10 +2,10 @@
 //! makes it possible.
 //!
 //! Most cases start the capsule as its own `mur run` process rather than in this one. That is the
-//! shape the slice is about — a capsule whose URL scrolled past in a terminal nobody has any more
-//! — and it is the only shape a case can `SIGKILL`, give a controlling terminal, or deny a
-//! writable home without doing the same to the test binary. Each such case gets its own scratch
-//! `HOME`, so an ordinal in one case never counts another case's capsule.
+//! shape under test — a capsule whose URL scrolled past in a terminal nobody has any more — and it
+//! is the only shape a case can `SIGKILL`, give a controlling terminal, or deny a writable home
+//! without doing the same to the test binary. Each such case gets its own scratch `HOME`, so an
+//! ordinal in one case never counts another case's capsule.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -40,7 +40,7 @@ const DRIVER_VERSION: &str = "0.1.4";
 const MARKER_ENV: &str = "MURMUR_TEST_MARKER";
 const MARKER_VALUE: &str = "marker-4f19bd0c-must-not-be-recorded";
 const API_KEY_ENV: &str = "MURMUR_TEST_API_KEY";
-const API_KEY_VALUE: &str = "sk-test-3d84f207-must-not-be-recorded";
+const API_KEY_VALUE: &str = "sk-test-8b1f24ce-must-not-be-recorded";
 
 // ── Scripted provider responses ───────────────────────────────────────────────
 
@@ -75,8 +75,8 @@ fn tool_call_response(id: &str, tool_use_id: &str, name: &str, input: Value) -> 
 
 /// A scratch `$HOME` with the fixture inference driver published into it.
 ///
-/// One per case: every record this slice is about lands under `$HOME/.murmur/running/`, and a home
-/// shared between cases would mean `@1` naming whichever capsule another case happened to start.
+/// One per case: every record lands under `$HOME/.murmur/running/`, and a home shared between
+/// cases would mean `@1` naming whichever capsule another case happened to start.
 fn driver_home() -> Arc<TempDir> {
     let home = tempfile::tempdir().unwrap();
     let artifacts = tempfile::tempdir().unwrap();

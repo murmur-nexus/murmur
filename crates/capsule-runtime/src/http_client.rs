@@ -47,6 +47,22 @@ pub(crate) fn http_json_with_timeout(
     extra_headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<Value, String> {
+    http_json_with_timeouts(method, url, body, extra_headers, timeout, timeout)
+}
+
+/// [`http_json_with_timeout`] with the connect deadline named apart from the read and write one.
+///
+/// For a caller that wants to give up quickly on an address nothing holds while still allowing a
+/// process that answered to take its time: the two deadlines then say different things, "is
+/// anything there" and "is it still able to reply".
+pub(crate) fn http_json_with_timeouts(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Result<Value, String> {
     let url = Url::parse(url).map_err(|error| format!("invalid URL '{url}': {error}"))?;
     if url.scheme() != "http" {
         return Err(format!("unsupported URL scheme '{}'", url.scheme()));
@@ -55,12 +71,12 @@ pub(crate) fn http_json_with_timeout(
         .host_str()
         .ok_or_else(|| format!("URL '{url}' has no host"))?;
     let port = url.port_or_known_default().unwrap_or(80);
-    let mut stream = connect_within(host, port, timeout)?;
+    let mut stream = connect_within(host, port, connect_timeout)?;
     stream
-        .set_read_timeout(Some(timeout))
+        .set_read_timeout(Some(io_timeout))
         .map_err(|error| error.to_string())?;
     stream
-        .set_write_timeout(Some(timeout))
+        .set_write_timeout(Some(io_timeout))
         .map_err(|error| error.to_string())?;
 
     let path = match url.query() {

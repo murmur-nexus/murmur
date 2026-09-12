@@ -22,9 +22,6 @@
 //! on the machine that can read it.
 
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -40,10 +37,12 @@ const RUNNING_DIR_MODE: u32 = 0o700;
 /// Mode held on each record file.
 const RECORD_FILE_MODE: u32 = 0o600;
 
-/// How long the door probe waits for a TCP connection.
+/// How long the door probe waits for a TCP connection: long enough for a loopback accept, short
+/// enough that an address nothing holds is reported rather than waited on.
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long the door probe waits for the agent card once connected.
+/// How long the door probe waits for the agent card once connected. Longer than the connect
+/// deadline: a capsule mid-turn has answered, and is allowed to be slow about the rest.
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where one running session's door is, and which process holds it.
@@ -196,41 +195,13 @@ impl RunningGuard {
         let body = serde_json::to_vec_pretty(record)
             .map_err(|err| format!("the record could not be serialized: {err}"))?;
 
-        // Written beside the record and renamed onto it, because a reader prunes what it cannot
+        // Staged beside the record and renamed onto it, because a reader prunes what it cannot
         // parse: a reader landing between the create and the write would otherwise unlink a
-        // record that was about to be complete. The staging name does not end in `.json`, so it
-        // is not a candidate for that read either.
-        let staging = dir.join(format!(
-            "{}.json.writing-{}",
-            record.session_id,
-            std::process::id()
-        ));
-        let write = || -> Result<(), String> {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(RECORD_FILE_MODE)
-                .open(&staging)
-                .map_err(|err| format!("failed to create {}: {err}", staging.display()))?;
-            file.write_all(&body)
-                .map_err(|err| format!("failed to write {}: {err}", staging.display()))?;
-            // Applied whether or not this call created the file, on the same terms the directory
-            // mode is: an earlier umask or a stray `chmod` must not leave a record readable to
-            // anyone but its owner.
-            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(RECORD_FILE_MODE))
-                .map_err(|err| format!("failed to set mode on {}: {err}", staging.display()))?;
-            std::fs::rename(&staging, &path)
-                .map_err(|err| format!("failed to place {}: {err}", path.display()))
-        };
-
-        match write() {
-            Ok(()) => Ok(Self { path }),
-            Err(reason) => {
-                let _ = std::fs::remove_file(&staging);
-                Err(reason)
-            }
-        }
+        // record that was about to be complete.
+        crate::retention::StagedRewrite::stage_with_mode(&path, &body, Some(RECORD_FILE_MODE))
+            .and_then(crate::retention::StagedRewrite::commit)
+            .map_err(|reason| format!("failed to write {}: {reason}", path.display()))?;
+        Ok(Self { path })
     }
 }
 
@@ -290,10 +261,15 @@ mod platform {
     ///
     /// The second field is the executable name in parentheses and may itself contain spaces and
     /// parentheses, so the split starts after its last `)`: the remainder begins at field 3.
+    /// Field 22, counted from the field after the executable name, which is field 3.
+    const STARTTIME_OFFSET_AFTER_COMM: usize = 22 - 3;
+
     pub(super) fn process_start_token(pid: u32) -> Option<String> {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let tail = &stat[stat.rfind(')')? + 1..];
-        tail.split_whitespace().nth(19).map(str::to_string)
+        tail.split_whitespace()
+            .nth(STARTTIME_OFFSET_AFTER_COMM)
+            .map(str::to_string)
     }
 }
 
@@ -308,6 +284,9 @@ mod platform {
             libc::KERN_PROC_PID,
             pid as libc::c_int,
         ];
+        // SAFETY: `kinfo_proc` is a plain C struct of integers, pointers and nested structs with
+        // no niche and no validity invariant, so an all-zero value is a valid one. It is
+        // overwritten by the `sysctl` below before anything reads it.
         let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<libc::kinfo_proc>();
 
@@ -334,63 +313,22 @@ mod platform {
 }
 
 /// Layer 3: the session id the door at `url` claims on its agent card.
-///
-/// A hand-rolled blocking `GET`, deliberately not a tokio client: the CLI reads records outside
-/// any runtime.
 fn probe_session_id(url: &str) -> Result<String, String> {
     let addr = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let socket = addr
-        .to_socket_addrs()
-        .map_err(|err| format!("{addr} could not be resolved: {err}"))?
-        .next()
-        .ok_or_else(|| format!("{addr} resolves to no address"))?;
-
-    let stream = TcpStream::connect_timeout(&socket, PROBE_CONNECT_TIMEOUT)
-        .map_err(|err| format!("nothing answered at {addr}: {err}"))?;
-    stream.set_read_timeout(Some(PROBE_READ_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(PROBE_READ_TIMEOUT)).ok();
-
-    let request = format!(
-        "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
-    );
-    (&stream)
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("the agent card could not be requested from {addr}: {err}"))?;
-
-    let mut reader = BufReader::new(&stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|err| format!("{addr} sent no reply: {err}"))?;
-    if !status_line.contains("200") {
-        return Err(format!(
-            "{addr} answered the agent-card request with {}",
-            status_line.trim()
-        ));
-    }
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-    let mut body = String::new();
-    reader
-        .read_to_string(&mut body)
-        .map_err(|err| format!("the agent card from {addr} could not be read: {err}"))?;
-
-    serde_json::from_str::<serde_json::Value>(&body)
-        .map_err(|err| format!("the agent card from {addr} is not JSON: {err}"))?
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("the agent card from {addr} names no session"))
+    crate::http_client::http_json_with_timeouts(
+        "GET",
+        &format!("http://{addr}/.well-known/agent-card.json"),
+        None,
+        &[("Accept", "application/json")],
+        PROBE_CONNECT_TIMEOUT,
+        PROBE_READ_TIMEOUT,
+    )?
+    .get("session_id")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_string)
+    .ok_or_else(|| format!("the agent card from {addr} names no session"))
 }
 
 #[cfg(test)]

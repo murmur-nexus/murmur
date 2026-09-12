@@ -409,15 +409,15 @@ fn cancel_arguments(
     session: Option<String>,
     task_id: Option<String>,
     url: Option<String>,
-) -> (Result<live_address::Target, error::CliError>, String) {
+) -> Result<(live_address::Target, String), error::CliError> {
     match (url, session, task_id) {
-        (Some(url), Some(task_id), None) => (Ok(live_address::Target::Url(url)), task_id),
+        (Some(url), Some(task_id), None) => Ok((live_address::Target::Url(url), task_id)),
         (Some(_), _, _) => cancel_usage_error(
             "--url names the capsule, so the task id is the only positional: \
              mur cancel --url <HOST:PORT> <TASK_ID>",
         ),
         (None, Some(session), Some(task_id)) => {
-            (live_address::target(Some(&session), None), task_id)
+            Ok((live_address::target(Some(&session), None)?, task_id))
         }
         (None, _, _) => cancel_usage_error(
             "mur cancel names a running session and the task to stop: mur cancel <SESSION> <TASK_ID>",
@@ -425,8 +425,14 @@ fn cancel_arguments(
     }
 }
 
+/// Renders `message` off the `cancel` subcommand so the usage line under it is `mur cancel`'s own.
+/// A freshly built [`Cli::command`] has no `bin_name`, and would print the crate name instead.
 fn cancel_usage_error(message: &str) -> ! {
-    Cli::command()
+    let mut root = Cli::command().bin_name("mur");
+    root.build();
+    root.find_subcommand_mut("cancel")
+        .expect("cancel is a subcommand")
+        .clone()
         .error(clap::error::ErrorKind::MissingRequiredArgument, message)
         .exit()
 }
@@ -638,10 +644,8 @@ fn main() {
             session,
             task_id,
             url,
-        } => {
-            let (target, task_id) = cancel_arguments(session, task_id, url);
-            target.and_then(|target| run_cancel(&target, &task_id))
-        }
+        } => cancel_arguments(session, task_id, url)
+            .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy {
             host,
