@@ -15,13 +15,13 @@ use capsule_runtime::ResumeMode;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 #[cfg(feature = "beta-mur-deploy")]
-use commands::deploy::run_deploy;
+use commands::deploy::{run_deploy, DeployCommand};
+#[cfg(feature = "beta-mur-deploy")]
+use commands::deploy_ls::run_deploy_ls;
 #[cfg(feature = "beta-mur-deploy")]
 use commands::destroy::run_destroy;
 #[cfg(feature = "beta-mur-new")]
 use commands::new::run_new;
-#[cfg(feature = "beta-mur-deploy")]
-use commands::ps::run_ps;
 #[cfg(feature = "beta-mur-topology")]
 use commands::topology::{run_topology, TopologyArgs};
 use commands::{
@@ -334,59 +334,17 @@ enum Commands {
         url: Option<String>,
     },
     #[cfg(feature = "beta-mur-deploy")]
-    /// Upload a capsule to an existing VM and start it
+    /// Deploy capsules to VMs and list what is deployed
     Deploy {
-        /// IP address or hostname of the target VM (must already exist)
-        #[arg(long)]
-        host: String,
-
-        /// SSH user on the target VM (default: root)
-        #[arg(long, default_value = "root")]
-        ssh_user: String,
-
-        /// Path to SSH private key; uses SSH agent / default keys if omitted
-        #[arg(long)]
-        ssh_key: Option<std::path::PathBuf>,
-
-        /// Path to murmur.yaml
-        #[arg(long, default_value = "./murmur.yaml")]
-        manifest: std::path::PathBuf,
-
-        /// Local workdir to upload into the capsule's working directory
-        #[arg(long)]
-        workdir: Option<std::path::PathBuf>,
-
-        /// Path to a pre-built mur binary for the target platform. If omitted, the version
-        /// from manifest.mur_version (or the running mur version) is downloaded from GitHub
-        /// releases and cached at ~/.murmur/bin/mur-{version}-{platform}.
-        #[arg(long)]
-        mur_binary: Option<std::path::PathBuf>,
-
-        /// Environment variables for mur run on the remote VM: --env KEY=VALUE (repeatable).
-        /// If neither --env nor --env-file is passed, .env in the manifest directory is
-        /// loaded automatically when it exists.
-        #[arg(long = "env", value_name = "KEY=VALUE")]
-        env_vars: Vec<String>,
-
-        /// Path to a .env file with KEY=VALUE entries (one per line, # comments ignored).
-        /// Takes precedence over auto-detection of .env in the manifest directory.
-        #[arg(long, value_name = "PATH")]
-        env_file: Option<std::path::PathBuf>,
-
-        /// Target platform for artifact resolution (default: linux-x86_64).
-        /// Artifacts are pulled and staged for this platform before deploying.
-        #[arg(long, default_value = "linux-x86_64")]
-        deploy_platform: String,
+        #[command(subcommand)]
+        command: DeployCommand,
     },
     #[cfg(feature = "beta-mur-deploy")]
     /// Terminate a deployed capsule VM and remove it from the deployment list
     Destroy {
-        /// Deployment ID returned by `mur deploy`; a unique prefix is enough
+        /// Deployment ID returned by `mur deploy run`; a unique prefix is enough
         deployment_id: String,
     },
-    #[cfg(feature = "beta-mur-deploy")]
-    /// List all deployed capsules
-    Ps,
     /// Manage opt-in beta features
     Beta {
         #[command(subcommand)]
@@ -470,7 +428,6 @@ fn main() {
     if !beta_config.is_enabled("mur-deploy") {
         cmd = cmd.mut_subcommand("deploy", |sc| sc.hide(true));
         cmd = cmd.mut_subcommand("destroy", |sc| sc.hide(true));
-        cmd = cmd.mut_subcommand("ps", |sc| sc.hide(true));
     }
     #[cfg(feature = "beta-mur-topology")]
     if !beta_config.is_enabled("mur-topology") {
@@ -647,17 +604,7 @@ fn main() {
         } => cancel_arguments(session, task_id, url)
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
         #[cfg(feature = "beta-mur-deploy")]
-        Commands::Deploy {
-            host,
-            ssh_user,
-            ssh_key,
-            manifest,
-            workdir,
-            mur_binary,
-            env_vars,
-            env_file,
-            deploy_platform,
-        } => {
+        Commands::Deploy { command } => {
             if !beta_config.is_enabled("mur-deploy") {
                 eprintln!(
                     "error: unrecognized subcommand 'deploy'\n\n\
@@ -665,17 +612,30 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            run_deploy(
-                &host,
-                ssh_key.as_deref(),
-                &ssh_user,
-                &manifest,
-                workdir.as_deref(),
-                mur_binary.as_deref(),
-                &env_vars,
-                env_file.as_deref(),
-                &deploy_platform,
-            )
+            match command {
+                DeployCommand::Run {
+                    host,
+                    ssh_user,
+                    ssh_key,
+                    manifest,
+                    workdir,
+                    mur_binary,
+                    env_vars,
+                    env_file,
+                    deploy_platform,
+                } => run_deploy(
+                    &host,
+                    ssh_key.as_deref(),
+                    &ssh_user,
+                    &manifest,
+                    workdir.as_deref(),
+                    mur_binary.as_deref(),
+                    &env_vars,
+                    env_file.as_deref(),
+                    &deploy_platform,
+                ),
+                DeployCommand::Ls => run_deploy_ls(),
+            }
         }
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Destroy { deployment_id } => {
@@ -687,17 +647,6 @@ fn main() {
                 std::process::exit(1);
             }
             run_destroy(&deployment_id)
-        }
-        #[cfg(feature = "beta-mur-deploy")]
-        Commands::Ps => {
-            if !beta_config.is_enabled("mur-deploy") {
-                eprintln!(
-                    "error: unrecognized subcommand 'ps'\n\n\
-                     For more information, try '--help'."
-                );
-                std::process::exit(1);
-            }
-            run_ps()
         }
         Commands::Beta { command } => run_beta(&command),
         Commands::Config { command } => run_config(&command),

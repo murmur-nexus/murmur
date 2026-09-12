@@ -6,6 +6,8 @@ pub(crate) mod conversation;
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod deploy;
 #[cfg(feature = "beta-mur-deploy")]
+pub(crate) mod deploy_ls;
+#[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod deploy_state;
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) mod destroy;
@@ -15,8 +17,6 @@ pub(crate) mod install;
 pub(crate) mod list;
 #[cfg(feature = "beta-mur-new")]
 pub(crate) mod new;
-#[cfg(feature = "beta-mur-deploy")]
-pub(crate) mod ps;
 pub(crate) mod publish;
 pub(crate) mod run;
 pub(crate) mod search;

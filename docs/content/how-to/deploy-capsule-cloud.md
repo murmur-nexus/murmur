@@ -3,11 +3,11 @@
 !!! warning "Beta feature"
 
     `mur deploy` is a beta feature and is hidden by default. Enable it first with
-    `mur beta enable deploy`. The same flag also enables its teardown counterpart,
-    `mur destroy` (used below) — both are gated together. Behavior and flags may
-    change in future releases.
+    `mur beta enable deploy`. The same flag also enables `mur deploy ls` and the
+    teardown counterpart `mur destroy` (both used below) — they are gated together.
+    Behavior and flags may change in future releases.
 
-`mur deploy` uploads your capsule files to an existing VM via SSH, starts the capsule, and returns a public A2A endpoint. You create and manage the VM through your cloud provider's dashboard — `mur deploy` never provisions or terminates VMs on your behalf.
+`mur deploy run` uploads your capsule files to an existing VM via SSH, starts the capsule, and returns a public A2A endpoint. You create and manage the VM through your cloud provider's dashboard — `mur deploy run` never provisions or terminates VMs on your behalf.
 
 The relevant manifest options are:
 
@@ -66,7 +66,7 @@ inference:
     artifact: murmur-driver-anthropic
 ```
 
-When `mur_version` is set, `mur deploy` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
+When `mur_version` is set, `mur deploy run` downloads that exact binary from GitHub releases and caches it at `~/.murmur/bin/mur-{version}-linux-x86_64`. Subsequent deploys with the same version skip the download entirely.
 
 If `mur_version` is omitted, the version of the `mur` binary currently running on your machine is used instead.
 
@@ -75,13 +75,13 @@ If `mur_version` is omitted, the version of the `mur` binary currently running o
 ## Step 3 — deploy
 
 ```bash
-mur deploy \
+mur deploy run \
   --host 1.2.3.4 \
   --manifest ./murmur.yaml \
   --env ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`mur deploy` shows every step upfront as pending `·` before any work starts.
+`mur deploy run` shows every step upfront as pending `·` before any work starts.
 Steps use a two-level hierarchy: the group header at level 1, individual items indented at level 2.
 When a group finishes, the level-2 items collapse — only the checkmarked summary stays.
 
@@ -133,7 +133,7 @@ After each group completes, level-2 items collapse. SSH disappears when the firs
   └──────────────────────────────────────────┘
 ```
 
-All output goes to **stderr**. Save the deployment ID from the box — you will need it for `mur ps` and `mur destroy`.
+All output goes to **stderr**. Save the deployment ID from the box — you will need it for `mur deploy ls` and `mur destroy`.
 
 ### All flags
 
@@ -149,7 +149,7 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 | `--workdir` | *(none)* | Local directory to upload as the capsule working directory |
 | `--deploy-platform` | `linux-x86_64` | Target platform for artifact resolution and staging |
 
-### What `mur deploy` does
+### What `mur deploy run` does
 
 1. Parses the manifest and resolves every declared artifact for the target platform — fails immediately if any artifact is unavailable, before touching the network. A native artifact installed for this host is not reused for a different target: the target platform's payload is downloaded and cached beside it
 2. Checks that every file referenced by the manifest (e.g. `inference.system_prompt_file`) exists locally — fails immediately if any file is missing
@@ -163,13 +163,13 @@ All output goes to **stderr**. Save the deployment ID from the box — you will 
 10. Sources `/root/mur-{short_id}/.env` (if present) and starts `mur run --manifest <path> --json`; waits up to 120 seconds for startup
 11. Appends the deployment record to `~/.murmur/deployments.json`
 
-Steps 1–4 all run locally before any SSH connection. A bad manifest, missing artifact, missing file, or malformed `--env` entry causes `mur deploy` to exit with a clear error message and no VM interaction.
+Steps 1–4 all run locally before any SSH connection. A bad manifest, missing artifact, missing file, or malformed `--env` entry causes `mur deploy run` to exit with a clear error message and no VM interaction.
 
 ---
 
 ## Step 4 — verify the agent card
 
-Once `mur deploy` returns, the capsule's A2A endpoint is publicly reachable. Confirm it is alive by fetching the agent card:
+Once `mur deploy run` returns, the capsule's A2A endpoint is publicly reachable. Confirm it is alive by fetching the agent card:
 
 ```bash
 curl http://1.2.3.4:9000/.well-known/agent-card.json
@@ -224,13 +224,13 @@ For a capsule to accept incoming tasks it must have `lifecycle.task_acceptance: 
 ## Step 6 — list deployments
 
 ```bash
-mur ps
+mur deploy ls
 ```
 
 ```text
-DEPLOYMENT_ID                           PROVIDER    IP            STATUS      URL
+DEPLOYMENT_ID                           PROVIDER      REGION        STATUS      URL
 ----------------------------------------------------------------------------------------------------
-dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c  manual      1.2.3.4       running     http://1.2.3.4:9000
+dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b    manual                      running     http://1.2.3.4:9000
 ```
 
 All active deployments are stored in `~/.murmur/deployments.json`. Each row maps to one entry.
@@ -242,7 +242,7 @@ All active deployments are stored in `~/.murmur/deployments.json`. Each row maps
 When you no longer need a deployment, remove it from the tracking list:
 
 ```bash
-mur destroy dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b8c
+mur destroy dep_01954a3b5c7d8e9f0a1b2c3d4e5f6a7b
 ```
 
 This removes the entry from `~/.murmur/deployments.json`. It does not stop or delete the VM — shut down the VM from your cloud provider's dashboard separately.
@@ -264,7 +264,7 @@ inference:
     artifact: murmur-driver-anthropic
 ```
 
-`mur deploy` automatically detects `instructions.md` as a referenced local file, verifies it exists before attempting any SSH connection, and uploads it alongside the manifest to the remote deploy directory. No additional flags required.
+`mur deploy run` automatically detects `instructions.md` as a referenced local file, verifies it exists before attempting any SSH connection, and uploads it alongside the manifest to the remote deploy directory. No additional flags required.
 
 ---
 
@@ -273,7 +273,7 @@ inference:
 Use `--env KEY=VALUE` to inject runtime secrets — API keys, tokens, database URLs — into the capsule's environment on the VM. Pass one flag per variable:
 
 ```bash
-mur deploy \
+mur deploy run \
   --host 1.2.3.4 \
   --manifest ./murmur.yaml \
   --env ANTHROPIC_API_KEY=sk-ant-... \
@@ -283,10 +283,10 @@ mur deploy \
 Or point to a `.env` file with `--env-file`:
 
 ```bash
-mur deploy --host 1.2.3.4 --env-file ./secrets.env
+mur deploy run --host 1.2.3.4 --env-file ./secrets.env
 ```
 
-If neither `--env` nor `--env-file` is provided, `mur deploy` looks for a `.env` file in the same directory as the manifest and loads it automatically when found. This means running `mur deploy --host 1.2.3.4` from a project folder that has a `.env` file works with no extra flags.
+If neither `--env` nor `--env-file` is provided, `mur deploy run` looks for a `.env` file in the same directory as the manifest and loads it automatically when found. This means running `mur deploy run --host 1.2.3.4` from a project folder that has a `.env` file works with no extra flags.
 
 Both `KEY=VALUE` and `export KEY=VALUE` formats are accepted; the `export ` prefix is stripped automatically.
 
@@ -304,18 +304,18 @@ inference:
 
 When the capsule starts, `mur run` reads `ANTHROPIC_API_KEY` from its environment and substitutes it wherever `${ANTHROPIC_API_KEY}` appears in the manifest. If the variable is not set, `mur run` exits with `E-MAN-003`.
 
-`mur deploy` writes all `--env` values to `/root/mur-{short_id}/.env` on the VM with mode `600` and sources that file before starting `mur run`. Values are transferred using base64 encoding, so values that contain spaces, equals signs, newlines, or shell metacharacters are preserved exactly. When no `--env` flags are passed, no `.env` file is written.
+`mur deploy run` writes all `--env` values to `/root/mur-{short_id}/.env` on the VM with mode `600` and sources that file before starting `mur run`. Values are transferred using base64 encoding, so values that contain spaces, equals signs, newlines, or shell metacharacters are preserved exactly. When no `--env` flags are passed, no `.env` file is written.
 
-Every `--env` entry is validated before any SSH connection is made. An entry with no `=` or an empty key causes `mur deploy` to exit immediately with an error.
+Every `--env` entry is validated before any SSH connection is made. An entry with no `=` or an empty key causes `mur deploy run` to exit immediately with an error.
 
 ---
 
 ## Reference: using a pre-built binary
 
-If you have already built a Linux `mur` binary — for example, on a CI server — pass it directly instead of letting `mur deploy` download one:
+If you have already built a Linux `mur` binary — for example, on a CI server — pass it directly instead of letting `mur deploy run` download one:
 
 ```bash
-mur deploy \
+mur deploy run \
   --host 1.2.3.4 \
   --manifest ./murmur.yaml \
   --mur-binary ./target/x86_64-unknown-linux-musl/release/mur
@@ -339,10 +339,10 @@ CARGO_PROFILE_DEV_DEBUG=0 cargo build --release \
 
 | Feature | Detail |
 |---|---|
-| Command | `mur deploy --host <IP> --manifest <path>` |
+| Command | `mur deploy run --host <IP> --manifest <path>` |
 | Progress | All steps shown upfront as pending; each activates in turn; artifact downloads show bytes/total bar; artifact uploads run in parallel (stderr) |
 | Output | Success summary box on **stderr** showing url, deployment id (`dep_` prefix + 8 hex chars), and elapsed time |
-| VM management | You create and delete VMs through your cloud provider; `mur deploy` never provisions or terminates VMs |
+| VM management | You create and delete VMs through your cloud provider; `mur deploy run` never provisions or terminates VMs |
 | Recommended OS | Ubuntu 22.04 LTS or 24.04 LTS |
 | mur binary | Auto-downloaded from GitHub releases; pin with `mur_version` in the manifest |
 | Manifest files | `inference.system_prompt_file` and any other referenced local files are uploaded automatically |
@@ -352,4 +352,4 @@ CARGO_PROFILE_DEV_DEBUG=0 cargo build --release \
 | State file | `~/.murmur/deployments.json` — appended on deploy, entry removed on `mur destroy` |
 | Health check | `GET {url}/.well-known/agent-card.json` returns 200 when the capsule is alive |
 | Tear down | `mur destroy <deployment_id>` removes the tracking entry; delete the VM from your provider dashboard |
-| List | `mur ps` — reads `~/.murmur/deployments.json` |
+| List | `mur deploy ls` — reads `~/.murmur/deployments.json` |

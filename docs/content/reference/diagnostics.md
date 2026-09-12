@@ -31,10 +31,10 @@ section that explains it.
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
 | `E-CFG-001` | No inference provider configured and wizard cannot run in non-interactive mode | [`mur new`](cli.md#mur-new) |
 | `E-CFG-002` | `mur config set` given an unsupported dotted key | [`mur config`](cli.md#mur-config) |
-| `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy`](cli.md#mur-deploy) |
-| `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy`](cli.md#mur-deploy) |
-| `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy`](cli.md#mur-deploy) |
-| `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub | [`mur deploy`](cli.md#mur-deploy) |
+| `E-DEPLOY-001` | No `--host` given, or an `--env` value is not `KEY=VALUE` | [`mur deploy run`](cli.md#mur-deploy-run) |
+| `E-DEPLOY-003` | SSH connection or remote command failed | [`mur deploy run`](cli.md#mur-deploy-run) |
+| `E-DEPLOY-004` | Capsule did not emit usable startup JSON within 120s | [`mur deploy run`](cli.md#mur-deploy-run) |
+| `E-DEPLOY-006` | The pinned `mur` release could not be fetched from GitHub | [`mur deploy run`](cli.md#mur-deploy-run) |
 | `E-EVAL-001` | Eval file parse error (malformed JSON, unknown `record_type`, missing required field); message includes `:line:` number | [`eval.jsonl` schema](observability-schemas.md#structured-evaluation-evaljsonl) |
 | `E-EVAL-002` | No eval file found for the session named on the command line | [`mur eval`](cli.md#mur-eval) |
 | `E-IO-001` | File or directory not found | — |
