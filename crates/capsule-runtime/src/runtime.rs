@@ -3177,10 +3177,10 @@ fn secret_shaped_env_grant_message(grant: &SecretShapedEnvGrant) -> String {
 /// capsule was handed a host secret murmur does not broker.
 ///
 /// `capabilities.env.allow` is the one grant whose value murmur never sees, issues or revokes: an
-/// operator names a host variable and the runtime passes it through. Nothing said so in either
-/// direction — a name that survives the credential backstop reached every WASM guest silently, and
-/// a name the backstop dropped delivered nothing just as silently — so an operator with a thousand
-/// capsules had no way to ask which of them holds what.
+/// operator names a host variable and the runtime passes it through. Without this line nothing
+/// states either outcome — that a name surviving the credential backstop reaches every WASM guest,
+/// or that a name the backstop drops delivers nothing — so an operator cannot ask which of their
+/// capsules holds what, or tell a working grant from an inert one.
 ///
 /// Never a refusal, including for the `after_task: sleep` combination: a long-lived worker holding
 /// an operator-granted database password is an ordinary shape, and refusing it would make that

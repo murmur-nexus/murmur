@@ -22,6 +22,15 @@ fn project(dir: &Path, manifest: &str) {
 /// `--explain-scope` returns ahead of every side effect, so these need no installed artifact and
 /// no registry.
 fn explain_scope_stderr(home: &TempDir, project_dir: &Path, extra_args: &[&str]) -> String {
+    explain_scope_stderr_with_env(home, project_dir, extra_args, &[])
+}
+
+fn explain_scope_stderr_with_env(
+    home: &TempDir,
+    project_dir: &Path,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+) -> String {
     let mut command = Command::cargo_bin("mur").unwrap();
     command
         .env("HOME", home.path())
@@ -29,6 +38,9 @@ fn explain_scope_stderr(home: &TempDir, project_dir: &Path, extra_args: &[&str])
         .current_dir(project_dir)
         .args(["run", "--manifest", "murmur.yaml", "--explain-scope"])
         .args(extra_args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
     let output = command.assert().success().get_output().stderr.clone();
     String::from_utf8(output).unwrap()
 }
@@ -66,7 +78,13 @@ fn a_held_secret_is_named_once_with_its_doc_link() {
          - DATABASE_PASSWORD\n",
     );
 
-    let stderr = explain_scope_stderr(&home, dir.path(), &[]);
+    // The host holds the variable, so a line that echoed the value would be caught below.
+    let stderr = explain_scope_stderr_with_env(
+        &home,
+        dir.path(),
+        &[],
+        &[("DATABASE_PASSWORD", "hunter2hunter2")],
+    );
     let lines = warning_lines(&stderr);
 
     assert_eq!(lines.len(), 1, "stderr was: {stderr}");
@@ -151,14 +169,12 @@ fn a_name_the_backstop_drops_is_reported_as_delivering_nothing() {
         "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      - GITHUB_TOKEN\n",
     );
 
-    let mut command = Command::cargo_bin("mur").unwrap();
-    command
-        .env("HOME", home.path())
-        .env_remove("NEXUS_API_KEY")
-        .env("GITHUB_TOKEN", "a-real-looking-token")
-        .current_dir(dir.path())
-        .args(["run", "--manifest", "murmur.yaml", "--explain-scope"]);
-    let stderr = String::from_utf8(command.assert().success().get_output().stderr.clone()).unwrap();
+    let stderr = explain_scope_stderr_with_env(
+        &home,
+        dir.path(),
+        &[],
+        &[("GITHUB_TOKEN", "a-real-looking-token")],
+    );
     let lines = warning_lines(&stderr);
 
     assert_eq!(lines.len(), 1, "stderr was: {stderr}");

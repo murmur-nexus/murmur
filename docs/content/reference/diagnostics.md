@@ -1767,8 +1767,14 @@ credential-shaped — its name contains `api_key`, `token`, `secret` or `passwor
 per distinct entry, in declaration order, on stderr, from `mur run` (including
 `mur run --explain-scope`) and from `mur doctor` in identical words.
 
-Which of two lines you get depends on whether the credential backstop drops the name. A name it
-keeps reaches every WASM guest the capsule runs:
+Which of the two lines you get depends on whether the credential backstop drops the name:
+
+| The backstop | What the capsule gets | Names it applies to |
+|---|---|---|
+| keeps the name | Every WASM guest the capsule runs observes the host's value | Credential-shaped names the backstop's patterns do not cover: `DATABASE_PASSWORD`, `SLACK_BOT_TOKEN`, `JWT_SECRET` |
+| drops the name | Nothing — the entry is inert and no guest sees a value | Names matching [the backstop's patterns](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) — `GITHUB_TOKEN`, `AWS_*`, `*_API_KEY` among them — or a [`capabilities.shell.strip_env`](manifest.md#field-capabilities) pattern the manifest declared |
+
+A name the backstop keeps:
 
 ```text
 [capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it: for as long as the capsule runs, the capsule holds it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
@@ -1782,38 +1788,29 @@ launched it is gone:
 [capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: sleep keeps this capsule alive past the task that launched it, so it holds that value with nothing left waiting on it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
 ```
 
-A name the backstop drops — one of its own patterns, or a
-[`capabilities.shell.strip_env`](manifest.md#field-capabilities) pattern the manifest declared —
-delivers nothing:
+A name the backstop drops:
 
 ```text
 [capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'GITHUB_TOKEN', a credential-shaped variable the credential backstop drops before any guest is built — the grant delivers nothing and no guest observes the host's value. Remove the entry, or rename the host variable if the capsule is meant to receive it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
 ```
 
 **Why it matters:** `capabilities.env.allow` is the one grant whose value murmur never issues, sees
-or revokes — an operator names a host variable, and the runtime passes it through to the guest.
-Nothing said so in either direction. A kept name reached every guest silently, and a dropped name
-delivered nothing just as silently, so an operator with a thousand capsules had no way to ask which
-of them holds what, and no way to tell a working grant from an inert one.
+or revokes — an operator names a host variable, and the runtime passes it through. The line is how
+you tell which of your capsules holds which secret, and a working grant from an inert one; without
+it both outcomes look the same from the outside.
 
-The two arms exist because a single wording would be false for the most obvious case.
-`GITHUB_TOKEN` is on the backstop's pattern list, so a manifest that allows it produces a capsule
-holding nothing — see [`capabilities.env.allow`](manifest.md#field-capabilities) for the list. The
-names that do reach a guest are the credential-shaped ones the list does not cover:
-`DATABASE_PASSWORD`, `SLACK_BOT_TOKEN`, `JWT_SECRET`.
+**What the runtime does about it:** nothing is refused and no exit code changes. The grant is as
+effective as it would be unwarned. The judgment is made from the variable's name alone: the line
+reads the same on a host that has the variable set and one that does not, and no value ever appears
+in it.
 
-**What the runtime does about it:** nothing is refused and no exit code changes, and the grant stays
-exactly as effective as it was. The judgment is made from the variable's name alone: the line reads
-the same on a host that has the variable set and one that does not, and no value ever appears in it.
+**What to do:** when the backstop keeps the name, decide whether this capsule should hold that
+secret for its whole life, and point the variable at the narrowest credential that does the job —
+murmur cannot rotate or withdraw it for you. When the backstop drops the name the entry is dead
+weight: remove it, or rename the host variable out of the backstop's patterns if the capsule is
+meant to receive it.
 
-**What to do:** on the kept arm, decide whether this capsule should hold that secret for its whole
-life, and give it a variable holding the narrowest credential that does the job — murmur cannot
-rotate or withdraw it for you. On the dropped arm the entry is dead weight: remove it, or rename the
-host variable out of the backstop's patterns if the capsule is genuinely meant to receive it.
-
-`after_task: sleep` does not escalate this to a refusal. A long-lived worker holding an
-operator-granted database password is an ordinary shape, and refusing it would make that shape
-unbuildable; `capabilities.env.allow` exists precisely because capsules need secrets murmur knows
-nothing about. `sleep` on its own is not a trigger either — with no credential-shaped name declared
-there is nothing being held.
-
+A capsule that holds an operator-granted secret for its whole life is a legitimate shape, which is
+why this is a warning and not a refusal — including with `after_task: sleep`.
+[`lifecycle.after_task`](manifest.md#lifecycle-after-task) is not a trigger on its own: with no
+credential-shaped name declared there is nothing being held.

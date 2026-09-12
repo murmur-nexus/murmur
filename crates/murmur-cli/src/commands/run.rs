@@ -332,10 +332,10 @@ pub(crate) fn run_run(
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
-    // Hoisted above the `--explain-scope` return because the warning below reads the resolved
+    // Parsed ahead of the `--explain-scope` return because the warning below reads the resolved
     // lifecycle, and a diagnostic that describes a launch must describe the flags it was given.
-    // A malformed value therefore refuses `--explain-scope` as it would refuse a real run — the
-    // same reason `check_no_reserved_tool_names` is placed ahead of it.
+    // A malformed value therefore refuses `--explain-scope` as it refuses a real run — the same
+    // reason `check_no_reserved_tool_names` is placed ahead of it.
     let lifecycle_override = parse_lifecycle_override(
         lifecycle_task_acceptance,
         lifecycle_after_task,
