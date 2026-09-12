@@ -6,6 +6,7 @@ mod error;
 mod formation;
 mod live_address;
 mod registry_client;
+mod residue;
 mod session_address;
 mod source;
 
@@ -36,9 +37,11 @@ use commands::{
     eval::{run_eval_diff, run_eval_run, run_eval_show, EvalCommand},
     install::run_install,
     list::run_list,
+    ps::run_ps,
     publish::run_publish,
     run::run_run,
     search::run_search,
+    stop::run_stop,
     trace::{run_trace_diff, run_trace_report, run_trace_show, run_trace_steps, TraceCommand},
     watch::run_watch,
 };
@@ -333,6 +336,17 @@ enum Commands {
         #[arg(long, value_name = "HOST:PORT")]
         url: Option<String>,
     },
+    /// List the capsules running on this machine
+    Ps,
+    /// Stop one running capsule, ending its session and everything it still holds
+    Stop {
+        /// Running session to stop: @1, a ses_ id, or a 4-character suffix of one
+        #[arg(value_name = "SESSION")]
+        session: String,
+        /// Seconds to wait after SIGTERM before SIGKILL; 0 escalates immediately
+        #[arg(long, default_value = "10", value_name = "SECONDS")]
+        timeout: u64,
+    },
     #[cfg(feature = "beta-mur-deploy")]
     /// Deploy capsules to VMs and list what is deployed
     Deploy {
@@ -603,6 +617,8 @@ fn main() {
             url,
         } => cancel_arguments(session, task_id, url)
             .and_then(|(target, task_id)| run_cancel(&target, &task_id)),
+        Commands::Ps => run_ps(),
+        Commands::Stop { session, timeout } => run_stop(&session, timeout),
         #[cfg(feature = "beta-mur-deploy")]
         Commands::Deploy { command } => {
             if !beta_config.is_enabled("mur-deploy") {

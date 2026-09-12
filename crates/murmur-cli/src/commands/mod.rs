@@ -17,9 +17,11 @@ pub(crate) mod install;
 pub(crate) mod list;
 #[cfg(feature = "beta-mur-new")]
 pub(crate) mod new;
+pub(crate) mod ps;
 pub(crate) mod publish;
 pub(crate) mod run;
 pub(crate) mod search;
+pub(crate) mod stop;
 #[cfg(feature = "beta-mur-topology")]
 pub(crate) mod topology;
 pub(crate) mod trace;

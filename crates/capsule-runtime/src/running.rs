@@ -167,6 +167,54 @@ pub fn verify(record: &RunningRecord) -> Liveness {
     }
 }
 
+/// What sending one signal to a record's process did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalOutcome {
+    /// The signal was delivered to the process that wrote the record.
+    Sent,
+    /// Nothing was signalled: the process that wrote the record is no longer there.
+    AlreadyGone,
+    /// The process is there and the kernel refused the signal; the string is the errno
+    /// description, `EPERM` included.
+    Refused(String),
+}
+
+/// `SIGTERM` the process a record names, if it is still that process.
+pub fn signal_term(record: &RunningRecord) -> SignalOutcome {
+    signal(record, libc::SIGTERM)
+}
+
+/// `SIGKILL` the process a record names, if it is still that process.
+pub fn signal_kill(record: &RunningRecord) -> SignalOutcome {
+    signal(record, libc::SIGKILL)
+}
+
+/// Re-verify layers 1 and 2, then signal — in that order, in this one place.
+///
+/// A record is a hint, and a pid whose recorded start time no longer matches names a process that
+/// inherited the number. Signalling it would end something the operator never launched, so the
+/// check is not a caller's to have made earlier: it is re-run here, immediately before the
+/// `kill(2)`, so the window between the two is two adjacent syscalls. No userspace program can
+/// close that window; narrowing it to this is the whole of what can be done about it.
+#[allow(unsafe_code)]
+fn signal(record: &RunningRecord, signal: libc::c_int) -> SignalOutcome {
+    if matches!(process_state(record), ProcessState::Gone(_)) {
+        return SignalOutcome::AlreadyGone;
+    }
+    // SAFETY: `kill` takes a pid and a signal number by value and dereferences no pointer. The
+    // pid is the one the check above just confirmed is held by the process that wrote the record.
+    if unsafe { libc::kill(record.pid as libc::pid_t, signal) } == 0 {
+        return SignalOutcome::Sent;
+    }
+    let err = std::io::Error::last_os_error();
+    // The process exited between the check and the call — the race this ordering narrows but
+    // cannot close. Nothing was signalled, and nothing needed to be.
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return SignalOutcome::AlreadyGone;
+    }
+    SignalOutcome::Refused(err.to_string())
+}
+
 /// Unlink one record. For a [`Liveness::Gone`] reading only.
 pub fn prune(record: &RunningRecord) {
     if let Ok(dir) = running_dir() {
@@ -230,14 +278,19 @@ fn read_record(path: &Path) -> Option<RunningRecord> {
 }
 
 /// Layer 1. `EPERM` counts as alive: the pid is held, by a process this user may not signal.
+///
+/// A zombie does not. It still holds its pid and still answers `kill(pid, 0)`, but it has exited
+/// — its door is closed and its memory reclaimed, and it stays in the table only until whoever
+/// started it waits on it. Counting one as alive would mean `mur ps` listing an exited capsule as
+/// `unreachable` for as long as its launcher neglected to reap it, and `mur stop` never able to
+/// confirm that the process it just signalled had gone.
 #[allow(unsafe_code)]
 fn pid_is_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 runs the existence and permission checks without delivering
     // anything, and dereferences no pointer.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let held = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    held && !platform::is_zombie(pid)
 }
 
 /// Layer 2's reading: an opaque, platform-local token for when `pid`'s process started.
@@ -270,6 +323,21 @@ mod platform {
         tail.split_whitespace()
             .nth(STARTTIME_OFFSET_AFTER_COMM)
             .map(str::to_string)
+    }
+
+    /// Field 3 of `/proc/<pid>/stat` — the first after the executable name — is the state
+    /// character, and `Z` is a process that has exited and not yet been waited on.
+    ///
+    /// A pid whose `stat` cannot be read is not reported as a zombie: the reading failed, which
+    /// says nothing about the process, and layer 2 refuses it a moment later anyway.
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let Some(close) = stat.rfind(')') else {
+            return false;
+        };
+        stat[close + 1..].split_whitespace().next() == Some("Z")
     }
 }
 
@@ -309,6 +377,37 @@ mod platform {
         }
         let started = info.kp_proc.p_starttime;
         Some(format!("{}.{:06}", started.tv_sec, started.tv_usec))
+    }
+
+    /// `kinfo_proc.kp_proc.p_stat` is `SZOMB` for a process that has exited and not yet been
+    /// waited on. A pid the kernel will not describe is not reported as a zombie, on the same
+    /// terms as the Linux reading.
+    #[allow(unsafe_code)]
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        let mut mib: [libc::c_int; 4] = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        // SAFETY: as in `process_start_token` above — `kinfo_proc` is a plain C struct with no
+        // validity invariant, so an all-zero value is valid, and it is overwritten by the
+        // `sysctl` before anything reads it.
+        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+        // SAFETY: a four-element `KERN_PROC_PID` MIB and an output buffer of exactly one
+        // `kinfo_proc`, with `size` set to its own size.
+        let status = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                std::ptr::addr_of_mut!(info).cast(),
+                std::ptr::addr_of_mut!(size),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && size != 0 && i32::from(info.kp_proc.p_stat) == libc::SZOMB
     }
 }
 
@@ -422,6 +521,49 @@ mod tests {
         let pid = std::process::id();
         assert_eq!(process_start_token(pid), process_start_token(pid));
         assert!(process_start_token(pid).is_some_and(|token| !token.is_empty()));
+    }
+
+    /// A process that has exited and not been waited on still holds its pid and still answers
+    /// `kill(pid, 0)`, and is not running.
+    #[test]
+    fn a_zombie_does_not_read_as_alive() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("sh should start");
+        let pid = child.id();
+        let token = process_start_token(pid).expect("a live child has a start time");
+
+        // Deliberately not waited on: the pid stays in the table as a zombie until it is.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if matches!(process_state(&record(pid, &token)), ProcessState::Gone(_)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a zombie kept reading as alive"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.wait();
+    }
+
+    /// The load-bearing invariant: a record whose recorded start time no longer matches names a
+    /// process that inherited the pid, and nothing is signalled at it.
+    #[test]
+    fn a_signal_at_a_mismatched_start_time_is_not_sent() {
+        // This process is alive and would die of a `SIGKILL` it were actually sent one.
+        let record = record(std::process::id(), "not-this-process");
+        assert_eq!(signal_kill(&record), SignalOutcome::AlreadyGone);
+        assert_eq!(signal_term(&record), SignalOutcome::AlreadyGone);
+    }
+
+    /// A pid nothing holds is reported as already gone rather than as a refusal — there is
+    /// nothing there to refuse.
+    #[test]
+    fn a_signal_at_a_pid_nothing_holds_is_already_gone() {
+        assert_eq!(signal_term(&record(0, "42")), SignalOutcome::AlreadyGone);
     }
 
     /// A live process whose door answers nothing is unreachable, not gone — the distinction the

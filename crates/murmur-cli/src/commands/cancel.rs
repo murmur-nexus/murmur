@@ -1,10 +1,21 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::error::{CliError, E_IO_003};
 use crate::live_address::Target;
+use crate::residue::{parts_from_artifacts, print_residue};
+
+/// How long the door has to accept a connection. A capsule mid-turn accepts immediately — the
+/// accept loop and the agent loop are different tasks — so anything slower is an address nothing
+/// is listening on.
+const DOOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the door has to answer once connected. Generous: the method itself takes a lock and
+/// answers, but it does so behind whatever else the connection task is already serving.
+const DOOR_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Stop one running task on a capsule without ending its session.
 ///
@@ -61,65 +72,30 @@ pub(crate) fn run_cancel(target: &Target, task_id: &str) -> Result<(), CliError>
     // One line per thing the capsule left running. Nothing was killed: a detached command keeps
     // its own lifecycle and a delegated child is still going, and both are named so whoever
     // cancelled knows what is still out there.
-    let residue: Vec<&Value> = result
-        .get("artifacts")
-        .and_then(Value::as_array)
-        .map(|artifacts| {
-            artifacts
-                .iter()
-                .filter(|artifact| artifact.get("name").and_then(Value::as_str) == Some("residue"))
-                .filter_map(|artifact| artifact.get("parts").and_then(Value::as_array))
-                .flatten()
-                .collect()
-        })
-        .unwrap_or_default();
-
-    for part in residue {
-        let Some(item) = part
-            .get("text")
-            .and_then(Value::as_str)
-            .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        else {
-            continue;
-        };
-        let kind = item
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        match kind {
-            "detached_shell" => println!(
-                "running: {}  detached shell  {}",
-                item.get("work_id").and_then(Value::as_str).unwrap_or("?"),
-                item.get("command").and_then(Value::as_str).unwrap_or("")
-            ),
-            "delegation" => println!(
-                "running: {}  delegation  {}@{}",
-                item.get("delegation_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?"),
-                item.get("capsule").and_then(Value::as_str).unwrap_or("?"),
-                item.get("version").and_then(Value::as_str).unwrap_or("?")
-            ),
-            other => println!("running: {other}"),
-        }
-    }
+    print_residue(&parts_from_artifacts(result));
 
     Ok(())
 }
 
 /// One JSON-RPC POST to the capsule's door, parsed.
-fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
-    let mut stream = TcpStream::connect(addr)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to connect to {addr}: {e}")))?;
+///
+/// Shared with `mur stop`, which asks the same door a different method. Both deadlines are held
+/// here rather than at either caller: a door that accepts a connection and then says nothing
+/// would otherwise leave the command waiting on it forever, and `mur stop` has two more steps to
+/// run whatever the door does.
+pub(crate) fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
+    let stream = connect_with_timeout(addr)?;
+    stream.set_read_timeout(Some(DOOR_READ_TIMEOUT)).ok();
+    let mut writer = &stream;
 
     let request = format!(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    stream
+    writer
         .write_all(request.as_bytes())
         .map_err(|e| CliError::new(E_IO_003, format!("failed to send request: {e}")))?;
-    stream
+    writer
         .flush()
         .map_err(|e| CliError::new(E_IO_003, format!("failed to flush request: {e}")))?;
 
@@ -162,4 +138,29 @@ fn post_json(addr: &str, body: &str) -> Result<Value, CliError> {
             format!("the capsule's reply was not JSON ({e}): {response_body}"),
         )
     })
+}
+
+/// Connect to `addr` under [`DOOR_CONNECT_TIMEOUT`].
+///
+/// `TcpStream::connect_timeout` takes a resolved `SocketAddr`, so the host is resolved first and
+/// every address it yields is tried in turn, which is what the plain `connect` does for free.
+fn connect_with_timeout(addr: &str) -> Result<TcpStream, CliError> {
+    let resolved: Vec<_> = addr
+        .to_socket_addrs()
+        .map_err(|e| CliError::new(E_IO_003, format!("failed to resolve {addr}: {e}")))?
+        .collect();
+    let mut last = None;
+    for socket_addr in resolved {
+        match TcpStream::connect_timeout(&socket_addr, DOOR_CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(CliError::new(
+        E_IO_003,
+        match last {
+            Some(e) => format!("failed to connect to {addr}: {e}"),
+            None => format!("failed to connect to {addr}: it resolved to no address"),
+        },
+    ))
 }

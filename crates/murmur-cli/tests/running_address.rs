@@ -1019,13 +1019,16 @@ fn the_positional_is_a_session_address_and_url_is_its_own_flag() {
         .timeout(Duration::from_secs(10))
         .output()
         .expect("mur watch --url should run");
-    assert!(
-        String::from_utf8_lossy(&watched.stderr)
-            .to_string()
-            .is_empty(),
-        "mur watch --url reported {:?}",
-        String::from_utf8_lossy(&watched.stderr)
-    );
+    // Stderr carries the line naming what Ctrl-C ends and nothing else: `--url` is a first-class
+    // spelling, not a fallback, so it reports no warning and no diagnostic.
+    let reported = String::from_utf8_lossy(&watched.stderr).to_string();
+    for absent in ["warning", "error[", "E-RUN-"] {
+        assert!(
+            !reported.contains(absent),
+            "mur watch --url reported a {absent}: {reported:?}"
+        );
+    }
+    assert!(reported.contains("Ctrl-C"), "{reported:?}");
 
     let conflict = mur(home.path())
         .args(["watch", "--url", &url, "@1"])

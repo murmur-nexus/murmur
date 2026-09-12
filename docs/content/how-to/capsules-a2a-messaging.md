@@ -411,6 +411,52 @@ was interrupted and what was still running when the loop stopped, and a `task_en
 
 ---
 
+## Ending the session
+
+`session/stop` cancels every task the session still holds and reports what it leaves running, in
+one answer. The capsule keeps running and keeps answering afterwards — the method cancels and
+reports, and ends nothing.
+
+```bash
+curl -s -X POST http://localhost:$PORT \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":4,"method":"session/stop","params":{}}'
+```
+
+```json
+{
+    "jsonrpc": "2.0",
+    "id": 4,
+    "result":
+    {
+        "session_id": "ses_019ed2af53da75c2aefee84ee10c34af",
+        "canceled": ["tsk_019ed5211c827f63a8fe4be623277c55"],
+        "residue":
+        [
+            {"kind": "detached_shell", "work_id": "wrk_9f2a1c", "binary": "bash", "command": "sleep 30", "started_at_ms": 1757068800123}
+        ]
+    }
+}
+```
+
+| Key | Carries |
+|---|---|
+| `session_id` | The session this door answers for |
+| `canceled` | The task ids this call moved to `canceled`, sorted. Empty when nothing was still running |
+| `residue` | One object per thing the session leaves running, in the same vocabulary `tasks/cancel` uses. Empty when nothing is |
+
+All three keys are always present. `residue` is `[]` rather than absent when nothing is running,
+which is the one place this differs from `tasks/cancel`: a session stop has to be able to say
+"nothing" as a positive fact, because that is the whole answer the caller asked for. Issued a
+second time the method returns an empty `canceled` array rather than an error, so a retried stop is
+not a failure.
+
+To end the capsule itself, use [`mur stop`](../reference/cli.md#mur-stop). It calls this method
+first and signals the process afterwards, so the account of what the session leaves running is read
+while the capsule can still be asked for it.
+
+---
+
 ## Step 7 — inspect both sides in the trace
 
 After the session, both the orchestrator capsule and worker capsule produce `trace.jsonl` files. Each captures its own side of the exchange.
@@ -454,4 +500,5 @@ When OTel tracing is configured, the `traceparent` header links the worker capsu
 | Network policy enforcement | Any peer URL not in `network.allow` is rejected before TCP connection |
 | Task ID | Returned by the message call; use it with `tasks/get` to poll status and `tasks/cancel` to stop it |
 | Stopping one task | `tasks/cancel`, or `mur cancel <session> <task-id>`; the session, its conversation and its queue keep running |
+| Ending the session | `mur stop <session>`, which calls `session/stop` for the account of what is still running and then signals the process. `session/stop` on its own cancels and reports without ending anything |
 | Trace | Both capsules write independent `trace.jsonl` files; `a2a_task_received` appears on the worker capsule side, `a2a_send` on the orchestrator capsule side |
