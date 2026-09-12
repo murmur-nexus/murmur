@@ -6,7 +6,7 @@ pub(crate) fn run_destroy(deployment_id: &str) -> Result<(), CliError> {
     let record = remove_deployment(deployment_id)?.ok_or_else(|| {
         CliError::new(
             E_IO_003,
-            format!("no deployment found with id '{deployment_id}'; check `mur ps`"),
+            format!("no deployment found with id '{deployment_id}'; check `mur deploy ls`"),
         )
     })?;
 

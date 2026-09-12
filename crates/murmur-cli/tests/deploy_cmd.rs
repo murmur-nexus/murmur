@@ -1,4 +1,4 @@
-// Integration tests for mur deploy/destroy/ps.
+// Integration tests for mur deploy run/deploy ls/destroy.
 // Tests cover argument validation and state file I/O.
 // No real VMs are provisioned.
 #![cfg(feature = "beta-mur-deploy")]
@@ -12,7 +12,7 @@ use tempfile::tempdir;
 
 // ─── fixture ids ──────────────────────────────────────────────────────────────
 
-// Shaped like what `mur deploy` mints: `format!("dep_{}", Uuid::now_v7().simple())`, i.e. the
+// Shaped like what `mur deploy run` mints: `format!("dep_{}", Uuid::now_v7().simple())`, i.e. the
 // `dep_` prefix followed by 32 lowercase hex characters. Tests slice prefixes out of these, so
 // the length matters as much as the prefix.
 const DEPLOYMENT_ID: &str = "dep_019e9d85f1a37b4e9c0d2f6a8b3c1d5e";
@@ -92,8 +92,8 @@ fn read_deployments(home: &std::path::Path) -> Vec<Value> {
     serde_json::from_str(&raw).unwrap()
 }
 
-/// Write ~/.murmur/config.yaml with `mur-deploy` enabled so the binary accepts
-/// deploy/destroy/ps commands during integration tests.
+/// Write ~/.murmur/config.yaml with `mur-deploy` enabled so the binary accepts the
+/// `deploy` and `destroy` commands during integration tests.
 fn enable_deploy_beta(home: &std::path::Path) {
     let config_dir = home.join(".murmur");
     fs::create_dir_all(&config_dir).unwrap();
@@ -104,16 +104,16 @@ fn enable_deploy_beta(home: &std::path::Path) {
     .unwrap();
 }
 
-// ─── mur ps ───────────────────────────────────────────────────────────────────
+// ─── mur deploy ls ────────────────────────────────────────────────────────────
 
 #[test]
-fn ps_empty_home_prints_no_deployments() {
+fn deploy_ls_empty_home_prints_no_deployments() {
     let dir = tempdir().unwrap();
     enable_deploy_beta(dir.path());
     let out = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", dir.path())
-        .arg("ps")
+        .args(["deploy", "ls"])
         .output()
         .unwrap();
 
@@ -123,7 +123,7 @@ fn ps_empty_home_prints_no_deployments() {
 }
 
 #[test]
-fn ps_lists_deployment_from_json() {
+fn deploy_ls_lists_deployment_from_json() {
     let dir = tempdir().unwrap();
     enable_deploy_beta(dir.path());
     write_deployment(dir.path(), DEPLOYMENT_ID, "1.2.3.4");
@@ -131,7 +131,7 @@ fn ps_lists_deployment_from_json() {
     let out = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", dir.path())
-        .arg("ps")
+        .args(["deploy", "ls"])
         .output()
         .unwrap();
 
@@ -144,7 +144,7 @@ fn ps_lists_deployment_from_json() {
 }
 
 #[test]
-fn ps_multiple_deployments_shows_all() {
+fn deploy_ls_multiple_deployments_shows_all() {
     let dir = tempdir().unwrap();
     enable_deploy_beta(dir.path());
     write_deployments(
@@ -158,7 +158,7 @@ fn ps_multiple_deployments_shows_all() {
     let out = Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", dir.path())
-        .arg("ps")
+        .args(["deploy", "ls"])
         .output()
         .unwrap();
 
@@ -166,6 +166,63 @@ fn ps_multiple_deployments_shows_all() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(DEPLOYMENT_ID), "got: {stdout}");
     assert!(stdout.contains(OTHER_DEPLOYMENT_ID), "got: {stdout}");
+}
+
+// ─── invocations the parser must reject ───────────────────────────────────────
+
+/// The `ps` name is deliberately unclaimed, reserved for a listing of local capsule processes. It
+/// carries no alias to `mur deploy ls`, so the parser must reject it outright rather than print
+/// the deployment table.
+#[test]
+fn ps_is_not_a_subcommand_even_with_beta_enabled() {
+    let dir = tempdir().unwrap();
+    enable_deploy_beta(dir.path());
+    write_deployment(dir.path(), DEPLOYMENT_ID, "1.2.3.4");
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .arg("ps")
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ps"),
+        "error must name the rejected subcommand, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("DEPLOYMENT_ID"),
+        "no deployment table may reach stdout, got: {stdout}"
+    );
+}
+
+/// `--host` belongs to `mur deploy run`, not to the `deploy` group, so passing it to the group
+/// is an argument error that never reaches the deploy path.
+#[test]
+fn flat_deploy_form_is_rejected_by_the_parser() {
+    let dir = tempdir().unwrap();
+    enable_deploy_beta(dir.path());
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["deploy", "--host", "1.2.3.4", "--manifest", "./murmur.yaml"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--host") || stderr.contains("subcommand"),
+        "expected a parser error about --host or a missing subcommand, got: {stderr}"
+    );
+    assert!(
+        !dir.path().join(".murmur/deployments.json").exists(),
+        "a rejected invocation must not record a deployment"
+    );
 }
 
 // ─── mur destroy ──────────────────────────────────────────────────────────────
@@ -258,6 +315,76 @@ fn destroy_by_ambiguous_prefix_removes_nothing() {
     );
 }
 
+/// An id matching no record is a user error, and the message has to name a command that exists
+/// so the user can go look the id up.
+#[test]
+fn destroy_unknown_id_points_at_deploy_ls() {
+    let dir = tempdir().unwrap();
+    enable_deploy_beta(dir.path());
+    write_deployment(dir.path(), DEPLOYMENT_ID, "1.2.3.4");
+
+    let out = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .args(["destroy", "dep_doesnotexist"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mur deploy ls"),
+        "error must send the user to a command that exists, got: {stderr}"
+    );
+}
+
+// ─── beta gating ──────────────────────────────────────────────────────────────
+
+/// The runtime opt-in is checked on the `deploy` group, not on its members, so every subcommand
+/// under it is refused together and `mur --help` advertises none of them.
+#[test]
+fn deploy_group_is_hidden_until_the_beta_is_enabled() {
+    let dir = tempdir().unwrap();
+
+    for args in [
+        vec!["deploy", "ls"],
+        vec!["deploy", "run", "--host", "1.2.3.4"],
+        vec!["destroy", "dep_01954a3b"],
+    ] {
+        let out = Command::cargo_bin("mur")
+            .unwrap()
+            .env("HOME", dir.path())
+            .args(&args)
+            .output()
+            .unwrap();
+
+        assert!(!out.status.success(), "{args:?} was accepted");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unrecognized subcommand"),
+            "{args:?} got: {stderr}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).is_empty(),
+            "{args:?} wrote to stdout"
+        );
+    }
+
+    let help = Command::cargo_bin("mur")
+        .unwrap()
+        .env("HOME", dir.path())
+        .arg("--help")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    for hidden in ["deploy", "destroy"] {
+        assert!(
+            !stdout.lines().any(|l| l.trim_start().starts_with(hidden)),
+            "--help lists {hidden}: {stdout}"
+        );
+    }
+}
+
 // ─── argument validation ──────────────────────────────────────────────────────
 
 #[test]
@@ -270,6 +397,7 @@ fn missing_manifest_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "1.2.3.4",
             "--manifest",
@@ -297,6 +425,7 @@ fn missing_workdir_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "1.2.3.4",
             "--manifest",
@@ -326,6 +455,7 @@ fn missing_mur_binary_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "1.2.3.4",
             "--manifest",
@@ -355,6 +485,7 @@ fn invalid_env_var_format_fails_before_connecting() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "1.2.3.4",
             "--manifest",
@@ -402,6 +533,7 @@ fn missing_artifact_fails_before_ssh_attempt() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "192.0.2.1", // TEST-NET; never reached because staging fails first
             "--manifest",
@@ -468,6 +600,7 @@ fn missing_system_prompt_file_fails_before_ssh_attempt() {
         .env("HOME", dir.path())
         .args([
             "deploy",
+            "run",
             "--host",
             "192.0.2.1", // TEST-NET; never reached because file check fails first
             "--manifest",

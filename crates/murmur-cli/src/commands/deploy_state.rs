@@ -77,8 +77,9 @@ pub(crate) fn save_deployments(records: &[DeploymentRecord]) -> Result<(), CliEr
 
     // Write-then-rename, the same shape as `write_lockfile_atomic`. A torn `deployments.json` is
     // not a recoverable inconvenience: `load_deployments` fails closed on malformed JSON, so a
-    // partial write takes out `mur ps` and `mur destroy` for *every* deployment at once, leaving
-    // running VMs with no record of how to reach them. The rename is atomic within the directory.
+    // partial write takes out `mur deploy ls` and `mur destroy` for *every* deployment at once,
+    // leaving running VMs with no record of how to reach them. The rename is atomic within the
+    // directory.
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, json)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to write {}: {e}", tmp.display())))?;
