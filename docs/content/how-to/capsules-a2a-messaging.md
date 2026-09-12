@@ -414,8 +414,8 @@ was interrupted and what was still running when the loop stopped, and a `task_en
 ## Ending the session
 
 `session/stop` cancels every task the session still holds and reports what it leaves running, in
-one answer. It ends no process: the capsule is still there and still answers afterwards, because
-a method that killed its own process would be racing its response out of it.
+one answer. The capsule keeps running and keeps answering afterwards — the method cancels and
+reports, and ends nothing.
 
 ```bash
 curl -s -X POST http://localhost:$PORT \
@@ -451,9 +451,9 @@ which is the one place this differs from `tasks/cancel`: a session stop has to b
 second time the method returns an empty `canceled` array rather than an error, so a retried stop is
 not a failure.
 
-[`mur stop`](../reference/cli.md#mur-stop) is the terminal-side version, and it is the one that
-ends the process: it calls this method first, then signals. The order is the point — this is the
-only moment anything can ask the capsule what it leaves behind.
+To end the capsule itself, use [`mur stop`](../reference/cli.md#mur-stop). It calls this method
+first and signals the process afterwards, so the account of what the session leaves running is read
+while the capsule can still be asked for it.
 
 ---
 

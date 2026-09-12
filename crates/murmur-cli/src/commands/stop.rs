@@ -24,8 +24,8 @@ const KILL_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The three residue outcomes, as three lines that cannot be mistaken for one another.
 ///
-/// "It left nothing behind" and "I could not ask what it left behind" are different facts about
-/// the machine, and an empty list renders both. Only the first is an answer.
+/// "it left nothing behind" and "it could not be asked what it left behind" are different facts
+/// about the machine, and an empty list renders both. Only the first is an answer.
 const RESIDUE_NONE: &str = "residue: nothing else was left running";
 const RESIDUE_UNKNOWN_PREFIX: &str = "residue: unknown — the capsule could not be asked:";
 

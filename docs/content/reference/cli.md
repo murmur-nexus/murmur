@@ -58,8 +58,8 @@ commands, and for `mur run` either `<manifest-dir>/workdir` or `.murmur` inside 
 `--workdir` names. See [Session workdir](workdir.md).
 
 `mur watch`, `mur cancel` and `mur stop` have to reach a process, so they take the three forms that
-name a session and refuse the path form: a path names a directory on disk, which says nothing about whether a process
-is running. An address naming a session that has stopped reports
+name a session and refuse the path form: a path names a directory on disk, which says nothing
+about whether a process is running. An address naming a session that has stopped reports
 [`E-RUN-022`](diagnostics.md#e-run-022) rather than resolving to a different capsule.
 
 Omitting the address selects a default:
@@ -773,10 +773,9 @@ Three steps, in this order:
 | 2. `SIGTERM` to the recorded process | Ends the capsule |
 | 3. `SIGKILL` after `--timeout` seconds | Only if the process is still there |
 
-The door step is not politeness. It is the only moment anything can ask the capsule what it leaves
-running — a detached shell command keeps its own lifecycle and a delegated sub-capsule is still
-going, and the registries that know about either die with the process. A stop that signalled first
-would have nothing left to ask.
+The door step is the only moment anything can ask the capsule what it leaves running. A detached
+shell command keeps its own lifecycle and a delegated sub-capsule is still going, and the record of
+both dies with the process, so the question is asked while the capsule is still answering.
 
 ```text
 stopped: ses_019f01a940ce7761854e768ecbe3d399
@@ -790,7 +789,7 @@ running: dlg_7b31de  delegation  worker@0.1.0
 The `running:` lines are the ones [`mur cancel`](#mur-cancel) prints for the same items. Nothing on
 them was stopped.
 
-### What it left behind is three answers, not two { #mur-stop-residue }
+### The three answers about what it left behind { #mur-stop-residue }
 
 | Line | Means |
 |---|---|

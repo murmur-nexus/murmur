@@ -649,7 +649,8 @@ fn stop_cancels_through_the_door_before_it_signals() {
         "the task did not end as canceled: {end:?}"
     );
 
-    // Longer than the scripted delay plus a whole further turn: measured at the provider.
+    // Longer than the scripted delay plus a whole further turn, so a loop that kept going
+    // would have reached the provider by now.
     thread::sleep(Duration::from_secs(5));
     assert_eq!(
         server.requests().len(),
