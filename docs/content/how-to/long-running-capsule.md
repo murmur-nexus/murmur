@@ -28,11 +28,6 @@ Start from a working agent manifest (inference block, driver artifact, network a
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -59,11 +54,6 @@ Start from a working agent manifest (inference block, driver artifact, network a
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -89,11 +79,6 @@ Start from a working agent manifest (inference block, driver artifact, network a
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

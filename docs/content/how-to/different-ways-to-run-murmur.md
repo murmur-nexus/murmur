@@ -27,11 +27,6 @@ Create a `murmur.yaml` file:
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -52,11 +47,6 @@ Create a `murmur.yaml` file:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -76,11 +66,6 @@ Create a `murmur.yaml` file:
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http
@@ -252,8 +237,7 @@ Effective grants
     - murmur-tool-git (tool): the whole accessible workdir — no capabilities.filesystem.scope declared
     - murmur-driver-anthropic (driver): the whole accessible workdir — no capabilities.filesystem.scope declared
     - murmur-hook-telemetry (hook): nothing preopened — no capabilities.filesystem.scope declared
-  network allow:
-    - https://api.anthropic.com
+  network allow: <none>
   unix sockets:     false
   shell allow: <none>
   spawn allow: <none>

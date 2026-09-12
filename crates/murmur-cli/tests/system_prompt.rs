@@ -48,9 +48,8 @@ fn inline_system_prompt_appears_in_every_api_call() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "expected two inference requests");
     for request in requests {
-        let system_field = request["system"]
-            .as_str()
-            .expect("system field should be present");
+        let system_field =
+            common::system_text(&request["system"]).expect("system field should be present");
         assert!(
             system_field.starts_with("[Capsule]\nName:"),
             "system field should start with [Capsule] block; got:\n{system_field}"
@@ -97,9 +96,8 @@ fn system_prompt_file_contents_injected_as_system_param() {
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1, "expected one inference request");
-    let system_field = requests[0]["system"]
-        .as_str()
-        .expect("system field should be present");
+    let system_field =
+        common::system_text(&requests[0]["system"]).expect("system field should be present");
     assert!(
         system_field.starts_with("[Capsule]\nName:"),
         "system field should start with [Capsule] block; got:\n{system_field}"
@@ -182,9 +180,8 @@ fn no_system_prompt_field_sends_no_system_param() {
     let requests = server.requests();
     assert_eq!(requests.len(), 2, "expected two inference requests");
     for request in requests {
-        let system_field = request["system"]
-            .as_str()
-            .expect("system field should be present");
+        let system_field =
+            common::system_text(&request["system"]).expect("system field should be present");
         assert!(
             system_field.starts_with("[Capsule]\nName:"),
             "system field should contain [Capsule] identity block even with no manifest system prompt; got:\n{system_field}"
@@ -597,10 +594,7 @@ impl CliFixture {
     fn only_system_field(&self) -> String {
         let requests = self.server.requests();
         assert_eq!(requests.len(), 1, "expected one inference request");
-        requests[0]["system"]
-            .as_str()
-            .expect("system field should be present")
-            .to_string()
+        common::system_text(&requests[0]["system"]).expect("system field should be present")
     }
 }
 

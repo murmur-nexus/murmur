@@ -36,9 +36,6 @@ The relevant manifest options are:
         runtime: tool
 
     capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
       filesystem:
         allow:
           - .
@@ -89,9 +86,6 @@ The relevant manifest options are:
         runtime: tool
 
     capabilities:
-      network:
-        allow:
-          - https://api.openai.com
       filesystem:
         allow:
           - .
@@ -142,9 +136,6 @@ The relevant manifest options are:
         runtime: tool
 
     capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
       filesystem:
         allow:
           - .

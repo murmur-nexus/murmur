@@ -114,6 +114,22 @@ pub fn skip_without_host_support(test_name: &str) -> bool {
     capsule_runtime::skip_without_host_support(test_name)
 }
 
+#[allow(dead_code)]
+/// The provider-bound `system` text: a plain string, or the concatenated `text` of the block array
+/// the anthropic driver sends when it places cache breakpoints.
+pub fn system_text(system: &serde_json::Value) -> Option<String> {
+    if let Some(text) = system.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = system.as_array()?;
+    Some(
+        blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+    )
+}
+
 pub fn fixture_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -363,6 +379,10 @@ pub fn create_driver_artifact(dir: &Path, name: &str, version: &str, wasm_path: 
     writeln!(zip, "name: {name}").unwrap();
     writeln!(zip, "version: {version}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
+    // A `transport: http` capsule refuses a driver that does not say how its provider takes the key.
+    writeln!(zip, "inference_auth:").unwrap();
+    writeln!(zip, "  header: x-api-key").unwrap();
+    writeln!(zip, "  value: \"{{key}}\"").unwrap();
 
     zip.start_file("tool.wasm", options).unwrap();
     zip.write_all(&fs::read(wasm_path).unwrap()).unwrap();

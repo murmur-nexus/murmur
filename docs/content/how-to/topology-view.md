@@ -96,11 +96,6 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -124,11 +119,6 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -151,11 +141,6 @@ Create a `murmur.yaml` with `observability.otel_endpoint` pointing to the OTLP i
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http
@@ -272,11 +257,6 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -304,11 +284,6 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -335,11 +310,6 @@ Create `worker/murmur.yaml`:
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

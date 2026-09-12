@@ -177,12 +177,37 @@ fn run_session(seed_budget: &str, hooks: &[(&str, &str, &str, Vec<u8>)]) -> Sess
         .collect();
 
     Session {
-        requests: server.requests(),
+        requests: server
+            .requests()
+            .into_iter()
+            .map(without_cache_control)
+            .collect(),
         trace,
         trace_raw,
         workdir,
         _project: project,
     }
+}
+
+/// `value` with every `cache_control` key removed. The anthropic driver marks prompt-cache
+/// breakpoints on the provider request; they say where the provider may cache, not what the
+/// conversation holds, which is all these assertions compare.
+fn without_cache_control(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for child in map.values_mut() {
+                *child = without_cache_control(child.take());
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                *item = without_cache_control(item.take());
+            }
+        }
+        _ => {}
+    }
+    value
 }
 
 /// A seed message of roughly `tokens` cl100k tokens, tagged so the assertions can tell one

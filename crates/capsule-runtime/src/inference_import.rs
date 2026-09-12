@@ -80,6 +80,9 @@ pub(crate) struct HookInferenceCtx {
     /// applies. Carried here so a hook's `run-inference` runs the driver under exactly the
     /// grant the agent loop's own turns do, rather than an unnarrowed copy of the ceiling.
     pub(crate) driver_grant: Option<ToolCapabilityGrant>,
+    /// The session's inference gateway, so a hook's `run-inference` reaches the provider exactly
+    /// as the agent loop's own turns do.
+    pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
     /// Buffered trace records, drained by the agent loop after hook dispatch.
     pub(crate) records: std::sync::Mutex<Vec<HookInferenceRecord>>,
 }
@@ -172,6 +175,7 @@ impl HookInferenceCtx {
                 capability_policy: &self.capability_policy,
                 network_allow_rules: &self.network_allow_rules,
                 artifact_grant: self.driver_grant.as_ref(),
+                inference_gateway: self.inference_gateway.as_ref(),
             },
             // A hook's completion is not part of the user-facing turn: it must
             // not stream chunks into the SSE stream or ask the user for input.
@@ -408,6 +412,7 @@ mod tests {
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),
             driver_grant: None,
+            inference_gateway: None,
             records: std::sync::Mutex::new(Vec::new()),
         }
     }

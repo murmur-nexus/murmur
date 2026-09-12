@@ -52,11 +52,6 @@ artifacts:
     version: "{{ v.murmur_driver_anthropic }}"
     runtime: driver
 
-capabilities:
-  network:
-    allow:
-      - https://api.anthropic.com
-
 inference:
   transport: http
   endpoint: https://api.anthropic.com

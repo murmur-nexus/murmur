@@ -396,6 +396,10 @@ pub struct StagedSession {
     pub resolved_lock_artifacts: Vec<ResolvedLockArtifact>,
     pub(crate) installed_artifacts: Vec<InstalledArtifactSummary>,
     pub(crate) inference: Option<InferenceConfig>,
+    /// The gateway the configured `transport: http` driver reaches its provider through, built at
+    /// staging from `inference` and the driver's own `inference_auth:` declaration. `None` for
+    /// `transport: process` and for a capsule with no inference.
+    pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
     /// Copied from [`StageRequest::system_prompt_overridden`] — the only record left that the
     /// prompt in `inference` came from `--system-prompt` and not from the manifest. Passed to
     /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.

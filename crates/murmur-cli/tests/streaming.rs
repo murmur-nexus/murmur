@@ -568,6 +568,9 @@ fn create_streaming_driver_artifact(dir: &Path) -> PathBuf {
     writeln!(zip, "name: {STREAMING_DRIVER_NAME}").unwrap();
     writeln!(zip, "version: {STREAMING_DRIVER_VERSION}").unwrap();
     writeln!(zip, "runtime: driver").unwrap();
+    writeln!(zip, "inference_auth:").unwrap();
+    writeln!(zip, "  header: x-api-key").unwrap();
+    writeln!(zip, "  value: \"{{key}}\"").unwrap();
 
     zip.start_file("tool.wasm", opts).unwrap();
     zip.write_all(&fs::read(streaming_driver_wasm_path()).unwrap())

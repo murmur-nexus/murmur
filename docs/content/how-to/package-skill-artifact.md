@@ -227,11 +227,6 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
         version: "1.0.0"
         runtime: skill
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -258,11 +253,6 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
         version: "1.0.0"
         runtime: skill
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -288,11 +278,6 @@ Create a `murmur.yaml` for the capsule that needs the skill. Add the skill artif
       - name: code-review-conventions
         version: "1.0.0"
         runtime: skill
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

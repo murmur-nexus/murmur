@@ -38,9 +38,6 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
       shell:
         allow:
           - bash
@@ -66,9 +63,6 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.openai.com
       shell:
         allow:
           - bash
@@ -94,9 +88,6 @@ Create a `murmur.yaml` file. This version does the job — the agent has `bash`,
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
       shell:
         allow:
           - bash
@@ -130,13 +121,10 @@ Each entry in `shell.allow` is a **bare binary name** — `bash`, `jq`, `python3
 
 ## Step 1 — set the capsule's capability ceiling
 
-The top-level `capabilities:` block is the ceiling. Add a `filesystem.scope` so the capsule works out of the repo subtree of the session workdir rather than the whole workdir, and keep `network.allow` scoped to the single host the runtime needs for inference:
+The top-level `capabilities:` block is the ceiling. Add a `filesystem.scope` so the capsule works out of the repo subtree of the session workdir rather than the whole workdir, and leave `network.allow` out: the runtime reaches the inference provider itself, so the capsule needs no outbound host at all:
 
 ```yaml
 capabilities:
-  network:
-    allow:
-      - https://api.anthropic.com   # your provider's inference endpoint
   filesystem:
     scope: repo
   shell:
@@ -267,8 +255,7 @@ artifacts:
     runtime: driver
     capabilities:
       network:
-        allow:
-          - https://api.anthropic.com
+        allow: []
   - name: murmur-tool-git
     version: "{{ v.murmur_tool_git }}"
     runtime: tool
@@ -288,7 +275,6 @@ artifacts:
 capabilities:
   network:
     allow:
-      - https://api.anthropic.com
       - https://github.com
   filesystem:
     scope: repo
@@ -299,8 +285,8 @@ capabilities:
 
 The effective grant is the intersection of what an artifact declares and the ceiling — it can only ever subtract. Each block does one job:
 
-- **The driver** reaches only `api.anthropic.com`, dropping `github.com` from the ceiling. A driver narrows through the same path as any WASM tool, so this also applies to a driver call a hook's `run-inference` makes.
-- **The git tool** reaches only `github.com`, dropping the inference endpoint it never calls.
+- **The driver** gets `network.allow: []` and reaches no host directly. Inference is unaffected: the runtime sends the driver's requests to `inference.endpoint` itself, including for a driver call a hook's `run-inference` makes.
+- **The git tool** reaches only `github.com`.
 - **The editor tool** gets `network.allow: []` — a real narrowing to zero outbound HTTP, distinct from omitting the key — and `filesystem.scope: repo`, which gives it only `<workdir>/repo` as its current directory. An absolute path, or one that escapes via `..`, fails at staging (`E-CAP-002`) before the tool runs.
 
 An artifact with **no** `capabilities:` block inherits the full ceiling. Grants are read only from your capsule manifest's artifact entry, never from the artifact's own bundled `murmur.yaml`, so an untrusted artifact cannot scope itself up.

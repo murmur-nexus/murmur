@@ -5,10 +5,11 @@ use capsule_runtime::{
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
-    warn_on_interpreter_runtime_grants, warn_on_secret_shaped_env_grants,
-    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
-    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    warn_on_inference_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_secret_shaped_env_grants, warn_on_unreachable_toolchain_helpers,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
+    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
+    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
@@ -726,6 +727,13 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         &capability_policy_from_runtime_manifest(&runtime_manifest),
         runtime_manifest.lifecycle.as_ref(),
         None,
+    );
+
+    // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming the
+    // inference endpoint grants direct reach without the key and no longer serves inference.
+    warn_on_inference_endpoint_in_network_allow(
+        &capability_policy_from_runtime_manifest(&runtime_manifest),
+        runtime_manifest.inference.as_ref(),
     );
 
     // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a

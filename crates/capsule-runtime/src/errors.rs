@@ -445,6 +445,20 @@ pub enum RuntimeError {
     #[error("inference driver '{0}' is not installed in the local tool registry")]
     DriverNotInstalled(String),
 
+    /// The configured `transport: http` driver's bundled manifest has no usable `inference_auth:`
+    /// block, so the runtime cannot tell how its provider expects the key. Refused at staging,
+    /// before any component runs, whether or not `inference.api_key` is set. `reason` is `None`
+    /// when the block is absent and says what is wrong when it is malformed.
+    #[error(
+        "inference driver '{name}@{version}' declares no usable inference_auth: block{}",
+        .reason.as_ref().map(|reason| format!(" ({reason})")).unwrap_or_default()
+    )]
+    DriverDeclaresNoInferenceAuth {
+        name: String,
+        version: String,
+        reason: Option<String>,
+    },
+
     #[error("agent loop failed: {0}")]
     AgentLoopFailed(String),
 

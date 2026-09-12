@@ -21,9 +21,6 @@ artifacts:
     runtime: driver
 
 capabilities:
-  network:
-    allow:
-      - https://api.anthropic.com
   shell:
     allow:
       - bash

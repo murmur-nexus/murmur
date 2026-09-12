@@ -163,11 +163,6 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     lifecycle:
       task_acceptance: single
       after_task: exit
@@ -194,11 +189,6 @@ The generator picks one of two shapes based on the task description.
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     lifecycle:
       task_acceptance: single
       after_task: exit
@@ -224,11 +214,6 @@ The generator picks one of two shapes based on the task description.
       - name: murmur-tool-git
         version: "{{ v.murmur_tool_git }}"
         runtime: tool
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     lifecycle:
       task_acceptance: single
@@ -257,9 +242,6 @@ The generator picks one of two shapes based on the task description.
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
       spawn:
         allow:
           - climate-data-worker
@@ -288,9 +270,6 @@ The generator picks one of two shapes based on the task description.
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.openai.com
       spawn:
         allow:
           - climate-data-worker
@@ -319,9 +298,6 @@ The generator picks one of two shapes based on the task description.
         runtime: driver
 
     capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
       spawn:
         allow:
           - climate-data-worker

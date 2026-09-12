@@ -41,11 +41,6 @@ Create a `murmur.yaml` file:
           conversation:
             read: true
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -75,11 +70,6 @@ Create a `murmur.yaml` file:
           conversation:
             read: true
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -108,11 +98,6 @@ Create a `murmur.yaml` file:
         capabilities:
           conversation:
             read: true
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

@@ -17,7 +17,7 @@ use murmur_artifact::{
     LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
     RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
     W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024,
+    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -56,6 +56,7 @@ use crate::{
         SessionContextData, ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
+    inference_gateway::InferenceGateway,
     inference_import::HookInferenceCtx,
     lanes::LaneQueue,
     limits::{classify_guest_failure, EpochTicker, ExecutionLimiter, GuestFailure},
@@ -849,6 +850,15 @@ pub fn stage_session(
         });
     }
 
+    // Before `dispatch_stage` runs any on-stage hook and before the session directory exists: a
+    // `transport: http` driver that does not say how its provider takes the key could only be run
+    // by handing it the key, so the launch is refused here rather than at the first turn.
+    let inference_gateway = stage_inference_gateway(
+        request.inference.as_ref(),
+        &installed_manifests,
+        &installed_artifacts,
+    )?;
+
     // Asked as soon as the hook artifacts are staged and their bindings are known, and before
     // the session directory is created: a resume that cannot continue anything must leave no
     // `ses_*` directory behind for the next `--resume @1` to name.
@@ -1015,6 +1025,7 @@ pub fn stage_session(
         resolved_lock_artifacts,
         installed_artifacts,
         inference: request.inference,
+        inference_gateway,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         context_id: request.context_id,
@@ -1135,8 +1146,9 @@ pub fn launch_session(
     let inference_env = staged
         .inference
         .as_ref()
-        .map(inference_env_pairs)
+        .map(|inference| inference_env_pairs(inference, staged.inference_gateway.as_deref()))
         .unwrap_or_default();
+    let inference_gateway = staged.inference_gateway.clone();
 
     if let Some(ref inference) = staged.inference {
         let workdir = staged.workdir.clone();
@@ -1596,6 +1608,7 @@ pub fn launch_session(
                         http: WasiHttpCtx::new(),
                         http_hooks: NetworkPolicyHooks {
                             network_allow_rules: network_allow_rules.clone(),
+                            inference_gateway: None,
                         },
                         network_allow_rules,
                         peer_fetch_rules,
@@ -1606,6 +1619,7 @@ pub fn launch_session(
                         plan_trace,
                         plan_counter: AtomicU64::new(0),
                         inference_env: all_env,
+                        inference_gateway,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
@@ -1665,6 +1679,7 @@ pub fn launch_session(
                                 capability_policy: state.capability_policy.clone(),
                                 network_allow_rules: state.network_allow_rules.clone(),
                                 driver_grant,
+                                inference_gateway: state.inference_gateway.clone(),
                                 records: std::sync::Mutex::new(Vec::new()),
                             })
                         });
@@ -2447,6 +2462,7 @@ pub fn launch_session(
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: network_allow_rules.clone(),
+            inference_gateway: None,
         },
         network_allow_rules,
         // A script capsule has no peer-handoff surface: `share-file` and `fetch-peer-file` are
@@ -2467,6 +2483,7 @@ pub fn launch_session(
         // `capsule` plan step would delegate with — it simply has no tool to call.
         delegation: None,
         inference_env,
+        inference_gateway: staged.inference_gateway.clone(),
         engine: staged.engine.clone(),
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
@@ -3209,6 +3226,56 @@ pub fn warn_on_secret_shaped_env_grants(
     }
 }
 
+/// Warns (non-fatal, once per matching entry) when a `transport: http` capsule names its inference
+/// endpoint in `capabilities.network.allow`.
+///
+/// The runtime reaches the provider itself, so inference no longer uses the entry. It still grants
+/// tools, subprocesses and the driver direct reach to that host, without the key, which is why this
+/// is a warning and not a refusal. Shared between `mur run` and `mur doctor` on the same terms as
+/// [`warn_on_secret_shaped_env_grants`], and decided before any session workdir exists, so it goes
+/// to stderr only.
+pub fn warn_on_inference_endpoint_in_network_allow(
+    policy: &CapabilityPolicy,
+    inference: Option<&InferenceConfig>,
+) {
+    for entry in inference_endpoint_allow_entries(&policy.network_allow, inference) {
+        let link = security_warning_link(W_SEC_025);
+        eprintln!(
+            "[capsule-runtime] warning[{W_SEC_025}]: capabilities.network.allow entry '{entry}' \
+             names the inference endpoint; inference no longer uses it — the runtime reaches the \
+             provider itself — so the entry now only grants tools, subprocesses and the driver \
+             direct reach to that host without the key ({link})"
+        );
+    }
+}
+
+/// The `network_allow` entries whose rule matches the `transport: http` inference endpoint, in
+/// declaration order. An entry that does not parse matches nothing: validation refuses it
+/// elsewhere.
+fn inference_endpoint_allow_entries<'a>(
+    network_allow: &'a [String],
+    inference: Option<&InferenceConfig>,
+) -> Vec<&'a str> {
+    let Some(endpoint) = inference
+        .filter(|inference| inference.transport == "http")
+        .and_then(|inference| inference.endpoint.as_deref())
+    else {
+        return Vec::new();
+    };
+    let Some(target) = endpoint
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| RequestTarget::from_request(&uri, uri.scheme_str() == Some("https")))
+    else {
+        return Vec::new();
+    };
+    network_allow
+        .iter()
+        .filter(|entry| NetworkAllowRule::parse(entry).is_ok_and(|rule| rule.matches(&target)))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Warns (non-fatal, once per allowlisted interpreter) when `capabilities.filesystem.read_only`
 /// is declared alongside a binary that can construct a write the dispatch-time analyser cannot
 /// see.
@@ -3660,7 +3727,14 @@ fn build_wasi_ctx(
     Ok(builder.build())
 }
 
-fn inference_env_pairs(inference: &murmur_artifact::InferenceConfig) -> Vec<(String, String)> {
+/// The `MURMUR_INFERENCE_*` variables every guest of an inference session sees.
+///
+/// Never the key: under `transport: http` the endpoint is the gateway's, and the runtime attaches
+/// the credential itself. `gateway` is `None` for `transport: process`, whose endpoint is empty.
+fn inference_env_pairs(
+    inference: &murmur_artifact::InferenceConfig,
+    gateway: Option<&InferenceGateway>,
+) -> Vec<(String, String)> {
     let mut pairs = vec![
         (
             "MURMUR_INFERENCE_TRANSPORT".to_string(),
@@ -3668,7 +3742,9 @@ fn inference_env_pairs(inference: &murmur_artifact::InferenceConfig) -> Vec<(Str
         ),
         (
             "MURMUR_INFERENCE_ENDPOINT".to_string(),
-            inference.endpoint.clone().unwrap_or_default(),
+            gateway
+                .map(InferenceGateway::driver_endpoint)
+                .unwrap_or_default(),
         ),
         (
             "MURMUR_INFERENCE_MODEL".to_string(),
@@ -3683,10 +3759,6 @@ fn inference_env_pairs(inference: &murmur_artifact::InferenceConfig) -> Vec<(Str
                 .unwrap_or_default(),
         ),
     ];
-
-    if let Some(api_key) = inference.api_key.as_ref() {
-        pairs.push(("MURMUR_INFERENCE_API_KEY".to_string(), api_key.clone()));
-    }
 
     if let Some(config) = inference.driver.as_ref().and_then(|d| d.config.as_ref()) {
         pairs.push(("MURMUR_INFERENCE_DRIVER_CONFIG".to_string(), config.clone()));
@@ -3819,6 +3891,11 @@ enum InputWaitEnd {
 
 pub(crate) struct NetworkPolicyHooks {
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
+    /// Set only on the configured inference driver's own store. A request addressed to the gateway
+    /// authority is then sent to the provider by the runtime, on the runtime's grant — neither
+    /// `network_allow_rules` nor the driver's per-artifact narrowing is consulted for it. Every
+    /// other request from the same store is checked exactly as it is without a gateway.
+    pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
 }
 
 impl WasiHttpHooks for NetworkPolicyHooks {
@@ -3827,6 +3904,17 @@ impl WasiHttpHooks for NetworkPolicyHooks {
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
+        if let Some(gateway) = self.inference_gateway.as_ref() {
+            if InferenceGateway::is_addressed_to_gateway(request.uri()) {
+                let (request, config) = gateway
+                    .rewrite(request, config)
+                    .map_err(wasmtime_wasi_http::p2::HttpError::from)?;
+                return Ok(wasmtime_wasi_http::p2::default_send_request(
+                    request, config,
+                ));
+            }
+        }
+
         let target =
             RequestTarget::from_request(request.uri(), config.use_tls).ok_or_else(|| {
                 wasmtime_wasi_http::p2::HttpError::from(WasiHttpErrorCode::HttpRequestDenied)
@@ -3886,6 +3974,9 @@ pub(crate) struct CapsuleStoreState {
     /// anything the model wrote, so a plan `id` reaches no path.
     pub(crate) plan_counter: AtomicU64,
     pub(crate) inference_env: Vec<(String, String)>,
+    /// Moved over from [`StagedSession::inference_gateway`]. Handed to every tool dispatch, and
+    /// attached by [`invoke_tool_component`] only to the configured driver's store.
+    pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
     pub(crate) engine: Engine,
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
@@ -4326,6 +4417,65 @@ impl manage::Host for CapsuleStoreState {
     }
 }
 
+/// The gateway a store for artifact `name` is built with: the session's, and only when `name` is
+/// the driver it was built for. Every other tool, hook and capsule store gets none, so a request
+/// they address to the gateway authority is an ordinary allow-list-checked request with no key.
+fn gateway_for_store(
+    gateway: Option<&Arc<InferenceGateway>>,
+    name: &str,
+) -> Option<Arc<InferenceGateway>> {
+    gateway
+        .filter(|gateway| gateway.driver_name == name)
+        .cloned()
+}
+
+/// Builds the session's inference gateway from the configured driver's bundled `inference_auth:`
+/// block, or refuses the launch with [`RuntimeError::DriverDeclaresNoInferenceAuth`].
+///
+/// `None` for `transport: process`, for no inference, and for a driver that is not among the staged
+/// artifacts — dispatch already refuses that one by name. The refusal depends on the declaration
+/// alone, never on whether `inference.api_key` is set.
+fn stage_inference_gateway(
+    inference: Option<&InferenceConfig>,
+    installed_manifests: &[(String, String)],
+    installed_artifacts: &[InstalledArtifactSummary],
+) -> Result<Option<Arc<InferenceGateway>>, RuntimeError> {
+    let Some(inference) = inference.filter(|inference| inference.transport == "http") else {
+        return Ok(None);
+    };
+    let (Some(driver), Some(endpoint)) = (inference.driver.as_ref(), inference.endpoint.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some((_, manifest_yaml)) = installed_manifests
+        .iter()
+        .find(|(name, _)| *name == driver.artifact)
+    else {
+        return Ok(None);
+    };
+    let refuse = |reason: Option<String>| RuntimeError::DriverDeclaresNoInferenceAuth {
+        name: driver.artifact.clone(),
+        version: installed_artifacts
+            .iter()
+            .find(|artifact| artifact.name == driver.artifact)
+            .map(|artifact| artifact.version.clone())
+            .unwrap_or_default(),
+        reason,
+    };
+    let auth = match murmur_artifact::parse_inference_auth(manifest_yaml) {
+        Ok(Some(auth)) => auth,
+        Ok(None) => return Err(refuse(None)),
+        Err(err) => return Err(refuse(Some(err.to_string()))),
+    };
+    InferenceGateway::new(
+        driver.artifact.clone(),
+        endpoint,
+        auth,
+        inference.api_key.clone(),
+    )
+    .map(|gateway| Some(Arc::new(gateway)))
+}
+
 /// Borrowed half of a WASM tool invocation environment: everything
 /// [`invoke_tool_component`] needs that is neither the component nor the A2A
 /// wiring. Grouped into a struct so the hook runtime can assemble one from its
@@ -4342,6 +4492,9 @@ pub(crate) struct ToolInvokeEnv<'a> {
     /// no `capabilities:` block on the entry — means the ceiling applies untouched and the
     /// whole `accessible_workdir` is preopened, exactly as before narrowing existed.
     pub(crate) artifact_grant: Option<&'a ToolCapabilityGrant>,
+    /// The session's inference gateway, attached to this store only when `name` is the driver it
+    /// was built for.
+    pub(crate) inference_gateway: Option<&'a Arc<InferenceGateway>>,
 }
 
 /// Per-session A2A wiring registered on a tool linker.
@@ -4397,6 +4550,7 @@ pub(crate) async fn invoke_tool_component(
         capability_policy,
         network_allow_rules,
         artifact_grant,
+        inference_gateway,
     } = env;
     let ToolA2aWiring {
         sse: a2a_sse,
@@ -4532,6 +4686,7 @@ pub(crate) async fn invoke_tool_component(
         http: WasiHttpCtx::new(),
         http_hooks: NetworkPolicyHooks {
             network_allow_rules: effective_network_rules.to_vec(),
+            inference_gateway: gateway_for_store(inference_gateway, name),
         },
     };
 
@@ -4624,6 +4779,7 @@ impl CapsuleStoreState {
                 // anything pulled in at runtime via `manage.pull()` (which has no operator
                 // manifest entry to narrow from) — both keep the full ceiling.
                 artifact_grant: self.artifact_grants.get(name),
+                inference_gateway: self.inference_gateway.as_ref(),
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -8633,6 +8789,7 @@ inference:
             http: WasiHttpCtx::new(),
             http_hooks: NetworkPolicyHooks {
                 network_allow_rules: Vec::new(),
+                inference_gateway: None,
             },
             network_allow_rules: Vec::new(),
             peer_fetch_rules: Vec::new(),
@@ -8643,6 +8800,7 @@ inference:
             plan_counter: AtomicU64::new(0),
             delegation: None,
             inference_env: Vec::new(),
+            inference_gateway: None,
             engine,
             workdir: workdir.clone(),
             accessible_workdir: workdir,
@@ -9815,6 +9973,7 @@ inference:
 
         let mut hooks = NetworkPolicyHooks {
             network_allow_rules: rules.to_vec(),
+            inference_gateway: None,
         };
         let body = Empty::<bytes::Bytes>::new()
             .map_err(|err| match err {})
@@ -9832,6 +9991,132 @@ inference:
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async { hooks.send_request(request, config).is_ok() })
+    }
+
+    fn gateway_test_config() -> wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+        wasmtime_wasi_http::p2::types::OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: std::time::Duration::from_millis(1),
+            first_byte_timeout: std::time::Duration::from_millis(1),
+            between_bytes_timeout: std::time::Duration::from_millis(1),
+        }
+    }
+
+    /// A tool store that is not the configured driver's gets no gateway, so its request to the
+    /// gateway authority is an ordinary allow-list-checked request — denied here — and is never
+    /// rewritten or given the key.
+    #[test]
+    fn gateway_is_driver_only() {
+        use http_body_util::{BodyExt, Empty};
+
+        const KEY: &str = "sk-s8-6e08b3d7";
+        let gateway = Arc::new(
+            InferenceGateway::new(
+                "the-driver",
+                "http://127.0.0.1:1",
+                murmur_artifact::InferenceAuth {
+                    header: "x-api-key".to_string(),
+                    value: "{key}".to_string(),
+                },
+                Some(KEY.to_string()),
+            )
+            .unwrap(),
+        );
+        assert!(gateway_for_store(Some(&gateway), "the-driver").is_some());
+        assert!(gateway_for_store(Some(&gateway), "other-tool").is_none());
+
+        let mut hooks = NetworkPolicyHooks {
+            network_allow_rules: Vec::new(),
+            inference_gateway: gateway_for_store(Some(&gateway), "other-tool"),
+        };
+        let request = hyper::Request::builder()
+            .uri("http://127.0.0.1:9/")
+            .body(
+                Empty::<bytes::Bytes>::new()
+                    .map_err(|err| match err {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let Err(denied) = rt.block_on(async { hooks.send_request(request, gateway_test_config()) })
+        else {
+            panic!("a non-driver store's request to the gateway authority is denied");
+        };
+        assert!(matches!(
+            denied.downcast_ref(),
+            Some(WasiHttpErrorCode::HttpRequestDenied)
+        ));
+        assert!(!format!("{denied:?}").contains(KEY));
+    }
+
+    fn http_inference(endpoint: &str, api_key: Option<&str>) -> InferenceConfig {
+        InferenceConfig {
+            transport: "http".to_string(),
+            endpoint: Some(endpoint.to_string()),
+            model: "test-model".to_string(),
+            api_key: api_key.map(str::to_string),
+            driver: Some(murmur_artifact::InferenceDriver {
+                artifact: "the-driver".to_string(),
+                config: None,
+            }),
+            command: None,
+            compaction: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            system_prompt_artifact: None,
+            max_turns: 10,
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn inference_env_pairs_never_carries_the_api_key() {
+        const KEY: &str = "sk-s7-6e08b3d7";
+        let inference = http_inference("https://api.moonshot.ai/v1", Some(KEY));
+        let gateway = InferenceGateway::new(
+            "the-driver",
+            "https://api.moonshot.ai/v1",
+            murmur_artifact::InferenceAuth {
+                header: "Authorization".to_string(),
+                value: "Bearer {key}".to_string(),
+            },
+            inference.api_key.clone(),
+        )
+        .unwrap();
+        for pairs in [
+            inference_env_pairs(&inference, Some(&gateway)),
+            inference_env_pairs(&inference, None),
+        ] {
+            assert!(pairs
+                .iter()
+                .all(|(name, value)| name != "MURMUR_INFERENCE_API_KEY" && !value.contains(KEY)));
+        }
+        let pairs = inference_env_pairs(&inference, Some(&gateway));
+        assert!(pairs.contains(&(
+            "MURMUR_INFERENCE_ENDPOINT".to_string(),
+            "http://127.0.0.1:9/v1".to_string()
+        )));
+    }
+
+    #[test]
+    fn inference_endpoint_allow_entries_names_only_entries_matching_the_endpoint() {
+        let allow = vec![
+            "api.anthropic.com".to_string(),
+            "https://api.anthropic.com".to_string(),
+            "http://api.anthropic.com".to_string(),
+            "example.com".to_string(),
+        ];
+        let inference = http_inference("https://api.anthropic.com", None);
+        assert_eq!(
+            inference_endpoint_allow_entries(&allow, Some(&inference)),
+            vec!["api.anthropic.com", "https://api.anthropic.com"]
+        );
+        let process = InferenceConfig {
+            transport: "process".to_string(),
+            endpoint: None,
+            ..inference
+        };
+        assert!(inference_endpoint_allow_entries(&allow, Some(&process)).is_empty());
     }
 
     /// The no-op invariant, network half: a tool with no per-artifact entry dispatches on the
@@ -10005,6 +10290,7 @@ inference:
                     capability_policy: &CapabilityPolicy::default(),
                     network_allow_rules: &ceiling,
                     artifact_grant: Some(&grant),
+                    inference_gateway: None,
                 },
                 ToolA2aWiring::silent(),
                 "scoped-tool",
@@ -10047,6 +10333,7 @@ inference:
                     capability_policy: &CapabilityPolicy::default(),
                     network_allow_rules: &ceiling,
                     artifact_grant: None,
+                    inference_gateway: None,
                 },
                 ToolA2aWiring::silent(),
                 "plain-tool",

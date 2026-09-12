@@ -32,11 +32,6 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     inference:
       transport: http
       endpoint: https://api.anthropic.com
@@ -67,11 +62,6 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -101,11 +91,6 @@ Create a `murmur.yaml` file. Add `murmur-tool-request-input` to `artifacts` with
       - name: murmur-tool-request-input
         version: "{{ v.murmur_tool_request_input }}"
         runtime: tool
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     inference:
       transport: http

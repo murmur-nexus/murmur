@@ -46,11 +46,6 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
-
     network:
       internal_port: 52222
 
@@ -79,11 +74,6 @@ Create `worker/murmur.yaml`:
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     network:
       internal_port: 52222
 
@@ -111,11 +101,6 @@ Create `worker/murmur.yaml`:
       - name: murmur-driver-deepseek
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
 
     network:
       internal_port: 52222
@@ -191,7 +176,6 @@ Create `orchestrator/murmur.yaml`:
     capabilities:
       network:
         allow:
-          - https://api.anthropic.com
           - localhost:52222
 
     inference:
@@ -217,7 +201,6 @@ Create `orchestrator/murmur.yaml`:
     capabilities:
       network:
         allow:
-          - https://api.openai.com
           - localhost:52222
 
     inference:
@@ -243,7 +226,6 @@ Create `orchestrator/murmur.yaml`:
     capabilities:
       network:
         allow:
-          - https://api.deepseek.com
           - localhost:52222
 
     inference:

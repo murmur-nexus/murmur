@@ -7,7 +7,6 @@ The relevant manifest options are:
 | Option | Controls |
 |---|---|
 | [artifacts[].runtime](../reference/manifest.md#field-artifacts) | Whether a declared artifact is a driver, tool, hook, or skill |
-| [capabilities.network.allow](../reference/manifest.md#field-capabilities) | Which hosts the capsule may reach |
 | [inference.driver.artifact](../reference/manifest.md#field-inference) | Which driver artifact performs the model calls |
 | [inference.model](../reference/manifest.md#field-inference) | Which model the driver calls |
 
@@ -27,11 +26,6 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
       - name: murmur-driver-anthropic
         version: "{{ v.murmur_driver_anthropic }}"
         runtime: driver
-
-    capabilities:
-      network:
-        allow:
-          - https://api.anthropic.com
 
     inference:
       transport: http
@@ -53,11 +47,6 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
         version: "{{ v.murmur_driver_openai }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.openai.com
-
     inference:
       transport: http
       endpoint: https://api.openai.com
@@ -78,11 +67,6 @@ Create a `murmur.yaml` file. A minimal agent capsule declares its identity, one 
         version: "{{ v.murmur_driver_deepseek }}"
         runtime: driver
 
-    capabilities:
-      network:
-        allow:
-          - https://api.deepseek.com
-
     inference:
       transport: http
       endpoint: https://api.deepseek.com
@@ -98,7 +82,7 @@ The `api_key` field reads from the environment at run time. Export your provider
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-This manifest is the entire contract. The capsule can call the one host listed under `capabilities.network.allow` and nothing else — no shell, no filesystem, no other network destinations, because none are declared.
+This manifest is the entire contract. The capsule reaches its inference provider through the runtime, which holds the API key, and nothing else — no shell, no filesystem, no network destinations, because none are declared.
 
 ---
 

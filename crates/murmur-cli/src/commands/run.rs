@@ -354,6 +354,14 @@ pub(crate) fn run_run(
         lifecycle_override.as_ref(),
     );
 
+    // Same seam, same reasons: the runtime reaches the provider itself, so an allow-list entry
+    // naming the inference endpoint no longer serves inference, and what it does still grant
+    // should be said before `--explain-scope` returns. Never a refusal.
+    capsule_runtime::warn_on_inference_endpoint_in_network_allow(
+        &capability_policy,
+        runtime_manifest.inference.as_ref(),
+    );
+
     // The same set, and the same checker, `stage_session` consults — called here only because the
     // installed-artifact pre-flight below would otherwise report a colliding name as a missing
     // artifact, sending the operator to `mur install` for something no registry may serve. Placed
