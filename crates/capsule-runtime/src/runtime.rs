@@ -1236,16 +1236,19 @@ pub fn launch_session(
 
         let capsule_url = format!("localhost:{external_port}");
         staged.capsule_url = capsule_url.clone();
-        on_url(&capsule_url);
 
         // The one place in the runtime that knows where this session's door is, so the one place
         // the record can be written. A guard rather than a line at each return: `loop_result?`
         // and both success returns below end the session, and a record that outlived its session
         // would resolve an address onto a port nothing holds.
         //
+        // Written before `on_url` announces the door: a caller that sees the URL and runs
+        // `mur ps` or addresses the session must find the record already there.
+        //
         // Only the agent path reaches here. A script capsule binds nothing and is never
         // addressable, so it records nothing.
         let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
+        on_url(&capsule_url);
 
         let capsule_identity = CapsuleIdentity {
             capsule_name: staged.capsule_name.clone(),
