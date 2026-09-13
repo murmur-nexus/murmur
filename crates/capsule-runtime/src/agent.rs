@@ -536,7 +536,7 @@ pub(crate) async fn run_agent_loop(
                         signal.note_phase(PHASE_INFERENCE);
                         None
                     }
-                    dispatched = store_state.dispatch_tool_async(
+                    dispatched = store_state.dispatch_driver_async(
                         driver_name,
                         ToolInput {
                             data: Some(payload_json),
@@ -547,7 +547,7 @@ pub(crate) async fn run_agent_loop(
             }
             None => Some(
                 store_state
-                    .dispatch_tool_async(
+                    .dispatch_driver_async(
                         driver_name,
                         ToolInput {
                             data: Some(payload_json),

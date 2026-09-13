@@ -785,6 +785,7 @@ fn process_transport_warns_under_machine_ceiling() {
 
         for line in lines.iter().chain(&doctor_lines) {
             assert!(line.contains(W_SEC_026_LINK), "{line}");
+            assert!(line.contains("spend.machine_tokens_per_day"), "{line}");
             assert!(line.contains("transport: process"), "{line}");
         }
     }

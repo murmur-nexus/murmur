@@ -142,7 +142,7 @@ moment it is reached.
 | Covered | Not covered |
 |---|---|
 | Runs whose `HOME` shares this `~/.murmur` — in practice, one user account | Other user accounts on the same host |
-| Runs launched with the ceiling in effect | A run launched without it: it writes no ledger lines and is not counted |
+| Sessions started by `mur run`, including delegated children, with the ceiling in effect | Sessions started by `mur eval run` or `mur new`, and any run launched without the ceiling in effect: they write no ledger lines and are not counted |
 | `transport: http` capsules | `transport: process` capsules, whose CLI reaches its provider with its own credentials — see [`W-SEC-026`](diagnostics.md#w-sec-026) |
 | A `~/.murmur` on a local filesystem | A `~/.murmur` on NFS, where the atomicity of appends the ledger relies on does not hold |
 

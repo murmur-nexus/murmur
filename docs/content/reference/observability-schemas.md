@@ -499,7 +499,7 @@ driver call before it is sent
 
 No `inference` line accompanies it: nothing was sent. A `"session"` refusal latches, so every later
 driver call in the session writes one of these too; a `"machine"` refusal is checked again on every
-call. `used + requested > ceiling` on every line.
+call.
 
 **`hook_dispatch_error`** — written when a hook call fails in a way the session survives
 

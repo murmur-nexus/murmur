@@ -438,7 +438,7 @@ is counted in cannot be used: `HOME` is unset, `~/.murmur/spend` cannot be creat
 at staging, before the session directory exists and before any provider request.
 
 ```text
-error[E-RUN-026]: spend ledger at /home/me/.murmur/spend is unavailable: /home/me/.murmur/spend exists and is not a directory
+error[E-RUN-026]: spend ledger at /home/me/.murmur/spend is unavailable: failed to create the directory: File exists (os error 17)
   hint: spend.machine_tokens_per_day is set in config.yaml, and the machine spend ceiling cannot be kept without its ledger; make ~/.murmur/spend a directory this user can write, or remove spend.machine_tokens_per_day
 ```
 

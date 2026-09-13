@@ -852,14 +852,13 @@ pub fn stage_session(
         });
     }
 
-    // Before `dispatch_stage` runs any on-stage hook and before the session directory exists: a
-    // `transport: http` driver that does not say how its provider takes the key could only be run
-    // by handing it the key, so the launch is refused here rather than at the first turn.
-    // Minted here rather than beside the workdir it names, because the spend ledger records it.
+    // Minted before the spend meter rather than beside the workdir it names: the ledger records it.
     let session_id = generate_session_id();
 
-    // Same seam, same reason: a machine ceiling that cannot be kept refuses the launch before any
-    // provider request and before the session directory exists.
+    // Before `dispatch_stage` runs any on-stage hook and before the session directory exists: a
+    // machine ceiling that cannot be kept, or a `transport: http` driver that does not say how its
+    // provider takes the key (it could only be run by handing it the key), refuses the launch here
+    // rather than at the first turn.
     let spend = stage_spend_meter(
         request.inference.as_ref(),
         request.machine_tokens_per_day,
@@ -3949,9 +3948,10 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     ) -> HttpResult<HostFutureIncomingResponse> {
         if let Some(gateway) = self.inference_gateway.as_ref() {
             if InferenceGateway::is_addressed_to_gateway(request.uri()) {
-                // Admission is what makes a keyed request possible at all: a driver invocation
-                // that reached here without one — a guest calling the driver by name as a tool —
-                // is refused before the key is attached.
+                // Refused before the key is attached unless some admission is open. The check is
+                // session-wide, not per-request: it holds only because the gateway is attached to
+                // the agent loop's driver dispatch and hooks' `run-inference`, both of which admit
+                // first, and never to a driver reached by name through tool dispatch.
                 if !gateway.spend.has_open_admission() {
                     return Err(wasmtime_wasi_http::p2::HttpError::from(
                         WasiHttpErrorCode::HttpRequestDenied,
@@ -4025,8 +4025,9 @@ pub(crate) struct CapsuleStoreState {
     /// anything the model wrote, so a plan `id` reaches no path.
     pub(crate) plan_counter: AtomicU64,
     pub(crate) inference_env: Vec<(String, String)>,
-    /// Moved over from [`StagedSession::inference_gateway`]. Handed to every tool dispatch, and
-    /// attached by [`invoke_tool_component`] only to the configured driver's store.
+    /// Moved over from [`StagedSession::inference_gateway`]. Handed only to
+    /// [`Self::dispatch_driver_async`], and attached by [`invoke_tool_component`] only to the
+    /// configured driver's store.
     pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
     /// Moved over from [`StagedSession::spend`]. The agent loop admits every driver turn against
     /// it; hooks' `run-inference` and the gateway hold clones of the same account.
@@ -4617,8 +4618,8 @@ impl ToolA2aWiring {
 /// `murmur:tool/run@0.1.0#run` export.
 ///
 /// This is the single WASM-tool (and therefore inference-driver) invocation
-/// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] is a thin
-/// wrapper that fills `env`/`a2a` from the capsule store; a hook's
+/// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] and
+/// [`CapsuleStoreState::dispatch_driver_async`] are thin wrappers that fill `env`/`a2a` from the capsule store; a hook's
 /// `run-inference` host import fills them from its own owned copies. Neither
 /// duplicates any part of the instantiate/type-check/call sequence below.
 pub(crate) async fn invoke_tool_component(
@@ -4844,11 +4845,33 @@ fn fence_tool_result(name: &str, result: &mut murmur::tool::run::ToolResult) {
 }
 
 impl CapsuleStoreState {
-    /// Async WASM tool dispatch — used by the agent loop for drivers and WASM tools.
+    /// Async WASM tool dispatch for a guest's `invoke` and the model's tool calls. Never carries the
+    /// inference gateway: a driver reached by name here gets no keyed route to its provider, and
+    /// so cannot spend outside an admission.
     pub(crate) async fn dispatch_tool_async(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        self.dispatch_component_async(name, input, None).await
+    }
+
+    /// The agent loop's driver turn: the one dispatch the inference gateway is attached to, and
+    /// only under the spend admission the loop opened for it.
+    pub(crate) async fn dispatch_driver_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        self.dispatch_component_async(name, input, self.inference_gateway.as_ref())
+            .await
+    }
+
+    async fn dispatch_component_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        inference_gateway: Option<&Arc<InferenceGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -4864,7 +4887,7 @@ impl CapsuleStoreState {
                 // anything pulled in at runtime via `manage.pull()` (which has no operator
                 // manifest entry to narrow from) — both keep the full ceiling.
                 artifact_grant: self.artifact_grants.get(name),
-                inference_gateway: self.inference_gateway.as_ref(),
+                inference_gateway,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
