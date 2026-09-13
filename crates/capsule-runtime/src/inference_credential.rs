@@ -7,8 +7,8 @@
 //! re-reads it, so `mur config set -g credentials.NAME` reaches a running capsule on its next
 //! request. A value from the environment or written literally in the manifest is read once.
 //!
-//! Only the `mur` runtime process reads the credentials file — never a guest, tool or subprocess.
-//! Nothing here writes a value, a hash of one, its length or any prefix to the trace, stderr, an
+//! The credentials file is read by the runtime itself; no guest, tool or shell subprocess is handed
+//! its path or its contents. Nothing here writes a value, a hash of one, its length or any prefix to the trace, stderr, an
 //! error or `Debug` output.
 
 use std::{

@@ -3088,14 +3088,6 @@ fn read_task(workdir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
-///
-/// The single result-text write funnel for both transports: every terminal arm of
-/// [`run_agent_loop`] and both dialect readers in [`process`] call this, and [`write_result`]
-/// has no other caller. That is what makes `murmur:task-io/read`'s `read-output` serve exactly
-/// what the loop produced. A terminal path that returns `Err` without producing result text
-/// never reaches here, and the output stays unset — the truthful pairing with the
-/// `exit-status: failed` the hook sees.
 /// A credential rejection the gateway recorded for the request a driver just failed, reported as
 /// `E-RUN-026` with its hint, or `None` when there is none.
 ///
@@ -3109,6 +3101,15 @@ fn credential_failure(store_state: &CapsuleStoreState) -> Option<String> {
         .and_then(|credential| credential.report_rejection())
 }
 
+/// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
+///
+/// The single result-text write funnel for both transports: every terminal arm of
+/// [`run_agent_loop`] and both dialect readers in [`process`] call this. That is what makes
+/// `murmur:task-io/read`'s `read-output` serve exactly what the loop produced. [`write_result`]
+/// has one other caller: a hook's `run-inference` that ends in a credential rejection writes
+/// `out/result.txt` directly, without recording task output. A terminal path that returns `Err`
+/// without producing result text never reaches here, and the output stays unset — the truthful
+/// pairing with the `exit-status: failed` the hook sees.
 fn record_result(hooks: &HookRuntime, workdir: &Path, value: &str) -> Result<(), String> {
     hooks.record_task_output(value);
     write_result(workdir, value)

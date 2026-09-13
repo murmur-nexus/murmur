@@ -703,6 +703,43 @@ fn launch_only_credential_warns() {
     }
 }
 
+/// S9 through the binary: `mur config set -g credentials.NAME` confirms without the value, and
+/// setting the `inference.api_key` scalar prints the note pointing at `credentials.<NAME>`.
+#[test]
+fn config_set_confirms_the_credential_without_its_value() {
+    let home = TempDir::new().unwrap();
+    let mur = |args: &[&str]| {
+        let output = Command::new(assert_cmd::cargo::cargo_bin("mur"))
+            .env("HOME", home.path())
+            .current_dir(home.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    let (stdout, stderr) = mur(&["config", "set", "-g", &format!("credentials.{NAME}"), OLD]);
+    assert_eq!(
+        stdout.trim(),
+        format!("Set credentials.{NAME} in ~/.murmur/config.yaml")
+    );
+    assert!(
+        !stdout.contains(OLD) && !stderr.contains(OLD),
+        "{stdout}{stderr}"
+    );
+
+    let (_, stderr) = mur(&["config", "set", "-g", "inference.api_key", LITERAL]);
+    assert!(
+        stderr.contains("note: mur run does not read inference.api_key"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("credentials.<NAME>"), "{stderr}");
+}
+
 /// S5: a credential held nowhere refuses the launch before anything is sent or created.
 #[test]
 fn missing_credential_refuses_before_launch() {

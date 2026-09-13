@@ -35,7 +35,7 @@ terminates at `session_start`. The tree is session → task → turn → the tur
 | `inference` (a hook's, carrying `origin`), `tool_call`, `skill_call`, `shell`, `shell_detached`, `shell_detach_unrecorded`, `compaction`, `compaction_declined` | The turn node, falling back to the task node and then the session node |
 | `call_denied`, `protected_path_denied` | The turn node, falling back to the task node and then the session node |
 | `session_end`, `a2a_task_received`, `a2a_send`, `hook_dispatch_error`, `retention` | The session node |
-| `inference_credential` | The session node — written when the gateway sends, from outside the turn |
+| `inference_credential` | The session node — written as the inference request is sent, outside any turn |
 | `shell_completed`, `shell_abandoned` | The session node — by the time either lands, the turn that started the command is over |
 | `shell_lost` | The `session_start` node of the session named in `session_id`, which is the session that started the command and not the one that wrote the line |
 | `resource_list`, `resource_read`, `peer_handle_mint`, `peer_handle_redeem`, `peer_file_fetch`, `delegation_start`, `delegation` | The session node |
@@ -111,7 +111,7 @@ be read, at the moment it happens.
 | `source` | string | `"config"` \| `"environment"` \| `"manifest"` — as `session_start.credential_source` |
 | `credential` | string | The credential name `inference.api_key: ${NAME}` referenced. Absent for a manifest literal |
 | `change` | string | `"rotated"` — a re-read found a different key; `"rejected"` — the provider answered `401` and the rejection stood; `"unreadable"` — the config file or its entry could not supply a key, and the last key read stays in use |
-| `trigger` | string | `"file_changed"` — the config file's stamp changed before a request; `"rejection"` — the re-read after a `401`. Only with `change: "rotated"` |
+| `trigger` | string | `"file_changed"` — the config file changed before a request; `"rejection"` — the re-read after a `401`. Only with `change: "rotated"` |
 | `status` | u16 | The provider's status, `401`. Only with `change: "rejected"` |
 | `retried` | bool | `true` when the rejected request was the one resend made with a re-read key. Only with `change: "rejected"` |
 | `reason` | string | `"missing"`, `"unreadable"`, `"unparseable"`, `"no_entry"` or `"empty_entry"`. Only with `change: "unreadable"`, which is written once per state of the file |

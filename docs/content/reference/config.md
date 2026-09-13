@@ -124,9 +124,8 @@ mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
 #### Rotating a key { #credentials-rotation }
 
 A replaced entry takes effect on the next inference request that any running capsule sends. Nothing
-restarts. Before each request that carries the key, the runtime stats the config file, with no
-timer. It re-reads the file only when the file's device, inode, size, modification time or change
-time differ from the last read.
+restarts. Before each request that carries the key, the runtime checks whether the config file has
+changed — its inode, size or timestamps — and re-reads it only then.
 
 | Change | When a running capsule uses it |
 |---|---|
