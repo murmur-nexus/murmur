@@ -392,17 +392,30 @@ fn run_with_env_allowlist_passes_declared_host_var_to_guest() {
     );
 }
 
+/// Declaring a name the credential backstop strips is refused before launch with `E-CAP-016`,
+/// and the host's value appears nowhere in the refusal.
 #[test]
-fn run_with_env_allowlisted_credential_var_is_still_stripped() {
-    let result = run_env_echo(
+fn run_with_env_allowlisted_credential_var_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let manifest_path = create_project(
+        project.path(),
+        "capsule-env-echo.wasm",
+        &format!("  - name: {TOOL_NAME}\n    version: {TOOL_VERSION}\n"),
         Some("  env:\n    allow:\n      - GITHUB_TOKEN\n"),
-        &[("GITHUB_TOKEN", "leaked-token")],
     );
 
-    assert!(
-        result.contains("GITHUB_TOKEN=absent"),
-        "credential backstop did not override the allowlist: {result}"
-    );
+    let stderr = String::from_utf8(
+        common::run_capsule_with_env(&home, &manifest_path, &[("GITHUB_TOKEN", "leaked-token")])
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+
+    assert!(stderr.contains("E-CAP-016"), "stderr was: {stderr}");
+    assert!(!stderr.contains("leaked-token"), "stderr was: {stderr}");
 }
 
 #[test]
