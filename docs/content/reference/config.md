@@ -125,20 +125,19 @@ mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
 #### Rotating a key { #credentials-rotation }
 
 A replaced entry takes effect on the next inference request that any running capsule sends. Nothing
-restarts. Before each request that carries the key, the runtime checks whether the config file has
-changed — its inode, size or timestamps — and re-reads it only then.
+restarts. Before each request that carries the key, the runtime reads the entry from the config
+file, however the file was last written.
 
 | Change | When a running capsule uses it |
 |---|---|
-| `mur config set -g credentials.NAME <key>` | The next request. The command replaces the file by rename, so the inode always changes |
-| A hand edit that changes the file's size or timestamps | The next request |
-| An in-place hand edit that keeps the size within one filesystem timestamp tick | The next change to the file, or the next `401` |
+| `mur config set -g credentials.NAME <key>`, or any hand edit, in place or by rename | The next request that reads the file after the write completes. This is the worst case for every way of writing the file |
+| A request that reads the file while an editor is part-way through saving it | That request uses the last key read, and the trace records `unreadable`. The next request uses the saved key |
 | Removing the entry, or the file becoming missing or unparseable | Never. The capsule keeps the last key it read, and the trace records `change: "unreadable"` once for that state of the file |
 
 Removing an entry does not revoke a running capsule's key; replacing it does.
 
-When the provider answers `401`, the runtime re-reads the file at once, whatever its timestamps
-say. A changed value is sent in one resend of the same request, and that response goes to the
+When the provider answers `401`, the runtime reads the file again before deciding whether to
+resend. A changed value is sent in one resend of the same request, and that response goes to the
 driver whatever its status. An unchanged value is not resent. A `401` that stands ends the task with
 [`E-RUN-027`](diagnostics.md#e-run-027). Every rotation and rejection is recorded in the session
 trace as an [`inference_credential`](observability-schemas.md#inference-credential) event, which

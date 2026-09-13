@@ -113,10 +113,10 @@ be read, at the moment it happens.
 | `source` | string | `"config"` \| `"environment"` \| `"manifest"` — as `session_start.credential_source` |
 | `credential` | string | The credential name `inference.api_key: ${NAME}` referenced. Absent for a manifest literal |
 | `change` | string | `"rotated"` — a re-read found a different key; `"rejected"` — the provider answered `401` and the rejection stood; `"unreadable"` — the config file or its entry could not supply a key, and the last key read stays in use |
-| `trigger` | string | `"file_changed"` — the config file changed before a request; `"rejection"` — the re-read after a `401`. Only with `change: "rotated"` |
+| `trigger` | string | `"file_changed"` — the config file held a different key when a request read it; `"rejection"` — the re-read after a `401`. Only with `change: "rotated"` |
 | `status` | u16 | The provider's status, `401`. Only with `change: "rejected"` |
 | `retried` | bool | `true` when the rejected request was the one resend made with a re-read key. Only with `change: "rejected"` |
-| `reason` | string | `"missing"`, `"unreadable"`, `"unparseable"`, `"no_entry"` or `"empty_entry"`. Only with `change: "unreadable"`, which is written once per state of the file |
+| `reason` | string | `"missing"`, `"unreadable"`, `"unparseable"`, `"no_entry"` or `"empty_entry"`. Only with `change: "unreadable"`, which is written once per state of the file and reason |
 
 No field carries the key, a hash of it, its length or any part of it. See
 [Rotating a key](config.md#credentials-rotation).

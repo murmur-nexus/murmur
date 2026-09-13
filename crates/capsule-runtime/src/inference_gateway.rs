@@ -164,11 +164,11 @@ impl InferenceGateway {
     /// Sends one driver request to the provider and returns the provider's response unbuffered.
     ///
     /// The request carries the credential's current value. When the provider answers `401`, the
-    /// credential is re-read whatever its file stamp says; a value different from the one sent is
-    /// attached to a single resend of the same bytes, and that response is returned whatever its
-    /// status. An unchanged value is not resent — the same key cannot get a different answer — and
-    /// the `401` is recorded as a rejection, as is a `401` to the resend. No other status is
-    /// looked at.
+    /// credential is read again, since its source may have changed after the request read it; a
+    /// value different from the one sent is attached to a single resend of the same bytes, and that
+    /// response is returned whatever its status. An unchanged value is not resent — the same key
+    /// cannot get a different answer — and the `401` is recorded as a rejection, as is a `401` to
+    /// the resend. No other status is looked at.
     pub(crate) async fn send(
         self: Arc<Self>,
         request: hyper::Request<HyperOutgoingBody>,

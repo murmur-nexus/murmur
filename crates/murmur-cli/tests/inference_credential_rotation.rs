@@ -518,6 +518,69 @@ fn rotation_reaches_a_running_capsule() {
     assert_eq!(run.session_start()["credential_source"], "config");
 }
 
+/// A key overwritten in place — same inode, same length, no rename — while the capsule waits on its
+/// first reply is the key its second request carries.
+#[test]
+fn in_place_edit_reaches_a_running_capsule() {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
+
+    assert_eq!(OLD.len(), NEW.len());
+    let upstream = Upstream::start(&[0], |index, _| {
+        (200, if index == 0 { TOOL_USE } else { END_TURN })
+    });
+    let capsule = Capsule::new(&upstream, ApiKey::Reference, "");
+    capsule.set_credential(OLD);
+    let child = capsule.spawn_run(None);
+    upstream.wait_for(1);
+
+    let config = capsule.config_path();
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        (metadata.dev(), metadata.ino(), metadata.len())
+    };
+    let before = identity(&config);
+    let offset = fs::read(&config)
+        .unwrap()
+        .windows(OLD.len())
+        .position(|window| window == OLD.as_bytes())
+        .expect("the config holds the old key");
+    let mut file = fs::OpenOptions::new().write(true).open(&config).unwrap();
+    file.seek(SeekFrom::Start(offset as u64)).unwrap();
+    file.write_all(NEW.as_bytes()).unwrap();
+    let written = Instant::now();
+    drop(file);
+    assert_eq!(identity(&config), before, "dev, inode and length unchanged");
+
+    upstream.release(0);
+    let run = Run::of(child.wait_with_output().unwrap());
+    assert!(run.ok(), "{}", run.context());
+
+    let requests = upstream.requests();
+    assert_eq!(requests.len(), 2, "{}", run.context());
+    for (index, request) in requests.iter().enumerate() {
+        println!("request {} x-api-key: {}", index + 1, label(request.key()));
+    }
+    assert_eq!(requests[0].key(), OLD);
+    assert_eq!(requests[1].key(), NEW);
+    assert!(requests
+        .iter()
+        .filter(|request| request.arrived > written)
+        .all(|request| request.key() != OLD));
+    println!(
+        "in-place write -> request 2 arrival: {} ms",
+        requests[1].arrived.duration_since(written).as_millis()
+    );
+
+    let events = run.credential_events();
+    println!("inference_credential events: {events:?}");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["change"], "rotated");
+    assert_eq!(events[0]["trigger"], "file_changed");
+    assert_eq!(events[0]["source"], "config");
+    assert_eq!(events[0]["credential"], NAME);
+}
+
 /// S2: a `401` after the config changed is answered by one resend of the same bytes with the new
 /// key, and the session never sees the rejection.
 #[test]
