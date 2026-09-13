@@ -93,6 +93,9 @@ pub(crate) struct TraceWriter {
     task_shell_calls: u32,
     task_start_instant: Option<Instant>,
     pub(crate) active_task_id: Option<String>,
+    /// The spend ceilings `session_start` records. Set by [`Self::set_spend_ceilings`].
+    max_session_tokens: Option<u64>,
+    machine_tokens_per_day: Option<u64>,
 }
 
 /// Provenance of an inference record that did **not** come from the agent
@@ -196,6 +199,12 @@ struct SessionStartEvent {
     capsule_version: String,
     model: String,
     max_turns: u32,
+    /// `inference.max_session_tokens` as this session enforces it. Always written, `null` when
+    /// no session ceiling applies.
+    max_session_tokens: Option<u64>,
+    /// `spend.machine_tokens_per_day` when this session keeps the machine ledger. Always written,
+    /// `null` when the machine ceiling does not cover this session.
+    machine_tokens_per_day: Option<u64>,
     capabilities: Vec<String>,
     tools_declared: Vec<String>,
     /// Strongest containment class any source asked for. A *requirement*, not an observation.
@@ -862,6 +871,24 @@ struct TaskReopenedEvent {
     reopen_number: u32,
 }
 
+/// A spend ceiling refused a driver call before it was sent. No `inference` line accompanies it,
+/// because no call was made.
+#[derive(Serialize)]
+struct SpendCeilingReachedEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    turn: u32,
+    task_id: Option<String>,
+    #[serde(flatten)]
+    refusal: &'a crate::spend::SpendRefusal,
+    /// `hook:<name>` for a hook's `run-inference` call; absent for an agent-loop turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a str>,
+}
+
 /// A policy hook refused a call before it ran. The one record that says a call the model asked
 /// for never happened — there is no `tool_call` or `shell` line for a denied call, because
 /// nothing ran.
@@ -1243,7 +1270,19 @@ impl TraceWriter {
             task_shell_calls: 0,
             task_start_instant: None,
             active_task_id: None,
+            max_session_tokens: None,
+            machine_tokens_per_day: None,
         })
+    }
+
+    /// The spend ceilings this session runs under, written into every later `session_start`.
+    pub(crate) fn set_spend_ceilings(
+        &mut self,
+        max_session_tokens: Option<u64>,
+        machine_tokens_per_day: Option<u64>,
+    ) {
+        self.max_session_tokens = max_session_tokens;
+        self.machine_tokens_per_day = machine_tokens_per_day;
     }
 
     /// The session node of this writer's event tree — the `event_id` its `session_start` will
@@ -1302,6 +1341,8 @@ impl TraceWriter {
             capsule_version: self.capsule_version.clone(),
             model: self.model.clone(),
             max_turns,
+            max_session_tokens: self.max_session_tokens,
+            machine_tokens_per_day: self.machine_tokens_per_day,
             capabilities: self.capabilities.clone(),
             tools_declared,
             containment_declared: self.effective_grants.declared_containment,
@@ -1977,6 +2018,28 @@ impl TraceWriter {
             hook_name: hook_name.to_string(),
             target: target.to_string(),
             reason: reason.to_string(),
+        };
+        self.write_event(&event).await
+    }
+
+    /// Record that a spend ceiling refused a driver call before it was sent. `origin` is the
+    /// `hook:<name>` of a hook's `run-inference` call, `None` for an agent-loop turn.
+    pub(crate) async fn write_spend_ceiling_reached(
+        &mut self,
+        turn: u32,
+        refusal: &crate::spend::SpendRefusal,
+        origin: Option<&str>,
+    ) -> std::io::Result<()> {
+        let event = SpendCeilingReachedEvent {
+            event_type: "spend_ceiling_reached",
+            event_id: new_event_id(),
+            parent_id: self.turn_parent(),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            turn,
+            task_id: self.active_task_id.clone(),
+            refusal,
+            origin,
         };
         self.write_event(&event).await
     }

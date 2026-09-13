@@ -536,7 +536,7 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
     );
 
     // No --no-env-file: .env is auto-loaded, so CI_TEST_VAR is in the environment `mur run`
-    // reads the credential from. `W-SEC-026` names it — it fires only for a `${NAME}` the
+    // reads the credential from. `W-SEC-027` names it — it fires only for a `${NAME}` the
     // environment holds — and the run then stops at the uninstalled-artifact check (E-RUN-008),
     // never at the unresolved-credential refusal (E-MAN-003).
     Command::cargo_bin("mur")
@@ -547,7 +547,7 @@ fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() 
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("W-SEC-026"))
+        .stderr(predicate::str::contains("W-SEC-027"))
         .stderr(predicate::str::contains("environment variable CI_TEST_VAR"))
         .stderr(predicate::str::contains("E-MAN-003").not())
         .stderr(predicate::str::contains("E-RUN-008"))

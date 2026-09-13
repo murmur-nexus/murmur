@@ -35,6 +35,7 @@ fn stub_inference() -> Option<InferenceConfig> {
         system_prompt_artifact: None,
         max_turns: 10,
         max_tokens: None,
+        max_session_tokens: None,
     })
 }
 
@@ -83,6 +84,7 @@ fn stage_request(capsule_dir: &TempDir, manifest: &RuntimeManifest) -> StageRequ
         declared_containment_floor: ContainmentClass::Advisory,
         exports: None,
         spawn_grant: None,
+        machine_tokens_per_day: None,
     }
 }
 

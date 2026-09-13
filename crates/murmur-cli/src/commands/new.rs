@@ -144,6 +144,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
             .unwrap_or_default(),
         exports: runtime_manifest.exports.clone(),
         spawn_grant: None,
+        machine_tokens_per_day: None,
     };
 
     // Stage the session (creates workdir, installs artifacts including skill.md).

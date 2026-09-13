@@ -38,6 +38,7 @@ fn stub_inference() -> Option<InferenceConfig> {
         system_prompt_artifact: None,
         max_turns: 10,
         max_tokens: None,
+        max_session_tokens: None,
     })
 }
 
@@ -108,6 +109,7 @@ fn local_source_file_path_installs_skill_md() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap();
@@ -172,6 +174,7 @@ fn local_source_directory_path_finds_skill_md_case_insensitively() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap();
@@ -247,6 +250,7 @@ fn local_source_coexists_with_registry_skill() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap();

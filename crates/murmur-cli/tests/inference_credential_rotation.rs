@@ -32,8 +32,8 @@ const OLD: &str = "sk-rotation-old-7a41c9e2";
 const NEW: &str = "sk-rotation-new-3d82e0b5";
 const NEW2: &str = "sk-rotation-newer-b61f07d4";
 const LITERAL: &str = "sk-rotation-literal-c9e5a310";
-const W_SEC_026_LINK: &str =
-    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-026";
+const W_SEC_027_LINK: &str =
+    "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027";
 const WAIT: Duration = Duration::from_secs(120);
 
 const TOOL_USE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"test-model","content":[{"type":"tool_use","id":"toolu_skill","name":"rotation-skill","input":{}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}"#;
@@ -554,7 +554,7 @@ fn rejected_request_rereads_and_retries_once() {
     assert!(events.iter().all(|event| event["change"] != "rejected"));
 }
 
-/// S3: a rejection that re-reading does not cure ends the task as `E-RUN-026`, naming where the
+/// S3: a rejection that re-reading does not cure ends the task as `E-RUN-027`, naming where the
 /// key came from, in place of the driver's own error.
 #[test]
 fn persistent_rejection_names_the_credential_source() {
@@ -602,7 +602,7 @@ fn persistent_rejection_names_the_credential_source() {
             .expect("task_end");
         assert_eq!(task_end["exit_status"], "failed", "{}", run.context());
 
-        let error_lines = run.lines("E-RUN-026");
+        let error_lines = run.lines("E-RUN-027");
         println!("{}", error_lines.join("\n"));
         assert_eq!(error_lines.len(), 1, "{}", run.context());
         let line = error_lines[0];
@@ -663,10 +663,10 @@ fn launch_only_credential_warns() {
             ("run --explain-scope", capsule.explain_scope(env_key)),
             ("doctor", capsule.doctor(env_key)),
         ] {
-            let lines = output.lines("W-SEC-026");
+            let lines = output.lines("W-SEC-027");
             println!("{surface}: {}", lines.join("\n"));
             assert_eq!(lines.len(), 1, "{surface}: {}", output.context());
-            assert!(lines[0].contains(W_SEC_026_LINK), "{}", lines[0]);
+            assert!(lines[0].contains(W_SEC_027_LINK), "{}", lines[0]);
             assert!(lines[0].contains(names), "{}", lines[0]);
             assert!(
                 lines[0].contains("cannot pick up a rotated key until it is restarted"),
@@ -696,7 +696,7 @@ fn launch_only_credential_warns() {
         ("doctor", capsule.doctor(Some(NEW))),
     ] {
         assert!(
-            output.lines("W-SEC-026").is_empty(),
+            output.lines("W-SEC-027").is_empty(),
             "{surface}: {}",
             output.context()
         );

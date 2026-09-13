@@ -547,6 +547,8 @@ fn session_start_carries_resumed_from_and_context_id() {
             "effective_grants",
             "event_id",
             "event_type",
+            "machine_tokens_per_day",
+            "max_session_tokens",
             "max_turns",
             "model",
             "parent_id",

@@ -34,7 +34,7 @@ use wasmtime_wasi_http::p2::{
     types::{IncomingResponse, OutgoingRequestConfig},
 };
 
-use crate::{errors::RuntimeError, inference_credential::InferenceCredential};
+use crate::{errors::RuntimeError, inference_credential::InferenceCredential, spend::SpendMeter};
 
 /// The authority `MURMUR_INFERENCE_ENDPOINT` names under `transport: http`.
 ///
@@ -55,6 +55,8 @@ pub(crate) struct InferenceGateway {
     auth: InferenceAuth,
     /// `inference.api_key`, resolved at staging. `None` attaches nothing.
     credential: Option<Arc<InferenceCredential>>,
+    /// The session's spend account. The gateway sends nothing unless it holds an open admission.
+    pub(crate) spend: Arc<SpendMeter>,
 }
 
 impl std::fmt::Debug for InferenceGateway {
@@ -111,6 +113,7 @@ impl InferenceGateway {
         endpoint: &str,
         auth: InferenceAuth,
         credential: Option<Arc<InferenceCredential>>,
+        spend: Arc<SpendMeter>,
     ) -> Result<Self, RuntimeError> {
         let refuse = |message: &str| {
             RuntimeError::Runtime(format!("inference.endpoint '{endpoint}' {message}"))
@@ -135,6 +138,7 @@ impl InferenceGateway {
             upstream_authority,
             auth,
             credential,
+            spend,
         })
     }
 
@@ -283,7 +287,14 @@ mod tests {
                     .unwrap(),
             )
         });
-        InferenceGateway::new("driver", endpoint, auth, credential).unwrap()
+        InferenceGateway::new(
+            "driver",
+            endpoint,
+            auth,
+            credential,
+            Arc::new(SpendMeter::unlimited()),
+        )
+        .unwrap()
     }
 
     fn request(uri: &str, headers: &[(&str, &str)]) -> hyper::Request<HyperOutgoingBody> {
@@ -443,8 +454,14 @@ mod tests {
             "https://api.example.com/v1?x=1",
             "https://api.example.com/#f",
         ] {
-            let err = InferenceGateway::new("driver", endpoint, auth("x-api-key", "{key}"), None)
-                .unwrap_err();
+            let err = InferenceGateway::new(
+                "driver",
+                endpoint,
+                auth("x-api-key", "{key}"),
+                None,
+                Arc::new(SpendMeter::unlimited()),
+            )
+            .unwrap_err();
             assert!(err.to_string().contains("inference.endpoint"), "{err}");
         }
     }

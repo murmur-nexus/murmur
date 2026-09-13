@@ -18,7 +18,7 @@ use murmur_artifact::{
     RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
     PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
     W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022,
-    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026,
+    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -80,6 +80,7 @@ use crate::{
         shell_tool_manifest_yaml, split_shell_words, ShellOutcome, ShellResult,
     },
     spawn_credential::SpawnCredential,
+    spend::{MachineLedger, SpendMeter},
     state_store::STATE_PREOPEN_NAME,
     streaming::{
         emit_chunk_sse, emit_sse, emit_thinking_chunk_sse, SseBroadcast, SseEventBuffer,
@@ -852,14 +853,24 @@ pub fn stage_session(
         });
     }
 
+    // Minted before the spend meter rather than beside the workdir it names: the ledger records it.
+    let session_id = generate_session_id();
+
     // Before `dispatch_stage` runs any on-stage hook and before the session directory exists: a
-    // `transport: http` driver that does not say how its provider takes the key could only be run
-    // by handing it the key, so the launch is refused here rather than at the first turn.
+    // machine ceiling that cannot be kept, or a `transport: http` driver that does not say how its
+    // provider takes the key (it could only be run by handing it the key), refuses the launch here
+    // rather than at the first turn.
+    let spend = stage_spend_meter(
+        request.inference.as_ref(),
+        request.machine_tokens_per_day,
+        &session_id,
+    )?;
     let inference_gateway = stage_inference_gateway(
         request.inference.as_ref(),
         request.credentials_file.as_deref(),
         &installed_manifests,
         &installed_artifacts,
+        &spend,
     )?;
 
     // Asked as soon as the hook artifacts are staged and their bindings are known, and before
@@ -892,7 +903,6 @@ pub fn stage_session(
             )
         };
 
-    let session_id = generate_session_id();
     let (workdir, accessible_workdir) = if let Some(ref user_dir) = request.workdir {
         let user_dir = if user_dir.is_absolute() {
             user_dir.clone()
@@ -1029,6 +1039,7 @@ pub fn stage_session(
         installed_artifacts,
         inference: request.inference,
         inference_gateway,
+        spend,
         system_prompt_overridden: request.system_prompt_overridden,
         context: request.context,
         context_id: request.context_id,
@@ -1152,6 +1163,7 @@ pub fn launch_session(
         .map(|inference| inference_env_pairs(inference, staged.inference_gateway.as_deref()))
         .unwrap_or_default();
     let inference_gateway = staged.inference_gateway.clone();
+    let spend = Arc::clone(&staged.spend);
 
     if let Some(ref inference) = staged.inference {
         let workdir = staged.workdir.clone();
@@ -1472,6 +1484,7 @@ pub fn launch_session(
             )
             .await
             .map_err(|e| RuntimeError::AgentLoopFailed(format!("failed to open trace.jsonl: {e}")))?;
+            trace.set_spend_ceilings(spend.session_ceiling(), spend.machine_ceiling());
 
             // The session frame is written once per launch, around the task loop, so it frames
             // the `on-session-start`/`on-session-end` hook pair. It goes in before anything
@@ -1638,6 +1651,7 @@ pub fn launch_session(
                         plan_counter: AtomicU64::new(0),
                         inference_env: all_env,
                         inference_gateway,
+                        spend,
                         engine: engine.clone(),
                         workdir: workdir.clone(),
                         accessible_workdir: accessible_workdir.clone(),
@@ -1699,7 +1713,9 @@ pub fn launch_session(
                                 network_allow_rules: state.network_allow_rules.clone(),
                                 driver_grant,
                                 inference_gateway: state.inference_gateway.clone(),
+                                spend: Arc::clone(&state.spend),
                                 records: std::sync::Mutex::new(Vec::new()),
+                                spend_refusals: std::sync::Mutex::new(Vec::new()),
                             })
                         });
 
@@ -2503,6 +2519,7 @@ pub fn launch_session(
         delegation: None,
         inference_env,
         inference_gateway: staged.inference_gateway.clone(),
+        spend: Arc::clone(&staged.spend),
         engine: staged.engine.clone(),
         workdir: staged.workdir.clone(),
         accessible_workdir: staged.accessible_workdir.clone(),
@@ -3307,11 +3324,35 @@ pub fn warn_on_launch_only_inference_credential(
             )
         }
     };
-    let link = security_warning_link(W_SEC_026);
+    let link = security_warning_link(W_SEC_027);
     eprintln!(
-        "[capsule-runtime] warning[{W_SEC_026}]: {source}, so the key is read once at launch and \
+        "[capsule-runtime] warning[{W_SEC_027}]: {source}, so the key is read once at launch and \
          this capsule cannot pick up a rotated key until it is restarted; store the key with \
          `mur config set -g credentials.{name} <key>` to have it re-read ({link})"
+    );
+}
+
+/// Print `W-SEC-026` when `spend.machine_tokens_per_day` is in effect and the capsule uses
+/// `transport: process`.
+///
+/// That transport's CLI reaches its provider with its own credentials, so nothing it spends passes
+/// the inference gateway and the machine ceiling does not cover it. Shared between `mur run` and
+/// `mur doctor` on the same terms as [`warn_on_inference_endpoint_in_network_allow`]: decided
+/// before any session workdir exists, so it goes to stderr only. Never a refusal.
+pub fn warn_on_machine_spend_ceiling_under_process_transport(
+    machine_tokens_per_day: Option<u64>,
+    inference: Option<&InferenceConfig>,
+) {
+    if machine_tokens_per_day.is_none()
+        || !inference.is_some_and(|inference| inference.transport == "process")
+    {
+        return;
+    }
+    let link = security_warning_link(W_SEC_026);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_026}]: spend.machine_tokens_per_day is set and this \
+         capsule uses transport: process — the CLI reaches its provider with its own credentials, \
+         so murmur neither counts nor limits this capsule's spend ({link})"
     );
 }
 
@@ -3972,6 +4013,15 @@ impl WasiHttpHooks for NetworkPolicyHooks {
     ) -> HttpResult<HostFutureIncomingResponse> {
         if let Some(gateway) = self.inference_gateway.as_ref() {
             if InferenceGateway::is_addressed_to_gateway(request.uri()) {
+                // Refused before the key is attached unless some admission is open. The check is
+                // session-wide, not per-request: it holds only because the gateway is attached to
+                // the agent loop's driver dispatch and hooks' `run-inference`, both of which admit
+                // first, and never to a driver reached by name through tool dispatch.
+                if !gateway.spend.has_open_admission() {
+                    return Err(wasmtime_wasi_http::p2::HttpError::from(
+                        WasiHttpErrorCode::HttpRequestDenied,
+                    ));
+                }
                 let gateway = Arc::clone(gateway);
                 return Ok(HostFutureIncomingResponse::pending(
                     wasmtime_wasi::runtime::spawn(async move {
@@ -4040,9 +4090,13 @@ pub(crate) struct CapsuleStoreState {
     /// anything the model wrote, so a plan `id` reaches no path.
     pub(crate) plan_counter: AtomicU64,
     pub(crate) inference_env: Vec<(String, String)>,
-    /// Moved over from [`StagedSession::inference_gateway`]. Handed to every tool dispatch, and
-    /// attached by [`invoke_tool_component`] only to the configured driver's store.
+    /// Moved over from [`StagedSession::inference_gateway`]. Handed only to
+    /// [`Self::dispatch_driver_async`], and attached by [`invoke_tool_component`] only to the
+    /// configured driver's store.
     pub(crate) inference_gateway: Option<Arc<InferenceGateway>>,
+    /// Moved over from [`StagedSession::spend`]. The agent loop admits every driver turn against
+    /// it; hooks' `run-inference` and the gateway hold clones of the same account.
+    pub(crate) spend: Arc<SpendMeter>,
     pub(crate) engine: Engine,
     pub(crate) workdir: PathBuf,
     pub(crate) accessible_workdir: PathBuf,
@@ -4510,6 +4564,7 @@ fn stage_inference_gateway(
     credentials_file: Option<&Path>,
     installed_manifests: &[(String, String)],
     installed_artifacts: &[InstalledArtifactSummary],
+    spend: &Arc<SpendMeter>,
 ) -> Result<Option<Arc<InferenceGateway>>, RuntimeError> {
     let Some(inference) = inference.filter(|inference| inference.transport == "http") else {
         return Ok(None);
@@ -4543,8 +4598,43 @@ fn stage_inference_gateway(
         Ok(None) => return Err(refuse(None)),
         Err(err) => return Err(refuse(Some(err.to_string()))),
     };
-    InferenceGateway::new(driver.artifact.clone(), endpoint, auth, credential)
-        .map(|gateway| Some(Arc::new(gateway)))
+    InferenceGateway::new(
+        driver.artifact.clone(),
+        endpoint,
+        auth,
+        credential,
+        Arc::clone(spend),
+    )
+    .map(|gateway| Some(Arc::new(gateway)))
+}
+
+/// Builds the session's spend account: `inference.max_session_tokens` as its session ceiling and,
+/// for a `transport: http` session with a driver, the shared daily ledger when
+/// `machine_tokens_per_day` is set.
+///
+/// Refuses with [`RuntimeError::SpendLedgerUnavailable`] when that ledger cannot be opened. A
+/// `transport: process` session holds no key and makes no call the runtime can meter, so it keeps
+/// no ledger whatever the operator set.
+fn stage_spend_meter(
+    inference: Option<&InferenceConfig>,
+    machine_tokens_per_day: Option<u64>,
+    session_id: &str,
+) -> Result<Arc<SpendMeter>, RuntimeError> {
+    let metered = inference.filter(|inference| {
+        inference.transport == "http"
+            && inference
+                .driver
+                .as_ref()
+                .is_some_and(|driver| !driver.artifact.is_empty())
+    });
+    let machine = match (metered, machine_tokens_per_day) {
+        (Some(_), Some(ceiling)) => Some(MachineLedger::open(session_id, ceiling)?),
+        _ => None,
+    };
+    Ok(Arc::new(SpendMeter::new(
+        metered.and_then(|inference| inference.max_session_tokens),
+        machine,
+    )))
 }
 
 /// Borrowed half of a WASM tool invocation environment: everything
@@ -4603,8 +4693,8 @@ impl ToolA2aWiring {
 /// `murmur:tool/run@0.1.0#run` export.
 ///
 /// This is the single WASM-tool (and therefore inference-driver) invocation
-/// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] is a thin
-/// wrapper that fills `env`/`a2a` from the capsule store; a hook's
+/// body in the runtime. [`CapsuleStoreState::dispatch_tool_async`] and
+/// [`CapsuleStoreState::dispatch_driver_async`] are thin wrappers that fill `env`/`a2a` from the capsule store; a hook's
 /// `run-inference` host import fills them from its own owned copies. Neither
 /// duplicates any part of the instantiate/type-check/call sequence below.
 pub(crate) async fn invoke_tool_component(
@@ -4830,11 +4920,33 @@ fn fence_tool_result(name: &str, result: &mut murmur::tool::run::ToolResult) {
 }
 
 impl CapsuleStoreState {
-    /// Async WASM tool dispatch — used by the agent loop for drivers and WASM tools.
+    /// Async WASM tool dispatch for a guest's `invoke` and the model's tool calls. Never carries the
+    /// inference gateway: a driver reached by name here gets no keyed route to its provider, and
+    /// so cannot spend outside an admission.
     pub(crate) async fn dispatch_tool_async(
         &self,
         name: &str,
         input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        self.dispatch_component_async(name, input, None).await
+    }
+
+    /// The agent loop's driver turn: the one dispatch the inference gateway is attached to, and
+    /// only under the spend admission the loop opened for it.
+    pub(crate) async fn dispatch_driver_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+    ) -> Result<murmur::tool::run::ToolResult, String> {
+        self.dispatch_component_async(name, input, self.inference_gateway.as_ref())
+            .await
+    }
+
+    async fn dispatch_component_async(
+        &self,
+        name: &str,
+        input: murmur::tool::run::ToolInput,
+        inference_gateway: Option<&Arc<InferenceGateway>>,
     ) -> Result<murmur::tool::run::ToolResult, String> {
         let Some(component) = self.tool_components.get(name) else {
             return Err(format!("tool '{name}' is not available in this session"));
@@ -4850,7 +4962,7 @@ impl CapsuleStoreState {
                 // anything pulled in at runtime via `manage.pull()` (which has no operator
                 // manifest entry to narrow from) — both keep the full ceiling.
                 artifact_grant: self.artifact_grants.get(name),
-                inference_gateway: self.inference_gateway.as_ref(),
+                inference_gateway,
             },
             ToolA2aWiring {
                 sse: self.a2a_sse.clone(),
@@ -7928,6 +8040,7 @@ inference:
             system_prompt_artifact: None,
             max_turns: 10,
             max_tokens: None,
+            max_session_tokens: None,
         }
     }
 
@@ -8388,6 +8501,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -8482,6 +8596,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -8562,6 +8677,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -8641,6 +8757,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let err = match stage_session(Arc::new(FakeRegistry), request) {
@@ -8758,6 +8875,7 @@ inference:
             system_prompt_artifact: None,
             max_turns: 10,
             max_tokens: None,
+            max_session_tokens: None,
         };
 
         let request = StageRequest {
@@ -8796,6 +8914,7 @@ inference:
             declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let staged = stage_session(Arc::new(PanicRegistry), request).unwrap();
@@ -8877,6 +8996,7 @@ inference:
             delegation: None,
             inference_env: Vec::new(),
             inference_gateway: None,
+            spend: Arc::new(SpendMeter::unlimited()),
             engine,
             workdir: workdir.clone(),
             accessible_workdir: workdir,
@@ -10098,6 +10218,7 @@ inference:
                     InferenceCredential::resolve(&ApiKeyReference::Literal(KEY.to_string()), None)
                         .unwrap(),
                 )),
+                Arc::new(SpendMeter::unlimited()),
             )
             .unwrap(),
         );
@@ -10145,6 +10266,7 @@ inference:
             system_prompt_artifact: None,
             max_turns: 10,
             max_tokens: None,
+            max_session_tokens: None,
         }
     }
 
@@ -10163,6 +10285,7 @@ inference:
                 .api_key
                 .as_ref()
                 .map(|reference| Arc::new(InferenceCredential::resolve(reference, None).unwrap())),
+            Arc::new(SpendMeter::unlimited()),
         )
         .unwrap();
         for pairs in [
@@ -10821,6 +10944,7 @@ inference:
             system_prompt_artifact: None,
             max_turns,
             max_tokens: None,
+            max_session_tokens: None,
         };
 
         let mut state = build_test_state(
@@ -11192,6 +11316,7 @@ inference:
             system_prompt_artifact: None,
             max_turns: 10,
             max_tokens: None,
+            max_session_tokens: None,
         }
     }
 

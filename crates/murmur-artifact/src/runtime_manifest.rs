@@ -901,6 +901,11 @@ pub struct InferenceConfig {
     /// Unrelated to [`ContextConfig::max_tokens`], which is the session-wide token budget that
     /// drives compaction. This one is a per-turn *output* cap.
     pub max_tokens: Option<u32>,
+    /// `inference.max_session_tokens`: the most tokens — the runtime's own measured input plus
+    /// output, over every driver call the session makes — this session may spend. `None` sets no
+    /// session ceiling. `transport: http` only — rejected at parse time under `transport: process`,
+    /// where the CLI reaches its provider with its own credentials and murmur sees no spend.
+    pub max_session_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1932,6 +1937,8 @@ struct RawInferenceConfig {
     max_task_reopens: Option<u32>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    max_session_tokens: Option<u64>,
     #[serde(flatten)]
     unknown: UnknownKeys,
 }
@@ -2401,6 +2408,7 @@ impl RawBlock for RawInferenceConfig {
         "max_turns",
         "max_task_reopens",
         "max_tokens",
+        "max_session_tokens",
     ];
     fn unknown_keys(&self) -> &UnknownKeys {
         &self.unknown
@@ -3771,6 +3779,12 @@ fn parse_inference(
                     message: "must be greater than 0".to_string(),
                 });
             }
+            if raw.max_session_tokens == Some(0) {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.max_session_tokens".to_string(),
+                    message: "must be greater than 0".to_string(),
+                });
+            }
 
             Ok(Some(InferenceConfig {
                 transport,
@@ -3785,6 +3799,7 @@ fn parse_inference(
                 system_prompt_artifact,
                 max_turns,
                 max_tokens: raw.max_tokens,
+                max_session_tokens: raw.max_session_tokens,
             }))
         }
         "process" => {
@@ -3826,6 +3841,15 @@ fn parse_inference(
                 });
             }
 
+            // murmur holds no key under this transport and sees no spend, so a ceiling here could
+            // never be enforced.
+            if raw.max_session_tokens.is_some() {
+                return Err(RuntimeManifestError::InvalidInferenceConfig {
+                    field: "inference.max_session_tokens".to_string(),
+                    message: "is not valid with transport: process".to_string(),
+                });
+            }
+
             let command = required_inference_field(raw.command, "command")?;
             // model is OPTIONAL for transport: process — an empty string means "use the CLI's
             // configured/account-default model" (e.g. a codex subscription's default; passing an
@@ -3846,6 +3870,7 @@ fn parse_inference(
                 system_prompt_artifact,
                 max_turns,
                 max_tokens: None,
+                max_session_tokens: None,
             }))
         }
         other => Err(RuntimeManifestError::InvalidInferenceConfig {
@@ -7106,6 +7131,103 @@ inference:
             msg.contains("not valid with transport: process"),
             "error was: {msg}"
         );
+    }
+
+    #[test]
+    fn process_transport_rejects_max_session_tokens() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: process
+  command: claude
+  model: claude-haiku-4-5-20251001
+  max_session_tokens: 200000
+"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inference.max_session_tokens"),
+            "error was: {msg}"
+        );
+        assert!(
+            msg.contains("not valid with transport: process"),
+            "error was: {msg}"
+        );
+    }
+
+    #[test]
+    fn inference_max_session_tokens_round_trips() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_session_tokens: 5000000000
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            manifest.inference.unwrap().max_session_tokens,
+            Some(5_000_000_000)
+        );
+    }
+
+    #[test]
+    fn inference_max_session_tokens_absent_is_none() {
+        let manifest = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.inference.unwrap().max_session_tokens, None);
+    }
+
+    #[test]
+    fn inference_max_session_tokens_zero_is_rejected() {
+        let err = RuntimeManifest::from_yaml_str(
+            r#"
+name: cap
+version: 0.0.1
+artifacts: []
+inference:
+  transport: http
+  endpoint: https://api.anthropic.com
+  model: claude-opus-4-5
+  max_session_tokens: 0
+  driver:
+    artifact: murmur-driver-anthropic
+"#,
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inference.max_session_tokens"),
+            "error was: {msg}"
+        );
+        assert!(msg.contains("greater than 0"), "error was: {msg}");
     }
 
     #[test]

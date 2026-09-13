@@ -677,6 +677,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
                 .unwrap_or_default(),
             exports: runtime_manifest.exports.clone(),
             spawn_grant: None,
+            machine_tokens_per_day: None,
         };
 
         let staged = match stage_session(Arc::clone(&local_registry), stage_request) {

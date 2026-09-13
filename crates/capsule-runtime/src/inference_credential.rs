@@ -8,8 +8,8 @@
 //! request. A value from the environment or written literally in the manifest is read once.
 //!
 //! The credentials file is read by the runtime itself; no guest, tool or shell subprocess is handed
-//! its path or its contents. Nothing here writes a value, a hash of one, its length or any prefix to the trace, stderr, an
-//! error or `Debug` output.
+//! its path or its contents. Nothing here writes a value, a hash of one, its length or any prefix to
+//! the trace, stderr, an error or `Debug` output.
 
 use std::{
     collections::BTreeMap,
@@ -26,7 +26,7 @@ use serde::Deserialize;
 use crate::{errors::RuntimeError, trace::ResourceTraceAppender};
 
 /// The diagnostic code a session fails with when the provider keeps rejecting its credential.
-pub(crate) const E_RUN_026: &str = "E-RUN-026";
+pub(crate) const E_RUN_027: &str = "E-RUN-027";
 
 /// Where a session's inference credential comes from. Carries names and paths, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,12 +403,12 @@ impl InferenceCredential {
         }
     }
 
-    /// Takes a pending rejection and, when there was one, prints `E-RUN-026` and its hint to
+    /// Takes a pending rejection and, when there was one, prints `E-RUN-027` and its hint to
     /// stderr and returns the message for `out/result.txt`.
     pub(crate) fn report_rejection(&self) -> Option<String> {
         let rejection = self.take_rejection()?;
         let message = self.rejection_message(rejection);
-        eprintln!("error[{E_RUN_026}]: {message}");
+        eprintln!("error[{E_RUN_027}]: {message}");
         eprintln!("  hint: {}", self.rejection_hint());
         Some(message)
     }
