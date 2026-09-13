@@ -33,6 +33,7 @@ pub(crate) mod inference_import;
 pub mod lanes;
 pub mod limits;
 pub mod mac_token;
+pub mod murmur_home;
 pub(crate) mod murmur_md;
 pub mod network_namespace;
 pub(crate) mod network_policy;

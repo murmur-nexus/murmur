@@ -372,7 +372,11 @@ pub(crate) fn stage_truncation(
         contents.push('\n');
     }
 
-    let staged = StagedRewrite::stage(path, contents.as_bytes())?;
+    let staged = StagedRewrite::stage_with_mode(
+        path,
+        contents.as_bytes(),
+        Some(crate::conversation::RECORD_FILE_MODE),
+    )?;
     Ok(Some((
         staged,
         TruncationOutcome {
@@ -396,12 +400,8 @@ pub(crate) struct StagedRewrite {
 }
 
 impl StagedRewrite {
-    pub(crate) fn stage(target: &Path, contents: &[u8]) -> Result<Self, String> {
-        Self::stage_with_mode(target, contents, None)
-    }
-
-    /// [`Self::stage`] with the staged file's mode set explicitly, for a target whose permissions
-    /// are part of its contract. `None` leaves the mode to the process umask.
+    /// Stage `contents` for `target`, with the staged file's mode set explicitly for a target whose
+    /// permissions are part of its contract. `None` leaves the mode to the process umask.
     pub(crate) fn stage_with_mode(
         target: &Path,
         contents: &[u8],
@@ -950,6 +950,19 @@ mod tests {
         let marker = read_header(&path).unwrap().truncated.unwrap();
         assert_eq!(marker.dropped, 8);
         assert_eq!(count_messages(&path), 2);
+    }
+
+    #[test]
+    fn truncation_rewrite_keeps_the_record_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_record(dir.path(), Some("capsule"), 5);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        truncate_record(&path, 2, "capsule").unwrap();
+
+        assert_eq!(count_messages(&path), 2);
+        assert_eq!(crate::murmur_home::mode_of(&path), 0o600);
     }
 
     /// A record already at or under the limit is left untouched, byte for byte.

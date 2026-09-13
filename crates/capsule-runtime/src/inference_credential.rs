@@ -94,6 +94,8 @@ pub(crate) enum CredentialChange {
 
 /// The config file's identity and last change, as `stat(2)` reports it. Any difference means the
 /// file may hold something else. `Unavailable` is a file that could not be stat'd or opened.
+///
+/// `mode` is compared with the rest, which changes nothing: `chmod(2)` also updates `ctime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileStamp {
     Unavailable,
@@ -103,6 +105,7 @@ enum FileStamp {
         len: u64,
         mtime: (i64, i64),
         ctime: (i64, i64),
+        mode: u32,
     },
 }
 
@@ -114,6 +117,7 @@ impl FileStamp {
             len: metadata.len(),
             mtime: (metadata.mtime(), metadata.mtime_nsec()),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
         }
     }
 
@@ -209,6 +213,9 @@ impl InferenceCredential {
     ///
     /// Refuses with [`RuntimeError::InferenceCredentialNotFound`] when neither place holds a
     /// `${NAME}`.
+    ///
+    /// A value found in `credentials_file` prints `W-SEC-028` when the handle it was read through
+    /// reports a mode granting any group or other bit. Re-reads during the session never do.
     pub(crate) fn resolve(
         reference: &ApiKeyReference,
         credentials_file: Option<&Path>,
@@ -226,6 +233,9 @@ impl InferenceCredential {
         if let Some(path) = credentials_file {
             let (stamp, read) = read_entry(path, name);
             if let EntryRead::Value(value) = read {
+                if let FileStamp::Present { mode, .. } = stamp {
+                    crate::murmur_home::warn_on_wide_credential_file(path, name, mode);
+                }
                 let credential = Self::new(
                     CredentialSource::Config {
                         path: path.to_path_buf(),

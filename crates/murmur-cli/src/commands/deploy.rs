@@ -880,12 +880,7 @@ pub(crate) fn run_deploy(
     let home_os = std::env::var_os("HOME")
         .ok_or_else(|| CliError::new(E_IO_001, "could not determine home directory"))?;
     let home = std::path::PathBuf::from(home_os);
-    let staging_dir = home
-        .join(".murmur")
-        .join("deploy_staging")
-        .join(&deployment_id);
-    std::fs::create_dir_all(&staging_dir)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to create staging dir: {e}")))?;
+    let staging_dir = crate::commands::deploy_state::create_deploy_staging_dir(&deployment_id)?;
     let _staging_guard = StagingGuard(staging_dir.clone());
 
     // ── 0.4. Load manifest, artifacts, sources ────────────────────────────────
