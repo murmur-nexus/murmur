@@ -201,11 +201,10 @@ jobs:
 
   macos:
     name: macos (${{ matrix.target }})
-    # macOS is a published platform, and before this job the only thing that compiled it was
-    # release.yml's build-macos, on a release tag. That is how `running.rs` reached main reading a
-    # `libc::kinfo_proc` the libc crate has never defined for Apple: every Linux job was green,
-    # and the release would have been the first build to notice. This compiles every target and
-    # every feature at each Apple triple the release publishes, on the runner the release uses.
+    # Compiles every target and every feature at each Apple triple the release publishes, on the
+    # runner the release uses. release.yml's build-macos runs only on a release tag, and `cfg`-gated
+    # macOS code (a `libc` item Apple does not define, an import unused off Linux) is invisible to
+    # every Linux job.
     #
     # The matrix must list every target in release.yml's build-macos matrix.
     # check-release-targets-in-ci.py, run by the release-targets-in-ci job below, fails when it
@@ -215,7 +214,6 @@ jobs:
     # is to find it on the pull request that breaks it.
     runs-on: macos-latest
     # A ceiling so a hung build or test fails the job rather than burning the runner's own limit.
-    # Not a measurement: nobody has timed this job yet.
     timeout-minutes: 60
     strategy:
       # One leg failing says nothing about the other, and both results are wanted.

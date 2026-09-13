@@ -2,13 +2,10 @@
 """
 Check that CI compiles every Apple target the release builds.
 
-macOS shipped for a long time with nothing compiling it except `release.yml`'s
-`build-macos` job, which only runs on a release tag. Code that did not build
-for Apple sat on main undetected, and the release was the first build of the
-platform. `ci.yml`'s `macos` job compiles those targets on every pull request.
-This check keeps the two matrices in step: an Apple target added to the
-release but not to CI fails here, so it cannot slip back to being compiled only
-by a release.
+`release.yml`'s `build-macos` job runs only on a release tag; `ci.yml`'s `macos`
+job compiles the same Apple targets on every pull request. This check keeps the
+two matrices in step: an Apple target added to the release but not to CI fails
+here, so the release is never the first build of a platform.
 
 It reads the `target:` values straight out of both workflow files rather than
 restating them, for the same reason `check-workflow-invocations.py` does: a

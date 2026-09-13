@@ -155,6 +155,6 @@ those two matrices are written in rather than YAML in general.
 | `1` | a release target is missing from CI's matrix, one line per target |
 | `2` | a workflow file, the job, its matrix, or any `target:` in it cannot be found |
 
-It exists because `build-macos` was once the only thing that compiled macOS,
-and it only runs on a release tag. Adding an Apple target means adding it to
-both matrices.
+`build-macos` runs only on a release tag, so an Apple target missing from CI's
+matrix would first be compiled by a release. Adding an Apple target means
+adding it to both matrices.
