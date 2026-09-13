@@ -543,6 +543,7 @@ mod tests {
         );
         assert_eq!(credential.refresh_locked(false), (OLD.to_string(), None));
         assert_eq!(credential.current().await, OLD);
+        assert_eq!(reads(&credential), 4);
 
         write_config(&path, NEW);
         assert_eq!(
@@ -555,6 +556,7 @@ mod tests {
             )
         );
         assert_eq!(credential.current().await, NEW);
+        assert_eq!(reads(&credential), 6);
     }
 
     #[tokio::test]
@@ -610,6 +612,18 @@ mod tests {
         assert_eq!(unreadable(&credential, true), None);
         assert_eq!(credential.current().await, OLD);
 
+        // A symlink to itself fails to open with a reason other than `missing`, and the file state
+        // is unavailable either way: the different reason alone is reported again.
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert_eq!(
+            unreadable(&credential, false),
+            Some(CredentialChange::Unreadable {
+                reason: "unreadable"
+            })
+        );
+        assert_eq!(unreadable(&credential, false), None);
+        fs::remove_file(&path).unwrap();
+
         fs::write(&path, "credentials: [\n").unwrap();
         assert_eq!(
             unreadable(&credential, false),
@@ -644,6 +658,13 @@ mod tests {
             })
         );
         assert_eq!(credential.current().await, NEW);
+
+        // A read that yielded a value resets the dedupe, so a failure seen before is reported again.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            unreadable(&credential, false),
+            Some(CredentialChange::Unreadable { reason: "missing" })
+        );
     }
 
     #[tokio::test]
