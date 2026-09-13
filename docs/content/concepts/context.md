@@ -20,19 +20,14 @@ hard limit:
 Compaction never consumes a turn slot. Whether a failure to compact is fatal depends on why it
 failed:
 
-- **No hook bound to `on-compaction`, or a replacement the runtime rejected** — non-fatal. The
-  runtime writes a `compaction_declined` line to `trace.jsonl` naming the turn and the reason, and
-  continues the session with the uncompacted history.
-- **A bound hook ran and returned an error** — fatal. There is no fallback compactor behind a
-  declared compaction hook, so the runtime ends the session as failed rather than continuing on
-  a context it already knows is over budget: `out/result.txt` records the error, the trace and
-  OTel (if configured) record `session_end` as `"failed"`, and the SSE stream (if the session has
-  a `task_id`) emits a final `status` event with `state: "failed"`. No further turns run.
-- **A bound hook returned an error after a spend ceiling refused its `run-inference` call** — the
-  session ends with `exit_status: "spend_ceiling_reached"` rather than `failed`, and
-  `out/result.txt` reads `stopped: spend ceiling reached: …`. The trace carries one
-  `spend_ceiling_reached` line tagged with the hook's `origin`. Any other hook error still ends
-  the session as `failed`.
+| Why compaction did not replace the context | Outcome |
+|---|---|
+| No hook bound to `on-compaction`, or a replacement the runtime rejected | Non-fatal. A `compaction_declined` line in `trace.jsonl` names the turn and the reason, and the session continues with the uncompacted history |
+| A bound hook returned an error after a spend ceiling refused its `run-inference` call | The session ends with `exit_status: "spend_ceiling_reached"`. `out/result.txt` reads `stopped: spend ceiling reached: …`, and the trace carries one `spend_ceiling_reached` line tagged with the hook's `origin` |
+| A bound hook returned any other error | The session ends with `exit_status: "failed"`. `out/result.txt` records the error, and the SSE stream (if the session has a `task_id`) emits a final `status` event with `state: "failed"` |
+
+A hook error is fatal because there is no fallback compactor behind a declared compaction hook, and
+another turn would run on a context already known to be over budget. No further turns run.
 
 Compaction requires both `context.max_tokens` to be set and a hook bound to `on-compaction` to be
 staged — see [Enable context compaction](../how-to/context-compaction.md) for the full

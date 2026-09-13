@@ -375,7 +375,7 @@ pub(crate) async fn run_agent_loop(
                     &sse,
                     &mut sse_event_id,
                     task_id.as_deref(),
-                    &task_id.clone().unwrap_or_default(),
+                    task_id.as_deref().unwrap_or_default(),
                     context_id.clone(),
                     0,
                     &refusal,

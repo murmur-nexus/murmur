@@ -330,7 +330,8 @@ the replacement whole and keeps the original, larger history. Non-fatal: it logs
 budget. Recurring `unresolved_tool_call` declines mean the hook is dropping one half of a
 call/result pair.
 
-**A bound hook ran and returned an error.** This *is* treated as a failure, and it ends the
+**A bound hook ran and returned an error, with no refused `run-inference` call behind it.** This
+*is* treated as a failure, and it ends the
 session: there is no fallback compactor behind a declared compaction hook, so continuing would
 mean another inference turn on a context already known to be over budget. `out/result.txt`
 records the error, the session's `trace.jsonl` records `session_end` with `exit_status: "failed"`,
@@ -350,8 +351,6 @@ ends the session as a spend stop, not as a failure. The hook's call crossed
 | OTel | `session_end` as `"spend_ceiling_reached"` |
 | SSE | A final `status` event with `state: "failed"` and the refusal text as its message |
 
-Any other error from a bound hook still ends the session as `failed`.
-
 If your compaction hook can fail (for example, the model it calls for summarization is
 unreachable), account for the fact that this ends the session rather than silently skipping
 compaction.
@@ -369,6 +368,6 @@ compaction.
 | `inference.compaction.dump_summaries: true` | Appends every committed compaction's summary to `out/compaction-summaries.jsonl`; default `false` |
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
-| A bound hook returns an error | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
+| A bound hook returns an error with no refused `run-inference` call behind it | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
 | A bound hook returns an error after a spend ceiling refused its `run-inference` call | Fatal — the session ends with `exit_status: "spend_ceiling_reached"`, not `failed`; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count after compaction | Reset to the count of the new (compacted) history, not to zero |
