@@ -246,6 +246,21 @@ pub enum RuntimeError {
         name: String,
     },
 
+    /// A capsule's `capabilities.env.allow` names variables the credential backstop strips from
+    /// every guest environment.
+    ///
+    /// The strip in `build_wasi_env_allowlist` is not negotiable from a manifest, so the entries
+    /// can only ever deliver nothing; the declaration is refused rather than left silently inert.
+    #[error(
+        "capabilities.env.allow names {}; these entries are removed from every guest environment \
+         before any guest is built, so the grant would deliver nothing",
+        crate::runtime::describe_stripped_env_allow_entries(entries)
+    )]
+    EnvAllowStrippedByBackstop {
+        /// Every distinct stripped entry, in first-declaration order.
+        entries: Vec<crate::runtime::StrippedEnvAllowEntry>,
+    },
+
     /// A synthetic tool manifest was written under a name absent from
     /// [`crate::runtime::RESERVED_TOOL_NAMES`].
     ///

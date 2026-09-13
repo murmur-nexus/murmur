@@ -75,7 +75,7 @@ fn suite() -> &'static Suite {
             &format!(
                 "artifacts: []\ncapabilities:\n  \
                  network:\n    allow: [{endpoint}]\n  \
-                 env:\n    allow: [{A_ONLY}, {B_ONLY}, GITHUB_TOKEN, MURMUR_TEST_ALLOWED_VAR]\n  \
+                 env:\n    allow: [{A_ONLY}, {B_ONLY}, MURMUR_TEST_ALLOWED_VAR]\n  \
                  spawn:\n    allow: [child-agent, child-a, child-b, child-escape, child-sealed, \
                  child-leak, child-reader, child-repeat]\n",
                 endpoint = inference.authority(),
@@ -120,13 +120,15 @@ fn suite() -> &'static Suite {
             &registry_path,
             "child-leak",
             "0.1.0",
-            "artifacts: []\ncapabilities:\n  env:\n    allow: [GITHUB_TOKEN, MURMUR_TEST_ALLOWED_VAR]\n",
+            "artifacts: []\ncapabilities:\n  env:\n    allow: [MURMUR_TEST_ALLOWED_VAR]\n",
             Some(&component("capsule-env-echo.wasm")),
         );
 
         // Agent children: they bind a port and serve A2A.
-        for (name, containment) in [("child-agent", ""), ("child-sealed", "  containment: sealed\n")]
-        {
+        for (name, containment) in [
+            ("child-agent", ""),
+            ("child-sealed", "  containment: sealed\n"),
+        ] {
             common::publish_capsule(
                 &registry_path,
                 name,
@@ -636,10 +638,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
         capsule_name: "child-leak".to_string(),
         capsule_version: "0.1.0".to_string(),
         grant,
-        child_env_allow: vec![
-            "GITHUB_TOKEN".to_string(),
-            "MURMUR_TEST_ALLOWED_VAR".to_string(),
-        ],
+        child_env_allow: vec!["MURMUR_TEST_ALLOWED_VAR".to_string()],
         roost_url: suite.roost.url.clone(),
         spawner: None,
         completion_deadline: None,
@@ -680,8 +679,7 @@ fn neither_token_leaks_into_a_file_a_trace_an_environment_or_an_error() {
     );
 
     // The guest's own view of its environment: the fixture reports what it saw for the two names
-    // it probes, and the host's `GITHUB_TOKEN` is stripped before it reaches WASI even though the
-    // child declared it.
+    // it probes, and the host's `GITHUB_TOKEN`, which the child does not declare, is absent.
     let observed = std::fs::read_to_string(child.workdir.join("out").join("result.txt")).unwrap();
     assert!(observed.contains("GITHUB_TOKEN=absent"), "{observed}");
     assert!(!observed.contains(&approval), "{observed}");

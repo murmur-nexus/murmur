@@ -77,7 +77,9 @@ pub use runtime_manifest::{
     PERSISTENT_PEER_HANDLE_TTL_CEILING_SECS,
 };
 pub use runtime_warnings::{runtime_warning_link, W_RUN_001};
-pub use secrets::{is_secret_shaped_name, scan_yaml_secrets, SecretWarning};
+pub use secrets::{
+    is_credential_shaped_env_name, is_secret_shaped_name, scan_yaml_secrets, SecretWarning,
+};
 pub use security_warnings::{
     security_warning_link, W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006,
     W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014,

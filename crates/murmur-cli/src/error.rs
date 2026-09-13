@@ -59,6 +59,7 @@ pub const E_CAP_012: &str = "E-CAP-012"; // capabilities.filesystem.read_only en
 pub const E_CAP_013: &str = "E-CAP-013"; // an artifact claims the name of a tool the runtime provides itself
 pub const E_CAP_014: &str = "E-CAP-014"; // a capsule in the spawn.allow closure declares an env.allow name unset in this environment
 pub const E_CAP_015: &str = "E-CAP-015"; // a capsule declares an env.allow entry the capsule that spawns it does not hold
+pub const E_CAP_016: &str = "E-CAP-016"; // a capabilities.env.allow entry names a variable the credential backstop strips from every guest
 
 // Build lints
 pub const E_BLD_001: &str = "E-BLD-001"; // artifact name is not a valid identifier
@@ -292,6 +293,14 @@ impl From<RuntimeError> for CliError {
                  be shadowed at dispatch whatever the tool allowlist said. Rename the artifact, \
                  or drop the dependency if the runtime-provided tool is what you wanted — see \
                  docs/content/reference/runtime-provided-tools.md",
+            ),
+            error @ RuntimeError::EnvAllowStrippedByBackstop { .. } => CliError::with_hint(
+                E_CAP_016,
+                error.to_string(),
+                "remove these entries from capabilities.env.allow. No manifest setting exempts a \
+                 name from the credential backstop, and a provider key never belongs in env.allow: \
+                 the runtime reaches the provider itself through inference.api_key — see \
+                 docs/content/reference/diagnostics.md#e-cap-016",
             ),
             error @ RuntimeError::RuntimeProvidedToolNotReserved { .. } => CliError::with_hint(
                 E_CAP_013,

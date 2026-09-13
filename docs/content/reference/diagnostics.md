@@ -26,6 +26,7 @@ section that explains it.
 | `E-CAP-013` | An artifact claims the name of a tool the runtime provides itself | [E-CAP-013](#e-cap-013) |
 | `E-CAP-014` | A variable this project needs is set by nothing in the environment | [E-CAP-014](#e-cap-014) |
 | `E-CAP-015` | A capsule declares a `capabilities.env.allow` entry the capsule that spawns it does not hold | [E-CAP-015](#e-cap-015) |
+| `E-CAP-016` | A `capabilities.env.allow` entry names a variable the credential backstop strips from every guest | [E-CAP-016](#e-cap-016) |
 | `E-CNV-001` | No such record store or context id under `~/.murmur/conversations/` | [E-CNV-001](#e-cnv-001) |
 | `E-CNV-002` | A context id is present under more than one record store | [E-CNV-002](#e-cnv-002) |
 | `E-CNV-003` | `mur conversation truncate --keep` is not a usable number of messages to keep | [E-CNV-003](#e-cnv-003) |
@@ -110,7 +111,7 @@ section that explains it.
 | `W-SEC-021` | A cgroup scope was created and the declared `cgroup_io_bytes_per_sec` ceiling did not apply to it | [W-SEC-021](#w-sec-021) |
 | `W-SEC-022` | The capsule can run shell commands, and its `lifecycle` block cannot receive a background command's completion | [W-SEC-022](#w-sec-022) |
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
-| `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker, or delivers nothing | [W-SEC-024](#w-sec-024) |
+| `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker | [W-SEC-024](#w-sec-024) |
 | `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 | `W-SEC-027` | The inference key is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
@@ -774,6 +775,44 @@ offline, naming both capsules and the axis:
 ```
 
 Add the name to the parent's `capabilities.env.allow`, or drop it from the child's.
+
+### E-CAP-016 — an `env.allow` entry the credential backstop strips { #e-cap-016 }
+
+A `capabilities.env.allow` entry names a variable the credential backstop removes from every guest
+environment:
+
+```text
+error[E-CAP-016]: capabilities.env.allow names 'GITHUB_TOKEN' (credential backstop pattern 'GITHUB_TOKEN'), 'MY_SERVICE_SECRET' (capabilities.shell.strip_env pattern '*_SERVICE_SECRET'); these entries are removed from every guest environment before any guest is built, so the grant would deliver nothing
+  hint: remove these entries from capabilities.env.allow. No manifest setting exempts a name from the credential backstop, and a provider key never belongs in env.allow: the runtime reaches the provider itself through inference.api_key — see docs/content/reference/diagnostics.md#e-cap-016
+```
+
+**Fires when:** a name matches one of these patterns. The error names every matching entry once, in
+declaration order, with the pattern that matched and where that pattern comes from.
+
+| Pattern source | Patterns |
+|---|---|
+| `credential backstop` | [The built-in list](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment): `GITHUB_TOKEN`, `AWS_*`, `DOCKER_*`, `*_API_KEY` among them |
+| `capabilities.shell.strip_env` | The [patterns the manifest declares](manifest.md#field-capabilities) |
+
+A built-in pattern covers names that carry no secret too, such as `AWS_REGION` and `DOCKER_HOST`.
+
+The verdict comes from the name alone, so a host that has the variable set and one that does not
+get the same result, and no value ever appears in the message. It is reported by:
+
+| Surface | Outcome |
+|---|---|
+| `mur run`, `mur new`, `mur eval`, and every capsule `mur-roost` launches | Refused at staging, before any artifact is resolved or pulled and before a session directory is created |
+| `mur run --explain-scope` | Refused, by the same code |
+| [`mur doctor`](cli.md#mur-doctor) | `warning[E-CAP-016]`, followed by `` `mur run` will refuse this capsule ``; the rest of the checklist still runs |
+
+**Why it is a refusal:** the backstop removes these names whatever the manifest declares, so the
+grant would deliver nothing, and a capsule that launched with it would look granted and hold
+nothing.
+
+**What to do:** remove the entries. For a provider key, set
+[`inference.api_key`](manifest.md#field-inference) instead: the runtime reaches the provider
+itself. For a variable a guest needs, give it a host name no pattern matches. A name the backstop
+keeps but that looks like a credential is reported by [`W-SEC-024`](#w-sec-024).
 
 ---
 
@@ -1859,25 +1898,38 @@ set `HOME` to a directory this user owns, and the next launch records itself.
 
 ### W-SEC-024 — `capabilities.env.allow` names a credential-shaped variable { #w-sec-024 }
 
-**Fires when:** an entry in [`capabilities.env.allow`](manifest.md#field-capabilities) is
-credential-shaped — its name contains `api_key`, `token`, `secret` or `password`, in any case. Once
-per distinct entry, in declaration order, on stderr, from `mur run` (including
-`mur run --explain-scope`) and from `mur doctor` in identical words.
+**Fires when:** an entry in [`capabilities.env.allow`](manifest.md#field-capabilities) reaches every
+WASM guest and its name is credential-shaped. Either rule makes a name credential-shaped:
 
-Which of the two lines you get depends on whether the credential backstop drops the name:
+1. It contains `api_key`, `token`, `secret` or `password`, in any case.
+2. One of its segments, split on every character that is not a letter or a digit, is `KEY`, `KEYS`,
+   `PASS`, `PASSWD`, `PASSPHRASE`, `CREDENTIAL`, `CREDENTIALS`, `CREDS`, `DSN`, `AUTH`, `PAT` or
+   `COOKIE`, in any case.
 
-| The backstop | What the capsule gets | Names it applies to |
-|---|---|---|
-| keeps the name | Every WASM guest the capsule runs observes the host's value | Credential-shaped names the backstop's patterns do not cover: `DATABASE_PASSWORD`, `SLACK_BOT_TOKEN`, `JWT_SECRET` |
-| drops the name | Nothing — the entry is inert and no guest sees a value | Names matching [the backstop's patterns](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) — `GITHUB_TOKEN`, `AWS_*`, `*_API_KEY` among them — or a [`capabilities.shell.strip_env`](manifest.md#field-capabilities) pattern the manifest declared |
+A name the credential backstop strips never reaches a guest and is refused with
+[`E-CAP-016`](#e-cap-016) instead. The warning prints once per distinct entry, in declaration order,
+on stderr, from `mur run` (including `mur run --explain-scope`) and from `mur doctor` in identical
+words.
 
-A name the backstop keeps:
+The rule is measured against a fixed list of 26 names that carry credentials and 16 that do not:
+
+| Result | Names |
+|---|---|
+| Caught: 22 of 26 | Rule 1 alone catches 6 of 26, including `DATABASE_PASSWORD`, `SLACK_BOT_TOKEN` and `STRIPE_API_KEY`. Rule 2 adds 16, including `PRIVATE_KEY`, `SSH_KEY`, `CREDENTIALS`, `SENTRY_DSN`, `SMTP_PASS` and `GH_PAT` |
+| Missed | `DATABASE_URL`, `REDIS_URL`, `DB_PWD`, `CONNECTION_STRING` |
+| Warned about but carry no credential | `TOKENIZERS_PARALLELISM`, `CACHE_KEY_PREFIX` |
+| Never warned about | `PATH`, `PWD`, `AUTHOR_NAME`, `KEYBOARD_LAYOUT`, `PASSENGER_COUNT` and the other ordinary names on the list |
+
+A name the rule misses is still delivered to every guest, so review a connection-string entry such
+as `DATABASE_URL` yourself.
+
+A credential-shaped name:
 
 ```text
 [capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it: for as long as the capsule runs, the capsule holds it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
 ```
 
-A kept name on a capsule whose resolved [`lifecycle.after_task`](manifest.md#lifecycle-after-task)
+A credential-shaped name on a capsule whose resolved [`lifecycle.after_task`](manifest.md#lifecycle-after-task)
 is `sleep` gets one further sentence, because the capsule holds the value after the task that
 launched it is gone:
 
@@ -1885,27 +1937,18 @@ launched it is gone:
 [capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'DATABASE_PASSWORD', a credential-shaped variable the credential backstop does not drop — every WASM guest this capsule runs observes the host's value. murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: sleep keeps this capsule alive past the task that launched it, so it holds that value with nothing left waiting on it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
 ```
 
-A name the backstop drops:
-
-```text
-[capsule-runtime] warning[W-SEC-024]: capabilities.env.allow names 'GITHUB_TOKEN', a credential-shaped variable the credential backstop drops before any guest is built — the grant delivers nothing and no guest observes the host's value. Remove the entry, or rename the host variable if the capsule is meant to receive it (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-024)
-```
-
 **Why it matters:** `capabilities.env.allow` is the one grant whose value murmur never issues, sees
 or revokes — an operator names a host variable, and the runtime passes it through. The line is how
-you tell which of your capsules holds which secret, and a working grant from an inert one; without
-it both outcomes look the same from the outside.
+you tell which of your capsules holds which secret.
 
 **What the runtime does about it:** nothing is refused and no exit code changes. The grant is as
 effective as it would be unwarned. The judgment is made from the variable's name alone: the line
 reads the same on a host that has the variable set and one that does not, and no value ever appears
 in it.
 
-**What to do:** when the backstop keeps the name, decide whether this capsule should hold that
-secret for its whole life, and point the variable at the narrowest credential that does the job —
-murmur cannot rotate or withdraw it for you. When the backstop drops the name the entry is dead
-weight: remove it, or rename the host variable out of the backstop's patterns if the capsule is
-meant to receive it.
+**What to do:** decide whether this capsule should hold that secret for its whole life, and point
+the variable at the narrowest credential that does the job — murmur cannot rotate or withdraw it
+for you.
 
 A capsule that holds an operator-granted secret for its whole life is a legitimate shape, which is
 why this is a warning and not a refusal — including with `after_task: sleep`.
