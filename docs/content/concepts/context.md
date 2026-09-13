@@ -28,6 +28,11 @@ failed:
   a context it already knows is over budget: `out/result.txt` records the error, the trace and
   OTel (if configured) record `session_end` as `"failed"`, and the SSE stream (if the session has
   a `task_id`) emits a final `status` event with `state: "failed"`. No further turns run.
+- **A bound hook returned an error after a spend ceiling refused its `run-inference` call** — the
+  session ends with `exit_status: "spend_ceiling_reached"` rather than `failed`, and
+  `out/result.txt` reads `stopped: spend ceiling reached: …`. The trace carries one
+  `spend_ceiling_reached` line tagged with the hook's `origin`. Any other hook error still ends
+  the session as `failed`.
 
 Compaction requires both `context.max_tokens` to be set and a hook bound to `on-compaction` to be
 staged — see [Enable context compaction](../how-to/context-compaction.md) for the full

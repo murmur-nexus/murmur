@@ -426,7 +426,7 @@ for every task, on every exit path
 | Field | Type | Notes |
 |---|---|---|
 | `task_id` | string | Matches the corresponding `task_start` |
-| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
+| `exit_status` | string | `"ok"` if the last attempt succeeded; `"failed"` if it did not; `"max_turns_reached"` if it spent the `inference.max_turns` budget without finishing; `"spend_ceiling_reached"` if a [spend ceiling](manifest.md#inference-max-session-tokens) refused its next driver call — an agent turn, or a compaction hook's `run-inference` call before the hook returned an error; `"reopen_budget_exhausted"` if an `on-task-end` hook still wanted to reopen the task after `lifecycle.max_task_reopens` (or the `inference.max_turns` ceiling) was reached; `"canceled"` if a person stopped the task with [`tasks/cancel`](../how-to/capsules-a2a-messaging.md#cancelling-a-running-task) |
 | `duration_ms` | u64 | Wall-clock time from `task_start` to `task_end`, across every attempt |
 | `turns` | u32 | Cumulative inference turns for this task across every attempt (reset at `task_start`) |
 | `input_tokens` | u64 | Input tokens for this task only |

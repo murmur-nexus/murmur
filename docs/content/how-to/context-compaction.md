@@ -314,7 +314,7 @@ a compaction the tool-call-pairing safety net rejects writes nothing.
 
 ## Compaction failure modes
 
-Three situations can prevent compaction from replacing the context, and the runtime treats them
+Four situations can prevent compaction from replacing the context, and the runtime treats them
 differently:
 
 **No hook bound to `on-compaction`.** This is not a failure — it means compaction was never
@@ -338,6 +338,20 @@ OTel emits `session_end` as `"failed"` (if `observability.otel_endpoint` is conf
 the session has a `task_id` — the final SSE `status` event reports `state: "failed"`. The agent
 loop does not attempt another turn after this.
 
+**A bound hook returned an error after a spend ceiling refused its `run-inference` call.** This
+ends the session as a spend stop, not as a failure. The hook's call crossed
+[`inference.max_session_tokens`](../reference/manifest.md#inference-max-session-tokens) or
+`spend.machine_tokens_per_day`, so nothing was sent:
+
+| Surface | What it records |
+|---|---|
+| `trace.jsonl` | One `spend_ceiling_reached` line with `origin: "hook:<name>"`; `task_end` and `session_end` with `exit_status: "spend_ceiling_reached"` |
+| `out/result.txt` | `stopped: spend ceiling reached: …` |
+| OTel | `session_end` as `"spend_ceiling_reached"` |
+| SSE | A final `status` event with `state: "failed"` and the refusal text as its message |
+
+Any other error from a bound hook still ends the session as `failed`.
+
 If your compaction hook can fail (for example, the model it calls for summarization is
 unreachable), account for the fact that this ends the session rather than silently skipping
 compaction.
@@ -356,4 +370,5 @@ compaction.
 | No hook bound to `on-compaction` | Non-fatal — session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns a replacement with an unpaired tool call | Non-fatal — the replacement is discarded and the session continues with the uncompacted history; `compaction_declined` written to the trace |
 | A bound hook returns an error | Fatal — the session ends as failed; see [Compaction failure modes](#compaction-failure-modes) |
+| A bound hook returns an error after a spend ceiling refused its `run-inference` call | Fatal — the session ends with `exit_status: "spend_ceiling_reached"`, not `failed`; see [Compaction failure modes](#compaction-failure-modes) |
 | Token count after compaction | Reset to the count of the new (compacted) history, not to zero |
