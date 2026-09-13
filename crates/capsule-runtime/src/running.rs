@@ -302,7 +302,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// | Platform | Token |
 /// |---|---|
 /// | Linux | field 22 of `/proc/<pid>/stat`, clock ticks since boot |
-/// | macOS | `kinfo_proc.kp_proc.p_starttime`, as `seconds.microseconds` |
+/// | macOS | `proc_bsdinfo.pbi_start_tvsec` / `pbi_start_tvusec`, as `seconds.microseconds` |
 #[must_use]
 pub fn process_start_token(pid: u32) -> Option<String> {
     platform::process_start_token(pid)
@@ -343,71 +343,47 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    /// `kinfo_proc.kp_proc.p_starttime`, rendered as `seconds.microseconds`.
-    #[allow(unsafe_code)]
-    pub(super) fn process_start_token(pid: u32) -> Option<String> {
-        let mut mib: [libc::c_int; 4] = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_PID,
-            pid as libc::c_int,
-        ];
-        // SAFETY: `kinfo_proc` is a plain C struct of integers, pointers and nested structs with
-        // no niche and no validity invariant, so an all-zero value is a valid one. It is
-        // overwritten by the `sysctl` below before anything reads it.
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+    use std::mem::size_of;
 
-        // SAFETY: `mib` is a four-element MIB as `KERN_PROC_PID` requires, and the output buffer
-        // is one `kinfo_proc` with `size` set to its own size, which is what the call writes at
-        // most. A pid the kernel does not know returns a non-zero status or a zero length, both
-        // of which are handled below rather than read.
-        let status = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                4,
-                std::ptr::addr_of_mut!(info).cast(),
-                std::ptr::addr_of_mut!(size),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != 0 || size == 0 {
-            return None;
-        }
-        let started = info.kp_proc.p_starttime;
-        Some(format!("{}.{:06}", started.tv_sec, started.tv_usec))
+    /// `proc_bsdinfo.pbi_start_tvsec` and `pbi_start_tvusec`, rendered as `seconds.microseconds`.
+    pub(super) fn process_start_token(pid: u32) -> Option<String> {
+        let info = bsd_info(pid)?;
+        Some(format!(
+            "{}.{:06}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
     }
 
-    /// `kinfo_proc.kp_proc.p_stat` is `SZOMB` for a process that has exited and not yet been
-    /// waited on. A pid the kernel will not describe is not reported as a zombie, on the same
-    /// terms as the Linux reading.
-    #[allow(unsafe_code)]
+    /// `proc_bsdinfo.pbi_status` is `SZOMB` for a process that has exited and not yet been waited
+    /// on — XNU still answers `PROC_PIDTBSDINFO` for one. A pid the kernel will not describe is not
+    /// reported as a zombie, on the same terms as the Linux reading.
     pub(super) fn is_zombie(pid: u32) -> bool {
-        let mut mib: [libc::c_int; 4] = [
-            libc::CTL_KERN,
-            libc::KERN_PROC,
-            libc::KERN_PROC_PID,
-            pid as libc::c_int,
-        ];
-        // SAFETY: as in `process_start_token` above — `kinfo_proc` is a plain C struct with no
-        // validity invariant, so an all-zero value is valid, and it is overwritten by the
-        // `sysctl` before anything reads it.
-        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
-        let mut size = std::mem::size_of::<libc::kinfo_proc>();
-        // SAFETY: a four-element `KERN_PROC_PID` MIB and an output buffer of exactly one
-        // `kinfo_proc`, with `size` set to its own size.
-        let status = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                4,
-                std::ptr::addr_of_mut!(info).cast(),
-                std::ptr::addr_of_mut!(size),
-                std::ptr::null_mut(),
+        bsd_info(pid).is_some_and(|info| info.pbi_status == libc::SZOMB)
+    }
+
+    /// The kernel's `PROC_PIDTBSDINFO` description of `pid`, or `None` when it wrote anything
+    /// other than exactly one `proc_bsdinfo`: an unknown pid, a pid this user may not inspect, or
+    /// a short write are all a failed reading rather than a struct to read fields from.
+    #[allow(unsafe_code)]
+    fn bsd_info(pid: u32) -> Option<libc::proc_bsdinfo> {
+        // SAFETY: `proc_bsdinfo` is a plain C struct of integers and fixed-size integer arrays,
+        // with no pointer, niche or validity invariant, so an all-zero value is a valid one.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = size_of::<libc::proc_bsdinfo>();
+
+        // SAFETY: the buffer is one `proc_bsdinfo` and the size passed is that struct's own size,
+        // which bounds what `proc_pidinfo` writes. The kernel copies into it and returns; nothing
+        // retains the pointer past the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
                 0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size as libc::c_int,
             )
         };
-        status == 0 && size != 0 && i32::from(info.kp_proc.p_stat) == libc::SZOMB
+        (usize::try_from(written).ok() == Some(size)).then_some(info)
     }
 }
 

@@ -60,6 +60,11 @@
 //! child side allocation-free on its success path — and it is what makes the composed-root layout
 //! testable at all on a host that cannot create a namespace.
 
+// The composed-root planner and the synthetic `/etc` content are pure so they stay unit-tested on
+// every OS, but outside tests only the Linux `linux` submodule and `sandbox`'s Linux enforcement
+// call them, so off Linux they are dead by construction.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------- AppArmor
@@ -1005,12 +1010,10 @@ const OLD_ROOT_NAME: &str = ".mur-oldroot";
 /// Same reason [`SEALED_ROOT_BASE_CANDIDATES_C`] exists: the probe child rehearses the pivot after
 /// `fork()`, where composing a `CString` is not allowed. `old_root_names_agree` keeps the three
 /// spellings in step.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const OLD_ROOT_NAME_C: &std::ffi::CStr = c".mur-oldroot";
 
 /// [`OLD_ROOT_NAME`] as it is named from inside the new root, once `pivot_root(2)` has parked the
 /// old one there.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const OLD_ROOT_PIVOTED_C: &std::ffi::CStr = c"/.mur-oldroot";
 
 /// Base directories the new-root `tmpfs` may be mounted over, most preferred first.
@@ -1028,7 +1031,6 @@ pub const SEALED_ROOT_BASE_CANDIDATES: &[&str] = &["/tmp", "/run", "/var/tmp", "
 /// time. Static literals are the only form usable there. `probe_root_base_candidates_match_the_str_list`
 /// keeps the two lists identical, so the probe can never rehearse a base the real construction
 /// would not choose.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const SEALED_ROOT_BASE_CANDIDATES_C: &[&std::ffi::CStr] =
     &[c"/tmp", c"/run", c"/var/tmp", c"/mnt", c"/media"];
 
@@ -1514,12 +1516,6 @@ pub(crate) use linux::{
 pub(crate) use linux::{
     make_dumpable_for_map_writes, restore_dumpable, userns_grant, write_decimal_map,
 };
-
-/// Non-Linux stub: nothing here can be probed, so nothing is claimed.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn probe_sealed_support() -> SealedProbe {
-    SealedProbe::default()
-}
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]

@@ -61,6 +61,11 @@
 //! [`crate::sandbox`]) is untouched here and remains the thing that refuses
 //! `/var/run/docker.sock`.
 
+// The probe outcome and the namespace plan stay defined everywhere so the decisions over them are
+// unit-tested on every OS, but outside tests only Linux code builds or reads them, so off Linux
+// they are dead by construction.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 /// One TCP listener per allowlisted port, plus the single wildcard UDP :53 resolver socket.
 ///
 /// Bounds the one `SCM_RIGHTS` message the child sends, and therefore the fixed stack buffers the

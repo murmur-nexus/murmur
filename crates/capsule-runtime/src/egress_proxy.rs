@@ -63,6 +63,10 @@
 //!   manifest schema expresses a UDP allowlist, so forwarding it would grant a capability no
 //!   capsule ever declared.
 
+// The policy and the DNS codec are pure so they stay unit-tested on every OS, but outside tests
+// only the Linux `linux` submodule calls them, so off Linux they are dead by construction.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
@@ -466,17 +470,6 @@ pub(crate) fn answer_dns_query(
 }
 
 // ---------------------------------------------------------------- the running proxy
-
-/// Non-Linux stub. The sockets this serves only exist inside a Linux network namespace, so there
-/// is nothing to run here — the same permanence `EnforcementTier::EnvironmentOnly` carries.
-#[cfg(not(target_os = "linux"))]
-#[derive(Debug)]
-pub(crate) struct EgressProxyHandle;
-
-#[cfg(not(target_os = "linux"))]
-impl EgressProxyHandle {
-    pub(crate) fn shutdown(self) {}
-}
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{start_egress_proxy, EgressProxyHandle};
@@ -889,6 +882,7 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::sync::Arc;
 
     use super::*;
