@@ -1107,6 +1107,7 @@ fn stage_in_process(
     stage_session(
         Arc::new(registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),

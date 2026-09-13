@@ -479,17 +479,17 @@ fn run_filesystem_escape_attempt_fails_and_does_not_write_outside_workdir() {
 /// Sets up a manifest-only "agent capsule" project (murmur.yaml, no capsule.wasm
 /// needed since `inference` is present) whose `inference.api_key` references an env
 /// var, plus a workspace-root `.env` that sets that var. The `murmur.yaml` doubles as
-/// the workspace-root marker that `.env` auto-loading keys on. The manifest also
-/// declares one uninstalled tool artifact so that, once manifest parsing succeeds,
-/// `mur run` fails fast with E-RUN-008 rather than starting an HTTP server and
-/// blocking forever.
-fn create_dotenv_project(project_dir: &Path, env_var: &str) -> PathBuf {
+/// the workspace-root marker that `.env` auto-loading keys on. `artifacts` is the manifest's
+/// `artifacts:` block verbatim: a launch that would otherwise get past staging needs an
+/// uninstalled artifact in it, so `mur run` fails fast with E-RUN-008 rather than starting an
+/// HTTP server and blocking forever.
+fn create_dotenv_project(project_dir: &Path, env_var: &str, artifacts: &str) -> PathBuf {
     fs::write(project_dir.join(".env"), format!("{env_var}=from-dotenv\n")).unwrap();
 
     fs::write(
         project_dir.join("murmur.yaml"),
         format!(
-            "name: capsule\nversion: 0.0.1\nartifacts:\n  - name: missing-tool\n    version: 0.0.1\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{env_var}}}\n  driver:\n    artifact: dummy-driver\n"
+            "name: capsule\nversion: 0.0.1\nartifacts:{artifacts}\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{env_var}}}\n  driver:\n    artifact: dummy-driver\n"
         ),
     )
     .unwrap();
@@ -497,12 +497,14 @@ fn create_dotenv_project(project_dir: &Path, env_var: &str) -> PathBuf {
     project_dir.join("murmur.yaml")
 }
 
+/// With `.env` skipped and no config entry, the credential is held nowhere, so staging refuses
+/// before anything launches. No artifacts are declared, so nothing earlier stops the run.
 #[test]
-fn run_no_env_file_skips_dotenv_and_fails_manifest_resolution() {
+fn run_no_env_file_skips_dotenv_and_refuses_the_unresolved_credential() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let manifest_path = create_dotenv_project(project.path(), "CI_TEST_VAR");
+    let manifest_path = create_dotenv_project(project.path(), "CI_TEST_VAR", " []");
 
     Command::cargo_bin("mur")
         .unwrap()
@@ -523,16 +525,20 @@ fn run_no_env_file_skips_dotenv_and_fails_manifest_resolution() {
 }
 
 #[test]
-fn run_without_no_env_file_flag_loads_dotenv_and_resolves_manifest() {
+fn run_without_no_env_file_flag_loads_dotenv_and_reads_the_credential_from_it() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
 
-    let manifest_path = create_dotenv_project(project.path(), "CI_TEST_VAR");
+    let manifest_path = create_dotenv_project(
+        project.path(),
+        "CI_TEST_VAR",
+        "\n  - name: missing-tool\n    version: 0.0.1",
+    );
 
-    // No --no-env-file: .env is auto-loaded, so CI_TEST_VAR resolves and manifest
-    // parsing succeeds. The run then fails later, at the uninstalled-artifact check
-    // (E-RUN-008) rather than at manifest resolution (E-MAN-003) — proof that
-    // inference.api_key was resolved via the auto-loaded .env file.
+    // No --no-env-file: .env is auto-loaded, so CI_TEST_VAR is in the environment `mur run`
+    // reads the credential from. `W-SEC-026` names it — it fires only for a `${NAME}` the
+    // environment holds — and the run then stops at the uninstalled-artifact check (E-RUN-008),
+    // never at the unresolved-credential refusal (E-MAN-003).
     Command::cargo_bin("mur")
         .unwrap()
         .env("HOME", home.path())
@@ -541,6 +547,9 @@ fn run_without_no_env_file_flag_loads_dotenv_and_resolves_manifest() {
         .args(["run", "--manifest", manifest_path.to_str().unwrap()])
         .assert()
         .failure()
+        .stderr(predicate::str::contains("W-SEC-026"))
+        .stderr(predicate::str::contains("environment variable CI_TEST_VAR"))
+        .stderr(predicate::str::contains("E-MAN-003").not())
         .stderr(predicate::str::contains("E-RUN-008"))
         .stderr(predicate::str::contains("missing-tool@0.0.1"));
 }

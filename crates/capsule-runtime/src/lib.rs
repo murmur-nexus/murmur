@@ -27,6 +27,7 @@ pub(crate) mod fence;
 pub(crate) mod hooks;
 pub(crate) mod http_client;
 pub(crate) mod identity;
+pub(crate) mod inference_credential;
 pub(crate) mod inference_gateway;
 pub(crate) mod inference_import;
 pub mod lanes;
@@ -159,8 +160,8 @@ pub use running::{Liveness, ProcessState, RunningGuard, RunningRecord, SignalOut
 pub use runtime::{
     check_no_reserved_tool_names, launch_session, secret_shaped_env_grants, stage_session,
     warn_on_inference_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_secret_shaped_env_grants, warn_on_userns_restriction_disabled_host_wide,
-    warn_on_workdir_exec, SecretShapedEnvGrant,
+    warn_on_launch_only_inference_credential, warn_on_secret_shaped_env_grants,
+    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, SecretShapedEnvGrant,
 };
 // The one question about a variable name a caller outside the runtime needs answered: would the
 // credential backstop drop it. `shell` is otherwise crate-private, and this is the predicate

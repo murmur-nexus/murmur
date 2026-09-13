@@ -4,27 +4,37 @@
 //! The driver is handed [`InferenceGateway::driver_endpoint`] as `MURMUR_INFERENCE_ENDPOINT` and
 //! builds its request URL from it as it would from the real endpoint. Its request leaves the guest
 //! through `wasi:http/outgoing-handler` into the store's `NetworkPolicyHooks::send_request`, which
-//! hands a request addressed to [`INFERENCE_GATEWAY_AUTHORITY`] to [`InferenceGateway::rewrite`]
-//! and then to wasi-http's own sender. The runtime therefore originates the upstream connection —
-//! with TLS for an `https` endpoint — and the response future, body included, goes back to the
-//! driver exactly as wasi-http produced it.
+//! hands a request addressed to [`INFERENCE_GATEWAY_AUTHORITY`] to [`InferenceGateway::send`]. The
+//! runtime therefore originates the upstream connection — with TLS for an `https` endpoint — and
+//! the response future, body included, goes back to the driver exactly as wasi-http produced it.
+//!
+//! The key attached to each request is the credential's value at the moment the request is sent,
+//! so a key rotated in the global config reaches the next request. The request body is buffered so
+//! that a `401` can be answered by re-reading the credential and resending once; the response
+//! never is.
 //!
 //! The gateway is not a listener. A WASM driver runs inside the `mur` process, so there is no
 //! socket to guard and nothing another process can connect to and spend the key through.
 //!
-//! Nothing here writes to the trace or logs, and no error this module returns carries the key or
-//! the rendered header.
+//! No error this module returns carries the key or the rendered header.
 
+use std::sync::Arc;
+
+use bytes::Bytes;
 use http::{
     header::{HeaderName, HeaderValue},
-    Uri,
+    HeaderMap, Method, StatusCode, Uri, Version,
 };
+use http_body_util::{BodyExt, Full};
 use murmur_artifact::InferenceAuth;
 use wasmtime_wasi_http::p2::{
-    bindings::http::types::ErrorCode, body::HyperOutgoingBody, types::OutgoingRequestConfig,
+    bindings::http::types::ErrorCode,
+    body::HyperOutgoingBody,
+    default_send_request_handler,
+    types::{IncomingResponse, OutgoingRequestConfig},
 };
 
-use crate::errors::RuntimeError;
+use crate::{errors::RuntimeError, inference_credential::InferenceCredential};
 
 /// The authority `MURMUR_INFERENCE_ENDPOINT` names under `transport: http`.
 ///
@@ -43,8 +53,8 @@ pub(crate) struct InferenceGateway {
     upstream_authority: String,
     /// The driver's own declaration of how its provider takes the key.
     auth: InferenceAuth,
-    /// `inference.api_key`, resolved at manifest parse. `None` attaches nothing.
-    api_key: Option<String>,
+    /// `inference.api_key`, resolved at staging. `None` attaches nothing.
+    credential: Option<Arc<InferenceCredential>>,
 }
 
 impl std::fmt::Debug for InferenceGateway {
@@ -53,8 +63,40 @@ impl std::fmt::Debug for InferenceGateway {
             .field("driver_name", &self.driver_name)
             .field("upstream", &self.upstream.as_str())
             .field("auth", &self.auth)
-            .field("api_key", &"<redacted>")
+            .field("credential", &self.credential)
             .finish()
+    }
+}
+
+/// Everything of a driver request but its body, kept so the request can be rebuilt for a resend.
+struct RequestHead {
+    method: Method,
+    uri: Uri,
+    version: Version,
+    headers: HeaderMap,
+}
+
+impl RequestHead {
+    fn request(&self, body: Bytes) -> hyper::Request<HyperOutgoingBody> {
+        let mut request = hyper::Request::new(
+            Full::new(body)
+                .map_err(|never| match never {})
+                .boxed_unsync(),
+        );
+        *request.method_mut() = self.method.clone();
+        *request.uri_mut() = self.uri.clone();
+        *request.version_mut() = self.version;
+        *request.headers_mut() = self.headers.clone();
+        request
+    }
+}
+
+fn copy_config(config: &OutgoingRequestConfig) -> OutgoingRequestConfig {
+    OutgoingRequestConfig {
+        use_tls: config.use_tls,
+        connect_timeout: config.connect_timeout,
+        first_byte_timeout: config.first_byte_timeout,
+        between_bytes_timeout: config.between_bytes_timeout,
     }
 }
 
@@ -68,7 +110,7 @@ impl InferenceGateway {
         driver_name: impl Into<String>,
         endpoint: &str,
         auth: InferenceAuth,
-        api_key: Option<String>,
+        credential: Option<Arc<InferenceCredential>>,
     ) -> Result<Self, RuntimeError> {
         let refuse = |message: &str| {
             RuntimeError::Runtime(format!("inference.endpoint '{endpoint}' {message}"))
@@ -92,8 +134,13 @@ impl InferenceGateway {
             upstream,
             upstream_authority,
             auth,
-            api_key,
+            credential,
         })
+    }
+
+    /// The session's inference credential, when `inference.api_key` is set.
+    pub(crate) fn credential(&self) -> Option<&Arc<InferenceCredential>> {
+        self.credential.as_ref()
     }
 
     /// The value of `MURMUR_INFERENCE_ENDPOINT`: plain `http` to the gateway authority, carrying
@@ -110,24 +157,85 @@ impl InferenceGateway {
                 == Some(INFERENCE_GATEWAY_AUTHORITY)
     }
 
-    /// Readdresses a driver request at the upstream and attaches the credential.
+    /// Sends one driver request to the provider and returns the provider's response unbuffered.
     ///
-    /// Every header named like `auth.header` is removed and, when a key is held, exactly one is
+    /// The request carries the credential's current value. When the provider answers `401`, the
+    /// credential is re-read whatever its file stamp says; a value different from the one sent is
+    /// attached to a single resend of the same bytes, and that response is returned whatever its
+    /// status. An unchanged value is not resent — the same key cannot get a different answer — and
+    /// the `401` is recorded as a rejection, as is a `401` to the resend. No other status is
+    /// looked at.
+    pub(crate) async fn send(
+        self: Arc<Self>,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> Result<IncomingResponse, ErrorCode> {
+        let Some(credential) = self.credential.clone() else {
+            let (request, config) = self.rewrite(request, config, None)?;
+            return default_send_request_handler(request, config).await;
+        };
+
+        let (parts, body) = request.into_parts();
+        let body = body.collect().await?.to_bytes();
+        let head = RequestHead {
+            method: parts.method,
+            uri: parts.uri,
+            version: parts.version,
+            headers: parts.headers,
+        };
+
+        let sent = credential.current().await;
+        let (request, first_config) = self.rewrite(
+            head.request(body.clone()),
+            copy_config(&config),
+            Some(&sent),
+        )?;
+        let response = default_send_request_handler(request, first_config).await?;
+        if response.resp.status() != StatusCode::UNAUTHORIZED {
+            credential.clear_rejection();
+            return Ok(response);
+        }
+
+        let reread = credential.reread_after_rejection().await;
+        if reread == sent {
+            credential
+                .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), false)
+                .await;
+            return Ok(response);
+        }
+        drop(response);
+
+        let (request, config) = self.rewrite(head.request(body), config, Some(&reread))?;
+        let resent = default_send_request_handler(request, config).await?;
+        if resent.resp.status() == StatusCode::UNAUTHORIZED {
+            credential
+                .record_rejection(StatusCode::UNAUTHORIZED.as_u16(), true)
+                .await;
+        } else {
+            credential.clear_rejection();
+        }
+        Ok(resent)
+    }
+
+    /// Readdresses a driver request at the upstream and attaches `key`.
+    ///
+    /// Every header named like `auth.header` is removed and, when a key is given, exactly one is
     /// inserted, marked sensitive. The URI keeps the request's own path and query and takes the
     /// upstream's scheme and authority; `use_tls` follows the upstream scheme. The body is moved
     /// through untouched. `host` is left unset — guests cannot set it — so wasi-http's sender fills
     /// it from the rewritten authority.
-    pub(crate) fn rewrite(
+    fn rewrite(
         &self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
+        key: Option<&str>,
     ) -> Result<(hyper::Request<HyperOutgoingBody>, OutgoingRequestConfig), ErrorCode> {
         let (mut parts, body) = request.into_parts();
 
         let header = HeaderName::from_bytes(self.auth.header.as_bytes())
             .map_err(|_| ErrorCode::InternalError(None))?;
         parts.headers.remove(&header);
-        if let Some(key) = self.api_key.as_deref() {
+        if let Some(key) = key {
             let mut value = HeaderValue::from_str(&self.auth.render(key))
                 .map_err(|_| ErrorCode::InternalError(None))?;
             value.set_sensitive(true);
@@ -154,7 +262,8 @@ impl InferenceGateway {
 mod tests {
     use std::time::Duration;
 
-    use http_body_util::{BodyExt, Empty};
+    use http_body_util::Empty;
+    use murmur_artifact::ApiKeyReference;
 
     use super::*;
 
@@ -168,7 +277,13 @@ mod tests {
     }
 
     fn gateway(endpoint: &str, auth: InferenceAuth, key: Option<&str>) -> InferenceGateway {
-        InferenceGateway::new("driver", endpoint, auth, key.map(str::to_string)).unwrap()
+        let credential = key.map(|key| {
+            Arc::new(
+                InferenceCredential::resolve(&ApiKeyReference::Literal(key.to_string()), None)
+                    .unwrap(),
+            )
+        });
+        InferenceGateway::new("driver", endpoint, auth, credential).unwrap()
     }
 
     fn request(uri: &str, headers: &[(&str, &str)]) -> hyper::Request<HyperOutgoingBody> {
@@ -209,7 +324,7 @@ mod tests {
                 ("content-type", "application/json"),
             ],
         );
-        let (rewritten, _) = gateway.rewrite(forged, config()).unwrap();
+        let (rewritten, _) = gateway.rewrite(forged, config(), Some(KEY)).unwrap();
         let values: Vec<_> = rewritten.headers().get_all("x-api-key").iter().collect();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0], KEY);
@@ -228,6 +343,7 @@ mod tests {
             .rewrite(
                 request("http://127.0.0.1:9/v1/chat/completions", &[]),
                 config(),
+                Some(KEY),
             )
             .unwrap();
         assert_eq!(
@@ -247,6 +363,7 @@ mod tests {
             .rewrite(
                 request("http://127.0.0.1:9/v1/chat/completions?x=1", &[]),
                 config(),
+                Some(KEY),
             )
             .unwrap();
         assert_eq!(
@@ -267,7 +384,11 @@ mod tests {
             Some(KEY),
         );
         let (rewritten, config) = gateway
-            .rewrite(request("http://127.0.0.1:9/api/chat", &[]), config())
+            .rewrite(
+                request("http://127.0.0.1:9/api/chat", &[]),
+                config(),
+                Some(KEY),
+            )
             .unwrap();
         assert_eq!(
             rewritten.uri().to_string(),
@@ -283,10 +404,12 @@ mod tests {
             auth("x-api-key", "{key}"),
             None,
         );
+        assert!(gateway.credential().is_none());
         let (rewritten, _) = gateway
             .rewrite(
                 request("http://127.0.0.1:9/v1/messages", &[("X-Api-Key", "forged")]),
                 config(),
+                None,
             )
             .unwrap();
         assert!(rewritten.headers().get("x-api-key").is_none());
@@ -335,7 +458,7 @@ mod tests {
         );
         let debug = format!("{gateway:?}");
         assert!(!debug.contains(KEY), "{debug}");
-        assert!(debug.contains("api_key: \"<redacted>\""), "{debug}");
+        assert!(debug.contains("value: \"<redacted>\""), "{debug}");
     }
 
     #[test]

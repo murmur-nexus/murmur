@@ -3415,6 +3415,7 @@ mod tests {
             model: "manifest-model".to_string(),
             engine: engine.clone(),
             accessible_workdir: accessible.path().to_path_buf(),
+            workdir: accessible.path().to_path_buf(),
             inference_env: Vec::new(),
             capability_policy: crate::types::CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),

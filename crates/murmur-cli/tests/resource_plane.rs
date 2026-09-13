@@ -273,6 +273,7 @@ fn launch(exports: Option<&str>, responses: usize) -> Capsule {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: project.clone(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),

@@ -23,6 +23,7 @@ Where both files set a value, the effective config is built per field:
 | `registry.index_url` | Project wins if non-empty, else global |
 | `inference.provider`, `inference.model`, `inference.endpoint` | Project wins if non-empty, else global |
 | `inference.api_key` | Always the global value — see [`inference.api_key` is always global](#inferenceapi_key-is-always-global) |
+| `credentials` | Always the global map. A non-empty `credentials:` in the project file is ignored, with a warning naming that file — see [`credentials:` section](#credentials) |
 | `registry.sources` | Union by `name`: a project entry sharing a global entry's name replaces it in place (position preserved); a project entry with a new name is appended; global-only entries are never dropped |
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
 | `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. See [Containment class](containment.md#field-containment) |
@@ -82,6 +83,83 @@ A `${VAR}` reference prints no warning. The variable name must be uppercase lett
 underscores, starting with a letter or underscore — `${MY_ORG_KEY}` is a reference, `${my_key}`
 is a literal and warns.
 
+`mur run` does not read `inference.api_key`. It reads provider keys from
+[`credentials:`](#credentials), and `mur config set inference.api_key` prints a one-line note saying
+so.
+
+### `credentials:` section { #credentials }
+
+Provider keys, by credential name. A manifest's
+[`inference.api_key: ${NAME}`](manifest.md#inference-api-key) names a credential, and `mur run`
+reads its value from `credentials.NAME` here.
+
+```yaml
+credentials:
+  ANTHROPIC_API_KEY: sk-ant-...
+  OPENAI_API_KEY: sk-...
+```
+
+| Key | Type | Description |
+|---|---|---|
+| `<NAME>` | string | The key for credential `NAME`. `NAME` is uppercase letters, digits and underscores, starting with a letter or underscore. An empty value counts as absent |
+
+Write an entry with `mur config set -g`. Only the global file holds credentials, so the command
+refuses without `-g`, and it prints the key's name, never its value:
+
+```bash
+mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
+# Set credentials.ANTHROPIC_API_KEY in ~/.murmur/config.yaml
+```
+
+#### Where `${NAME}` is read from { #credentials-precedence }
+
+| Situation | Key used | Re-read while the capsule runs |
+|---|---|---|
+| `credentials.NAME` is a non-empty entry in `~/.murmur/config.yaml` | That entry, even when the environment variable `NAME` is also set | Yes |
+| No entry, and the environment variable `NAME` is set | The variable, with [`W-SEC-026`](diagnostics.md#w-sec-026) | No |
+| Neither | None: `mur run` refuses before any session directory exists, with `E-MAN-003` naming both places | — |
+| `inference.api_key` is a literal, not `${NAME}` | The literal, with [`W-SEC-026`](diagnostics.md#w-sec-026) | No |
+| No `inference.api_key` | None | — |
+
+#### Rotating a key { #credentials-rotation }
+
+A replaced entry takes effect on the next inference request that any running capsule sends. Nothing
+restarts. Before each request that carries the key, the runtime stats the config file, with no
+timer. It re-reads the file only when the file's device, inode, size, modification time or change
+time differ from the last read.
+
+| Change | When a running capsule uses it |
+|---|---|
+| `mur config set -g credentials.NAME <key>` | The next request. The command replaces the file by rename, so the inode always changes |
+| A hand edit that changes the file's size or timestamps | The next request |
+| An in-place hand edit that keeps the size within one filesystem timestamp tick | The next change to the file, or the next `401` |
+| Removing the entry, or the file becoming missing or unparseable | Never. The capsule keeps the last key it read, and the trace records `change: "unreadable"` once for that state of the file |
+
+Removing an entry does not revoke a running capsule's key; replacing it does.
+
+When the provider answers `401`, the runtime re-reads the file at once, whatever its timestamps
+say. A changed value is sent in one resend of the same request, and that response goes to the
+driver whatever its status. An unchanged value is not resent. A `401` that stands ends the task with
+[`E-RUN-026`](diagnostics.md#e-run-026). Every rotation and rejection is recorded in the session
+trace as an [`inference_credential`](observability-schemas.md#inference-credential) event, which
+never carries the key.
+
+A capsule started by another capsule's `delegate-task` runs with the same `HOME`, so it reads the
+same file and picks up a rotated key too. Only `transport: http` capsules read credentials.
+
+#### File permissions { #credentials-permissions }
+
+`mur config set` does not set a mode on what it writes. Under the common umask `022`,
+`~/.murmur` is created `0755` and `~/.murmur/config.yaml` is written `0644`, which every user on the
+host can read. Restrict the file once it holds a key:
+
+```bash
+chmod 600 ~/.murmur/config.yaml
+```
+
+The mode survives later `mur config set` writes only if your umask keeps new files private.
+Run `chmod 600` again after each write, or set `umask 077` in the shell that writes it.
+
 ### `registry:` section
 
 | Key | Description |
@@ -119,6 +197,7 @@ warns when the name is not one of them.
 | `mur install` source-chain resolution | `registry.default`, `registry.sources` |
 | `mur search` | `registry.index_url` |
 | `mur run`, `mur doctor` — the containment floor | `containment` |
+| `mur run` — the key for `inference.api_key: ${NAME}`, re-read while the capsule runs; `mur doctor` — whether to warn with `W-SEC-026` | `credentials`, from the global file only |
 
 `mur new` and `mur deploy` read `~/.murmur/config.yaml` only; a project-level file does not
 affect them.

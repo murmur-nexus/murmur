@@ -55,6 +55,7 @@ fn shell_desc_driver_writes_enriched_manifest_for_known_binary() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-shell-desc".to_string(),
             capsule_version: "0.1.0".to_string(),
@@ -166,6 +167,7 @@ fn shell_desc_driver_not_declared_falls_back_to_generic() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-no-driver".to_string(),
             capsule_version: "0.1.0".to_string(),
@@ -264,6 +266,7 @@ fn shell_desc_driver_respects_custom_manifest() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test-custom-manifest".to_string(),
             capsule_version: "0.1.0".to_string(),

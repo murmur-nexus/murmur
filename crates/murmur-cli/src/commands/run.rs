@@ -362,6 +362,14 @@ pub(crate) fn run_run(
         runtime_manifest.inference.as_ref(),
     );
 
+    // Same seam again: a key read only at launch is what an operator rotating keys needs to hear
+    // about before the capsule is running, and `--explain-scope` should say it too. Never a
+    // refusal.
+    capsule_runtime::warn_on_launch_only_inference_credential(
+        runtime_manifest.inference.as_ref(),
+        crate::config::mur_config_path().ok().as_deref(),
+    );
+
     // The same set, and the same checker, `stage_session` consults — called here only because the
     // installed-artifact pre-flight below would otherwise report a colliding name as a missing
     // artifact, sending the operator to `mur install` for something no registry may serve. Placed
@@ -645,6 +653,7 @@ pub(crate) fn run_run(
     };
 
     let stage_request = StageRequest {
+        credentials_file: crate::config::mur_config_path().ok(),
         manifest_dir: project_dir.clone(),
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),

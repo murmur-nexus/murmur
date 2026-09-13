@@ -120,6 +120,9 @@ pub(crate) struct EnvironmentNames {
     /// Whether this process's own environment counts. False only for the test constructor, so a
     /// unit test's expectations do not depend on what the machine running it exports.
     include_process_env: bool,
+    /// Credential names the global config's `credentials:` map holds a non-empty value for. An
+    /// `inference.api_key: ${NAME}` is answered from there before the environment is consulted.
+    credentials: BTreeSet<String>,
 }
 
 impl EnvironmentNames {
@@ -129,11 +132,25 @@ impl EnvironmentNames {
     /// than replacing it: the process environment still decides every name, and suppressing the
     /// whole variable list over one malformed line would hide the report the operator came for.
     pub(crate) fn for_workspace(workspace_root: &Path) -> (Self, Option<DotenvError>) {
+        // Only which names hold a value is kept; the values are dropped here.
+        let credentials = crate::config::load_mur_config_if_exists()
+            .ok()
+            .flatten()
+            .map(|config| {
+                config
+                    .credentials
+                    .into_iter()
+                    .filter(|(_, value)| !value.trim().is_empty())
+                    .map(|(name, _)| name)
+                    .collect()
+            })
+            .unwrap_or_default();
         match dotenv_variable_names(workspace_root) {
             Ok(declared) => (
                 Self {
                     declared,
                     include_process_env: true,
+                    credentials,
                 },
                 None,
             ),
@@ -141,6 +158,7 @@ impl EnvironmentNames {
                 Self {
                     declared: BTreeSet::new(),
                     include_process_env: true,
+                    credentials,
                 },
                 Some(error),
             ),
@@ -156,7 +174,24 @@ impl EnvironmentNames {
         Self {
             declared: names.into_iter().map(Into::into).collect(),
             include_process_env: false,
+            credentials: BTreeSet::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_credentials<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.credentials = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether `reference` is answered before the environment is asked: an `inference.api_key`
+    /// whose name the global config's `credentials:` map holds.
+    fn answers_from_credentials(&self, reference: &ReferencedEnvVariable) -> bool {
+        reference.field == "inference.api_key" && self.credentials.contains(&reference.variable)
     }
 
     /// A name set to the empty string counts as present, because `child_environment` copies it
@@ -192,7 +227,10 @@ pub(crate) fn formation_env_report(
     // what keeps a fully-provisioned capsule's report to what the walk alone found.
     let unset_references: Vec<ReferencedEnvVariable> = referenced_env_variables(root_manifest_yaml)
         .into_iter()
-        .filter(|reference| !environment.contains(&reference.variable))
+        .filter(|reference| {
+            !environment.answers_from_credentials(reference)
+                && !environment.contains(&reference.variable)
+        })
         .collect();
     let root_ref = format!("{}@{}", root.name, root.version);
 
@@ -939,6 +977,36 @@ mod tests {
             &EnvironmentNames::from_names(["SOLO_REFERENCE_4C7E05B1"]),
         )
         .is_none());
+    }
+
+    /// An `inference.api_key` whose name the global config's `credentials:` map holds is not a
+    /// variable the operator lacks, even with the environment variable unset.
+    #[test]
+    fn a_reference_held_in_global_credentials_is_not_reported_missing() {
+        let project = TempDir::new().unwrap();
+        let yaml = "name: solo\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  driver:\n    artifact: murmur-driver-anthropic\n  api_key: ${SOLO_REFERENCE_4C7E05B1}\n";
+        let root = RuntimeManifest::from_yaml_str(yaml).unwrap();
+
+        assert!(formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(Vec::<String>::new())
+                .with_credentials(["SOLO_REFERENCE_4C7E05B1"]),
+        )
+        .is_none());
+
+        // A credential under another name answers nothing.
+        let report = formation_env_report(
+            &root,
+            yaml,
+            project.path(),
+            None,
+            &EnvironmentNames::from_names(Vec::<String>::new()).with_credentials(["OTHER_KEY"]),
+        )
+        .expect("the reference is still unheld");
+        assert_eq!(report.variables[0].name, "SOLO_REFERENCE_4C7E05B1");
     }
 
     /// One list, whatever named the variable: a reference to a name the closure also declares

@@ -459,6 +459,22 @@ pub enum RuntimeError {
         reason: Option<String>,
     },
 
+    /// `inference.api_key: ${variable}` names a credential that neither the global config's
+    /// `credentials:` map nor the launching environment holds. Refused at staging, before the
+    /// session directory exists.
+    #[error(
+        "murmur.yaml: inference.api_key references ${{{variable}}}, but neither \
+         credentials.{variable} in {} nor the environment variable {variable} is set",
+        .credentials_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the global config".to_string())
+    )]
+    InferenceCredentialNotFound {
+        variable: String,
+        credentials_file: Option<std::path::PathBuf>,
+    },
+
     #[error("agent loop failed: {0}")]
     AgentLoopFailed(String),
 

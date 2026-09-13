@@ -331,6 +331,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
     let staged = stage_session(
         std::sync::Arc::new(local_registry),
         StageRequest {
+            credentials_file: None,
             manifest_dir: capsule_dir.path().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),

@@ -70,7 +70,9 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         ),
         RuntimeManifestError::InvalidArtifact { index, message } => CliError::new(
             E_MAN_003,
-            format!("{MANIFEST_FILENAME}: invalid artifact declaration at index {index}: {message}"),
+            format!(
+                "{MANIFEST_FILENAME}: invalid artifact declaration at index {index}: {message}"
+            ),
         ),
         RuntimeManifestError::InvalidInferenceConfig { field, message } => CliError::new(
             E_MAN_003,
@@ -87,16 +89,6 @@ pub(crate) fn runtime_manifest_error_to_cli(error: RuntimeManifestError) -> CliE
         RuntimeManifestError::InvalidTraceConfig { field, message } => CliError::new(
             E_MAN_003,
             format!("{MANIFEST_FILENAME}: invalid trace config for '{field}': {message}"),
-        ),
-        RuntimeManifestError::MissingInferenceEnvVar {
-            field: _,
-            reference,
-            variable: _,
-        } => CliError::new(
-            E_MAN_003,
-            format!(
-                "{MANIFEST_FILENAME}: inference.api_key references {reference} but the environment variable is not set"
-            ),
         ),
         RuntimeManifestError::Io { path, source } => CliError::new(
             E_IO_003,

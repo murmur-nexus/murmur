@@ -543,6 +543,7 @@ fn session_start_carries_resumed_from_and_context_id() {
             "containment_achieved",
             "containment_declared",
             "context_id",
+            "credential_source",
             "effective_grants",
             "event_id",
             "event_type",

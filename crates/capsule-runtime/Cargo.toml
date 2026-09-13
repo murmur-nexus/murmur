@@ -12,11 +12,14 @@ path = "src/lib.rs"
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4"
 hickory-resolver = "0.26"
 hmac = "0.12"
 http = "1"
+# The inference gateway buffers a driver's request body so it can resend it after a 401.
+http-body-util = "0.1"
 hyper = { version = "1", default-features = false }
 libc = "0.2"
 murmur-artifact.workspace = true
@@ -58,10 +61,6 @@ alloc-bench = []
 [dev-dependencies]
 mur-roost = { path = "../mur-roost" }
 tempfile = "3"
-# Dev-only: builds an empty `HyperOutgoingBody` so the hook capability tests can call
-# `NetworkPolicyHooks::send_request` directly through a hook store's `WasiHttpView`.
-bytes = "1"
-http-body-util = "0.1"
 # Dev-only: hand-authored WAT component doubles for the hook-instantiation tests
 # (required-vs-optional lifecycle export resolution). No production impact.
 wat = "=1.251.0"
