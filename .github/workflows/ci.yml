@@ -199,6 +199,69 @@ jobs:
         # job's copy fails here rather than during a release.
         run: python .github/scripts/check-workflow-invocations.py
 
+  macos:
+    name: macos (${{ matrix.target }})
+    # macOS is a published platform, and before this job the only thing that compiled it was
+    # release.yml's build-macos, on a release tag. That is how `running.rs` reached main reading a
+    # `libc::kinfo_proc` the libc crate has never defined for Apple: every Linux job was green,
+    # and the release would have been the first build to notice. This compiles every target and
+    # every feature at each Apple triple the release publishes, on the runner the release uses.
+    #
+    # The matrix must list every target in release.yml's build-macos matrix.
+    # check-release-targets-in-ci.py, run by the release-targets-in-ci job below, fails when it
+    # does not, so an Apple target cannot be added to the release without being compiled here.
+    #
+    # No `if:`: a platform that only breaks at merge is still found after the fact, and the point
+    # is to find it on the pull request that breaks it.
+    runs-on: macos-latest
+    # A ceiling so a hung build or test fails the job rather than burning the runner's own limit.
+    # Not a measurement: nobody has timed this job yet.
+    timeout-minutes: 60
+    strategy:
+      # One leg failing says nothing about the other, and both results are wanted.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Check workspace
+        # `--all-targets --all-features` for the same reason as `lint`: tests, `mur-alloc-bench`
+        # and the feature-gated command files are otherwise never compiled for this platform at
+        # all. Warnings are denied because cfg-gated code is exactly where an import or a helper
+        # goes unused on one OS only, and no Linux job can see it.
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo check --workspace --all-targets --all-features --target ${{ matrix.target }}
+      - name: Process-identity tests on a Darwin kernel
+        # macos-latest is Apple Silicon, so this leg is the native one. The live-session record's
+        # start-time token and zombie reading call `proc_pidinfo` directly, and compiling that
+        # proves nothing about what the kernel answers.
+        if: matrix.target == 'aarch64-apple-darwin'
+        # Quoted: a plain scalar ending in `:` reads as a mapping key.
+        run: 'cargo test -p capsule-runtime --lib running::'
+
+  release-targets-in-ci:
+    name: release-targets-in-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: CI compiles every Apple target the release builds
+        # Reads the `target:` values of release.yml's build-macos matrix and of the macos job
+        # above, and fails when the release builds one this workflow does not compile. It also
+        # fails when it cannot find either matrix: a check that finds nothing to compare must not
+        # report that nothing differs.
+        run: python .github/scripts/check-release-targets-in-ci.py
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

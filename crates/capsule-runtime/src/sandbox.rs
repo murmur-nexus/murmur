@@ -6404,7 +6404,7 @@ mod landlock_probe_isolation {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod linux_integration_tests {
     use std::path::Path;
 

@@ -132,3 +132,29 @@ It reads the invocations rather than restating them for the same reason — a
 copy would drift from what CI actually runs and prove nothing. If the command
 lines move out of `.github/workflows/`, the check fails rather than reporting
 that zero invocations all passed.
+
+---
+
+## `check-release-targets-in-ci.py`
+
+```bash
+python .github/scripts/check-release-targets-in-ci.py [--root <repo root>]
+```
+
+**Used by:** `ci.yml`'s `release-targets-in-ci` job, on every PR and push to
+`main`.
+
+Reads the `target:` values of `release.yml`'s `build-macos` matrix and of
+`ci.yml`'s `macos` matrix, and fails when the release builds an Apple target
+that CI does not compile. Standard library only, so it reads the YAML subset
+those two matrices are written in rather than YAML in general.
+
+| Exit | Meaning |
+|---|---|
+| `0` | every release target is in CI's matrix |
+| `1` | a release target is missing from CI's matrix, one line per target |
+| `2` | a workflow file, the job, its matrix, or any `target:` in it cannot be found |
+
+It exists because `build-macos` was once the only thing that compiled macOS,
+and it only runs on a release tag. Adding an Apple target means adding it to
+both matrices.

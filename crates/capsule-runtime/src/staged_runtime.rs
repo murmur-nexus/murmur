@@ -49,6 +49,7 @@
 //! provable statement of what the planned step must do on a real kernel, without needing a sealed
 //! capsule, a `pivot_root` or the enforcement pipeline to demonstrate it.
 
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
 use murmur_artifact::{ContainmentClass, StagedRuntimeGrant};
