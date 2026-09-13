@@ -6243,6 +6243,7 @@ pub struct StrippedEnvAllowEntry {
     pub name: String,
     /// The matching backstop pattern, verbatim.
     pub pattern: String,
+    /// The list the pattern came from.
     pub source: crate::shell::BackstopPatternSource,
 }
 
