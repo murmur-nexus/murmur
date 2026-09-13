@@ -211,10 +211,15 @@ before it is sent, with `limit: "machine"` on its
 does not latch: the next call is checked again, and the total starts from zero at 00:00 UTC.
 
 **The ceiling is approximate.** Every `mur run` appends each settled call to a shared ledger and
-reads only what was appended since its last read; there is no lock and no daemon. Other processes'
-admitted-but-unsettled calls are invisible, so the machine total can exceed
-`spend.machine_tokens_per_day` by up to the tokens of the calls in flight on the machine at the
-moment it is reached.
+reads only the lines appended since its last read; there is no lock and no daemon. A call one run
+has admitted and not yet settled is invisible to every other run, so the machine total can exceed
+`spend.machine_tokens_per_day` by at most the tokens of the calls in flight on the machine —
+admitted and not yet settled — when the last call was admitted. Every `mur run` makes one call at a
+time, so that is at most one call per concurrently running `mur run`. Those tokens are the
+runtime's own `input_tokens + output_tokens` for each call, however much output the call asked for.
+
+The bound holds only while the ledger can be read and appended to. A run that cannot append to it
+prints a warning, and those calls are not counted.
 
 | Covered | Not covered |
 |---|---|
