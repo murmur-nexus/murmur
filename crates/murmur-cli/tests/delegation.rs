@@ -1011,6 +1011,7 @@ fn stage_request(
         declared_containment_floor: ContainmentClass::Advisory,
         exports: runtime_manifest.exports.clone(),
         spawn_grant: None,
+        machine_tokens_per_day: None,
     }
 }
 

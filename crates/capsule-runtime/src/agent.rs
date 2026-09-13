@@ -28,6 +28,7 @@ use crate::{
     otel::OtelEmitter,
     protected_paths::ProtectedPathRefusal,
     runtime::CapsuleStoreState,
+    spend::SpendRefusal,
     streaming::{
         emit_chunk_sse_final, emit_sse, SseBroadcast, SseEventBuffer, StreamArtifact, StreamStatus,
         TaskArtifactUpdateEvent, TaskStatusUpdateEvent,
@@ -161,6 +162,9 @@ pub(crate) enum AgentLoopExit {
     Ok,
     Failed,
     MaxTurnsReached,
+    /// A spend ceiling refused the next driver call. Like `MaxTurnsReached`, a budget the operator
+    /// set ran out: the session survives it and reports on it.
+    SpendCeilingReached,
     /// A person stopped this task. Not a failure: the loop did exactly what it was asked to, and
     /// the session it ran in is untouched.
     Canceled,
@@ -172,6 +176,7 @@ impl AgentLoopExit {
             Self::Ok => "ok",
             Self::Failed => "failed",
             Self::MaxTurnsReached => "max_turns_reached",
+            Self::SpendCeilingReached => "spend_ceiling_reached",
             Self::Canceled => "canceled",
         }
     }
@@ -493,6 +498,32 @@ pub(crate) async fn run_agent_loop(
             .a2a_chunk_event_id
             .store(sse_event_id, Ordering::Relaxed);
 
+        // Admitted after the call is measured and before anything is sent. The guard is settled
+        // once the response's output is counted; every other way out of this turn drops it, which
+        // charges the input alone.
+        let admission = match store_state.spend.admit(
+            u64::from(input_tokens),
+            u64::from(run_config.max_output_tokens),
+        ) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                return finish_spend_refused_turn(
+                    hooks,
+                    trace,
+                    otel,
+                    workdir,
+                    &sse,
+                    &mut sse_event_id,
+                    task_id.as_deref(),
+                    &task_id_str,
+                    context_id.clone(),
+                    turn_u32,
+                    &refusal,
+                )
+                .await;
+            }
+        };
+
         let inference_started = Instant::now();
         // Raced rather than awaited: a cancel must stop the provider call in flight rather than
         // wait it out. Losing the race drops the `call_async` future, which disposes the guest
@@ -505,7 +536,7 @@ pub(crate) async fn run_agent_loop(
                         signal.note_phase(PHASE_INFERENCE);
                         None
                     }
-                    dispatched = store_state.dispatch_tool_async(
+                    dispatched = store_state.dispatch_driver_async(
                         driver_name,
                         ToolInput {
                             data: Some(payload_json),
@@ -516,7 +547,7 @@ pub(crate) async fn run_agent_loop(
             }
             None => Some(
                 store_state
-                    .dispatch_tool_async(
+                    .dispatch_driver_async(
                         driver_name,
                         ToolInput {
                             data: Some(payload_json),
@@ -628,6 +659,7 @@ pub(crate) async fn run_agent_loop(
 
         let output_tokens = count_tokens(raw);
         session_tokens = session_tokens.saturating_add(output_tokens);
+        admission.settle(u64::from(input_tokens), u64::from(output_tokens));
 
         let response: Value = serde_json::from_str(raw).map_err(|e| {
             RuntimeError::AgentLoopFailed(format!("failed to parse driver response: {e}"))
@@ -1350,6 +1382,59 @@ async fn finish_canceled_turn(
     AgentLoopExit::Canceled
 }
 
+/// End one attempt because a spend ceiling refused the next driver call.
+///
+/// Nothing was sent, so nothing is appended to the conversation and the model gets no further turn.
+/// The refusal is recorded as what it is — a `spend_ceiling_reached` trace line and a result that
+/// says it stopped — and never as a driver or provider error. A2A has no state for a task stopped
+/// by policy, so the terminal status is `failed` and its message carries the refusal, as it does
+/// for `inference.max_turns`.
+#[allow(clippy::too_many_arguments)]
+async fn finish_spend_refused_turn(
+    hooks: &mut HookRuntime,
+    trace: &mut TraceWriter,
+    otel: &mut OtelEmitter,
+    workdir: &Path,
+    sse: &Option<(SseBroadcast, Arc<Mutex<SseEventBuffer>>)>,
+    sse_event_id: &mut u64,
+    task_id: Option<&str>,
+    task_id_str: &str,
+    context_id: Option<String>,
+    turn: u32,
+    refusal: &SpendRefusal,
+) -> Result<AgentLoopExit, RuntimeError> {
+    // An async hook's completion may have settled or been refused while this turn was measured.
+    flush_hook_inference_records(hooks, trace, otel, turn).await;
+    trace
+        .write_spend_ceiling_reached(turn, refusal, None)
+        .await
+        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    record_result(hooks, workdir, &format!("stopped: {refusal}"))
+        .map_err(RuntimeError::AgentLoopFailed)?;
+    flush_hook_dispatch_faults(hooks, trace).await;
+    otel.emit_session_end(AgentLoopExit::SpendCeilingReached.as_str())
+        .await;
+    if task_id.is_some() {
+        emit_sse(
+            sse,
+            sse_event_id,
+            "status",
+            &TaskStatusUpdateEvent {
+                id: task_id_str.to_string(),
+                context_id,
+                status: StreamStatus {
+                    state: "failed".into(),
+                    message: refusal.to_string(),
+                    response: None,
+                },
+                r#final: true,
+            },
+        )
+        .await;
+    }
+    Ok(AgentLoopExit::SpendCeilingReached)
+}
+
 /// How the output cap in force is named wherever a capped turn is reported: the manifest field a
 /// person edits, and the value that field resolved to.
 fn output_cap_phrase(cap: u32) -> String {
@@ -1507,12 +1592,20 @@ async fn finish_completed_turn(
 /// through the session's real `TraceWriter`/`OtelEmitter`. Called after any
 /// point a hook may have run — `hooks.rs` can't write these itself, since it
 /// has no access to `trace`/`otel` (see `HookInferenceCtx::records`).
+///
+/// A hook call a spend ceiling refused made no call and has no `inference` record; its
+/// `spend_ceiling_reached` line is written here too, tagged with the hook's origin.
 async fn flush_hook_inference_records(
     hooks: &HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
     turn: u32,
 ) {
+    for refused in hooks.drain_spend_refusals() {
+        let _ = trace
+            .write_spend_ceiling_reached(turn, &refused.refusal, Some(&refused.origin))
+            .await;
+    }
     for record in hooks.drain_inference_records() {
         let _ = trace
             .write_inference(
@@ -4848,5 +4941,9 @@ forgery: {prompt}"
         assert_eq!(AgentLoopExit::Ok.as_str(), "ok");
         assert_eq!(AgentLoopExit::Failed.as_str(), "failed");
         assert_eq!(AgentLoopExit::MaxTurnsReached.as_str(), "max_turns_reached");
+        assert_eq!(
+            AgentLoopExit::SpendCeilingReached.as_str(),
+            "spend_ceiling_reached"
+        );
     }
 }

@@ -115,6 +115,7 @@ fn stage_agent(home: &TempDir, manifest_path: &Path) -> capsule_runtime::StagedS
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap()

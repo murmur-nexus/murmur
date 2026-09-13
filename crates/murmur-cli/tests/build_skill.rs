@@ -324,6 +324,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
         system_prompt_artifact: None,
         max_turns: 10,
         max_tokens: None,
+        max_session_tokens: None,
     });
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
@@ -357,6 +358,7 @@ fn skill_build_roundtrip_skill_md_installed_in_workdir() {
             declared_containment_floor: ContainmentClass::Advisory,
             exports: None,
             spawn_grant: None,
+            machine_tokens_per_day: None,
         },
     )
     .unwrap();

@@ -415,6 +415,20 @@ struct CallDeniedEvent {
     reason: String,
 }
 
+/// A spend ceiling refused a driver call before it was sent. There is no `inference` line for a
+/// refused call.
+#[derive(Debug, Deserialize)]
+struct SpendCeilingReachedEvent {
+    /// `"session"` or `"machine"`.
+    limit: String,
+    ceiling: u64,
+    used: u64,
+    requested: u64,
+    /// `hook:<name>` for a hook's `run-inference` call; absent for an agent-loop turn.
+    #[serde(default)]
+    origin: Option<String>,
+}
+
 /// The capsule manifest's own `capabilities.filesystem.read_only` rule refused a call before it
 /// ran. Rendered where it cannot be scrolled past, and counted: a run where the capsule attempted
 /// a protected write four times and was refused is a different result from one where it never
@@ -595,6 +609,7 @@ enum TraceEvent {
     PlanStepStart(PlanStepStartEvent),
     PlanStep(PlanStepEvent),
     PlanEnd(PlanEndEvent),
+    SpendCeilingReached(SpendCeilingReachedEvent),
     #[serde(other)]
     Unknown,
 }
@@ -1524,6 +1539,8 @@ fn compute_metrics(
                     run.step_count = e.steps_total;
                 }
             }
+            // Rendered in the step list; the summary has no spend section.
+            TraceEvent::SpendCeilingReached(_) => {}
             TraceEvent::Unknown => {}
         }
     }
@@ -2848,6 +2865,18 @@ fn steps_row(record: &TraceRecord, verbose: bool) -> Option<String> {
             e.target,
             e.hook_name
         ),
+        TraceEvent::SpendCeilingReached(e) => format!(
+            "{}{}  used {} of {}  needs {}{}",
+            kind("spend_ceiling_reached"),
+            e.limit,
+            fmt_thousands(e.used),
+            fmt_thousands(e.ceiling),
+            fmt_thousands(e.requested),
+            e.origin
+                .as_deref()
+                .map(|origin| format!("  {origin}"))
+                .unwrap_or_default()
+        ),
         TraceEvent::ProtectedPathDenied(e) => format!(
             "{}{}  {}  rule {}",
             kind("protected_path_denied"),
@@ -3915,6 +3944,26 @@ mod tests {
         assert!(
             !rendered.contains("exit"),
             "a lost command asserts no exit code: {rendered}"
+        );
+    }
+
+    /// A spend refusal names the limit, what was used of the ceiling and what the refused call
+    /// needed, and a hook's refusal names the hook.
+    #[test]
+    fn spend_ceiling_reached_row_names_the_limit_and_the_numbers() {
+        let line = r#"{"event_type":"spend_ceiling_reached","event_id":"evt_6","parent_id":"evt_1","session_id":"ses_0a1b2c3d4e5f6a7b","timestamp":6,"turn":3,"task_id":null,"limit":"session","ceiling":200000,"used":195400,"requested":12100}"#;
+        assert_eq!(
+            row(line),
+            "spend_ceiling_reached session  used 195,400 of 200,000  needs 12,100"
+        );
+        let hook = line.replace(
+            r#""requested":12100"#,
+            r#""requested":12100,"origin":"hook:compact""#,
+        );
+        assert!(
+            row(&hook).ends_with("needs 12,100  hook:compact"),
+            "{}",
+            row(&hook)
         );
     }
 

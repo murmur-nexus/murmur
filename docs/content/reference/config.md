@@ -26,6 +26,7 @@ Where both files set a value, the effective config is built per field:
 | `registry.sources` | Union by `name`: a project entry sharing a global entry's name replaces it in place (position preserved); a project entry with a new name is appended; global-only entries are never dropped |
 | `beta.enabled` | Union by value: global flags first, then any project-only flags appended, in the project file's order |
 | `containment` | **Strongest wins**: a project file may raise the class the global file asked for, never lower it. See [Containment class](containment.md#field-containment) |
+| `spend.machine_tokens_per_day` | **Lowest wins**: a project file may lower the ceiling, never raise it. See [`spend:` section](#spend) |
 
 The base of the merge is the global file, or the built-in default when
 `~/.murmur/config.yaml` is absent. That default is `registry.default: official` and a single
@@ -111,6 +112,56 @@ A name this build does not compile in has no effect until a build that includes 
 [`mur beta list`](cli.md#mur-beta) prints the features this build has, and `mur beta enable`
 warns when the name is not one of them.
 
+### `spend:` section { #spend }
+
+A machine-wide ceiling on inference spend, counted in tokens per UTC day.
+
+```yaml
+spend:
+  machine_tokens_per_day: 5000000
+```
+
+| Key | Type | Required | Description |
+|---|---|---|---|
+| `machine_tokens_per_day` | integer | no | Most tokens every run on this `~/.murmur` may spend per UTC day. No default: absent sets no machine ceiling. `0` is refused with `E-IO-003` when the config is loaded |
+
+It counts what [`inference.max_session_tokens`](manifest.md#inference-max-session-tokens) counts:
+the runtime's own `input_tokens + output_tokens` for every driver call, agent turns and hooks'
+`run-inference` calls alike. Before each call, a run adds the day's total, its own calls still in
+flight and the call's input plus its most output; a call that would cross the ceiling is refused
+before it is sent, with `limit: "machine"` on its
+[`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line. A machine refusal
+does not latch: the next call is checked again, and the total starts from zero at 00:00 UTC.
+
+**The ceiling is approximate.** Every `mur run` appends each settled call to a shared ledger and
+reads only what was appended since its last read; there is no lock and no daemon. Other processes'
+admitted-but-unsettled calls are invisible, so the machine total can exceed
+`spend.machine_tokens_per_day` by up to the tokens of the calls in flight on the machine at the
+moment it is reached.
+
+| Covered | Not covered |
+|---|---|
+| Runs whose `HOME` shares this `~/.murmur` — in practice, one user account | Other user accounts on the same host |
+| Sessions started by `mur run`, including delegated children, with the ceiling in effect | Sessions started by `mur eval run` or `mur new`, and any run launched without the ceiling in effect: they write no ledger lines and are not counted |
+| `transport: http` capsules | `transport: process` capsules, whose CLI reaches its provider with its own credentials — see [`W-SEC-026`](diagnostics.md#w-sec-026) |
+| A `~/.murmur` on a local filesystem | A `~/.murmur` on NFS, where the atomicity of appends the ledger relies on does not hold |
+
+Each run enforces its own effective config's value against the shared total, so two runs launched
+from projects with different ceilings each stop at their own.
+
+**The ledger** is one file per UTC day:
+
+| Property | Value |
+|---|---|
+| Path | `~/.murmur/spend/<YYYY-MM-DD>.jsonl` |
+| Modes | Directory `0700`, file `0600` |
+| Line | `{"ts":<unix ms>,"session_id":"ses_…","input_tokens":<n>,"output_tokens":<n>}` |
+| When written | Once per settled call. A call cancelled, refused at dispatch or failed is written with its `input_tokens` and `output_tokens: 0` |
+| Retention | A run that opens the ledger removes `<YYYY-MM-DD>.jsonl` files dated more than 30 days before today. Other names are left alone |
+
+A run that cannot create or open the ledger refuses to start with
+[`E-RUN-026`](diagnostics.md#e-run-026).
+
 ### Where the effective config is used
 
 | Consumer | Reads |
@@ -119,6 +170,7 @@ warns when the name is not one of them.
 | `mur install` source-chain resolution | `registry.default`, `registry.sources` |
 | `mur search` | `registry.index_url` |
 | `mur run`, `mur doctor` — the containment floor | `containment` |
+| `mur run` — the machine spend ceiling; `mur run` and `mur doctor` — [`W-SEC-026`](diagnostics.md#w-sec-026) | `spend.machine_tokens_per_day` |
 
 `mur new` and `mur deploy` read `~/.murmur/config.yaml` only; a project-level file does not
 affect them.

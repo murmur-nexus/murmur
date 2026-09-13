@@ -6,10 +6,10 @@ use capsule_runtime::{
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
     warn_on_inference_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
-    warn_on_secret_shaped_env_grants, warn_on_unreachable_toolchain_helpers,
-    warn_on_userns_restriction_disabled_host_wide, warn_on_workdir_exec, ArtifactRequest,
-    InstalledProfileState, ProfileAttachment, UsernsGrant, SEALED_APPARMOR_ATTACHMENT_PATHS,
-    SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
+    warn_on_machine_spend_ceiling_under_process_transport, warn_on_secret_shaped_env_grants,
+    warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
+    warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
+    SEALED_APPARMOR_ATTACHMENT_PATHS, SEALED_APPARMOR_PROFILE_PATH, SEALED_APPARMOR_PROFILE_SHA256,
 };
 use murmur_artifact::{
     current_platform, effective_containment_floor, native_binary_verdict,
@@ -736,6 +736,17 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         runtime_manifest.inference.as_ref(),
     );
 
+    // And `W-SEC-026`, from the same emitter `mur run` calls: a machine spend ceiling does not
+    // cover a `transport: process` capsule. Read from the same effective config `mur run` reads.
+    let effective_config = load_effective_mur_config_if_any_exists()?;
+    warn_on_machine_spend_ceiling_under_process_transport(
+        effective_config
+            .as_ref()
+            .and_then(|config| config.spend.as_ref())
+            .and_then(|spend| spend.machine_tokens_per_day),
+        runtime_manifest.inference.as_ref(),
+    );
+
     // Same reasoning for `staged_runtime`, but it is a refusal rather than a posture warning: a
     // capsule declaring one without an effective `sealed` floor is rejected at staging with
     // E-CAP-004, and finding that out from `mur doctor` beats finding it out from a failed run.
@@ -750,7 +761,7 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // because the two reachability checks below need it for *every* capsule, not only one
     // declaring a grant.
     let declared_floor = effective_containment_floor(
-        load_effective_mur_config_if_any_exists()?.and_then(|config| config.containment),
+        effective_config.and_then(|config| config.containment),
         runtime_manifest
             .capabilities
             .as_ref()

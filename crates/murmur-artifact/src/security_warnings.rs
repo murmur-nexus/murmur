@@ -259,6 +259,14 @@ pub const W_SEC_024: &str = "W-SEC-024";
 /// once per matching entry, before any session workdir exists.
 pub const W_SEC_025: &str = "W-SEC-025";
 
+/// `spend.machine_tokens_per_day` is in effect and the capsule uses `transport: process`.
+///
+/// The CLI that transport drives reaches its provider with its own credentials, so no request
+/// passes the inference gateway and murmur neither counts nor limits the capsule's spend: the
+/// ceiling does not cover it. Never a refusal. Fires once per launch or `mur doctor`, before any
+/// session workdir exists.
+pub const W_SEC_026: &str = "W-SEC-026";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -279,7 +287,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025,
+            W_SEC_025, W_SEC_026,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

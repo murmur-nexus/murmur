@@ -677,6 +677,7 @@ These fields are read under `transport: http`, and setting any of them under
 | `inference.provider.artifact` | string | no | Accepted older spelling of `inference.driver.artifact`; `inference.driver.artifact` wins when both are set. |
 | `inference.api_key` | string | no | Literal value or `${ENV_VAR}` reference — see [`inference.api_key` resolution](#inference-api-key). |
 | `inference.max_tokens` | integer | no | Maximum output tokens the model may generate **per turn**. Default: `8192`. Must be > 0; not clamped at the top end. Distinct from [`context.max_tokens`](#field-context) — see [Output cap](#inference-max-tokens). |
+| `inference.max_session_tokens` | integer | no | Most tokens this session's driver calls may use in total, as the runtime measures them. No default: absent sets no session ceiling. Must be > 0. See [Session spend ceiling](#inference-max-session-tokens). |
 
 These fields are read under `transport: process`:
 
@@ -894,6 +895,7 @@ inference:
   model: claude-opus-4-5
   api_key: ${ANTHROPIC_API_KEY}
   max_tokens: 4096        # optional per-turn output cap; default 8192
+  max_session_tokens: 2000000   # optional session spend ceiling; default none
   driver:
     artifact: murmur-driver-anthropic
 ```
@@ -929,6 +931,55 @@ attempts no continuation turn, and every surface carrying the reply marks it as 
 
 A driver reaches this path by reporting `stop_reason: "max_tokens"` in its response. A driver whose
 provider names the same condition differently normalizes it to that value.
+
+#### Session spend ceiling: `inference.max_session_tokens` { #inference-max-session-tokens }
+
+`inference.max_session_tokens` caps the tokens one session spends on inference. It counts every
+driver call the session makes — each agent turn, and each hook's `run-inference` call, including
+compaction and seed summarization. What it counts is the runtime's own measurement,
+`input_tokens + output_tokens`, the same numbers the trace's
+[`inference`](observability-schemas.md#session-trace-tracejsonl) lines carry, so summing those
+lines checks the ceiling.
+
+Before each driver call the runtime admits the call only if these three fit under the ceiling
+together:
+
+| Part | Value |
+|---|---|
+| Used | Every earlier call's `input_tokens + output_tokens`, plus what calls still in flight reserved |
+| The call's input | `input_tokens` of the request about to be sent |
+| The call's most output | `inference.max_tokens` (default `8192`) for an agent turn; the built-in `8192` for a hook's completion |
+
+A call that does not fit is never sent. The refusal appears as:
+
+| Surface | What it says |
+|---|---|
+| `trace.jsonl` | A [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line naming the limit, the ceiling, what was used and what the call needed |
+| `out/result.txt` | `stopped: spend ceiling reached: …`, ending with `retrying will not get past it` |
+| A2A terminal status | `failed`, with the same `spend ceiling reached: …` text as its message |
+| A hook's `run-inference` | `err` with the same text |
+| `task_end`, `session_end` | `exit_status: "spend_ceiling_reached"` |
+
+The first refusal latches. That task ends, and every later call and task in the session is refused
+without reaching the provider; the session itself stays up. A compaction hook whose call is refused
+handles the `err` as it would any other `run-inference` failure.
+
+A call that is cancelled, fails to dispatch or returns a failed status is charged its input alone.
+The sum of a session's `inference` lines never exceeds the ceiling, except by how far a response's
+measured `output_tokens` runs past the call's reserved output — the runtime's count of a response
+can be larger than the cap the provider applied.
+
+| Setting | Bounds |
+|---|---|
+| `inference.max_session_tokens` | Tokens across the whole session, input and output |
+| [`inference.max_tokens`](#inference-max-tokens) | One response's output |
+| [`context.max_tokens`](#field-context) | The conversation's size, which drives compaction |
+| [`spend.machine_tokens_per_day`](config.md#spend) | Tokens across every run on the machine per UTC day |
+
+`transport: http` only: under `transport: process` the CLI reaches its provider with its own
+credentials, murmur sees no spend, and the field is a manifest error. A delegated child is bounded
+by its own `inference.max_session_tokens` and by the machine ceiling, not by its parent's session
+ceiling.
 
 #### Endpoint scheme and host validation { #endpoint-validation }
 

@@ -382,6 +382,11 @@ pub struct StageRequest {
     /// an artifact rather than a session, and the parent already held it when it started this
     /// process.
     pub spawn_grant: Option<SpawnApproval>,
+    /// `spend.machine_tokens_per_day` from the operator's effective `config.yaml`. `Some` makes
+    /// staging open the shared daily spend ledger for a `transport: http` session with a driver,
+    /// and refuse when it cannot; `None` — every launch that does not read the operator config —
+    /// keeps no ledger and is not counted.
+    pub machine_tokens_per_day: Option<u64>,
 }
 
 pub struct StagedSession {
@@ -400,6 +405,10 @@ pub struct StagedSession {
     /// staging from `inference` and the driver's own `inference_auth:` declaration. `None` for
     /// `transport: process` and for a capsule with no inference.
     pub(crate) inference_gateway: Option<Arc<crate::inference_gateway::InferenceGateway>>,
+    /// This session's spend account, built at staging from `inference.max_session_tokens` and
+    /// [`StageRequest::machine_tokens_per_day`]. Always present: a session with no ceiling gets a
+    /// meter that admits everything, so every driver call has an admission to open.
+    pub(crate) spend: Arc<crate::spend::SpendMeter>,
     /// Copied from [`StageRequest::system_prompt_overridden`] — the only record left that the
     /// prompt in `inference` came from `--system-prompt` and not from the manifest. Passed to
     /// `TraceWriter::open`, which turns it into `session_start.system_prompt_source`.

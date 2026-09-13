@@ -58,6 +58,20 @@ pub struct MurConfig {
     /// [`merge_containment`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<ContainmentClass>,
+    /// Machine-wide inference spend ceilings. Merged as a min, never a project-wins override (see
+    /// [`merge_spend`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<SpendConfig>,
+}
+
+/// The `spend:` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SpendConfig {
+    /// Most tokens — the runtime's own measured input plus output — every `mur run` on this
+    /// `~/.murmur` may spend per UTC day, counted through the shared ledger under
+    /// `~/.murmur/spend/`. Approximate: see the config reference. `0` is refused at load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_tokens_per_day: Option<u64>,
 }
 
 /// The default artifact source is a Rust literal compiled into the `murmur-cli`
@@ -85,6 +99,7 @@ impl Default for MurConfig {
             inference: None,
             beta: BetaConfig::default(),
             containment: None,
+            spend: None,
         }
     }
 }
@@ -322,7 +337,26 @@ pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurCo
             enabled: merge_beta_enabled(global.beta.enabled, project.beta.enabled),
         },
         containment: merge_containment(global.containment, project.containment),
+        spend: merge_spend(global.spend, project.spend),
     }
+}
+
+/// Merges the two `spend` sections, keeping the **lower** `machine_tokens_per_day`, deliberately
+/// breaking this file's project-wins rule: a ceiling is a limit, so a project file may lower what
+/// the global file set but never raise it. A side that sets nothing does not participate.
+pub fn merge_spend(
+    global: Option<SpendConfig>,
+    project: Option<SpendConfig>,
+) -> Option<SpendConfig> {
+    let global = global.and_then(|spend| spend.machine_tokens_per_day);
+    let project = project.and_then(|spend| spend.machine_tokens_per_day);
+    let machine_tokens_per_day = match (global, project) {
+        (Some(global), Some(project)) => Some(global.min(project)),
+        (value, None) | (None, value) => value,
+    };
+    machine_tokens_per_day.map(|value| SpendConfig {
+        machine_tokens_per_day: Some(value),
+    })
 }
 
 /// Merges the two `containment` declarations as a **max**, deliberately breaking this file's
@@ -452,14 +486,27 @@ fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfig>, CliErro
         )
     })?;
 
-    serde_yaml::from_str::<MurConfig>(&raw)
-        .map(Some)
-        .map_err(|source| {
-            CliError::new(
-                E_IO_003,
-                format!("failed to parse {}: {source}", config_path.display()),
-            )
-        })
+    let config = serde_yaml::from_str::<MurConfig>(&raw).map_err(|source| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to parse {}: {source}", config_path.display()),
+        )
+    })?;
+    if config
+        .spend
+        .as_ref()
+        .and_then(|spend| spend.machine_tokens_per_day)
+        == Some(0)
+    {
+        return Err(CliError::new(
+            E_IO_003,
+            format!(
+                "invalid spend.machine_tokens_per_day 0 in {} (expected a positive integer)",
+                config_path.display()
+            ),
+        ));
+    }
+    Ok(Some(config))
 }
 
 fn write_mur_config_file(config_path: &Path, config: &MurConfig) -> Result<(), CliError> {
@@ -815,6 +862,82 @@ registry:
             merged.inference.as_ref().map(|i| i.model.as_str()),
             Some("claude")
         );
+    }
+
+    #[test]
+    fn spend_config_parses_and_survives_a_config_yaml_round_trip() {
+        let parsed: MurConfig =
+            serde_yaml::from_str("spend:\n  machine_tokens_per_day: 2000000\n").unwrap();
+        assert_eq!(
+            parsed.spend,
+            Some(SpendConfig {
+                machine_tokens_per_day: Some(2_000_000)
+            })
+        );
+        let rendered = serde_yaml::to_string(&parsed).unwrap();
+        assert!(
+            rendered.contains("machine_tokens_per_day: 2000000"),
+            "{rendered}"
+        );
+        let bare: MurConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(bare.spend, None);
+        assert!(!serde_yaml::to_string(&bare).unwrap().contains("spend"));
+    }
+
+    #[test]
+    fn spend_config_zero_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "spend:\n  machine_tokens_per_day: 0\n").unwrap();
+        let err = read_mur_config_file(&path).unwrap_err();
+        assert_eq!(err.code, E_IO_003);
+        assert!(
+            err.message.contains("spend.machine_tokens_per_day"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn spend_config_merge_keeps_the_lower_ceiling() {
+        let set = |n| {
+            Some(SpendConfig {
+                machine_tokens_per_day: Some(n),
+            })
+        };
+        assert_eq!(merge_spend(None, None), None);
+        assert_eq!(merge_spend(set(10), None), set(10));
+        assert_eq!(merge_spend(None, set(10)), set(10));
+        assert_eq!(merge_spend(set(10), set(20)), set(10));
+        assert_eq!(merge_spend(set(20), set(10)), set(10));
+        assert_eq!(merge_spend(Some(SpendConfig::default()), set(7)), set(7));
+        assert_eq!(merge_spend(Some(SpendConfig::default()), None), None);
+    }
+
+    #[test]
+    fn spend_config_merge_mur_configs_lowers_but_never_raises_the_ceiling() {
+        let global = MurConfig {
+            spend: Some(SpendConfig {
+                machine_tokens_per_day: Some(1_000),
+            }),
+            ..MurConfig::default()
+        };
+        let raising = MurConfig {
+            spend: Some(SpendConfig {
+                machine_tokens_per_day: Some(5_000),
+            }),
+            ..MurConfig::default()
+        };
+        let merged = merge_mur_configs(global.clone(), Some(raising));
+        assert_eq!(merged.spend.unwrap().machine_tokens_per_day, Some(1_000));
+        let lowering = MurConfig {
+            spend: Some(SpendConfig {
+                machine_tokens_per_day: Some(10),
+            }),
+            ..MurConfig::default()
+        };
+        let merged = merge_mur_configs(global, Some(lowering));
+        assert_eq!(merged.spend.unwrap().machine_tokens_per_day, Some(10));
     }
 
     #[test]

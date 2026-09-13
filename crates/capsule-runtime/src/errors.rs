@@ -459,6 +459,13 @@ pub enum RuntimeError {
         reason: Option<String>,
     },
 
+    /// `spend.machine_tokens_per_day` is in effect and the shared ledger it is kept in cannot be
+    /// used — an unset `HOME`, a `~/.murmur/spend` that cannot be made a `0700` directory, or a
+    /// daily file that cannot be opened. Raised at staging, before the session directory exists
+    /// and before any provider request.
+    #[error("spend ledger at {path} is unavailable: {message}")]
+    SpendLedgerUnavailable { path: String, message: String },
+
     #[error("agent loop failed: {0}")]
     AgentLoopFailed(String),
 

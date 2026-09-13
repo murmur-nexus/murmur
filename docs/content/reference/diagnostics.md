@@ -74,6 +74,7 @@ section that explains it.
 | `E-RUN-023` | The capsule a session address named is running and did not answer | [E-RUN-023](#e-run-023) |
 | `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
 | `E-RUN-025` | The `transport: http` inference driver declares no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
+| `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -110,6 +111,7 @@ section that explains it.
 | `W-SEC-023` | A session opened its door and its running-capsule record could not be written | [W-SEC-023](#w-sec-023) |
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker, or delivers nothing | [W-SEC-024](#w-sec-024) |
 | `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
+| `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 
 ---
 
@@ -427,6 +429,18 @@ A block that is present and malformed adds the reason in parentheses:
 | `contains characters an HTTP header value cannot hold` | `value` has a control character such as a newline |
 
 The block's shape is in [Driver `inference_auth:` block](default-artifacts.md#inference-auth).
+
+### E-RUN-026 — the spend ledger cannot be used { #e-run-026 }
+
+[`spend.machine_tokens_per_day`](config.md#spend) is set, and the shared ledger the machine ceiling
+is counted in cannot be used: `HOME` is unset, `~/.murmur/spend` cannot be created or held as a
+`0700` directory, or today's file cannot be opened. `mur run` refuses a `transport: http` capsule
+at staging, before the session directory exists and before any provider request.
+
+```text
+error[E-RUN-026]: spend ledger at /home/me/.murmur/spend is unavailable: failed to create the directory: File exists (os error 17)
+  hint: spend.machine_tokens_per_day is set in config.yaml, and the machine spend ceiling cannot be kept without its ledger; make ~/.murmur/spend a directory this user can write, or remove spend.machine_tokens_per_day
+```
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1014,7 +1028,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1881,3 +1895,17 @@ The runtime reaches the provider for the driver and attaches the key there, so i
 or without the entry. The entry still grants every tool, shell subprocess and the driver direct
 access to that host, without the key. Remove it unless something other than inference needs that
 host.
+
+### W-SEC-026 — a machine spend ceiling does not cover a `transport: process` capsule { #w-sec-026 }
+
+**Fires when:** [`spend.machine_tokens_per_day`](config.md#spend) is set in the effective config and
+the capsule's [`inference.transport`](manifest.md#field-inference) is `process`. Once, on stderr,
+from `mur run` (including `mur run --explain-scope`) and from `mur doctor`.
+
+```text
+[capsule-runtime] warning[W-SEC-026]: spend.machine_tokens_per_day is set and this capsule uses transport: process — the CLI reaches its provider with its own credentials, so murmur neither counts nor limits this capsule's spend (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-026)
+```
+
+The CLI that `transport: process` drives holds its own credentials, so none of its requests pass
+the runtime, and the capsule runs with no ledger lines and no machine refusal. Bound that CLI's
+spend with its provider's own controls.
