@@ -11,10 +11,16 @@
 //! driver invocation that skipped admission cannot reach the provider with the key.
 //!
 //! [`MachineLedger`] is the shared, append-only daily file every `mur run` on this `~/.murmur`
-//! writes its settled calls to. There is no lock and no daemon: each process reads only the bytes
-//! appended since its last read, so the machine total lags by whatever other processes have
-//! admitted and not yet settled, and the ceiling can be overshot by up to the calls in flight
-//! when it is reached.
+//! writes its settled calls to. There is no lock and no daemon: each process reads only the
+//! complete lines appended since its last read, so a call admitted and not yet settled is invisible
+//! to every other admission. The machine total can therefore exceed the ceiling by at most the
+//! measured tokens of the calls in flight — admitted and not yet settled — when the last call was
+//! admitted. The last call is among them, so an output that measures more than its reservation
+//! still counts in full.
+//!
+//! That bound holds only while the ledger can be read and appended to. After staging, a failed
+//! append or read warns on stderr and the run carries on: a call whose line was never written is
+//! never counted, and the overshoot is unbounded for as long as the failure lasts.
 
 use std::{
     fmt,
@@ -230,8 +236,12 @@ impl SpendMeter {
     }
 
     fn finish(&self, reserved: u64, input_tokens: u64, output_tokens: u64) {
-        // Appended before the reservation is released, so a concurrent admission can count this
-        // call twice — once in the ledger, once as reserved — but never zero times.
+        // Appended before the reservation is released, so an admission that reads the ledger after
+        // the append sees this call, and one that takes the meter lock before the release sees it
+        // reserved; one that does both counts it twice. `admit` reads the ledger before taking the
+        // lock, so an admission whose read ran before the append and whose lock is taken after the
+        // release counts this call zero times. The call was then in flight at that read, which is
+        // what the machine ceiling's overshoot is bounded by.
         if let Some(ledger) = self.machine.as_ref() {
             ledger.append(input_tokens, output_tokens);
         }
@@ -509,8 +519,12 @@ mod tests {
         io::Read,
         net::TcpListener,
         os::unix::fs::PermissionsExt,
-        sync::atomic::{AtomicI64, Ordering},
-        time::Duration,
+        process::{Child, Command, Stdio},
+        sync::{
+            atomic::{AtomicI64, Ordering},
+            Barrier,
+        },
+        time::{Duration, Instant},
     };
 
     use chrono::TimeZone;
@@ -722,10 +736,518 @@ mod tests {
         assert_eq!(attempt(&mut hooks), (true, false), "after drop");
     }
 
+    // ── the machine ledger under concurrent admissions ─────────────────────────
+
+    /// Replays a race's call sizes and jitter when set to the seed a run printed.
+    const RACE_SEED_ENV: &str = "MURMUR_SPEND_RACE_SEED";
+    const RACE_MAX_INPUT: u64 = 120;
+    const RACE_MAX_OUTPUT: u64 = 80;
+    /// The most one race call can settle: output never exceeds what the call reserved.
+    const RACE_MAX_CALL: u64 = RACE_MAX_INPUT + RACE_MAX_OUTPUT;
+    const RACE_CEILING: u64 = 30 * RACE_MAX_CALL;
+    /// Today's ledger under `fixed_clock`.
+    const RACE_LEDGER: &str = "2026-09-12.jsonl";
+
+    /// xorshift64, so every call size and jitter in a race follows from one printed seed.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            // One splitmix64 step, so nearby seeds diverge at once and the state is never zero.
+            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            Self((z ^ (z >> 31)) | 1)
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        /// A value in `low..=high`.
+        fn between(&mut self, low: u64, high: u64) -> u64 {
+            low + self.next() % (high - low + 1)
+        }
+    }
+
+    /// [`RACE_SEED_ENV`] when set, the clock otherwise. Printed before the race starts, so a failing
+    /// run's captured output names it.
+    fn race_seed(test: &str) -> u64 {
+        let seed = std::env::var(RACE_SEED_ENV)
+            .ok()
+            .and_then(|seed| seed.parse().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+            });
+        println!("{test}: seed {seed} (replay with {RACE_SEED_ENV}={seed})");
+        seed
+    }
+
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Settled {
+        calls: u64,
+        tokens: u64,
+    }
+
+    impl std::ops::Add for Settled {
+        type Output = Self;
+
+        fn add(self, other: Self) -> Self {
+            Self {
+                calls: self.calls + other.calls,
+                tokens: self.tokens + other.tokens,
+            }
+        }
+    }
+
+    /// Admit, sleep 0–2 ms, and settle with no more output than was reserved, until the machine
+    /// ceiling refuses.
+    fn race_until_refused(meter: &Arc<SpendMeter>, rng: &mut XorShift) -> Settled {
+        let mut settled = Settled::default();
+        loop {
+            let input = rng.between(1, RACE_MAX_INPUT);
+            let max_output = rng.between(1, RACE_MAX_OUTPUT);
+            let admission = match meter.admit(input, max_output) {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    assert_eq!(refusal.limit, SpendLimit::Machine, "{refusal}");
+                    return settled;
+                }
+            };
+            std::thread::sleep(Duration::from_micros(rng.between(0, 2_000)));
+            let output = rng.between(0, max_output);
+            admission.settle(input, output);
+            settled = settled
+                + Settled {
+                    calls: 1,
+                    tokens: input + output,
+                };
+        }
+    }
+
+    /// Assert the race ledger in `dir` holds exactly `settled`: every line a whole ledger record,
+    /// one line per settled call, and a reader opened now totalling their tokens.
+    fn assert_ledger_holds(dir: &Path, settled: Settled, context: &str) {
+        let contents = std::fs::read_to_string(dir.join(RACE_LEDGER)).unwrap();
+        assert!(
+            contents.is_empty() || contents.ends_with('\n'),
+            "{context}: the ledger ends in a torn line"
+        );
+        let mut lines = Settled::default();
+        for line in contents.lines() {
+            let record: LedgerLine<'_> = serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("{context}: {line:?} is not a ledger record: {err}"));
+            lines = lines
+                + Settled {
+                    calls: 1,
+                    tokens: record.input_tokens + record.output_tokens,
+                };
+        }
+        assert_eq!(lines, settled, "{context}: ledger lines against settles");
+        assert_eq!(
+            ledger(dir, "ses_fresh", RACE_CEILING, fixed_clock).refresh_total(),
+            settled.tokens,
+            "{context}: a freshly opened ledger's total"
+        );
+    }
+
+    /// `meter_count` meters with their own ledger handles on one directory, `threads_per_meter`
+    /// threads racing on each, over `rounds` fresh directories.
+    fn race_meters(test: &str, meter_count: usize, threads_per_meter: usize, rounds: u64) {
+        let seed = race_seed(test);
+        let threads = meter_count * threads_per_meter;
+        let bound = threads as u64 * RACE_MAX_CALL;
+        let mut max_overshoot = 0;
+        for round in 0..rounds {
+            let context = format!("{test} seed {seed} round {round}");
+            let dir = TempDir::new().unwrap();
+            let meters: Vec<Arc<SpendMeter>> = (0..meter_count)
+                .map(|index| {
+                    let session_id = format!("ses_race_{index}");
+                    Arc::new(SpendMeter::new(
+                        None,
+                        Some(ledger(dir.path(), &session_id, RACE_CEILING, fixed_clock)),
+                    ))
+                })
+                .collect();
+            let start = Barrier::new(threads);
+            let settled = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|thread| {
+                        let meter = &meters[thread % meter_count];
+                        let start = &start;
+                        let mut rng = XorShift::new(seed ^ (round << 32) ^ thread as u64);
+                        scope.spawn(move || {
+                            start.wait();
+                            race_until_refused(meter, &mut rng)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .fold(Settled::default(), std::ops::Add::add)
+            });
+
+            assert_ledger_holds(dir.path(), settled, &context);
+            for (index, meter) in meters.iter().enumerate() {
+                assert_eq!(
+                    meter.machine.as_ref().unwrap().refresh_total(),
+                    settled.tokens,
+                    "{context}: meter {index}'s own ledger total"
+                );
+            }
+            let overshoot = settled.tokens.saturating_sub(RACE_CEILING);
+            assert!(
+                overshoot <= bound,
+                "{context}: total {} exceeds ceiling {RACE_CEILING} by {overshoot}, past the \
+                 bound {bound}",
+                settled.tokens
+            );
+            max_overshoot = max_overshoot.max(overshoot);
+        }
+        println!(
+            "{test}: {threads} threads on {meter_count} meters, ceiling {RACE_CEILING}, max call \
+             tokens {RACE_MAX_CALL}: max observed overshoot {max_overshoot} of bound {bound} over \
+             {rounds} rounds"
+        );
+    }
+
+    #[test]
+    fn machine_ledger_concurrent_threads() {
+        race_meters("machine_ledger_concurrent_threads", 8, 1, 50);
+    }
+
+    #[test]
+    fn machine_ledger_concurrent_shared_meter() {
+        // Several threads per meter, so one thread's settle can land between another's ledger
+        // read and its meter lock.
+        race_meters("machine_ledger_concurrent_shared_meter", 3, 4, 50);
+    }
+
+    #[test]
+    fn machine_ledger_concurrent_worst_case() {
+        const WORKERS: u64 = 8;
+        const INPUT: u64 = 60;
+        const MAX_OUTPUT: u64 = 40;
+        const REQUESTED: u64 = INPUT + MAX_OUTPUT;
+        // One call fits under it; a second on top of the first does not.
+        const CEILING: u64 = REQUESTED + REQUESTED / 2;
+
+        let dir = TempDir::new().unwrap();
+        let meters: Vec<Arc<SpendMeter>> = (0..WORKERS)
+            .map(|index| {
+                let session_id = format!("ses_worst_{index}");
+                Arc::new(SpendMeter::new(
+                    None,
+                    Some(ledger(dir.path(), &session_id, CEILING, fixed_clock)),
+                ))
+            })
+            .collect();
+        // Between admission and settling, so every call is admitted before any is settled.
+        let all_admitted = Barrier::new(meters.len());
+        let admitted: Vec<bool> = std::thread::scope(|scope| {
+            let workers: Vec<_> = meters
+                .iter()
+                .map(|meter| {
+                    let all_admitted = &all_admitted;
+                    scope.spawn(move || {
+                        let admission = meter.admit(INPUT, MAX_OUTPUT);
+                        all_admitted.wait();
+                        admission.map(|admission| admission.settle(INPUT, MAX_OUTPUT))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap().is_ok())
+                .collect()
+        });
+
+        assert!(admitted.iter().all(|ok| *ok), "{admitted:?}");
+        let total = ledger(dir.path(), "ses_fresh", CEILING, fixed_clock).refresh_total();
+        assert_eq!(total, WORKERS * REQUESTED);
+        let bound = WORKERS * REQUESTED;
+        let overshoot = total - CEILING;
+        assert!(overshoot <= bound, "overshoot {overshoot} of bound {bound}");
+        for meter in &meters {
+            let refusal = meter.admit(1, 0).unwrap_err();
+            assert_eq!(refusal.limit, SpendLimit::Machine);
+            assert_eq!(refusal.used, total);
+        }
+        println!(
+            "machine_ledger_concurrent_worst_case: {WORKERS} meters, ceiling {CEILING}, max call \
+             tokens {REQUESTED}: max observed overshoot {overshoot} of bound {bound} over 1 rounds"
+        );
+    }
+
+    const CHILD_ROLE_ENV: &str = "MURMUR_SPEND_CHILD_ROLE";
+    const CHILD_DIR_ENV: &str = "MURMUR_SPEND_CHILD_DIR";
+    const CHILD_SESSION_ENV: &str = "MURMUR_SPEND_CHILD_SESSION";
+    const CHILD_CEILING_ENV: &str = "MURMUR_SPEND_CHILD_CEILING";
+    const CHILD_SEED_ENV: &str = "MURMUR_SPEND_CHILD_SEED";
+    /// A directory of marker files: `start` once every child is spawned, `settled-<session id>`
+    /// once a writer has been refused, `all-settled` once every writer has, and `done` once every
+    /// writer has exited.
+    const CHILD_MARKERS_ENV: &str = "MURMUR_SPEND_CHILD_MARKERS";
+    const CHILD_REPORT: &str = "SPEND_CHILD_REPORT";
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn wait_for_marker(path: &Path) {
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// One process of `machine_ledger_concurrent_processes`, selected by [`CHILD_ROLE_ENV`]. A
+    /// writer races [`race_until_refused`] on its own ledger handle; a reader refreshes its total
+    /// without pause until `done`.
+    #[test]
+    #[ignore = "run as a child process by machine_ledger_concurrent_processes"]
+    fn machine_ledger_child_worker() {
+        let Ok(role) = std::env::var(CHILD_ROLE_ENV) else {
+            return;
+        };
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset"));
+        let dir = PathBuf::from(var(CHILD_DIR_ENV));
+        let markers = PathBuf::from(var(CHILD_MARKERS_ENV));
+        let session_id = var(CHILD_SESSION_ENV);
+        let ceiling: u64 = var(CHILD_CEILING_ENV).parse().unwrap();
+        let seed: u64 = var(CHILD_SEED_ENV).parse().unwrap();
+        let handle = ledger(&dir, &session_id, ceiling, fixed_clock);
+        wait_for_marker(&markers.join("start"));
+
+        let report = match role.as_str() {
+            "writer" => {
+                let meter = Arc::new(SpendMeter::new(None, Some(handle)));
+                let settled = race_until_refused(&meter, &mut XorShift::new(seed));
+                std::fs::write(markers.join(format!("settled-{session_id}")), "").unwrap();
+                wait_for_marker(&markers.join("all-settled"));
+                serde_json::json!({
+                    "role": "writer",
+                    "settled_calls": settled.calls,
+                    "settled_tokens": settled.tokens,
+                    "final_total": meter.machine.as_ref().unwrap().refresh_total(),
+                })
+            }
+            "reader" => {
+                let done = markers.join("done");
+                let mut last = 0;
+                while !done.exists() {
+                    let total = handle.refresh_total();
+                    assert!(total >= last, "the total went from {last} to {total}");
+                    last = total;
+                }
+                serde_json::json!({"role": "reader", "final_total": handle.refresh_total()})
+            }
+            other => panic!("unknown {CHILD_ROLE_ENV} {other:?}"),
+        };
+        println!("{CHILD_REPORT} {report}");
+    }
+
+    /// Children killed when dropped, so a failed assertion does not leave them running.
+    struct Children(Vec<(String, Child)>);
+
+    impl Drop for Children {
+        fn drop(&mut self) {
+            for (_, child) in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn drain(child: &mut Child) -> (String, String) {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        (stdout, stderr)
+    }
+
+    /// Wait for `child` to exit by `deadline`, assert it ran the worker test and passed, and return
+    /// its one report.
+    fn child_report(
+        context: &str,
+        label: &str,
+        child: &mut Child,
+        deadline: Instant,
+    ) -> serde_json::Value {
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{context}: {label} did not exit within {CHILD_TIMEOUT:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let (stdout, stderr) = drain(child);
+        let output = format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        assert!(status.success(), "{context}: {label} failed\n{output}");
+        assert!(
+            stdout.contains("1 passed"),
+            "{context}: {label} did not run the worker\n{output}"
+        );
+        let reports: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.split_once(&format!("{CHILD_REPORT} ")))
+            .map(|(_, report)| report)
+            .collect();
+        assert_eq!(reports.len(), 1, "{context}: {label}\n{output}");
+        serde_json::from_str(reports[0]).unwrap()
+    }
+
+    #[test]
+    fn machine_ledger_concurrent_processes() {
+        const WRITERS: usize = 8;
+        const READERS: usize = 2;
+        const ROUNDS: u64 = 5;
+        let test = "machine_ledger_concurrent_processes";
+        let seed = race_seed(test);
+        let bound = WRITERS as u64 * RACE_MAX_CALL;
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut max_overshoot = 0;
+
+        for round in 0..ROUNDS {
+            let context = format!("{test} seed {seed} round {round}");
+            let dir = TempDir::new().unwrap();
+            let markers = TempDir::new().unwrap();
+            let spawn = |role: &str, session_id: String, child_seed: u64| {
+                let child = Command::new(&exe)
+                    .args([
+                        "--exact",
+                        "spend::tests::machine_ledger_child_worker",
+                        "--ignored",
+                        "--test-threads=1",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ROLE_ENV, role)
+                    .env(CHILD_DIR_ENV, dir.path())
+                    .env(CHILD_SESSION_ENV, &session_id)
+                    .env(CHILD_CEILING_ENV, RACE_CEILING.to_string())
+                    .env(CHILD_SEED_ENV, child_seed.to_string())
+                    .env(CHILD_MARKERS_ENV, markers.path())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("re-exec the test binary for a ledger child");
+                (session_id, child)
+            };
+            let mut children = Children(Vec::new());
+            for writer in 0..WRITERS {
+                let child_seed = seed ^ (round << 32) ^ writer as u64;
+                children
+                    .0
+                    .push(spawn("writer", format!("ses_writer_{writer}"), child_seed));
+            }
+            for reader in 0..READERS {
+                children
+                    .0
+                    .push(spawn("reader", format!("ses_reader_{reader}"), 0));
+            }
+            std::fs::write(markers.path().join("start"), "").unwrap();
+
+            let deadline = Instant::now() + CHILD_TIMEOUT;
+            loop {
+                let all_settled = children.0[..WRITERS].iter().all(|(session_id, _)| {
+                    markers
+                        .path()
+                        .join(format!("settled-{session_id}"))
+                        .exists()
+                });
+                if all_settled {
+                    break;
+                }
+                // No child exits before `all-settled`, so one that has is a failure to report now
+                // rather than at the deadline.
+                for (label, child) in &mut children.0 {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        let (stdout, stderr) = drain(child);
+                        panic!(
+                            "{context}: {label} exited early with {status}\n--- stdout ---\n\
+                             {stdout}\n--- stderr ---\n{stderr}"
+                        );
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{context}: writers did not all settle within {CHILD_TIMEOUT:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::fs::write(markers.path().join("all-settled"), "").unwrap();
+
+            let mut reports = Vec::new();
+            for (label, child) in &mut children.0[..WRITERS] {
+                reports.push(child_report(&context, label, child, deadline));
+            }
+            std::fs::write(markers.path().join("done"), "").unwrap();
+            for (label, child) in &mut children.0[WRITERS..] {
+                reports.push(child_report(&context, label, child, deadline));
+            }
+
+            let (writer_reports, reader_reports) = reports.split_at(WRITERS);
+            assert!(writer_reports
+                .iter()
+                .all(|report| report["role"] == "writer"));
+            assert!(reader_reports
+                .iter()
+                .all(|report| report["role"] == "reader"));
+            let settled = writer_reports
+                .iter()
+                .map(|report| Settled {
+                    calls: report["settled_calls"].as_u64().unwrap(),
+                    tokens: report["settled_tokens"].as_u64().unwrap(),
+                })
+                .fold(Settled::default(), std::ops::Add::add);
+            assert_ledger_holds(dir.path(), settled, &context);
+            for report in &reports {
+                assert_eq!(
+                    report["final_total"].as_u64(),
+                    Some(settled.tokens),
+                    "{context}: {report}"
+                );
+            }
+            let overshoot = settled.tokens.saturating_sub(RACE_CEILING);
+            assert!(
+                overshoot <= bound,
+                "{context}: total {} exceeds ceiling {RACE_CEILING} by {overshoot}, past the \
+                 bound {bound}",
+                settled.tokens
+            );
+            max_overshoot = max_overshoot.max(overshoot);
+        }
+        println!(
+            "{test}: {WRITERS} writer and {READERS} reader processes, ceiling {RACE_CEILING}, max \
+             call tokens {RACE_MAX_CALL}: max observed overshoot {max_overshoot} of bound {bound} \
+             over {ROUNDS} rounds"
+        );
+    }
+
     // ── the machine ledger ─────────────────────────────────────────────────────
 
     #[test]
-    fn machine_ledger_overshoot_is_bounded_by_in_flight_calls() {
+    fn machine_ledger_two_unseen_admissions_both_pass() {
         let dir = TempDir::new().unwrap();
         let one = Arc::new(SpendMeter::new(
             None,

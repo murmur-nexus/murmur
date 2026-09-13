@@ -16,7 +16,7 @@ use std::{
     net::TcpStream,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -721,6 +721,119 @@ fn machine_ceiling_spans_processes() {
         events(&trace_b, "session_start")[0]["machine_tokens_per_day"],
         json!(ceiling)
     );
+}
+
+#[test]
+fn machine_ceiling_concurrent_runs_overshoot_is_bounded() {
+    const RUNS: usize = 6;
+    println!("machine_ceiling_concurrent_runs_overshoot_is_bounded");
+    let home = home_with_driver();
+
+    // Every run below carries this manifest name, so every first call measures what this one did.
+    let control_server = common::ScriptedServer::start(vec![end_turn("msg_c", "hello")]);
+    let control_project = project(&http_manifest(
+        "spend-concurrent",
+        &control_server.endpoint,
+        "",
+    ));
+    let control = run_task(&home, &control_project);
+    let first_input = agent_turns(&control.trace())[0].0;
+    let ceiling = ceiling_between_first_and_second_call(first_input);
+    set_machine_ceiling(&home, ceiling);
+
+    // No server answers until every run's call has been sent, so every run is admitted against a
+    // ledger none of the others has settled into.
+    let gate = common::RequestGate::new(RUNS);
+    let servers: Vec<common::ScriptedServer> = (0..RUNS)
+        .map(|index| {
+            common::ScriptedServer::start_gated(
+                vec![end_turn(&format!("msg_{index}"), "hello")],
+                Arc::clone(&gate),
+            )
+        })
+        .collect();
+    let projects: Vec<Project> = servers
+        .iter()
+        .map(|server| project(&http_manifest("spend-concurrent", &server.endpoint, "")))
+        .collect();
+    let runs: Vec<Run> = std::thread::scope(|scope| {
+        let handles: Vec<_> = projects
+            .iter()
+            .map(|project| {
+                let home = &home;
+                scope.spawn(move || run_task(home, project))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    let today = format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d"));
+    let ledger = fs::read_to_string(home.path().join(".murmur/spend").join(&today)).unwrap();
+    println!("ledger {today}:\n{}", ledger.trim_end());
+
+    let mut sessions = HashSet::new();
+    let mut trace_total = 0;
+    for (index, (run, server)) in runs.iter().zip(&servers).enumerate() {
+        let trace = run.trace();
+        assert_eq!(server.requests().len(), 1, "run {index}: {}", run.stderr);
+        assert_eq!(
+            exit_status(&trace, "session_end"),
+            "ok",
+            "run {index}: {}",
+            run.stderr
+        );
+        sessions.insert(events(&trace, "session_start")[0]["session_id"].clone());
+        trace_total += trace_token_sum(&trace);
+    }
+    assert_eq!(gate.arrived(), RUNS);
+
+    let lines: Vec<Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|err| panic!("{line:?}: {err}")))
+        .collect();
+    assert_eq!(lines.len(), RUNS, "{ledger}");
+    let ledger_sessions: HashSet<Value> = lines
+        .iter()
+        .map(|line| line["session_id"].clone())
+        .collect();
+    assert_eq!(ledger_sessions, sessions);
+    let ledger_total: u64 = lines
+        .iter()
+        .map(|line| {
+            line["input_tokens"].as_u64().unwrap() + line["output_tokens"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(ledger_total, trace_total);
+    // Every run was admitted before any settled, and `RUNS` first calls do not fit under a ceiling
+    // sized for one, so the overshoot happened rather than merely being allowed.
+    assert!(
+        ledger_total > ceiling,
+        "ledger total {ledger_total} under ceiling {ceiling}"
+    );
+    let overshoot = i128::from(ledger_total) - i128::from(ceiling);
+    assert!(
+        overshoot <= i128::from(trace_total),
+        "ledger total {ledger_total} exceeds ceiling {ceiling} by {overshoot}, past the bound \
+         {trace_total}"
+    );
+    println!(
+        "{RUNS} concurrent runs, ceiling {ceiling}, max call tokens {}: observed overshoot \
+         {overshoot} of bound {trace_total}",
+        first_input + MAX_OUTPUT
+    );
+
+    let server = common::ScriptedServer::start(vec![end_turn("msg_after", "hello")]);
+    let after_project = project(&http_manifest("spend-concurrent", &server.endpoint, ""));
+    let after = run_task(&home, &after_project);
+    let trace = after.trace();
+    assert_eq!(server.requests().len(), 0, "{}", after.stderr);
+    let refusals = events(&trace, "spend_ceiling_reached");
+    assert_eq!(refusals.len(), 1, "{}", after.stderr);
+    println!("following run's refusal line: {}", refusals[0]);
+    assert_eq!(refusals[0]["limit"], "machine");
+    assert_eq!(refusals[0]["used"], json!(ledger_total));
 }
 
 #[test]

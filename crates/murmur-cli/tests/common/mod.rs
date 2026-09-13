@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
 };
 
@@ -592,6 +592,23 @@ impl ScriptedServer {
     /// policy whose age window is shorter than the run itself must still leave the running
     /// session's own directory standing.
     pub fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
+        Self::start_inner(responses, delay, None)
+    }
+
+    /// `start`, holding each response until `gate` has seen its expected number of requests
+    /// across every server sharing it, or [`RequestGate::TIMEOUT`] has passed.
+    ///
+    /// For races that need every client's request in flight at once: no response is written, so
+    /// no call can finish, until all of them have been sent.
+    pub fn start_gated(responses: Vec<String>, gate: Arc<RequestGate>) -> Self {
+        Self::start_inner(responses, std::time::Duration::ZERO, Some(gate))
+    }
+
+    fn start_inner(
+        responses: Vec<String>,
+        delay: std::time::Duration,
+        gate: Option<Arc<RequestGate>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let endpoint = format!("http://{addr}");
@@ -607,6 +624,9 @@ impl ScriptedServer {
                     .unwrap_or_else(|_| json!({"_raw": request_body}));
                 requests_for_thread.lock().unwrap().push(parsed);
 
+                if let Some(gate) = gate.as_ref() {
+                    gate.arrive_and_wait();
+                }
                 if !delay.is_zero() {
                     thread::sleep(delay);
                 }
@@ -644,6 +664,43 @@ impl Drop for ScriptedServer {
         // we must not block the test runner. The detached thread will exit
         // once the test process ends.
         let _ = self.join.take();
+    }
+}
+
+/// Shared by [`ScriptedServer::start_gated`] servers: each holds its response until `expected`
+/// requests have arrived across all of them.
+pub struct RequestGate {
+    expected: usize,
+    arrived: Mutex<usize>,
+    all_arrived: Condvar,
+}
+
+impl RequestGate {
+    /// How long a gated server waits for the rest before answering anyway, so a client that never
+    /// sends cannot hang the suite.
+    pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    pub fn new(expected: usize) -> Arc<Self> {
+        Arc::new(Self {
+            expected,
+            arrived: Mutex::new(0),
+            all_arrived: Condvar::new(),
+        })
+    }
+
+    /// Requests that have arrived so far, across every server sharing this gate.
+    pub fn arrived(&self) -> usize {
+        *self.arrived.lock().unwrap()
+    }
+
+    fn arrive_and_wait(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.all_arrived.notify_all();
+        let _ = self
+            .all_arrived
+            .wait_timeout_while(arrived, Self::TIMEOUT, |arrived| *arrived < self.expected)
+            .unwrap();
     }
 }
 

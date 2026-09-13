@@ -242,11 +242,23 @@ before it is sent, with `limit: "machine"` on its
 [`spend_ceiling_reached`](observability-schemas.md#spend-ceiling-reached) line. A machine refusal
 does not latch: the next call is checked again, and the total starts from zero at 00:00 UTC.
 
-**The ceiling is approximate.** Every `mur run` appends each settled call to a shared ledger and
-reads only what was appended since its last read; there is no lock and no daemon. Other processes'
-admitted-but-unsettled calls are invisible, so the machine total can exceed
-`spend.machine_tokens_per_day` by up to the tokens of the calls in flight on the machine at the
-moment it is reached.
+**The ceiling is approximate.** Each run appends a call to the shared ledger when the call settles,
+and checks the ledger before its next call. A call that is admitted and not yet settled is
+invisible to every other run. The machine total can therefore exceed
+`spend.machine_tokens_per_day` by at most the tokens of the calls in flight on the machine
+(admitted and not yet settled) when the last call was admitted. Those tokens are the runtime's own
+`input_tokens + output_tokens` for each call, however much output the call asked for.
+
+Calls that can be in flight at the same time:
+
+- one agent turn per running session
+- one agent turn per [delegated child](roost-api.md#the-delegation-tool), since each child is a
+  session of its own and keeps running after `delegate-task` returns
+- one `run-inference` call per [`execution_mode: async`](manifest.md#hook-contract-fields) hook,
+  which runs alongside the agent turn
+
+The bound holds only while the ledger can be read and appended to. A run that cannot append to it
+prints a warning, and those calls are not counted.
 
 | Covered | Not covered |
 |---|---|
