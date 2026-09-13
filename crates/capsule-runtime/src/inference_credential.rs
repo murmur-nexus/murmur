@@ -3,9 +3,12 @@
 //!
 //! A `${NAME}` in `inference.api_key` is looked up at staging, first in the global config's
 //! `credentials:` map and then in the launching environment. A value from the config stays
-//! re-readable for the whole session: every keyed request stats the file, and a changed stamp
-//! re-reads it, so `mur config set -g credentials.NAME` reaches a running capsule on its next
-//! request. A value from the environment or written literally in the manifest is read once.
+//! re-readable for the whole session: every keyed request reads `credentials.NAME` from the file
+//! and compares it with the value last read, so a key replaced by `mur config set -g` or by any
+//! editor, in place or by rename, reaches a running capsule on the next request that reads the
+//! file after the write. File metadata never decides whether to read: a same-size in-place write
+//! can leave inode, size and timestamps as they were. A value from the environment or written
+//! literally in the manifest is read once.
 //!
 //! The credentials file is read by the runtime itself; no guest, tool or shell subprocess is handed
 //! its path or its contents. Nothing here writes a value, a hash of one, its length or any prefix to
@@ -31,7 +34,7 @@ pub(crate) const E_RUN_027: &str = "E-RUN-027";
 /// Where a session's inference credential comes from. Carries names and paths, never a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
-    /// `credentials.<name>` in the global config file at `path`. Re-read when the file changes.
+    /// `credentials.<name>` in the global config file at `path`. Read before every keyed request.
     Config { path: PathBuf, name: String },
     /// The launching environment's variable `name`. Read once at launch.
     Environment { name: String },
@@ -92,8 +95,9 @@ pub(crate) enum CredentialChange {
     Unreadable { reason: &'static str },
 }
 
-/// The config file's identity and last change, as `stat(2)` reports it. Any difference means the
-/// file may hold something else. `Unavailable` is a file that could not be stat'd or opened.
+/// The identity and last change of an opened config file, as `fstat(2)` reports them. Identifies a
+/// state of the file for reporting `unreadable` once; it never decides whether to read.
+/// `Unavailable` is a file that could not be opened or stat'd.
 ///
 /// `mode` is compared with the rest, which changes nothing: `chmod(2)` also updates `ctime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,12 +123,6 @@ impl FileStamp {
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
             mode: metadata.mode(),
         }
-    }
-
-    fn stat(path: &Path) -> Self {
-        fs::metadata(path)
-            .map(|metadata| Self::of(&metadata))
-            .unwrap_or(Self::Unavailable)
     }
 }
 
@@ -179,10 +177,9 @@ pub(crate) fn config_holds_credential(path: &Path, name: &str) -> bool {
 struct CredentialState {
     /// The last good value. Never cleared: an unreadable source keeps it.
     value: String,
-    /// The stamp of the file `value` was last checked against. `None` for a source with no file.
-    stamp: Option<FileStamp>,
-    /// The stamp an `unreadable` event was last written for, so one broken file is reported once.
-    unreadable_reported_for: Option<FileStamp>,
+    /// The file state and reason an `unreadable` event was last written for, so a broken file read
+    /// on every request is reported once. `None` after a read that yielded a value.
+    unreadable_reported_for: Option<(FileStamp, &'static str)>,
     pending_rejection: Option<CredentialRejection>,
 }
 
@@ -222,11 +219,7 @@ impl InferenceCredential {
     ) -> Result<Self, RuntimeError> {
         let name = match reference {
             ApiKeyReference::Literal(value) => {
-                return Ok(Self::new(
-                    CredentialSource::ManifestLiteral,
-                    value.clone(),
-                    None,
-                ))
+                return Ok(Self::new(CredentialSource::ManifestLiteral, value.clone()))
             }
             ApiKeyReference::Environment(name) => name,
         };
@@ -242,7 +235,6 @@ impl InferenceCredential {
                         name: name.clone(),
                     },
                     value,
-                    Some(stamp),
                 );
                 credential.count_read();
                 return Ok(credential);
@@ -252,7 +244,6 @@ impl InferenceCredential {
             Ok(value) if !value.is_empty() => Ok(Self::new(
                 CredentialSource::Environment { name: name.clone() },
                 value,
-                None,
             )),
             _ => Err(RuntimeError::InferenceCredentialNotFound {
                 variable: name.clone(),
@@ -261,12 +252,11 @@ impl InferenceCredential {
         }
     }
 
-    fn new(source: CredentialSource, value: String, stamp: Option<FileStamp>) -> Self {
+    fn new(source: CredentialSource, value: String) -> Self {
         Self {
             source,
             state: Mutex::new(CredentialState {
                 value,
-                stamp,
                 unreadable_reported_for: None,
                 pending_rejection: None,
             }),
@@ -285,15 +275,16 @@ impl InferenceCredential {
         let _ = self.trace.set(trace);
     }
 
-    /// The value to attach to the next request. For a config source, stats the file and re-reads
-    /// it only when its stamp differs from the one last seen.
+    /// The value to attach to the next request. For a config source, reads `credentials.NAME` from
+    /// the file on every call; a value different from the last one read replaces it. An unreadable
+    /// file or entry keeps the last value read.
     pub(crate) async fn current(&self) -> String {
         self.refresh(false).await
     }
 
-    /// Re-reads a config source whatever its stamp says, after the provider rejected the value.
-    /// A same-size in-place edit within one timestamp tick is seen here even though
-    /// [`Self::current`] missed it.
+    /// Reads a config source again after the provider rejected the value, since the file may have
+    /// changed after the rejected request read it. A different value is recorded with the trigger
+    /// `"rejection"`.
     pub(crate) async fn reread_after_rejection(&self) -> String {
         self.refresh(true).await
     }
@@ -318,12 +309,9 @@ impl InferenceCredential {
         let CredentialSource::Config { path, name } = &self.source else {
             return (state.value.clone(), None);
         };
-        if !after_rejection && state.stamp == Some(FileStamp::stat(path)) {
-            return (state.value.clone(), None);
-        }
+        // The read happens under the lock, so concurrent requests take values in file order.
         self.count_read();
         let (stamp, read) = read_entry(path, name);
-        state.stamp = Some(stamp);
         let change = match read {
             EntryRead::Value(value) => {
                 state.unreadable_reported_for = None;
@@ -341,10 +329,10 @@ impl InferenceCredential {
                 }
             }
             EntryRead::Unreadable(reason) => {
-                if state.unreadable_reported_for == Some(stamp) {
+                if state.unreadable_reported_for == Some((stamp, reason)) {
                     None
                 } else {
-                    state.unreadable_reported_for = Some(stamp);
+                    state.unreadable_reported_for = Some((stamp, reason));
                     Some(CredentialChange::Unreadable { reason })
                 }
             }
@@ -481,15 +469,34 @@ mod tests {
         credential.reads.load(Ordering::SeqCst)
     }
 
+    /// Overwrites the file's bytes from offset 0 without truncating or renaming, as an editor that
+    /// saves in place does, and asserts inode and length are unchanged.
+    fn overwrite_in_place(path: &Path, value: &str) {
+        let before = fs::metadata(path).unwrap();
+        let text = fs::read_to_string(path).unwrap().replace(OLD, value);
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+        drop(file);
+        let after = fs::metadata(path).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.len()),
+            (after.dev(), after.ino(), after.len())
+        );
+    }
+
+    /// Any metadata check that skips the read makes this fail: on kernels with multigrain
+    /// timestamps a test cannot write a stamp-identical edit, so the read count stands in for it.
     #[tokio::test]
-    async fn inference_credential_unchanged_file_is_read_once() {
+    async fn inference_credential_every_call_reads_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let (_, credential) = config_credential(&dir);
         assert_eq!(credential.source().trace_name(), "config");
         for _ in 0..5 {
             assert_eq!(credential.current().await, OLD);
         }
-        assert_eq!(reads(&credential), 1);
+        assert_eq!(reads(&credential), 6);
+        assert_eq!(credential.refresh_locked(false).1, None);
+        assert_eq!(reads(&credential), 7);
     }
 
     #[tokio::test]
@@ -500,7 +507,7 @@ mod tests {
         replace_config(&path, NEW);
         assert_eq!(credential.current().await, NEW);
         assert_eq!(credential.current().await, NEW);
-        assert_eq!(reads(&credential), 2);
+        assert_eq!(reads(&credential), 4);
     }
 
     #[tokio::test]
@@ -513,17 +520,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_credential_reread_after_rejection_sees_a_same_size_edit_the_stamp_misses() {
+    async fn inference_credential_same_size_in_place_edit_is_seen_on_the_next_call() {
         let dir = tempfile::tempdir().unwrap();
         let (path, credential) = config_credential(&dir);
         assert_eq!(OLD.len(), NEW.len());
-        write_config(&path, NEW);
-        // An edit inside one filesystem timestamp tick leaves the stamp as it was.
-        credential.state.lock().unwrap().stamp = Some(FileStamp::stat(&path));
         assert_eq!(credential.current().await, OLD);
-        assert_eq!(reads(&credential), 1);
-        assert_eq!(credential.reread_after_rejection().await, NEW);
-        assert_eq!(reads(&credential), 2);
+        overwrite_in_place(&path, NEW);
+        assert_eq!(
+            credential.refresh_locked(false).1,
+            Some(CredentialChange::Rotated {
+                trigger: "file_changed"
+            })
+        );
+        assert_eq!(credential.current().await, NEW);
+    }
+
+    /// An editor that truncates and then writes can be read between the two.
+    #[tokio::test]
+    async fn inference_credential_torn_read_keeps_the_last_good_value_then_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, credential) = config_credential(&dir);
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        let (value, change) = credential.refresh_locked(false);
+        assert_eq!(value, OLD);
+        assert!(
+            matches!(change, Some(CredentialChange::Unreadable { .. })),
+            "{change:?}"
+        );
+        assert_eq!(credential.refresh_locked(false), (OLD.to_string(), None));
+        assert_eq!(credential.current().await, OLD);
+        assert_eq!(reads(&credential), 4);
+
+        write_config(&path, NEW);
+        assert_eq!(
+            credential.refresh_locked(false),
+            (
+                NEW.to_string(),
+                Some(CredentialChange::Rotated {
+                    trigger: "file_changed"
+                })
+            )
+        );
+        assert_eq!(credential.current().await, NEW);
+        assert_eq!(reads(&credential), 6);
+    }
+
+    #[tokio::test]
+    async fn inference_credential_read_cost() {
+        const CALLS: u32 = 10_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let filler = "x".repeat(200);
+        let mut text = format!(
+            "registry:\n  default: official\n  url: https://registry.example.invalid/v1\n\
+             inference:\n  endpoint: https://api.example.invalid/v1\n  model: test-model\n\
+             credentials:\n  {NAME}: {OLD}-{filler}\n"
+        );
+        for index in 1..10 {
+            text.push_str(&format!("  OTHER_KEY_{index}: other-{index}-{filler}\n"));
+        }
+        assert!(text.len() >= 2048, "{}", text.len());
+        fs::write(&path, text).unwrap();
+        let credential = InferenceCredential::resolve(
+            &ApiKeyReference::Environment(NAME.to_string()),
+            Some(&path),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        for _ in 0..CALLS {
+            credential.current().await;
+        }
+        let mean = started.elapsed() / CALLS;
+        println!(
+            "mean current() cost: {} µs over {CALLS} calls",
+            mean.as_micros()
+        );
+        assert_eq!(reads(&credential), CALLS as usize + 1);
+        assert!(mean < std::time::Duration::from_millis(5), "{mean:?}");
     }
 
     #[tokio::test]
@@ -539,10 +618,22 @@ mod tests {
             unreadable(&credential, false),
             Some(CredentialChange::Unreadable { reason: "missing" })
         );
-        // The same (absent) stamp is reported once, whether or not a rejection forced the read.
+        // One missing file is reported once, whether or not a rejection forced the read.
         assert_eq!(unreadable(&credential, false), None);
         assert_eq!(unreadable(&credential, true), None);
         assert_eq!(credential.current().await, OLD);
+
+        // A symlink to itself fails to open with a reason other than `missing`, and the file state
+        // is unavailable either way: the different reason alone is reported again.
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert_eq!(
+            unreadable(&credential, false),
+            Some(CredentialChange::Unreadable {
+                reason: "unreadable"
+            })
+        );
+        assert_eq!(unreadable(&credential, false), None);
+        fs::remove_file(&path).unwrap();
 
         fs::write(&path, "credentials: [\n").unwrap();
         assert_eq!(
@@ -578,6 +669,13 @@ mod tests {
             })
         );
         assert_eq!(credential.current().await, NEW);
+
+        // A read that yielded a value resets the dedupe, so a failure seen before is reported again.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            unreadable(&credential, false),
+            Some(CredentialChange::Unreadable { reason: "missing" })
+        );
     }
 
     #[tokio::test]
