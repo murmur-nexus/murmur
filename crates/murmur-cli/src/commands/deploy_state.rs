@@ -61,17 +61,22 @@ pub(crate) fn load_deployments() -> Result<Vec<DeploymentRecord>, CliError> {
         .map_err(|e| CliError::new(E_IO_003, format!("deployments.json is malformed: {e}")))
 }
 
+/// Create `path` if missing and hold it at `0700`, as `E-IO-003` naming the path on failure.
+#[cfg(feature = "beta-mur-deploy")]
+fn hold_private_dir(path: &std::path::Path) -> Result<(), CliError> {
+    capsule_runtime::murmur_home::hold_private_dir(path).map_err(|reason| {
+        CliError::new(
+            E_IO_003,
+            format!("failed to hold {} owner-only: {reason}", path.display()),
+        )
+    })
+}
+
+/// Writes `~/.murmur/deployments.json` at `0600` inside a `~/.murmur` held at `0700`.
 #[cfg(feature = "beta-mur-deploy")]
 pub(crate) fn save_deployments(records: &[DeploymentRecord]) -> Result<(), CliError> {
     let path = deployments_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CliError::new(
-                E_IO_003,
-                format!("failed to create {}: {e}", parent.display()),
-            )
-        })?;
-    }
+    hold_private_dir(&murmur_home()?)?;
     let json = serde_json::to_string_pretty(records)
         .map_err(|e| CliError::new(E_IO_003, format!("failed to serialize deployments: {e}")))?;
 
@@ -80,20 +85,26 @@ pub(crate) fn save_deployments(records: &[DeploymentRecord]) -> Result<(), CliEr
     // partial write takes out `mur deploy ls` and `mur destroy` for *every* deployment at once,
     // leaving running VMs with no record of how to reach them. The rename is atomic within the
     // directory.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)
-        .map_err(|e| CliError::new(E_IO_003, format!("failed to write {}: {e}", tmp.display())))?;
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
+    capsule_runtime::murmur_home::write_private_file(&path, json.as_bytes()).map_err(|reason| {
         CliError::new(
             E_IO_003,
-            format!(
-                "failed to replace {} with {}: {e}",
-                path.display(),
-                tmp.display()
-            ),
+            format!("failed to write {}: {reason}", path.display()),
         )
     })
+}
+
+/// Creates [`deploy_staging_dir`] for `deployment_id`, holding `~/.murmur`, `deploy_staging` and
+/// the deployment's own directory at `0700`, oldest first. The tree receives a copy of the
+/// manifest, the workdir and the `mur` binary.
+#[cfg(feature = "beta-mur-deploy")]
+pub(crate) fn create_deploy_staging_dir(deployment_id: &str) -> Result<PathBuf, CliError> {
+    let staging = deploy_staging_dir(deployment_id)?;
+    hold_private_dir(&murmur_home()?)?;
+    if let Some(root) = staging.parent() {
+        hold_private_dir(root)?;
+    }
+    hold_private_dir(&staging)?;
+    Ok(staging)
 }
 
 #[cfg(feature = "beta-mur-deploy")]
@@ -196,5 +207,88 @@ mod tests {
             "the record must carry the full id, not the prefix"
         );
         assert_eq!(hit[0].deployment_id, full);
+    }
+
+    /// Holds `HOME` at a scratch directory for one test, serialised with every other test in the
+    /// crate that sets it.
+    #[cfg(feature = "beta-mur-deploy")]
+    struct HomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    impl HomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let lock = crate::config::HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let saved = env::var_os("HOME");
+            // SAFETY: serialised by HOME_ENV_LOCK across every test in the crate that sets HOME.
+            unsafe { env::set_var("HOME", home) };
+            Self { _lock: lock, saved }
+        }
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding `_lock`.
+            unsafe {
+                match &self.saved {
+                    Some(home) => env::set_var("HOME", home),
+                    None => env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    #[test]
+    fn save_deployments_writes_an_owner_only_file_in_an_owner_only_home() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(home.path());
+        let murmur = home.path().join(".murmur");
+        fs::create_dir(&murmur).unwrap();
+        set_mode(&murmur, 0o755);
+        let path = murmur.join("deployments.json");
+        fs::write(&path, "[]").unwrap();
+        set_mode(&path, 0o644);
+
+        save_deployments(&[record()]).unwrap();
+
+        assert_eq!(mode_of(&murmur), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(load_deployments().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "beta-mur-deploy")]
+    #[test]
+    fn deploy_staging_dir_is_created_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = HomeGuard::set(home.path());
+        let murmur = home.path().join(".murmur");
+        fs::create_dir_all(murmur.join("deploy_staging")).unwrap();
+        set_mode(&murmur, 0o755);
+        set_mode(&murmur.join("deploy_staging"), 0o755);
+
+        let staging = create_deploy_staging_dir("dep_0123").unwrap();
+
+        assert_eq!(staging, murmur.join("deploy_staging").join("dep_0123"));
+        for dir in [&murmur, &murmur.join("deploy_staging"), &staging] {
+            assert_eq!(mode_of(dir), 0o700, "{}", dir.display());
+        }
     }
 }

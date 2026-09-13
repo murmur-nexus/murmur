@@ -111,8 +111,8 @@ std::fs::write("state/notes.jsonl", contents)?;   // the store
 std::fs::write("out/result.txt", summary)?;       // the workdir
 ```
 
-Both `~/.murmur/state/` and each store directory under it are created mode `0700`, and the mode is
-reasserted on every launch.
+`~/.murmur`, `~/.murmur/state/` and each store directory under it are created mode `0700`, and the
+mode is reasserted on every launch. See [`~/.murmur` modes](config.md#murmur-home-permissions).
 
 ### What distinguishes it
 
@@ -267,8 +267,14 @@ directory is reported once to stderr and to `logs/bootstrap.log`, and the task r
 
 No artifact ever gets a filesystem path into `~/.murmur/conversations/`. The only way in is
 [`murmur:conversation/read`](wit-interfaces.md#murmurconversationread), granted per hook with
-[`capabilities.conversation.read: true`](manifest.md#hook-capabilities). The conversation root and
-each directory under it are created mode `0700`.
+[`capabilities.conversation.read: true`](manifest.md#hook-capabilities).
+
+| Path | Mode |
+|---|---|
+| `~/.murmur`, the conversation root and each directory under it | `0700` |
+| `conversation.jsonl` | `0600` |
+
+Each mode is set again on every append and every rewrite.
 
 ---
 

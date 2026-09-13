@@ -277,6 +277,15 @@ pub const W_SEC_026: &str = "W-SEC-026";
 /// exists, and never names the value.
 pub const W_SEC_027: &str = "W-SEC-027";
 
+/// A file under `~/.murmur` that holds a secret, or the config file a `transport: http` capsule
+/// is resolving its inference key from, has a mode that lets other accounts on the host read it.
+///
+/// Never a refusal. Fires once at staging when a `credentials.<NAME>` is read from a config file
+/// granting any group or other bit, and from `mur doctor` once for every owner-only entry, or
+/// path beneath one, that is wider than expected. Names the path, its mode and the `chmod` that
+/// fixes it, never a value.
+pub const W_SEC_028: &str = "W-SEC-028";
+
 const DIAGNOSTICS_DOC_URL: &str =
     "https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/";
 
@@ -297,7 +306,7 @@ mod tests {
             W_SEC_001, W_SEC_002, W_SEC_003, W_SEC_004, W_SEC_005, W_SEC_006, W_SEC_007, W_SEC_008,
             W_SEC_009, W_SEC_010, W_SEC_011, W_SEC_012, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016,
             W_SEC_017, W_SEC_018, W_SEC_019, W_SEC_020, W_SEC_021, W_SEC_022, W_SEC_023, W_SEC_024,
-            W_SEC_025, W_SEC_026, W_SEC_027,
+            W_SEC_025, W_SEC_026, W_SEC_027, W_SEC_028,
         ];
         for code in codes {
             assert!(code.starts_with("W-SEC-"), "malformed code: {code}");

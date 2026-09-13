@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use capsule_runtime::murmur_home::{audit_murmur_home, wide_entry_warning, HomeEntryState};
 use capsule_runtime::{
     capability_policy_from_runtime_manifest, check_egress_namespace,
     check_interpreted_entrypoints_reachable, check_roost_health, check_staged_runtime_floor,
@@ -297,6 +298,86 @@ fn report_userns_grant() {
 
     // Stderr, in the same words `mur run` uses at staging, so the two cannot state it differently.
     warn_on_userns_restriction_disabled_host_wide(grant);
+}
+
+/// Prints the mode of `~/.murmur` and of every entry in it, and a `W-SEC-028` line on stderr for
+/// each owner-only entry, or path beneath one, that is wider than expected.
+///
+/// Reads metadata only through [`audit_murmur_home`]: it changes no mode, reaches no `fixes`
+/// entry and cannot change doctor's exit status.
+fn report_murmur_home() {
+    let home = match crate::config::mur_config_path() {
+        Ok(config) => config
+            .parent()
+            .expect("the global config path always has ~/.murmur as its parent")
+            .to_path_buf(),
+        Err(err) => {
+            println!("Murmur home");
+            println!("  not reported: {}", err.message);
+            println!();
+            return;
+        }
+    };
+
+    println!("Murmur home ({})", home.display());
+    let mut warnings = Vec::new();
+    for report in audit_murmur_home(&home) {
+        let name = match report.path.strip_prefix(&home) {
+            Ok(relative) if !relative.as_os_str().is_empty() => relative.display().to_string(),
+            _ => ".".to_string(),
+        };
+        let expected = if report.kind.expected_private() {
+            ", expected owner-only"
+        } else {
+            ""
+        };
+        let holds = report.kind.holds();
+        match &report.state {
+            HomeEntryState::Absent => println!("  {name}: absent  {holds}{expected}"),
+            HomeEntryState::Unreadable { error } => {
+                println!("  {name}: unreadable ({error})  {holds}{expected}")
+            }
+            HomeEntryState::Present {
+                mode,
+                wide,
+                wide_descendants,
+                wide_descendants_omitted,
+            } => {
+                println!("  {name}: {mode:04o}  {holds}{expected}");
+                if *wide {
+                    warnings.push(wide_entry_warning(
+                        &report.path,
+                        holds,
+                        *mode,
+                        report.allowed(),
+                    ));
+                }
+                for entry in wide_descendants {
+                    let relative = entry.path.strip_prefix(&home).unwrap_or(&entry.path);
+                    println!(
+                        "    wider than {:04o}: {} is {:04o}",
+                        entry.allowed,
+                        relative.display(),
+                        entry.mode
+                    );
+                    warnings.push(wide_entry_warning(
+                        &entry.path,
+                        holds,
+                        entry.mode,
+                        entry.allowed,
+                    ));
+                }
+                if *wide_descendants_omitted > 0 {
+                    println!("    and {wide_descendants_omitted} more wider than expected");
+                }
+            }
+        }
+    }
+    println!();
+
+    for warning in warnings {
+        eprintln!("{warning}");
+    }
 }
 
 /// Prints the filesystem surface every guest-bearing artifact in `runtime_manifest` will be
@@ -861,6 +942,10 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     // sealed` needs to know whether that came from the profile murmur ships or from the host's
     // unprivileged-userns hardening being switched off for every binary on the machine.
     report_userns_grant();
+
+    // The modes of everything under `~/.murmur`, which holds provider credentials and deploy keys
+    // whatever the project in front of doctor declares.
+    report_murmur_home();
 
     // What each guest will actually be preopened into, printed before the artifact checklist for
     // the same reason the block above is: it is a property of the manifest, not of any one

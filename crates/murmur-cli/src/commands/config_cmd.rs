@@ -243,6 +243,66 @@ mod tests {
         assert!(!cwd.path().join(".murmur").join("config.yaml").exists());
     }
 
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn global_write_is_owner_only_even_when_home_and_file_were_wide() {
+        use std::os::unix::fs::MetadataExt;
+
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _guard = EnvGuard::set_up(home.path(), cwd.path());
+        let murmur = home.path().join(".murmur");
+        let config = murmur.join("config.yaml");
+        std::fs::create_dir(&murmur).unwrap();
+        set_mode(&murmur, 0o755);
+        std::fs::write(
+            &config,
+            "registry:\n  default: official\ncredentials:\n  OTHER_KEY: keep-me\n",
+        )
+        .unwrap();
+        set_mode(&config, 0o644);
+        let inode = std::fs::metadata(&config).unwrap().ino();
+
+        run_config_set("credentials.PROVIDER_KEY", "v", true).expect("set should succeed");
+
+        assert_eq!(mode_of(&murmur), 0o700);
+        assert_eq!(mode_of(&config), 0o600);
+        assert_ne!(std::fs::metadata(&config).unwrap().ino(), inode);
+        let cfg = load_mur_config().expect("load");
+        assert_eq!(cfg.registry.default.as_deref(), Some("official"));
+        assert_eq!(cfg.credentials["OTHER_KEY"], "keep-me");
+        assert_eq!(cfg.credentials["PROVIDER_KEY"], "v");
+        let leftovers: Vec<_> = std::fs::read_dir(&murmur)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("config.yaml")]);
+    }
+
+    #[test]
+    fn project_write_sets_no_mode() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _guard = EnvGuard::set_up(home.path(), cwd.path());
+        let project = cwd.path().join(".murmur");
+        std::fs::create_dir(&project).unwrap();
+        set_mode(&project, 0o755);
+
+        run_config_set("registry.default", "local", false).expect("set should succeed");
+
+        assert_eq!(mode_of(&project), 0o755);
+        assert!(!home.path().join(".murmur").exists());
+    }
+
     #[test]
     fn set_does_not_clobber_unrelated_keys() {
         let home = tempfile::tempdir().expect("home");

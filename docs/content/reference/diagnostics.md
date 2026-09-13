@@ -114,6 +114,7 @@ section that explains it.
 | `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
 | `W-SEC-027` | The inference key is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
+| `W-SEC-028` | A file under `~/.murmur` that holds a secret, or the config file an inference key was read from, is readable by other accounts | [W-SEC-028](#w-sec-028) |
 
 ---
 
@@ -1058,7 +1059,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027`, `W-SEC-028` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1964,3 +1965,33 @@ that key breaks it until it restarts, with [`E-RUN-027`](#e-run-027).
 **What to do:** store the key with `mur config set -g credentials.<NAME> <key>` and write
 `inference.api_key: ${NAME}` in the manifest. A `${NAME}` that neither the config nor the
 environment holds does not warn: the launch is refused with [`E-MAN-003`](#index).
+
+### W-SEC-028 — a file holding a secret is readable by other accounts { #w-sec-028 }
+
+**Fires when:** a path under `~/.murmur` that is expected to be owner-only has a mode wider than
+that. It fires from two places, on stderr:
+
+| Source | Fires for | How often |
+|---|---|---|
+| `mur run` | The config file a `transport: http` capsule reads its key from, as [`credentials.<NAME>`](config.md#credentials), when its mode grants any group or other permission | Once per launch. A key from the environment or a literal never fires it, and neither does a re-read while the capsule runs |
+| `mur doctor` | Every owner-only entry in [the `~/.murmur` modes table](config.md#murmur-home-permissions) wider than its mode, and every directory wider than `0700` or file wider than `0600` beneath one | Once per path |
+
+```text
+[capsule-runtime] warning[W-SEC-028]: the inference credential credentials.ANTHROPIC_API_KEY is read from /home/alice/.murmur/config.yaml, which is mode 0644 and readable by other accounts on this host; run `chmod 600 /home/alice/.murmur/config.yaml` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
+```
+
+```text
+[capsule-runtime] warning[W-SEC-028]: /home/alice/.murmur/deploy_keys/dep_x/id_ed25519 holds SSH private keys and is mode 0644, which other accounts on this host can read; run `chmod 600 /home/alice/.murmur/deploy_keys/dep_x/id_ed25519` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
+```
+
+Neither form prints a value or a file's contents.
+
+**Why it matters:** any account on the host can read the provider key, deploy key or record the
+path holds.
+
+**What the runtime does about it:** nothing is refused and no mode is changed. murmur's own writes
+set these modes on every write, so a wide path was loosened by hand, restored from a backup, or
+written by an older build.
+
+**What to do:** run the `chmod` the warning names. Running `mur config set -g` again also rewrites
+`config.yaml` at `0600`.

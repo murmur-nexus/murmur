@@ -290,12 +290,15 @@ pub fn load_project_mur_config_if_exists() -> Result<Option<MurConfig>, CliError
     read_mur_config_file(&project_mur_config_path()?)
 }
 
+/// Writes `~/.murmur/config.yaml` at `0600` inside a `~/.murmur` held at `0700`, whatever mode
+/// either had before. Fails with `E-IO-003` rather than leave the file written wider.
 pub fn save_mur_config(config: &MurConfig) -> Result<(), CliError> {
-    write_mur_config_file(&mur_config_path()?, config)
+    write_mur_config_file(&mur_config_path()?, config, true)
 }
 
+/// Writes `<cwd>/.murmur/config.yaml` under the umask. It may not hold credentials.
 pub fn save_project_mur_config(config: &MurConfig) -> Result<(), CliError> {
-    write_mur_config_file(&project_mur_config_path()?, config)
+    write_mur_config_file(&project_mur_config_path()?, config, false)
 }
 
 /// Loads the effective `MurConfig`: the global (`~/.murmur/config.yaml`) merged with
@@ -538,7 +541,40 @@ fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfig>, CliErro
     Ok(Some(config))
 }
 
-fn write_mur_config_file(config_path: &Path, config: &MurConfig) -> Result<(), CliError> {
+/// Replaces `config_path` by rename, so the inode changes on every write and a running capsule's
+/// credential stamp sees it.
+///
+/// `private` holds the parent directory at `0700` and the file at `0600`, reapplied on every
+/// write; otherwise both are left to the umask.
+fn write_mur_config_file(
+    config_path: &Path,
+    config: &MurConfig,
+    private: bool,
+) -> Result<(), CliError> {
+    if private {
+        let serialized = serde_yaml::to_string(config).map_err(|source| {
+            CliError::new(E_IO_003, format!("failed to serialize config: {source}"))
+        })?;
+        if let Some(parent) = config_path.parent() {
+            capsule_runtime::murmur_home::hold_private_dir(parent).map_err(|reason| {
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to hold {} owner-only: {reason}", parent.display()),
+                )
+            })?;
+        }
+        return capsule_runtime::murmur_home::write_private_file(
+            config_path,
+            serialized.as_bytes(),
+        )
+        .map_err(|reason| {
+            CliError::new(
+                E_IO_003,
+                format!("failed to write {}: {reason}", config_path.display()),
+            )
+        });
+    }
+
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
             CliError::new(
