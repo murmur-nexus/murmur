@@ -192,6 +192,122 @@ pub fn compaction_hook_wasm(summary: &str) -> Vec<u8> {
     )
 }
 
+/// Interface a hook imports `run-inference` from.
+const INFERENCE_IFACE: &str = "murmur:runtime/inference@0.3.0";
+
+/// An `on-compaction` hook that calls `run-inference` once — no messages, no system prompt,
+/// `model: none` — and returns `err(<text>)`, where `text` is whichever string the call produced:
+/// the completion's text on `ok`, the error on `err`.
+///
+/// `run-inference`'s `result<inference-response, string>` is written to 256: discriminant at 0 and
+/// either string's ptr/len at 8/12, since both payloads start at the record's 8-byte alignment.
+/// The lifted `result<hook-output, string>` is at [`RETURN_AREA`]: discriminant `1` at 0, the error
+/// string's ptr/len at 4/8.
+pub fn run_inference_then_err_compaction_hook_wasm() -> Vec<u8> {
+    let stubs = HOOK_FNS
+        .iter()
+        .filter(|n| **n != "on-compaction")
+        .map(|n| format!("    (export \"{n}\" (func $noop))"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let wat = format!(
+        r#"(component
+  (import "{INFERENCE_IFACE}" (instance $inf
+    (type (option string))
+    (type (record
+      (field "role" string)
+      (field "content" string)
+      (field "id" 0)
+      (field "source-id" 0)))
+    (export "message" (type (eq 1)))
+    (type (list 2))
+    (type (record
+      (field "messages" 3)
+      (field "system-prompt" 0)
+      (field "model" 0)))
+    (export "inference-request" (type (eq 4)))
+    (type (record
+      (field "text" string)
+      (field "model-used" string)
+      (field "input-tokens" u64)
+      (field "output-tokens" u64)))
+    (export "inference-response" (type (eq 6)))
+    (type (result 7 (error string)))
+    (export "run-inference" (func (param "request" 5) (result 8)))
+  ))
+  (alias export $inf "run-inference" (func $runi))
+
+  ;; Memory and `realloc` in their own module, so the lowered import can name them without a
+  ;; cyclic instantiation.
+  (core module $libc
+    (memory (export "memory") 4)
+    (global $bump (mut i32) (i32.const 65536))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      (local.set $p (i32.and (i32.add (global.get $bump) (i32.const 7)) (i32.const -8)))
+      (global.set $bump (i32.add (local.get $p) (local.get 3)))
+      (local.get $p))
+  )
+  (core instance $li (instantiate $libc))
+  (alias core export $li "memory" (core memory $mem))
+  (alias core export $li "realloc" (core func $realloc))
+  (core func $run_lowered
+    (canon lower (func $runi) (memory $mem) (realloc $realloc) string-encoding=utf8))
+
+  (core module $m
+    (import "libc" "memory" (memory 4))
+    (import "inf" "run" (func $run (param i32 i32 i32 i32 i32 i32 i32 i32 i32)))
+    (func (export "handler") (param i32 i32 i64 f64 i32 i32 i32 i32 i32 i32) (result i32)
+      (call $run
+        (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 0) (i32.const 0) (i32.const 0)
+        (i32.const 256))
+      (i32.store (i32.const {RETURN_AREA}) (i32.const 1))
+      (i32.store (i32.const {ptr}) (i32.load (i32.const 264)))
+      (i32.store (i32.const {len}) (i32.load (i32.const 268)))
+      (i32.const {RETURN_AREA}))
+    (func (export "noop"))
+  )
+  (core instance $i (instantiate $m
+    (with "libc" (instance $li))
+    (with "inf" (instance (export "run" (func $run_lowered))))))
+
+  (type $message (record
+    (field "role" string)
+    (field "content" string)
+    (field "id" (option string))
+    (field "source-id" (option string))))
+  (type $tool-manifest (record (field "binary-name" string) (field "content" string)))
+{HOOK_OUTPUT}
+  (type $event (record
+    (field "messages" (list $message))
+    (field "session-tokens" u64)
+    (field "threshold" f64)
+    (field "model" (option string))
+    (field "system-prompt" (option string))))
+  (type $ft (func (param "event" $event) (result (result $hook-output (error string)))))
+
+  (func $impl (type $ft)
+    (canon lift (core func $i "handler") (memory $mem) (realloc $realloc) string-encoding=utf8))
+  (func $noop (canon lift (core func $i "noop")))
+
+  (instance $lc
+    (export "message" (type $message))
+    (export "tool-manifest" (type $tool-manifest))
+    (export "hook-output" (type $hook-output))
+    (export "compaction-event" (type $event))
+    (export "on-compaction" (func $impl))
+{stubs}
+  )
+  (export "{LIFECYCLE_IFACE}" (instance $lc))
+)"#,
+        ptr = RETURN_AREA + 4,
+        len = RETURN_AREA + 8,
+    );
+    wat::parse_str(&wat).expect("run-inference compaction hook WAT parses")
+}
+
 /// Pack a hook `.mur.zip` whose bundled manifest declares the binding and commit policy the
 /// runtime cross-checks at staging.
 pub fn create_hook_zip(

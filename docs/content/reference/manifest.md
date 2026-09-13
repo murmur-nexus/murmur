@@ -961,8 +961,16 @@ A call that does not fit is never sent. The refusal appears as:
 | `task_end`, `session_end` | `exit_status: "spend_ceiling_reached"` |
 
 The first refusal latches. That task ends, and every later call and task in the session is refused
-without reaching the provider; the session itself stays up. A compaction hook whose call is refused
-handles the `err` as it would any other `run-inference` failure.
+without reaching the provider; the session itself stays up.
+
+A compaction hook whose call is refused decides what happens next:
+
+| The hook returns | Outcome |
+|---|---|
+| `none` or `replace-context` | The session continues, and the next agent turn's admission decides |
+| An error | The task and session end with `exit_status: "spend_ceiling_reached"`, not `failed`, and `out/result.txt` reads `stopped: spend ceiling reached: …` |
+
+A compaction hook error that follows no refused call ends the session as `failed`.
 
 A call that is cancelled, fails to dispatch or returns a failed status is charged its input alone.
 The sum of a session's `inference` lines never exceeds the ceiling, except by how far a response's

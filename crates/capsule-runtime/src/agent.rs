@@ -346,7 +346,7 @@ pub(crate) async fn run_agent_loop(
     // with no hook bound to `on-compaction`.
     if resume == Some(ResumeMode::Compact) && !messages.is_empty() {
         session_tokens = occupancy.count(&messages);
-        try_compact_via_hooks(
+        let compacted = try_compact_via_hooks(
             &mut messages,
             &mut session_tokens,
             &occupancy,
@@ -362,8 +362,28 @@ pub(crate) async fn run_agent_loop(
             run_config.compaction_dump_summaries,
             record.as_mut(),
         )
-        .await
-        .map_err(RuntimeError::AgentLoopFailed)?;
+        .await;
+        match compacted {
+            Ok(()) => {}
+            Err(CompactionFailure::Hook(text)) => return Err(RuntimeError::AgentLoopFailed(text)),
+            Err(CompactionFailure::SpendRefused(refusal)) => {
+                return finish_spend_refused_turn(
+                    hooks,
+                    trace,
+                    otel,
+                    workdir,
+                    &sse,
+                    &mut sse_event_id,
+                    task_id.as_deref(),
+                    task_id.as_deref().unwrap_or_default(),
+                    context_id.clone(),
+                    0,
+                    &refusal,
+                    RefusalLine::AlreadyWritten,
+                )
+                .await;
+            }
+        }
     }
 
     let task_message = with_new_id(json!({
@@ -519,6 +539,7 @@ pub(crate) async fn run_agent_loop(
                     context_id.clone(),
                     turn_u32,
                     &refusal,
+                    RefusalLine::Write,
                 )
                 .await;
             }
@@ -830,8 +851,26 @@ pub(crate) async fn run_agent_loop(
                 // A declared compaction hook that returned `Err` ends the session the
                 // same way a driver inference error does — there is no fallback
                 // compactor behind it, so continuing would mean another turn on a
-                // context we already know is over budget.
-                if let Err(error) = compacted {
+                // context we already know is over budget. An `Err` that followed a refused
+                // `run-inference` call is the spend ceiling's stop, and ends as one.
+                if let Err(CompactionFailure::SpendRefused(refusal)) = &compacted {
+                    return finish_spend_refused_turn(
+                        hooks,
+                        trace,
+                        otel,
+                        workdir,
+                        &sse,
+                        &mut sse_event_id,
+                        task_id.as_deref(),
+                        &task_id_str,
+                        context_id.clone(),
+                        turn_u32,
+                        refusal,
+                        RefusalLine::AlreadyWritten,
+                    )
+                    .await;
+                }
+                if let Err(CompactionFailure::Hook(error)) = compacted {
                     eprintln!("compaction failed: {error}");
                     record_result(hooks, workdir, &format!("error: {error}"))
                         .map_err(RuntimeError::AgentLoopFailed)?;
@@ -1398,6 +1437,10 @@ async fn finish_canceled_turn(
 /// says it stopped — and never as a driver or provider error. A2A has no state for a task stopped
 /// by policy, so the terminal status is `failed` and its message carries the refusal, as it does
 /// for `inference.max_turns`.
+///
+/// `line` says whether the `spend_ceiling_reached` line is still to be written: a refused hook
+/// call has had its own, tagged with the hook's origin, written by
+/// [`flush_hook_inference_records`].
 #[allow(clippy::too_many_arguments)]
 async fn finish_spend_refused_turn(
     hooks: &mut HookRuntime,
@@ -1411,13 +1454,16 @@ async fn finish_spend_refused_turn(
     context_id: Option<String>,
     turn: u32,
     refusal: &SpendRefusal,
+    line: RefusalLine,
 ) -> Result<AgentLoopExit, RuntimeError> {
     // An async hook's completion may have settled or been refused while this turn was measured.
     flush_hook_inference_records(hooks, trace, otel, turn).await;
-    trace
-        .write_spend_ceiling_reached(turn, refusal, None)
-        .await
-        .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    if line == RefusalLine::Write {
+        trace
+            .write_spend_ceiling_reached(turn, refusal, None)
+            .await
+            .map_err(|e| RuntimeError::AgentLoopFailed(format!("trace write failed: {e}")))?;
+    }
     record_result(hooks, workdir, &format!("stopped: {refusal}"))
         .map_err(RuntimeError::AgentLoopFailed)?;
     flush_hook_dispatch_faults(hooks, trace).await;
@@ -1442,6 +1488,36 @@ async fn finish_spend_refused_turn(
         .await;
     }
     Ok(AgentLoopExit::SpendCeilingReached)
+}
+
+/// Whether [`finish_spend_refused_turn`] writes the `spend_ceiling_reached` line itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalLine {
+    /// The refused call was the agent turn's own; its line carries no `origin`.
+    Write,
+    /// The refused call was a hook's, and its line is already in the trace.
+    AlreadyWritten,
+}
+
+/// Why a compaction attempt ended the session.
+#[derive(Debug, PartialEq, Eq)]
+enum CompactionFailure {
+    /// The hook returned `Err` after a spend ceiling refused its `run-inference` call. Carries the
+    /// last refusal drained with that dispatch's records.
+    SpendRefused(SpendRefusal),
+    /// The hook returned `Err` with no refusal behind it. Carries the text the session fails with.
+    Hook(String),
+}
+
+/// Classify a compaction hook's `Err` by the spend refusals drained right after that dispatch.
+///
+/// Only those refusals count: a machine refusal never latches in the meter, and a latch set by an
+/// earlier call says nothing about why this hook failed.
+fn classify_compaction_failure(error: String, refusals: Vec<SpendRefusal>) -> CompactionFailure {
+    match refusals.into_iter().last() {
+        Some(refusal) => CompactionFailure::SpendRefused(refusal),
+        None => CompactionFailure::Hook(format!("compaction hook failed: {error}")),
+    }
 }
 
 /// How the output cap in force is named wherever a capped turn is reported: the manifest field a
@@ -1603,17 +1679,20 @@ async fn finish_completed_turn(
 /// has no access to `trace`/`otel` (see `HookInferenceCtx::records`).
 ///
 /// A hook call a spend ceiling refused made no call and has no `inference` record; its
-/// `spend_ceiling_reached` line is written here too, tagged with the hook's origin.
+/// `spend_ceiling_reached` line is written here too, tagged with the hook's origin. Returns those
+/// refusals, in the order they were made.
 async fn flush_hook_inference_records(
     hooks: &HookRuntime,
     trace: &mut TraceWriter,
     otel: &OtelEmitter,
     turn: u32,
-) {
+) -> Vec<SpendRefusal> {
+    let mut refusals = Vec::new();
     for refused in hooks.drain_spend_refusals() {
         let _ = trace
             .write_spend_ceiling_reached(turn, &refused.refusal, Some(&refused.origin))
             .await;
+        refusals.push(refused.refusal);
     }
     for record in hooks.drain_inference_records() {
         let _ = trace
@@ -1648,6 +1727,7 @@ async fn flush_hook_inference_records(
         )
         .await;
     }
+    refusals
 }
 
 /// The session's pre-dispatch decision point, in one place so every route to a call reaches the
@@ -2101,7 +2181,7 @@ async fn try_compact_via_hooks(
     compaction_system_prompt: Option<String>,
     dump_summaries: bool,
     record: Option<&mut crate::conversation::ConversationRecord>,
-) -> Result<(), String> {
+) -> Result<(), CompactionFailure> {
     let wit_messages = to_wit_messages(messages);
 
     let tokens_before = *session_tokens;
@@ -2125,14 +2205,15 @@ async fn try_compact_via_hooks(
     // the replacement. A hook that retried after a failure therefore leaves two
     // separately-tagged records rather than one relabelled span.
     let turn_u32 = u32::try_from(turn).unwrap_or(u32::MAX);
-    flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
+    let refusals = flush_hook_inference_records(hooks, trace, otel, turn_u32).await;
 
     // A declared compaction hook that failed is a session failure, not a silent
     // fallback: the caller has no other way to get back under budget, and limping
     // on with an over-budget context is indistinguishable to the operator from
     // "no hook was ever bound". The caller turns this into the same observable
-    // failure a driver inference error takes.
-    let replacement = dispatched.map_err(|error| format!("compaction hook failed: {error}"))?;
+    // failure a driver inference error takes, or into the spend stop when a ceiling
+    // refused the call the hook made.
+    let replacement = dispatched.map_err(|error| classify_compaction_failure(error, refusals))?;
 
     let Some(new_wit_messages) = replacement else {
         append_bootstrap_log(
@@ -3234,6 +3315,43 @@ fn extract_text_content(content: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spend::SpendLimit;
+
+    fn refusal(limit: SpendLimit, ceiling: u64) -> SpendRefusal {
+        SpendRefusal {
+            limit,
+            ceiling,
+            used: 10,
+            requested: 9_000,
+        }
+    }
+
+    #[test]
+    fn compaction_failure_without_refusals_is_a_hook_failure() {
+        assert_eq!(
+            classify_compaction_failure("summarizer unreachable".into(), Vec::new()),
+            CompactionFailure::Hook("compaction hook failed: summarizer unreachable".into())
+        );
+    }
+
+    #[test]
+    fn compaction_failure_after_one_refusal_is_a_spend_stop() {
+        let refused = refusal(SpendLimit::Session, 100);
+        assert_eq!(
+            classify_compaction_failure(refused.to_string(), vec![refused.clone()]),
+            CompactionFailure::SpendRefused(refused)
+        );
+    }
+
+    #[test]
+    fn compaction_failure_after_two_refusals_carries_the_last() {
+        let first = refusal(SpendLimit::Session, 100);
+        let last = refusal(SpendLimit::Machine, 200);
+        assert_eq!(
+            classify_compaction_failure("gave up".into(), vec![first, last.clone()]),
+            CompactionFailure::SpendRefused(last)
+        );
+    }
 
     /// The refusal the agent reads, pinned verbatim: it names the hook, carries the hook's
     /// reason, and says the retry will fail. A model shown only "error" retries.

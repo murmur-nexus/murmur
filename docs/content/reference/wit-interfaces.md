@@ -250,8 +250,13 @@ optional `context-id`, and the `text` — and returns the peer's `task-id`, `con
 
 Hook artifacts (`runtime: hook`) export this interface. The runtime calls each handler
 synchronously. Returning an error logs it to `logs/hook-<name>.log` in the workdir and the
-session continues — except at `on-compaction`, where the error fails the session, because the
-runtime has no other way back under the token budget.
+session continues — except at `on-compaction`, where the error ends the session, because the
+runtime has no other way back under the token budget:
+
+| `on-compaction` error | Session `exit_status` |
+|---|---|
+| Follows a `run-inference` call a [spend ceiling](manifest.md#inference-max-session-tokens) refused | `spend_ceiling_reached` |
+| Any other | `failed` |
 
 | Handler | Fires |
 |---|---|

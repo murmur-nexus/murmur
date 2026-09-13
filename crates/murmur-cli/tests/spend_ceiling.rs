@@ -170,6 +170,10 @@ impl Run {
 }
 
 fn run_task(home: &TempDir, project: &Project) -> Run {
+    run_task_with(home, project, "Say hello.", &[])
+}
+
+fn run_task_with(home: &TempDir, project: &Project, task: &str, extra: &[&str]) -> Run {
     Run::of(
         mur(home, project)
             .args([
@@ -177,9 +181,10 @@ fn run_task(home: &TempDir, project: &Project) -> Run {
                 "--manifest",
                 project.manifest.to_str().unwrap(),
                 "--task",
-                "Say hello.",
+                task,
                 "--verbose",
             ])
+            .args(extra)
             .output()
             .unwrap(),
     )
@@ -860,6 +865,222 @@ fn unusable_ledger_refuses_launch() {
         fs::read_dir(&workdirs).map_or(true, |mut entries| entries.next().is_none()),
         "a session workdir was created"
     );
+}
+
+// ── A compaction hook's call crosses the ceiling ──────────────────────────────
+
+/// The output a hook's `run-inference` call reserves: the built-in cap, not `inference.max_tokens`.
+const HOOK_MAX_OUTPUT: u64 = 8_192;
+
+/// A scratch `HOME` with the driver and the `compactor` hook published into it. The hook calls
+/// `run-inference` and returns whatever string that produced as its `err`.
+fn home_with_compactor() -> TempDir {
+    let home = home_with_driver();
+    let artifacts = TempDir::new().unwrap();
+    let artifact = common::hook_wat::create_hook_zip(
+        artifacts.path(),
+        "compactor",
+        "on-compaction",
+        "replace-context",
+        &common::hook_wat::run_inference_then_err_compaction_hook_wasm(),
+    );
+    common::publish_local(&home, &artifact).success();
+    home
+}
+
+/// [`http_manifest`] with the `compactor` hook bound, and — when `context_budget` is set — a
+/// `context.max_tokens` and threshold the first agent turn already crosses.
+fn compaction_manifest(endpoint: &str, inference_extra: &str, context_budget: bool) -> String {
+    let context = if context_budget {
+        "context:\n  max_tokens: 200\n"
+    } else {
+        ""
+    };
+    format!(
+        "name: spend-compaction\nversion: 0.1.0\nartifacts:\n  - name: {DRIVER}\n    version: \
+         {DRIVER_VERSION}\n    runtime: driver\n  - name: compactor\n    version: 0.1.0\n    \
+         runtime: hook\n{context}inference:\n  transport: http\n  endpoint: {endpoint}\n  model: \
+         test-model\n  api_key: test-key\n  max_tokens: {MAX_OUTPUT}\n{inference_extra}  \
+         compaction:\n    threshold: 0.01\n  driver:\n    artifact: {DRIVER}\n"
+    )
+}
+
+fn compaction_responses() -> Vec<String> {
+    vec![end_turn("msg_1", "done"), end_turn("msg_2", "summary")]
+}
+
+/// The first agent turn's input under the compaction manifest, from a run with no ceiling, and a
+/// ceiling that turn fits under and the hook's call cannot.
+fn compaction_ceiling(home: &TempDir) -> u64 {
+    let server = common::ScriptedServer::start(compaction_responses());
+    let control = project(&compaction_manifest(&server.endpoint, "", true));
+    let run = run_task(home, &control);
+    let turns = agent_turns(&run.trace());
+    assert_eq!(turns.len(), 1, "{}", run.stderr);
+    let first_input = turns[0].0;
+    let ceiling = ceiling_between_first_and_second_call(first_input);
+    assert!(first_input + MAX_OUTPUT <= ceiling);
+    assert!(HOOK_MAX_OUTPUT > MAX_OUTPUT + first_input / 2);
+    println!("control first input {first_input}; ceiling {ceiling}");
+    ceiling
+}
+
+/// The one `spend_ceiling_reached` line a refused compaction call leaves, and the exit statuses
+/// and result that go with it.
+fn assert_compaction_spend_stop(run: &Run, limit: &str, result_prefix: &str) -> Value {
+    let trace = run.trace();
+    let refusals = events(&trace, "spend_ceiling_reached");
+    assert_eq!(refusals.len(), 1, "{}", run.stderr);
+    let refusal = refusals[0].clone();
+    println!("refusal line: {refusal}");
+    assert_eq!(refusal["limit"], limit);
+    assert_eq!(refusal["origin"], "hook:compactor");
+
+    println!("task_end line: {}", events(&trace, "task_end")[0]);
+    println!("session_end line: {}", events(&trace, "session_end")[0]);
+    assert_eq!(exit_status(&trace, "task_end"), "spend_ceiling_reached");
+    assert_eq!(exit_status(&trace, "session_end"), "spend_ceiling_reached");
+
+    let result = run.result();
+    println!("result: {result}");
+    assert!(result.starts_with(result_prefix), "{result}");
+    assert!(!result.contains("compaction hook failed"), "{result}");
+    assert!(
+        !run.stderr.contains("compaction hook failed"),
+        "{}",
+        run.stderr
+    );
+    assert!(!run.stderr.contains("compaction failed:"), "{}", run.stderr);
+    refusal
+}
+
+#[test]
+fn compaction_refused_by_session_ceiling() {
+    println!("compaction_refused_by_session_ceiling");
+    let home = home_with_compactor();
+    let ceiling = compaction_ceiling(&home);
+
+    let server = common::ScriptedServer::start(compaction_responses());
+    let stopped = project(&compaction_manifest(
+        &server.endpoint,
+        &session_ceiling(ceiling),
+        true,
+    ));
+    let run = run_task(&home, &stopped);
+    let requests = server.requests().len();
+    println!("upstream requests: {requests}");
+    assert_eq!(requests, 1, "{}", run.stderr);
+
+    let refusal = assert_compaction_spend_stop(
+        &run,
+        "session",
+        &format!("stopped: spend ceiling reached: inference.max_session_tokens is {ceiling}"),
+    );
+    assert_eq!(refusal["ceiling"], json!(ceiling));
+    assert!(events(&run.trace(), "inference")
+        .iter()
+        .all(|event| event.get("origin").is_none()));
+}
+
+#[test]
+fn compaction_refused_by_machine_ceiling() {
+    println!("compaction_refused_by_machine_ceiling");
+    let home = home_with_compactor();
+    let ceiling = compaction_ceiling(&home);
+    set_machine_ceiling(&home, ceiling);
+
+    let server = common::ScriptedServer::start(compaction_responses());
+    let stopped = project(&compaction_manifest(&server.endpoint, "", true));
+    let run = run_task(&home, &stopped);
+    let requests = server.requests().len();
+    println!("upstream requests: {requests}");
+    assert_eq!(requests, 1, "{}", run.stderr);
+
+    let refusal = assert_compaction_spend_stop(
+        &run,
+        "machine",
+        &format!("stopped: spend ceiling reached: spend.machine_tokens_per_day is {ceiling}"),
+    );
+    assert_eq!(refusal["ceiling"], json!(ceiling));
+
+    let today = format!("{}.jsonl", chrono::Utc::now().format("%Y-%m-%d"));
+    let ledger = fs::read_to_string(home.path().join(".murmur/spend").join(today)).unwrap();
+    println!("ledger:\n{}", ledger.trim_end());
+    assert_eq!(ledger.lines().count(), 1);
+}
+
+#[test]
+fn compaction_hook_error_without_refusal_stays_failed() {
+    println!("compaction_hook_error_without_refusal_stays_failed");
+    let home = home_with_compactor();
+    let server = common::ScriptedServer::start(compaction_responses());
+    let control = project(&compaction_manifest(&server.endpoint, "", true));
+    let run = run_task(&home, &control);
+    let trace = run.trace();
+    let requests = server.requests().len();
+    println!("upstream requests: {requests}");
+    assert_eq!(requests, 2, "{}", run.stderr);
+
+    assert!(events(&trace, "spend_ceiling_reached").is_empty());
+    let hook_calls: Vec<_> = events(&trace, "inference")
+        .into_iter()
+        .filter(|event| event["origin"] == "hook:compactor")
+        .collect();
+    assert_eq!(hook_calls.len(), 1);
+
+    println!("task_end line: {}", events(&trace, "task_end")[0]);
+    println!("session_end line: {}", events(&trace, "session_end")[0]);
+    assert_eq!(exit_status(&trace, "task_end"), "failed");
+    assert_eq!(exit_status(&trace, "session_end"), "failed");
+    let result = run.result();
+    println!("result: {result}");
+    assert!(
+        result.starts_with("error: compaction hook failed: "),
+        "{result}"
+    );
+}
+
+#[test]
+fn resume_compact_refused_by_spend_ceiling() {
+    println!("resume_compact_refused_by_spend_ceiling");
+    let home = home_with_compactor();
+    let server = common::ScriptedServer::start(vec![
+        end_turn("msg_1", "first"),
+        end_turn("msg_2", "never asked for"),
+    ]);
+    let project = project(&compaction_manifest(&server.endpoint, "", false));
+
+    let first = run_task_with(
+        &home,
+        &project,
+        "first task",
+        &["--context", "ctx_spend_resume"],
+    );
+    assert_eq!(
+        exit_status(&first.trace(), "session_end"),
+        "ok",
+        "{}",
+        first.stderr
+    );
+    let before = server.requests().len();
+
+    set_machine_ceiling(&home, 10);
+    let run = run_task_with(
+        &home,
+        &project,
+        "second task",
+        &["--resume", "@1", "--resume-mode", "compact"],
+    );
+    let new_requests = server.requests().len() - before;
+    println!("new upstream requests: {new_requests}");
+    assert_eq!(new_requests, 0, "{}", run.stderr);
+
+    let refusal = assert_compaction_spend_stop(
+        &run,
+        "machine",
+        "stopped: spend ceiling reached: spend.machine_tokens_per_day is 10",
+    );
+    assert_eq!(refusal["turn"], json!(0));
 }
 
 // ── S13: W-SEC-026 ────────────────────────────────────────────────────────────
