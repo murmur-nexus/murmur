@@ -870,3 +870,82 @@ fn rotated_key_never_recorded() {
         }
     }
 }
+
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A key read from a config file other accounts can read warns once with `W-SEC-028`, naming the
+/// file, its mode and the fix, and the session still runs.
+#[test]
+fn wide_credential_file_warns_w_sec_028_once_and_never_prints_the_key() {
+    let upstream = Upstream::start(&[], |_, _| (200, END_TURN));
+    let capsule = Capsule::new(&upstream, ApiKey::Reference, "");
+    capsule.set_credential(OLD);
+    let config = capsule.config_path();
+    set_mode(&config, 0o644);
+
+    let run = capsule.run(None);
+
+    assert!(run.ok(), "{}", run.context());
+    assert_eq!(run.session_start()["credential_source"], "config");
+    let lines = run.lines("warning[W-SEC-028]");
+    println!("{}", lines.join("\n"));
+    assert_eq!(lines.len(), 1, "{}", run.context());
+    let path = config.display().to_string();
+    assert!(
+        lines[0].contains(&format!("credentials.{NAME}")),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains(&format!("read from {path},")),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("mode 0644"), "{}", lines[0]);
+    assert!(
+        lines[0].contains(&format!("`chmod 600 {path}`")),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("#w-sec-028"), "{}", lines[0]);
+    assert!(!run.stdout.contains(OLD) && !run.stderr.contains(OLD));
+}
+
+#[test]
+fn private_credential_file_does_not_warn_w_sec_028() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let upstream = Upstream::start(&[], |_, _| (200, END_TURN));
+    let capsule = Capsule::new(&upstream, ApiKey::Reference, "");
+    capsule.set_credential(OLD);
+    let mode = fs::metadata(capsule.config_path())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "mur config set -g writes the file owner-only");
+
+    let run = capsule.run(None);
+
+    assert!(run.ok(), "{}", run.context());
+    assert!(run.lines("W-SEC-028").is_empty(), "{}", run.context());
+}
+
+#[test]
+fn environment_sourced_key_does_not_warn_w_sec_028_about_a_wide_config() {
+    let upstream = Upstream::start(&[], |_, _| (200, END_TURN));
+    let capsule = Capsule::new(&upstream, ApiKey::Reference, "");
+    let config = capsule.config_path();
+    fs::write(&config, "registry:\n  default: local\n").unwrap();
+    set_mode(&config, 0o644);
+
+    let run = capsule.run(Some(OLD));
+
+    assert!(run.ok(), "{}", run.context());
+    assert_eq!(run.session_start()["credential_source"], "environment");
+    assert!(run.lines("W-SEC-028").is_empty(), "{}", run.context());
+    assert_eq!(run.lines("W-SEC-027").len(), 1, "{}", run.context());
+}

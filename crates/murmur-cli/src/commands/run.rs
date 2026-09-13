@@ -332,6 +332,12 @@ pub(crate) fn run_run(
 
     let capability_policy = capability_policy_from_runtime_manifest(&runtime_manifest);
 
+    // `stage_session` refuses the same thing with the same checker; called here so
+    // `--explain-scope` refuses exactly what a launch refuses, and ahead of the `W-SEC-024`
+    // emitter so a refused manifest prints no grant warning about names it cannot hold.
+    capsule_runtime::check_env_allow_reaches_guests(&capability_policy)
+        .map_err(|error| fail(&session_id, &workdir, CliError::from(error), json))?;
+
     // Parsed ahead of the `--explain-scope` return because the warning below reads the resolved
     // lifecycle, and a diagnostic that describes a launch must describe the flags it was given.
     // A malformed value therefore refuses `--explain-scope` as it refuses a real run — the same

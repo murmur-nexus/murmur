@@ -71,12 +71,12 @@ pub struct RunningRecord {
     pub started_at: String,
 }
 
-/// `~/.murmur/running`, created if missing and held at `0700`.
+/// `~/.murmur/running`, created if missing and held at `0700`, inside a `~/.murmur` held at `0700`.
 ///
 /// The directory is global rather than per-workdir because the question a live address answers is
 /// "what is running on this machine", which no single project directory can answer.
 pub fn running_dir() -> Result<PathBuf, String> {
-    let dir = crate::state_store::murmur_home_dir()?.join(RUNNING_DIR);
+    let dir = crate::murmur_home::ensure_murmur_home()?.join(RUNNING_DIR);
     crate::state_store::ensure_private_dir(&dir, RUNNING_DIR_MODE)?;
     Ok(dir)
 }
@@ -580,5 +580,37 @@ mod tests {
         };
         record.url = format!("127.0.0.1:{port}");
         assert!(matches!(verify(&record), Liveness::Unreachable(_)));
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn running_dir_holds_a_wide_murmur_home_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::wide_dir(&home.path().join(".murmur"), 0o755);
+        crate::murmur_home::run_with_home(
+            "running::home_tests::inner_running_dir_under_scratch_home",
+            home.path(),
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur")),
+            0o700
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur").join(RUNNING_DIR)),
+            RUNNING_DIR_MODE
+        );
+    }
+
+    #[test]
+    #[ignore = "run by running_dir_holds_a_wide_murmur_home_owner_only"]
+    fn inner_running_dir_under_scratch_home() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        running_dir().unwrap();
     }
 }

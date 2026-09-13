@@ -98,6 +98,8 @@ pub(crate) enum CredentialChange {
 /// The identity and last change of an opened config file, as `fstat(2)` reports them. Identifies a
 /// state of the file for reporting `unreadable` once; it never decides whether to read.
 /// `Unavailable` is a file that could not be opened or stat'd.
+///
+/// `mode` is compared with the rest, which changes nothing: `chmod(2)` also updates `ctime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileStamp {
     Unavailable,
@@ -107,6 +109,7 @@ enum FileStamp {
         len: u64,
         mtime: (i64, i64),
         ctime: (i64, i64),
+        mode: u32,
     },
 }
 
@@ -118,6 +121,7 @@ impl FileStamp {
             len: metadata.len(),
             mtime: (metadata.mtime(), metadata.mtime_nsec()),
             ctime: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
         }
     }
 }
@@ -206,6 +210,9 @@ impl InferenceCredential {
     ///
     /// Refuses with [`RuntimeError::InferenceCredentialNotFound`] when neither place holds a
     /// `${NAME}`.
+    ///
+    /// A value found in `credentials_file` prints `W-SEC-028` when the handle it was read through
+    /// reports a mode granting any group or other bit. Re-reads during the session never do.
     pub(crate) fn resolve(
         reference: &ApiKeyReference,
         credentials_file: Option<&Path>,
@@ -217,7 +224,11 @@ impl InferenceCredential {
             ApiKeyReference::Environment(name) => name,
         };
         if let Some(path) = credentials_file {
-            if let EntryRead::Value(value) = read_entry(path, name).1 {
+            let (stamp, read) = read_entry(path, name);
+            if let EntryRead::Value(value) = read {
+                if let FileStamp::Present { mode, .. } = stamp {
+                    crate::murmur_home::warn_on_wide_credential_file(path, name, mode);
+                }
                 let credential = Self::new(
                     CredentialSource::Config {
                         path: path.to_path_buf(),
