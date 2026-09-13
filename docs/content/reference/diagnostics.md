@@ -1984,14 +1984,12 @@ that. It fires from two places, on stderr:
 [capsule-runtime] warning[W-SEC-028]: /home/alice/.murmur/deploy_keys/dep_x/id_ed25519 holds SSH private keys and is mode 0644, which other accounts on this host can read; run `chmod 600 /home/alice/.murmur/deploy_keys/dep_x/id_ed25519` (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-028)
 ```
 
-Neither form prints a value or a file's contents.
-
 **Why it matters:** any account on the host can read the provider key, deploy key or record the
 path holds.
 
-**What the runtime does about it:** nothing is refused and no mode is changed. murmur's own writes
-set these modes on every write, so a wide path was loosened by hand, restored from a backup, or
-written by an older build.
+**What the runtime does about it:** nothing is refused and no mode is changed. murmur sets these
+modes on every write, so a wide path was loosened by hand, restored from a backup, or written by
+another tool.
 
 **What to do:** run the `chmod` the warning names. Running `mur config set -g` again also rewrites
 `config.yaml` at `0600`.

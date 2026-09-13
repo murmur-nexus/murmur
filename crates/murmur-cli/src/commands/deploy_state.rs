@@ -209,57 +209,14 @@ mod tests {
         assert_eq!(hit[0].deployment_id, full);
     }
 
-    /// Holds `HOME` at a scratch directory for one test, serialised with every other test in the
-    /// crate that sets it.
     #[cfg(feature = "beta-mur-deploy")]
-    struct HomeGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(feature = "beta-mur-deploy")]
-    impl HomeGuard {
-        fn set(home: &std::path::Path) -> Self {
-            let lock = crate::config::HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let saved = env::var_os("HOME");
-            // SAFETY: serialised by HOME_ENV_LOCK across every test in the crate that sets HOME.
-            unsafe { env::set_var("HOME", home) };
-            Self { _lock: lock, saved }
-        }
-    }
-
-    #[cfg(feature = "beta-mur-deploy")]
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding `_lock`.
-            unsafe {
-                match &self.saved {
-                    Some(home) => env::set_var("HOME", home),
-                    None => env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "beta-mur-deploy")]
-    fn mode_of(path: &std::path::Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    #[cfg(feature = "beta-mur-deploy")]
-    fn set_mode(path: &std::path::Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
+    use crate::config::test_env::{mode_of, set_mode, EnvGuard};
 
     #[cfg(feature = "beta-mur-deploy")]
     #[test]
     fn save_deployments_writes_an_owner_only_file_in_an_owner_only_home() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = HomeGuard::set(home.path());
+        let _guard = EnvGuard::set_up(home.path(), home.path());
         let murmur = home.path().join(".murmur");
         fs::create_dir(&murmur).unwrap();
         set_mode(&murmur, 0o755);
@@ -278,7 +235,7 @@ mod tests {
     #[test]
     fn deploy_staging_dir_is_created_owner_only() {
         let home = tempfile::tempdir().unwrap();
-        let _guard = HomeGuard::set(home.path());
+        let _guard = EnvGuard::set_up(home.path(), home.path());
         let murmur = home.path().join(".murmur");
         fs::create_dir_all(murmur.join("deploy_staging")).unwrap();
         set_mode(&murmur, 0o755);

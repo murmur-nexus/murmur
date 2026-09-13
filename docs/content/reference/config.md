@@ -185,7 +185,7 @@ chmod 600 ~/.murmur/config.yaml
 | `running/`, `running/<session_id>.json` | `0700`, `0600` | Running-capsule records | `mur run` when a session opens its door |
 | `deployments.json` | `0600` | Deployment records | `mur deploy`, `mur destroy` |
 | `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
-| `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys an earlier build wrote. Nothing in this build writes here | `mur destroy` removes a deployment's directory |
+| `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
 | `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
 | `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
 

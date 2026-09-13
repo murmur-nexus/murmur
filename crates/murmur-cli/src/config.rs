@@ -702,6 +702,64 @@ fn is_valid_env_variable(value: &str) -> bool {
 #[cfg(test)]
 pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Test helpers shared by every test in the crate that points `HOME` or the working directory at a
+/// scratch directory, or checks a file mode.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use super::HOME_ENV_LOCK;
+
+    /// Holds `HOME` and the working directory at scratch paths until dropped, serialised by
+    /// [`HOME_ENV_LOCK`].
+    pub(crate) struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_home: Option<std::ffi::OsString>,
+        saved_cwd: PathBuf,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set_up(home: &Path, cwd: &Path) -> Self {
+            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved_home = std::env::var_os("HOME");
+            let saved_cwd = std::env::current_dir().expect("cwd");
+            // SAFETY: serialized by HOME_ENV_LOCK across every test in the crate that sets HOME.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            std::env::set_current_dir(cwd).expect("set cwd");
+            Self {
+                _lock: lock,
+                saved_home,
+                saved_cwd,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding `_lock`.
+            unsafe {
+                match &self.saved_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = std::env::set_current_dir(&self.saved_cwd);
+        }
+    }
+
+    /// `path`'s permission bits.
+    pub(crate) fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    pub(crate) fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

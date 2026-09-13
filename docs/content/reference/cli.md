@@ -603,8 +603,8 @@ Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or d
 
 ### Murmur home { #doctor-murmur-home }
 
-Every run prints a `Murmur home` block: the mode of `~/.murmur` and of each entry in it, whatever the
-project declares. The known entries are always listed, present or not, followed by any other name in
+Once the manifest loads, `mur doctor` prints a `Murmur home` block: the mode of `~/.murmur` and of
+each entry in it, whatever the project declares. The known entries are always listed, present or not, followed by any other name in
 the directory.
 
 ```text
@@ -633,8 +633,8 @@ Murmur home (/home/alice/.murmur)
 | `wider than <mode>: <path> is <mode>` | A directory beneath an owner-only entry wider than `0700`, or a file wider than `0600`. At most 20 are listed per entry, then `and N more wider than expected` |
 
 Each owner-only entry wider than expected, and each path listed beneath one, also prints
-[`W-SEC-028`](diagnostics.md#w-sec-028) on stderr. The block reads modes only: it changes nothing,
-never prints a file's contents, and does not change the exit code. When `HOME` cannot be resolved,
+[`W-SEC-028`](diagnostics.md#w-sec-028) on stderr. The block changes no mode and does not affect the
+exit code. When `HOME` cannot be resolved,
 the block is one `not reported` line.
 
 ### Warnings

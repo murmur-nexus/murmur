@@ -164,44 +164,7 @@ fn apply_key(config: &mut MurConfig, key: &ConfigKey<'_>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HOME_ENV_LOCK;
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved_home: Option<std::ffi::OsString>,
-        saved_cwd: std::path::PathBuf,
-    }
-
-    impl EnvGuard {
-        fn set_up(home: &std::path::Path, cwd: &std::path::Path) -> Self {
-            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let saved_home = std::env::var_os("HOME");
-            let saved_cwd = std::env::current_dir().expect("cwd");
-            // SAFETY: serialized by HOME_ENV_LOCK across this module's tests.
-            unsafe {
-                std::env::set_var("HOME", home);
-            }
-            std::env::set_current_dir(cwd).expect("set cwd");
-            Self {
-                _lock: lock,
-                saved_home,
-                saved_cwd,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding `_lock`.
-            unsafe {
-                match &self.saved_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-            let _ = std::env::set_current_dir(&self.saved_cwd);
-        }
-    }
+    use crate::config::test_env::{mode_of, set_mode, EnvGuard};
 
     #[test]
     fn set_rejects_unknown_key() {
@@ -241,16 +204,6 @@ mod tests {
 
         assert!(home.path().join(".murmur").join("config.yaml").exists());
         assert!(!cwd.path().join(".murmur").join("config.yaml").exists());
-    }
-
-    fn mode_of(path: &std::path::Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    fn set_mode(path: &std::path::Path, mode: u32) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
