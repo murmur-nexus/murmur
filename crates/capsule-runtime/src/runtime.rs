@@ -10,15 +10,15 @@ use std::{
 };
 
 use murmur_artifact::{
-    current_platform, is_secret_shaped_name, native_binary_verdict, parse_hook_config_from_yaml,
-    parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
-    write_lockfile_atomic, AfterTask, ApiKeyReference, ArtifactImplementation, ArtifactRuntime,
-    ContextConfig, ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant,
-    LifecycleConfig, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
-    RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
-    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
-    W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022,
-    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027,
+    current_platform, is_credential_shaped_env_name, native_binary_verdict,
+    parse_hook_config_from_yaml, parse_tool_implementation_from_yaml, read_lockfile,
+    security_warning_link, verify_sha256, write_lockfile_atomic, AfterTask, ApiKeyReference,
+    ArtifactImplementation, ArtifactRuntime, ContextConfig, ConversationMode, HookBinding,
+    InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig, LockedSha256, LockfileError,
+    MurmurLock, NativeBinaryVerdict, Registry, RegistryError, RuntimeType, TaskAcceptance,
+    LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007,
+    W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017,
+    W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -474,6 +474,9 @@ pub fn stage_session(
             .iter()
             .map(|artifact| artifact.name.as_str()),
     )?;
+    // A grant the credential backstop empties before any guest is built is refused on the same
+    // terms, ahead of every resolve and pull: the manifest yields, the backstop does not.
+    check_env_allow_reaches_guests(&request.capability_policy)?;
     // Resolved here for the same reason `state_stores` above is: a malformed `config:` block
     // refuses the launch before any registry pull, workdir creation or component instantiation,
     // and through the identical function `mur run --explain-scope` calls on the identical inputs.
@@ -3144,7 +3147,7 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
     );
 }
 
-/// One credential-shaped entry of `capabilities.env.allow`, judged.
+/// One credential-shaped entry of `capabilities.env.allow` that reaches every WASM guest.
 ///
 /// The judgment is made from the name alone: nothing here reads the host environment, so the
 /// warning an operator sees reads identically on a machine that has the variable set and one that
@@ -3153,10 +3156,7 @@ pub fn warn_on_workdir_exec(workdir_exec: bool) {
 pub struct SecretShapedEnvGrant {
     /// The declared variable name, verbatim. Never its value.
     pub name: String,
-    /// `false` when the credential backstop would drop this name before any guest is built.
-    pub reaches_guest: bool,
-    /// `true` only when `reaches_guest` is also true and the resolved `lifecycle.after_task`
-    /// is `Sleep`.
+    /// `true` when the resolved `lifecycle.after_task` is `Sleep`.
     pub outlives_launcher: bool,
 }
 
@@ -3164,14 +3164,12 @@ pub struct SecretShapedEnvGrant {
 /// [`warn_on_secret_shaped_env_grants`] on the same terms as
 /// [`unreachable_delegation_outcomes_warning`], so a test can assert it without capturing stderr.
 ///
-/// One entry per distinct credential-shaped name, in declaration order — a name repeated in
-/// `env.allow` is judged once, because the grant it describes is one grant.
-///
-/// `reaches_guest` is [`crate::credential_backstop_drops`] inverted rather than a second reading of
-/// the pattern list: the diagnostic has to agree with what
-/// [`crate::shell::build_wasi_env_allowlist`] will actually pass through, and `GITHUB_TOKEN` is the
-/// case that makes the distinction load-bearing — it is credential-shaped *and* on the backstop's
-/// list, so the grant delivers nothing.
+/// One entry per distinct name that [`is_credential_shaped_env_name`] flags and the credential
+/// backstop keeps, in declaration order — a name repeated in `env.allow` is judged once, because
+/// the grant it describes is one grant. A name the backstop drops is passed over: it is refused at
+/// staging with `E-CAP-016` by [`check_env_allow_reaches_guests`], and the skip reads
+/// [`crate::credential_backstop_drops`] so the two agree with what
+/// [`crate::shell::build_wasi_env_allowlist`] passes through.
 ///
 /// `outlives_launcher` reads `lifecycle.after_task` directly instead of
 /// [`LifecycleConfig::can_receive_background_tasks`]: that predicate also requires
@@ -3184,17 +3182,18 @@ pub fn secret_shaped_env_grants(
     let mut grants: Vec<SecretShapedEnvGrant> = Vec::new();
 
     for name in &policy.env_allow {
-        if !is_secret_shaped_name(name) {
+        if crate::shell::credential_backstop_drops(name, &policy.shell_strip_env) {
+            continue;
+        }
+        if !is_credential_shaped_env_name(name) {
             continue;
         }
         if grants.iter().any(|grant| &grant.name == name) {
             continue;
         }
-        let reaches_guest = !crate::shell::credential_backstop_drops(name, &policy.shell_strip_env);
         grants.push(SecretShapedEnvGrant {
             name: name.clone(),
-            reaches_guest,
-            outlives_launcher: reaches_guest && lifecycle.after_task == AfterTask::Sleep,
+            outlives_launcher: lifecycle.after_task == AfterTask::Sleep,
         });
     }
 
@@ -3204,15 +3203,6 @@ pub fn secret_shaped_env_grants(
 /// The line body for one judged grant, so the two arms exist once rather than once per call site.
 fn secret_shaped_env_grant_message(grant: &SecretShapedEnvGrant) -> String {
     let name = &grant.name;
-    if !grant.reaches_guest {
-        return format!(
-            "capabilities.env.allow names '{name}', a credential-shaped variable the credential \
-             backstop drops before any guest is built — the grant delivers nothing and no guest \
-             observes the host's value. Remove the entry, or rename the host variable if the \
-             capsule is meant to receive it"
-        );
-    }
-
     let held = if grant.outlives_launcher {
         "murmur does not broker this secret and cannot withdraw it, and lifecycle.after_task: \
          sleep keeps this capsule alive past the task that launched it, so it holds that value \
@@ -3234,9 +3224,9 @@ fn secret_shaped_env_grant_message(grant: &SecretShapedEnvGrant) -> String {
 ///
 /// `capabilities.env.allow` is the one grant whose value murmur never sees, issues or revokes: an
 /// operator names a host variable and the runtime passes it through. Without this line nothing
-/// states either outcome — that a name surviving the credential backstop reaches every WASM guest,
-/// or that a name the backstop drops delivers nothing — so an operator cannot ask which of their
-/// capsules holds what, or tell a working grant from an inert one.
+/// states that a name surviving the credential backstop reaches every WASM guest, so an operator
+/// cannot ask which of their capsules holds what. A name the backstop drops is not reported here:
+/// staging refuses it with `E-CAP-016`.
 ///
 /// Never a refusal, including for the `after_task: sleep` combination: a long-lived worker holding
 /// an operator-granted database password is an ordinary shape, and refusing it would make that
@@ -6245,6 +6235,71 @@ where
     Ok(())
 }
 
+/// A `capabilities.env.allow` entry the credential backstop removes from every guest environment,
+/// with the pattern that removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrippedEnvAllowEntry {
+    /// The declared variable name, verbatim. Never its value.
+    pub name: String,
+    /// The matching backstop pattern, verbatim.
+    pub pattern: String,
+    /// The list the pattern came from.
+    pub source: crate::shell::BackstopPatternSource,
+}
+
+/// Every distinct `policy.env_allow` name the credential backstop drops, in first-declaration
+/// order, each attributed through [`crate::credential_backstop_match`] against
+/// `policy.shell_strip_env`. Empty when every declared name reaches the guest, including when
+/// `env_allow` is empty. Judged from names alone.
+pub fn stripped_env_allow_entries(policy: &CapabilityPolicy) -> Vec<StrippedEnvAllowEntry> {
+    let mut entries: Vec<StrippedEnvAllowEntry> = Vec::new();
+    for name in &policy.env_allow {
+        if entries.iter().any(|entry| &entry.name == name) {
+            continue;
+        }
+        if let Some(matched) =
+            crate::shell::credential_backstop_match(name, &policy.shell_strip_env)
+        {
+            entries.push(StrippedEnvAllowEntry {
+                name: name.clone(),
+                pattern: matched.pattern,
+                source: matched.source,
+            });
+        }
+    }
+    entries
+}
+
+/// Refuses a capsule whose `capabilities.env.allow` names a variable the credential backstop
+/// strips, naming every such entry at once.
+///
+/// [`crate::shell::build_wasi_env_allowlist`] drops those names whatever the manifest says, so the
+/// grant would deliver nothing. Called from `stage_session` ahead of every registry resolve, from
+/// `mur run` ahead of `--explain-scope`, and from `mur doctor` as a warning, so all three judge
+/// one set of manifests.
+pub fn check_env_allow_reaches_guests(policy: &CapabilityPolicy) -> Result<(), RuntimeError> {
+    let entries = stripped_env_allow_entries(policy);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    Err(RuntimeError::EnvAllowStrippedByBackstop { entries })
+}
+
+/// The `E-CAP-016` entry list: `'NAME' (<source> pattern 'PATTERN')`, comma-joined.
+pub(crate) fn describe_stripped_env_allow_entries(entries: &[StrippedEnvAllowEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            let source = match entry.source {
+                crate::shell::BackstopPatternSource::Builtin => "credential backstop",
+                crate::shell::BackstopPatternSource::StripEnv => "capabilities.shell.strip_env",
+            };
+            format!("'{}' ({source} pattern '{}')", entry.name, entry.pattern)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Write a single artifact's `murmur.yaml` under `<workdir>/tools/<name>/`.
 ///
 /// Used both by `stage_session` (for every artifact declared in the manifest) and by
@@ -7911,7 +7966,6 @@ inference:
             grants,
             vec![SecretShapedEnvGrant {
                 name: "DATABASE_PASSWORD".to_string(),
-                reaches_guest: true,
                 outlives_launcher: false,
             }]
         );
@@ -7948,41 +8002,47 @@ inference:
         }
     }
 
-    /// The dropped arm, and the case that makes two arms necessary: `GITHUB_TOKEN` is
-    /// credential-shaped *and* on the backstop's list, so the grant delivers nothing — and a name
-    /// that never reaches a guest outlives nothing, whatever the lifecycle says.
+    /// `GITHUB_TOKEN` is credential-shaped *and* on the backstop's list, so no guest holds it and
+    /// there is no grant to report; `E-CAP-016` refuses the declaration instead.
     #[test]
-    fn a_name_the_backstop_drops_is_never_reported_as_held_or_outliving() {
-        let grants = secret_shaped_env_grants(
+    fn a_name_the_backstop_drops_produces_no_grant() {
+        assert!(secret_shaped_env_grants(
             &env_allow_policy(&["GITHUB_TOKEN"], &[]),
             &lifecycle(TaskAcceptance::Queue, AfterTask::Sleep),
-        );
-
-        assert_eq!(
-            grants,
-            vec![SecretShapedEnvGrant {
-                name: "GITHUB_TOKEN".to_string(),
-                reaches_guest: false,
-                outlives_launcher: false,
-            }]
-        );
-        let message = secret_shaped_env_grant_message(&grants[0]);
-        assert!(message.contains("the grant delivers nothing"), "{message}");
-        assert!(!message.contains("the capsule holds it"), "{message}");
-        assert!(!message.contains("lifecycle.after_task"), "{message}");
+        )
+        .is_empty());
     }
 
-    /// A manifest's own `capabilities.shell.strip_env` pattern moves a name into the dropped arm,
-    /// because the backstop it predicts consults that list too.
+    /// A manifest's own `capabilities.shell.strip_env` pattern takes a credential-shaped name out
+    /// of the warning, because the backstop consults that list too.
     #[test]
-    fn a_manifest_strip_pattern_moves_a_name_into_the_dropped_arm() {
-        let grants = secret_shaped_env_grants(
+    fn a_strip_matched_credential_shaped_name_produces_no_grant() {
+        assert!(secret_shaped_env_grants(
             &env_allow_policy(&["MY_SERVICE_SECRET"], &["*_SERVICE_SECRET"]),
+            &LifecycleConfig::default(),
+        )
+        .is_empty());
+    }
+
+    /// Names only the segment rule of `is_credential_shaped_env_name` catches still reach every
+    /// guest, so each is reported.
+    #[test]
+    fn segment_matched_credential_names_each_produce_a_grant() {
+        let grants = secret_shaped_env_grants(
+            &env_allow_policy(
+                &["PRIVATE_KEY", "SSH_KEY", "CREDENTIALS", "SENTRY_DSN"],
+                &[],
+            ),
             &LifecycleConfig::default(),
         );
 
-        assert_eq!(grants.len(), 1);
-        assert!(!grants[0].reaches_guest);
+        assert_eq!(
+            grants
+                .iter()
+                .map(|grant| grant.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PRIVATE_KEY", "SSH_KEY", "CREDENTIALS", "SENTRY_DSN"]
+        );
     }
 
     /// `after_task: sleep` is not itself a trigger: with no credential-shaped name declared there
@@ -8001,8 +8061,8 @@ inference:
         .is_empty());
     }
 
-    /// One judgment per distinct name, in declaration order, with non-credential names passed over
-    /// rather than counted.
+    /// One judgment per distinct name, in declaration order, with non-credential names and names
+    /// the backstop drops passed over rather than counted.
     #[test]
     fn every_distinct_credential_shaped_name_is_judged_once_in_declaration_order() {
         let grants = secret_shaped_env_grants(
@@ -8011,6 +8071,7 @@ inference:
                     "DATABASE_PASSWORD",
                     "HOME",
                     "GITHUB_TOKEN",
+                    "SIGNING_KEY",
                     "DATABASE_PASSWORD",
                 ],
                 &[],
@@ -8021,9 +8082,76 @@ inference:
         assert_eq!(
             grants
                 .iter()
-                .map(|grant| (grant.name.as_str(), grant.reaches_guest))
+                .map(|grant| grant.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![("DATABASE_PASSWORD", true), ("GITHUB_TOKEN", false)]
+            vec!["DATABASE_PASSWORD", "SIGNING_KEY"]
+        );
+    }
+
+    // ── E-CAP-016: env.allow entries the credential backstop strips ─────────
+
+    #[test]
+    fn stripped_env_allow_entries_are_distinct_ordered_and_attributed() {
+        let entries = super::stripped_env_allow_entries(&env_allow_policy(
+            &[
+                "NPM_TOKEN",
+                "TZ",
+                "MY_SERVICE_SECRET",
+                "NPM_TOKEN",
+                "AWS_REGION",
+            ],
+            &["*_SERVICE_SECRET"],
+        ));
+
+        assert_eq!(
+            entries,
+            vec![
+                super::StrippedEnvAllowEntry {
+                    name: "NPM_TOKEN".to_string(),
+                    pattern: "NPM_TOKEN".to_string(),
+                    source: crate::shell::BackstopPatternSource::Builtin,
+                },
+                super::StrippedEnvAllowEntry {
+                    name: "MY_SERVICE_SECRET".to_string(),
+                    pattern: "*_SERVICE_SECRET".to_string(),
+                    source: crate::shell::BackstopPatternSource::StripEnv,
+                },
+                super::StrippedEnvAllowEntry {
+                    name: "AWS_REGION".to_string(),
+                    pattern: "AWS_*".to_string(),
+                    source: crate::shell::BackstopPatternSource::Builtin,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn env_allow_names_the_backstop_keeps_pass_the_check() {
+        assert!(super::check_env_allow_reaches_guests(&env_allow_policy(
+            &["TZ", "PRIVATE_KEY", "DATABASE_PASSWORD"],
+            &[],
+        ))
+        .is_ok());
+        assert!(super::check_env_allow_reaches_guests(&CapabilityPolicy::default()).is_ok());
+    }
+
+    /// The message names every entry with its pattern and that pattern's source.
+    #[test]
+    fn the_refusal_names_each_entry_its_pattern_and_the_patterns_source() {
+        let error = super::check_env_allow_reaches_guests(&env_allow_policy(
+            &["GITHUB_TOKEN", "MY_SERVICE_SECRET"],
+            &["*_SERVICE_SECRET"],
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("capabilities.env.allow"), "{message}");
+        assert!(
+            message.contains(
+                "'GITHUB_TOKEN' (credential backstop pattern 'GITHUB_TOKEN'), 'MY_SERVICE_SECRET' \
+                 (capabilities.shell.strip_env pattern '*_SERVICE_SECRET')"
+            ),
+            "{message}"
         );
     }
 
@@ -8833,6 +8961,81 @@ inference:
         fs::write(&skill, b"# absolute").unwrap();
         let bytes = load_local_skill_md(manifest_dir.path(), &skill.to_string_lossy()).unwrap();
         assert_eq!(bytes, b"# absolute");
+    }
+
+    /// A backstop-stripped `env.allow` entry refuses staging before the registry is consulted for
+    /// the one declared artifact.
+    #[test]
+    fn stage_session_refuses_an_env_allow_entry_the_backstop_strips() {
+        struct PanicRegistry;
+        impl Registry for PanicRegistry {
+            fn resolve(&self, _: &str, _: &str) -> Result<ResolvedArtifact, RegistryError> {
+                panic!("the refusal must precede registry resolution");
+            }
+            fn publish(
+                &self,
+                _: ArtifactMeta,
+                _: &[u8],
+            ) -> Result<murmur_artifact::PublishResult, RegistryError> {
+                panic!("the refusal must precede any registry call");
+            }
+            fn list_index(&self) -> Result<Vec<ArtifactMeta>, RegistryError> {
+                panic!("the refusal must precede any registry call");
+            }
+        }
+
+        let project = tempfile::tempdir().unwrap();
+        let request = StageRequest {
+            credentials_file: None,
+            manifest_dir: project.path().to_path_buf(),
+            capsule_name: "test".to_string(),
+            capsule_version: "0.0.1".to_string(),
+            capsule_component_bytes: Vec::new(),
+            artifacts: vec![crate::types::ArtifactRequest {
+                name: "some-tool".to_string(),
+                version: "0.1.0".to_string(),
+                runtime: ArtifactRuntime::Tool,
+                source: None,
+                on_overflow: Default::default(),
+                capabilities: None,
+                config: None,
+            }],
+            allowlisted_tools: HashSet::new(),
+            lock_expectations: None,
+            capability_policy: env_allow_policy(&["GITHUB_TOKEN"], &[]),
+            inference: None,
+            system_prompt_overridden: false,
+            context: None,
+            context_id: None,
+            resume: None,
+            otel_endpoint: None,
+            eval_config_json: None,
+            case_id: None,
+            dataset_id: None,
+            lifecycle: None,
+            lifecycle_override: None,
+            trace: None,
+            workdir: None,
+            bind_addr: "127.0.0.1".to_string(),
+            internal_port: None,
+            declared_containment_floor: murmur_artifact::ContainmentClass::Advisory,
+            exports: None,
+            spawn_grant: None,
+            machine_tokens_per_day: None,
+        };
+
+        match stage_session(Arc::new(PanicRegistry), request) {
+            Err(RuntimeError::EnvAllowStrippedByBackstop { entries }) => assert_eq!(
+                entries,
+                vec![super::StrippedEnvAllowEntry {
+                    name: "GITHUB_TOKEN".to_string(),
+                    pattern: "GITHUB_TOKEN".to_string(),
+                    source: crate::shell::BackstopPatternSource::Builtin,
+                }]
+            ),
+            Err(other) => panic!("expected EnvAllowStrippedByBackstop, got {other}"),
+            Ok(_) => panic!("staging must refuse a backstop-stripped env.allow entry"),
+        }
     }
 
     #[test]

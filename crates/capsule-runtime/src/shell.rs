@@ -721,21 +721,51 @@ pub(crate) fn strip_credential_shaped_vars(
     env.retain(|key, _| !credential_backstop_drops(key, extra_patterns));
 }
 
-/// Whether the credential backstop would drop a variable of this name — the same question
-/// [`strip_credential_shaped_vars`] answers per entry, asked of a name alone.
+/// Which list a credential backstop pattern came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackstopPatternSource {
+    /// [`CREDENTIAL_ENV_PATTERNS`], the list no manifest can change.
+    Builtin,
+    /// The manifest's own `capabilities.shell.strip_env`.
+    StripEnv,
+}
+
+/// The pattern that makes the credential backstop drop a name, verbatim, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackstopMatch {
+    pub pattern: String,
+    pub source: BackstopPatternSource,
+}
+
+/// The first credential backstop pattern that matches `name`, or `None` when the backstop keeps
+/// it — the one decision procedure behind [`strip_credential_shaped_vars`],
+/// [`credential_backstop_drops`], `W-SEC-024` and the `E-CAP-016` staging refusal.
 ///
-/// Exists so a diagnostic can predict the backstop rather than re-implement it: the
-/// `capabilities.env.allow` judgment behind `W-SEC-024` has to say whether a declared name reaches
-/// a guest at all, and a second copy of [`CREDENTIAL_ENV_PATTERNS`] plus the glob rules would
-/// agree today and drift the first time either changes. `extra_patterns` is a policy's
-/// `shell_strip_env`, so a manifest that strips a name of its own is predicted as accurately as
-/// the fixed list.
-pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool {
+/// [`CREDENTIAL_ENV_PATTERNS`] is tried before `extra_patterns`, so a name both lists cover is
+/// attributed to the built-in pattern: that is the one no manifest edit can remove.
+/// `extra_patterns` is a policy's `shell_strip_env`. Judges a name alone and never reads the host
+/// environment.
+pub fn credential_backstop_match(name: &str, extra_patterns: &[String]) -> Option<BackstopMatch> {
     CREDENTIAL_ENV_PATTERNS
         .iter()
-        .copied()
-        .chain(extra_patterns.iter().map(String::as_str))
-        .any(|pattern| env_name_matches_pattern(pattern, name))
+        .map(|pattern| (*pattern, BackstopPatternSource::Builtin))
+        .chain(
+            extra_patterns
+                .iter()
+                .map(|pattern| (pattern.as_str(), BackstopPatternSource::StripEnv)),
+        )
+        .find(|(pattern, _)| env_name_matches_pattern(pattern, name))
+        .map(|(pattern, source)| BackstopMatch {
+            pattern: pattern.to_string(),
+            source,
+        })
+}
+
+/// Whether the credential backstop would drop a variable of this name — the same question
+/// [`strip_credential_shaped_vars`] answers per entry, asked of a name alone. See
+/// [`credential_backstop_match`] for which pattern decided it.
+pub fn credential_backstop_drops(name: &str, extra_patterns: &[String]) -> bool {
+    credential_backstop_match(name, extra_patterns).is_some()
 }
 
 /// Resolve the host variables a WASM guest may observe: only names the manifest declared in
@@ -1211,6 +1241,32 @@ mod tests {
         assert!(env.is_empty(), "expected all names stripped, got {env:?}");
     }
 
+    /// A credential-shaped name outside every backstop pattern is delivered like any other
+    /// declared name: `W-SEC-024` reports that grant, and nothing withholds it.
+    #[test]
+    fn build_wasi_env_allowlist_delivers_a_credential_shaped_name_the_backstop_keeps() {
+        std::env::set_var("PRIVATE_KEY", "host-private-key");
+        std::env::set_var("MURMUR_TEST_WASI_PLAIN", "host-plain");
+        let policy = CapabilityPolicy {
+            env_allow: vec![
+                "PRIVATE_KEY".to_string(),
+                "MURMUR_TEST_WASI_PLAIN".to_string(),
+            ],
+            ..CapabilityPolicy::default()
+        };
+
+        let env = build_wasi_env_allowlist(&policy);
+
+        assert_eq!(
+            env.get("PRIVATE_KEY"),
+            Some(&"host-private-key".to_string())
+        );
+        assert_eq!(
+            env.get("MURMUR_TEST_WASI_PLAIN"),
+            Some(&"host-plain".to_string())
+        );
+    }
+
     #[test]
     fn build_shell_env_home_override_cannot_survive() {
         let temp = tempdir().unwrap();
@@ -1288,7 +1344,63 @@ mod tests {
                 !env.contains_key(name),
                 "prediction and strip disagree about {name}"
             );
+            assert_eq!(
+                credential_backstop_match(name, &extra).is_some(),
+                !env.contains_key(name),
+                "match and strip disagree about {name}"
+            );
         }
+    }
+
+    #[test]
+    fn credential_backstop_match_attributes_a_builtin_pattern() {
+        assert_eq!(
+            credential_backstop_match("AWS_REGION", &[]),
+            Some(BackstopMatch {
+                pattern: "AWS_*".to_string(),
+                source: BackstopPatternSource::Builtin,
+            })
+        );
+        assert_eq!(
+            credential_backstop_match("GITHUB_TOKEN", &[]),
+            Some(BackstopMatch {
+                pattern: "GITHUB_TOKEN".to_string(),
+                source: BackstopPatternSource::Builtin,
+            })
+        );
+    }
+
+    #[test]
+    fn credential_backstop_match_attributes_a_strip_env_pattern() {
+        assert_eq!(
+            credential_backstop_match("MY_SERVICE_SECRET", &["*_SERVICE_SECRET".to_string()]),
+            Some(BackstopMatch {
+                pattern: "*_SERVICE_SECRET".to_string(),
+                source: BackstopPatternSource::StripEnv,
+            })
+        );
+    }
+
+    /// A name both lists cover is attributed to the built-in pattern, the one a manifest edit
+    /// cannot remove.
+    #[test]
+    fn credential_backstop_match_prefers_the_builtin_pattern_when_both_match() {
+        assert_eq!(
+            credential_backstop_match("STRIPE_API_KEY", &["STRIPE_*".to_string()]),
+            Some(BackstopMatch {
+                pattern: "*_API_KEY".to_string(),
+                source: BackstopPatternSource::Builtin,
+            })
+        );
+    }
+
+    #[test]
+    fn credential_backstop_match_is_none_for_a_name_the_backstop_keeps() {
+        assert_eq!(credential_backstop_match("TZ", &[]), None);
+        assert_eq!(
+            credential_backstop_match("PRIVATE_KEY", &["*_SERVICE_SECRET".to_string()]),
+            None
+        );
     }
 
     #[test]

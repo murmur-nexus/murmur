@@ -109,6 +109,49 @@ pub fn is_secret_shaped_name(name: &str) -> bool {
     SENSITIVE_KEYS.iter().any(|s| normalized.contains(s))
 }
 
+/// Whole name segments that mark an environment variable as carrying a credential, compared
+/// case-insensitively against the pieces of a name split on non-alphanumerics.
+///
+/// Matched as segments rather than substrings because env names are short and dense with
+/// unrelated words: `KEY` as a substring would catch `KEYBOARD_LAYOUT` and `MONKEY_PATCH`, and
+/// `PASS` would catch `PASSENGER_COUNT`. `PWD` is absent because it is the shell's working
+/// directory, `PRIVATE` because of names like `PRIVATE_REGISTRY_HOST`, and `URL`, `CERT` and
+/// `SESSION` because most names holding them carry no secret.
+const ENV_CREDENTIAL_SEGMENTS: [&str; 12] = [
+    "KEY",
+    "KEYS",
+    "PASS",
+    "PASSWD",
+    "PASSPHRASE",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "CREDS",
+    "DSN",
+    "AUTH",
+    "PAT",
+    "COOKIE",
+];
+
+/// Whether an environment variable name looks like it carries a credential: it matches
+/// [`is_secret_shaped_name`], or one of its segments is in [`ENV_CREDENTIAL_SEGMENTS`].
+///
+/// Judges a name and never a value. Wider than [`is_secret_shaped_name`] and kept apart from it
+/// because the manifest literal-secret scan in [`scan_yaml_secrets`] reads YAML keys, where a
+/// segment rule would flag keys such as `auth:` or `key:` that hold no literal secret. The
+/// measured recall over a fixed corpus is pinned by
+/// `env_name_recall_is_measured_over_a_fixed_corpus`; `DATABASE_URL`-style connection strings
+/// are the known class it misses.
+pub fn is_credential_shaped_env_name(name: &str) -> bool {
+    is_secret_shaped_name(name)
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|segment| {
+                ENV_CREDENTIAL_SEGMENTS
+                    .iter()
+                    .any(|marker| segment.eq_ignore_ascii_case(marker))
+            })
+}
+
 fn should_warn_secret_value(value: &str) -> bool {
     if is_env_reference(value) {
         return false;
@@ -187,5 +230,101 @@ mod tests {
         let warnings = scan_yaml_secrets(&path).unwrap();
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].field_path, "config.creds.password");
+    }
+
+    /// Recall of the two name checks over one fixed corpus of env names. Each row is
+    /// `(name, is_secret_shaped_name, is_credential_shaped_env_name)`; the totals are what
+    /// `docs/content/reference/diagnostics.md#w-sec-024` publishes, so a change to either check
+    /// fails here until the corpus and that page agree again.
+    #[test]
+    fn env_name_recall_is_measured_over_a_fixed_corpus() {
+        const CARRIERS: [(&str, bool, bool); 26] = [
+            ("DATABASE_PASSWORD", true, true),
+            ("SLACK_BOT_TOKEN", true, true),
+            ("JWT_SECRET", true, true),
+            ("CLIENT_SECRET", true, true),
+            ("STRIPE_API_KEY", true, true),
+            ("AWS_SECRET_ACCESS_KEY", true, true),
+            ("PRIVATE_KEY", false, true),
+            ("SSH_KEY", false, true),
+            ("SIGNING_KEY", false, true),
+            ("ENCRYPTION_KEY", false, true),
+            ("MASTER_KEY", false, true),
+            ("CREDENTIALS", false, true),
+            ("GOOGLE_APPLICATION_CREDENTIALS", false, true),
+            ("DB_CREDS", false, true),
+            ("SENTRY_DSN", false, true),
+            ("DSN", false, true),
+            ("SMTP_PASS", false, true),
+            ("MYSQL_PASSWD", false, true),
+            ("GPG_PASSPHRASE", false, true),
+            ("BASIC_AUTH", false, true),
+            ("GH_PAT", false, true),
+            ("SESSION_COOKIE", false, true),
+            // Known misses under both checks: a connection string or a shortened password name.
+            ("DATABASE_URL", false, false),
+            ("REDIS_URL", false, false),
+            ("DB_PWD", false, false),
+            ("CONNECTION_STRING", false, false),
+        ];
+        const ORDINARY: [&str; 16] = [
+            "PATH",
+            "HOME",
+            "TZ",
+            "LANG",
+            "LOG_LEVEL",
+            "NODE_ENV",
+            "PORT",
+            "DATABASE_HOST",
+            "AUTHOR_NAME",
+            "KEYBOARD_LAYOUT",
+            "MONKEY_PATCH",
+            "PWD",
+            "OLDPWD",
+            "SSL_CERT_FILE",
+            "PASSENGER_COUNT",
+            "COMPASS_URL",
+        ];
+        const FALSE_POSITIVES: [(&str, bool, bool); 2] = [
+            ("TOKENIZERS_PARALLELISM", true, true),
+            ("CACHE_KEY_PREFIX", false, true),
+        ];
+
+        for (name, old, new) in CARRIERS.iter().chain(FALSE_POSITIVES.iter()) {
+            assert_eq!(is_secret_shaped_name(name), *old, "old check on {name}");
+            assert_eq!(
+                is_credential_shaped_env_name(name),
+                *new,
+                "new check on {name}"
+            );
+        }
+        for name in ORDINARY {
+            assert!(!is_credential_shaped_env_name(name), "new check on {name}");
+        }
+
+        let old_hits = CARRIERS
+            .iter()
+            .filter(|(name, _, _)| is_secret_shaped_name(name))
+            .count();
+        let new_hits = CARRIERS
+            .iter()
+            .filter(|(name, _, _)| is_credential_shaped_env_name(name))
+            .count();
+        assert_eq!((old_hits, new_hits), (6, 22));
+    }
+
+    /// The build-time literal scan keeps its own four-substring rule: a YAML key the env-name
+    /// check would flag by segment, holding a long literal, is not a warning.
+    #[test]
+    fn scan_yaml_secrets_is_not_widened_by_the_env_name_check() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("murmur.yaml");
+        fs::write(
+            &path,
+            "author: \"a-sufficiently-long-name\"\nprivate_key: \"a-long-literal-value\"\n",
+        )
+        .unwrap();
+
+        assert!(scan_yaml_secrets(&path).unwrap().is_empty());
     }
 }

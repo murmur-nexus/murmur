@@ -582,14 +582,14 @@ opposed to a resolution failure, is still rejected outright with
 [`E-CAP-001`](diagnostics.md#e-cap-001).
 
 A WASM guest never inherits the host process's environment. `capabilities.env.allow` is the only
-way to expose a host variable, and even a name declared there is dropped if it is credential-shaped
-(see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment)
-for the pattern list) or matches `capabilities.shell.strip_env`. A declared-but-unset host variable
-is omitted rather than reported.
+way to expose a host variable. A declared-but-unset host variable is omitted rather than reported.
+A declared name is judged by name alone:
 
-A credential-shaped entry — one whose name contains `api_key`, `token`, `secret` or `password` — is
-reported once by [`W-SEC-024`](diagnostics.md#w-sec-024), which states whether the name reaches
-every guest or the backstop drops it and the grant delivers nothing.
+| The name | Result |
+|---|---|
+| Matches a credential backstop pattern (see [Lock down a capsule's capabilities](../how-to/lock-down-capsule.md#step-2-manage-the-subprocess-environment) for the list) or a `capabilities.shell.strip_env` pattern | The capsule is refused with [`E-CAP-016`](diagnostics.md#e-cap-016) |
+| Credential-shaped: contains `api_key`, `token`, `secret` or `password`, or has a segment such as `KEY`, `PASS`, `CREDENTIALS`, `DSN` or `AUTH` | Reaches every guest, reported once by [`W-SEC-024`](diagnostics.md#w-sec-024), which lists the full rule |
+| Anything else | Reaches every guest |
 
 The field governs WASM guests and capsules delegated to through
 [`capabilities.spawn.allow`](#field-capabilities) — never the capsule process itself, which is

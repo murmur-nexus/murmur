@@ -2,9 +2,10 @@
 //! variable.
 //!
 //! Driven through the real `mur` binary because the claim is about two stderr streams reading
-//! identically, and about which of the two arms a name lands in — an in-process assertion about
-//! the decision cannot tell you whether `mur run` and `mur doctor` print the same bytes, or
-//! whether the emitter is reached at all before `--explain-scope` returns.
+//! identically, and about which names are reported at all — an in-process assertion about the
+//! decision cannot tell you whether `mur run` and `mur doctor` print the same bytes, or whether
+//! the emitter is reached at all before `--explain-scope` returns. A name the credential backstop
+//! strips is refused with `E-CAP-016` instead; `env_allow_stripped.rs` covers that.
 
 use std::{fs, path::Path};
 
@@ -156,78 +157,70 @@ fn the_cli_lifecycle_override_is_honoured() {
     assert_eq!(warning_lines(&from_flag).len(), 1);
 }
 
-/// `GITHUB_TOKEN` is credential-shaped *and* on the credential backstop's list, so declaring it
-/// delivers nothing — reporting it as held would tell an operator the opposite of what every guest
-/// will observe. A name that never reaches a guest outlives nothing either, whatever the lifecycle
-/// says.
+/// Names only the segment rule catches reach every guest and are each reported, in declaration
+/// order, in the same bytes from `mur run --explain-scope` and `mur doctor`.
 #[test]
-fn a_name_the_backstop_drops_is_reported_as_delivering_nothing() {
+fn segment_matched_names_are_each_reported_in_order_by_run_and_doctor() {
     let home = TempDir::new().unwrap();
     let dir = TempDir::new().unwrap();
     project(
         dir.path(),
-        "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      - GITHUB_TOKEN\n",
+        "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      \
+         - PRIVATE_KEY\n      - SSH_KEY\n      - CREDENTIALS\n      - SENTRY_DSN\n",
     );
 
-    let stderr = explain_scope_stderr_with_env(
-        &home,
+    let from_run = explain_scope_stderr(&home, dir.path(), &[]);
+    let from_doctor = doctor_stderr(&home, dir.path());
+    let run_lines = warning_lines(&from_run);
+
+    assert_eq!(run_lines.len(), 4, "stderr was: {from_run}");
+    for (line, name) in
+        run_lines
+            .iter()
+            .zip(["PRIVATE_KEY", "SSH_KEY", "CREDENTIALS", "SENTRY_DSN"])
+    {
+        assert!(line.contains(&format!("'{name}'")), "{line}");
+        assert!(line.contains("the capsule holds it"), "{line}");
+    }
+    assert_eq!(run_lines, warning_lines(&from_doctor));
+}
+
+/// Ordinary names that the segment rule is written to pass over — a substring of a marker, or the
+/// shell's working directory — produce neither the warning nor the refusal.
+#[test]
+fn near_miss_ordinary_names_are_silent() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    project(
         dir.path(),
-        &[],
-        &[("GITHUB_TOKEN", "a-real-looking-token")],
-    );
-    let lines = warning_lines(&stderr);
-
-    assert_eq!(lines.len(), 1, "stderr was: {stderr}");
-    assert!(lines[0].contains("'GITHUB_TOKEN'"), "{}", lines[0]);
-    assert!(
-        lines[0].contains("the grant delivers nothing"),
-        "{}",
-        lines[0]
-    );
-    assert!(!lines[0].contains("the capsule holds it"), "{}", lines[0]);
-    assert!(
-        !stderr.contains("a-real-looking-token"),
-        "stderr was: {stderr}"
+        "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      \
+         - TZ\n      - AUTHOR_NAME\n      - KEYBOARD_LAYOUT\n      - PWD\n",
     );
 
+    let stderr = explain_scope_stderr(&home, dir.path(), &[]);
+
+    assert!(!stderr.contains(CODE), "stderr was: {stderr}");
+    assert!(!stderr.contains("E-CAP-016"), "stderr was: {stderr}");
+}
+
+/// A segment-matched name on a sleeping capsule gets the outliving clause, once.
+#[test]
+fn a_segment_matched_name_under_sleep_gets_the_outliving_clause() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     project(
         dir.path(),
         "name: demo\nversion: 0.1.0\nlifecycle:\n  after_task: sleep\ncapabilities:\n  env:\n    \
-         allow:\n      - GITHUB_TOKEN\n",
-    );
-    let sleeping = explain_scope_stderr(&home, dir.path(), &[]);
-    let sleeping_lines = warning_lines(&sleeping);
-
-    assert_eq!(sleeping_lines.len(), 1, "stderr was: {sleeping}");
-    assert!(
-        !sleeping_lines[0].contains("lifecycle.after_task: sleep"),
-        "{}",
-        sleeping_lines[0]
-    );
-}
-
-/// The prediction consults the manifest's own strip patterns, so a capsule that strips a name of
-/// its own is told the grant is inert rather than held.
-#[test]
-fn a_manifest_strip_pattern_moves_a_name_into_the_dropped_arm() {
-    let home = TempDir::new().unwrap();
-    let dir = TempDir::new().unwrap();
-    project(
-        dir.path(),
-        // `capabilities.shell` is rejected without a non-empty `allow`, so the block that
-        // carries `strip_env` names a binary too.
-        "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      \
-         - MY_SERVICE_SECRET\n  shell:\n    allow:\n      - echo\n    strip_env:\n      \
-         - \"*_SERVICE_SECRET\"\n",
+         allow:\n      - SIGNING_KEY\n",
     );
 
     let stderr = explain_scope_stderr(&home, dir.path(), &[]);
     let lines = warning_lines(&stderr);
 
     assert_eq!(lines.len(), 1, "stderr was: {stderr}");
-    assert!(lines[0].contains("'MY_SERVICE_SECRET'"), "{}", lines[0]);
+    assert!(lines[0].contains("'SIGNING_KEY'"), "{}", lines[0]);
     assert!(
-        lines[0].contains("the grant delivers nothing"),
+        lines[0].contains("lifecycle.after_task: sleep"),
         "{}",
         lines[0]
     );
@@ -293,7 +286,7 @@ fn every_distinct_name_is_reported_once_in_declaration_order() {
     project(
         dir.path(),
         "name: demo\nversion: 0.1.0\ncapabilities:\n  env:\n    allow:\n      \
-         - DATABASE_PASSWORD\n      - HOME\n      - GITHUB_TOKEN\n      - DATABASE_PASSWORD\n",
+         - DATABASE_PASSWORD\n      - HOME\n      - SIGNING_KEY\n      - DATABASE_PASSWORD\n",
     );
 
     let stderr = explain_scope_stderr(&home, dir.path(), &[]);
@@ -301,5 +294,5 @@ fn every_distinct_name_is_reported_once_in_declaration_order() {
 
     assert_eq!(lines.len(), 2, "stderr was: {stderr}");
     assert!(lines[0].contains("'DATABASE_PASSWORD'"), "{}", lines[0]);
-    assert!(lines[1].contains("'GITHUB_TOKEN'"), "{}", lines[1]);
+    assert!(lines[1].contains("'SIGNING_KEY'"), "{}", lines[1]);
 }

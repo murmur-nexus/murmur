@@ -25,7 +25,8 @@ use crate::commands::run::{artifact_presence, ArtifactPresence};
 use crate::commands::{lockfile_error_to_cli, runtime_manifest_error_to_cli};
 use crate::config::load_effective_mur_config_if_any_exists;
 use crate::error::{
-    CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_RUN_019,
+    CliError, E_CAP_002, E_CAP_004, E_CAP_005, E_CAP_006, E_CAP_014, E_CAP_015, E_CAP_016,
+    E_RUN_019,
 };
 use crate::formation::{
     formation_env_report, EnvironmentNames, FormationEnvReport, RequiredVariable,
@@ -728,6 +729,19 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         runtime_manifest.lifecycle.as_ref(),
         None,
     );
+
+    // The entries `W-SEC-024` passes over because the backstop strips them are an `E-CAP-016`
+    // refusal at `mur run`; a warning here, on the `E-CAP-004` terms below, so the rest of the
+    // checklist still runs.
+    if let Err(error) = capsule_runtime::check_env_allow_reaches_guests(
+        &capability_policy_from_runtime_manifest(&runtime_manifest),
+    ) {
+        eprintln!(
+            "[mur doctor] warning[{E_CAP_016}]: {error}\n  \
+             `mur run` will refuse this capsule — remove the entries above; no manifest setting \
+             exempts a name from the credential backstop."
+        );
+    }
 
     // And `W-SEC-025`, from the same emitter `mur run` calls: an allow-list entry naming the
     // inference endpoint grants direct reach without the key and does not serve inference.
