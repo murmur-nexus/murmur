@@ -164,44 +164,7 @@ fn apply_key(config: &mut MurConfig, key: &ConfigKey<'_>, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HOME_ENV_LOCK;
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved_home: Option<std::ffi::OsString>,
-        saved_cwd: std::path::PathBuf,
-    }
-
-    impl EnvGuard {
-        fn set_up(home: &std::path::Path, cwd: &std::path::Path) -> Self {
-            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let saved_home = std::env::var_os("HOME");
-            let saved_cwd = std::env::current_dir().expect("cwd");
-            // SAFETY: serialized by HOME_ENV_LOCK across this module's tests.
-            unsafe {
-                std::env::set_var("HOME", home);
-            }
-            std::env::set_current_dir(cwd).expect("set cwd");
-            Self {
-                _lock: lock,
-                saved_home,
-                saved_cwd,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding `_lock`.
-            unsafe {
-                match &self.saved_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-            let _ = std::env::set_current_dir(&self.saved_cwd);
-        }
-    }
+    use crate::config::test_env::{mode_of, set_mode, EnvGuard};
 
     #[test]
     fn set_rejects_unknown_key() {
@@ -241,6 +204,56 @@ mod tests {
 
         assert!(home.path().join(".murmur").join("config.yaml").exists());
         assert!(!cwd.path().join(".murmur").join("config.yaml").exists());
+    }
+
+    #[test]
+    fn global_write_is_owner_only_even_when_home_and_file_were_wide() {
+        use std::os::unix::fs::MetadataExt;
+
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _guard = EnvGuard::set_up(home.path(), cwd.path());
+        let murmur = home.path().join(".murmur");
+        let config = murmur.join("config.yaml");
+        std::fs::create_dir(&murmur).unwrap();
+        set_mode(&murmur, 0o755);
+        std::fs::write(
+            &config,
+            "registry:\n  default: official\ncredentials:\n  OTHER_KEY: keep-me\n",
+        )
+        .unwrap();
+        set_mode(&config, 0o644);
+        let inode = std::fs::metadata(&config).unwrap().ino();
+
+        run_config_set("credentials.PROVIDER_KEY", "v", true).expect("set should succeed");
+
+        assert_eq!(mode_of(&murmur), 0o700);
+        assert_eq!(mode_of(&config), 0o600);
+        assert_ne!(std::fs::metadata(&config).unwrap().ino(), inode);
+        let cfg = load_mur_config().expect("load");
+        assert_eq!(cfg.registry.default.as_deref(), Some("official"));
+        assert_eq!(cfg.credentials["OTHER_KEY"], "keep-me");
+        assert_eq!(cfg.credentials["PROVIDER_KEY"], "v");
+        let leftovers: Vec<_> = std::fs::read_dir(&murmur)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("config.yaml")]);
+    }
+
+    #[test]
+    fn project_write_sets_no_mode() {
+        let home = tempfile::tempdir().expect("home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let _guard = EnvGuard::set_up(home.path(), cwd.path());
+        let project = cwd.path().join(".murmur");
+        std::fs::create_dir(&project).unwrap();
+        set_mode(&project, 0o755);
+
+        run_config_set("registry.default", "local", false).expect("set should succeed");
+
+        assert_eq!(mode_of(&project), 0o755);
+        assert!(!home.path().join(".murmur").exists());
     }
 
     #[test]

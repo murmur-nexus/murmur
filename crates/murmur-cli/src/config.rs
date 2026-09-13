@@ -290,12 +290,15 @@ pub fn load_project_mur_config_if_exists() -> Result<Option<MurConfig>, CliError
     read_mur_config_file(&project_mur_config_path()?)
 }
 
+/// Writes `~/.murmur/config.yaml` at `0600` inside a `~/.murmur` held at `0700`, whatever mode
+/// either had before. Fails with `E-IO-003` rather than leave the file written wider.
 pub fn save_mur_config(config: &MurConfig) -> Result<(), CliError> {
-    write_mur_config_file(&mur_config_path()?, config)
+    write_mur_config_file(&mur_config_path()?, config, true)
 }
 
+/// Writes `<cwd>/.murmur/config.yaml` under the umask. It may not hold credentials.
 pub fn save_project_mur_config(config: &MurConfig) -> Result<(), CliError> {
-    write_mur_config_file(&project_mur_config_path()?, config)
+    write_mur_config_file(&project_mur_config_path()?, config, false)
 }
 
 /// Loads the effective `MurConfig`: the global (`~/.murmur/config.yaml`) merged with
@@ -538,7 +541,40 @@ fn read_mur_config_file(config_path: &Path) -> Result<Option<MurConfig>, CliErro
     Ok(Some(config))
 }
 
-fn write_mur_config_file(config_path: &Path, config: &MurConfig) -> Result<(), CliError> {
+/// Replaces `config_path` by rename, so the inode changes on every write and a running capsule's
+/// credential stamp sees it.
+///
+/// `private` holds the parent directory at `0700` and the file at `0600`, reapplied on every
+/// write; otherwise both are left to the umask.
+fn write_mur_config_file(
+    config_path: &Path,
+    config: &MurConfig,
+    private: bool,
+) -> Result<(), CliError> {
+    if private {
+        let serialized = serde_yaml::to_string(config).map_err(|source| {
+            CliError::new(E_IO_003, format!("failed to serialize config: {source}"))
+        })?;
+        if let Some(parent) = config_path.parent() {
+            capsule_runtime::murmur_home::hold_private_dir(parent).map_err(|reason| {
+                CliError::new(
+                    E_IO_003,
+                    format!("failed to hold {} owner-only: {reason}", parent.display()),
+                )
+            })?;
+        }
+        return capsule_runtime::murmur_home::write_private_file(
+            config_path,
+            serialized.as_bytes(),
+        )
+        .map_err(|reason| {
+            CliError::new(
+                E_IO_003,
+                format!("failed to write {}: {reason}", config_path.display()),
+            )
+        });
+    }
+
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
             CliError::new(
@@ -665,6 +701,64 @@ fn is_valid_env_variable(value: &str) -> bool {
 // working directory, so concurrently-run tests don't race on shared process state.
 #[cfg(test)]
 pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test helpers shared by every test in the crate that points `HOME` or the working directory at a
+/// scratch directory, or checks a file mode.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use super::HOME_ENV_LOCK;
+
+    /// Holds `HOME` and the working directory at scratch paths until dropped, serialised by
+    /// [`HOME_ENV_LOCK`].
+    pub(crate) struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved_home: Option<std::ffi::OsString>,
+        saved_cwd: PathBuf,
+    }
+
+    impl EnvGuard {
+        pub(crate) fn set_up(home: &Path, cwd: &Path) -> Self {
+            let lock = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved_home = std::env::var_os("HOME");
+            let saved_cwd = std::env::current_dir().expect("cwd");
+            // SAFETY: serialized by HOME_ENV_LOCK across every test in the crate that sets HOME.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            std::env::set_current_dir(cwd).expect("set cwd");
+            Self {
+                _lock: lock,
+                saved_home,
+                saved_cwd,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding `_lock`.
+            unsafe {
+                match &self.saved_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let _ = std::env::set_current_dir(&self.saved_cwd);
+        }
+    }
+
+    /// `path`'s permission bits.
+    pub(crate) fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    pub(crate) fn set_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
 
 #[cfg(test)]
 mod tests {

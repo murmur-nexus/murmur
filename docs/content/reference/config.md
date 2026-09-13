@@ -125,20 +125,19 @@ mur config set -g credentials.ANTHROPIC_API_KEY sk-ant-...
 #### Rotating a key { #credentials-rotation }
 
 A replaced entry takes effect on the next inference request that any running capsule sends. Nothing
-restarts. Before each request that carries the key, the runtime checks whether the config file has
-changed — its inode, size or timestamps — and re-reads it only then.
+restarts. Before each request that carries the key, the runtime reads the entry from the config
+file, however the file was last written.
 
 | Change | When a running capsule uses it |
 |---|---|
-| `mur config set -g credentials.NAME <key>` | The next request. The command replaces the file by rename, so the inode always changes |
-| A hand edit that changes the file's size or timestamps | The next request |
-| An in-place hand edit that keeps the size within one filesystem timestamp tick | The next change to the file, or the next `401` |
+| `mur config set -g credentials.NAME <key>`, or any hand edit, in place or by rename | The next request that reads the file after the write completes. This is the worst case for every way of writing the file |
+| A request that reads the file while an editor is part-way through saving it | That request uses the last key read, and the trace records `unreadable`. The next request uses the saved key |
 | Removing the entry, or the file becoming missing or unparseable | Never. The capsule keeps the last key it read, and the trace records `change: "unreadable"` once for that state of the file |
 
 Removing an entry does not revoke a running capsule's key; replacing it does.
 
-When the provider answers `401`, the runtime re-reads the file at once, whatever its timestamps
-say. A changed value is sent in one resend of the same request, and that response goes to the
+When the provider answers `401`, the runtime reads the file again before deciding whether to
+resend. A changed value is sent in one resend of the same request, and that response goes to the
 driver whatever its status. An unchanged value is not resent. A `401` that stands ends the task with
 [`E-RUN-027`](diagnostics.md#e-run-027). Every rotation and rejection is recorded in the session
 trace as an [`inference_credential`](observability-schemas.md#inference-credential) event, which
@@ -149,16 +148,49 @@ same file and picks up a rotated key too. Only `transport: http` capsules read c
 
 #### File permissions { #credentials-permissions }
 
-`mur config set` does not set a mode on what it writes. Under the common umask `022`,
-`~/.murmur` is created `0755` and `~/.murmur/config.yaml` is written `0644`, which every user on the
-host can read. Restrict the file once it holds a key:
+Every write to the global file leaves `~/.murmur/config.yaml` mode `0600` inside a `~/.murmur` held
+at `0700`, whatever the umask and whatever modes the two had before. A write that cannot set either
+mode fails with `E-IO-003`. The project-level `<cwd>/.murmur/config.yaml` is written under the
+umask; it cannot hold credentials.
+
+| Writes the global file | Command |
+|---|---|
+| Keys and credentials | `mur config set -g` |
+| `beta.enabled` | `mur beta enable`, `mur beta disable` |
+| `inference:` | The `mur new` first-run setup |
+
+A file loosened after it was written stays loose until the next write, and is reported:
+
+| Reports it | When | Output |
+|---|---|---|
+| `mur run` | A `transport: http` capsule reads its key from `credentials.<NAME>` in a file that grants any group or other permission | [`W-SEC-028`](diagnostics.md#w-sec-028) on stderr, once per launch |
+| `mur doctor` | Always | The mode of every entry in `~/.murmur`, and `W-SEC-028` for each one wider than the table below — see [`mur doctor`](cli.md#doctor-murmur-home) |
+
+Neither changes a mode or refuses. Tighten the file by hand:
 
 ```bash
 chmod 600 ~/.murmur/config.yaml
 ```
 
-The mode survives later `mur config set` writes only if your umask keeps new files private.
-Run `chmod 600` again after each write, or set `umask 077` in the shell that writes it.
+#### `~/.murmur` modes { #murmur-home-permissions }
+
+| Path | Mode | Holds | Written by |
+|---|---|---|---|
+| `~/.murmur/` | `0700` | Everything below | Held by every writer below before it creates anything |
+| `config.yaml` | `0600` | Provider credentials, registry tokens | `mur config set -g`, `mur beta`, `mur new` |
+| `state/`, `state/<store>/` | `0700` | Capsule state stores. Files inside are written by the capsule with no mode set | `mur run` at staging |
+| `spend/`, `spend/<YYYY-MM-DD>.jsonl` | `0700`, `0600` | The machine spend ledger | `mur run` with [`spend.machine_tokens_per_day`](#spend) in effect |
+| `conversations/` and each directory below, `conversation.jsonl` | `0700`, `0600` | Conversation records | `mur run`, on the first recorded message; `mur conversation` rewrites |
+| `running/`, `running/<session_id>.json` | `0700`, `0600` | Running-capsule records | `mur run` when a session opens its door |
+| `deployments.json` | `0600` | Deployment records | `mur deploy`, `mur destroy` |
+| `deploy_staging/`, `deploy_staging/<deployment_id>/` | `0700` | A copy of the manifest, workdir and `mur` binary while a deploy uploads | `mur deploy` |
+| `deploy_keys/` | Expected `0700`, files `0600` | SSH private keys for a deployment | Nothing writes here; `mur destroy` removes a deployment's directory |
+| `artifacts/` | Umask | Installed artifacts | `mur install`, `mur publish` |
+| `bin/mur-*` | `0755` | Cached `mur` binaries for deploy targets | `mur deploy` |
+
+Every mode marked `0700` or `0600` is set again on each write, not only when the path is created.
+A `mur run` that writes under an existing `~/.murmur` removes its group and other permissions and
+leaves its owner permissions as they are, so a home closed with `chmod 500` stays closed.
 
 ### `registry:` section
 

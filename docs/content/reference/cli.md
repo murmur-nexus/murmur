@@ -601,6 +601,42 @@ Checking /path/to/murmur.yaml for darwin-aarch64...
 Fix: demo-skill: artifact on disk does not match murmur.lock — re-publish or delete the lock
 ```
 
+### Murmur home { #doctor-murmur-home }
+
+Once the manifest loads, `mur doctor` prints a `Murmur home` block: the mode of `~/.murmur` and of
+each entry in it, whatever the project declares. The known entries are always listed, present or not, followed by any other name in
+the directory.
+
+```text
+Murmur home (/home/alice/.murmur)
+  .: 0755  the murmur home, expected owner-only
+  config.yaml: 0644  provider credentials, expected owner-only
+  deploy_keys: 0700  SSH private keys, expected owner-only
+    wider than 0600: deploy_keys/dep_x/id_ed25519 is 0644
+  deploy_staging: absent  deployment staging copies, expected owner-only
+  deployments.json: 0600  deployment records, expected owner-only
+  spend: 0700  the machine spend ledger, expected owner-only
+  conversations: 0700  conversation records, expected owner-only
+  running: absent  running-capsule records, expected owner-only
+  state: 0700  capsule state stores, expected owner-only
+  artifacts: 0755  installed artifacts
+  bin: absent  cached mur binaries
+  nexus-config.json: 0644  something not recognised by this build
+```
+
+| Line | Meaning |
+|---|---|
+| `<name>: <mode>` | The entry's permission bits. `.` is `~/.murmur` itself |
+| `<name>: absent` | Nothing exists at that name |
+| `<name>: unreadable (<error>)` | The entry exists and its metadata could not be read |
+| `expected owner-only` | The entry is held at the mode in [`~/.murmur` modes](config.md#murmur-home-permissions), and so is everything beneath it |
+| `wider than <mode>: <path> is <mode>` | A directory beneath an owner-only entry wider than `0700`, or a file wider than `0600`. At most 20 are listed per entry, then `and N more wider than expected` |
+
+Each owner-only entry wider than expected, and each path listed beneath one, also prints
+[`W-SEC-028`](diagnostics.md#w-sec-028) on stderr. The block changes no mode and does not affect the
+exit code. When `HOME` cannot be resolved,
+the block is one `not reported` line.
+
 ### Warnings
 
 A finding that is worth reporting but is not a failure prints on its own checklist line, marked

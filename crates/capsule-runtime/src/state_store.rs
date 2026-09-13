@@ -92,8 +92,18 @@ pub fn validate_store_name(store: &str) -> Result<(), RuntimeError> {
 /// The only function here with side effects, and it is called only from the staging path — never
 /// from a diagnostic. A capsule that fails to launch for any other reason therefore leaves no
 /// directory behind, and an undeclared capability creates nothing at all.
+///
+/// `~/.murmur` itself is held at `0700` before the root beneath it is created.
 pub fn ensure_state_store(store: &str) -> Result<PathBuf, RuntimeError> {
-    ensure_state_store_in(&murmur_home(store)?, store)
+    validate_store_name(store)?;
+    let home = crate::murmur_home::ensure_murmur_home().map_err(|message| {
+        RuntimeError::StateStoreUnavailable {
+            store: store.to_string(),
+            path: "~/.murmur".to_string(),
+            message,
+        }
+    })?;
+    ensure_state_store_in(&home, store)
 }
 
 /// Every state store the given artifacts declare, resolved and validated but not created.
@@ -370,6 +380,33 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn ensuring_a_store_holds_a_wide_murmur_home_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::wide_dir(&home.path().join(".murmur"), 0o755);
+        crate::murmur_home::run_with_home(
+            "state_store::tests::inner_ensure_state_store_under_scratch_home",
+            home.path(),
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur")),
+            0o700
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur/state/shey")),
+            0o700
+        );
+    }
+
+    #[test]
+    #[ignore = "run by ensuring_a_store_holds_a_wide_murmur_home_owner_only"]
+    fn inner_ensure_state_store_under_scratch_home() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        ensure_state_store("shey").unwrap();
     }
 
     /// Two capsules, one host: each name resolves to its own directory, and neither can read the

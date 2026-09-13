@@ -333,7 +333,7 @@ impl fmt::Debug for MachineLedger {
 impl MachineLedger {
     /// Open today's ledger under `~/.murmur/spend` for `session_id`, pruning old days.
     pub(crate) fn open(session_id: &str, ceiling: u64) -> Result<Self, RuntimeError> {
-        let home = crate::state_store::murmur_home_dir().map_err(|message| {
+        let home = crate::murmur_home::ensure_murmur_home().map_err(|message| {
             RuntimeError::SpendLedgerUnavailable {
                 path: format!("~/.murmur/{SPEND_DIR}"),
                 message,
@@ -1400,5 +1400,37 @@ mod tests {
             matches!(err, RuntimeError::SpendLedgerUnavailable { ref path, .. } if path.ends_with("spend")),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn opening_the_ledger_holds_a_wide_murmur_home_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::wide_dir(&home.path().join(".murmur"), 0o755);
+        crate::murmur_home::run_with_home(
+            "spend::home_tests::inner_open_ledger_under_scratch_home",
+            home.path(),
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur")),
+            0o700
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur").join(SPEND_DIR)),
+            SPEND_DIR_MODE
+        );
+    }
+
+    #[test]
+    #[ignore = "run by opening_the_ledger_holds_a_wide_murmur_home_owner_only"]
+    fn inner_open_ledger_under_scratch_home() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        MachineLedger::open("ses_home_test", 1_000).unwrap();
     }
 }

@@ -1585,3 +1585,125 @@ fn doctor_names_the_running_binary_and_what_attaches_to_it() {
         "doctor must say which profile, if any, attaches, stdout was:\n{stdout}"
     );
 }
+
+/// `mur doctor` reports the mode of every entry under `~/.murmur`, warns `W-SEC-028` for each
+/// owner-only entry or file beneath one that other accounts can read, and changes nothing.
+#[test]
+fn doctor_reports_murmur_home_permissions_and_warns_on_wide_private_entries() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    create_project(project.path(), "  []\n");
+
+    let murmur = home.path().join(".murmur");
+    let dir = |path: &Path, mode: u32| {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let file = |path: &Path, contents: &str, mode: u32| {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    dir(&murmur, 0o755);
+    file(
+        &murmur.join("config.yaml"),
+        "credentials:\n  K: secret-doctor-value\n",
+        0o644,
+    );
+    dir(&murmur.join("deploy_keys/dep_x"), 0o700);
+    dir(&murmur.join("deploy_keys"), 0o700);
+    file(
+        &murmur.join("deploy_keys/dep_x/id_ed25519"),
+        "-----BEGIN PRIVATE KEY-----\n",
+        0o644,
+    );
+    file(&murmur.join("deployments.json"), "[]", 0o644);
+    dir(&murmur.join("spend"), 0o700);
+    file(
+        &murmur.join("spend/2026-09-13.jsonl"),
+        "{\"ts\":1,\"session_id\":\"ses_x\",\"input_tokens\":1,\"output_tokens\":1}\n",
+        0o600,
+    );
+    dir(&murmur.join("conversations"), 0o755);
+    dir(&murmur.join("artifacts"), 0o755);
+    file(&murmur.join("nexus-config.json"), "{}", 0o644);
+
+    let modes = || -> Vec<(PathBuf, u32)> {
+        let mut found = Vec::new();
+        let mut stack = vec![murmur.clone()];
+        while let Some(path) = stack.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            found.push((path.clone(), metadata.permissions().mode() & 0o777));
+            if metadata.is_dir() {
+                for entry in fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+            }
+        }
+        found.sort();
+        found
+    };
+    let before = modes();
+
+    let output = mur_doctor(&home, project.path())
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    println!("{stdout}\n{stderr}");
+
+    assert!(
+        stdout.contains(&format!("Murmur home ({})", murmur.display())),
+        "{stdout}"
+    );
+    for line in [
+        "  .: 0755  the murmur home, expected owner-only",
+        "  config.yaml: 0644  provider credentials, expected owner-only",
+        "  deploy_keys: 0700  SSH private keys, expected owner-only",
+        "  deploy_staging: absent",
+        "  deployments.json: 0644",
+        "  spend: 0700",
+        "  conversations: 0755",
+        "  running: absent",
+        "  state: absent",
+        "  artifacts: 0755  installed artifacts\n",
+        "  bin: absent",
+        "  nexus-config.json: 0644  something not recognised by this build",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in:\n{stdout}");
+    }
+
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("warning[W-SEC-028]"))
+        .collect();
+    for (path, mode, chmod) in [
+        (murmur.clone(), "0755", "700"),
+        (murmur.join("config.yaml"), "0644", "600"),
+        (murmur.join("deploy_keys/dep_x/id_ed25519"), "0644", "600"),
+        (murmur.join("deployments.json"), "0644", "600"),
+        (murmur.join("conversations"), "0755", "700"),
+    ] {
+        let path = path.display().to_string();
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains(&format!("{path} holds"))
+                    && line.contains(&format!("mode {mode}"))
+                    && line.contains(&format!("`chmod {chmod} {path}`"))),
+            "no W-SEC-028 for {path}:\n{stderr}"
+        );
+    }
+    assert_eq!(warnings.len(), 5, "{stderr}");
+    for quiet in ["spend", "artifacts", "nexus-config.json"] {
+        let path = murmur.join(quiet).display().to_string();
+        assert!(
+            !warnings.iter().any(|line| line.contains(&path)),
+            "{quiet} must not warn:\n{stderr}"
+        );
+    }
+    assert!(!streams(&output).contains("secret-doctor-value"));
+    assert_eq!(modes(), before, "mur doctor changes no mode");
+}

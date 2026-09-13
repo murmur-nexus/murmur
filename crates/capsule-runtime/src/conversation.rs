@@ -40,6 +40,9 @@ pub(crate) const RECORD_HEADER_TYPE: &str = "murmur.record";
 /// owner-only, because a record is the whole of one capsule's conversation.
 const RECORD_DIR_MODE: u32 = 0o700;
 
+/// Mode every record file is held at, on each append and each rewrite.
+pub(crate) const RECORD_FILE_MODE: u32 = 0o600;
+
 /// Prefix on every host-minted cursor, so a value the host did not mint is refused rather than
 /// parsed into a position.
 const CURSOR_PREFIX: &str = "mc_";
@@ -324,17 +327,16 @@ impl ConversationRecord {
         self.ensure_dirs()?;
         self.ensure_header()?;
 
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path())
-            .and_then(|mut file| file.write_all(line.as_bytes()))
+        let mut file = open_record_file(&self.path(), false)?;
+        file.write_all(line.as_bytes())
             .map_err(|err| err.to_string())
     }
 
     /// Create the record root, the record directory and the context directory if they are
     /// missing, oldest ancestor first, so a context directory is never reachable through a parent
     /// a wider mode left open.
+    ///
+    /// When the record root sits in `~/.murmur`, the home itself is held at `0700` first.
     fn ensure_dirs(&self) -> Result<(), String> {
         let mut chain = Vec::new();
         let mut dir = Some(self.dir.as_path());
@@ -342,6 +344,11 @@ impl ConversationRecord {
             if let Some(current) = dir {
                 chain.push(current);
                 dir = current.parent();
+            }
+        }
+        if let (Some(owner), Ok(home)) = (dir, crate::state_store::murmur_home_dir()) {
+            if owner == home {
+                crate::murmur_home::ensure_murmur_home()?;
             }
         }
         for path in chain.into_iter().rev() {
@@ -398,15 +405,42 @@ impl ConversationRecord {
         // followed by an append carrying the same messages, and a record marked as headered
         // before its header was written would take those messages headerless and stay unowned.
         if existing.is_empty() {
-            std::fs::write(&path, line).map_err(|err| format!("{}: {err}", path.display()))?;
+            open_record_file(&path, true)?
+                .write_all(line.as_bytes())
+                .map_err(|err| format!("{}: {err}", path.display()))?;
         } else {
             let mut contents = line;
             contents.push_str(&existing);
-            crate::retention::StagedRewrite::stage(&path, contents.as_bytes())?.commit()?;
+            crate::retention::StagedRewrite::stage_with_mode(
+                &path,
+                contents.as_bytes(),
+                Some(RECORD_FILE_MODE),
+            )?
+            .commit()?;
         }
         self.header_ensured = true;
         Ok(())
     }
+}
+
+/// Open a record file for appending, or for replacing when `truncate`, held at
+/// [`RECORD_FILE_MODE`] whether or not this call created it.
+fn open_record_file(path: &Path, truncate: bool) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).mode(RECORD_FILE_MODE);
+    if truncate {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    let file = options
+        .open(path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(RECORD_FILE_MODE))
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(file)
 }
 
 /// The parsed record one reader holds between pages.
@@ -612,6 +646,87 @@ mod tests {
 
     fn id_at(id: usize) -> String {
         format!("msg_{:032x}", id)
+    }
+
+    #[test]
+    fn record_file_is_held_owner_only_on_append() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/shared");
+        crate::murmur_home::wide_dir(&root.join("ctx_1"), 0o755);
+        let path = root.join("ctx_1").join(RECORD_FILE_NAME);
+        crate::murmur_home::wide_file(&path, "", 0o644);
+
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path(), None).unwrap();
+        record.append(&[message(&id_at(1), "user", "hello")]);
+
+        assert_eq!(crate::murmur_home::mode_of(&path), 0o600);
+        assert_eq!(crate::murmur_home::mode_of(&root.join("ctx_1")), 0o700);
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    fn record_file_is_created_owner_only_with_its_header() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/shared");
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[message(&id_at(1), "user", "hello")]);
+
+        assert_eq!(crate::murmur_home::mode_of(&record.path()), 0o600);
+    }
+
+    /// Adopting a headerless record rewrites it by rename; the replacement is owner-only too.
+    #[test]
+    fn record_rewrite_keeps_the_file_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        let root = home.path().join("conversations/shared");
+        crate::murmur_home::wide_dir(&root.join("ctx_1"), 0o755);
+        let path = root.join("ctx_1").join(RECORD_FILE_NAME);
+        let old = serde_json::to_string(&message(&id_at(1), "user", "old")).unwrap();
+        crate::murmur_home::wide_file(&path, &format!("{old}\n"), 0o644);
+
+        let mut record =
+            ConversationRecord::open(&root, "ctx_1", workdir.path(), Some(CAPSULE)).unwrap();
+        record.append(&[message(&id_at(2), "user", "new")]);
+
+        assert!(read_header(&path).is_some(), "the record was adopted");
+        assert_eq!(crate::murmur_home::mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn record_root_under_a_wide_murmur_home_holds_the_home_owner_only() {
+        let home = tempfile::tempdir().unwrap();
+        crate::murmur_home::wide_dir(&home.path().join(".murmur"), 0o755);
+        crate::murmur_home::run_with_home(
+            "conversation::tests::inner_append_under_scratch_home",
+            home.path(),
+        );
+        assert_eq!(
+            crate::murmur_home::mode_of(&home.path().join(".murmur")),
+            0o700
+        );
+        let record = home
+            .path()
+            .join(".murmur/conversations/shared/ctx_1")
+            .join(RECORD_FILE_NAME);
+        assert_eq!(crate::murmur_home::mode_of(&record), 0o600);
+    }
+
+    #[test]
+    #[ignore = "run by record_root_under_a_wide_murmur_home_holds_the_home_owner_only"]
+    fn inner_append_under_scratch_home() {
+        if !crate::murmur_home::in_scratch_home() {
+            return;
+        }
+        let workdir = tempfile::tempdir().unwrap();
+        let root = record_root("shared").unwrap();
+        let mut record = ConversationRecord::open(&root, "ctx_1", workdir.path(), None).unwrap();
+        record.append(&[message(&id_at(1), "user", "hello")]);
+        assert!(record.path().exists());
     }
 
     /// The header is the first line a new record gets, and it names the capsule that wrote it —
