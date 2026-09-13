@@ -638,6 +638,7 @@ pub(crate) fn run_eval_run(capsule: Option<&Path>, dataset: Option<&Path>) -> Re
         println!("  case: {}", case.case_id);
 
         let stage_request = StageRequest {
+            credentials_file: crate::config::mur_config_path().ok(),
             manifest_dir: project_dir.clone(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),

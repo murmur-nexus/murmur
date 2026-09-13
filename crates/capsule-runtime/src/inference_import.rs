@@ -83,6 +83,8 @@ pub(crate) struct HookInferenceCtx {
     pub(crate) model: String,
     pub(crate) engine: Engine,
     pub(crate) accessible_workdir: PathBuf,
+    /// The session's bookkeeping directory, where a credential failure writes `out/result.txt`.
+    pub(crate) workdir: PathBuf,
     pub(crate) inference_env: Vec<(String, String)>,
     pub(crate) capability_policy: CapabilityPolicy,
     pub(crate) network_allow_rules: Vec<NetworkAllowRule>,
@@ -234,12 +236,18 @@ impl HookInferenceCtx {
             .or(result.summary)
             .ok_or_else(|| "inference driver returned no data".to_string())?;
         if !matches!(result.status, Status::Passed) {
+            if let Some(message) = self.credential_failure() {
+                return Err(message);
+            }
             return Err(format!("inference driver returned an error: {raw}"));
         }
 
         let response: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("failed to parse inference driver response: {e}"))?;
         if response.get("stop_reason").and_then(Value::as_str) == Some("error") {
+            if let Some(message) = self.credential_failure() {
+                return Err(message);
+            }
             let err = response
                 .get("error")
                 .and_then(Value::as_str)
@@ -250,6 +258,20 @@ impl HookInferenceCtx {
         let text = response_text(&response);
         let usage = parse_driver_usage(&response);
         Ok((raw, text, usage))
+    }
+
+    /// A credential rejection the gateway recorded for this call, reported as `E-RUN-027` and
+    /// written to `out/result.txt` in place of the driver's error, or `None` when there is none.
+    fn credential_failure(&self) -> Option<String> {
+        let message = self
+            .inference_gateway
+            .as_ref()
+            .and_then(|gateway| gateway.credential())
+            .and_then(|credential| credential.report_rejection())?;
+        if let Err(err) = crate::agent::write_result(&self.workdir, &format!("error: {message}")) {
+            eprintln!("{err}");
+        }
+        Some(message)
     }
 
     fn record(&self, record: HookInferenceRecord) {
@@ -464,6 +486,7 @@ mod tests {
             model: "manifest-model".to_string(),
             engine: engine.clone(),
             accessible_workdir: workdir.to_path_buf(),
+            workdir: workdir.to_path_buf(),
             inference_env: Vec::new(),
             capability_policy: CapabilityPolicy::default(),
             network_allow_rules: Vec::new(),

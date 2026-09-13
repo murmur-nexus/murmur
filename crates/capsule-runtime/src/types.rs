@@ -321,6 +321,10 @@ pub struct StageRequest {
     pub lock_expectations: Option<Vec<LockExpectation>>,
     pub capability_policy: CapabilityPolicy,
     pub inference: Option<InferenceConfig>,
+    /// The global config file a `${NAME}` in `inference.api_key` is looked up in first, as
+    /// `credentials.NAME`, and re-read from while the session runs. `None` looks in the launching
+    /// environment only.
+    pub credentials_file: Option<PathBuf>,
     /// Whether `inference` above had its system-prompt declaration replaced by the caller
     /// (`mur run --system-prompt`) rather than read from the manifest. Purely a provenance
     /// signal for the trace: the override itself is already applied to `inference`, which by

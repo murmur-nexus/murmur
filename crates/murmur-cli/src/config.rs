@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -58,6 +59,11 @@ pub struct MurConfig {
     /// [`merge_containment`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<ContainmentClass>,
+    /// Provider keys by credential name. A manifest's `inference.api_key: ${NAME}` is answered from
+    /// `credentials.NAME` here before the environment, and `mur run` re-reads the file while a
+    /// capsule runs. Read from the global file only (see [`merge_mur_configs`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, String>,
     /// Machine-wide inference spend ceilings. Merged as a min, never a project-wins override (see
     /// [`merge_spend`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +105,7 @@ impl Default for MurConfig {
             inference: None,
             beta: BetaConfig::default(),
             containment: None,
+            credentials: BTreeMap::new(),
             spend: None,
         }
     }
@@ -311,6 +318,9 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
 
     if let Some(project) = &project_opt {
         warn_if_project_api_key_literal(project)?;
+        if let Some(warning) = project_credentials_warning(&project_mur_config_path()?, project) {
+            eprintln!("{warning}");
+        }
     }
 
     let global = global_opt.unwrap_or_default();
@@ -318,9 +328,9 @@ pub fn load_effective_mur_config_if_any_exists() -> Result<Option<MurConfig>, Cl
 }
 
 /// Per-key merge of a global and an optional project-level `MurConfig`. `project` values win
-/// for non-empty scalars; `registry.sources` and `beta.enabled` merge as unions; `api_key` is
-/// unconditionally sourced from `global`, never `project`, regardless of its shape. Returns
-/// `global` unchanged when `project` is `None`.
+/// for non-empty scalars; `registry.sources` and `beta.enabled` merge as unions; `api_key` and
+/// `credentials` are unconditionally sourced from `global`, never `project`, regardless of their
+/// shape. Returns `global` unchanged when `project` is `None`.
 pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurConfig {
     let Some(project) = project else {
         return global;
@@ -337,6 +347,7 @@ pub fn merge_mur_configs(global: MurConfig, project: Option<MurConfig>) -> MurCo
             enabled: merge_beta_enabled(global.beta.enabled, project.beta.enabled),
         },
         containment: merge_containment(global.containment, project.containment),
+        credentials: global.credentials,
         spend: merge_spend(global.spend, project.spend),
     }
 }
@@ -466,6 +477,24 @@ fn warn_if_project_api_key_literal(project: &MurConfig) -> Result<(), CliError> 
         path.display()
     );
     Ok(())
+}
+
+/// The warning printed when the project-level file at `path` holds a non-empty `credentials:` map,
+/// which nothing reads. Names the file, never a value.
+fn project_credentials_warning(path: &Path, project: &MurConfig) -> Option<String> {
+    (!project.credentials.is_empty()).then(|| {
+        format!(
+            "warning: {} sets credentials:, but credentials are read from the global config \
+             (~/.murmur/config.yaml) only; these project-level entries will be ignored",
+            path.display()
+        )
+    })
+}
+
+/// Whether `name` can be a credential name: the `${NAME}` grammar a manifest's `inference.api_key`
+/// accepts, `[A-Z_][A-Z0-9_]*`.
+pub(crate) fn is_valid_credential_name(name: &str) -> bool {
+    is_valid_env_variable(name)
 }
 
 /// True when `value` is non-empty and is not a `${VAR}` env-var reference — i.e. it would be
@@ -1006,6 +1035,43 @@ registry:
         assert!(!serde_yaml::to_string(&bare)
             .unwrap()
             .contains("containment"));
+    }
+
+    #[test]
+    fn credentials_come_from_the_global_config_only() {
+        let mut global = MurConfig::default();
+        global
+            .credentials
+            .insert("PROVIDER_KEY".to_string(), "global-value".to_string());
+        let mut project = MurConfig::default();
+        project
+            .credentials
+            .insert("PROVIDER_KEY".to_string(), "project-value".to_string());
+        project
+            .credentials
+            .insert("OTHER_KEY".to_string(), "project-other".to_string());
+
+        let path = Path::new("/work/.murmur/config.yaml");
+        let warning = project_credentials_warning(path, &project).expect("a warning");
+        assert!(warning.contains("/work/.murmur/config.yaml"), "{warning}");
+        assert!(!warning.contains("project-value"), "{warning}");
+        assert!(project_credentials_warning(path, &MurConfig::default()).is_none());
+
+        let merged = merge_mur_configs(global.clone(), Some(project));
+        assert_eq!(merged.credentials, global.credentials);
+    }
+
+    #[test]
+    fn credentials_empty_map_is_not_serialized() {
+        let rendered = serde_yaml::to_string(&MurConfig::default()).unwrap();
+        assert!(!rendered.contains("credentials"), "{rendered}");
+
+        let parsed: MurConfig =
+            serde_yaml::from_str("credentials:\n  PROVIDER_KEY: some-value\n").unwrap();
+        assert_eq!(
+            parsed.credentials.get("PROVIDER_KEY").map(String::as_str),
+            Some("some-value")
+        );
     }
 
     #[test]

@@ -1810,7 +1810,7 @@ mur config set <key> <value> [-g|--global]
 Writes `<key>` to the project-level file at `<cwd>/.murmur/config.yaml` by default. Pass
 `-g`/`--global` to write `~/.murmur/config.yaml` instead.
 
-Exactly six dotted keys are settable:
+These dotted keys are settable:
 
 | Key | Maps to |
 |---|---|
@@ -1818,8 +1818,9 @@ Exactly six dotted keys are settable:
 | `registry.index_url` | `registry.index_url` |
 | `inference.provider` | `inference.provider` |
 | `inference.model` | `inference.model` |
-| `inference.api_key` | `inference.api_key` |
+| `inference.api_key` | `inference.api_key`. Also prints a note that `mur run` reads provider keys from `credentials.<NAME>` |
 | `inference.endpoint` | `inference.endpoint` |
+| `credentials.<NAME>` | One entry of [`credentials:`](config.md#credentials). `-g` only; `NAME` matches `[A-Z_][A-Z0-9_]*`. Running capsules use a replaced entry on their next inference request |
 
 `registry.sources` and `beta.enabled` are list-typed and **not** settable with `config set` —
 edit `registry.sources` by hand in the YAML file, and use
@@ -1841,7 +1842,16 @@ nothing:
 ```bash
 mur config set nonsense.field value
 # error[E-CFG-002]: unsupported config key 'nonsense.field'
-#   hint: supported keys: registry.default, registry.index_url, inference.provider, inference.model, inference.api_key, inference.endpoint
+#   hint: supported keys: registry.default, registry.index_url, inference.provider, inference.model, inference.api_key, inference.endpoint, credentials.<NAME>
+```
+
+`credentials.<NAME>` without `-g`, or with a `NAME` outside the grammar, is refused with the same
+code:
+
+```bash
+mur config set credentials.ANTHROPIC_API_KEY sk-ant-...
+# error[E-CFG-002]: 'credentials.ANTHROPIC_API_KEY' can only be set in the global config
+#   hint: credentials are read from the global config (~/.murmur/config.yaml) only; run `mur config set -g credentials.ANTHROPIC_API_KEY <key>`
 ```
 
 !!! warning "`inference.api_key` is always global"

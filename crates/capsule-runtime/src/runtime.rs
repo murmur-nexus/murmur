@@ -12,13 +12,13 @@ use std::{
 use murmur_artifact::{
     current_platform, is_secret_shaped_name, native_binary_verdict, parse_hook_config_from_yaml,
     parse_tool_implementation_from_yaml, read_lockfile, security_warning_link, verify_sha256,
-    write_lockfile_atomic, AfterTask, ArtifactImplementation, ArtifactRuntime, ContextConfig,
-    ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant, LifecycleConfig,
-    LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry, RegistryError,
-    RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME, PACKED_MANIFEST_ENTRY, W_SEC_003,
-    W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011, W_SEC_013, W_SEC_014, W_SEC_015,
-    W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022, W_SEC_023, W_SEC_024, W_SEC_025,
-    W_SEC_026,
+    write_lockfile_atomic, AfterTask, ApiKeyReference, ArtifactImplementation, ArtifactRuntime,
+    ContextConfig, ConversationMode, HookBinding, InferenceConfig, InterpreterRuntimeGrant,
+    LifecycleConfig, LockedSha256, LockfileError, MurmurLock, NativeBinaryVerdict, Registry,
+    RegistryError, RuntimeType, TaskAcceptance, LOCK_VERSION, MANIFEST_FILENAME,
+    PACKED_MANIFEST_ENTRY, W_SEC_003, W_SEC_006, W_SEC_007, W_SEC_008, W_SEC_009, W_SEC_011,
+    W_SEC_013, W_SEC_014, W_SEC_015, W_SEC_016, W_SEC_017, W_SEC_018, W_SEC_020, W_SEC_022,
+    W_SEC_023, W_SEC_024, W_SEC_025, W_SEC_026, W_SEC_027,
 };
 use serde_yaml::Value;
 use wasmtime::{
@@ -57,6 +57,7 @@ use crate::{
         SessionContextData, ShellDispatchInfo, TaskReopen,
     },
     identity::{self, CapsuleIdentity},
+    inference_credential::{config_holds_credential, InferenceCredential},
     inference_gateway::InferenceGateway,
     inference_import::HookInferenceCtx,
     lanes::LaneQueue,
@@ -866,6 +867,7 @@ pub fn stage_session(
     )?;
     let inference_gateway = stage_inference_gateway(
         request.inference.as_ref(),
+        request.credentials_file.as_deref(),
         &installed_manifests,
         &installed_artifacts,
         &spend,
@@ -1234,16 +1236,19 @@ pub fn launch_session(
 
         let capsule_url = format!("localhost:{external_port}");
         staged.capsule_url = capsule_url.clone();
-        on_url(&capsule_url);
 
         // The one place in the runtime that knows where this session's door is, so the one place
         // the record can be written. A guard rather than a line at each return: `loop_result?`
         // and both success returns below end the session, and a record that outlived its session
         // would resolve an address onto a port nothing holds.
         //
+        // Written before `on_url` announces the door: a caller that sees the URL and runs
+        // `mur ps` or addresses the session must find the record already there.
+        //
         // Only the agent path reaches here. A script capsule binds nothing and is never
         // addressable, so it records nothing.
         let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
+        on_url(&capsule_url);
 
         let capsule_identity = CapsuleIdentity {
             capsule_name: staged.capsule_name.clone(),
@@ -1498,6 +1503,15 @@ pub fn launch_session(
                     .filter_map(|t| t.get("name").and_then(serde_json::Value::as_str))
                     .map(str::to_string)
                     .collect();
+            let inference_credential = inference_gateway
+                .as_ref()
+                .and_then(|gateway| gateway.credential())
+                .cloned();
+            trace.set_credential_source(
+                inference_credential
+                    .as_ref()
+                    .map_or("none", |credential| credential.source().trace_name()),
+            );
             trace
                 .write_session_start(inference.max_turns, tools_declared)
                 .await
@@ -1530,6 +1544,12 @@ pub fn launch_session(
             .await
             .ok()
             .map(std::sync::Arc::new);
+            // The credential records a rotation or rejection through the same kind of handle, and
+            // for the same reason: the gateway sends from a task the loop's writer cannot reach,
+            // and the record should land when the request does.
+            if let (Some(credential), Some(appender)) = (&inference_credential, &resource_trace) {
+                credential.attach_trace(Arc::clone(appender));
+            }
             // The same file again, for the same reason and on the same terms: a plan's steps run
             // on blocking threads, so they cannot be lent the agent loop's own writer. A trace
             // that cannot be opened leaves a plan unrecorded and still runs it.
@@ -1690,6 +1710,7 @@ pub fn launch_session(
                                 model: inference_model.clone(),
                                 engine: state.engine.clone(),
                                 accessible_workdir: state.accessible_workdir.clone(),
+                                workdir: state.workdir.clone(),
                                 inference_env: state.inference_env.clone(),
                                 capability_policy: state.capability_policy.clone(),
                                 network_allow_rules: state.network_allow_rules.clone(),
@@ -3267,6 +3288,53 @@ pub fn warn_on_inference_endpoint_in_network_allow(
     }
 }
 
+/// Warns (non-fatal, once) when a `transport: http` capsule's `inference.api_key` can only be read
+/// at launch: a literal in the manifest, or a `${NAME}` that the global config's `credentials:`
+/// map does not hold and the environment supplies.
+///
+/// Such a capsule keeps the key it launched with, so a key rotated with `mur config set -g
+/// credentials.NAME` does not reach it until it restarts. Reads only whether `credentials_file`
+/// holds the name, never prints a value, and stays silent for a `${NAME}` found nowhere — staging
+/// refuses that one. Shared between `mur run` and `mur doctor` on the same terms as
+/// [`warn_on_inference_endpoint_in_network_allow`].
+pub fn warn_on_launch_only_inference_credential(
+    inference: Option<&InferenceConfig>,
+    credentials_file: Option<&Path>,
+) {
+    let Some(reference) = inference
+        .filter(|inference| inference.transport == "http")
+        .and_then(|inference| inference.api_key.as_ref())
+    else {
+        return;
+    };
+    let (source, name) = match reference {
+        ApiKeyReference::Literal(_) => (
+            "inference.api_key is written literally in murmur.yaml".to_string(),
+            "<NAME>",
+        ),
+        ApiKeyReference::Environment(name) => {
+            if credentials_file.is_some_and(|path| config_holds_credential(path, name))
+                || std::env::var_os(name).is_none_or(|value| value.is_empty())
+            {
+                return;
+            }
+            (
+                format!(
+                    "inference.api_key: ${{{name}}} is read from the environment variable {name}, \
+                     because credentials.{name} is not set in the global config"
+                ),
+                name.as_str(),
+            )
+        }
+    };
+    let link = security_warning_link(W_SEC_027);
+    eprintln!(
+        "[capsule-runtime] warning[{W_SEC_027}]: {source}, so the key is read once at launch and \
+         this capsule cannot pick up a rotated key until it is restarted; store the key with \
+         `mur config set -g credentials.{name} <key>` to have it re-read ({link})"
+    );
+}
+
 /// Print `W-SEC-026` when `spend.machine_tokens_per_day` is in effect and the capsule uses
 /// `transport: process`.
 ///
@@ -3957,11 +4025,11 @@ impl WasiHttpHooks for NetworkPolicyHooks {
                         WasiHttpErrorCode::HttpRequestDenied,
                     ));
                 }
-                let (request, config) = gateway
-                    .rewrite(request, config)
-                    .map_err(wasmtime_wasi_http::p2::HttpError::from)?;
-                return Ok(wasmtime_wasi_http::p2::default_send_request(
-                    request, config,
+                let gateway = Arc::clone(gateway);
+                return Ok(HostFutureIncomingResponse::pending(
+                    wasmtime_wasi::runtime::spawn(async move {
+                        Ok(gateway.send(request, config).await)
+                    }),
                 ));
             }
         }
@@ -4490,8 +4558,13 @@ fn gateway_for_store(
 /// `None` for `transport: process`, for no inference, and for a driver that is not among the staged
 /// artifacts — dispatch already refuses that one by name. The refusal depends on the declaration
 /// alone, never on whether `inference.api_key` is set.
+///
+/// A `transport: http` `inference.api_key` is resolved first, against `credentials_file` and the
+/// environment, so a credential found nowhere refuses the launch with
+/// [`RuntimeError::InferenceCredentialNotFound`] even when no gateway would be built.
 fn stage_inference_gateway(
     inference: Option<&InferenceConfig>,
+    credentials_file: Option<&Path>,
     installed_manifests: &[(String, String)],
     installed_artifacts: &[InstalledArtifactSummary],
     spend: &Arc<SpendMeter>,
@@ -4499,6 +4572,11 @@ fn stage_inference_gateway(
     let Some(inference) = inference.filter(|inference| inference.transport == "http") else {
         return Ok(None);
     };
+    let credential = inference
+        .api_key
+        .as_ref()
+        .map(|reference| InferenceCredential::resolve(reference, credentials_file).map(Arc::new))
+        .transpose()?;
     let (Some(driver), Some(endpoint)) = (inference.driver.as_ref(), inference.endpoint.as_deref())
     else {
         return Ok(None);
@@ -4527,7 +4605,7 @@ fn stage_inference_gateway(
         driver.artifact.clone(),
         endpoint,
         auth,
-        inference.api_key.clone(),
+        credential,
         Arc::clone(spend),
     )
     .map(|gateway| Some(Arc::new(gateway)))
@@ -8391,6 +8469,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
@@ -8481,6 +8560,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
@@ -8561,6 +8641,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
@@ -8640,6 +8721,7 @@ inference:
 
         let tempdir = tempfile::tempdir().unwrap();
         let request = StageRequest {
+            credentials_file: None,
             manifest_dir: tempdir.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: String::new(),
@@ -8800,6 +8882,7 @@ inference:
         };
 
         let request = StageRequest {
+            credentials_file: None,
             manifest_dir: project.path().to_path_buf(),
             capsule_name: "test".to_string(),
             capsule_version: "0.0.1".to_string(),
@@ -10134,7 +10217,10 @@ inference:
                     header: "x-api-key".to_string(),
                     value: "{key}".to_string(),
                 },
-                Some(KEY.to_string()),
+                Some(Arc::new(
+                    InferenceCredential::resolve(&ApiKeyReference::Literal(KEY.to_string()), None)
+                        .unwrap(),
+                )),
                 Arc::new(SpendMeter::unlimited()),
             )
             .unwrap(),
@@ -10171,7 +10257,7 @@ inference:
             transport: "http".to_string(),
             endpoint: Some(endpoint.to_string()),
             model: "test-model".to_string(),
-            api_key: api_key.map(str::to_string),
+            api_key: api_key.map(|key| ApiKeyReference::Literal(key.to_string())),
             driver: Some(murmur_artifact::InferenceDriver {
                 artifact: "the-driver".to_string(),
                 config: None,
@@ -10198,7 +10284,10 @@ inference:
                 header: "Authorization".to_string(),
                 value: "Bearer {key}".to_string(),
             },
-            inference.api_key.clone(),
+            inference
+                .api_key
+                .as_ref()
+                .map(|reference| Arc::new(InferenceCredential::resolve(reference, None).unwrap())),
             Arc::new(SpendMeter::unlimited()),
         )
         .unwrap();

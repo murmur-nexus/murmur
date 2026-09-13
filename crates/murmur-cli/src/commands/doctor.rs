@@ -6,6 +6,7 @@ use capsule_runtime::{
     detect_egress_namespace_blocker, detect_userns_grant, find_on_path, inspect_installed_profile,
     inspect_profile_attachment, preopen_reports, read_only_advisory_for, render_read_only,
     warn_on_inference_endpoint_in_network_allow, warn_on_interpreter_runtime_grants,
+    warn_on_launch_only_inference_credential,
     warn_on_machine_spend_ceiling_under_process_transport, warn_on_secret_shaped_env_grants,
     warn_on_unreachable_toolchain_helpers, warn_on_userns_restriction_disabled_host_wide,
     warn_on_workdir_exec, ArtifactRequest, InstalledProfileState, ProfileAttachment, UsernsGrant,
@@ -678,15 +679,14 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
         error
     })?;
     let manifest_path = resolve_manifest_path(&project_root);
-    // Parsed without resolving any secret it references, and the text kept for the reference scan
-    // below, so the file is read once. Doctor reads no `inference.api_key` value, and a manifest
-    // referencing a variable this shell does not hold is exactly the manifest an operator runs
-    // `mur doctor` to diagnose — refusing to load it would withhold the report naming the
-    // variable. `mur run`, which does need the value, still resolves it and still refuses.
+    // The text is kept for the reference scan below, so the file is read once. The parse keeps
+    // what `inference.api_key` names without reading any value, so a manifest referencing a
+    // variable this shell does not hold still loads — that is exactly the manifest an operator runs
+    // `mur doctor` to diagnose.
     let manifest_yaml =
         read_runtime_manifest_text(&manifest_path).map_err(runtime_manifest_error_to_cli)?;
-    let runtime_manifest = RuntimeManifest::from_yaml_str_without_secrets(&manifest_yaml)
-        .map_err(runtime_manifest_error_to_cli)?;
+    let runtime_manifest =
+        RuntimeManifest::from_yaml_str(&manifest_yaml).map_err(runtime_manifest_error_to_cli)?;
 
     // Keys this build does not recognize, in the same words and from the same emitter `mur run`
     // uses — an operator reaching for `mur doctor` to find out why a declaration did nothing is
@@ -734,6 +734,13 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
     warn_on_inference_endpoint_in_network_allow(
         &capability_policy_from_runtime_manifest(&runtime_manifest),
         runtime_manifest.inference.as_ref(),
+    );
+
+    // And `W-SEC-027`, from the same emitter `mur run` calls: a key read only at launch cannot be
+    // rotated into a running capsule.
+    warn_on_launch_only_inference_credential(
+        runtime_manifest.inference.as_ref(),
+        crate::config::mur_config_path().ok().as_deref(),
     );
 
     // And `W-SEC-026`, from the same emitter `mur run` calls: a machine spend ceiling does not

@@ -622,10 +622,13 @@ pub(crate) async fn run_agent_loop(
         sse_event_id = store_state.a2a_chunk_event_id.load(Ordering::Relaxed);
 
         if !matches!(driver_result.status, Status::Passed) {
-            let error_text = driver_result
-                .data
-                .or(driver_result.summary)
-                .unwrap_or_else(|| "driver returned error".to_string());
+            let error_text = match credential_failure(store_state) {
+                Some(message) => message,
+                None => driver_result
+                    .data
+                    .or(driver_result.summary)
+                    .unwrap_or_else(|| "driver returned error".to_string()),
+            };
             record_result(hooks, workdir, &format!("error: {error_text}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
@@ -756,12 +759,18 @@ pub(crate) async fn run_agent_loop(
         )
         .await;
         if stop_reason == "error" {
-            let error = response
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("driver returned error")
-                .to_string();
-            eprintln!("inference error from driver: {error}");
+            let error = match credential_failure(store_state) {
+                Some(message) => message,
+                None => {
+                    let error = response
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("driver returned error")
+                        .to_string();
+                    eprintln!("inference error from driver: {error}");
+                    error
+                }
+            };
             record_result(hooks, workdir, &format!("error: {error}"))
                 .map_err(RuntimeError::AgentLoopFailed)?;
             flush_hook_dispatch_faults(hooks, trace).await;
@@ -3172,20 +3181,34 @@ fn read_task(workdir: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// A credential rejection the gateway recorded for the request a driver just failed, reported as
+/// `E-RUN-027` with its hint, or `None` when there is none.
+///
+/// The rejection is what the driver's error is about, and the operator's fix depends on where the
+/// credential came from — so its message replaces the driver's text rather than sitting beside it.
+fn credential_failure(store_state: &CapsuleStoreState) -> Option<String> {
+    store_state
+        .inference_gateway
+        .as_ref()
+        .and_then(|gateway| gateway.credential())
+        .and_then(|credential| credential.report_rejection())
+}
+
 /// Record `value` as the in-scope task attempt's result text, then write `out/result.txt`.
 ///
 /// The single result-text write funnel for both transports: every terminal arm of
-/// [`run_agent_loop`] and both dialect readers in [`process`] call this, and [`write_result`]
-/// has no other caller. That is what makes `murmur:task-io/read`'s `read-output` serve exactly
-/// what the loop produced. A terminal path that returns `Err` without producing result text
-/// never reaches here, and the output stays unset — the truthful pairing with the
-/// `exit-status: failed` the hook sees.
+/// [`run_agent_loop`] and both dialect readers in [`process`] call this. That is what makes
+/// `murmur:task-io/read`'s `read-output` serve exactly what the loop produced. [`write_result`]
+/// has one other caller: a hook's `run-inference` that ends in a credential rejection writes
+/// `out/result.txt` directly, without recording task output. A terminal path that returns `Err`
+/// without producing result text never reaches here, and the output stays unset — the truthful
+/// pairing with the `exit-status: failed` the hook sees.
 fn record_result(hooks: &HookRuntime, workdir: &Path, value: &str) -> Result<(), String> {
     hooks.record_task_output(value);
     write_result(workdir, value)
 }
 
-fn write_result(workdir: &Path, value: &str) -> Result<(), String> {
+pub(crate) fn write_result(workdir: &Path, value: &str) -> Result<(), String> {
     let out_dir = workdir.join("out");
     fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create output directory: {e}"))?;
     fs::write(out_dir.join("result.txt"), value)

@@ -1028,13 +1028,24 @@ inference:
 
 `api_key` accepts two forms:
 
+- **Credential reference:** `api_key: ${ANTHROPIC_API_KEY}` names a credential
 - **Literal string:** `api_key: sk-ant-xxxx`
-- **Environment variable reference:** `api_key: ${ANTHROPIC_API_KEY}` — resolved at parse time from
-  the host environment. If the variable is not set, `mur run` exits with an error before launch.
 
-Only `${UPPER_SNAKE_CASE}` references are expanded. Anything else is treated as a literal value.
+Only `${UPPER_SNAKE_CASE}` is a reference. Anything else is a literal value.
 
-The runtime keeps the resolved key, and the driver never receives it. On each request the driver
+`mur run` resolves a reference before any session directory exists:
+
+| Order | Where | Rotation |
+|---|---|---|
+| 1 | `credentials.ANTHROPIC_API_KEY` in `~/.murmur/config.yaml`, when non-empty | Re-read while the capsule runs: a key replaced with `mur config set -g` is used on the next inference request |
+| 2 | The environment variable `ANTHROPIC_API_KEY` | Read once at launch, with [`W-SEC-027`](diagnostics.md#w-sec-027) |
+| — | Neither | `mur run` refuses with `E-MAN-003`, naming both places |
+
+A literal is read once at launch, also with `W-SEC-027`. The re-read cadence, the single retry
+after a `401`, and what removing an entry does are in
+[`credentials:` section](config.md#credentials).
+
+The runtime keeps the key, and the driver never receives it. On each request the driver
 sends, the runtime attaches the header the driver's own
 [`inference_auth:`](default-artifacts.md#inference-auth) block declares and sends the request to
 `inference.endpoint` itself. A driver without that block refuses to start with

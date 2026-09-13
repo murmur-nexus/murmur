@@ -645,7 +645,15 @@ mod tests {
                     header: "x-api-key".to_string(),
                     value: "{key}".to_string(),
                 },
-                Some("sk-spend-gateway-marker".to_string()),
+                Some(Arc::new(
+                    crate::inference_credential::InferenceCredential::resolve(
+                        &murmur_artifact::ApiKeyReference::Literal(
+                            "sk-spend-gateway-marker".to_string(),
+                        ),
+                        None,
+                    )
+                    .unwrap(),
+                )),
                 Arc::clone(&meter),
             )
             .unwrap(),

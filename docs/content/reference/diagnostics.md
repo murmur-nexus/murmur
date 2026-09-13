@@ -42,7 +42,7 @@ section that explains it.
 | `E-IO-003` | General I/O error (read/write failure) | — |
 | `E-MAN-001` | Missing required manifest field | — |
 | `E-MAN-002` | YAML syntax error in manifest | — |
-| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config) | — |
+| `E-MAN-003` | Field type mismatch in manifest, or a structurally valid value the runtime rejects (artifact entry, inference config, capability config), or an `inference.api_key: ${NAME}` that neither `credentials.NAME` in `~/.murmur/config.yaml` nor the environment variable `NAME` holds | [Where `${NAME}` is read from](config.md#credentials-precedence) |
 | `E-NEW-001` | The generator agent produced no `out/murmur.yaml` | [`mur new`](cli.md#mur-new) |
 | `E-REG-001` | Artifact not found in registry, or found in a release that publishes no asset for the host platform | [`mur install`](cli.md#mur-install) |
 | `E-REG-002` | Installed artifact bytes do not match the sha256 recorded for them | [Lockfile](workdir.md#lockfile-murmurlock) |
@@ -75,6 +75,7 @@ section that explains it.
 | `E-RUN-024` | The session named could not be ended and is still running | [E-RUN-024](#e-run-024) |
 | `E-RUN-025` | The `transport: http` inference driver declares no usable `inference_auth:` block | [E-RUN-025](#e-run-025) |
 | `E-RUN-026` | `spend.machine_tokens_per_day` is set and the spend ledger under `~/.murmur/spend` cannot be used | [E-RUN-026](#e-run-026) |
+| `E-RUN-027` | The provider kept rejecting the inference credential after it was re-read | [E-RUN-027](#e-run-027) |
 | `E-TOP-001` | Tempo endpoint unreachable, or invalid `--window` format | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-002` | Tempo HTTP query failed (search or trace fetch) | [`mur topology`](cli.md#mur-topology) |
 | `E-TOP-003` | Tempo response JSON parse failure | [`mur topology`](cli.md#mur-topology) |
@@ -112,6 +113,7 @@ section that explains it.
 | `W-SEC-024` | `capabilities.env.allow` names a credential-shaped variable — the grant hands the capsule a secret murmur does not broker, or delivers nothing | [W-SEC-024](#w-sec-024) |
 | `W-SEC-025` | `capabilities.network.allow` names the inference endpoint — inference does not use the entry, and it grants direct reach to that host without the key | [W-SEC-025](#w-sec-025) |
 | `W-SEC-026` | `spend.machine_tokens_per_day` is set and the capsule uses `transport: process`, whose spend murmur neither counts nor limits | [W-SEC-026](#w-sec-026) |
+| `W-SEC-027` | The inference key is read only at launch — from the environment or a literal in `murmur.yaml` — so a rotated key does not reach the running capsule | [W-SEC-027](#w-sec-027) |
 
 ---
 
@@ -441,6 +443,34 @@ at staging, before the session directory exists and before any provider request.
 error[E-RUN-026]: spend ledger at /home/me/.murmur/spend is unavailable: failed to create the directory: File exists (os error 17)
   hint: spend.machine_tokens_per_day is set in config.yaml, and the machine spend ceiling cannot be kept without its ledger; make ~/.murmur/spend a directory this user can write, or remove spend.machine_tokens_per_day
 ```
+
+### E-RUN-027 — the provider rejected the inference credential { #e-run-027 }
+
+The provider answered a `transport: http` inference request with `401`, and re-reading the
+credential did not cure it. When a request is rejected, the runtime re-reads
+[`credentials.<NAME>`](config.md#credentials) at once. If the value there has changed, the request
+is sent once more with it. The task ends with this error when the value is unchanged, or when that
+single resend is rejected too. It replaces the driver's own error text. The same message, without
+the code, is written to `out/result.txt`, and the session fails.
+
+```text
+error[E-RUN-027]: the provider rejected the inference credential credentials.ANTHROPIC_API_KEY in /home/me/.murmur/config.yaml (HTTP 401)
+  hint: replace it with `mur config set -g credentials.ANTHROPIC_API_KEY <key>`; running capsules use it on their next call
+```
+
+What the message names depends on where the key came from:
+
+| Source | Message names | Hint |
+|---|---|---|
+| `credentials.<NAME>` in the global config | The entry and the config file path | Replace the entry; running capsules use it on their next call |
+| The environment variable `<NAME>` | The variable, and that it is read once at launch | Restart the capsule with a valid key, or store the key as `credentials.<NAME>` |
+| A literal `inference.api_key` in `murmur.yaml` | The manifest literal, and that it is read once at launch | As for the environment |
+
+When the single resend was also rejected, the message adds that the credential was re-read and its
+new value was rejected too. The session trace records the rejection as an
+[`inference_credential`](observability-schemas.md#inference-credential) event with
+`change: "rejected"`. Any status other than `401`, including `403`, reaches the driver unchanged
+and is reported as the driver reports it.
 
 ### E-CAP-004 — staged runtime below the `sealed` floor { #e-cap-004 }
 
@@ -1028,7 +1058,7 @@ Where a warning is written depends on whether a session workdir exists yet:
 | Warning | Written to |
 |---|---|
 | `W-SEC-001`, `W-SEC-002`, `W-SEC-003`, `W-SEC-005`, `W-SEC-010`, `W-SEC-020`, `W-SEC-021`, `W-SEC-022`, `W-SEC-023` — decided at launch | stderr and `workdir/<session_id>/logs/bootstrap.log` |
-| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026` — decided at staging, before the workdir exists | stderr |
+| `W-SEC-006` to `W-SEC-009`, `W-SEC-011` to `W-SEC-019`, `W-SEC-024`, `W-SEC-025`, `W-SEC-026`, `W-SEC-027` — decided at staging, before the workdir exists | stderr |
 | `W-SEC-004` — from `mur build` | stderr |
 
 ### W-SEC-001 — No kernel sandbox on this platform { #w-sec-001 }
@@ -1909,3 +1939,28 @@ from `mur run` (including `mur run --explain-scope`) and from `mur doctor`.
 The CLI that `transport: process` drives holds its own credentials, so none of its requests pass
 the runtime, and the capsule runs with no ledger lines and no machine refusal. Bound that CLI's
 spend with its provider's own controls.
+
+### W-SEC-027 — the inference key is read only at launch { #w-sec-027 }
+
+**Fires when:** a `transport: http` capsule's [`inference.api_key`](manifest.md#inference-api-key)
+can only be read at launch. That is either a literal value in `murmur.yaml`, or a `${NAME}` that
+[`credentials.<NAME>`](config.md#credentials) does not hold and the launching shell's environment
+supplies. It fires once per launch, on stderr, from `mur run` (including `mur run --explain-scope`)
+and from `mur doctor`.
+
+```text
+[capsule-runtime] warning[W-SEC-027]: inference.api_key: ${ANTHROPIC_API_KEY} is read from the environment variable ANTHROPIC_API_KEY, because credentials.ANTHROPIC_API_KEY is not set in the global config, so the key is read once at launch and this capsule cannot pick up a rotated key until it is restarted; store the key with `mur config set -g credentials.ANTHROPIC_API_KEY <key>` to have it re-read (https://docs.murmur.nexus/murmur-nexus/murmur/reference/diagnostics/#w-sec-027)
+```
+
+For a literal, the warning names `inference.api_key is written literally in murmur.yaml` and never
+prints the value.
+
+**Why it matters:** a key stored with `mur config set -g credentials.<NAME>` reaches every running
+capsule on its next inference request. This capsule keeps the key it launched with, so revoking
+that key breaks it until it restarts, with [`E-RUN-027`](#e-run-027).
+
+**What the runtime does about it:** nothing is refused. Exporting the key is how CI runs are keyed.
+
+**What to do:** store the key with `mur config set -g credentials.<NAME> <key>` and write
+`inference.api_key: ${NAME}` in the manifest. A `${NAME}` that neither the config nor the
+environment holds does not warn: the launch is refused with [`E-MAN-003`](#index).

@@ -14,6 +14,7 @@ use tokio::{
 use crate::{
     agent::DriverUsage,
     containment::ScopeReport,
+    inference_credential::CredentialChange,
     lanes::TaskLane,
     origin::{TaskProvenance, TrustClass},
     trace_blobs::BlobStore,
@@ -48,6 +49,9 @@ pub(crate) struct TraceWriter {
     /// effect. Always written to `session_start` (as `null` when absent) so a trace records *that*
     /// a prompt was in effect and which one, even when the text itself is withheld.
     system_prompt_sha256: Option<String>,
+    /// Where the inference credential came from: `"config"`, `"environment"`, `"manifest"` or
+    /// `"none"`. Set by [`Self::set_credential_source`] before `session_start` is written.
+    credential_source: &'static str,
     /// The session `mur run --resume` continued, verbatim as the operator's address resolved it.
     /// `None` on every ordinary launch. Written to `session_start` on both, so its absence
     /// identifies a trace from a runtime that predates the key.
@@ -255,6 +259,9 @@ struct SessionStartEvent {
     /// prompt that actually went on the wire: this one names the prompt the operator wrote.
     /// Under `trace.capture: content` those resolved bytes are also the blob this hash names.
     system_prompt_sha256: Option<String>,
+    /// Where the inference credential this session attaches came from: `"config"`,
+    /// `"environment"`, `"manifest"` or `"none"`. Never the value.
+    credential_source: &'static str,
     /// The session `mur run --resume` continued, or `null` on an ordinary launch. Together with
     /// `context_id` below it is what makes a resumed conversation followable back through the
     /// sessions that built it.
@@ -1240,6 +1247,7 @@ impl TraceWriter {
             blobs,
             system_prompt_source,
             system_prompt_sha256,
+            credential_source: "none",
             resumed_from,
             context_id,
             spawned_by,
@@ -1312,6 +1320,12 @@ impl TraceWriter {
         self.turn_event_id.clone().or_else(|| self.task_parent())
     }
 
+    /// Records where the inference credential came from, as
+    /// [`crate::inference_credential::CredentialSource::trace_name`] names it. `"none"` until set.
+    pub(crate) fn set_credential_source(&mut self, source: &'static str) {
+        self.credential_source = source;
+    }
+
     pub(crate) async fn write_session_start(
         &mut self,
         max_turns: u32,
@@ -1338,6 +1352,7 @@ impl TraceWriter {
             effective_grants: self.effective_grants.clone(),
             system_prompt_source: self.system_prompt_source,
             system_prompt_sha256: self.system_prompt_sha256.clone(),
+            credential_source: self.credential_source,
             resumed_from: self.resumed_from.clone(),
             context_id: self.context_id.clone(),
             spawned_by: self.spawned_by.clone(),
@@ -2141,6 +2156,30 @@ impl TraceWriter {
     }
 }
 
+/// `inference_credential`: a rotation, rejection or unreadable source for the session's inference
+/// credential. `trigger` is written only with `change: "rotated"`, `status` and `retried` only with
+/// `"rejected"`, `reason` only with `"unreadable"`, and `credential` whenever the manifest named one.
+#[derive(Serialize)]
+struct InferenceCredentialEvent<'a> {
+    event_type: &'static str,
+    event_id: String,
+    parent_id: Option<String>,
+    session_id: String,
+    timestamp: u64,
+    source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<&'a str>,
+    change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retried: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
 // ── Resource-plane appender ───────────────────────────────────────────────────
 
 /// A second, independent `O_APPEND` handle to the session's `trace.jsonl`, used by the resource
@@ -2383,6 +2422,40 @@ impl ResourceTraceAppender {
             outcome,
             reason,
         );
+        self.append(&event).await;
+    }
+
+    /// Records one change to the session's inference credential. Carries where the credential
+    /// comes from and what happened to it, never the value.
+    pub(crate) async fn write_inference_credential(
+        &self,
+        source: &'static str,
+        credential: Option<&str>,
+        change: CredentialChange,
+    ) {
+        let (change_name, trigger, status, retried, reason) = match change {
+            CredentialChange::Rotated { trigger } => ("rotated", Some(trigger), None, None, None),
+            CredentialChange::Rejected { status, retried } => {
+                ("rejected", None, Some(status), Some(retried), None)
+            }
+            CredentialChange::Unreadable { reason } => {
+                ("unreadable", None, None, None, Some(reason))
+            }
+        };
+        let event = InferenceCredentialEvent {
+            event_type: "inference_credential",
+            event_id: new_event_id(),
+            parent_id: Some(self.session_event_id.clone()),
+            session_id: self.session_id.clone(),
+            timestamp: timestamp_ms(),
+            source,
+            credential,
+            change: change_name,
+            trigger,
+            status,
+            retried,
+            reason,
+        };
         self.append(&event).await;
     }
 

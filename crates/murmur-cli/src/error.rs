@@ -481,6 +481,16 @@ impl From<RuntimeError> for CliError {
                 "the runtime presents the provider key itself and needs the driver to say how; \
                  update the driver to a version whose murmur.yaml declares inference_auth:",
             ),
+            ref error @ RuntimeError::InferenceCredentialNotFound { ref variable, .. } => {
+                CliError::with_hint(
+                    E_MAN_003,
+                    error.to_string(),
+                    format!(
+                        "store the key with `mur config set -g credentials.{variable} <key>`, \
+                         which running capsules re-read, or export {variable} before launching"
+                    ),
+                )
+            }
             error @ RuntimeError::SpendLedgerUnavailable { .. } => CliError::with_hint(
                 E_RUN_026,
                 error.to_string(),

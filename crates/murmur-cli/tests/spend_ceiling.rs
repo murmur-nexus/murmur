@@ -403,6 +403,7 @@ fn stage_queue_capsule(home: &TempDir, manifest_path: &Path) -> capsule_runtime:
             home.path().join(".murmur").join("artifacts"),
         )),
         StageRequest {
+            credentials_file: None,
             manifest_dir: manifest_path.parent().unwrap().to_path_buf(),
             capsule_name: runtime_manifest.name.clone(),
             capsule_version: runtime_manifest.version.clone(),

@@ -68,7 +68,9 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
         )
     })?;
     if let Some(inference) = runtime_manifest.inference.as_mut() {
-        inference.api_key = Some(inf.api_key.clone());
+        inference.api_key = Some(murmur_artifact::ApiKeyReference::Literal(
+            inf.api_key.clone(),
+        ));
     }
 
     // Check that all generator capsule artifacts are installed before staging.
@@ -109,6 +111,7 @@ pub(crate) fn run_new(task: &str, registry: Option<&str>) -> Result<(), CliError
     }
 
     let stage_request = StageRequest {
+        credentials_file: None,
         manifest_dir,
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),
@@ -625,7 +628,9 @@ mod tests {
                 )
             })?;
             if let Some(inference) = runtime_manifest.inference.as_mut() {
-                inference.api_key = Some(inf.api_key.clone());
+                inference.api_key = Some(murmur_artifact::ApiKeyReference::Literal(
+                    inf.api_key.clone(),
+                ));
             }
             Ok(runtime_manifest)
         })();

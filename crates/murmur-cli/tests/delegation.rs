@@ -762,6 +762,7 @@ impl Parent {
         let staged = stage_session(
             Arc::new(LocalRegistry::new(&suite.registry)),
             StageRequest {
+                credentials_file: None,
                 // An empty context is a per-message fact, not a launch-scoped one: `--context`
                 // refuses one, while an A2A `contextId` of `""` is taken as the conversation. So
                 // an empty id here means "stamp it on every message" and "fix none at launch".
@@ -967,6 +968,7 @@ fn stage_request(
     runtime_manifest: &murmur_artifact::RuntimeManifest,
 ) -> StageRequest {
     StageRequest {
+        credentials_file: None,
         manifest_dir: project.to_path_buf(),
         capsule_name: runtime_manifest.name.clone(),
         capsule_version: runtime_manifest.version.clone(),

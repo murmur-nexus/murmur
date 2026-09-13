@@ -853,13 +853,33 @@ pub struct InferenceDriver {
     pub config: Option<String>,
 }
 
+/// What `inference.api_key` names, as the manifest wrote it. Parsing never resolves it: the
+/// runtime looks the value up at staging, where it knows where credentials are kept.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ApiKeyReference {
+    /// `${NAME}`: a credential name, looked up in the global config's `credentials:` map and
+    /// then in the launching environment.
+    Environment(String),
+    /// Any other non-empty value, used verbatim as the key.
+    Literal(String),
+}
+
+impl std::fmt::Debug for ApiKeyReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment(name) => f.debug_tuple("Environment").field(name).finish(),
+            Self::Literal(_) => f.debug_tuple("Literal").field(&"<redacted>").finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceConfig {
     pub transport: String,
     /// HTTP endpoint for the WASM driver. Present for `transport: http`, absent for `transport: process`.
     pub endpoint: Option<String>,
     pub model: String,
-    pub api_key: Option<String>,
+    pub api_key: Option<ApiKeyReference>,
     /// WASM driver artifact. Present for `transport: http`, absent for `transport: process`.
     pub driver: Option<InferenceDriver>,
     /// CLI binary to spawn. Present for `transport: process`, absent for `transport: http`.
@@ -1425,15 +1445,6 @@ pub enum RuntimeManifestError {
         MANIFEST_FILENAME
     )]
     InvalidExports { field: String, message: String },
-    #[error(
-        "{}: inference.api_key references {reference} but the environment variable is not set",
-        MANIFEST_FILENAME
-    )]
-    MissingInferenceEnvVar {
-        field: String,
-        reference: String,
-        variable: String,
-    },
     #[error("{}: invalid trace config for '{field}': {message}", MANIFEST_FILENAME)]
     InvalidTraceConfig { field: String, message: String },
     #[error("failed to read {} at {path}: {source}", MANIFEST_FILENAME)]
@@ -2555,17 +2566,17 @@ pub fn referenced_env_variables(manifest_yaml: &str) -> Vec<ReferencedEnvVariabl
     referenced
 }
 
-/// Whether a parse is allowed to reach outside the manifest text for a secret it references.
+/// Whether a parse keeps what the manifest says about a secret it references.
 ///
 /// The two [`RuntimeManifest`] constructors differ by this value and nothing else, so validation
-/// cannot drift between a manifest `mur run` accepts and one a referee accepts.
+/// cannot drift between a manifest `mur run` accepts and one a referee accepts. Neither reads the
+/// process environment.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SecretResolution {
-    /// `inference.api_key` is resolved: an `${ENV_REF}` is looked up in the process environment
-    /// and a missing variable is an error.
+    /// `inference.api_key` is kept as an [`ApiKeyReference`], unresolved.
     Resolve,
     /// `inference.api_key` is left unread. The parsed [`InferenceConfig::api_key`] is `None`
-    /// whatever the manifest wrote, and the process environment is never touched.
+    /// whatever the manifest wrote.
     Skip,
 }
 
@@ -2577,10 +2588,8 @@ impl RuntimeManifest {
     /// Parse a manifest without resolving any secret it references.
     ///
     /// Validation is identical to [`RuntimeManifest::from_yaml_str`] on every block, `inference`
-    /// included, with one difference: `inference.api_key` is never resolved and the resulting
-    /// [`InferenceConfig::api_key`] is always `None`, whether the manifest wrote an `${ENV_REF}`
-    /// or a literal key. Nothing on this path reads the process environment, so a manifest
-    /// referencing a variable this process does not hold still parses.
+    /// included, with one difference: the resulting [`InferenceConfig::api_key`] is always
+    /// `None`, whether the manifest wrote an `${ENV_REF}` or a literal key.
     ///
     /// For a caller that reads a foreign capsule's manifest for its capability policy alone —
     /// `mur-roost` refereeing a delegation — and is entitled to none of the credentials that
@@ -3745,7 +3754,10 @@ fn parse_inference(
                     if trimmed.is_empty() {
                         None
                     } else {
-                        Some(resolve_inference_api_key(trimmed)?)
+                        Some(match parse_env_reference(trimmed) {
+                            Some(name) => ApiKeyReference::Environment(name.to_string()),
+                            None => ApiKeyReference::Literal(trimmed.to_string()),
+                        })
                     }
                 }
             };
@@ -4243,18 +4255,6 @@ fn parse_inference_driver_config(
             message: format!("failed to encode JSON: {err}"),
         }
     })
-}
-
-fn resolve_inference_api_key(value: &str) -> Result<String, RuntimeManifestError> {
-    if let Some(variable) = parse_env_reference(value) {
-        return std::env::var(variable).map_err(|_| RuntimeManifestError::MissingInferenceEnvVar {
-            field: "inference.api_key".to_string(),
-            reference: value.to_string(),
-            variable: variable.to_string(),
-        });
-    }
-
-    Ok(value.to_string())
 }
 
 fn parse_env_reference(value: &str) -> Option<&str> {
@@ -5901,7 +5901,10 @@ inference:
             Some("http://127.0.0.1:8080".to_string())
         );
         assert_eq!(inference.model, "test-model");
-        assert_eq!(inference.api_key, Some("literal-key".to_string()));
+        assert_eq!(
+            inference.api_key,
+            Some(ApiKeyReference::Literal("literal-key".to_string()))
+        );
         let driver = inference.driver.as_ref().expect("driver should be present");
         assert_eq!(driver.artifact, "murmur-driver-anthropic");
         assert_eq!(
@@ -6444,45 +6447,44 @@ inference:
         assert!(msg.contains("system_prompt_file"));
     }
 
+    /// A `${NAME}` is kept as the name it is, whether or not this process holds the variable: the
+    /// parse never reads the environment.
     #[test]
-    fn resolves_api_key_env_reference() {
-        let key = "MURMUR_TEST_INFERENCE_KEY_RESOLVE";
-        std::env::set_var(key, "resolved-secret");
-
-        let manifest = RuntimeManifest::from_yaml_str(&format!(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{key}}}\n  driver:\n    artifact: murmur-driver-anthropic\n"
-        ))
-        .unwrap();
-
-        assert_eq!(
-            manifest.inference.unwrap().api_key,
-            Some("resolved-secret".to_string())
-        );
-
-        std::env::remove_var(key);
-    }
-
-    #[test]
-    fn parse_without_secrets_declines_a_resolvable_api_key() {
-        let key = "MURMUR_TEST_INFERENCE_KEY_WITHOUT_SECRETS";
-        std::env::set_var(key, "sentinel-secret");
-
+    fn api_key_env_reference_parses_to_its_name_without_reading_the_environment() {
+        let key = "MURMUR_TEST_INFERENCE_KEY_NEVER_SET";
         let yaml = format!(
             "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{key}}}\n  driver:\n    artifact: murmur-driver-anthropic\n"
         );
 
-        let resolving = RuntimeManifest::from_yaml_str(&yaml).unwrap();
-        let without_secrets = RuntimeManifest::from_yaml_str_without_secrets(&yaml).unwrap();
-
-        std::env::remove_var(key);
-
-        // The variable was set and readable for both parses: the second holds no key because it
-        // declined to look, not because there was nothing to find.
         assert_eq!(
-            resolving.inference.unwrap().api_key,
-            Some("sentinel-secret".to_string())
+            RuntimeManifest::from_yaml_str(&yaml)
+                .unwrap()
+                .inference
+                .unwrap()
+                .api_key,
+            Some(ApiKeyReference::Environment(key.to_string()))
         );
-        assert_eq!(without_secrets.inference.unwrap().api_key, None);
+        assert_eq!(
+            RuntimeManifest::from_yaml_str_without_secrets(&yaml)
+                .unwrap()
+                .inference
+                .unwrap()
+                .api_key,
+            None
+        );
+    }
+
+    #[test]
+    fn api_key_reference_debug_names_a_variable_and_redacts_a_literal() {
+        let literal = ["sk-", "ant-", "debug"].concat();
+        let debug = format!(
+            "{:?} {:?}",
+            ApiKeyReference::Environment("SOME_KEY".to_string()),
+            ApiKeyReference::Literal(literal.clone())
+        );
+        assert!(debug.contains("Environment(\"SOME_KEY\")"), "{debug}");
+        assert!(debug.contains("Literal(\"<redacted>\")"), "{debug}");
+        assert!(!debug.contains(&literal), "{debug}");
     }
 
     #[test]
@@ -6500,7 +6502,7 @@ inference:
                 .inference
                 .unwrap()
                 .api_key,
-            Some(literal)
+            Some(ApiKeyReference::Literal(literal))
         );
         assert_eq!(
             RuntimeManifest::from_yaml_str_without_secrets(&yaml)
@@ -6552,22 +6554,6 @@ inference:
 
         let unparseable = "name: broken\nversion: [\n";
         assert!(referenced_env_variables(unparseable).is_empty());
-    }
-
-    #[test]
-    fn missing_api_key_env_reference_reports_clear_error() {
-        let key = "MURMUR_TEST_INFERENCE_KEY_MISSING";
-        std::env::remove_var(key);
-
-        let err = RuntimeManifest::from_yaml_str(&format!(
-            "name: cap\nversion: 0.0.1\nartifacts: []\ninference:\n  transport: http\n  endpoint: http://127.0.0.1:8080\n  model: test-model\n  api_key: ${{{key}}}\n  driver:\n    artifact: murmur-driver-anthropic\n"
-        ))
-        .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("inference.api_key"));
-        assert!(msg.contains(&format!("${{{key}}}")));
-        assert!(msg.contains("environment variable is not set"));
     }
 
     #[test]

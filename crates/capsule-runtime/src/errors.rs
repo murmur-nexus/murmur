@@ -459,6 +459,22 @@ pub enum RuntimeError {
         reason: Option<String>,
     },
 
+    /// `inference.api_key: ${variable}` names a credential that neither the global config's
+    /// `credentials:` map nor the launching environment holds. Refused at staging, before the
+    /// session directory exists.
+    #[error(
+        "murmur.yaml: inference.api_key references ${{{variable}}}, but neither \
+         credentials.{variable} in {} nor the environment variable {variable} is set",
+        .credentials_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the global config".to_string())
+    )]
+    InferenceCredentialNotFound {
+        variable: String,
+        credentials_file: Option<std::path::PathBuf>,
+    },
+
     /// `spend.machine_tokens_per_day` is in effect and the shared ledger it is kept in cannot be
     /// used — an unset `HOME`, a `~/.murmur/spend` that cannot be made a `0700` directory, or a
     /// daily file that cannot be opened. Raised at staging, before the session directory exists
