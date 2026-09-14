@@ -235,7 +235,7 @@ async fn run_task_with_reopens(
         .await;
 
         // Stands in for work between `task_canceled` and `task_end` — a slow `on-task-end` hook —
-        // so the `ps_stop` tests can hold a capsule in that window. Absent from release builds.
+        // so a test can hold a capsule in that window. Absent from release builds.
         #[cfg(debug_assertions)]
         {
             if let Some(ms) = std::env::var("MURMUR_DEBUG_TASK_END_DELAY_MS")
@@ -1119,9 +1119,36 @@ pub fn stage_session(
 ///
 /// Agent capsules (inference configured) run the built-in native Rust loop.
 /// Script capsules (WASM component present) instantiate and call `murmur:capsule/run#run()`.
+///
+/// Leaves the process's `SIGTERM` disposition alone: a caller that runs several sessions in one
+/// process, or does more work after this returns, keeps the default of ending at once. A caller
+/// whose process is the session uses [`launch_session_handling_sigterm`] instead.
 pub fn launch_session(
+    staged: StagedSession,
+    on_url: impl FnOnce(&str),
+) -> Result<LaunchResult, RuntimeError> {
+    launch(staged, on_url, false)
+}
+
+/// [`launch_session`] for a process whose lifetime is this one session.
+///
+/// On unix an agent session takes `SIGTERM` over for the rest of the process: the first signal
+/// cancels every live task and ends the session through its normal teardown, a second exits at
+/// once with status 143, and [`TERMINATE_TEARDOWN_DEADLINE`] after the first the process exits
+/// with status 143 whatever it is doing. Those exits end the whole process, so nothing that
+/// outlives the session may share it. A script capsule, or a platform without `SIGTERM`, launches
+/// exactly as [`launch_session`] does.
+pub fn launch_session_handling_sigterm(
+    staged: StagedSession,
+    on_url: impl FnOnce(&str),
+) -> Result<LaunchResult, RuntimeError> {
+    launch(staged, on_url, true)
+}
+
+fn launch(
     mut staged: StagedSession,
     on_url: impl FnOnce(&str),
+    handle_sigterm: bool,
 ) -> Result<LaunchResult, RuntimeError> {
     let network_allow_rules = parse_network_allow_rules(&staged.capability_policy.network_allow)?;
 
@@ -1273,12 +1300,16 @@ pub fn launch_session(
         // addressable, so it records nothing.
         let _running_record = open_running_record(&staged, &session_id, &capsule_url, &workdir);
 
-        // Taken over from the default disposition before the door is announced, so a `SIGTERM`
-        // sent by anyone who has seen the URL is held for the task loop's handler rather than
-        // ending the process with no teardown. A signal that arrives before the handler is
-        // spawned is delivered to it then.
+        // Taken over from the default disposition, when the caller owns the process, before the
+        // door is announced, so a `SIGTERM` sent by anyone who has seen the URL is held for the
+        // task loop's handler rather than ending the process with no teardown. A signal that
+        // arrives before the handler is spawned is delivered to it then.
+        #[cfg(not(unix))]
+        let _ = handle_sigterm;
         #[cfg(unix)]
-        let sigterm = {
+        let sigterm = if !handle_sigterm {
+            None
+        } else {
             let _runtime = rt.enter();
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(sigterm) => Some(sigterm),

@@ -1547,3 +1547,90 @@ fn a_session_that_cannot_be_signalled_is_reported_and_its_record_kept() {
         "the session is still running; its record must be kept"
     );
 }
+
+/// `mur eval run` launches one session after another in its own process, so a `SIGTERM` is not
+/// one session's to absorb: the process ends at once, under the default disposition, and no
+/// further case reaches the provider.
+#[cfg(unix)]
+#[test]
+fn a_sigterm_ends_mur_eval_at_once() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let server = common::ScriptedServer::start_with_delay(
+        vec![
+            end_turn_response("msg_1", "case one"),
+            end_turn_response("msg_2", "case two"),
+            end_turn_response("msg_3", "case three"),
+        ],
+        Duration::from_secs(20),
+    );
+    let home = driver_home();
+    let project = tempfile::tempdir().unwrap();
+    let endpoint = &server.endpoint;
+    fs::write(
+        project.path().join("murmur.yaml"),
+        format!(
+            "name: eval-sigterm\nversion: 0.1.0\n\
+             artifacts:\n  - name: {DRIVER_NAME}\n    version: {DRIVER_VERSION}\n    runtime: driver\n\
+             capabilities:\n  network:\n    allow:\n      - {endpoint}\n\
+             lifecycle:\n  task_acceptance: single\n  after_task: exit\n\
+             inference:\n  transport: http\n  endpoint: {endpoint}\n  model: test-model\n  \
+             api_key: test-key\n  driver:\n    artifact: {DRIVER_NAME}\n"
+        ),
+    )
+    .unwrap();
+    let dataset = project.path().join("dataset.jsonl");
+    let mut lines = String::new();
+    for case in 1..=3 {
+        let task = project.path().join(format!("task{case}.md"));
+        fs::write(&task, format!("case {case}\n")).unwrap();
+        lines.push_str(&format!(
+            "{}\n",
+            json!({"case_id": format!("c{case}"), "task_path": task.to_str().unwrap()})
+        ));
+    }
+    fs::write(&dataset, lines).unwrap();
+
+    let mut eval = std::process::Command::new(assert_cmd::cargo::cargo_bin("mur"))
+        .args(["eval", "run"])
+        .arg(project.path())
+        .arg("--dataset")
+        .arg(&dataset)
+        .current_dir(project.path())
+        .env("HOME", home.path())
+        .env_remove("NEXUS_API_KEY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("mur eval run should start");
+
+    // Longer than the capsule tests' wait: eval stages and compiles each case's session before it
+    // reaches the provider, which on one loaded CPU takes more than a minute.
+    wait_for_requests(&server, 1, Duration::from_secs(240));
+    kill(eval.id(), 15);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = eval.try_wait().expect("the child is waitable") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = eval.kill();
+            let _ = eval.wait();
+            panic!("mur eval run was still running 2 s after SIGTERM");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        status.signal(),
+        Some(15),
+        "SIGTERM should end mur eval run under the default disposition, got {status:?}"
+    );
+
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "no case after the first may reach the provider"
+    );
+}

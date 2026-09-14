@@ -720,8 +720,8 @@ connection at all and needs no daemon running. See
 
 ### `SIGTERM` { #mur-run-sigterm }
 
-An agent capsule that receives `SIGTERM` — from [`mur stop`](#mur-stop), `kill`, or a service
-manager — ends its session the way a clean exit does:
+An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),
+`kill`, or a service manager — ends its session the way a clean exit does:
 
 1. Every live task is cancelled, as [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) cancels them, and no new task is started.
 2. Each cancelled task's `task_end` is written, after its `on-task-end` hooks.
@@ -732,8 +732,9 @@ manager — ends its session the way a clean exit does:
 | A second `SIGTERM` | The process exits at once, with status 143 |
 | 20 seconds after the first `SIGTERM` | The process exits with status 143, wherever the teardown is |
 
-A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule
-has no `SIGTERM` handling and ends at once.
+A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
+and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
+ends at once.
 
 **Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]` and a `mur install` hint. Run `mur install` first to fetch missing artifacts.
 
