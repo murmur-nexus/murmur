@@ -598,7 +598,8 @@ pub fn stage_session(
     // Landlock Execute right — so `cc` starts and the first real compile does not finish. This
     // warns rather than refuses because the probe behind it is a heuristic about one driver
     // family; see `reachability::warn_on_unreachable_toolchain_helpers`, which prints each
-    // `W-SEC-012` line itself so `mur doctor` and this call site cannot state it differently.
+    // `W-SEC-012` line, and each `W-SEC-029` line for a driver it could not run, itself so
+    // `mur doctor` and this call site cannot state them differently.
     crate::reachability::warn_on_unreachable_toolchain_helpers(
         &request.capability_policy,
         request.declared_containment_floor,

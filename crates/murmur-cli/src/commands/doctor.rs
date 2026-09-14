@@ -906,9 +906,9 @@ pub(crate) fn run_doctor() -> Result<(), CliError> {
              or lower `capabilities.containment` if this capsule does not need a composed root."
         );
     }
-    // The second already prints its own `W-SEC-012` line, in the same words `mur run` uses, so
-    // there is nothing to reformat here — the return value is only for callers that want to
-    // inspect what was warned about.
+    // The second already prints its own `W-SEC-012` and `W-SEC-029` lines, in the same words
+    // `mur run` uses, so there is nothing to reformat here — the returned report is only for
+    // callers that want to inspect what was warned about.
     let _ = warn_on_unreachable_toolchain_helpers(&capability_policy, declared_floor);
 
     // Same reasoning again, for the mechanism that replaced the seccomp connect/sendto
