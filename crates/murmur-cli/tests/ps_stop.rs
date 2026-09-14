@@ -1605,7 +1605,7 @@ fn a_sigterm_ends_mur_eval_at_once() {
         .expect("mur eval run should start");
 
     // Longer than the capsule tests' wait: eval stages and compiles each case's session before it
-    // reaches the provider, which on one loaded CPU takes more than a minute.
+    // reaches the provider, which under load can take more than a minute.
     wait_for_requests(&server, 1, Duration::from_secs(240));
     kill(eval.id(), 15);
 

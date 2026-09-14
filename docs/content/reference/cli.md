@@ -718,24 +718,6 @@ refuses the launch with [`E-RUN-019`](diagnostics.md#e-run-019). Every other cap
 connection at all and needs no daemon running. See
 [the mur-roost HTTP API](roost-api.md#post-register).
 
-### `SIGTERM` { #mur-run-sigterm }
-
-An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),
-`kill`, or a service manager — ends its session the way a clean exit does:
-
-1. Every live task is cancelled, as [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) cancels them, and no new task is started.
-2. Each cancelled task's `task_end` is written, after its `on-task-end` hooks.
-3. The session teardown runs: `on-session-end`, the async hook drain, `shell_abandoned` records for detached commands, `session_end`, and removal of the [running-capsule record](#running-capsule-records).
-
-| Bound | Effect |
-|---|---|
-| A second `SIGTERM` | The process exits at once, with status 143 |
-| 20 seconds after the first `SIGTERM` | The process exits with status 143, wherever the teardown is |
-
-A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
-and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
-ends at once.
-
 **Artifact pre-check:** Before staging, `mur run` verifies that all artifacts declared in the manifest are installed locally. If any are missing it exits immediately with `error[E-RUN-008]` and a `mur install` hint. Run `mur install` first to fetch missing artifacts.
 
 Current runtime constraints:
@@ -748,6 +730,24 @@ Current runtime constraints:
   - otherwise requires exactly one root `*.wasm`
   - under `--capsule`, the root component of the artifact archive, with no project directory searched
 - Agent capsules require either `transport: http` (with `inference.driver.artifact`) or `transport: process` (with `inference.command`) in `murmur.yaml`; missing driver config exits with `error[E-RUN-005]` or `error[E-RUN-006]` respectively
+
+### `SIGTERM` { #mur-run-sigterm }
+
+An agent capsule started with `mur run` that receives `SIGTERM` — from [`mur stop`](#mur-stop),
+`kill`, or a service manager — ends its session the way a clean exit does:
+
+1. Every live task is cancelled, as [`session/stop`](../how-to/capsules-a2a-messaging.md#ending-the-session) cancels them, and no new task is started.
+2. Each cancelled task's `task_end` is written, after its `on-task-end` hooks.
+3. The session teardown runs: `on-session-end`, waiting for asynchronous hooks to finish, `shell_abandoned` records for detached commands, `session_end`, and removal of the [running-capsule record](#running-capsule-records).
+
+| Bound | Effect |
+|---|---|
+| A second `SIGTERM` | The process exits at once, with status 143 |
+| 20 seconds after the first `SIGTERM` | The process exits with status 143, wherever the teardown is |
+
+A teardown cut short by either bound, or by `SIGKILL`, leaves the rest undone. A script capsule,
+and every session that `mur eval run` or `mur new` runs, has no `SIGTERM` handling: the process
+ends at once.
 
 ---
 
